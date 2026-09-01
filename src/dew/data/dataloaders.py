@@ -48,10 +48,12 @@ def generate_collate_fn(media_type="image"):
             # Check if all images have the same shape
             image_shapes = [sample["image"].shape for sample in batch]
             if len(set(str(shape) for shape in image_shapes)) > 1:
-                # Different shapes, need to resize all to the same shape
-                target_shape = max(shape[0] for shape in image_shapes), max(shape[1] for shape in image_shapes)
+                # Different shapes: resize everything to the largest. cv2 takes (width, height).
+                target_h = max(shape[0] for shape in image_shapes)
+                target_w = max(shape[1] for shape in image_shapes)
                 images = np.stack([
-                    cv2.resize(sample["image"], target_shape) if sample["image"].shape[:2] != target_shape else sample["image"] 
+                    cv2.resize(sample["image"], (target_w, target_h))
+                    if sample["image"].shape[:2] != (target_h, target_w) else sample["image"]
                     for sample in batch
                 ], axis=0)
             else:

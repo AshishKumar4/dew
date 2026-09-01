@@ -480,3 +480,31 @@ def test_av_benchmark_script_imports_against_the_real_av_utils():
     assert callable(module.benchmark_av_reading)
     assert callable(module.read_av_improved)
     assert not (REPO_ROOT / "src" / "dew" / "data" / "sources" / "av_example.py").exists()
+
+
+# ---------------------------------------------------------------------------------
+# Collate
+# ---------------------------------------------------------------------------------
+
+class _StubTokenizer:
+    def __init__(self, tensor_type="np"):
+        pass
+
+    def __call__(self, captions):
+        n = len(captions)
+        return {"input_ids": np.zeros((n, 4), np.int32), "attention_mask": np.ones((n, 4), np.int32)}
+
+
+def test_image_collate_resizes_mixed_shapes_to_the_largest(monkeypatch):
+    """cv2.resize takes (width, height); passing (height, width) transposed every
+    non-square image, np.stack failed, and the except branch fed zero images on."""
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+    batch = [
+        {"image": np.full((16, 24, 3), 200, np.uint8), "caption": "wide"},
+        {"image": np.full((20, 16, 3), 100, np.uint8), "caption": "tall"},
+    ]
+    out = collate(batch)
+    assert out["image"].shape == (2, 20, 24, 3)
+    assert out["image"][0].min() == 200 and out["image"][1].min() == 100
+    assert out["text"]["input_ids"].shape == (2, 4)
