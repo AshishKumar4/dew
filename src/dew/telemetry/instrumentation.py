@@ -24,18 +24,30 @@ PEAK_FLOPS_PER_DEVICE = {
 }
 
 
-def step_flops(jitted, *args, **kwargs) -> Optional[float]:
-    """FLOPs for one call of a jitted function, straight from the compiler.
+def compiled_flops(compiled) -> Optional[float]:
+    """FLOPs for one call of an executable that is already compiled.
 
-    Measured rather than derived from a hand-written parameter-count formula, so
-    it stays honest across architectures, remat and gradient accumulation.
+    Reading the count off the executable the loop actually runs costs nothing;
+    compiling a second one to ask the same question costs a full XLA compile.
     """
-    analysis = jitted.lower(*args, **kwargs).compile().cost_analysis()
+    analysis = compiled.cost_analysis()
     if isinstance(analysis, (list, tuple)):
         analysis = analysis[0] if analysis else None
     if not analysis or 'flops' not in analysis:
         return None
     return float(analysis['flops'])
+
+
+def step_flops(jitted, *args, **kwargs) -> Optional[float]:
+    """FLOPs for one call of a jitted function, straight from the compiler.
+
+    Measured rather than derived from a hand-written parameter-count formula, so
+    it stays honest across architectures, remat and gradient accumulation.
+
+    Compiles the function, which the caller has usually already paid for: hold
+    on to the compiled executable and use compiled_flops instead.
+    """
+    return compiled_flops(jitted.lower(*args, **kwargs).compile())
 
 
 def model_flops_utilization(

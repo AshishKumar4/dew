@@ -15,7 +15,7 @@ from termcolor import colored
 from typing import Dict, Callable, Any, Tuple
 from dew.random_state import RandomMarkovState
 from dew.telemetry.instrumentation import (
-    enable_compilation_cache, model_flops_utilization, step_flops,
+    compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
 from .distributed import (
     DEFAULT_MIN_SHARD_SIZE, DevicePrefetchIterator, batch_sharding, build_mesh,
@@ -99,8 +99,11 @@ class SimpleTrainer:
         self.profile_steps = profile_steps
         self.log_every = log_every
         self.max_bad_loss_steps = max_bad_loss_steps
-        # Measured from the compiled step the first time it runs.
+        # Measured off the compiled step, once per run.
         self.flops_per_step = None
+        # (jitted step, its executable). Compiled on the first step of a run
+        # and reused by every epoch after it.
+        self._compiled_train_step = (None, None)
         self.global_batch_size = 0
 
         load_directly_from_dir = False
@@ -371,6 +374,25 @@ class SimpleTrainer:
         except Exception as e:
             print("Error logging images to wandb", e)
 
+    def _compiled_step(self, train_step_fn: Callable, *args):
+        """The training step's executable, compiled at most once per run.
+
+        Calling a jitted function compiles it, and asking the compiler for its
+        cost analysis compiles it a second time: `lower(...).compile()` builds
+        an executable of its own that the jit cache knows nothing about. Running
+        the loop on that executable pays for one compilation and reads the FLOP
+        count off it. The lowering carries the jit's shardings and donation, so
+        the loop still donates its train state.
+        """
+        cached_fn, compiled = self._compiled_train_step
+        if compiled is not None and cached_fn is train_step_fn:
+            return compiled
+        compiled = train_step_fn.lower(*args).compile()
+        self._compiled_train_step = (train_step_fn, compiled)
+        if self.flops_per_step is None:
+            self.flops_per_step = compiled_flops(compiled)
+        return compiled
+
     def train_loop(
         self,
         train_state: SimpleTrainState,
@@ -401,13 +423,17 @@ class SimpleTrainer:
 
         last_log_time = time.time()
         steps_since_log = 0
+        compiled_step = None
 
         for i in range(train_steps_per_epoch):
             batch = next(train_ds)
+            if compiled_step is None:
+                compiled_step = self._compiled_step(
+                    train_step_fn, train_state, rng_state, batch)
             if i == 0 and self.profile_steps:
                 jax.profiler.start_trace(self.profile_path())
 
-            train_state, loss, aux, rng_state, is_finite = train_step_fn(
+            train_state, loss, aux, rng_state, is_finite = compiled_step(
                 train_state, rng_state, batch)
             # No stale alias may outlive the step: its buffers were donated.
             self.state, self.rngstate = train_state, rng_state
@@ -418,9 +444,6 @@ class SimpleTrainer:
 
             if i == 0:
                 print(f"Training started for process index {process_index} at step {current_step}")
-                if self.flops_per_step is None:
-                    self.flops_per_step = step_flops(
-                        train_step_fn, train_state, rng_state, batch)
 
             epoch_loss += loss
             current_step += 1
