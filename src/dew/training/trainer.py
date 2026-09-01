@@ -473,7 +473,7 @@ class SimpleTrainer:
                     now = time.time()
                     elapsed = now - last_log_time
                     pbar.set_postfix(loss=f'{loss:.4f}')
-                    pbar.update(log_every)
+                    pbar.update(steps_since_log)
                     if self.wandb is not None:
                         self.wandb.log({
                             "train/step": current_step,
@@ -495,6 +495,8 @@ class SimpleTrainer:
             self._stop_trace(traced_steps, loss)
         self._check_finite(worst_bad_run, current_step)
         if pbar is not None:
+            # Whatever ran since the last tick is progress too.
+            pbar.update(steps_since_log)
             pbar.close()
         return epoch_loss, current_step, train_state, rng_state
 
