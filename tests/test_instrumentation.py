@@ -124,6 +124,37 @@ def test_profiler_writes_a_trace(tmp_path):
     assert any(files for _, _, files in os.walk(trainer.profile_path()))
 
 
+def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
+    """Reading the cost analysis used to compile the step a second time, which
+    doubled the startup cost of every fit()."""
+    trainer = make_trainer(tmp_path)
+    compiles = []
+    real_compile = jax.stages.Lowered.compile
+
+    def counting_compile(lowered, *args, **kwargs):
+        compiles.append(lowered)
+        return real_compile(lowered, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", counting_compile)
+
+    jitted = []
+    real_define = trainer._define_train_step
+
+    def capture(**kwargs):
+        step = real_define(**kwargs)
+        jitted.append(step)
+        return step
+
+    monkeypatch.setattr(trainer, "_define_train_step", capture)
+    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=2, val_steps_per_epoch=0)
+
+    assert len(compiles) == 1, "the training step was compiled more than once"
+    # Both epochs ran on that one executable; a jit call would have compiled
+    # its own and left it in the jit cache.
+    assert jitted[0]._cache_size() == 0, "the loop went through the jit path too"
+    assert trainer.flops_per_step and trainer.flops_per_step > 0
+
+
 # --------------------------------------------------------------------------
 # Divergence
 # --------------------------------------------------------------------------
