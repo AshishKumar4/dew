@@ -91,6 +91,8 @@ class TrainerConfig:
     load_from_checkpoint: Optional[str] = None
     resume_last_run: Optional[str] = None
     max_checkpoints_to_keep: int = 1
+    checkpoint_every_steps: Optional[int] = None
+    """Save a checkpoint every N global steps, not only at epoch boundaries."""
     distributed_training: bool = True
     fsdp_size: int = 1
     fsdp_min_param_size: Optional[int] = None

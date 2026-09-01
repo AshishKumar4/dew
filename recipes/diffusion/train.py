@@ -13,35 +13,27 @@ import hashlib
 import json
 import os
 import re
-import resource
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, Optional
 
 import jax
-import optax
 import tqdm
 import tyro
 
-from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
-from dew.data.dataloaders import get_dataset_grain, get_dataset_online
+from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
+from dew.data.dataloaders import load_data
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.processors import defaultTextEncodeModel
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model, canonicalize_architecture
 from dew.sampling.euler import EulerAncestralSampler
-from dew.training import ObjectiveTrainer
+from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
 
 warnings.filterwarnings("ignore")
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
-
-OPTIMIZER_MAP = {
-    'adam': optax.adam,
-    'adamw': optax.adamw,
-    'lamb': optax.lamb,
-}
 
 ATTENTION = {
     "heads": 8, "dtype": None, "use_projection": False,
@@ -83,31 +75,6 @@ class DiffusionRunConfig(RunConfig):
     """Pull 2000 batches through the pipeline before training, for benchmarking."""
 
 
-def load_data(config: DataConfig) -> dict:
-    """Dataset iterators from the grain pipeline, or the online streamer."""
-    online = (config.loader == 'online'
-              or (config.loader == 'auto' and 'online' in config.dataset))
-    read_thread_count = config.read_thread_count
-    worker_buffer_size = config.worker_buffer_size
-    if online:
-        print("Using Online Dataset Generator")
-        generator = get_dataset_online
-        # Streaming reads are slower per shard, so more of them are in flight
-        read_thread_count *= 4
-        worker_buffer_size *= 5
-    else:
-        generator = get_dataset_grain
-
-    return generator(
-        config.dataset,
-        batch_size=config.batch_size, image_scale=config.image_size,
-        worker_count=config.worker_count, read_thread_count=read_thread_count,
-        read_buffer_size=config.read_buffer_size, worker_buffer_size=worker_buffer_size,
-        seed=config.dataset_seed,
-        dataset_source=config.dataset_path,
-    )
-
-
 def load_autoencoder(config: DiffusionRunConfig):
     """The VAE for latent diffusion, with the shape it hands the model."""
     if config.autoencoder is None:
@@ -130,30 +97,6 @@ def model_kwargs(config: DiffusionRunConfig, channels: int, sample_size: int):
     else:
         kwargs['output_channels'] = channels
     return architecture, kwargs
-
-
-def build_optimizer(config: OptimConfig, steps_per_epoch: int):
-    """The solver, with its schedule, clipping and gradient accumulation."""
-    learning_rate = config.learning_rate
-    if config.learning_rate_schedule == 'cosine':
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate, peak_value=config.learning_rate_peak,
-            warmup_steps=config.learning_rate_warmup_steps,
-            decay_steps=steps_per_epoch * config.learning_rate_decay_epochs,
-            end_value=config.learning_rate_end,
-        )
-    opts = dict(config.optimizer_opts)
-    if config.weight_decay is not None:
-        opts['weight_decay'] = config.weight_decay
-    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
-
-    if config.clip_grads > 0:
-        solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
-    if config.grad_accum_steps > 1:
-        # Accumulate over several micro-batches so the effective batch can
-        # exceed what fits in device memory at once.
-        solver = optax.MultiSteps(solver, every_k_schedule=config.grad_accum_steps)
-    return solver
 
 
 def build_input_config(config: DiffusionRunConfig) -> DiffusionInputConfig:
@@ -224,22 +167,7 @@ def experiment_name(config: DiffusionRunConfig, summary: dict, latent: bool) -> 
 
 
 def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
-    # The image augmenters read this at MapTransform construction time
-    os.environ['FLAXDIFF_AUGMENT_MODE'] = config.data.augmentation_mode
-    if config.trainer.wandb_offline:
-        os.environ['WANDB_MODE'] = 'offline'
-
-    resource.setrlimit(
-        resource.RLIMIT_CORE,
-        (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
-
-    print("Initializing JAX")
-    try:
-        jax.distributed.initialize()
-    except Exception:
-        pass
-    print(f"Number of devices: {jax.device_count()}")
+    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline)
     print(f"Local devices: {jax.local_devices()}")
 
     data = load_data(config.data)
@@ -355,6 +283,7 @@ def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
         sampler_class=EulerAncestralSampler,
         sampling_noise_schedule=sampling_schedule,
         val_steps_per_epoch=config.data.val_steps_per_epoch,
+        checkpoint_every_steps=config.trainer.checkpoint_every_steps,
     )
     return trainer
 

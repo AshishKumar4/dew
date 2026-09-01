@@ -12,29 +12,25 @@ them. The Objective seam is what makes the same trainer serve both.
 """
 
 import os
-import resource
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 import jax
-import optax
 import tyro
 
 from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
-from dew.data.dataloaders import get_dataset_grain, get_dataset_online
+from dew.data.dataloaders import load_data
 from dew.inputs import DiffusionInputConfig
 from dew.objectives.jepa import (
     JepaObjective, multi_block_mask, get_linear_probe_metric, get_knn_probe_metric,
 )
 from dew.registry import build_model, canonicalize_architecture
-from dew.training import ObjectiveTrainer
+from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
-
-OPTIMIZER_MAP = {'adam': optax.adam, 'adamw': optax.adamw, 'lamb': optax.lamb}
 
 DEFAULT_ENCODER_CONFIG = {"precision": "default"}
 
@@ -73,23 +69,6 @@ class JepaRunConfig(RunConfig):
     knn_k: int = 20
 
 
-def load_data(config: DataConfig) -> dict:
-    """Dataset iterators from the grain pipeline, or the online streamer."""
-    online = (config.loader == 'online'
-              or (config.loader == 'auto' and 'online' in config.dataset))
-    generator = get_dataset_online if online else get_dataset_grain
-    return generator(
-        config.dataset,
-        batch_size=config.batch_size, image_scale=config.image_size,
-        worker_count=config.worker_count,
-        read_thread_count=config.read_thread_count,
-        read_buffer_size=config.read_buffer_size,
-        worker_buffer_size=config.worker_buffer_size,
-        seed=config.dataset_seed,
-        dataset_source=config.dataset_path,
-    )
-
-
 def build_encoder(config: JepaRunConfig):
     """The encoder, and the config the registry built it from."""
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
@@ -111,28 +90,6 @@ def build_predictor(config: JepaRunConfig, encoder, grid, is_video: bool):
     return build_model('jepa_predictor', predictor_config), predictor_config
 
 
-def build_optimizer(config: OptimConfig, steps_per_epoch: int):
-    """The solver, with its schedule, clipping and gradient accumulation."""
-    learning_rate = config.learning_rate
-    if config.learning_rate_schedule == 'cosine':
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate, peak_value=config.learning_rate_peak,
-            warmup_steps=config.learning_rate_warmup_steps,
-            decay_steps=steps_per_epoch * config.learning_rate_decay_epochs,
-            end_value=config.learning_rate_end,
-        )
-    opts = dict(config.optimizer_opts)
-    if config.weight_decay is not None:
-        opts['weight_decay'] = config.weight_decay
-    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
-
-    if config.clip_grads > 0:
-        solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
-    if config.grad_accum_steps > 1:
-        solver = optax.MultiSteps(solver, every_k_schedule=config.grad_accum_steps)
-    return solver
-
-
 def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
     """Flat view of the run, for the wandb config."""
     return {
@@ -147,19 +104,7 @@ def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
 
 
 def main(config: JepaRunConfig) -> ObjectiveTrainer:
-    os.environ['FLAXDIFF_AUGMENT_MODE'] = config.data.augmentation_mode
-    if config.trainer.wandb_offline:
-        os.environ['WANDB_MODE'] = 'offline'
-
-    resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
-
-    print("Initializing JAX")
-    try:
-        jax.distributed.initialize()
-    except Exception:
-        pass
-    print(f"Number of devices: {jax.device_count()}")
+    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline)
 
     checkpoint_dir = config.trainer.checkpoint_dir
     if config.trainer.checkpoint_fs == 'gcs':
@@ -269,7 +214,8 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
     start = time.time()
     trainer.fit(data, training_steps_per_epoch=steps_per_epoch,
                 epochs=config.trainer.epochs,
-                val_steps_per_epoch=config.data.val_steps_per_epoch)
+                val_steps_per_epoch=config.data.val_steps_per_epoch,
+                checkpoint_every_steps=config.trainer.checkpoint_every_steps)
     print(f"Training finished in {time.time() - start:.0f}s")
     return trainer
 

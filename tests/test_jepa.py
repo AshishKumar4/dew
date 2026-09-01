@@ -476,7 +476,7 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
                        "label": jnp.asarray(rs.randint(0, classes, 4))}
         return {"train": batches, "val": batches, "train_len": 16, "local_batch_size": 4}
 
-    monkeypatch.setattr(training_jepa, "get_dataset_grain", fake_dataset)
+    monkeypatch.setattr(training_jepa, "load_data", fake_dataset)
     config = training_jepa.JepaRunConfig(
         model=ModelConfig("jepa_encoder", {
             "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
