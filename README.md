@@ -1,37 +1,37 @@
-# ![](images/logo.jpeg "FlaxDiff")
+# ![](images/logo.jpeg "Dew")
 
 **This project is partially supported by [Google TPU Research Cloud](https://sites.research.google/trc/about/). I would like to thank the Google Cloud TPU team for providing me with the resources to train the bigger text-conditional models in multi-host distributed settings.**
 
-## A Versatile and simple Diffusion Library
+## A Versatile and simple Framework for Generative Models
 
 In recent years, diffusion and score-based multi-step models have revolutionized the generative AI domain. However, the latest research in this field has become highly math-intensive, making it challenging to understand how state-of-the-art diffusion models work and generate such impressive images. Replicating this research in code can be daunting.
 
-FlaxDiff is a library of tools (schedulers, samplers, models, etc.) designed and implemented in an easy-to-understand way. The focus is on understandability and readability over performance. I started this project as a hobby to familiarize myself with Flax and Jax and to learn about diffusion and the latest research in generative AI.
+Dew is a library of tools (schedulers, samplers, models, etc.) designed and implemented in an easy-to-understand way. The focus is on understandability and readability over performance. I started this project as a hobby to familiarize myself with Flax and Jax and to learn about diffusion and the latest research in generative AI.
 
-I initially started this project in Keras, being familiar with TensorFlow 2.0, but transitioned to Flax, powered by Jax, for its performance and ease of use. The old notebooks and models, including my first Flax models, are also provided.
+Dew is the project I published as FlaxDiff, renamed and restructured once the trainer stopped being about diffusion alone: what to optimize is now an objective you plug in, and diffusion is one of them.
 
-The `Diffusion_flax_linen.ipynb` notebook is my main workspace for experiments. Several checkpoints are uploaded to the `pretrained` folder along with a copy of the working notebook associated with each checkpoint. *You may need to copy the notebook to the working root for it to function properly.*
+I initially started this project in Keras, being familiar with TensorFlow 2.0, but transitioned to Flax, powered by Jax, for its performance and ease of use.
 
 The library has since grown beyond images: it now also covers video diffusion, flow matching, latent diffusion with a VAE, and I-JEPA/V-JEPA self-supervised training, all running through the same trainer with data-parallel and FSDP sharding. The bigger text-conditional models in the gallery were trained on a TPU-v4-32 pod.
 
 ## Example Notebooks from scratch
 
-In the `tutorial notebooks` folder, you will find comprehensive notebooks for various diffusion techniques, written entirely from scratch and are independent of the FlaxDiff library. Each notebook includes detailed explanations of the underlying mathematics and concepts, making them invaluable resources for learning and understanding diffusion models.
+In the `tutorials` folder, you will find notebooks for various diffusion techniques, written entirely from scratch and are independent of the Dew library. Each notebook includes detailed explanations of the underlying mathematics and concepts, making them invaluable resources for learning and understanding diffusion models.
 
 ### Available Notebooks and Resources
 
-- **[Diffusion explained (nbviewer link)](https://nbviewer.org/github/AshishKumar4/FlaxDiff/blob/main/tutorial%20notebooks/simple%20diffusion%20flax.ipynb) [(local link)](tutorial%20notebooks/simple%20diffusion%20flax.ipynb)**
+- **[Diffusion explained (nbviewer link)](https://nbviewer.org/github/AshishKumar4/Dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb) [(local link)](tutorials/simple%20diffusion%20flax.ipynb)**
 
   - **WORK IN PROGRESS** An in-depth exploration of the concept of Diffusion based generative models, DDPM (Denoising Diffusion Probabilistic Models), DDIM (Denoising Diffusion Implicit Models), and the SDE/ODE generalizations of diffusion, with step-by-step explainations and code.
 
-  <a target="_blank" href="https://colab.research.google.com/github/AshishKumar4/FlaxDiff/blob/main/tutorial%20notebooks/simple%20diffusion%20flax.ipynb">
+  <a target="_blank" href="https://colab.research.google.com/github/AshishKumar4/Dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
-- **[EDM (Elucidating the Design Space of Diffusion-based Generative Models)](tutorial%20notebooks/edm%20tutorial.ipynb)**
+- **[EDM (Elucidating the Design Space of Diffusion-based Generative Models)](tutorials/edm%20tutorial.ipynb)**
   - **TODO** A thorough guide to EDM, discussing the innovative approaches and techniques used in this advanced diffusion model.
 
-  <a target="_blank" href="https://colab.research.google.com/github/AshishKumar4/FlaxDiff/blob/main/tutorial%20notebooks/edm%20tutorial.ipynb">
+  <a target="_blank" href="https://colab.research.google.com/github/AshishKumar4/Dew/blob/main/tutorials/edm%20tutorial.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
@@ -39,10 +39,10 @@ These notebooks aim to provide a very easy to understand and step-by-step guide 
 
 #### Other resources
 
-- **[Multi-host Data parallel training script in JAX](./training.py)**
-  - Training script for multi-host data parallel training in JAX, to serve as a reference for training large models on multiple GPUs/TPUs across multiple hosts. A full-fledged tutorial notebook is in the works.
+- **[Training recipes](./recipes/)**
+  - The full training entry points: [`recipes/diffusion/train.py`](./recipes/diffusion/train.py) for diffusion and [`recipes/jepa/train.py`](./recipes/jepa/train.py) for I-JEPA/V-JEPA. Both run multi-host data parallel, and serve as a reference for training large models on multiple GPUs/TPUs across multiple hosts. A full-fledged tutorial notebook is in the works.
 
-- **[TPU utilities for making life easier](./tpu-tools/)**
+- **[TPU utilities for making life easier](./tools/tpu/)**
   - A collection of utilities and scripts to make working with TPUs easier, such as cli to create/start/stop/setup TPUs, script to setup TPU VMs (install everything you need), mounting gcs datasets etc.
 
 ## Disclaimer (and About Me)
@@ -53,19 +53,24 @@ Also, few of the text may be generated with help of github copilot, so please ex
 
 ## Index
 
-- [A Versatile and simple Diffusion Library](#a-versatile-and-simple-diffusion-library)
+- [A Versatile and simple Framework for Generative Models](#a-versatile-and-simple-framework-for-generative-models)
 - [Disclaimer (and About Me)](#disclaimer-and-about-me)
 - [Features](#features)
+  - [Objectives](#objectives)
   - [Schedulers](#schedulers)
   - [Model Predictors](#model-predictors)
   - [Samplers](#samplers)
   - [Training](#training)
   - [Models](#models)
+  - [Data](#data)
   - [Metrics](#metrics)
-- [Installation of FlaxDiff](#installation)
-- [Getting Started with FlaxDiff](#getting-started)
+  - [Interop](#interop)
+- [Installation](#installation)
+- [Getting Started](#getting-started)
   - [Training Example](#training-example)
+  - [Recipes](#recipes)
   - [Inference Example](#inference-example)
+- [Testing](#testing)
 - [References and Acknowledgements](#references-and-acknowledgements)
 - [Pending things to do list](#pending-things-to-do-list)
 - [Gallery](#gallery)
@@ -74,99 +79,117 @@ Also, few of the text may be generated with help of github copilot, so please ex
 
 ## Features
 
+### Objectives
+Implemented in `dew.objectives`:
+- **Objective** (`dew.objectives.Objective`): The seam between the trainer and the research question. It owns the parameters, the loss and the validation artifacts, while the trainer owns sharding, EMA, checkpoints and logging.
+- **DiffusionObjective** (`dew.objectives.diffusion.DiffusionObjective`): Sample a noise level, corrupt the sample, predict, weight the loss. This is the default.
+- **JepaObjective** (`dew.objectives.jepa.JepaObjective`): I-JEPA and V-JEPA. Predicts the representation of masked target blocks from the visible context, with the target encoder as an EMA of the context encoder and collapse telemetry on every step.
+
 ### Schedulers
-Implemented in `flaxdiff.schedulers`:
-- **LinearNoiseScheduler** (`flaxdiff.schedulers.LinearNoiseScheduler`): A beta-parameterized discrete scheduler.
-- **CosineNoiseScheduler** (`flaxdiff.schedulers.CosineNoiseScheduler`): A beta-parameterized discrete scheduler.
-- **ExpNoiseScheduler** (`flaxdiff.schedulers.ExpNoiseScheduler`): A beta-parameterized discrete scheduler.
-- **CosineContinuousNoiseScheduler** (`flaxdiff.schedulers.CosineContinuousNoiseScheduler`): A continuous scheduler.
-- **CosineGeneralNoiseScheduler** (`flaxdiff.schedulers.CosineGeneralNoiseScheduler`): A continuous sigma parameterized cosine scheduler.
-- **SqrtContinuousNoiseScheduler** (`flaxdiff.schedulers.SqrtContinuousNoiseScheduler`): A continuous scheduler using the sqrt schedule proposed for diffusion language models.
-- **KarrasVENoiseScheduler** (`flaxdiff.schedulers.KarrasVENoiseScheduler`): A sigma-parameterized continuous scheduler proposed by Karras et al. 2022, best suited for inference.
-- **EDMNoiseScheduler** (`flaxdiff.schedulers.EDMNoiseScheduler`): A sigma-parameterized continuous scheduler based on the EDM paper, best suited for training with the KarrasVENoiseScheduler.
-- **FlowMatchingScheduler** (`flaxdiff.schedulers.FlowMatchingScheduler`): A rectified-flow scheduler with logit-normal timestep sampling and resolution-dependent shifting, as used in Stable Diffusion 3.
+Implemented in `dew.objectives.diffusion.schedules`:
+- **LinearNoiseScheduler**: A beta-parameterized discrete scheduler.
+- **CosineNoiseScheduler**: A beta-parameterized discrete scheduler.
+- **ExpNoiseScheduler**: A beta-parameterized discrete scheduler.
+- **CosineContinuousNoiseScheduler**: A continuous scheduler.
+- **CosineGeneralNoiseScheduler**: A continuous sigma parameterized cosine scheduler.
+- **SqrtContinuousNoiseScheduler**: A continuous scheduler using the sqrt schedule proposed for diffusion language models.
+- **KarrasVENoiseScheduler**: A sigma-parameterized continuous scheduler proposed by Karras et al. 2022, best suited for inference.
+- **EDMNoiseScheduler**: A sigma-parameterized continuous scheduler based on the EDM paper, best suited for training with the KarrasVENoiseScheduler.
+- **FlowMatchingScheduler**: A rectified-flow scheduler with logit-normal timestep sampling and resolution-dependent shifting, as used in Stable Diffusion 3.
 
 ### Model Predictors
-Implemented in `flaxdiff.predictors`:
-- **EpsilonPredictionTransform** (`flaxdiff.predictors.EpsilonPredictionTransform`): The model predicts the noise in the data.
-- **DirectPredictionTransform** (`flaxdiff.predictors.DirectPredictionTransform`): The model predicts the original data from the noisy data.
-- **VPredictionTransform** (`flaxdiff.predictors.VPredictionTransform`): The model predicts a linear combination of the data and noise.
-- **FlowMatchPredictionTransform** (`flaxdiff.predictors.FlowMatchPredictionTransform`): The model predicts the flow velocity.
-- **KarrasPredictionTransform** (`flaxdiff.predictors.KarrasPredictionTransform`): A generalized transform for the EDM, integrating various parameterizations.
-- **get_diffusion_preset** (`flaxdiff.predictors.get_diffusion_preset`): One call which pairs a training schedule, a sampling schedule and a transform for the `"edm"`, `"karras"`, `"cosine"` and `"flow"` setups.
+Implemented in `dew.objectives.diffusion.transforms`:
+- **EpsilonPredictionTransform**: The model predicts the noise in the data.
+- **DirectPredictionTransform**: The model predicts the original data from the noisy data.
+- **VPredictionTransform**: The model predicts a linear combination of the data and noise.
+- **FlowMatchPredictionTransform**: The model predicts the flow velocity.
+- **KarrasPredictionTransform**: A generalized transform for the EDM, integrating various parameterizations.
+- **get_diffusion_preset**: One call which pairs a training schedule, a sampling schedule and a transform for the `"edm"`, `"karras"`, `"cosine"` and `"flow"` setups.
 
 ### Samplers
-Implemented in `flaxdiff.samplers`:
-- **DDPMSampler** (`flaxdiff.samplers.DDPMSampler`): Implements the Denoising Diffusion Probabilistic Model (DDPM) sampling process.
-- **DDIMSampler** (`flaxdiff.samplers.DDIMSampler`): Implements the Denoising Diffusion Implicit Model (DDIM) sampling process.
-- **EulerSampler** (`flaxdiff.samplers.EulerSampler`): An ODE solver sampler using Euler's method.
-- **EulerAncestralSampler** (`flaxdiff.samplers.EulerAncestralSampler`): Euler sampling with ancestral noise injection.
-- **HeunSampler** (`flaxdiff.samplers.HeunSampler`): An ODE solver sampler using Heun's method.
-- **RK4Sampler** (`flaxdiff.samplers.RK4Sampler`): An ODE solver sampler using the Runge-Kutta method.
-- **MultiStepDPM** (`flaxdiff.samplers.MultiStepDPM`): Implements a multi-step sampling method inspired by the Multistep DPM solver as presented here: [tonyduan/diffusion](https://github.com/tonyduan/diffusion/blob/fcc0ed829baf29e1493b460b073e735a848c08ea/src/samplers.py#L44)
+Implemented in `dew.sampling`:
+- **DDPMSampler** (`dew.sampling.DDPMSampler`): Implements the Denoising Diffusion Probabilistic Model (DDPM) sampling process.
+- **DDIMSampler** (`dew.sampling.DDIMSampler`): Implements the Denoising Diffusion Implicit Model (DDIM) sampling process.
+- **EulerSampler** (`dew.sampling.EulerSampler`): An ODE solver sampler using Euler's method.
+- **EulerAncestralSampler** (`dew.sampling.EulerAncestralSampler`): Euler sampling with ancestral noise injection.
+- **HeunSampler** (`dew.sampling.HeunSampler`): An ODE solver sampler using Heun's method.
+- **RK4Sampler** (`dew.sampling.RK4Sampler`): An ODE solver sampler using the Runge-Kutta method.
+- **MultiStepDPM** (`dew.sampling.MultiStepDPM`): Implements a multi-step sampling method inspired by the Multistep DPM solver as presented here: [tonyduan/diffusion](https://github.com/tonyduan/diffusion/blob/fcc0ed829baf29e1493b460b073e735a848c08ea/src/samplers.py#L44)
 
 All samplers support classifier-free guidance, including interval-limited guidance.
 
 ### Training
-Implemented in `flaxdiff.trainer`:
-- **GeneralDiffusionTrainer** (`flaxdiff.trainer.GeneralDiffusionTrainer`): Manages the training loop, loss calculation, EMA, gradient accumulation, checkpointing and wandb logging, for both image and video data. It runs data-parallel and FSDP sharded training through `jax.jit` with `NamedSharding` on a `(data, fsdp)` mesh.
-- **Objectives** (`flaxdiff.trainer.objectives`): What to optimize is pluggable. `DiffusionObjective` is the default; `JepaObjective` (`flaxdiff.jepa`) trains I-JEPA/V-JEPA encoders on the same trainer.
+Implemented in `dew.training`:
+- **ObjectiveTrainer** (`dew.training.ObjectiveTrainer`): Manages the training loop, loss calculation, EMA, gradient accumulation, checkpointing and wandb logging, for both image and video data. It runs data-parallel and FSDP sharded training through `jax.jit` with `NamedSharding` on a `(data, fsdp)` mesh.
+- **Sharding** (`dew.training.distributed`): The device mesh, the parameter specs, the batch sharding and the device prefetch iterator. `fsdp_size=1` degenerates to plain data parallelism, so one code path serves both.
+- **Telemetry** (`dew.telemetry.instrumentation`): Step FLOPs straight from the compiler, model FLOPs utilization, and the persistent XLA compilation cache.
+- **Config** (`dew.config`): `RunConfig` with its `ModelConfig`, `DataConfig`, `OptimConfig` and `TrainerConfig` parts, which is how the recipes describe a run.
 
 ### Models
-Implemented in `flaxdiff.models` and constructed via `flaxdiff.models.registry.build_model`:
+Implemented in `dew.nn` and constructed via `dew.registry.build_model`:
 - **Unet**: A classic convolutional UNet.
 - **UNet3D**: A video UNet which can inflate 2D Unet checkpoints.
 - **UViT / SimpleUDiT**: U-shaped transformers.
 - **SimpleDiT / SimpleMMDiT / HierarchicalMMDiT**: DiT and SD3-style multi-modal DiT variants.
 - **HybridSSMAttentionDiT**: Interleaves S5 state-space blocks with attention.
 - **VideoDiT**: A factorized spatial-temporal DiT for video.
+- **JepaEncoder / JepaVideoEncoder / JepaPredictor**: The ViT encoders and the predictor that the JEPA objective trains.
 - Hilbert and zigzag patch scan orders are available via the `+hilbert` and `+zigzag` architecture suffixes.
-- **Autoencoders** (`flaxdiff.models.autoencoder`): `StableDiffusionVAE` (vendored Flax VAE, loads Hugging Face hub weights) and `SimpleAutoEncoder` for latent diffusion without any external weights.
+- **Autoencoders** (`dew.nn.autoencoders`): `StableDiffusionVAE` (vendored Flax VAE, loads Hugging Face hub weights) and `SimpleAutoEncoder` for latent diffusion without any external weights.
+
+### Data
+Implemented in `dew.data`:
+- **Sources** (`dew.data.sources`): TFDS datasets, ArrayRecord shards on a GCS mount, local video trees, VoxCeleb2, and a loader that streams images and videos from URLs.
+- **Loaders** (`dew.data.dataloaders`): `get_dataset_grain` for images and `get_media_dataset_grain` for images or video, both grain pipelines, both with a validation split read in canonical order.
+- **Registry** (`dew.data.registry`): `datasetMap` and `mediaDatasetMap`, the dataset names the loaders and the recipes accept.
 
 ### Metrics
-Implemented in `flaxdiff.metrics`: FID (vendored InceptionV3), CLIP score, PSNR, SSIM, and linear/kNN probes for JEPA.
+Implemented in `dew.eval`: FID (vendored InceptionV3), CLIP score, PSNR and SSIM. The linear and kNN probes for JEPA sit with the objective, in `dew.objectives.jepa.probes`.
+
+### Interop
+Implemented in `dew.interop`: `save_params`, `load_params` and `save_hf_layout` move a Flax parameter tree to and from safetensors, naming each tensor by its '/'-joined path so other tools can read the file.
 
 ## Installation
 
-To install FlaxDiff, you need to have Python 3.11 or higher:
+To install Dew, you need to have Python 3.11 or higher:
 
 ```bash
-pip install flaxdiff
+pip install dew-ml
 ```
+
+The package installs as `dew-ml` and imports as `dew`; the bare `dew` name on PyPI is a pending claim.
 
 Optional extras pull in the heavier dependencies only when you need them:
 
-- `flaxdiff[av]`: video/audio sources and readers (OpenCV, decord, moviepy, PyAV)
-- `flaxdiff[metrics]`: FID (scipy) and Inception weight download
-- `flaxdiff[streaming]`: online URL-streaming loader (Hugging Face `datasets`)
-- `flaxdiff[tfds]`: TFDS-backed dataset sources
+- `dew-ml[av]`: video/audio sources and readers (OpenCV, decord, moviepy, PyAV)
+- `dew-ml[metrics]`: FID (scipy) and Inception weight download
+- `dew-ml[streaming]`: online URL-streaming loader (Hugging Face `datasets`)
+- `dew-ml[tfds]`: TFDS-backed dataset sources
+- `dew-ml[interop]`: safetensors conversion
 
 Or for development, clone the repo and install in editable mode with the test dependencies:
 
 ```bash
 pip install -e .[test]
-JAX_PLATFORMS=cpu pytest -m "not network" -q
 ```
-
-The test suite covers model forward passes for every architecture, scheduler and transform invariants, sampler convergence against an analytic denoiser, trainer smoke runs for images and videos, FSDP and data-parallel parity on a simulated 8-device mesh, sharded checkpoint round-trips with mid-epoch data resume, and the JEPA objectives. Tests marked `network` download pretrained weights and are excluded by default.
 
 ## Getting Started
 
 ### Training Example
 
-Here is a simplified example to get you started with training a diffusion model using FlaxDiff:
+Here is a simplified example to get you started with training a diffusion model using Dew:
 
 ```python
 from datetime import datetime
 import jax, optax
 
-from flaxdiff.data.dataloaders import get_dataset_grain
-from flaxdiff.inputs import DiffusionInputConfig, ConditionalInputConfig
-from flaxdiff.inputs.encoders import CLIPTextEncoder
-from flaxdiff.models.registry import build_model
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.samplers.euler import EulerAncestralSampler
+from dew.data.dataloaders import get_dataset_grain
+from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
+from dew.inputs.encoders import CLIPTextEncoder
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.registry import build_model
+from dew.sampling.euler import EulerAncestralSampler
+from dew.training import ObjectiveTrainer
 
 BATCH_SIZE, IMAGE_SIZE = 16, 128
 
@@ -185,7 +208,7 @@ model = build_model("simple_dit", dict(
     emb_features=512, num_layers=8, num_heads=8, patch_size=8,
 ))
 
-trainer = GeneralDiffusionTrainer(
+trainer = ObjectiveTrainer(
     model=model,
     optimizer=optax.adamw(2e-4),
     input_config=input_config,
@@ -206,14 +229,29 @@ trainer.fit(
 )
 ```
 
-The full-featured entry points are [`training.py`](./training.py) for diffusion and [`training_jepa.py`](./training_jepa.py) for I-JEPA/V-JEPA.
+### Recipes
+
+The recipes wrap that same trainer in a config tree: a run is a `dew.config.RunConfig`, and every field of it has a command line flag.
+
+```bash
+python recipes/diffusion/train.py --data.dataset oxford_flowers102 --data.image-size 128 \
+    --data.batch-size 32 --trainer.epochs 2000 --model.architecture simple_dit \
+    --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
+```
+
+```bash
+python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102 \
+    --model.config '{"patch_size": 16, "emb_features": 384}'
+```
+
+Architecture arguments go in one json object, straight to `build_model`, so anything the registry accepts works. `--help` on either recipe prints the whole config tree.
 
 ### Inference Example
 
 Here is a simplified example for generating images using a trained model:
 
 ```python
-from flaxdiff.inference.pipeline import DiffusionInferencePipeline
+from dew.sampling.pipelines import DiffusionInferencePipeline
 
 pipeline = DiffusionInferencePipeline.from_wandb_registry(
     modelname="diffusion-model", project="my-project",
@@ -223,6 +261,31 @@ images = pipeline.generate_samples(
     guidance_scale=3.0, conditioning_data=["a water lily", "a rose"],
 )
 ```
+
+## Testing
+
+The suite runs in two lanes.
+
+The mesh lane runs everything on CPU, and is what CI runs:
+
+```bash
+JAX_PLATFORMS=cpu pytest -m "not network" -q
+```
+
+`tests/conftest.py` asks XLA for 8 host devices, so the sharding tests exercise a real 4x2 data/fsdp mesh on any machine. It covers model forward passes for every architecture, scheduler and transform invariants, sampler convergence against an analytic denoiser, trainer smoke runs for images and videos, FSDP and data-parallel parity, sharded checkpoint round-trips with mid-epoch data resume, and the JEPA objectives.
+
+The kernel lane runs the model and training files on a real GPU, with no `JAX_PLATFORMS` override so a CUDA jax picks the device:
+
+```bash
+pytest tests/test_models.py tests/test_samplers.py tests/test_schedulers.py tests/test_predictors.py \
+    tests/test_flow_matching.py tests/test_metrics.py tests/test_autoencoder.py tests/test_trainer.py \
+    tests/test_objectives.py tests/test_instrumentation.py tests/test_remat.py tests/test_encoders.py \
+    tests/test_config.py -q -m "not network"
+```
+
+The multi-device suites stay on the CPU lane: those 8 devices are an XLA host-platform trick, and one GPU is one device.
+
+Tests marked `network` download pretrained weights and are excluded by default.
 
 ## References and Acknowledgements
 
@@ -256,10 +319,11 @@ images = pipeline.generate_samples(
 
 ## Pending things to do list
 
+- **Autoregressive LM and diffusion-LM objectives on the same trainer**
 - **Multi-host validation of the revamped trainer on an actual TPU pod**
 - **A proper precision policy (dtype/param_dtype are still threaded ad-hoc)**
 - **Full FID-50k evaluation (the current FID metric is per-validation-batch)**
-- **Autoregressive LM and diffusion-LM objectives on the same trainer**
+- **The `dew` name on PyPI, claimed under PEP 541 and still pending, which is why the package ships as `dew-ml`**
 
 ## Gallery
 
@@ -332,7 +396,7 @@ Images generated by the following prompts using classifier free guidance with gu
 
 ## Contribution
 
-Feel free to contribute by opening issues or submitting pull requests. Let's make FlaxDiff better together!
+Feel free to contribute by opening issues or submitting pull requests. Let's make Dew better together!
 
 ## License
 
