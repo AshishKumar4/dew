@@ -40,7 +40,7 @@ class DiffusionInferencePipeline(InferencePipeline):
     """Inference pipeline for diffusion models.
     
     This pipeline handles loading models from wandb and generating samples using the
-    DiffusionSampler from FlaxDiff.
+    DiffusionSampler.
     """
     artifact: Any = None
     state: TrainState = None

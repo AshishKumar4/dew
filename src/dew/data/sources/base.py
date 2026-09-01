@@ -6,7 +6,7 @@ from functools import partial
 
 
 class DataSource(ABC):
-    """Base class for all data sources in FlaxDiff."""
+    """Base class for all data sources in Dew."""
     
     @abstractmethod
     def get_source(self, path_override: str) -> Any:
@@ -49,7 +49,7 @@ class DataSource(ABC):
 
 
 class DataAugmenter(ABC):
-    """Base class for all data augmenters in FlaxDiff.
+    """Base class for all data augmenters in Dew.
 
     The contract is deliberately only `create_transform`: no grain pipeline in
     this repo applies a filter operation, so filtering lives solely on the one

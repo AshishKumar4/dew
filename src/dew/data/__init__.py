@@ -1,4 +1,4 @@
-"""Data layer for FlaxDiff: sources, augmenters and dataset loaders.
+"""Data layer for Dew: sources, augmenters and dataset loaders.
 
 Importing this package is deliberately cheap. The data layer's heavy
 dependencies (HF `datasets`, opencv, torch, decord/pyav, tensorflow_datasets)
