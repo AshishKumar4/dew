@@ -90,24 +90,25 @@ def load_data(config: DataConfig) -> dict:
     )
 
 
-def build_models(config: JepaRunConfig, is_video: bool):
-    """The encoder, the predictor that reads its embeddings, and their configs."""
+def build_encoder(config: JepaRunConfig):
+    """The encoder, and the config the registry built it from."""
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
     encoder_config = {**config.model.config, **suffix_flags}
     if encoder_config.get('use_hilbert') and encoder_config.get('use_zigzag'):
         raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
-    encoder = build_model(architecture, encoder_config)
+    return build_model(architecture, encoder_config), encoder_config
 
-    grid = (config.data.image_size // encoder.patch_size,) * 2
+
+def build_predictor(config: JepaRunConfig, encoder, grid, is_video: bool):
+    """The predictor that reads the encoder's embeddings, and its config."""
     predictor_config = {
-        **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
+        **{k: v for k, v in config.model.config.items() if k in SHARED_MODEL_KEYS},
         **config.predictor,
         "grid": grid,
         "factorized": is_video,
         "scan_order": encoder.scan_order,
     }
-    predictor = build_model('jepa_predictor', predictor_config)
-    return (encoder, encoder_config), (predictor, predictor_config), grid
+    return build_model('jepa_predictor', predictor_config), predictor_config
 
 
 def build_optimizer(config: OptimConfig, steps_per_epoch: int):
@@ -175,8 +176,9 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
         raise ValueError(
             "--frames-per-sample and --model.architecture jepa_video_encoder go together")
 
-    (encoder, encoder_config), (predictor, predictor_config), grid = build_models(
-        config, is_video)
+    encoder, encoder_config = build_encoder(config)
+    grid = (config.data.image_size // encoder.patch_size,) * 2
+    predictor, predictor_config = build_predictor(config, encoder, grid, is_video)
 
     mask = multi_block_mask(
         grid,
