@@ -2,13 +2,19 @@ import grain.python as pygrain
 from typing import Dict, Any, Optional, Union, List, Callable
 import numpy as np
 import jax
-import cv2  # Added missing import
+import cv2
 from dew.inputs.processors import AutoTextTokenizer
 from .registry import datasetMap, onlineDatasetMap, mediaDatasetMap
 import traceback
 # NOTE: .online_loader is imported lazily inside the two `*_online` factories.
 # It needs HF `datasets`, which the grain paths must not require.
 from functools import partial
+from absl import flags
+
+# grain's worker processes read absl flags; a script that never runs absl.app
+# would crash on any worker_count > 0 with UnparsedFlagAccessError.
+if not flags.FLAGS.is_parsed():
+    flags.FLAGS.mark_as_parsed()
 
 
 def generate_collate_fn(media_type="image"):
