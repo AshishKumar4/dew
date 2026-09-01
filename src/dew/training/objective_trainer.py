@@ -17,7 +17,8 @@ from dew.inputs import ConditioningEncoder, ConditionalInputConfig, DiffusionInp
 
 from .trainer import SimpleTrainer, SimpleTrainState, Metrics
 from .distributed import shard_batch
-from dew.objectives.base import Objective, DiffusionObjective
+from dew.objectives.base import Objective
+from dew.objectives.diffusion import DiffusionObjective
 
 from dew.nn.autoencoders.api import AutoEncoder
 from flax.training import dynamic_scale as dynamic_scale_lib
