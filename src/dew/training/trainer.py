@@ -12,10 +12,10 @@ import os
 import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
-from typing import Dict, Callable, Any, Tuple
+from typing import Dict, Callable, Any, Tuple, Optional
 from dew.random_state import RandomMarkovState
 from dew.telemetry.instrumentation import (
-    enable_compilation_cache, model_flops_utilization, step_flops,
+    compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
 from .distributed import (
     DEFAULT_MIN_SHARD_SIZE, DevicePrefetchIterator, batch_sharding, build_mesh,
@@ -73,6 +73,7 @@ class SimpleTrainer:
                  fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
                  compilation_cache_dir: str = None,
                  profile_steps: int = 0,
+                 profile_warmup_steps: int = 2,
                  log_every: int = 100,
                  max_bad_loss_steps: int = 5,
                  ):
@@ -97,10 +98,14 @@ class SimpleTrainer:
         self.input_shapes = input_shapes
         self.checkpoint_base_path = checkpoint_base_path
         self.profile_steps = profile_steps
+        self.profile_warmup_steps = profile_warmup_steps
         self.log_every = log_every
         self.max_bad_loss_steps = max_bad_loss_steps
-        # Measured from the compiled step the first time it runs.
+        # Measured off the compiled step, once per run.
         self.flops_per_step = None
+        # (jitted step, its executable). Compiled on the first step of a run
+        # and reused by every epoch after it.
+        self._compiled_train_step = (None, None)
         self.global_batch_size = 0
 
         load_directly_from_dir = False
@@ -371,6 +376,25 @@ class SimpleTrainer:
         except Exception as e:
             print("Error logging images to wandb", e)
 
+    def _compiled_step(self, train_step_fn: Callable, *args):
+        """The training step's executable, compiled at most once per run.
+
+        Calling a jitted function compiles it, and asking the compiler for its
+        cost analysis compiles it a second time: `lower(...).compile()` builds
+        an executable of its own that the jit cache knows nothing about. Running
+        the loop on that executable pays for one compilation and reads the FLOP
+        count off it. The lowering carries the jit's shardings and donation, so
+        the loop still donates its train state.
+        """
+        cached_fn, compiled = self._compiled_train_step
+        if compiled is not None and cached_fn is train_step_fn:
+            return compiled
+        compiled = train_step_fn.lower(*args).compile()
+        self._compiled_train_step = (train_step_fn, compiled)
+        if self.flops_per_step is None:
+            self.flops_per_step = compiled_flops(compiled)
+        return compiled
+
     def train_loop(
         self,
         train_state: SimpleTrainState,
@@ -401,13 +425,23 @@ class SimpleTrainer:
 
         last_log_time = time.time()
         steps_since_log = 0
+        compiled_step = None
+        # Compilation and the first steps say nothing about how the loop runs
+        # once it is warm, so the trace skips them.
+        profile_start = self.profile_warmup_steps if self.profile_steps else None
+        tracing = False
+        traced_steps = 0
 
         for i in range(train_steps_per_epoch):
             batch = next(train_ds)
-            if i == 0 and self.profile_steps:
+            if compiled_step is None:
+                compiled_step = self._compiled_step(
+                    train_step_fn, train_state, rng_state, batch)
+            if not tracing and i == profile_start:
                 jax.profiler.start_trace(self.profile_path())
+                tracing = True
 
-            train_state, loss, aux, rng_state, is_finite = train_step_fn(
+            train_state, loss, aux, rng_state, is_finite = compiled_step(
                 train_state, rng_state, batch)
             # No stale alias may outlive the step: its buffers were donated.
             self.state, self.rngstate = train_state, rng_state
@@ -418,18 +452,16 @@ class SimpleTrainer:
 
             if i == 0:
                 print(f"Training started for process index {process_index} at step {current_step}")
-                if self.flops_per_step is None:
-                    self.flops_per_step = step_flops(
-                        train_step_fn, train_state, rng_state, batch)
 
             epoch_loss += loss
             current_step += 1
             steps_since_log += 1
 
-            if self.profile_steps and i + 1 == self.profile_steps:
-                loss.block_until_ready()
-                jax.profiler.stop_trace()
-                print(f"Wrote profile for {self.profile_steps} steps to {self.profile_path()}")
+            if tracing:
+                traced_steps += 1
+                if traced_steps == self.profile_steps:
+                    tracing = False
+                    self._stop_trace(traced_steps, loss)
 
             if i % log_every == 0:
                 self._check_finite(worst_bad_run, current_step)
@@ -441,7 +473,7 @@ class SimpleTrainer:
                     now = time.time()
                     elapsed = now - last_log_time
                     pbar.set_postfix(loss=f'{loss:.4f}')
-                    pbar.update(log_every)
+                    pbar.update(steps_since_log)
                     if self.wandb is not None:
                         self.wandb.log({
                             "train/step": current_step,
@@ -450,19 +482,31 @@ class SimpleTrainer:
                             **self._throughput_metrics(elapsed, steps_since_log),
                         }, step=current_step)
                     last_log_time, steps_since_log = now, 0
-                # Save the model every few steps
-                if save_every and i % save_every == 0 and i > 0:
-                    print(f"Saving model after {save_every} step {current_step}")
-                    self.save(current_epoch, current_step, train_state, rng_state)
-                    print(f"Saving done by process index {process_index}")
-                    print(colored(f"Epoch done on index {process_index} => {current_epoch} Loss: {epoch_loss/train_steps_per_epoch}", 'green'))
+
+            # On its own clock, not the logging one: nested inside the log tick,
+            # a cadence that did not divide log_every never fired at all.
+            if save_every and current_step % save_every == 0:
+                self.save(current_epoch, current_step, train_state, rng_state)
+
+        if tracing:
+            # The window outlived the epoch, and a trace left running takes the
+            # next one down with it.
+            self._stop_trace(traced_steps, loss)
         self._check_finite(worst_bad_run, current_step)
         if pbar is not None:
+            # Whatever ran since the last tick is progress too.
+            pbar.update(steps_since_log)
             pbar.close()
         return epoch_loss, current_step, train_state, rng_state
 
     def profile_path(self):
         return os.path.join(self.checkpoint_path(), 'profile')
+
+    def _stop_trace(self, traced_steps: int, loss):
+        """Close the profiler window once its last step has actually landed."""
+        loss.block_until_ready()
+        jax.profiler.stop_trace()
+        print(f"Wrote profile for {traced_steps} steps to {self.profile_path()}")
 
     def _check_finite(self, worst_bad_run, current_step):
         """Fail a diverged run loudly rather than papering over it.
@@ -493,7 +537,8 @@ class SimpleTrainer:
         return metrics
 
 
-    def fit(self, data, train_steps_per_epoch, epochs, train_step_args={}, val_steps_per_epoch=5, validation_step_args={}):
+    def fit(self, data, train_steps_per_epoch, epochs, train_step_args={}, val_steps_per_epoch=5,
+            validation_step_args={}, checkpoint_every_steps: Optional[int] = None):
         local_batch_size = data.get('local_batch_size', 0)
         self.global_batch_size = data.get(
             'global_batch_size', local_batch_size * jax.process_count())
@@ -532,6 +577,7 @@ class SimpleTrainer:
                 train_steps_per_epoch,
                 self.latest_step,
                 rng_state,
+                save_every=checkpoint_every_steps,
             )
             print(colored(f"Epoch done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
             
