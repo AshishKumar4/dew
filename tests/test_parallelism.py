@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 from dew.inputs import DiffusionInputConfig
 from dew.eval.common import EvaluationMetric
 from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer
 from dew.objectives.base import EMASpec, Objective
 from dew.training.distributed import (

@@ -1,6 +1,6 @@
 from typing import Union
 import jax.numpy as jnp
-from dew.objectives.diffusion.schedules import (
+from dew.diffusion.schedules import (
     NoiseScheduler,
     GeneralizedNoiseScheduler,
     get_coeff_shapes_tuple,

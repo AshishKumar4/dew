@@ -20,7 +20,7 @@ import jax, optax
 from dew.data.dataloaders import get_dataset_grain
 from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
 from dew.inputs.encoders import CLIPTextEncoder
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model
 from dew.training import ObjectiveTrainer
 

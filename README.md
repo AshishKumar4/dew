@@ -86,7 +86,7 @@ Implemented in `dew.objectives`:
 - **JepaObjective** (`dew.objectives.jepa.JepaObjective`): I-JEPA and V-JEPA. Predicts the representation of masked target blocks from the visible context, with the target encoder as an EMA of the context encoder and collapse telemetry on every step.
 
 ### Schedulers
-Implemented in `dew.objectives.diffusion.schedules`:
+Implemented in `dew.diffusion.schedules`:
 - **LinearNoiseScheduler**: A beta-parameterized discrete scheduler.
 - **CosineNoiseScheduler**: A beta-parameterized discrete scheduler.
 - **ExpNoiseScheduler**: A beta-parameterized discrete scheduler.
@@ -98,7 +98,7 @@ Implemented in `dew.objectives.diffusion.schedules`:
 - **FlowMatchingScheduler**: A rectified-flow scheduler with logit-normal timestep sampling and resolution-dependent shifting, as used in Stable Diffusion 3.
 
 ### Model Predictors
-Implemented in `dew.objectives.diffusion.transforms`:
+Implemented in `dew.diffusion.transforms`:
 - **EpsilonPredictionTransform**: The model predicts the noise in the data.
 - **DirectPredictionTransform**: The model predicts the original data from the noisy data.
 - **VPredictionTransform**: The model predicts a linear combination of the data and noise.
@@ -186,7 +186,7 @@ import jax, optax
 from dew.data.dataloaders import get_dataset_grain
 from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
 from dew.inputs.encoders import CLIPTextEncoder
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model
 from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer

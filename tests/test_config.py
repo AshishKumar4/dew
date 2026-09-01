@@ -95,7 +95,7 @@ def test_parse_config_resolves_dotted_values():
 def test_training_and_inference_share_schedule_presets():
     """--noise_schedule must mean the same thing at train and inference time.
     Both sides now build from get_diffusion_preset."""
-    from dew.objectives.diffusion.transforms import get_diffusion_preset
+    from dew.diffusion.transforms import get_diffusion_preset
 
     train, sample, transform = get_diffusion_preset("edm")
     assert type(train).__name__ == "EDMNoiseScheduler"

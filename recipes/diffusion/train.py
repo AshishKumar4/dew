@@ -28,7 +28,7 @@ from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data.dataloaders import get_dataset_grain, get_dataset_online
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.processors import defaultTextEncodeModel
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model, canonicalize_architecture
 from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer
@@ -73,7 +73,7 @@ class DiffusionRunConfig(RunConfig):
     unset keeps the schedule's own weighting."""
     flow_shift: float = 1.0
     """Resolution shift for the flow matching schedule, see
-    dew.objectives.diffusion.schedules.flow.compute_resolution_shift."""
+    dew.diffusion.schedules.flow.compute_resolution_shift."""
     autoencoder: Optional[Literal['stable_diffusion']] = None
     autoencoder_opts: JsonDict = field(
         default_factory=lambda: {"modelname": "pcuenq/sd-vae-ft-mse-flax"})

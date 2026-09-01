@@ -14,7 +14,7 @@ import pytest
 
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.telemetry.instrumentation import (

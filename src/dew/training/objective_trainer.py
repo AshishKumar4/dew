@@ -8,8 +8,8 @@ from dataclasses import field, dataclass
 import jax.numpy as jnp
 import optax
 import functools
-from dew.objectives.diffusion.schedules import NoiseScheduler
-from dew.objectives.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
+from dew.diffusion.schedules import NoiseScheduler
+from dew.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
 
 from dew.checkpoints.utils import get_latest_checkpoint, serialize_model
 from dew.random_state import RandomMarkovState
