@@ -1,0 +1,15 @@
+site_name: dew
+site_description: A JAX/Flax framework for training diffusion, JEPA and other large models from scratch
+repo_url: https://github.com/AshishKumar4/Dew
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Concepts:
+      - The objectives seam: concepts/objectives.md
+      - Distributed training: concepts/distributed.md
+      - The data pipeline: concepts/data.md
+  - Recipes: recipes.md
+  - API: api.md
