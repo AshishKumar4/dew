@@ -37,7 +37,7 @@ dependencies = [
 license = "MIT"
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "safetensors"]
 # AV/video sources and readers (lazy imports in dew.data)
 av = ["opencv-python", "decord", "moviepy", "av", "pillow"]
 # FID (scipy sqrtm) and Inception weight download
@@ -46,6 +46,8 @@ metrics = ["scipy", "requests"]
 streaming = ["datasets"]
 # TFDS-backed dataset sources
 tfds = ["tensorflow-datasets", "tensorflow"]
+# Flax <-> safetensors conversion (dew.interop)
+interop = ["safetensors"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
