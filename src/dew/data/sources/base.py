@@ -58,14 +58,14 @@ class DataAugmenter(ABC):
     """
     
     @abstractmethod
-    def create_transform(self, **kwargs) -> Callable[[], pygrain.MapTransform]:
+    def create_transform(self, **kwargs) -> Callable[[], pygrain.Transformation]:
         """Create a transformation function for the data.
         
         Args:
             **kwargs: Additional arguments for the transformation.
             
         Returns:
-            A callable that returns a pygrain.MapTransform instance.
+            A callable that returns a pygrain.Transformation instance.
         """
         pass
     
@@ -124,13 +124,13 @@ class MediaDataset:
         """
         return self.source.get_source(path_override)
     
-    def get_augmenter(self, **kwargs) -> Callable[[], pygrain.MapTransform]:
+    def get_augmenter(self, **kwargs) -> Callable[[], pygrain.Transformation]:
         """Get the augmenter transformation.
         
         Args:
             **kwargs: Additional arguments for the augmenter.
             
         Returns:
-            A callable that returns a pygrain.MapTransform instance.
+            A callable that returns a pygrain.Transformation instance.
         """
         return self.augmenter.create_transform(**kwargs)
