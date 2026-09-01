@@ -200,7 +200,8 @@ class ObjectiveTrainer(SimpleTrainer):
 
         return self._build_state(init_fn)
 
-    def fit(self, data, training_steps_per_epoch, epochs, val_steps_per_epoch=8, **validation_step_args):
+    def fit(self, data, training_steps_per_epoch, epochs, val_steps_per_epoch=8,
+            checkpoint_every_steps: Optional[int] = None, **validation_step_args):
         local_batch_size = data['local_batch_size']
         return super().fit(
             data,
@@ -209,6 +210,7 @@ class ObjectiveTrainer(SimpleTrainer):
             train_step_args={"batch_size": local_batch_size},
             val_steps_per_epoch=val_steps_per_epoch,
             validation_step_args=validation_step_args,
+            checkpoint_every_steps=checkpoint_every_steps,
         )
 
     def _define_train_step(self, batch_size):
