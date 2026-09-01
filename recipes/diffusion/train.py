@@ -1,644 +1,363 @@
-import jax
-# jax.config.update("jax_enable_x64", True)
+"""Train a diffusion model over images or latents.
 
-from typing import Any, Tuple, Mapping, Callable, List, Dict
-from functools import partial
-import flax.training.dynamic_scale
-import jax.experimental.multihost_utils
-from dew.registry import build_model, canonicalize_architecture
-from dew.objectives.diffusion.transforms import get_diffusion_preset
-from dew.sampling.euler import EulerAncestralSampler
-import struct as st
-import flax
-import tqdm
-import jax.numpy as jnp
-import re
-import optax
-import time
-import os
-from datetime import datetime
+    python recipes/diffusion/train.py --data.dataset oxford_flowers102 \
+        --data.image-size 128 --data.batch-size 32 --trainer.epochs 2000 \
+        --model.architecture simple_dit \
+        --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
 
-import json
+Architecture kwargs go through --model.config as one JSON object, straight to
+the registry, so the wandb config is exactly what built the model.
+"""
+
 import hashlib
-# For CLIP
-import argparse
-from dataclasses import dataclass
+import json
+import os
+import re
 import resource
-
-from dew.data.dataloaders import get_dataset_grain, get_dataset_online
-
 import warnings
-import traceback
-from dew._utils_dissolve import DEFAULT_MIN_SHARD_SIZE, defaultTextEncodeModel
-from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Literal, Optional
+
+import jax
+import optax
+import tqdm
+import tyro
+
+from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
+from dew.data.dataloaders import get_dataset_grain, get_dataset_online
+from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
+from dew.inputs.processors import defaultTextEncodeModel
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.registry import build_model, canonicalize_architecture
+from dew.sampling.euler import EulerAncestralSampler
+from dew.training import ObjectiveTrainer
+from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
 
 warnings.filterwarnings("ignore")
-
-
-#####################################################################################################################
-################################################# Initialization ####################################################
-#####################################################################################################################
-
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
-PROCESS_COLOR_MAP = {
-    0: "green",
-    1: "yellow",
-    2: "magenta",
-    3: "cyan", 
-    4: "white",
-    5: "light_blue",
-    6: "light_red",
-    7: "light_cyan"
+OPTIMIZER_MAP = {
+    'adam': optax.adam,
+    'adamw': optax.adamw,
+    'lamb': optax.lamb,
 }
 
-#####################################################################################################################
-################################################## Data Pipeline ####################################################
-#####################################################################################################################
+ATTENTION = {
+    "heads": 8, "dtype": None, "use_projection": False,
+    "use_self_and_cross": True, "only_pure_attention": True,
+}
 
-    
+# The default unet: attention everywhere but the full-resolution stage, where
+# it costs the most. Every other architecture takes its own kwargs as JSON.
+DEFAULT_MODEL_CONFIG = {
+    "attention_configs": [None, ATTENTION, ATTENTION, ATTENTION],
+    "precision": "default",
+}
 
-#####################################################################################################################
-############################################### Training Pipeline ###################################################
-#####################################################################################################################
+DEFAULT_EXPERIMENT_NAME = ("dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/"
+                           "schd-{noise_schedule}/arch-{architecture}/lr-{learning_rate}")
 
-from dew.training.objective_trainer import GeneralDiffusionTrainer
+DEFAULT_BEST_TRACKER_METRIC = "val/clip_similarity"
 
-def boolean_string(s):
-    if type(s) == bool:
-        return s
-    return s == 'True'
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description='Train a diffusion model')
-parser.add_argument('--GRAIN_WORKER_COUNT', type=int,
-                    default=32, help='Number of grain workers')
-# parser.add_argument('--GRAIN_READ_THREAD_COUNT', type=int,
-#                     default=512, help='Number of grain read threads')
-# parser.add_argument('--GRAIN_READ_BUFFER_SIZE', type=int,
-#                     default=80, help='Grain read buffer size')
-# parser.add_argument('--GRAIN_WORKER_BUFFER_SIZE', type=int,
-#                     default=500, help='Grain worker buffer size')
-# parser.add_argument('--GRAIN_WORKER_COUNT', type=int,
-#                     default=32, help='Number of grain workers')
-parser.add_argument('--GRAIN_READ_THREAD_COUNT', type=int,
-                    default=140, help='Number of grain read threads')
-parser.add_argument('--GRAIN_READ_BUFFER_SIZE', type=int,
-                    default=96, help='Grain read buffer size')
-parser.add_argument('--GRAIN_WORKER_BUFFER_SIZE', type=int,
-                    default=100, help='Grain worker buffer size')
+@dataclass(frozen=True)
+class DiffusionRunConfig(RunConfig):
+    """A run, plus the diffusion objective's own knobs."""
 
-parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-parser.add_argument('--image_size', type=int, default=128, help='Image size')
-parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-parser.add_argument('--steps_per_epoch', type=int,
-                    default=None, help='Training Steps per epoch')
-parser.add_argument('--val_steps_per_epoch', type=int,
-                    default=4, help='Validation Steps per epoch')
-parser.add_argument('--dataset', type=str,
-                    default='laiona_coco', help='Dataset to use')
-parser.add_argument('--dataset_path', type=str,
-                    default='/home/mrwhite0racle/gcs_mount', help="Dataset location path")
+    model: ModelConfig = field(
+        default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
+    noise_schedule: Literal['cosine', 'karras', 'edm', 'flow', 'flow_matching'] = 'edm'
+    # min-SNR-gamma loss weighting (Hang et al. 2023); 5.0 is the paper value,
+    # unset keeps the schedule's own weighting
+    min_snr_gamma: Optional[float] = None
+    # Resolution shift for the flow matching schedule, see
+    # dew.objectives.diffusion.schedules.flow.compute_resolution_shift
+    flow_shift: float = 1.0
+    autoencoder: Optional[Literal['stable_diffusion']] = None
+    autoencoder_opts: JsonDict = field(
+        default_factory=lambda: {"modelname": "pcuenq/sd-vae-ft-mse-flax"})
+    val_metrics: list[Literal['clip', 'clip_score', 'fid']] = field(
+        default_factory=lambda: ['clip'])
+    # Pull 2000 batches through the pipeline before training, for benchmarking
+    dataset_test: bool = False
 
-parser.add_argument('--noise_schedule', type=str, default='edm',
-                    choices=['cosine', 'karras', 'edm', 'flow', 'flow_matching'], help='Noise schedule')
-parser.add_argument('--min_snr_gamma', type=float, default=None,
-                    help='min-SNR-gamma loss weighting (Hang et al. 2023). 5.0 is the paper default; unset keeps the schedule own weighting.')
-parser.add_argument('--flow_shift', type=float, default=1.0,
-                    help='Resolution shift for the flow matching schedule. See dew.objectives.diffusion.schedules.flow.compute_resolution_shift.')
 
-# Any name from dew.registry, optionally with +2d/+hilbert/+zigzag
-# suffixes; validated by build_model against the registry itself
-parser.add_argument('--architecture', type=str, default="unet", help='Architecture to use')
-parser.add_argument('--emb_features', type=int, default=256, help='Embedding features')
-parser.add_argument('--feature_depths', type=int, nargs='+', default=[64, 128, 256, 512], help='Feature depths')
-parser.add_argument('--attention_heads', type=int, default=8, help='Number of attention heads')
-parser.add_argument('--attention_impl', type=str, default=None,
-                    choices=[None, 'xla', 'cudnn', 'tpu'],
-                    help='Fused attention kernel: None (reference), cudnn (GPU flash), tpu (pallas flash)')
-parser.add_argument('--use_projection', type=boolean_string, default=False, help='Use projection')
-parser.add_argument('--use_self_and_cross', type=boolean_string, default=True, help='Use self and cross attention')
-parser.add_argument('--only_pure_attention', type=boolean_string, default=True, help='Use only pure attention or proper transformer in the attention blocks') 
-parser.add_argument('--norm_groups', type=int, default=8, help='Number of normalization groups. 0 for RMSNorm')
+def load_data(config: DataConfig) -> dict:
+    """Dataset iterators from the grain pipeline, or the online streamer."""
+    online = (config.loader == 'online'
+              or (config.loader == 'auto' and 'online' in config.dataset))
+    read_thread_count = config.read_thread_count
+    worker_buffer_size = config.worker_buffer_size
+    if online:
+        print("Using Online Dataset Generator")
+        generator = get_dataset_online
+        # Streaming reads are slower per shard, so more of them are in flight
+        read_thread_count *= 4
+        worker_buffer_size *= 5
+    else:
+        generator = get_dataset_grain
 
-parser.add_argument('--named_norms', type=boolean_string, default=False, help='Use named norms')
+    return generator(
+        config.dataset,
+        batch_size=config.batch_size, image_scale=config.image_size,
+        worker_count=config.worker_count, read_thread_count=read_thread_count,
+        read_buffer_size=config.read_buffer_size, worker_buffer_size=worker_buffer_size,
+        seed=config.dataset_seed,
+        dataset_source=config.dataset_path,
+    )
 
-parser.add_argument('--num_res_blocks', type=int, default=2, help='Number of residual blocks')
-parser.add_argument('--num_middle_res_blocks', type=int,  default=1, help='Number of middle residual blocks')
-parser.add_argument('--activation', type=str, default='swish', help='activation to use')
 
-parser.add_argument('--patch_size', type=int, default=16, help='Patch size for the transformer if using UViT')
-parser.add_argument('--num_layers', type=int, default=12, help='Number of layers in the transformer if using UViT')
-parser.add_argument('--num_heads', type=int, default=12, help='Number of heads in the transformer if using UViT')
-parser.add_argument('--mlp_ratio', type=int, default=4, help='MLP ratio in the transformer if using UViT')
-parser.add_argument('--use_hilbert', type=boolean_string, default=False, help='Use Hilbert patch reordering for the transformer')
-parser.add_argument('--use_zigzag', type=boolean_string, default=False, help='Use zigzag (ZigMa-style serpentine) patch reordering for the transformer. Mutually exclusive with --use_hilbert.')
-parser.add_argument('--use_2d_fusion', type=boolean_string, default=False, help='Spatial-Mamba style 2D state fusion inside hybrid_dit SSM blocks. Adds multi-dilation depthwise conv after the SSM scan.')
-parser.add_argument('--ssm_attention_ratio', type=str, default='3:1', help='SSM to attention ratio for hybrid_dit (e.g., "3:1", "1:1", "all-ssm", "all-attn")')
-parser.add_argument('--ssm_state_dim', type=int, default=64, help='State dimension for S5 SSM blocks')
+def load_autoencoder(config: DiffusionRunConfig):
+    """The VAE for latent diffusion, with the shape it hands the model."""
+    if config.autoencoder is None:
+        return None, 3, config.data.image_size
+    print("Using Stable Diffusion Autoencoder for Latent Diffusion Modeling")
+    from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+    autoencoder = StableDiffusionVAE(**config.autoencoder_opts)
+    return (autoencoder, autoencoder.latent_channels,
+            config.data.image_size // autoencoder.downscale_factor)
 
-parser.add_argument('--dtype', type=str, default=None, help='dtype to use')
-parser.add_argument('--precision', type=str, default='default', help='precision to use', choices=['high', 'default', 'highest', 'None', None])
 
-parser.add_argument('--distributed_training', type=boolean_string, default=True, help='Should use distributed training or not')
-parser.add_argument('--fsdp_size', type=int, default=1, help='Shard parameters over this many devices (FSDP). 1 replicates them (pure data parallelism)')
-parser.add_argument('--fsdp_min_param_size', type=int, default=DEFAULT_MIN_SHARD_SIZE, help='Only shard parameters with at least this many elements')
-parser.add_argument('--grad_accum_steps', type=int, default=1, help='Accumulate gradients over this many micro-batches before updating')
-parser.add_argument('--remat', type=boolean_string, default=False, help='Rematerialize transformer blocks to trade compute for activation memory')
-parser.add_argument('--profile_steps', type=int, default=0, help='Write a jax profiler trace covering this many steps of the first epoch')
-parser.add_argument('--compilation_cache_dir', type=str, default=None, help='Directory for the persistent XLA compilation cache')
-parser.add_argument('--log_every', type=int, default=100, help='Steps between throughput/loss logs')
-parser.add_argument('--experiment_name', type=str, default=None, help='Experiment name, would be generated if not provided')
-parser.add_argument('--load_from_checkpoint', type=str,
-                    default=None, help='Load from the best previously stored checkpoint. The checkpoint path should be provided')
-parser.add_argument('--resume_last_run', type=str,
-                    default=None, help='Resume the last run from the experiment name')
-parser.add_argument('--dataset_seed', type=int, default=0, help='Dataset starting seed')
+def model_kwargs(config: DiffusionRunConfig, channels: int, sample_size: int):
+    """Canonical architecture name and the kwargs the registry builds it from."""
+    architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
+    kwargs = {**config.model.config, **suffix_flags}
+    if kwargs.get('use_hilbert') and kwargs.get('use_zigzag'):
+        raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
+    if architecture == 'diffusers_unet_simple':
+        kwargs.update(sample_size=sample_size, in_channels=channels, out_channels=channels)
+    else:
+        kwargs['output_channels'] = channels
+    return architecture, kwargs
 
-parser.add_argument('--dataset_test', type=boolean_string,
-                    default=False, help='Run the dataset iterator for 3000 steps for testintg/benchmarking')
 
-parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Checkpoint directory')
-parser.add_argument('--checkpoint_fs', type=str, default='local', choices=['local', 'gcs'], help='Checkpoint filesystem')
+def build_optimizer(config: OptimConfig, steps_per_epoch: int):
+    """The solver, with its schedule, clipping and gradient accumulation."""
+    learning_rate = config.learning_rate
+    if config.learning_rate_schedule == 'cosine':
+        learning_rate = optax.warmup_cosine_decay_schedule(
+            init_value=learning_rate, peak_value=config.learning_rate_peak,
+            warmup_steps=config.learning_rate_warmup_steps,
+            decay_steps=steps_per_epoch * config.learning_rate_decay_epochs,
+            end_value=config.learning_rate_end,
+        )
+    opts = dict(config.optimizer_opts)
+    if config.weight_decay is not None:
+        opts['weight_decay'] = config.weight_decay
+    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 
-parser.add_argument('--optimizer', type=str, default='adamw',
-                    choices=['adam', 'adamw', 'lamb'], help='Optimizer to use')
-parser.add_argument('--optimizer_opts', type=str, default='{}', help='Optimizer options as a dictionary')
-parser.add_argument('--learning_rate_schedule', type=str, default=None, choices=[None, 'cosine'], help='Learning rate schedule')
-parser.add_argument('--learning_rate', type=float,
-                    default=2.7e-4, help='Initial Learning rate')
-parser.add_argument('--learning_rate_peak', type=float, default=3e-4, help='Learning rate peak')
-parser.add_argument('--learning_rate_end', type=float, default=2e-4, help='Learning rate end')
-parser.add_argument('--learning_rate_warmup_steps', type=int, default=10000, help='Learning rate warmup steps')
-parser.add_argument('--learning_rate_decay_epochs', type=int, default=1, help='Learning rate decay epochs')
+    if config.clip_grads > 0:
+        solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
+    if config.grad_accum_steps > 1:
+        # Accumulate over several micro-batches so the effective batch can
+        # exceed what fits in device memory at once.
+        solver = optax.MultiSteps(solver, every_k_schedule=config.grad_accum_steps)
+    return solver
 
-parser.add_argument('--autoencoder', type=str, default=None, help='Autoencoder model for Latend Diffusion technique',
-                    choices=[None, 'stable_diffusion'])
-parser.add_argument('--autoencoder_opts', type=str, 
-                    default='{"modelname":"pcuenq/sd-vae-ft-mse-flax"}', help='Autoencoder options as a dictionary')
 
-parser.add_argument('--use_dynamic_scale', type=boolean_string, default=False, help='Use dynamic scale for training')
-parser.add_argument('--clip_grads', type=float, default=0, help='Clip gradients to this value')
-parser.add_argument('--add_residualblock_output', type=boolean_string, default=False, help='Add a residual block stage to the final output')
-# parser.add_argument('--kernel_init', type=None, default=1.0, help='Kernel initialization value')
+def build_input_config(config: DiffusionRunConfig) -> DiffusionInputConfig:
+    """Images conditioned on pretokenized text, encoded by the default CLIP."""
+    return DiffusionInputConfig(
+        sample_data_key='image',
+        sample_data_shape=(config.data.image_size, config.data.image_size, 3),
+        conditions=[
+            ConditionalInputConfig(
+                encoder=defaultTextEncodeModel(),
+                conditioning_data_key='text',
+                pretokenized=True,
+                unconditional_input="",
+                model_key_override="textcontext",
+            )
+        ],
+    )
 
-parser.add_argument('--max_checkpoints_to_keep', type=int, default=1, help='Max checkpoints to keep')
 
-parser.add_argument('--wandb_project', type=str, default='mlops-msml605-project', help='Wandb project name')
-parser.add_argument('--wandb_entity', type=str, default='umd-projects', help='Wandb entity name')
+def build_eval_metrics(names: list[str]) -> list:
+    """Validation metrics, imported lazily since each pulls its own weights."""
+    metrics = []
+    if 'clip' in names:
+        from dew.eval.images import get_clip_metric
+        print("Using legacy CLIP distance metric (val/clip_similarity) for validation")
+        metrics.append(get_clip_metric())
+    if 'clip_score' in names:
+        from dew.eval.images import get_clip_score_metric
+        print("Using CLIPScore (val/clip_score, higher is better) for validation")
+        metrics.append(get_clip_score_metric())
+    if 'fid' in names:
+        from dew.eval.fid import get_fid_metric
+        print("Using per-batch FID (val/fid) for validation")
+        metrics.append(get_fid_metric())
+    return metrics
 
-parser.add_argument('--val_metrics', type=str, nargs='+', default=['clip'], help='Validation metrics to use')
-parser.add_argument('--best_tracker_metric', type=str, default='val/clip_similarity', help='Best tracker metric to use')
 
-# expose previously-hardcoded training knobs, defaults unchanged
-parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate for transformer blocks. DiT canon uses 0; EDM2 uses 0.1 for larger models.')
-parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay for weight averaging. DiT canon uses 0.9999.')
-parser.add_argument('--augmentation_mode', type=str, default='flip_jitter', choices=['none', 'flip_only', 'flip_jitter'],
-                    help='Image augmentation strategy applied before VAE. flip_only = DiT canon (horizontal flip only). flip_jitter = legacy default (flip + ColorJitter).')
+def run_summary(config: DiffusionRunConfig, model_config: dict, arguments_hash: str) -> dict:
+    """Flat view of the run, for the wandb config and the experiment name."""
+    return {
+        **model_config,
+        "architecture": config.model.architecture,
+        "dataset": config.data.dataset,
+        "image_size": config.data.image_size,
+        "batch_size": config.data.batch_size,
+        "noise_schedule": config.noise_schedule,
+        "learning_rate": config.optim.learning_rate,
+        "epochs": config.trainer.epochs,
+        "arguments_hash": arguments_hash,
+        "date": datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
+    }
 
-# parser.add_argument('--wandb_project', type=str, default='dew', help='Wandb project name')
-# parser.add_argument('--wandb_entity', type=str, default='ashishkumar4', help='Wandb entity name')
 
-def main(args):
-    # the image augmenters read this env var at MapTransform construction time
-    os.environ['FLAXDIFF_AUGMENT_MODE'] = args.augmentation_mode
+def experiment_name(config: DiffusionRunConfig, summary: dict, latent: bool) -> str:
+    """The configured name, or one built from the fields that shape the run."""
+    name = config.trainer.name or DEFAULT_EXPERIMENT_NAME
+    if not re.search(r"\{.+?\}", name):
+        return name
+
+    name = name + "/arguments_hash-{arguments_hash}/date-{date}"
+    if latent:
+        name = f"LDM-{name}"
+    if 'hybrid_dit' in config.model.architecture:
+        name = f"SSM-{name}"
+    if summary.get('use_hilbert'):
+        name = f"Hilbert-{name}"
+    return name.format(**summary)
+
+
+def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
+    # The image augmenters read this at MapTransform construction time
+    os.environ['FLAXDIFF_AUGMENT_MODE'] = config.data.augmentation_mode
+    if config.trainer.wandb_offline:
+        os.environ['WANDB_MODE'] = 'offline'
 
     resource.setrlimit(
         resource.RLIMIT_CORE,
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-
-    resource.setrlimit(
-        resource.RLIMIT_OFILE,
-        (65535, 65535))
+    resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
 
     print("Initializing JAX")
     try:
         jax.distributed.initialize()
     except Exception:
         pass
-
-    # jax.config.update('jax_threefry_partitionable', True)
     print(f"Number of devices: {jax.device_count()}")
     print(f"Local devices: {jax.local_devices()}")
 
-    OPTIMIZER_MAP = {
-        'adam' : optax.adam,
-        'adamw' : optax.adamw,
-        'lamb' : optax.lamb,
-    }
-    
-    CHECKPOINT_DIR = args.checkpoint_dir
-    if args.checkpoint_fs == 'gcs':
-        CHECKPOINT_DIR = f"gs://{CHECKPOINT_DIR}"
+    data = load_data(config.data)
 
-    # Model configs carry plain strings; build_model resolves them, so the
-    # logged wandb config is exactly the construction input
-    DTYPE = args.dtype
-    PRECISION = args.precision
-
-    GRAIN_WORKER_COUNT = args.GRAIN_WORKER_COUNT
-    GRAIN_READ_THREAD_COUNT = args.GRAIN_READ_THREAD_COUNT
-    GRAIN_READ_BUFFER_SIZE = args.GRAIN_READ_BUFFER_SIZE
-    GRAIN_WORKER_BUFFER_SIZE = args.GRAIN_WORKER_BUFFER_SIZE
-
-    BATCH_SIZE = args.batch_size
-    IMAGE_SIZE = args.image_size
-
-    dataset_name = args.dataset
-    
-    if 'online' in dataset_name:
-        print("Using Online Dataset Generator")
-        dataset_generator = get_dataset_online
-        GRAIN_WORKER_BUFFER_SIZE *= 5
-        GRAIN_READ_THREAD_COUNT *= 4
-    else:
-        dataset_generator = get_dataset_grain
-
-    data = dataset_generator(
-        args.dataset,
-        batch_size=BATCH_SIZE, image_scale=IMAGE_SIZE,
-        worker_count=GRAIN_WORKER_COUNT, read_thread_count=GRAIN_READ_THREAD_COUNT,
-        read_buffer_size=GRAIN_READ_BUFFER_SIZE, worker_buffer_size=GRAIN_WORKER_BUFFER_SIZE,
-        seed=args.dataset_seed,
-        dataset_source=args.dataset_path,
-    )
-
-    if args.dataset_test:
+    if config.dataset_test:
         dataset = iter(data['train']())
-
         for _ in tqdm.tqdm(range(2000)):
-            batch = next(dataset)
-            
+            next(dataset)
+
     datalen = data['train_len']
-    batches = datalen // BATCH_SIZE
-    # Define the configuration using the command-line arguments
-    attention_configs = [
-        None,
-    ]
+    batches = datalen // config.data.batch_size
+    steps_per_epoch = config.trainer.steps_per_epoch or batches
 
-    if args.attention_heads > 0:
-        attention_configs += [
-            {
-                "heads": args.attention_heads, "dtype": DTYPE,
-                "use_projection": args.use_projection, "use_self_and_cross": args.use_self_and_cross,
-                "only_pure_attention": args.only_pure_attention,    
-            },
-        ] * (len(args.feature_depths) - 2)
-        attention_configs += [
-            {
-                "heads": args.attention_heads, "dtype": DTYPE,
-                "use_projection": False, "use_self_and_cross": args.use_self_and_cross,
-                "only_pure_attention": args.only_pure_attention
-            },
-        ]
-    else:
-        print("Attention heads not provided, disabling attention")
-        attention_configs += [
-            None,
-        ] * (len(args.feature_depths) - 1)
+    autoencoder, channels, sample_size = load_autoencoder(config)
+    architecture, model_config = model_kwargs(config, channels, sample_size)
+    model = build_model(architecture, model_config)
 
-    INPUT_CHANNELS = 3
-    DIFFUSION_INPUT_SIZE = IMAGE_SIZE
-    autoencoder = None
-    if args.autoencoder is not None:
-        autoencoder_opts = json.loads(args.autoencoder_opts)
-        if args.autoencoder == 'stable_diffusion':
-            print("Using Stable Diffusion Autoencoder for Latent Diffusion Modeling")
-            from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-            autoencoder = StableDiffusionVAE(**autoencoder_opts)
-            INPUT_CHANNELS = 4
-            DIFFUSION_INPUT_SIZE = DIFFUSION_INPUT_SIZE // 8
-    
-    architecture_name, suffix_flags = canonicalize_architecture(args.architecture)
-    use_hilbert = args.use_hilbert or suffix_flags.get('use_hilbert', False)
-    use_zigzag = args.use_zigzag or suffix_flags.get('use_zigzag', False)
-    use_2d_fusion = args.use_2d_fusion or suffix_flags.get('use_2d_fusion', False)
-    assert not (use_hilbert and use_zigzag), "use_hilbert and use_zigzag are mutually exclusive"
-    
-    if 'diffusers' in architecture_name:
-        model_config = {}
-    else:
-        model_config = {
-            "emb_features": args.emb_features,
-            "dtype": DTYPE,
-            "precision": PRECISION,
-            "output_channels": INPUT_CHANNELS,
-            "attention_impl": args.attention_impl,
-            "remat": args.remat,
-        }
-    
-    
-    ARCHITECTURE_KWARGS = {
-        "unet": {
-            "kwargs": {
-                "feature_depths": args.feature_depths,
-                "attention_configs": attention_configs,
-                "num_res_blocks": args.num_res_blocks,
-                "num_middle_res_blocks": args.num_middle_res_blocks,
-                "named_norms": args.named_norms,
-                "activation": args.activation,
-                "norm_groups": args.norm_groups,
-            },
-        },
-        "unet_3d": {
-            "kwargs": {
-                "feature_depths": args.feature_depths,
-                "attention_configs": attention_configs,
-                "num_res_blocks": args.num_res_blocks,
-                "num_middle_res_blocks": args.num_middle_res_blocks,
-                "named_norms": args.named_norms,
-                "activation": args.activation,
-                "norm_groups": args.norm_groups,
-            },
-        },
-        "video_dit": {
-            "kwargs": {
-                "patch_size":  args.patch_size,
-                "num_layers":  args.num_layers,
-                "num_heads":  args.num_heads,
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-                "use_zigzag": use_zigzag,
-            },
-        },
-        "uvit": {
-            "kwargs": {
-                "patch_size":  args.patch_size,
-                "num_layers":  args.num_layers,
-                "num_heads":  args.num_heads,
-                "add_residualblock_output": args.add_residualblock_output,
-                "activation": args.activation,
-                "norm_groups": args.norm_groups,
-                "use_self_and_cross": args.use_self_and_cross,
-                "use_hilbert": use_hilbert,
-            },
-        },
-        "simple_udit": {
-            "kwargs": {
-                "patch_size":  args.patch_size,
-                "num_layers":  args.num_layers,
-                "num_heads":  args.num_heads,
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-            },
-        },
-        "simple_dit": {
-            "kwargs": {
-                "patch_size":  args.patch_size,
-                "num_layers":  args.num_layers,
-                "num_heads":  args.num_heads,
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-                "use_zigzag": use_zigzag,
-            },
-        },
-        "simple_mmdit": {
-            "kwargs": {
-                "patch_size":  args.patch_size,
-                "num_layers":  args.num_layers,
-                "num_heads":  args.num_heads,
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-            },
-        },
-        "hierarchical_mmdit": {
-            "kwargs": {
-                "base_patch_size": args.patch_size // 2,  # Use half the patch size for base
-                "emb_features": (args.emb_features - 256, args.emb_features, args.emb_features + 256),  # Default dims per stage
-                "num_layers": (args.num_layers // 3, args.num_layers // 2, args.num_layers),  # Default layers per stage
-                "num_heads": (args.num_heads - 2, args.num_heads, args.num_heads + 2),  # Default heads per stage
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-            },
-        },
-        "hybrid_dit": {
-            "kwargs": {
-                "patch_size": args.patch_size,
-                "num_layers": args.num_layers,
-                "num_heads": args.num_heads,
-                "dropout_rate": args.dropout_rate,
-                "mlp_ratio": args.mlp_ratio,
-                "use_hilbert": use_hilbert,
-                "use_zigzag": use_zigzag,
-                "use_2d_fusion": use_2d_fusion,
-                "ssm_state_dim": args.ssm_state_dim,
-                "ssm_attention_ratio": args.ssm_attention_ratio,
-            },
-        },
-        "diffusers_unet_simple": {
-            "kwargs": {
-                "sample_size": DIFFUSION_INPUT_SIZE,
-                "in_channels": INPUT_CHANNELS,
-                "out_channels": INPUT_CHANNELS,
-                "layers_per_block": args.num_res_blocks,
-                "block_out_channels":args.feature_depths,
-                "cross_attention_dim":args.emb_features,
-                "dtype": DTYPE,
-                "attention_head_dim": args.attention_heads,
-                "only_cross_attention": not args.use_self_and_cross,
-            },
-        }
-    }
-    
-    model_config.update(ARCHITECTURE_KWARGS[architecture_name]['kwargs'])
-    
-    if architecture_name == 'uvit':
-        model_config['emb_features'] = 768
-        
-    sorted_args_json = json.dumps(vars(args), sort_keys=True)
-    # hash() is randomized per process; identical args must map to the same experiment
-    arguments_hash = hashlib.sha256(sorted_args_json.encode()).hexdigest()[:16]
-    
-    text_encoder = defaultTextEncodeModel()
-    
-    input_config = DiffusionInputConfig(
-        sample_data_key='image',
-        sample_data_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
-        conditions=[
-            ConditionalInputConfig(
-                encoder=text_encoder,
-                conditioning_data_key='text',
-                pretokenized=True,
-                unconditional_input="",
-                model_key_override="textcontext",
-            )
-        ]
-    )
-    
-    eval_metrics = []
-    # Validation metrics
-    if args.val_metrics is not None:
-        if 'clip' in args.val_metrics:
-            from dew.eval.images import get_clip_metric
-            print("Using legacy CLIP distance metric (val/clip_similarity) for validation")
-            eval_metrics.append(get_clip_metric())
-        if 'clip_score' in args.val_metrics:
-            from dew.eval.images import get_clip_score_metric
-            print("Using CLIPScore (val/clip_score, higher is better) for validation")
-            eval_metrics.append(get_clip_score_metric())
-        if 'fid' in args.val_metrics:
-            from dew.eval.fid import get_fid_metric
-            print("Using per-batch FID (val/fid) for validation")
-            eval_metrics.append(get_fid_metric())
-    
-    CONFIG = {
-        "model": model_config,
-        "architecture": architecture_name,
-        "dataset": {
-            "name": dataset_name,
-            "length": datalen,
-            "batches": datalen // BATCH_SIZE,
-        },
-        "learning_rate": args.learning_rate,
-        "batch_size": BATCH_SIZE,
-        "epochs": args.epochs,
-        "input_shapes": input_config.get_input_shapes(
-            autoencoder=autoencoder,
-        ),
-        "input_config": input_config.serialize(),
-        "arguments": vars(args),
-        "autoencoder": args.autoencoder,
-        "autoencoder_opts": args.autoencoder_opts,
-        "arguments_hash": arguments_hash,
-    }
-    
-    batches = batches if args.steps_per_epoch is None else args.steps_per_epoch
-
+    input_config = build_input_config(config)
+    eval_metrics = build_eval_metrics(config.val_metrics)
     train_schedule, sampling_schedule, prediction_transform = get_diffusion_preset(
-        args.noise_schedule, shift=args.flow_shift, min_snr_gamma=args.min_snr_gamma,
+        config.noise_schedule, shift=config.flow_shift, min_snr_gamma=config.min_snr_gamma,
     )
-    
-    if args.experiment_name is not None:
-        experiment_name = args.experiment_name
-    else:
-        experiment_name = "manual-dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/schd-{noise_schedule}/dtype-{dtype}/arch-{architecture}/lr-{learning_rate}/resblks-{num_res_blocks}/emb-{emb_features}/pure-attn-{only_pure_attention}"
-    
-    # Check if format strings are required using regex
-    pattern = r"\{.+?\}"
-    if re.search(pattern, experiment_name):
-        experiment_name = f"{experiment_name}/" + "arguments_hash-{arguments_hash}/date-{date}"
-        if autoencoder is not None:
-            experiment_name = f"LDM-{experiment_name}"
 
-        if 'hybrid_dit' in args.architecture:
-            experiment_name = f"SSM-{experiment_name}"
+    run_config = config.to_dict()
+    # hash() is randomized per process; identical configs must map to the same
+    # experiment
+    arguments_hash = hashlib.sha256(
+        json.dumps(run_config, sort_keys=True).encode()).hexdigest()[:16]
+    summary = run_summary(config, model_config, arguments_hash)
+    name = experiment_name(config, summary, latent=autoencoder is not None)
+    print("Experiment_Name:", name)
 
-        if args.use_hilbert:
-            experiment_name = f"Hilbert-{experiment_name}"
-                
-        conf_args = CONFIG['arguments']
-        conf_args['date'] = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-        conf_args['arguments_hash'] = arguments_hash
-        # Format the string with the arguments
-        experiment_name = experiment_name.format(**vars(args))
-    else:
-        # If no format strings, just use the provided name
-        experiment_name = args.experiment_name
-        
-    print("Experiment_Name:", experiment_name)
+    checkpoint_dir = config.trainer.checkpoint_dir
+    if config.trainer.checkpoint_fs == 'gcs':
+        checkpoint_dir = f"gs://{checkpoint_dir}"
 
-    model = build_model(architecture_name, model_config)
-
-    learning_rate = CONFIG['learning_rate']
-    optimizer = OPTIMIZER_MAP[args.optimizer]
-    optimizer_opts = json.loads(args.optimizer_opts)
-    if args.learning_rate_schedule == 'cosine':
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate, peak_value=args.learning_rate_peak, warmup_steps=args.learning_rate_warmup_steps,
-            decay_steps=batches * args.learning_rate_decay_epochs, end_value=args.learning_rate_end,
-        )
-    solver = optimizer(learning_rate, **optimizer_opts)
-
-    if args.clip_grads > 0:
-        solver = optax.chain(
-            optax.clip_by_global_norm(args.clip_grads),
-            solver,
-        )
-
-    if args.grad_accum_steps > 1:
-        # Accumulate gradients over several micro-batches so the effective batch
-        # can exceed what fits in device memory at once.
-        solver = optax.MultiSteps(solver, every_k_schedule=args.grad_accum_steps)
-
-    wandb_config = {
-        "project": args.wandb_project,
-        "entity": args.wandb_entity,
-        "config": CONFIG,
-        "name": experiment_name,
+    wandb_config: dict[str, Any] = {
+        "project": config.trainer.wandb_project,
+        "entity": config.trainer.wandb_entity,
+        "name": name,
+        "config": {
+            "model": model_config,
+            "architecture": architecture,
+            "dataset": {
+                "name": config.data.dataset,
+                "length": datalen,
+                "batches": batches,
+            },
+            "learning_rate": config.optim.learning_rate,
+            "batch_size": config.data.batch_size,
+            "epochs": config.trainer.epochs,
+            "input_shapes": input_config.get_input_shapes(autoencoder=autoencoder),
+            "input_config": input_config.serialize(),
+            "arguments": summary,
+            "run_config": run_config,
+            "autoencoder": config.autoencoder,
+            "autoencoder_opts": json.dumps(config.autoencoder_opts),
+            "arguments_hash": arguments_hash,
+        },
     }
-    
-    if args.resume_last_run is not None:
-        wandb_config['id'] = args.resume_last_run
-    
-    start_time = time.time()
-    
-    trainer = GeneralDiffusionTrainer(
-        model, optimizer=solver,
+    if config.trainer.resume_last_run is not None:
+        wandb_config['id'] = config.trainer.resume_last_run
+
+    trainer = ObjectiveTrainer(
+        model,
+        optimizer=build_optimizer(config.optim, steps_per_epoch),
         input_config=input_config,
         noise_schedule=train_schedule,
         rngs=jax.random.PRNGKey(4),
-        name=experiment_name,
+        name=name,
         model_output_transform=prediction_transform,
-        load_from_checkpoint=args.load_from_checkpoint,
+        load_from_checkpoint=config.trainer.load_from_checkpoint,
+        checkpoint_step=config.trainer.checkpoint_step,
         wandb_config=wandb_config,
-        distributed_training=args.distributed_training,
-        checkpoint_base_path=CHECKPOINT_DIR,
+        distributed_training=config.trainer.distributed_training,
+        checkpoint_base_path=checkpoint_dir,
         autoencoder=autoencoder,
-        use_dynamic_scale=args.use_dynamic_scale,
-        native_resolution=IMAGE_SIZE,
-        max_checkpoints_to_keep=args.max_checkpoints_to_keep,
+        use_dynamic_scale=config.optim.use_dynamic_scale,
+        native_resolution=config.data.image_size,
+        max_checkpoints_to_keep=config.trainer.max_checkpoints_to_keep,
         eval_metrics=eval_metrics,
-        best_tracker_metric=args.best_tracker_metric,
-        ema_decay=args.ema_decay,
-        grad_accum_steps=args.grad_accum_steps,
-        fsdp_size=args.fsdp_size,
-        fsdp_min_param_size=args.fsdp_min_param_size,
-        compilation_cache_dir=args.compilation_cache_dir,
-        profile_steps=args.profile_steps,
-        log_every=args.log_every,
+        best_tracker_metric=config.trainer.best_tracker_metric or DEFAULT_BEST_TRACKER_METRIC,
+        ema_decay=config.trainer.ema_decay,
+        grad_accum_steps=config.optim.grad_accum_steps,
+        fsdp_size=config.trainer.fsdp_size,
+        fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
+        compilation_cache_dir=config.trainer.compilation_cache_dir,
+        profile_steps=config.trainer.profile_steps,
+        log_every=config.trainer.log_every,
     )
-    
+
     if trainer.distributed_training:
         print("Distributed Training enabled")
-    print(f"Training on {CONFIG['dataset']['name']} dataset with {batches} samples")
-     
+    print(f"Training on {config.data.dataset} dataset with {steps_per_epoch} steps per epoch")
+
     # Hardcoding these cuz don't have much time for project submission
-    if dataset_name == 'laiona_coco':
+    if config.data.dataset == 'laiona_coco':
         import pickle
-        val_set = pickle.load(open("/home/mrwhite0racle/gcs_mount/datasets/laion12m+mscoco_filtered-new/validation_set_small.pkl", "rb"))
+        val_set = pickle.load(open(
+            "/home/mrwhite0racle/gcs_mount/datasets/laion12m+mscoco_filtered-new/validation_set_small.pkl",
+            "rb"))
+
         def get_val_dataset():
             for i in range(0, len(val_set)):
                 yield val_set[i]
-        val, val_len = get_val_dataset, len(val_set)
-        data['val_len'] = val_len
-        data['val'] = val
 
-    final_state = trainer.fit(
+        data['val'], data['val_len'] = get_val_dataset, len(val_set)
+
+    trainer.fit(
         data,
-        training_steps_per_epoch=batches,
-        epochs=CONFIG['epochs'], 
-        sampler_class=EulerAncestralSampler, 
+        training_steps_per_epoch=steps_per_epoch,
+        epochs=config.trainer.epochs,
+        sampler_class=EulerAncestralSampler,
         sampling_noise_schedule=sampling_schedule,
-        val_steps_per_epoch=args.val_steps_per_epoch,
+        val_steps_per_epoch=config.data.val_steps_per_epoch,
     )
-    
+    return trainer
+
+
 if __name__ == '__main__':
-    args = parser.parse_args()
-    main(args)
-
-"""
-New -->
-
-python3 training/training.py --dataset=oxford_flowers102\
-            --checkpoint_dir='./checkpoints/' --checkpoint_fs='local'\
-            --epochs=2000 --batch_size=32 --image_size=128 \
-            --learning_rate=2e-4 --num_res_blocks=2 \
-            --use_self_and_cross=True --dtype=bfloat16 --precision=default --attention_heads=8\
-            --experiment_name='dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/schd-{noise_schedule}/dtype-{dtype}/arch-{architecture}/lr-{learning_rate}/resblks-{num_res_blocks}/emb-{emb_features}/pure-attn-{only_pure_attention}'\
-            --optimizer=adamw --use_dynamic_scale=True --norm_groups 0 --only_pure_attention=True --use_projection=False
-"""
+    main(tyro.cli(DiffusionRunConfig))

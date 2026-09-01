@@ -457,7 +457,9 @@ def test_registry_builds_the_jepa_models(architecture):
 
 
 def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
-    """Registry -> mask -> objective -> trainer -> probes, as the CLI wires them."""
+    """Registry -> mask -> objective -> trainer -> probes, as the recipe wires them."""
+    from dew.config import DataConfig, ModelConfig, TrainerConfig
+
     spec = importlib.util.spec_from_file_location(
         "jepa_train_recipe", Path(__file__).resolve().parents[1] / "recipes" / "jepa" / "train.py")
     training_jepa = importlib.util.module_from_spec(spec)
@@ -475,13 +477,18 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
         return {"train": batches, "val": batches, "train_len": 16, "local_batch_size": 4}
 
     monkeypatch.setattr(training_jepa, "get_dataset_grain", fake_dataset)
-    args = training_jepa.parser.parse_args([
-        '--image_size', str(RES), '--patch_size', str(PATCH), '--batch_size', '4',
-        '--emb_features', '32', '--num_layers', '1', '--num_heads', '2', '--mlp_ratio', '2',
-        '--predictor_features', '16', '--predictor_layers', '1', '--predictor_heads', '2',
-        '--epochs', '1', '--steps_per_epoch', '2', '--val_steps_per_epoch', '1',
-        '--probe_classes', str(classes), '--distributed_training', 'False',
-        '--ssm_attention_ratio', '3:1', '--ssm_state_dim', '8',
-        '--checkpoint_dir', str(tmp_path),
-    ])
-    training_jepa.main(args)
+    config = training_jepa.JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {
+            "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
+            "mlp_ratio": 2, "ssm_attention_ratio": "3:1", "ssm_state_dim": 8,
+        }),
+        data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
+        trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
+                              checkpoint_dir=str(tmp_path)),
+        predictor={"predictor_features": 16, "num_layers": 1, "num_heads": 2},
+        probe_classes=classes,
+    )
+    trainer = training_jepa.main(config)
+
+    assert trainer.objective.tag == 'jepa'
+    assert trainer.state.step == 2

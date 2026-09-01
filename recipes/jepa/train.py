@@ -1,114 +1,155 @@
 """Train a JEPA encoder (I-JEPA over images, V-JEPA over video).
 
-A sibling of training.py rather than a flag on it: the two share the data
-pipeline, the registry and the trainer, but nothing else. A JEPA run has no
-noise schedule, no sampler, no text conditioning and no VAE, and folding an
---objective switch into training.py would mean threading None through all of
+A sibling of the diffusion recipe rather than a flag on it: the two share the
+data pipeline, the registry and the trainer, but nothing else. A JEPA run has
+no noise schedule, no sampler, no text conditioning and no VAE, and folding an
+--objective switch into one recipe would mean threading None through all of
 them. The Objective seam is what makes the same trainer serve both.
+
+    python recipes/jepa/train.py --data.dataset oxford_flowers102 \
+        --data.image-size 128 --trainer.epochs 100 --probe-classes 102 \
+        --model.config '{"patch_size": 16, "emb_features": 384, "num_layers": 12}'
 """
 
-import argparse
-import json
 import os
 import resource
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, Optional
 
 import jax
 import optax
+import tyro
 
+from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data.dataloaders import get_dataset_grain, get_dataset_online
 from dew.inputs import DiffusionInputConfig
 from dew.objectives.jepa import (
     JepaObjective, multi_block_mask, get_linear_probe_metric, get_knn_probe_metric,
 )
 from dew.registry import build_model, canonicalize_architecture
-from dew.training import GeneralDiffusionTrainer
+from dew.training import ObjectiveTrainer
+from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 OPTIMIZER_MAP = {'adam': optax.adam, 'adamw': optax.adamw, 'lamb': optax.lamb}
 
+DEFAULT_ENCODER_CONFIG = {"precision": "default"}
 
-def boolean_string(s):
-    return s if isinstance(s, bool) else s == 'True'
-
-
-parser = argparse.ArgumentParser(description='Train a JEPA encoder')
-parser.add_argument('--GRAIN_WORKER_COUNT', type=int, default=32)
-parser.add_argument('--GRAIN_READ_THREAD_COUNT', type=int, default=140)
-parser.add_argument('--GRAIN_READ_BUFFER_SIZE', type=int, default=96)
-parser.add_argument('--GRAIN_WORKER_BUFFER_SIZE', type=int, default=100)
-
-parser.add_argument('--dataset', type=str, default='oxford_flowers102')
-parser.add_argument('--dataset_path', type=str, default='/home/mrwhite0racle/gcs_mount')
-parser.add_argument('--dataset_seed', type=int, default=0)
-parser.add_argument('--batch_size', type=int, default=64)
-parser.add_argument('--image_size', type=int, default=128)
-parser.add_argument('--frames_per_sample', type=int, default=None,
-                    help='Set for video (V-JEPA); leave unset for images (I-JEPA)')
-parser.add_argument('--epochs', type=int, default=100)
-parser.add_argument('--steps_per_epoch', type=int, default=None)
-parser.add_argument('--val_steps_per_epoch', type=int, default=4)
-
-parser.add_argument('--architecture', type=str, default='jepa_encoder',
-                    choices=['jepa_encoder', 'jepa_video_encoder'])
-parser.add_argument('--patch_size', type=int, default=16)
-parser.add_argument('--emb_features', type=int, default=384)
-parser.add_argument('--num_layers', type=int, default=12)
-parser.add_argument('--num_heads', type=int, default=6)
-parser.add_argument('--mlp_ratio', type=int, default=4)
-parser.add_argument('--ssm_attention_ratio', type=str, default='all-attn',
-                    help='Mixer pattern per layer: "all-attn", "all-ssm", "3:1", ...')
-parser.add_argument('--ssm_state_dim', type=int, default=64)
-parser.add_argument('--use_hilbert', type=boolean_string, default=False)
-parser.add_argument('--use_zigzag', type=boolean_string, default=False)
-parser.add_argument('--dropout_rate', type=float, default=0.0)
-parser.add_argument('--attention_impl', type=str, default=None,
-                    choices=[None, 'xla', 'cudnn', 'tpu'])
-parser.add_argument('--dtype', type=str, default=None)
-parser.add_argument('--precision', type=str, default='default',
-                    choices=['high', 'default', 'highest', 'None', None])
-
-parser.add_argument('--predictor_features', type=int, default=192)
-parser.add_argument('--predictor_layers', type=int, default=6)
-parser.add_argument('--predictor_heads', type=int, default=6)
-
-parser.add_argument('--num_target_blocks', type=int, default=4)
-parser.add_argument('--target_scale', type=float, nargs=2, default=[0.15, 0.2])
-parser.add_argument('--target_aspect', type=float, nargs=2, default=[0.75, 1.5])
-parser.add_argument('--momentum', type=float, nargs=2, default=[0.996, 1.0],
-                    help='Target-encoder EMA momentum, ramped over --momentum_steps')
-parser.add_argument('--momentum_steps', type=int, default=None,
-                    help='Defaults to the full training run')
-
-parser.add_argument('--optimizer', type=str, default='adamw', choices=list(OPTIMIZER_MAP))
-parser.add_argument('--optimizer_opts', type=str, default='{}')
-parser.add_argument('--learning_rate', type=float, default=1e-3)
-parser.add_argument('--learning_rate_schedule', type=str, default=None, choices=[None, 'cosine'])
-parser.add_argument('--learning_rate_peak', type=float, default=1.5e-3)
-parser.add_argument('--learning_rate_end', type=float, default=1e-6)
-parser.add_argument('--learning_rate_warmup_steps', type=int, default=10000)
-parser.add_argument('--learning_rate_decay_epochs', type=int, default=1)
-parser.add_argument('--clip_grads', type=float, default=0)
-
-parser.add_argument('--probe_classes', type=int, default=None,
-                    help='Number of classes for the frozen-encoder probes')
-parser.add_argument('--probe_label_key', type=str, default='label')
-parser.add_argument('--knn_k', type=int, default=20)
-
-parser.add_argument('--distributed_training', type=boolean_string, default=True)
-parser.add_argument('--experiment_name', type=str, default=None)
-parser.add_argument('--load_from_checkpoint', type=str, default=None)
-parser.add_argument('--resume_last_run', type=str, default=None)
-parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
-parser.add_argument('--checkpoint_fs', type=str, default='local', choices=['local', 'gcs'])
-parser.add_argument('--max_checkpoints_to_keep', type=int, default=1)
-parser.add_argument('--wandb_project', type=str, default='mlops-msml605-project')
-parser.add_argument('--wandb_entity', type=str, default='umd-projects')
+# What the predictor takes from the encoder unless --predictor overrides it.
+# Its depth and width are its own: a predictor as wide as the encoder makes the
+# objective too easy.
+SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
+                     "ssm_state_dim", "dropout_rate", "attention_impl", "dtype", "precision")
 
 
-def main(args):
+@dataclass(frozen=True)
+class JepaRunConfig(RunConfig):
+    """A run, plus the JEPA objective's own knobs."""
+
+    model: ModelConfig = field(
+        default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
+    data: DataConfig = field(
+        default_factory=lambda: DataConfig(dataset="oxford_flowers102", batch_size=64))
+    optim: OptimConfig = field(
+        default_factory=lambda: OptimConfig(
+            learning_rate=1e-3, learning_rate_peak=1.5e-3, learning_rate_end=1e-6))
+    # Predictor kwargs, over the encoder's shared ones
+    predictor: JsonDict = field(default_factory=dict)
+    # Set for video (V-JEPA), leave unset for images (I-JEPA)
+    frames_per_sample: Optional[int] = None
+    num_target_blocks: int = 4
+    target_scale: list[float] = field(default_factory=lambda: [0.15, 0.2])
+    target_aspect: list[float] = field(default_factory=lambda: [0.75, 1.5])
+    # Target-encoder EMA momentum, ramped over momentum_steps
+    momentum: list[float] = field(default_factory=lambda: [0.996, 1.0])
+    # Defaults to the full training run
+    momentum_steps: Optional[int] = None
+    # Number of classes for the frozen-encoder probes
+    probe_classes: Optional[int] = None
+    probe_label_key: str = 'label'
+    knn_k: int = 20
+
+
+def load_data(config: DataConfig) -> dict:
+    """Dataset iterators from the grain pipeline, or the online streamer."""
+    online = (config.loader == 'online'
+              or (config.loader == 'auto' and 'online' in config.dataset))
+    generator = get_dataset_online if online else get_dataset_grain
+    return generator(
+        config.dataset,
+        batch_size=config.batch_size, image_scale=config.image_size,
+        worker_count=config.worker_count,
+        read_thread_count=config.read_thread_count,
+        read_buffer_size=config.read_buffer_size,
+        worker_buffer_size=config.worker_buffer_size,
+        seed=config.dataset_seed,
+        dataset_source=config.dataset_path,
+    )
+
+
+def build_models(config: JepaRunConfig, is_video: bool):
+    """The encoder, the predictor that reads its embeddings, and their configs."""
+    architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
+    encoder_config = {**config.model.config, **suffix_flags}
+    if encoder_config.get('use_hilbert') and encoder_config.get('use_zigzag'):
+        raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
+    encoder = build_model(architecture, encoder_config)
+
+    grid = (config.data.image_size // encoder.patch_size,) * 2
+    predictor_config = {
+        **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
+        **config.predictor,
+        "grid": grid,
+        "factorized": is_video,
+        "scan_order": encoder.scan_order,
+    }
+    predictor = build_model('jepa_predictor', predictor_config)
+    return (encoder, encoder_config), (predictor, predictor_config), grid
+
+
+def build_optimizer(config: OptimConfig, steps_per_epoch: int):
+    """The solver, with its schedule, clipping and gradient accumulation."""
+    learning_rate = config.learning_rate
+    if config.learning_rate_schedule == 'cosine':
+        learning_rate = optax.warmup_cosine_decay_schedule(
+            init_value=learning_rate, peak_value=config.learning_rate_peak,
+            warmup_steps=config.learning_rate_warmup_steps,
+            decay_steps=steps_per_epoch * config.learning_rate_decay_epochs,
+            end_value=config.learning_rate_end,
+        )
+    opts = dict(config.optimizer_opts)
+    if config.weight_decay is not None:
+        opts['weight_decay'] = config.weight_decay
+    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
+
+    if config.clip_grads > 0:
+        solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
+    if config.grad_accum_steps > 1:
+        solver = optax.MultiSteps(solver, every_k_schedule=config.grad_accum_steps)
+    return solver
+
+
+def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
+    """Flat view of the run, for the wandb config."""
+    return {
+        **encoder_config,
+        "architecture": config.model.architecture,
+        "dataset": config.data.dataset,
+        "image_size": config.data.image_size,
+        "batch_size": config.data.batch_size,
+        "learning_rate": config.optim.learning_rate,
+        "epochs": config.trainer.epochs,
+    }
+
+
+def main(config: JepaRunConfig) -> ObjectiveTrainer:
+    os.environ['FLAXDIFF_AUGMENT_MODE'] = config.data.augmentation_mode
+    if config.trainer.wandb_offline:
+        os.environ['WANDB_MODE'] = 'offline'
+
     resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
 
@@ -119,72 +160,37 @@ def main(args):
         pass
     print(f"Number of devices: {jax.device_count()}")
 
-    checkpoint_dir = (f"gs://{args.checkpoint_dir}" if args.checkpoint_fs == 'gcs'
-                      else args.checkpoint_dir)
+    checkpoint_dir = config.trainer.checkpoint_dir
+    if config.trainer.checkpoint_fs == 'gcs':
+        checkpoint_dir = f"gs://{checkpoint_dir}"
 
-    dataset_generator = (get_dataset_online if 'online' in args.dataset
-                         else get_dataset_grain)
-    data = dataset_generator(
-        args.dataset,
-        batch_size=args.batch_size, image_scale=args.image_size,
-        worker_count=args.GRAIN_WORKER_COUNT,
-        read_thread_count=args.GRAIN_READ_THREAD_COUNT,
-        read_buffer_size=args.GRAIN_READ_BUFFER_SIZE,
-        worker_buffer_size=args.GRAIN_WORKER_BUFFER_SIZE,
-        seed=args.dataset_seed,
-        dataset_source=args.dataset_path,
-    )
-    steps_per_epoch = args.steps_per_epoch or data['train_len'] // args.batch_size
-    total_steps = steps_per_epoch * args.epochs
+    data = load_data(config.data)
+    steps_per_epoch = (config.trainer.steps_per_epoch
+                       or data['train_len'] // config.data.batch_size)
+    total_steps = steps_per_epoch * config.trainer.epochs
 
-    architecture, suffix_flags = canonicalize_architecture(args.architecture)
-    is_video = args.frames_per_sample is not None
+    is_video = config.frames_per_sample is not None
+    architecture, _ = canonicalize_architecture(config.model.architecture)
     if is_video != (architecture == 'jepa_video_encoder'):
         raise ValueError(
-            "--frames_per_sample and --architecture=jepa_video_encoder go together")
+            "--frames-per-sample and --model.architecture jepa_video_encoder go together")
 
-    grid = (args.image_size // args.patch_size,) * 2
+    (encoder, encoder_config), (predictor, predictor_config), grid = build_models(
+        config, is_video)
+
     mask = multi_block_mask(
         grid,
-        num_targets=args.num_target_blocks,
-        scale=tuple(args.target_scale),
-        aspect=tuple(args.target_aspect),
+        num_targets=config.num_target_blocks,
+        scale=tuple(config.target_scale),
+        aspect=tuple(config.target_aspect),
     )
     print(f"Mask geometry: {mask.block_area} tokens per target block "
           f"({mask.block_shapes}), {mask.num_context} context tokens of {mask.num_patches}")
 
-    shared = {
-        "emb_features": args.emb_features,
-        "num_heads": args.num_heads,
-        "mlp_ratio": args.mlp_ratio,
-        "ssm_attention_ratio": args.ssm_attention_ratio,
-        "ssm_state_dim": args.ssm_state_dim,
-        "dropout_rate": args.dropout_rate,
-        "attention_impl": args.attention_impl,
-        "dtype": args.dtype,
-        "precision": args.precision,
-    }
-    encoder_config = {
-        **shared,
-        "patch_size": args.patch_size,
-        "num_layers": args.num_layers,
-        "use_hilbert": args.use_hilbert or suffix_flags.get('use_hilbert', False),
-        "use_zigzag": args.use_zigzag or suffix_flags.get('use_zigzag', False),
-    }
-    predictor_config = {
-        **shared,
-        "grid": grid,
-        "predictor_features": args.predictor_features,
-        "num_layers": args.predictor_layers,
-        "num_heads": args.predictor_heads,
-        "factorized": is_video,
-    }
-    encoder = build_model(architecture, encoder_config)
-    predictor_config["scan_order"] = encoder.scan_order
-    predictor = build_model('jepa_predictor', predictor_config)
-
-    sample_data_shape = ((args.frames_per_sample, args.image_size, args.image_size, 3)
-                         if is_video else (args.image_size, args.image_size, 3))
+    sample_data_shape = ((config.frames_per_sample, config.data.image_size,
+                          config.data.image_size, 3)
+                         if is_video else
+                         (config.data.image_size, config.data.image_size, 3))
     input_config = DiffusionInputConfig(
         sample_data_key='video' if is_video else 'image',
         sample_data_shape=sample_data_shape,
@@ -196,73 +202,75 @@ def main(args):
         mask=mask,
         sample_data_key=input_config.sample_data_key,
         sample_data_shape=sample_data_shape,
-        momentum=tuple(args.momentum),
-        momentum_steps=args.momentum_steps or total_steps,
+        momentum=tuple(config.momentum),
+        momentum_steps=config.momentum_steps or total_steps,
     )
 
     eval_metrics = []
-    if args.probe_classes:
+    if config.probe_classes:
         eval_metrics = [
-            get_linear_probe_metric(args.probe_classes, label_key=args.probe_label_key),
-            get_knn_probe_metric(args.probe_classes, label_key=args.probe_label_key,
-                                 k=args.knn_k),
+            get_linear_probe_metric(config.probe_classes, label_key=config.probe_label_key),
+            get_knn_probe_metric(config.probe_classes, label_key=config.probe_label_key,
+                                 k=config.knn_k),
         ]
 
-    learning_rate = args.learning_rate
-    if args.learning_rate_schedule == 'cosine':
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate, peak_value=args.learning_rate_peak,
-            warmup_steps=args.learning_rate_warmup_steps,
-            decay_steps=steps_per_epoch * args.learning_rate_decay_epochs,
-            end_value=args.learning_rate_end)
-    solver = OPTIMIZER_MAP[args.optimizer](learning_rate, **json.loads(args.optimizer_opts))
-    if args.clip_grads > 0:
-        solver = optax.chain(optax.clip_by_global_norm(args.clip_grads), solver)
+    name = config.trainer.name or (
+        f"jepa-{config.data.dataset}/res-{config.data.image_size}/patch-{encoder.patch_size}/"
+        f"mixer-{encoder.ssm_attention_ratio}/emb-{encoder.emb_features}/"
+        f"lr-{config.optim.learning_rate}/date-{datetime.now().strftime('%Y-%m-%d_%H:%M:%S')}")
+    print("Experiment_Name:", name)
 
-    experiment_name = args.experiment_name or (
-        f"jepa-{args.dataset}/res-{args.image_size}/patch-{args.patch_size}/"
-        f"mixer-{args.ssm_attention_ratio}/emb-{args.emb_features}/"
-        f"lr-{args.learning_rate}/date-{datetime.now().strftime('%Y-%m-%d_%H:%M:%S')}")
-    print("Experiment_Name:", experiment_name)
-
-    wandb_config = {
-        "project": args.wandb_project,
-        "entity": args.wandb_entity,
-        "name": experiment_name,
+    wandb_config: dict[str, Any] = {
+        "project": config.trainer.wandb_project,
+        "entity": config.trainer.wandb_entity,
+        "name": name,
         "config": {
             "encoder": encoder_config,
             "predictor": predictor_config,
             "architecture": architecture,
             "mask": {"grid": grid, "block_shapes": mask.block_shapes,
                      "block_area": mask.block_area, "num_context": mask.num_context},
-            "dataset": {"name": args.dataset, "length": data['train_len']},
-            "arguments": vars(args),
+            "dataset": {"name": config.data.dataset, "length": data['train_len']},
+            "arguments": run_summary(config, encoder_config),
+            "run_config": config.to_dict(),
         },
     }
-    if args.resume_last_run is not None:
-        wandb_config['id'] = args.resume_last_run
+    if config.trainer.resume_last_run is not None:
+        wandb_config['id'] = config.trainer.resume_last_run
 
-    trainer = GeneralDiffusionTrainer(
+    trainer = ObjectiveTrainer(
         model=encoder,
-        optimizer=solver,
+        optimizer=build_optimizer(config.optim, steps_per_epoch),
         input_config=input_config,
         rngs=jax.random.PRNGKey(4),
         objective=objective,
-        name=experiment_name,
+        name=name,
         wandb_config=wandb_config,
-        distributed_training=args.distributed_training,
+        distributed_training=config.trainer.distributed_training,
         checkpoint_base_path=checkpoint_dir,
-        load_from_checkpoint=args.load_from_checkpoint,
-        max_checkpoints_to_keep=args.max_checkpoints_to_keep,
+        checkpoint_step=config.trainer.checkpoint_step,
+        load_from_checkpoint=config.trainer.load_from_checkpoint,
+        max_checkpoints_to_keep=config.trainer.max_checkpoints_to_keep,
         eval_metrics=eval_metrics,
-        best_tracker_metric="val/knn_probe_accuracy" if eval_metrics else "train/best_loss",
+        best_tracker_metric=(
+            config.trainer.best_tracker_metric
+            or ("val/knn_probe_accuracy" if eval_metrics else "train/best_loss")),
+        grad_accum_steps=config.optim.grad_accum_steps,
+        use_dynamic_scale=config.optim.use_dynamic_scale,
+        fsdp_size=config.trainer.fsdp_size,
+        fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
+        compilation_cache_dir=config.trainer.compilation_cache_dir,
+        profile_steps=config.trainer.profile_steps,
+        log_every=config.trainer.log_every,
     )
 
     start = time.time()
-    trainer.fit(data, training_steps_per_epoch=steps_per_epoch, epochs=args.epochs,
-                val_steps_per_epoch=args.val_steps_per_epoch)
+    trainer.fit(data, training_steps_per_epoch=steps_per_epoch,
+                epochs=config.trainer.epochs,
+                val_steps_per_epoch=config.data.val_steps_per_epoch)
     print(f"Training finished in {time.time() - start:.0f}s")
+    return trainer
 
 
 if __name__ == '__main__':
-    main(parser.parse_args())
+    main(tyro.cli(JepaRunConfig))
