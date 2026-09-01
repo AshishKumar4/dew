@@ -16,15 +16,15 @@ from flax import linen as nn
 
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
-from dew.objectives.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
+from dew.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
 from dew.sampling.ddim import DDIMSampler
 from dew.sampling.ddpm import DDPMSampler, SimpleDDPMSampler
 from dew.sampling.euler import EulerSampler, EulerAncestralSampler
 from dew.sampling.heun_sampler import HeunSampler
 from dew.sampling.multistep_dpm import MultiStepDPM
 from dew.sampling.rk4_sampler import RK4Sampler
-from dew.objectives.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
-from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
+from dew.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
+from dew.diffusion.schedules.common import get_coeff_shapes_tuple
 from dew.random_state import RandomMarkovState
 
 DATA_STD = 0.3

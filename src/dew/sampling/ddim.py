@@ -2,7 +2,7 @@ import jax.numpy as jnp
 from .common import DiffusionSampler
 from dew.random_state import MarkovState, RandomMarkovState
 import jax
-from dew.objectives.diffusion.schedules import get_coeff_shapes_tuple
+from dew.diffusion.schedules import get_coeff_shapes_tuple
 
 class DDIMSampler(DiffusionSampler):
     def __init__(self, *args, eta=0.0, **kwargs):

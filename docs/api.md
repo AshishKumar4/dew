@@ -18,9 +18,15 @@ The public modules, and what each one is for.
 | --- | --- |
 | `dew.objectives` | `Objective`, `EMASpec` |
 | `dew.objectives.diffusion` | `DiffusionObjective` |
-| `dew.objectives.diffusion.schedules` | `LinearNoiseScheduler`, `CosineNoiseScheduler`, `ExpNoiseScheduler`, `CosineContinuousNoiseScheduler`, `CosineGeneralNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler` |
-| `dew.objectives.diffusion.transforms` | `EpsilonPredictionTransform`, `DirectPredictionTransform`, `VPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `get_diffusion_preset` |
 | `dew.objectives.jepa` | `JepaObjective`, `MultiBlockMask`, `representation_health`, `get_linear_probe_metric`, `get_knn_probe_metric` |
+
+## Diffusion
+
+| Module | Contents |
+| --- | --- |
+| `dew.diffusion` | the schedules and prediction transforms below, re-exported |
+| `dew.diffusion.schedules` | `LinearNoiseScheduler`, `CosineNoiseScheduler`, `ExpNoiseScheduler`, `CosineContinuousNoiseScheduler`, `CosineGeneralNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler` |
+| `dew.diffusion.transforms` | `EpsilonPredictionTransform`, `DirectPredictionTransform`, `VPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `get_diffusion_preset` |
 
 ## Models
 

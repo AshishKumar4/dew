@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from .common import DiffusionSampler
-from dew.objectives.diffusion.schedules import get_coeff_shapes_tuple
+from dew.diffusion.schedules import get_coeff_shapes_tuple
 from dew.random_state import RandomMarkovState
 
 class MultiStepDPM(DiffusionSampler):
