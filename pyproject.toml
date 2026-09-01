@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dew-ml"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A JAX/Flax framework for training diffusion, JEPA and other large models from scratch"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -56,6 +56,9 @@ pythonpath = ["src", "."]
 markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "dew.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
