@@ -18,7 +18,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
 from dew.training import GeneralDiffusionTrainer
 from dew.objectives.base import EMASpec, Objective
-from dew._utils_dissolve import (
+from dew.training.distributed import (
     DevicePrefetchIterator, batch_sharding, build_mesh, parameter_spec, shard_batch,
 )
 

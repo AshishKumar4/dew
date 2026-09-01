@@ -19,7 +19,7 @@ from dew.sampling.euler import EulerSampler
 from dew.objectives.diffusion.schedules import FlowMatchingScheduler
 from dew.objectives.diffusion.schedules.flow import compute_resolution_shift
 from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 
 STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 

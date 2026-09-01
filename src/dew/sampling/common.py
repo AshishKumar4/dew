@@ -8,7 +8,8 @@ from typing import List, Tuple, Dict, Any, Optional
 
 from dew.objectives.diffusion.transforms import DiffusionPredictionTransform
 from dew.objectives.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
-from dew._utils_dissolve import RandomMarkovState, MarkovState, clip_images
+from dew.random_state import RandomMarkovState, MarkovState
+from dew.image_ops import clip_images
 from dew.nn.autoencoders import AutoEncoder
 from dew.inputs import DiffusionInputConfig
 

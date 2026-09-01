@@ -1,7 +1,7 @@
 import cv2
 import jax.numpy as jnp
 import grain.python as pygrain
-from dew._utils_dissolve import AutoAudioProcessor
+from dew.inputs.processors import AutoAudioProcessor
 from typing import Dict, Any, Callable, List, Optional
 import hashlib
 import os

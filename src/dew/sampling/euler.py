@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from .common import DiffusionSampler
 from dew.objectives.diffusion.schedules import get_coeff_shapes_tuple
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 
 class EulerSampler(DiffusionSampler):
     # Basically a DDIM Sampler but parameterized as an ODE

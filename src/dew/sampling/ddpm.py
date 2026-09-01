@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from .common import DiffusionSampler
 from dew.objectives.diffusion.schedules import get_coeff_shapes_tuple
-from dew._utils_dissolve import MarkovState, RandomMarkovState
+from dew.random_state import MarkovState, RandomMarkovState
 
 class DDPMSampler(DiffusionSampler):
     """Exact ancestral sampler for the reverse diffusion SDE.

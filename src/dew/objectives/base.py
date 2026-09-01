@@ -26,7 +26,7 @@ from dew.sampling.common import DiffusionSampler
 from dew.sampling.ddim import DDIMSampler
 from dew.nn.autoencoders.api import AutoEncoder
 from ..inputs import DiffusionInputConfig
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 
 
 @dataclass

@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import Union
-from dew._utils_dissolve import RandomMarkovState  
+from dew.random_state import RandomMarkovState  
 
 def get_coeff_shapes_tuple(array):
     shape_tuple = (-1,) + (1,) * (array.ndim - 1)

@@ -4,7 +4,7 @@ Enumerates a VoxCeleb2 tree and hands the grain pipeline one record per
 utterance. Clip sampling, audio features and batching are the
 AudioVideoAugmenter's job (see `sources/videos.py`), which reads clips with
 `av_utils.read_av_random_clip` and featurises audio with
-`dew._utils_dissolve.AutoAudioProcessor`. Every AV dependency is imported lazily,
+`dew.inputs.processors.AutoAudioProcessor`. Every AV dependency is imported lazily,
 inside those readers - importing this module costs nothing.
 """
 
