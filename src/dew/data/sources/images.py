@@ -49,6 +49,37 @@ def image_augmenter(image, image_scale, method=cv2.INTER_AREA):
                        interpolation=method)
     return image
 
+def image_augmentations():
+    """Build the image augmentation pipeline selected by FLAXDIFF_AUGMENT_MODE.
+
+    Modes: flip_only (DiT style), flip_jitter (default), or none
+    (deterministic eval/debugging).
+    """
+    import albumentations as A
+
+    aug_mode = os.environ.get('FLAXDIFF_AUGMENT_MODE', 'flip_jitter')
+    if aug_mode == 'none':
+        return A.Compose([])
+    if aug_mode == 'flip_only':
+        return A.Compose([A.HorizontalFlip(p=0.5)])
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0, p=1.0),
+    ])
+
+
+def augment_image(augments, image, rng: np.random.Generator):
+    """Apply a pipeline from image_augmentations to one image.
+
+    The seed is drawn from grain's per-record rng (Philox keyed by the record
+    index), so every record gets the same augmentation regardless of how many
+    workers or processes produced the batch. albumentations keeps its
+    randomness in instance-local generators, so numpy's global RNG is never
+    touched from inside data-loading workers.
+    """
+    augments.set_random_seed(int(rng.integers(0, 2**32 - 1)))
+    return augments(image=image)['image']
+
 
 PROMPT_TEMPLATES = [
     "a photo of a {}",
@@ -141,7 +172,7 @@ class ImageTFDSAugmenter(DataAugmenter):
             label_path = os.path.join(os.path.expanduser("~"), "tensorflow_datasets/oxford_flowers102/2.1.1/label.labels.txt")
         self.label_path = label_path
     
-    def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.MapTransform]:
+    def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.Transformation]:
         """Create a transform for TFDS image datasets.
         
         Args:
@@ -149,7 +180,7 @@ class ImageTFDSAugmenter(DataAugmenter):
             method: Interpolation method for resizing.
             
         Returns:
-            A callable that returns a pygrain.MapTransform.
+            A callable that returns a pygrain.RandomMapTransform.
         """
         labelizer = labelizer_oxford_flowers102(self.label_path)
         
@@ -158,30 +189,18 @@ class ImageTFDSAugmenter(DataAugmenter):
         else:
             interpolation = cv2.INTER_AREA
         
-        from torchvision.transforms import v2
-        # FLAXDIFF_AUGMENT_MODE: flip_only (DiT style), flip_jitter (old default),
-        # or none (deterministic eval/debugging)
-        aug_mode = os.environ.get('FLAXDIFF_AUGMENT_MODE', 'flip_jitter')
-        if aug_mode == 'none':
-            augments = v2.Compose([])
-        elif aug_mode == 'flip_only':
-            augments = v2.Compose([v2.RandomHorizontalFlip(p=0.5)])
-        else:  # 'flip_jitter'
-            augments = v2.Compose([
-                v2.RandomHorizontalFlip(p=0.5),
-                v2.ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2)
-            ])
+        augments = image_augmentations()
 
-        class TFDSTransform(pygrain.MapTransform):
+        class TFDSTransform(pygrain.RandomMapTransform):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.tokenize = AutoTextTokenizer(tensor_type="np")
                 
-            def map(self, element) -> Dict[str, jnp.array]:
+            def random_map(self, element, rng: np.random.Generator) -> Dict[str, jnp.array]:
                 image = element['image']
                 image = cv2.resize(image, (image_scale, image_scale),
                                   interpolation=interpolation)
-                image = augments(image)
+                image = augment_image(augments, image, rng)
                 
                 caption = labelizer(element)
                 results = self.tokenize(caption)
@@ -266,7 +285,7 @@ class ImageGCSAugmenter(DataAugmenter):
         """
         self.labelizer = labelizer or (lambda sample: sample['txt'])
     
-    def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.MapTransform]:
+    def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.Transformation]:
         """Create a transform for GCS image datasets.
         
         Args:
@@ -274,7 +293,7 @@ class ImageGCSAugmenter(DataAugmenter):
             method: Interpolation method for resizing.
             
         Returns:
-            A callable that returns a pygrain.MapTransform.
+            A callable that returns a pygrain.RandomMapTransform.
         """
         labelizer = self.labelizer
         if method is None:
@@ -285,31 +304,20 @@ class ImageGCSAugmenter(DataAugmenter):
                 
         print(f"Using method: {method}")
         
-        from torchvision.transforms import v2
-        # same FLAXDIFF_AUGMENT_MODE handling as the TFDS augmenter above
-        aug_mode = os.environ.get('FLAXDIFF_AUGMENT_MODE', 'flip_jitter')
-        if aug_mode == 'none':
-            augments = v2.Compose([])
-        elif aug_mode == 'flip_only':
-            augments = v2.Compose([v2.RandomHorizontalFlip(p=0.5)])
-        else:  # 'flip_jitter'
-            augments = v2.Compose([
-                v2.RandomHorizontalFlip(p=0.5),
-                v2.ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2)
-            ])
+        augments = image_augmentations()
 
-        class GCSTransform(pygrain.MapTransform):
+        class GCSTransform(pygrain.RandomMapTransform):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.auto_tokenize = AutoTextTokenizer(tensor_type="np")
                 self.image_augmenter = partial(image_augmenter, image_scale=image_scale, method=method)
                 
-            def map(self, element) -> Dict[str, jnp.array]:
+            def random_map(self, element, rng: np.random.Generator) -> Dict[str, jnp.array]:
                 element = unpack_dict_of_byte_arrays(element)
                 image = np.asarray(bytearray(element['jpg']), dtype="uint8")
                 image = cv2.imdecode(image, cv2.IMREAD_UNCHANGED)
                 image = self.image_augmenter(image)
-                image = augments(image)
+                image = augment_image(augments, image, rng)
                 caption = labelizer(element).decode('utf-8')
                 results = self.auto_tokenize(caption)
                 return {
