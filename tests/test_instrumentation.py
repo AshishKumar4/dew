@@ -15,7 +15,7 @@ import pytest
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
-from dew.training import GeneralDiffusionTrainer
+from dew.training import ObjectiveTrainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.telemetry.instrumentation import (
     enable_compilation_cache, model_flops_utilization, step_flops,
@@ -27,7 +27,7 @@ BATCH = 8
 
 def make_trainer(tmp_path, **kwargs):
     train_schedule, _, transform = get_diffusion_preset("edm")
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
         optimizer=optax.adam(1e-3),
         noise_schedule=train_schedule,
