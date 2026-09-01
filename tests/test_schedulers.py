@@ -15,13 +15,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-import flaxdiff.schedulers as schedulers
-from flaxdiff.predictors import (
+import dew.objectives.diffusion.schedules as schedulers
+from dew.objectives.diffusion.transforms import (
     EpsilonPredictionTransform,
     VPredictionTransform,
     get_diffusion_preset,
 )
-from flaxdiff.schedulers import (
+from dew.objectives.diffusion.schedules import (
     CosineContinuousNoiseScheduler,
     CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
@@ -32,7 +32,7 @@ from flaxdiff.schedulers import (
     LinearNoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
-from flaxdiff.schedulers.common import get_coeff_shapes_tuple
+from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
 
 # Timesteps ascending from low to high noise, in each schedule's own domain:
 # an index into the beta table for the discrete schedules, [0, 1] for the
@@ -178,7 +178,7 @@ def test_karras_weights_at_sigma_min():
 @pytest.mark.parametrize("P_mean,P_std", [(-0.4, 1.0), (-1.2, 1.2)])
 def test_edm_lognormal_sigma_distribution(rng, P_mean, P_std):
     """EDM training sigmas follow exp(N(P_mean, P_std^2)), defaulting to EDM2."""
-    from flaxdiff.utils import RandomMarkovState
+    from dew._utils_dissolve import RandomMarkovState
 
     schedule = EDMNoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5, P_mean=P_mean, P_std=P_std)
     steps, _ = schedule.generate_timesteps(20000, RandomMarkovState(rng))

@@ -14,8 +14,8 @@ import types
 import numpy as np
 import pytest
 
-from flaxdiff.data.sources import av_utils
-from flaxdiff.data.sources.av_utils import read_av_improved, read_av_random_clip
+from dew.data.sources import av_utils
+from dew.data.sources.av_utils import read_av_improved, read_av_random_clip
 
 FPS = 25.0
 SAMPLE_RATE = 16000

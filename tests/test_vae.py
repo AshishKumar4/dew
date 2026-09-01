@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flaxdiff.models.autoencoder import AutoEncoder
+from dew.nn.autoencoders import AutoEncoder
 
 
 class IdentityAutoEncoder(AutoEncoder):
@@ -54,7 +54,7 @@ def test_latent_normalization_whitens_a_known_distribution(rng):
 
 @pytest.fixture(scope="module")
 def vae():
-    from flaxdiff.models.autoencoder.diffusers import StableDiffusionVAE
+    from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
     return StableDiffusionVAE(dtype=jnp.float32)
 
 

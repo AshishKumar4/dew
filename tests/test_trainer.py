@@ -13,12 +13,12 @@ import numpy as np
 import optax
 import pytest
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.trainer import general_diffusion_trainer as gdt
-from flaxdiff.utils import get_latest_checkpoint
+from dew.inputs import DiffusionInputConfig
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.training import GeneralDiffusionTrainer
+from dew.training import objective_trainer as gdt
+from dew._utils_dissolve import get_latest_checkpoint
 
 RES = 8
 
@@ -91,7 +91,7 @@ def test_restore_preserves_optimizer_state(tmp_path):
 
 def test_fit_video_model(tmp_path):
     """Video end to end: 5D batches through the real trainer and the video DiT."""
-    from flaxdiff.models.video_dit import VideoDiT
+    from dew.nn.backbones.video_dit import VideoDiT
 
     train_schedule, _, transform = get_diffusion_preset("edm")
     trainer = GeneralDiffusionTrainer(

@@ -16,12 +16,12 @@ import numpy as np
 import optax
 import pytest
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.trainer.general_diffusion_trainer import TrainState
-from flaxdiff.trainer.objectives import EMASpec, Objective
+from dew.inputs import DiffusionInputConfig
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.training import GeneralDiffusionTrainer
+from dew.training.objective_trainer import TrainState
+from dew.objectives.base import EMASpec, Objective
 
 RES = 8
 

@@ -8,11 +8,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.models.simple_mmdit import SimpleMMDiT, HierarchicalMMDiT
-from flaxdiff.models.simple_vit import SimpleUDiT
-from flaxdiff.models.ssm_dit import HybridSSMAttentionDiT
-from flaxdiff.models.video_dit import VideoDiT
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.mmdit import SimpleMMDiT, HierarchicalMMDiT
+from dew.nn.backbones.uvit import SimpleUDiT
+from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
+from dew.nn.backbones.video_dit import VideoDiT
 
 RES = 32
 

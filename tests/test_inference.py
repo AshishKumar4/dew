@@ -15,19 +15,19 @@ import numpy as np
 import optax
 import pytest
 
-from flaxdiff import inference
-from flaxdiff.inference import (
+from dew import sampling as inference
+from dew.sampling import (
     DiffusionInferencePipeline, InferencePipeline, load_from_checkpoint, parse_config,
 )
-from flaxdiff.inference import utils as inference_utils
-from flaxdiff.inputs import (
+from dew.sampling import loading as inference_utils
+from dew.inputs import (
     CONDITIONAL_ENCODERS_REGISTRY, ConditioningEncoder, DiffusionInputConfig,
 )
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.samplers.euler import EulerAncestralSampler
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.utils import get_latest_checkpoint
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.sampling.euler import EulerAncestralSampler
+from dew.training import GeneralDiffusionTrainer
+from dew._utils_dissolve import get_latest_checkpoint
 
 RES = 8
 MODEL_KWARGS = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)

@@ -10,8 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flaxdiff.inference.utils import parse_config
-from flaxdiff.inputs import (
+from dew.sampling.loading import parse_config
+from dew.inputs import (
     CONDITIONAL_ENCODERS_REGISTRY, ConditionalInputConfig, ConditioningEncoder,
     DiffusionInputConfig,
 )
@@ -95,7 +95,7 @@ def test_parse_config_resolves_dotted_values():
 def test_training_and_inference_share_schedule_presets():
     """--noise_schedule must mean the same thing at train and inference time.
     Both sides now build from get_diffusion_preset."""
-    from flaxdiff.predictors import get_diffusion_preset
+    from dew.objectives.diffusion.transforms import get_diffusion_preset
 
     train, sample, transform = get_diffusion_preset("edm")
     assert type(train).__name__ == "EDMNoiseScheduler"
@@ -118,7 +118,7 @@ def test_training_and_inference_share_schedule_presets():
 def test_registry_builds_every_architecture():
     """Every registry entry must construct from a minimal string config -
     the same call path training and inference share."""
-    from flaxdiff.models.registry import MODEL_REGISTRY, build_model
+    from dew.registry import MODEL_REGISTRY, build_model
 
     base = {"emb_features": 64, "dtype": "float32", "precision": "default",
             "output_channels": 3, "patch_size": 4, "num_layers": 2, "num_heads": 2}
@@ -141,7 +141,7 @@ def test_registry_builds_every_architecture():
 
 
 def test_registry_suffix_canonicalization():
-    from flaxdiff.models.registry import canonicalize_architecture
+    from dew.registry import canonicalize_architecture
 
     name, flags = canonicalize_architecture("hybrid_dit+2d+hilbert")
     assert name == "hybrid_dit"

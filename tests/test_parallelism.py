@@ -12,13 +12,13 @@ import optax
 import pytest
 from jax.sharding import PartitionSpec as P
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.metrics.common import EvaluationMetric
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.trainer.objectives import EMASpec, Objective
-from flaxdiff.utils import (
+from dew.inputs import DiffusionInputConfig
+from dew.eval.common import EvaluationMetric
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.training import GeneralDiffusionTrainer
+from dew.objectives.base import EMASpec, Objective
+from dew._utils_dissolve import (
     DevicePrefetchIterator, batch_sharding, build_mesh, parameter_spec, shard_batch,
 )
 
