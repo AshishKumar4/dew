@@ -73,6 +73,7 @@ class SimpleTrainer:
                  fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
                  compilation_cache_dir: str = None,
                  profile_steps: int = 0,
+                 profile_warmup_steps: int = 2,
                  log_every: int = 100,
                  max_bad_loss_steps: int = 5,
                  ):
@@ -97,6 +98,7 @@ class SimpleTrainer:
         self.input_shapes = input_shapes
         self.checkpoint_base_path = checkpoint_base_path
         self.profile_steps = profile_steps
+        self.profile_warmup_steps = profile_warmup_steps
         self.log_every = log_every
         self.max_bad_loss_steps = max_bad_loss_steps
         # Measured off the compiled step, once per run.
@@ -424,14 +426,20 @@ class SimpleTrainer:
         last_log_time = time.time()
         steps_since_log = 0
         compiled_step = None
+        # Compilation and the first steps say nothing about how the loop runs
+        # once it is warm, so the trace skips them.
+        profile_start = self.profile_warmup_steps if self.profile_steps else None
+        tracing = False
+        traced_steps = 0
 
         for i in range(train_steps_per_epoch):
             batch = next(train_ds)
             if compiled_step is None:
                 compiled_step = self._compiled_step(
                     train_step_fn, train_state, rng_state, batch)
-            if i == 0 and self.profile_steps:
+            if not tracing and i == profile_start:
                 jax.profiler.start_trace(self.profile_path())
+                tracing = True
 
             train_state, loss, aux, rng_state, is_finite = compiled_step(
                 train_state, rng_state, batch)
@@ -449,10 +457,11 @@ class SimpleTrainer:
             current_step += 1
             steps_since_log += 1
 
-            if self.profile_steps and i + 1 == self.profile_steps:
-                loss.block_until_ready()
-                jax.profiler.stop_trace()
-                print(f"Wrote profile for {self.profile_steps} steps to {self.profile_path()}")
+            if tracing:
+                traced_steps += 1
+                if traced_steps == self.profile_steps:
+                    tracing = False
+                    self._stop_trace(traced_steps, loss)
 
             if i % log_every == 0:
                 self._check_finite(worst_bad_run, current_step)
@@ -479,6 +488,11 @@ class SimpleTrainer:
                     self.save(current_epoch, current_step, train_state, rng_state)
                     print(f"Saving done by process index {process_index}")
                     print(colored(f"Epoch done on index {process_index} => {current_epoch} Loss: {epoch_loss/train_steps_per_epoch}", 'green'))
+
+        if tracing:
+            # The window outlived the epoch, and a trace left running takes the
+            # next one down with it.
+            self._stop_trace(traced_steps, loss)
         self._check_finite(worst_bad_run, current_step)
         if pbar is not None:
             pbar.close()
@@ -486,6 +500,12 @@ class SimpleTrainer:
 
     def profile_path(self):
         return os.path.join(self.checkpoint_path(), 'profile')
+
+    def _stop_trace(self, traced_steps: int, loss):
+        """Close the profiler window once its last step has actually landed."""
+        loss.block_until_ready()
+        jax.profiler.stop_trace()
+        print(f"Wrote profile for {traced_steps} steps to {self.profile_path()}")
 
     def _check_finite(self, worst_bad_run, current_step):
         """Fail a diverged run loudly rather than papering over it.
