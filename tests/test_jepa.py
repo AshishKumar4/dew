@@ -15,7 +15,7 @@ from dew.objectives.jepa import (
 )
 from dew.nn.backbones.jepa import JepaPredictor
 from dew.training import GeneralDiffusionTrainer
-from dew._utils_dissolve import DevicePrefetchIterator
+from dew.training.distributed import DevicePrefetchIterator
 
 RES = 32
 PATCH = 4

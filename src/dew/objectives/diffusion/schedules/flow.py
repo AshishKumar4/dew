@@ -1,7 +1,7 @@
 import math
 import jax
 import jax.numpy as jnp
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 from .continuous import ContinuousNoiseScheduler
 from .common import reshape_rates
 

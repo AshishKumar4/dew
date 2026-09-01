@@ -1,7 +1,7 @@
 import cv2
 import jax.numpy as jnp
 import grain.python as pygrain
-from dew._utils_dissolve import AutoTextTokenizer
+from dew.inputs.processors import AutoTextTokenizer
 from typing import Dict, Any, Callable, List, Optional
 import random
 import augmax

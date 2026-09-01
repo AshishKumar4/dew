@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional, Union, List, Callable
 import numpy as np
 import jax
 import cv2  # Added missing import
-from dew._utils_dissolve import AutoTextTokenizer
+from dew.inputs.processors import AutoTextTokenizer
 from .registry import datasetMap, onlineDatasetMap, mediaDatasetMap
 import traceback
 # NOTE: .online_loader is imported lazily inside the two `*_online` factories.

@@ -11,10 +11,12 @@ import functools
 from dew.objectives.diffusion.schedules import NoiseScheduler
 from dew.objectives.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
 
-from dew._utils_dissolve import RandomMarkovState, serialize_model, get_latest_checkpoint, shard_batch
+from dew.checkpoints.utils import get_latest_checkpoint, serialize_model
+from dew.random_state import RandomMarkovState
 from dew.inputs import ConditioningEncoder, ConditionalInputConfig, DiffusionInputConfig
 
 from .trainer import SimpleTrainer, SimpleTrainState, Metrics
+from .distributed import shard_batch
 from dew.objectives.base import Objective, DiffusionObjective
 
 from dew.nn.autoencoders.api import AutoEncoder

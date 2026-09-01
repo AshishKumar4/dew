@@ -18,7 +18,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
 from dew.training import GeneralDiffusionTrainer
 from dew.training import objective_trainer as gdt
-from dew._utils_dissolve import get_latest_checkpoint
+from dew.checkpoints.utils import get_latest_checkpoint
 
 RES = 8
 

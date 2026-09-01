@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from .common import GeneralizedNoiseScheduler
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
     def __init__(self, timesteps=1.0, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5, *args, **kwargs):

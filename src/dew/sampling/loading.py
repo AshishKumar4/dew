@@ -11,7 +11,7 @@ from dew.objectives.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model, canonicalize_architecture, map_config_strings
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
-from dew._utils_dissolve import defaultTextEncodeModel
+from dew.inputs.processors import defaultTextEncodeModel
 
 def get_wandb_run(wandb_run: str, project, entity):
     """
