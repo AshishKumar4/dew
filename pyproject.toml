@@ -25,6 +25,7 @@ dependencies = [
     "augmax",
     "albumentations",
     "rich",
+    "tyro",
     "python-dotenv",
     "transformers",
     "huggingface_hub",
