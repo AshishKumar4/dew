@@ -1,6 +1,3 @@
 [submodule "tpu-tools"]
-	path = tpu-tools
+	path = tools/tpu
 	url = git@github.com:AshishKumar4/tpu-tools.git
-[submodule "preprocess"]
-	path = preprocess
-	url = git@github.com:AshishKumar4/PipeCraft.git
