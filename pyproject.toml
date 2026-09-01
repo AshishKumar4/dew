@@ -3,10 +3,11 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flaxdiff"
-version = "0.2.10"
-description = "A versatile and easy to understand Diffusion library"
+name = "dew-ml"
+version = "0.1.0"
+description = "A JAX/Flax framework for training diffusion, JEPA and other large models from scratch"
 readme = "README.md"
+requires-python = ">=3.11"
 authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
@@ -36,7 +37,7 @@ license = "MIT"
 
 [project.optional-dependencies]
 test = ["pytest"]
-# AV/video sources and readers (lazy imports in flaxdiff.data)
+# AV/video sources and readers (lazy imports in dew.data)
 av = ["opencv-python", "decord", "moviepy", "av", "pillow"]
 # FID (scipy sqrtm) and Inception weight download
 metrics = ["scipy", "requests"]
@@ -47,12 +48,12 @@ tfds = ["tensorflow-datasets", "tensorflow"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Root-level entrypoints (training.py, training_jepa.py) are importable whether
-# pytest is invoked as `pytest` or `python -m pytest`
-pythonpath = ["."]
+# "src" resolves the dew package from source; "." lets tests load the recipes
+pythonpath = ["src", "."]
 markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
 ]
 
 [tool.setuptools.packages.find]
-include = ["flaxdiff*"]
+where = ["src"]
+include = ["dew*"]

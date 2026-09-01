@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from flaxdiff.models.autoencoder import AutoEncoder, SimpleAutoEncoder
+from dew.nn.autoencoders import AutoEncoder, SimpleAutoEncoder
 
 # Small enough to stay quick on CPU: 3 stages -> downscale factor 8
 DEPTHS = (8, 16, 32)

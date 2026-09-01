@@ -1,19 +1,21 @@
 """I-JEPA and V-JEPA: masking, shapes, the objective, and collapse telemetry."""
 
+import importlib.util
+from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.jepa import (
+from dew.inputs import DiffusionInputConfig
+from dew.objectives.jepa import (
     JepaEncoder, JepaVideoEncoder, JepaObjective, multi_block_mask,
     representation_health, normalize_targets, linear_probe, knn_probe,
 )
-from flaxdiff.jepa.models import JepaPredictor
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.utils import DevicePrefetchIterator
+from dew.nn.backbones.jepa import JepaPredictor
+from dew.training import GeneralDiffusionTrainer
+from dew._utils_dissolve import DevicePrefetchIterator
 
 RES = 32
 PATCH = 4
@@ -448,7 +450,7 @@ def test_probes_are_at_chance_on_noise():
 
 @pytest.mark.parametrize("architecture", ["jepa_encoder", "jepa_video_encoder"])
 def test_registry_builds_the_jepa_models(architecture):
-    from flaxdiff.models.registry import build_model
+    from dew.registry import build_model
     model = build_model(f"{architecture}+hilbert",
                         {"patch_size": PATCH, "emb_features": 32, "num_layers": 1})
     assert model.emb_features == 32 and model.scan_order == 'hilbert'
@@ -456,7 +458,10 @@ def test_registry_builds_the_jepa_models(architecture):
 
 def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
     """Registry -> mask -> objective -> trainer -> probes, as the CLI wires them."""
-    import training_jepa
+    spec = importlib.util.spec_from_file_location(
+        "jepa_train_recipe", Path(__file__).resolve().parents[1] / "recipes" / "jepa" / "train.py")
+    training_jepa = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(training_jepa)
 
     monkeypatch.setenv("WANDB_MODE", "disabled")
     classes = 4

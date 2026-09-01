@@ -12,11 +12,11 @@ import numpy as np
 import optax
 import pytest
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.predictors import get_diffusion_preset
-from flaxdiff.trainer import GeneralDiffusionTrainer
-from flaxdiff.utils import (
+from dew.inputs import DiffusionInputConfig
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.training import GeneralDiffusionTrainer
+from dew._utils_dissolve import (
     DevicePrefetchIterator, enable_compilation_cache, model_flops_utilization, step_flops,
 )
 
@@ -80,7 +80,7 @@ def test_mfu_is_skipped_on_unknown_hardware():
 
 
 def test_mfu_scales_with_time_and_devices(monkeypatch):
-    import flaxdiff.utils as utils
+    import dew._utils_dissolve as utils
     monkeypatch.setitem(utils.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
     assert utils.model_flops_utilization(50.0, 1.0, 1) == pytest.approx(0.5)
     assert utils.model_flops_utilization(50.0, 1.0, 2) == pytest.approx(0.25)

@@ -14,18 +14,18 @@ import jax.numpy as jnp
 import pytest
 from flax import linen as nn
 
-from flaxdiff.inputs import ConditionalInputConfig, DiffusionInputConfig
-from flaxdiff.inputs.encoders import ConditioningEncoder
-from flaxdiff.predictors import EpsilonPredictionTransform, KarrasPredictionTransform
-from flaxdiff.samplers.ddim import DDIMSampler
-from flaxdiff.samplers.ddpm import DDPMSampler, SimpleDDPMSampler
-from flaxdiff.samplers.euler import EulerSampler, EulerAncestralSampler
-from flaxdiff.samplers.heun_sampler import HeunSampler
-from flaxdiff.samplers.multistep_dpm import MultiStepDPM
-from flaxdiff.samplers.rk4_sampler import RK4Sampler
-from flaxdiff.schedulers import CosineNoiseScheduler, KarrasVENoiseScheduler
-from flaxdiff.schedulers.common import get_coeff_shapes_tuple
-from flaxdiff.utils import RandomMarkovState
+from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
+from dew.inputs.encoders import ConditioningEncoder
+from dew.objectives.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
+from dew.sampling.ddim import DDIMSampler
+from dew.sampling.ddpm import DDPMSampler, SimpleDDPMSampler
+from dew.sampling.euler import EulerSampler, EulerAncestralSampler
+from dew.sampling.heun_sampler import HeunSampler
+from dew.sampling.multistep_dpm import MultiStepDPM
+from dew.sampling.rk4_sampler import RK4Sampler
+from dew.objectives.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
+from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
+from dew._utils_dissolve import RandomMarkovState
 
 DATA_STD = 0.3
 

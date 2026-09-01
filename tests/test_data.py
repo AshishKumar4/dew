@@ -2,10 +2,11 @@
 
 The shared environment has no HF `datasets`, decord, pyav, moviepy or
 video_reader, which is the point of several of these tests: the grain paths and
-`import flaxdiff.data` must not need them. Anything that genuinely requires an
+`import dew.data` must not need them. Anything that genuinely requires an
 optional dependency skips.
 """
 
+import os
 import importlib.util
 import inspect
 import itertools
@@ -19,17 +20,17 @@ import grain.python as pygrain
 import numpy as np
 import pytest
 
-import flaxdiff.data
-from flaxdiff.data import dataloaders
-from flaxdiff.data.dataloaders import get_dataset_online, get_media_dataset_grain
-from flaxdiff.data.dataset_map import mediaDatasetMap
-from flaxdiff.data.sources.audio_utils import _read_wav_mono, read_audio_ffmpeg
-from flaxdiff.data.sources.av_utils import choose_clip_start
-from flaxdiff.data.sources.base import DataAugmenter, DataSource, MediaDataset
-from flaxdiff.data.sources.images import ImageTFDSAugmenter, gcs_filters
-from flaxdiff.data.sources import videos as videos_module
-from flaxdiff.data.sources.videos import AudioVideoAugmenter, VideoLocalSource
-from flaxdiff.data.sources.voxceleb2 import VoxCeleb2Source
+import dew.data
+from dew.data import dataloaders
+from dew.data.dataloaders import get_dataset_online, get_media_dataset_grain
+from dew.data.registry import mediaDatasetMap
+from dew.data.sources.audio_utils import _read_wav_mono, read_audio_ffmpeg
+from dew.data.sources.av_utils import choose_clip_start
+from dew.data.sources.base import DataAugmenter, DataSource, MediaDataset
+from dew.data.sources.images import ImageTFDSAugmenter, gcs_filters
+from dew.data.sources import videos as videos_module
+from dew.data.sources.videos import AudioVideoAugmenter, VideoLocalSource
+from dew.data.sources.voxceleb2 import VoxCeleb2Source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -89,43 +90,44 @@ def test_gcs_filter_returns_a_usable_filter_transform():
 # Lazy imports: the data layer must not drag in HF datasets / opencv / decord
 # ---------------------------------------------------------------------------------
 
-def test_importing_flaxdiff_data_pulls_in_no_heavy_dependencies():
-    """`import flaxdiff.data` used to import online_loader, which imports HF
+def test_importing_dew_data_pulls_in_no_heavy_dependencies():
+    """`import dew.data` used to import online_loader, which imports HF
     `datasets` at module scope and took the whole package down with it."""
     probe = (
-        "import sys, flaxdiff.data;"
+        "import sys, dew.data;"
         "heavy = [m for m in ('datasets', 'cv2', 'decord', 'jax',"
-        " 'flaxdiff.data.online_loader', 'flaxdiff.data.dataloaders')"
+        " 'dew.data.online_loader', 'dew.data.dataloaders')"
         " if m in sys.modules];"
         "assert not heavy, heavy;"
-        "assert flaxdiff.data.MediaDataset.__name__ == 'MediaDataset'"
+        "assert dew.data.MediaDataset.__name__ == 'MediaDataset'"
     )
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
     result = subprocess.run([sys.executable, "-c", probe], cwd=REPO_ROOT,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr
 
 
 def test_lazy_exports_resolve_and_unknown_names_raise_attribute_error():
-    assert flaxdiff.data.get_media_dataset_grain is get_media_dataset_grain
-    assert flaxdiff.data.VoxCeleb2Source is VoxCeleb2Source
-    assert "get_dataset_grain" in dir(flaxdiff.data)
+    assert dew.data.get_media_dataset_grain is get_media_dataset_grain
+    assert dew.data.VoxCeleb2Source is VoxCeleb2Source
+    assert "get_dataset_grain" in dir(dew.data)
     with pytest.raises(AttributeError, match="has no attribute"):
-        flaxdiff.data.get_dataset_from_thin_air
+        dew.data.get_dataset_from_thin_air
 
 
 def test_online_dataset_factories_defer_the_streaming_import():
     """The streaming stack needs HF datasets; asking for a bad dataset name must
     fail on the name, not on the missing dependency."""
-    already_imported = "flaxdiff.data.online_loader" in sys.modules
+    already_imported = "dew.data.online_loader" in sys.modules
     with pytest.raises(ValueError, match="not found in onlineDatasetMap"):
         get_dataset_online("no_such_dataset")
     if not already_imported:
-        assert "flaxdiff.data.online_loader" not in sys.modules
+        assert "dew.data.online_loader" not in sys.modules
 
 
 def test_online_streaming_loader_no_longer_accepts_the_unapplied_pre_map_args():
     try:
-        from flaxdiff.data.online_loader import OnlineStreamingDataLoader
+        from dew.data.online_loader import OnlineStreamingDataLoader
     except ImportError as exc:  # HF datasets missing: nothing to check here
         pytest.skip(f"the streaming loader needs HF datasets ({exc})")
 
@@ -470,11 +472,11 @@ def test_video_local_source_without_a_directory_says_so():
 
 def test_av_benchmark_script_imports_against_the_real_av_utils():
     """It used to import a read_av_batch that av_utils never defined."""
-    script = REPO_ROOT / "scripts" / "av_benchmark.py"
+    script = REPO_ROOT / "tools" / "av_benchmark.py"
     spec = importlib.util.spec_from_file_location("av_benchmark_under_test", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
     assert callable(module.benchmark_av_reading)
     assert callable(module.read_av_improved)
-    assert not (REPO_ROOT / "flaxdiff" / "data" / "sources" / "av_example.py").exists()
+    assert not (REPO_ROOT / "src" / "dew" / "data" / "sources" / "av_example.py").exists()

@@ -12,15 +12,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import flaxdiff.metrics as metrics
-from flaxdiff.metrics import (
+import dew.eval as metrics
+from dew.eval import (
     EvaluationMetric,
     get_psnr_metric,
     get_ssim_metric,
     psnr,
     ssim,
 )
-from flaxdiff.metrics.fid import frechet_distance, get_fid_metric
+from dew.eval.fid import frechet_distance, get_fid_metric
 
 
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):

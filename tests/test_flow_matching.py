@@ -12,14 +12,14 @@ import optax
 import pytest
 from flax import linen as nn
 
-from flaxdiff.inputs import DiffusionInputConfig
-from flaxdiff.predictors import FlowMatchPredictionTransform, get_diffusion_preset
-from flaxdiff.samplers.ddim import DDIMSampler
-from flaxdiff.samplers.euler import EulerSampler
-from flaxdiff.schedulers import FlowMatchingScheduler
-from flaxdiff.schedulers.flow import compute_resolution_shift
-from flaxdiff.schedulers.common import get_coeff_shapes_tuple
-from flaxdiff.utils import RandomMarkovState
+from dew.inputs import DiffusionInputConfig
+from dew.objectives.diffusion.transforms import FlowMatchPredictionTransform, get_diffusion_preset
+from dew.sampling.ddim import DDIMSampler
+from dew.sampling.euler import EulerSampler
+from dew.objectives.diffusion.schedules import FlowMatchingScheduler
+from dew.objectives.diffusion.schedules.flow import compute_resolution_shift
+from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
+from dew._utils_dissolve import RandomMarkovState
 
 STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 

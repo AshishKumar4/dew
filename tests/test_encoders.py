@@ -9,8 +9,8 @@ downloaded; the network-marked test covers a real HF audio model.
 import numpy as np
 import pytest
 
-from flaxdiff.inputs import CONDITIONAL_ENCODERS_REGISTRY
-from flaxdiff.inputs.encoders import (
+from dew.inputs import CONDITIONAL_ENCODERS_REGISTRY
+from dew.inputs.encoders import (
     ConditioningEncoder, TextEncoder, CLIPTextEncoder, AudioEncoder, HFAudioEncoder,
 )
 

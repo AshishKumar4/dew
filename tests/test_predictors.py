@@ -9,14 +9,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from flaxdiff.predictors import (
+from dew.objectives.diffusion.transforms import (
     EpsilonPredictionTransform,
     DirectPredictionTransform,
     VPredictionTransform,
     KarrasPredictionTransform,
 )
-from flaxdiff.schedulers import CosineNoiseScheduler, KarrasVENoiseScheduler
-from flaxdiff.schedulers.common import get_coeff_shapes_tuple
+from dew.objectives.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
+from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
 
 TRANSFORMS = [
     ("epsilon", EpsilonPredictionTransform()),

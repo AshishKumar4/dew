@@ -9,11 +9,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from flaxdiff.models.simple_unet import Unet
-from flaxdiff.models.simple_dit import SimpleDiT
-from flaxdiff.models.simple_mmdit import SimpleMMDiT
-from flaxdiff.models.simple_vit import UViT
-from flaxdiff.models.ssm_dit import HybridSSMAttentionDiT
+from dew.nn.backbones.unet import Unet
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.mmdit import SimpleMMDiT
+from dew.nn.backbones.uvit import UViT
+from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 
 RES = 32
 
@@ -111,7 +111,7 @@ def test_uvit_hilbert_forward(rng):
 def test_hilbert_patchify_roundtrip(rng):
     """patchify returns patches in hilbert order plus the inverse permutation;
     unpatchify with that permutation must be an exact identity."""
-    from flaxdiff.models.hilbert import hilbert_patchify, hilbert_unpatchify
+    from dew.nn.scan_orders import hilbert_patchify, hilbert_unpatchify
 
     x = jax.random.normal(rng, (2, 16, 16, 3))
     patches, inv_idx = hilbert_patchify(x, 4)
@@ -142,7 +142,7 @@ def test_dropout_is_active_in_train_mode(rng):
 
 
 def test_hierarchical_mmdit_forward(rng):
-    from flaxdiff.models.simple_mmdit import HierarchicalMMDiT
+    from dew.nn.backbones.mmdit import HierarchicalMMDiT
     model = HierarchicalMMDiT(base_patch_size=2, emb_features=(32, 64, 96),
                               num_layers=(1, 1, 1), num_heads=(2, 2, 2), mlp_ratio=2)
     x, temb, textcontext = small_inputs(rng)
@@ -183,7 +183,7 @@ def test_attention_impl_parity(rng):
 def test_video_dit_forward(rng):
     """Factorized ST video model over (B, T, H, W, C), the replacement for
     the never-wired diffusers-derived UNet3D."""
-    from flaxdiff.models.video_dit import VideoDiT
+    from dew.nn.backbones.video_dit import VideoDiT
     model = VideoDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x = jax.random.normal(rng, (2, 3, 16, 16, 3))
     temb = jnp.ones((2,))
@@ -196,7 +196,7 @@ def test_video_dit_forward(rng):
 def test_video_dit_temporal_mixing(rng):
     """Temporal blocks must actually mix across frames: perturbing frame 0
     must change the prediction for frame 2."""
-    from flaxdiff.models.video_dit import VideoDiT
+    from dew.nn.backbones.video_dit import VideoDiT
     model = VideoDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x = jax.random.normal(rng, (1, 3, 16, 16, 3))
     temb = jnp.ones((1,))
@@ -213,7 +213,7 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     """A UNet3D inflated from a 2D Unet checkpoint must reproduce the 2D model
     frame by frame exactly - the temporal blocks are zero-initialized, so
     training starts from the pretrained image model and only learns motion."""
-    from flaxdiff.models.unet_3d import UNet3D, inflate_unet_params
+    from dew.nn.backbones.unet3d import UNet3D, inflate_unet_params
 
     config = dict(
         emb_features=64,
@@ -243,7 +243,7 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
 
 def test_unet3d_temporal_mixing_after_training_signal(rng):
     """Once the temporal gate is nudged off zero, frames must exchange information."""
-    from flaxdiff.models.unet_3d import UNet3D
+    from dew.nn.backbones.unet3d import UNet3D
 
     model = UNet3D(emb_features=64, feature_depths=[16, 32],
                    attention_configs=[None, None], num_res_blocks=1,
