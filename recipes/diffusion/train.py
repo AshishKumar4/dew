@@ -68,19 +68,19 @@ class DiffusionRunConfig(RunConfig):
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     noise_schedule: Literal['cosine', 'karras', 'edm', 'flow', 'flow_matching'] = 'edm'
-    # min-SNR-gamma loss weighting (Hang et al. 2023); 5.0 is the paper value,
-    # unset keeps the schedule's own weighting
     min_snr_gamma: Optional[float] = None
-    # Resolution shift for the flow matching schedule, see
-    # dew.objectives.diffusion.schedules.flow.compute_resolution_shift
+    """min-SNR-gamma loss weighting (Hang et al. 2023); 5.0 is the paper value,
+    unset keeps the schedule's own weighting."""
     flow_shift: float = 1.0
+    """Resolution shift for the flow matching schedule, see
+    dew.objectives.diffusion.schedules.flow.compute_resolution_shift."""
     autoencoder: Optional[Literal['stable_diffusion']] = None
     autoencoder_opts: JsonDict = field(
         default_factory=lambda: {"modelname": "pcuenq/sd-vae-ft-mse-flax"})
     val_metrics: list[Literal['clip', 'clip_score', 'fid']] = field(
         default_factory=lambda: ['clip'])
-    # Pull 2000 batches through the pipeline before training, for benchmarking
     dataset_test: bool = False
+    """Pull 2000 batches through the pipeline before training, for benchmarking."""
 
 
 def load_data(config: DataConfig) -> dict:
