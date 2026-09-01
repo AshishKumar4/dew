@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import grain.python as pygrain
-from typing import Dict, Any, Optional, Union, List, Callable
+from typing import Dict, Any, Optional, Union, List, Callable, TYPE_CHECKING
 import numpy as np
 import jax
 import cv2
@@ -10,6 +12,11 @@ import traceback
 # It needs HF `datasets`, which the grain paths must not require.
 from functools import partial
 from absl import flags
+
+if TYPE_CHECKING:
+    # Only for the load_data signature; importing dew.config at module scope
+    # here would make the data stack depend on tyro.
+    from dew.config import DataConfig
 
 # grain's worker processes read absl flags; a script that never runs absl.app
 # would crash on any worker_count > 0 with UnparsedFlagAccessError.
@@ -652,3 +659,55 @@ def get_media_dataset_online(
         "global_batch_size": batch_size,
         "media_type": media_type,
     }
+
+
+def load_data(config: DataConfig) -> dict:
+    """Dataset iterators for a run config: which factory, and with what knobs.
+
+    'grain' and 'online' name the factory. 'auto' prefers grain when the
+    dataset is registered for it, and only falls back to the online streamer
+    for datasets registered solely there - the name alone once decided this
+    ('online' in the dataset name), which chose a loader from spelling.
+    """
+    name = config.dataset
+    if config.loader == 'grain':
+        online = False
+    elif config.loader == 'online':
+        online = True
+    else:
+        online = name in onlineDatasetMap and name not in datasetMap
+
+    read_thread_count = config.read_thread_count
+    worker_buffer_size = config.worker_buffer_size
+    if online:
+        print("Using Online Dataset Generator")
+        # Streaming reads are slower per shard than arrayrecord grain reads,
+        # so more of them are kept in flight to hold the same throughput.
+        read_thread_count *= 4
+        worker_buffer_size *= 5
+        return get_dataset_online(
+            name,
+            batch_size=config.batch_size, image_scale=config.image_size,
+            worker_count=config.worker_count, read_thread_count=read_thread_count,
+            read_buffer_size=config.read_buffer_size,
+            worker_buffer_size=worker_buffer_size,
+            seed=config.dataset_seed, dataset_source=config.dataset_path,
+        )
+
+    if name in datasetMap:
+        return get_dataset_grain(
+            name,
+            batch_size=config.batch_size, image_scale=config.image_size,
+            worker_count=config.worker_count, read_thread_count=read_thread_count,
+            read_buffer_size=config.read_buffer_size,
+            worker_buffer_size=worker_buffer_size,
+            seed=config.dataset_seed, dataset_source=config.dataset_path,
+        )
+    return get_media_dataset_grain(
+        name,
+        batch_size=config.batch_size, media_scale=config.image_size,
+        worker_count=config.worker_count, read_thread_count=read_thread_count,
+        read_buffer_size=config.read_buffer_size,
+        worker_buffer_size=worker_buffer_size,
+        seed=config.dataset_seed, dataset_source=config.dataset_path,
+    )
