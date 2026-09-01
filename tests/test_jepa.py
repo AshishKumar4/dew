@@ -14,8 +14,8 @@ from dew.objectives.jepa import (
     representation_health, normalize_targets, linear_probe, knn_probe,
 )
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.training import GeneralDiffusionTrainer
-from dew._utils_dissolve import DevicePrefetchIterator
+from dew.training import ObjectiveTrainer
+from dew.training.distributed import DevicePrefetchIterator
 
 RES = 32
 PATCH = 4
@@ -331,7 +331,7 @@ def test_momentum_schedule_endpoints(mask):
 
 def make_jepa_trainer(tmp_path, mask, learning_rate=1e-3, fsdp_size=1, **kwargs):
     encoder = make_encoder()
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=encoder,
         optimizer=optax.adam(learning_rate),
         input_config=DiffusionInputConfig(

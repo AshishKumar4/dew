@@ -1,6 +1,6 @@
 """Trainer smoke tests: training without wandb, and checkpoint save/restore.
 
-These run the real GeneralDiffusionTrainer on CPU with a tiny DiT and an
+These run the real ObjectiveTrainer on CPU with a tiny DiT and an
 unconditional synthetic dataset - the same code path a real run takes, minus
 wandb and conditioning encoders.
 """
@@ -16,16 +16,16 @@ import pytest
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
-from dew.training import GeneralDiffusionTrainer
+from dew.training import ObjectiveTrainer
 from dew.training import objective_trainer as gdt
-from dew._utils_dissolve import get_latest_checkpoint
+from dew.checkpoints.utils import get_latest_checkpoint
 
 RES = 8
 
 
 def make_trainer(tmp_path, name="smoke", load_from_checkpoint=None):
     train_schedule, _, transform = get_diffusion_preset("edm")
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
         optimizer=optax.adam(1e-3),
         noise_schedule=train_schedule,
@@ -94,7 +94,7 @@ def test_fit_video_model(tmp_path):
     from dew.nn.backbones.video_dit import VideoDiT
 
     train_schedule, _, transform = get_diffusion_preset("edm")
-    trainer = GeneralDiffusionTrainer(
+    trainer = ObjectiveTrainer(
         model=VideoDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
         optimizer=optax.adam(1e-3),
         noise_schedule=train_schedule,

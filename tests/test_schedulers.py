@@ -178,7 +178,7 @@ def test_karras_weights_at_sigma_min():
 @pytest.mark.parametrize("P_mean,P_std", [(-0.4, 1.0), (-1.2, 1.2)])
 def test_edm_lognormal_sigma_distribution(rng, P_mean, P_std):
     """EDM training sigmas follow exp(N(P_mean, P_std^2)), defaulting to EDM2."""
-    from dew._utils_dissolve import RandomMarkovState
+    from dew.random_state import RandomMarkovState
 
     schedule = EDMNoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5, P_mean=P_mean, P_std=P_std)
     steps, _ = schedule.generate_timesteps(20000, RandomMarkovState(rng))

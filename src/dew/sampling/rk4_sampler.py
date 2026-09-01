@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from .common import DiffusionSampler
-from dew._utils_dissolve import RandomMarkovState, MarkovState
+from dew.random_state import RandomMarkovState, MarkovState
 from dew.objectives.diffusion.schedules import GeneralizedNoiseScheduler, get_coeff_shapes_tuple
 
 class RK4Sampler(DiffusionSampler):

@@ -18,7 +18,8 @@ from dew.objectives.diffusion.transforms import (
 )
 from dew.nn.autoencoders import AutoEncoder
 from dew.inputs import DiffusionInputConfig
-from dew._utils_dissolve import defaultTextEncodeModel, RandomMarkovState
+from dew.inputs.processors import defaultTextEncodeModel
+from dew.random_state import RandomMarkovState
 from dew.sampling.euler import EulerAncestralSampler
 from dew.sampling.loading import parse_config, load_from_wandb_run, load_from_wandb_registry
 
