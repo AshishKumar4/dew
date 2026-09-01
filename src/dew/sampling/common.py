@@ -6,8 +6,8 @@ import tqdm
 from flax import linen as nn
 from typing import List, Tuple, Dict, Any, Optional
 
-from dew.objectives.diffusion.transforms import DiffusionPredictionTransform
-from dew.objectives.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
+from dew.diffusion.transforms import DiffusionPredictionTransform
+from dew.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
 from dew.random_state import RandomMarkovState, MarkovState
 from dew.image_ops import clip_images
 from dew.nn.autoencoders import AutoEncoder

@@ -13,12 +13,12 @@ import pytest
 from flax import linen as nn
 
 from dew.inputs import DiffusionInputConfig
-from dew.objectives.diffusion.transforms import FlowMatchPredictionTransform, get_diffusion_preset
+from dew.diffusion.transforms import FlowMatchPredictionTransform, get_diffusion_preset
 from dew.sampling.ddim import DDIMSampler
 from dew.sampling.euler import EulerSampler
-from dew.objectives.diffusion.schedules import FlowMatchingScheduler
-from dew.objectives.diffusion.schedules.flow import compute_resolution_shift
-from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
+from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.diffusion.schedules.flow import compute_resolution_shift
+from dew.diffusion.schedules.common import get_coeff_shapes_tuple
 from dew.random_state import RandomMarkovState
 
 STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])

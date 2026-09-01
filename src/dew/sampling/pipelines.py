@@ -1,19 +1,22 @@
+from __future__ import annotations
+
 import jax
 import flax.linen as nn
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Union, List, Tuple, Type
+from typing import Optional, Dict, Any, Union, List, Tuple, Type, TYPE_CHECKING
 
-from dew.training import (
-    SimpleTrainState,
-    TrainState,
-)
+if TYPE_CHECKING:
+    # Typing-only: these two annotations are the whole use. An eager
+    # dew.training import here would cycle through the diffusion objective
+    # back into this package's samplers.
+    from dew.training import SimpleTrainState, TrainState
 from dew.sampling import (
     DiffusionSampler,
 )
-from dew.objectives.diffusion.schedules import (
+from dew.diffusion.schedules import (
     NoiseScheduler,
 )
-from dew.objectives.diffusion.transforms import (
+from dew.diffusion.transforms import (
     DiffusionPredictionTransform,
 )
 from dew.nn.autoencoders import AutoEncoder
