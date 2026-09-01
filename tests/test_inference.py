@@ -24,7 +24,7 @@ from dew.inputs import (
     CONDITIONAL_ENCODERS_REGISTRY, ConditioningEncoder, DiffusionInputConfig,
 )
 from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer
 from dew.checkpoints.utils import get_latest_checkpoint

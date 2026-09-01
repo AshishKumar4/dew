@@ -18,7 +18,7 @@ import pytest
 
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.diffusion.transforms import get_diffusion_preset
+from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer
 from dew.training.objective_trainer import TrainState
 from dew.objectives.base import EMASpec, Objective

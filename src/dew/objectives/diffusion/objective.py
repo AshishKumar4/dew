@@ -8,8 +8,8 @@ import numpy as np
 import optax
 
 from dew.objectives.base import Objective, EMASpec
-from dew.objectives.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
-from dew.objectives.diffusion.transforms import DiffusionPredictionTransform
+from dew.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
+from dew.diffusion.transforms import DiffusionPredictionTransform
 from dew.sampling.common import DiffusionSampler
 from dew.sampling.ddim import DDIMSampler
 from dew.nn.autoencoders.api import AutoEncoder

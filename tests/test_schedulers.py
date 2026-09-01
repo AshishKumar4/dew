@@ -15,13 +15,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-import dew.objectives.diffusion.schedules as schedulers
-from dew.objectives.diffusion.transforms import (
+import dew.diffusion.schedules as schedulers
+from dew.diffusion.transforms import (
     EpsilonPredictionTransform,
     VPredictionTransform,
     get_diffusion_preset,
 )
-from dew.objectives.diffusion.schedules import (
+from dew.diffusion.schedules import (
     CosineContinuousNoiseScheduler,
     CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
@@ -32,7 +32,7 @@ from dew.objectives.diffusion.schedules import (
     LinearNoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
-from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
+from dew.diffusion.schedules.common import get_coeff_shapes_tuple
 
 # Timesteps ascending from low to high noise, in each schedule's own domain:
 # an index into the beta table for the discrete schedules, [0, 1] for the
