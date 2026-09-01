@@ -51,8 +51,8 @@ class DataConfig:
     batch_size: int = 32
     image_size: int = 128
     val_steps_per_epoch: int = 4
-    # 'auto' reads the dataset name: anything containing 'online' streams
     loader: Literal["auto", "grain", "online"] = "auto"
+    """'auto' reads the dataset name: anything containing 'online' streams."""
     augmentation_mode: Literal["none", "flip_only", "flip_jitter"] = "flip_jitter"
     worker_count: int = 32
     read_thread_count: int = 140

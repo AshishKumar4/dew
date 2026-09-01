@@ -56,19 +56,19 @@ class JepaRunConfig(RunConfig):
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             learning_rate=1e-3, learning_rate_peak=1.5e-3, learning_rate_end=1e-6))
-    # Predictor kwargs, over the encoder's shared ones
     predictor: JsonDict = field(default_factory=dict)
-    # Set for video (V-JEPA), leave unset for images (I-JEPA)
+    """Predictor kwargs, over the encoder's shared ones."""
     frames_per_sample: Optional[int] = None
+    """Set for video (V-JEPA), leave unset for images (I-JEPA)."""
     num_target_blocks: int = 4
     target_scale: list[float] = field(default_factory=lambda: [0.15, 0.2])
     target_aspect: list[float] = field(default_factory=lambda: [0.75, 1.5])
-    # Target-encoder EMA momentum, ramped over momentum_steps
     momentum: list[float] = field(default_factory=lambda: [0.996, 1.0])
-    # Defaults to the full training run
+    """Target-encoder EMA momentum, ramped over momentum_steps."""
     momentum_steps: Optional[int] = None
-    # Number of classes for the frozen-encoder probes
+    """Defaults to the full training run."""
     probe_classes: Optional[int] = None
+    """Number of classes for the frozen-encoder probes."""
     probe_label_key: str = 'label'
     knn_k: int = 20
 
