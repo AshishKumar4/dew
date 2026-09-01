@@ -23,7 +23,7 @@ from dew.checkpoints.utils import get_latest_checkpoint
 RES = 8
 
 
-def make_trainer(tmp_path, name="smoke", load_from_checkpoint=None):
+def make_trainer(tmp_path, name="smoke", load_from_checkpoint=None, **kwargs):
     train_schedule, _, transform = get_diffusion_preset("edm")
     return ObjectiveTrainer(
         model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
@@ -41,6 +41,7 @@ def make_trainer(tmp_path, name="smoke", load_from_checkpoint=None):
         distributed_training=False,
         checkpoint_base_path=str(tmp_path),
         load_from_checkpoint=load_from_checkpoint,
+        **kwargs,
     )
 
 
@@ -159,6 +160,32 @@ def test_fit_skips_the_final_save_when_the_loop_already_wrote_that_step(tmp_path
 
     # One save, from the epoch's best-loss branch; the tail must not add a second
     assert written == [4]
+
+
+def test_checkpoint_every_steps_saves_on_its_own_cadence(tmp_path):
+    """Step-based checkpointing was implemented in the loop but never reachable
+    from fit(), and it only fired on steps that were also logging ticks."""
+    trainer = make_trainer(tmp_path, name="cadence", max_checkpoints_to_keep=4)
+    # The epoch's best-loss branch would otherwise add a save of its own
+    trainer.best_loss = -1.0
+    written = []
+    real_save = trainer.save
+
+    def spy(epoch=0, step=0, state=None, rngstate=None):
+        written.append(step)
+        return real_save(epoch=epoch, step=step, state=state, rngstate=rngstate)
+
+    trainer.save = spy
+    data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
+    trainer.fit(data, training_steps_per_epoch=6, epochs=1, val_steps_per_epoch=0,
+                checkpoint_every_steps=2)
+    trainer.wait_for_checkpoints()
+
+    # 2 and 4 mid-epoch, then 6 from the loop rather than a duplicate final save
+    assert written == [2, 4, 6]
+    assert trainer.last_saved_step == 6
+    assert set(trainer.checkpointer.all_steps()) == {2, 4, 6}
+
 
 
 def test_fit_that_never_trains_checkpoints_step_zero(tmp_path):

@@ -12,7 +12,7 @@ import os
 import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
-from typing import Dict, Callable, Any, Tuple
+from typing import Dict, Callable, Any, Tuple, Optional
 from dew.random_state import RandomMarkovState
 from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, model_flops_utilization,
@@ -482,12 +482,11 @@ class SimpleTrainer:
                             **self._throughput_metrics(elapsed, steps_since_log),
                         }, step=current_step)
                     last_log_time, steps_since_log = now, 0
-                # Save the model every few steps
-                if save_every and i % save_every == 0 and i > 0:
-                    print(f"Saving model after {save_every} step {current_step}")
-                    self.save(current_epoch, current_step, train_state, rng_state)
-                    print(f"Saving done by process index {process_index}")
-                    print(colored(f"Epoch done on index {process_index} => {current_epoch} Loss: {epoch_loss/train_steps_per_epoch}", 'green'))
+
+            # On its own clock, not the logging one: nested inside the log tick,
+            # a cadence that did not divide log_every never fired at all.
+            if save_every and current_step % save_every == 0:
+                self.save(current_epoch, current_step, train_state, rng_state)
 
         if tracing:
             # The window outlived the epoch, and a trace left running takes the
@@ -538,7 +537,8 @@ class SimpleTrainer:
         return metrics
 
 
-    def fit(self, data, train_steps_per_epoch, epochs, train_step_args={}, val_steps_per_epoch=5, validation_step_args={}):
+    def fit(self, data, train_steps_per_epoch, epochs, train_step_args={}, val_steps_per_epoch=5,
+            validation_step_args={}, checkpoint_every_steps: Optional[int] = None):
         local_batch_size = data.get('local_batch_size', 0)
         self.global_batch_size = data.get(
             'global_batch_size', local_batch_size * jax.process_count())
@@ -577,6 +577,7 @@ class SimpleTrainer:
                 train_steps_per_epoch,
                 self.latest_step,
                 rng_state,
+                save_every=checkpoint_every_steps,
             )
             print(colored(f"Epoch done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
             
