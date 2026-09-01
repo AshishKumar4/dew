@@ -26,7 +26,7 @@ from dew.inputs import (
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
 from dew.sampling.euler import EulerAncestralSampler
-from dew.training import GeneralDiffusionTrainer
+from dew.training import ObjectiveTrainer
 from dew.checkpoints.utils import get_latest_checkpoint
 
 RES = 8
@@ -36,7 +36,7 @@ MODEL_KWARGS = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, ml
 def make_trainer(tmp_path, name="inference"):
     """The tiny unconditional DiT of tests/test_trainer.py, on one device."""
     train_schedule, _, transform = get_diffusion_preset("edm")
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=SimpleDiT(**MODEL_KWARGS),
         optimizer=optax.adam(1e-3),
         noise_schedule=train_schedule,
