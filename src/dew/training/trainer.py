@@ -13,10 +13,13 @@ import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
 from typing import Dict, Callable, Any, Tuple
-from dew._utils_dissolve import (
-    DEFAULT_MIN_SHARD_SIZE, DevicePrefetchIterator, RandomMarkovState, batch_sharding,
-    build_mesh, enable_compilation_cache, model_flops_utilization, shard_batch,
-    state_sharding_tree, step_flops,
+from dew.random_state import RandomMarkovState
+from dew.telemetry.instrumentation import (
+    enable_compilation_cache, model_flops_utilization, step_flops,
+)
+from .distributed import (
+    DEFAULT_MIN_SHARD_SIZE, DevicePrefetchIterator, batch_sharding, build_mesh,
+    shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
 from dataclasses import dataclass

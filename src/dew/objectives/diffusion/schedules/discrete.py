@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import Union
-from dew._utils_dissolve import RandomMarkovState  
+from dew.random_state import RandomMarkovState  
 from .common import NoiseScheduler, reshape_rates, get_coeff_shapes_tuple
 
 class DiscreteNoiseScheduler(NoiseScheduler):

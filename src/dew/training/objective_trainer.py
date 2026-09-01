@@ -11,11 +11,14 @@ import functools
 from dew.objectives.diffusion.schedules import NoiseScheduler
 from dew.objectives.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
 
-from dew._utils_dissolve import RandomMarkovState, serialize_model, get_latest_checkpoint, shard_batch
+from dew.checkpoints.utils import get_latest_checkpoint, serialize_model
+from dew.random_state import RandomMarkovState
 from dew.inputs import ConditioningEncoder, ConditionalInputConfig, DiffusionInputConfig
 
 from .trainer import SimpleTrainer, SimpleTrainState, Metrics
-from dew.objectives.base import Objective, DiffusionObjective
+from .distributed import shard_batch
+from dew.objectives.base import Objective
+from dew.objectives.diffusion import DiffusionObjective
 
 from dew.nn.autoencoders.api import AutoEncoder
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -54,14 +57,13 @@ class TrainState(SimpleTrainState):
 
 from dew.eval.common import EvaluationMetric
 
-class GeneralDiffusionTrainer(SimpleTrainer):
-    """
-    General trainer for diffusion models supporting both images and videos.
-    
-    Extends DiffusionTrainer to support:
-    1. Both image data (4D tensors: B,H,W,C) and video data (5D tensors: B,T,H,W,C)
-    2. Multiple conditioning inputs
-    3. Various model architectures
+class ObjectiveTrainer(SimpleTrainer):
+    """Runs an Objective: gradients, sharding, EMA, checkpoints and logging.
+
+    Handles image data (4D tensors: B,H,W,C) and video data (5D tensors:
+    B,T,H,W,C), any number of conditioning inputs and any model architecture.
+    What the loss is stays with the objective, which defaults to diffusion over
+    `model`.
     """
     
     def __init__(self,
@@ -104,7 +106,6 @@ class GeneralDiffusionTrainer(SimpleTrainer):
                 otherwise the EMA runs on a different clock than the params.
             **kwargs: Additional arguments for parent class
         """
-        # Initialize with parent DiffusionTrainer but without encoder parameter
         input_shapes = input_config.get_input_shapes(
             autoencoder=autoencoder,
         )
@@ -180,7 +181,7 @@ class GeneralDiffusionTrainer(SimpleTrainer):
         model: nn.Module = None,
         use_dynamic_scale: bool = False
     ) -> TrainState:
-        print("Generating states for DiffusionTrainer")
+        print("Generating states for ObjectiveTrainer")
 
         def init_fn():
             next_rngs, subkey = jax.random.split(rngs)

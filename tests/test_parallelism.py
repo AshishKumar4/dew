@@ -16,9 +16,9 @@ from dew.inputs import DiffusionInputConfig
 from dew.eval.common import EvaluationMetric
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
-from dew.training import GeneralDiffusionTrainer
+from dew.training import ObjectiveTrainer
 from dew.objectives.base import EMASpec, Objective
-from dew._utils_dissolve import (
+from dew.training.distributed import (
     DevicePrefetchIterator, batch_sharding, build_mesh, parameter_spec, shard_batch,
 )
 
@@ -32,7 +32,7 @@ TINY = 256
 def make_trainer(tmp_path, name, distributed_training, fsdp_size=1,
                  optimizer=None, **kwargs):
     train_schedule, _, transform = get_diffusion_preset("edm")
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
         optimizer=optax.adam(1e-3) if optimizer is None else optimizer,
         noise_schedule=train_schedule,
@@ -304,7 +304,7 @@ def make_deterministic_trainer(tmp_path, name, grad_accum_steps):
     optimizer = optax.sgd(0.5)
     if grad_accum_steps > 1:
         optimizer = optax.MultiSteps(optimizer, every_k_schedule=grad_accum_steps)
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=model,
         optimizer=optimizer,
         input_config=input_config,

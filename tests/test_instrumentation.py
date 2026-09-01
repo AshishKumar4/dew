@@ -15,9 +15,10 @@ import pytest
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.transforms import get_diffusion_preset
-from dew.training import GeneralDiffusionTrainer
-from dew._utils_dissolve import (
-    DevicePrefetchIterator, enable_compilation_cache, model_flops_utilization, step_flops,
+from dew.training import ObjectiveTrainer
+from dew.training.distributed import DevicePrefetchIterator
+from dew.telemetry.instrumentation import (
+    enable_compilation_cache, model_flops_utilization, step_flops,
 )
 
 RES = 8
@@ -26,7 +27,7 @@ BATCH = 8
 
 def make_trainer(tmp_path, **kwargs):
     train_schedule, _, transform = get_diffusion_preset("edm")
-    return GeneralDiffusionTrainer(
+    return ObjectiveTrainer(
         model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
         optimizer=optax.adam(1e-3),
         noise_schedule=train_schedule,
@@ -80,11 +81,12 @@ def test_mfu_is_skipped_on_unknown_hardware():
 
 
 def test_mfu_scales_with_time_and_devices(monkeypatch):
-    import dew._utils_dissolve as utils
-    monkeypatch.setitem(utils.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
-    assert utils.model_flops_utilization(50.0, 1.0, 1) == pytest.approx(0.5)
-    assert utils.model_flops_utilization(50.0, 1.0, 2) == pytest.approx(0.25)
-    assert utils.model_flops_utilization(50.0, 2.0, 1) == pytest.approx(0.25)
+    from dew.telemetry import instrumentation
+    monkeypatch.setitem(instrumentation.PEAK_FLOPS_PER_DEVICE,
+                        jax.devices()[0].device_kind, 100.0)
+    assert instrumentation.model_flops_utilization(50.0, 1.0, 1) == pytest.approx(0.5)
+    assert instrumentation.model_flops_utilization(50.0, 1.0, 2) == pytest.approx(0.25)
+    assert instrumentation.model_flops_utilization(50.0, 2.0, 1) == pytest.approx(0.25)
 
 
 def test_fit_reports_throughput_to_wandb(tmp_path):

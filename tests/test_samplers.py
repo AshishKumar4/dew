@@ -25,7 +25,7 @@ from dew.sampling.multistep_dpm import MultiStepDPM
 from dew.sampling.rk4_sampler import RK4Sampler
 from dew.objectives.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
 from dew.objectives.diffusion.schedules.common import get_coeff_shapes_tuple
-from dew._utils_dissolve import RandomMarkovState
+from dew.random_state import RandomMarkovState
 
 DATA_STD = 0.3
 

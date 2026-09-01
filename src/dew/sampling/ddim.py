@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 from .common import DiffusionSampler
-from dew._utils_dissolve import MarkovState, RandomMarkovState
+from dew.random_state import MarkovState, RandomMarkovState
 import jax
 from dew.objectives.diffusion.schedules import get_coeff_shapes_tuple
 
