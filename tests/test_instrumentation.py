@@ -117,11 +117,37 @@ def test_compilation_cache_directory_is_configured(tmp_path):
     assert jax.config.jax_compilation_cache_dir == path
 
 
-def test_profiler_writes_a_trace(tmp_path):
-    trainer = make_trainer(tmp_path, profile_steps=2)
-    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
+def test_profiler_writes_a_trace(tmp_path, monkeypatch):
+    """The window has to open after the warmup: a trace that starts at step 0
+    is mostly compilation, and reports its occupancy instead of the loop's."""
+    trainer = make_trainer(tmp_path, profile_steps=2, profile_warmup_steps=2)
+    started_at = []
+    real_start = jax.profiler.start_trace
+
+    def spy(*args, **kwargs):
+        # The train state is replaced after every step, so its counter is the
+        # number of steps that have run by the time the trace opens.
+        started_at.append(int(trainer.state.step))
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(jax.profiler, "start_trace", spy)
+    trainer.fit(data_dict(), training_steps_per_epoch=5, epochs=1, val_steps_per_epoch=0)
+
+    assert started_at == [2], "the trace did not open at the configured step"
     assert os.path.isdir(trainer.profile_path())
     assert any(files for _, _, files in os.walk(trainer.profile_path()))
+
+
+def test_an_unfinished_profile_window_is_still_closed(tmp_path):
+    """A window wider than the epoch has to close anyway: a trace left running
+    takes the next one down with it."""
+    trainer = make_trainer(tmp_path / "long", profile_steps=8, profile_warmup_steps=1)
+    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
+    assert any(files for _, _, files in os.walk(trainer.profile_path()))
+
+    second = make_trainer(tmp_path / "short", profile_steps=1, profile_warmup_steps=0)
+    second.fit(data_dict(), training_steps_per_epoch=2, epochs=1, val_steps_per_epoch=0)
+    assert any(files for _, _, files in os.walk(second.profile_path()))
 
 
 def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
