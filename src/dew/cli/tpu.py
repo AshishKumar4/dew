@@ -27,7 +27,11 @@ READY_TIMEOUT = 1800
 POLL_SECONDS = 10
 
 Positional = tyro.conf.Positional
-Optional = lambda what, name: Annotated[what | None, tyro.conf.arg(metavar=name)]  # noqa: E731
+
+
+def Optional(what: type, metavar: str) -> object:
+    """An optional flag that shows a name instead of {None}|STR in --help."""
+    return Annotated[what | None, tyro.conf.arg(metavar=metavar)]
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -50,7 +54,7 @@ def _open(cmd: Base) -> tuple[config.TpuConfig, Gcloud]:
 def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) -> str:
     """The zone a TPU lives in: the flag, the cache, or the first zone that has it."""
     if wanted:
-        config.cache_zone(name, wanted)
+        # Not cached: an unverified flag would send every later command astray.
         return wanted
     cached = config.cached_zone(name)
     if cached:
@@ -67,6 +71,10 @@ def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) 
     raise SystemExit(f"{name} is in none of {', '.join(cfg.zones)}")
 
 
+def _missing(tpu: Tpu) -> SystemExit:
+    return SystemExit(f"{tpu.name} is not in {tpu.zone}. Pass --zone to look elsewhere.")
+
+
 def _tpu(cmd: Base, cfg: config.TpuConfig, gcloud: Gcloud, name: str) -> Tpu:
     return Tpu(gcloud, name, _zone(gcloud, cfg, name, cmd.zone), cfg.ssh_user)
 
@@ -78,7 +86,7 @@ def _slice(tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> tuple[int, s
         return config.worker_count(kind), kind
     node = tpu.describe()
     if node is None:
-        raise SystemExit(f"{tpu.name} is not in {tpu.zone}")
+        raise _missing(tpu)
     return node.workers, node.accelerator_type or type_hint or cfg.accelerator_type
 
 
@@ -164,7 +172,7 @@ def _hosts(tpu: Tpu, count: int) -> list[str]:
         return [f"<worker-{index}-ip>" for index in range(count)]
     node = tpu.describe()
     if node is None:
-        raise SystemExit(f"{tpu.name} is not in {tpu.zone}")
+        raise _missing(tpu)
     return [ip or node.internal_ips[index] for index, ip in enumerate(node.ips)]
 
 
@@ -367,7 +375,7 @@ class Describe(Base):
         if node is None:
             if gcloud.dry_run:
                 return 0
-            raise SystemExit(f"{self.name} is not in {tpu.zone}")
+            raise _missing(tpu)
         _table(("FIELD", "VALUE"), [
             ("name", node.name),
             ("zone", node.zone),

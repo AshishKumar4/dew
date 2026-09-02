@@ -610,11 +610,12 @@ def test_zone_search_follows_the_configured_order_and_caches(fake):
     assert zones_seen(fake.gcloud_calls(), "describe") == ["europe-west4-a"]
 
 
-def test_the_zone_flag_skips_the_search(fake):
+def test_the_zone_flag_skips_the_search_and_is_not_cached(fake):
     fake.offer("slice", "us-east1-d")
     assert run("describe", "slice", "--zone", "us-east1-d") == 0
     assert zones_seen(fake.gcloud_calls(), "describe") == ["us-east1-d"]
-    assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-east1-d"}
+    # An unverified flag must not decide where later commands look.
+    assert not (config_dir() / "zones.json").exists()
 
 
 # ---------------------------------------------------------------------- config
