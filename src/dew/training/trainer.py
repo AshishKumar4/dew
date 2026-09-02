@@ -50,6 +50,38 @@ class SimpleTrainState(train_state.TrainState):
 def _epoch_loss(metrics):
     return metrics['loss']
 
+
+def _checkpoint_handler_registry() -> ocp.CheckpointHandlerRegistry:
+    """The pytree handler for a save, writing replicated arrays cooperatively.
+
+    A replicated array is written by one replica while every other replica
+    idles, unless replica-parallel is on: then each replica writes its own
+    slice of the array. The option is `use_replica_parallel` on orbax's
+    jax.Array type handler (`ArrayHandler.__init__`, orbax 0.12.4
+    `_src/serialization/jax_array_handlers.py`), and orbax defaults it from
+    the environment - off when JAX_PLATFORMS names 'gpu' or 'cuda'
+    (`_get_default_use_replica_parallel`), on everywhere else. Dew's mesh has
+    replicas whenever fsdp_size < device_count, so this asks for the split
+    rather than inheriting whichever way the launcher spelled the platform.
+
+    Only the jax.Array entry changes. Every other leaf type keeps the handler
+    orbax registered for it, and the array metadata store stays orbax's
+    default, so the checkpoint still records the write shape of each array.
+    """
+    handlers = ocp.type_handlers
+    array_handler = handlers.ArrayHandler(
+        use_replica_parallel=True,
+        array_metadata_store=ocp.v1.options.ArrayOptions.Saving().array_metadata_store)
+    leaf_handlers = handlers.create_type_handler_registry(*(
+        (leaf_type, array_handler if leaf_type is jax.Array
+         else handlers.get_type_handler(leaf_type))
+        for leaf_type in handlers.supported_types()))
+    handler = ocp.PyTreeCheckpointHandler(type_handler_registry=leaf_handlers)
+    registry = ocp.DefaultCheckpointHandlerRegistry()
+    registry.add(None, ocp.args.PyTreeSave, handler)
+    registry.add(None, ocp.args.PyTreeRestore, handler)
+    return registry
+
 @dataclass
 class SimpleTrainer:
     state: SimpleTrainState
@@ -170,7 +202,9 @@ class SimpleTrainer:
             ]),
             best_fn=_epoch_loss, best_mode='min',
             create=True, enable_async_checkpointing=True)
-        self.checkpointer = ocp.CheckpointManager(self.checkpoint_path(), options=options)
+        self.checkpointer = ocp.CheckpointManager(
+            self.checkpoint_path(), options=options,
+            handler_registry=_checkpoint_handler_registry())
 
         # A run into a directory that already holds steps trains a whole epoch
         # and only then discovers that orbax will not overwrite one. Nothing
