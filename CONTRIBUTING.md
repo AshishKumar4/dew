@@ -26,6 +26,7 @@ Anything that implements a published architecture, schedule, sampler or loss is 
 - Types are narrow and honest. No `Any`, no casts to make a checker quiet.
 - Comments say why, never what or what changed. Docstrings describe the code as it is.
 - Performance is measured, not assumed. A change that claims to be faster ships with the number, the command that produced it and the hardware it ran on. Defaults are the fast ones.
+- Performance never costs anything else. An optimization is accepted only if the loss, gradients and outputs match the code it replaces to fp32 tolerance, nothing observable is removed, and no reduced-precision path, clipping or approximation is introduced. A test that would fail if a term were dropped ships with it.
 
 ## Tests
 
