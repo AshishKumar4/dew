@@ -140,8 +140,8 @@ dew-tpu train dew-16 --job lm-1 -- recipes/lm/train.py --data.batch-size 64
 ```
 rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-0-ip>:~/dew/'
 rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-1-ip>:~/dew/'
-gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=0 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd ~/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-0.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
-gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=1 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd ~/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-1.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
+gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=0 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd $HOME/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-0.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
+gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=1 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd $HOME/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-1.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
 job lm-1 on 2 worker(s), following worker 0
 gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=0 '--command=tail -f -n 200 $HOME/dew-runs/lm-1/worker-0.log' --project=dew-training
 ```
