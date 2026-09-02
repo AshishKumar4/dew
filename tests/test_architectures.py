@@ -30,6 +30,7 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.eval.common import EvaluationMetric
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
+from dew.objectives.lm import LMObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import MODEL_REGISTRY, build_model
 from dew.training import ObjectiveTrainer
@@ -88,10 +89,16 @@ class Case:
     """Video architectures take (frames, H, W, C) samples; 0 means images."""
     predictor: Optional[dict] = None
     """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
+    seq_len: int = 0
+    """Set for language models: batches are token windows, not images."""
 
     @property
     def is_jepa(self) -> bool:
         return self.predictor is not None
+
+    @property
+    def is_lm(self) -> bool:
+        return self.seq_len > 0
 
     @property
     def sample_shape(self) -> tuple:
@@ -114,6 +121,9 @@ ENCODER = {"patch_size": PATCH, "emb_features": 32, "num_layers": 2, "num_heads"
 PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
              "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}
 
+VOCAB = 64
+SEQ_LEN = 16
+
 CASES = [
     Case("unet", UNET),
     # Both U-shaped stacks split their layers into a down and an up half
@@ -133,6 +143,9 @@ CASES = [
     Case("jepa_encoder", ENCODER, predictor=PREDICTOR),
     Case("jepa_video_encoder", {**ENCODER, "num_layers": 1},
          predictor={**PREDICTOR, "factorized": True}, frames=FRAMES),
+    Case("causal_transformer", {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2,
+                                "num_heads": 2, "num_kv_heads": 1, "mlp_ratio": 2,
+                                "max_seq_len": SEQ_LEN}, seq_len=SEQ_LEN),
 ]
 
 # jepa_predictor has no training step of its own: it is built through the
@@ -200,10 +213,13 @@ def text_condition() -> ConditionalInputConfig:
 def batches(case: Case):
     """uint8-range samples, as the data pipeline delivers them."""
     rng = np.random.default_rng(0)
-    batch = {case.sample_key: rng.integers(
-        0, 256, size=(BATCH, *case.sample_shape)).astype(np.float32)}
-    if not case.is_jepa:
-        batch["text"] = np.ones((BATCH, TEXT_TOKENS), np.int32)
+    if case.is_lm:
+        batch = {"text": rng.integers(0, VOCAB, size=(BATCH, case.seq_len + 1)).astype(np.int32)}
+    else:
+        batch = {case.sample_key: rng.integers(
+            0, 256, size=(BATCH, *case.sample_shape)).astype(np.float32)}
+        if not case.is_jepa:
+            batch["text"] = np.ones((BATCH, TEXT_TOKENS), np.int32)
 
     def source():
         while True:
@@ -220,9 +236,10 @@ def shape_metric(seen):
     afterwards is what makes a validation step that never ran a failure.
     """
     def record(artifacts, batch):
-        artifacts = np.asarray(artifacts)
+        # The language model objective returns a dict; its cross entropy is the artifact.
+        artifacts = np.asarray(artifacts["ce"] if isinstance(artifacts, dict) else artifacts)
         seen.append(artifacts.shape)
-        return float(artifacts.std())
+        return float(artifacts.std()) if artifacts.ndim else float(artifacts)
 
     return EvaluationMetric(function=record, name="artifact_spread")
 
@@ -261,6 +278,10 @@ def make_trainer(case: Case, tmp_path, fsdp_size, seen):
         checkpoint_base_path=str(tmp_path),
         eval_metrics=[shape_metric(seen)],
     )
+
+    if case.is_lm:
+        objective = LMObjective(model, case.seq_len, vocab_size=VOCAB)
+        return ObjectiveTrainer(input_config=None, objective=objective, **common)
 
     if case.is_jepa:
         objective = JepaObjective(
@@ -322,7 +343,9 @@ def assert_run_landed(trainer, state, case, seen, losses):
 
     # fit() validates once as a pre-training sanity check and once after the
     # epoch, both from the EMA parameters as they sit on the mesh.
-    if case.is_jepa:
+    if case.is_lm:
+        expected = ()
+    elif case.is_jepa:
         expected = (BATCH, case.config["emb_features"])
     else:
         expected = (BATCH, *case.sample_shape)

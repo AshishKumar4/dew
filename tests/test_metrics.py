@@ -210,6 +210,7 @@ def test_metrics_package_exports_resolve():
         'get_psnr_metric',
         'ssim',
         'get_ssim_metric',
+        'get_perplexity_metric',
     }
     for name in metrics.__all__:
         assert getattr(metrics, name) is not None
