@@ -14,13 +14,13 @@
   <text x="24" y="234.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" letter-spacing="1.5" fill="#59636e">OBJECTIVES</text>
   <rect x="150" y="196" width="331.3333333333333" height="68" rx="8" fill="#e6fbf7" stroke="#2fb8a8" stroke-width="1.25"/>
   <text x="168" y="226" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">dew.objectives</text>
-  <text x="168" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Diffusion, JEPA; the plug-in</text>
+  <text x="168" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Diffusion, JEPA, language models; the plug-in</text>
   <rect x="497.3333333333333" y="196" width="331.3333333333333" height="68" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
   <text x="515.3333333333333" y="226" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">dew.sampling</text>
-  <text x="515.3333333333333" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">samplers, guidance, pipelines</text>
+  <text x="515.3333333333333" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">samplers, guidance, generation, pipelines</text>
   <rect x="844.6666666666666" y="196" width="331.3333333333333" height="68" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
   <text x="862.6666666666666" y="226" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">dew.eval</text>
-  <text x="862.6666666666666" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">FID, CLIP score, PSNR, SSIM</text>
+  <text x="862.6666666666666" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">FID, CLIP score, PSNR, SSIM, perplexity</text>
   <text x="24" y="322.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" letter-spacing="1.5" fill="#59636e">PRIMITIVES</text>
   <rect x="150" y="284" width="331.3333333333333" height="68" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
   <text x="168" y="314" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">dew.nn</text>
@@ -30,6 +30,6 @@
   <text x="515.3333333333333" y="336" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">schedules, transforms, presets</text>
   <rect x="844.6666666666666" y="284" width="331.3333333333333" height="68" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
   <text x="862.6666666666666" y="314" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">dew.data / dew.inputs</text>
-  <text x="862.6666666666666" y="336" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Grain sources, conditioning encoders</text>
+  <text x="862.6666666666666" y="336" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Grain sources, tokenizers, conditioning</text>
   <text x="150" y="378" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="start">Each layer imports only the layers below it.</text>
 </svg>
