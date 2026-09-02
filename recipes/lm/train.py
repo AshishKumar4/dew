@@ -91,8 +91,8 @@ def build_lm(config: LmRunConfig, vocab_size: int, max_seq_len: int):
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
     model_config = apply_precision_policy(
         architecture,
-        # The token files decide the vocabulary, so that one is not overridable.
-        {"max_seq_len": max_seq_len, **config.model.config, **suffix_flags,
+        # Data decides the vocabulary. Training and sampling decide the context.
+        {**config.model.config, **suffix_flags, "max_seq_len": max_seq_len,
          "vocab_size": vocab_size},
         dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     return build_model(architecture, model_config), model_config
