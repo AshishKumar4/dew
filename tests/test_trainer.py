@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 import pytest
 
 from dew.inputs import DiffusionInputConfig
@@ -150,9 +151,10 @@ def test_fit_skips_the_final_save_when_the_loop_already_wrote_that_step(tmp_path
     written = []
     real_save = trainer.save
 
-    def spy(epoch=0, step=0, state=None, rngstate=None):
+    def spy(epoch=0, step=0, state=None, rngstate=None, metrics=None):
         written.append(step)
-        return real_save(epoch=epoch, step=step, state=state, rngstate=rngstate)
+        return real_save(epoch=epoch, step=step, state=state, rngstate=rngstate,
+                         metrics=metrics)
 
     trainer.save = spy
     data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
@@ -171,9 +173,10 @@ def test_checkpoint_every_steps_saves_on_its_own_cadence(tmp_path):
     written = []
     real_save = trainer.save
 
-    def spy(epoch=0, step=0, state=None, rngstate=None):
-        written.append(step)
-        return real_save(epoch=epoch, step=step, state=state, rngstate=rngstate)
+    def spy(epoch=0, step=0, state=None, rngstate=None, metrics=None):
+        written.append((step, metrics))
+        return real_save(epoch=epoch, step=step, state=state, rngstate=rngstate,
+                         metrics=metrics)
 
     trainer.save = spy
     data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
@@ -182,10 +185,66 @@ def test_checkpoint_every_steps_saves_on_its_own_cadence(tmp_path):
     trainer.wait_for_checkpoints()
 
     # 2 and 4 mid-epoch, then 6 from the loop rather than a duplicate final save
-    assert written == [2, 4, 6]
+    assert written == [(2, None), (4, None), (6, None)]
     assert trainer.last_saved_step == 6
     assert set(trainer.checkpointer.all_steps()) == {2, 4, 6}
+    assert trainer.checkpointer.best_step() is None, "a cadence save became the best"
 
+
+# --------------------------------------------------------------------------
+# Which checkpoint is the best one
+# --------------------------------------------------------------------------
+
+def test_best_step_is_the_lowest_epoch_loss(tmp_path):
+    """The epoch loss rides along with the save, and the lowest one is what
+    orbax keeps and reports however the run wanders."""
+    trainer = make_trainer(tmp_path, name="best", max_checkpoints_to_keep=1)
+    for step, loss in ((1, 0.9), (2, 0.3), (3, 0.7)):
+        trainer.save(epoch=step, step=step, metrics={"loss": loss})
+    trainer.wait_for_checkpoints()
+
+    assert trainer.checkpointer.best_step() == 2
+    # The newest step is kept for resuming, the lowest loss for publishing
+    assert set(trainer.checkpointer.all_steps()) == {2, 3}
+
+    # A metric-less save is newer than the best and must not displace it
+    trainer.save(epoch=4, step=4)
+    trainer.wait_for_checkpoints()
+    assert trainer.checkpointer.best_step() == 2
+    assert set(trainer.checkpointer.all_steps()) == {2, 4}
+
+    reopened = make_trainer(tmp_path, name="best")
+    assert reopened.checkpointer.best_step() == 2, "the metric did not survive a reopen"
+
+
+def test_resume_from_a_checkpoint_that_stored_its_own_best_state(tmp_path):
+    """Checkpoints holding a second train state under 'best_state' still
+    resume; the copy is skipped rather than restored."""
+    trainer = make_trainer(tmp_path, name="old-layout")
+    trainer.state = trainer.state.apply_gradients(
+        grads=jax.tree.map(jnp.ones_like, trainer.state.params)).apply_ema(0.99)
+
+    written = str(tmp_path / "old-layout-checkpoint")
+    manager = ocp.CheckpointManager(
+        written, options=ocp.CheckpointManagerOptions(create=True))
+    manager.save(2, args=ocp.args.PyTreeSave({
+        'rngs': trainer.get_rngstate(),
+        'state': trainer.get_state(),
+        'best_state': trainer.get_state(),
+        'best_loss': np.array(0.25),
+        'epoch': 1,
+    }), force=True)
+    manager.wait_until_finished()
+    manager.close()
+
+    restored = make_trainer(tmp_path, name="resumed", load_from_checkpoint=written)
+    assert restored.latest_step == 2
+    assert int(restored.state.step) == 1, "the train state was not restored"
+    assert restored.best_loss == 0.25
+    assert not hasattr(restored, "best_state")
+    for before, after in zip(jax.tree.leaves(trainer.state.params),
+                             jax.tree.leaves(restored.state.params)):
+        np.testing.assert_allclose(np.asarray(before), np.asarray(after))
 
 
 def test_fit_that_never_trains_checkpoints_step_zero(tmp_path):
