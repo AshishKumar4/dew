@@ -97,9 +97,14 @@ class LMObjective(Objective):
                 f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
-        logits = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  positions=None if positions is None else positions[:, :-1],
-                                  segment_ids=None if segment_ids is None else segment_ids[:, :-1])
+        # Only a packed batch names these, and only a model that packs takes
+        # them: an unpacked run calls the model exactly as it always did.
+        packing = {}
+        if positions is not None:
+            packing["positions"] = positions[:, :-1]
+        if segment_ids is not None:
+            packing["segment_ids"] = segment_ids[:, :-1]
+        logits = self.model.apply(params, inputs, train=train, rngs=rngs, **packing)
         logits = logits.astype(jnp.float32)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
         correct = (jnp.argmax(logits, axis=-1) == targets).astype(losses.dtype)
