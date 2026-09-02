@@ -164,7 +164,7 @@ class Unet(nn.Module):
                                         use_self_and_cross=attention_config.get("use_self_and_cross", True),
                                         precision=attention_config.get("precision", self.precision),
                                         only_pure_attention=attention_config.get("only_pure_attention", True),
-                                        force_fp32_for_softmax=middle_attention.get("force_fp32_for_softmax", False),
+                                        force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
                                         norm_inputs=attention_config.get("norm_inputs", True),
                                         explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
                                         name=f"up_{i}_attention_{j}")(x, textcontext)
