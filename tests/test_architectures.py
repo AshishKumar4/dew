@@ -88,8 +88,6 @@ class Case:
     """Video architectures take (frames, H, W, C) samples; 0 means images."""
     predictor: Optional[dict] = None
     """Set for JEPA: `architecture` is the encoder and this builds its predictor."""
-    fsdp_xfail: Optional[str] = None
-    """Non-None records a real defect the fsdp leg hits, with its error."""
 
     @property
     def is_jepa(self) -> bool:
@@ -346,8 +344,6 @@ def test_architecture_trains_data_parallel(case, tmp_path):
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_architecture_trains_under_fsdp(case, tmp_path):
     """2x4: the parameter tree really split four ways, moments and EMA with it."""
-    if case.fsdp_xfail:
-        pytest.xfail(case.fsdp_xfail)
     _, state = run_case(case, tmp_path, fsdp_size=4)
 
     sharded = fsdp_leaves(state.params)
