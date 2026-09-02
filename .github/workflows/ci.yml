@@ -35,4 +35,10 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
     - name: Test with pytest
       run: |
-        JAX_PLATFORMS=cpu pytest -m "not network" -q
+        JAX_PLATFORMS=cpu pytest -m "not network" -q -ra --junitxml=pytest-report.xml
+    - name: Upload the test report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pytest-report
+        path: pytest-report.xml
