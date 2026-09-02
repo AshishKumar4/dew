@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6e7681"/></marker></defs>
+  <rect x="24" y="24" width="760" height="84" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="40" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">recipes<tspan fill="#9198a1" font-weight="400" dx="9">dew.config</tspan></text>
+  <text x="40" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">RunConfig, one tyro flag per field</text>
+  <text x="40" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">the logged config is the one that ran</text>
+  <rect x="808" y="24" width="368" height="84" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="824" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.interop</text>
+  <text x="824" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">params to and from safetensors</text>
+  <text x="824" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">HF layout for transformers, vLLM, verl</text>
+  <rect x="24" y="148" width="1152" height="104" rx="10" fill="#1c2128" stroke="#30363d" stroke-width="1.25"/>
+  <text x="40" y="175" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.training<tspan fill="#9198a1" font-weight="400" dx="9">ObjectiveTrainer</tspan></text>
+  <text x="40" y="198" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">(data, fsdp) mesh, jit with donation, one compile per run</text>
+  <text x="40" y="217" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">EMA on the update clock, gradient accumulation, bf16 compute over fp32 params</text>
+  <text x="40" y="236" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">async orbax checkpoints (latest and best, mid-epoch resume), wandb, profiler, MFU</text>
+  <rect x="24" y="292" width="440" height="104" rx="10" fill="#0f2a27" stroke="#2fb8a8" stroke-width="1.25"/>
+  <text x="40" y="319" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.objectives<tspan fill="#9198a1" font-weight="400" dx="9">the seam</tspan></text>
+  <text x="40" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">Objective: init_params, loss, validation step</text>
+  <text x="40" y="361" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">DiffusionObjective, JepaObjective</text>
+  <text x="40" y="380" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">next: language models</text>
+  <rect x="488" y="292" width="340" height="104" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="504" y="319" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.sampling</text>
+  <text x="504" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">DDPM, DDIM, Euler, Heun, RK4, DPM</text>
+  <text x="504" y="361" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">interval-limited CFG, pipelines</text>
+  <rect x="852" y="292" width="324" height="104" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="868" y="319" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.eval</text>
+  <text x="868" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">FID, CLIP score, PSNR, SSIM</text>
+  <text x="868" y="361" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">linear and kNN probes</text>
+  <rect x="24" y="436" width="440" height="122" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="40" y="463" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.nn<tspan fill="#9198a1" font-weight="400" dx="9">pure Flax</tspan></text>
+  <text x="40" y="486" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">UNet, UNet3D, UViT, DiT, MMDiT, SSM-DiT,</text>
+  <text x="40" y="505" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">VideoDiT, JEPA encoders, VAE</text>
+  <text x="40" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">scan orders, one attention path for all kernels</text>
+  <rect x="488" y="436" width="340" height="122" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="504" y="463" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.diffusion<tspan fill="#9198a1" font-weight="400" dx="9">the maths</tspan></text>
+  <text x="504" y="486" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">schedules and prediction transforms,</text>
+  <text x="504" y="505" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">paired by get_diffusion_preset</text>
+  <rect x="852" y="436" width="324" height="122" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="868" y="463" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#e6edf3" xml:space="preserve">dew.data<tspan fill="#9198a1" font-weight="400" dx="9">dew.inputs</tspan></text>
+  <text x="868" y="486" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">grain over TFDS, GCS, video, URLs</text>
+  <text x="868" y="505" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">augmentation seeded per record</text>
+  <text x="868" y="524" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1" xml:space="preserve">CLIP text and audio conditioning</text>
+  <line x1="404" y1="108" x2="404" y2="146" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="244" y1="252" x2="244" y2="290" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="658" y1="252" x2="658" y2="290" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="1014" y1="252" x2="1014" y2="290" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="244" y1="396" x2="244" y2="434" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="658" y1="396" x2="658" y2="434" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="1014" y1="396" x2="1014" y2="434" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <line x1="464" y1="344" x2="486" y2="344" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
+  <text x="24" y="586" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">Arrows are imports. None point upward; the sideways one is the diffusion objective using the samplers for validation.</text>
+</svg>

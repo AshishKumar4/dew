@@ -1,9 +1,11 @@
 site_name: dew
 site_description: A JAX/Flax framework for training diffusion, JEPA and other large models from scratch
-repo_url: https://github.com/AshishKumar4/Dew
+repo_url: https://github.com/AshishKumar4/dew
 
 theme:
   name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
 
 nav:
   - Home: index.md
@@ -13,3 +15,6 @@ nav:
       - The data pipeline: concepts/data.md
   - Recipes: recipes.md
   - API: api.md
+  - Gallery: gallery.md
+  - References: references.md
+  - Coming from FlaxDiff: from-flaxdiff.md
