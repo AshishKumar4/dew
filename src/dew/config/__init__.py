@@ -39,6 +39,10 @@ class ModelConfig:
 
     architecture: str = "unet"
     config: JsonDict = dataclasses.field(default_factory=dict)
+    dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    """Compute dtype; params stay float32."""
+    attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
+    """Attention kernel; 'auto' is cudnn on gpu, xla elsewhere."""
 
 
 @dataclasses.dataclass(frozen=True)

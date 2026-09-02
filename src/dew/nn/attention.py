@@ -19,10 +19,15 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     Inputs are [B, S, H, D]. The param trees of the callers never change with
     the implementation, so checkpoints are interchangeable across hardware:
 
-    - None: flax reference attention (einsum + softmax). Runs everywhere and
-      honors force_fp32_for_softmax; the default.
+    - None: flax reference attention (einsum + softmax). The only path that
+      reads dtype, precision and force_fp32_for_softmax; the portable default.
+    - 'auto': 'cudnn' on a gpu backend, 'xla' anywhere else. Resolved per
+      trace, so a config logged as 'auto' still runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
-      fused cudnn flash kernel on supported GPUs.
+      fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
+      or softmax argument: the logits accumulate and the softmax runs in fp32
+      whatever the inputs are. dtype is ignored, the other two are rejected
+      rather than silently dropped.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -32,7 +37,32 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             query, key, value, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
+
+    if implementation == 'auto':
+        implementation = 'cudnn' if jax.default_backend() == 'gpu' else 'xla'
+
+    requested = {str(getattr(p, 'name', p)).upper()
+                 for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
+                 if p is not None}
+    if requested & {'HIGH', 'HIGHEST'}:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            f"precision={precision}: fused attention accumulates the logits and "
+            "runs the softmax in fp32 regardless. Leave precision at DEFAULT, or "
+            "use the reference implementation (attention_impl 'reference').")
+    if not force_fp32_for_softmax:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            "force_fp32_for_softmax=False: fused attention runs the softmax in "
+            "fp32 regardless. Leave it True, or use the reference implementation "
+            "(attention_impl 'reference').")
+
     if implementation in ('xla', 'cudnn'):
+        if implementation == 'cudnn' and query.dtype not in (jnp.bfloat16, jnp.float16):
+            raise ValueError(
+                "cudnn attention needs bf16 or fp16 inputs, the query is "
+                f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
+                "keep this precision.")
         return jax.nn.dot_product_attention(query, key, value, implementation=implementation)
     if implementation == 'tpu':
         from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
@@ -58,7 +88,7 @@ class NormalAttention(nn.Module):
     # kernel_init: Callable = kernel_init(1.0)
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
-    attention_impl: Optional[str] = None  # None (reference) | 'xla' | 'cudnn' | 'tpu'
+    attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
 
     def setup(self):
         inner_dim = self.dim_head * self.heads

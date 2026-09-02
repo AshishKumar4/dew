@@ -27,7 +27,7 @@ from dew.data.dataloaders import load_data
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.processors import defaultTextEncodeModel
 from dew.diffusion.transforms import get_diffusion_preset
-from dew.registry import build_model, canonicalize_architecture
+from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
 from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore")
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 ATTENTION = {
-    "heads": 8, "dtype": None, "use_projection": False,
+    "heads": 8, "use_projection": False,
     "use_self_and_cross": True, "only_pure_attention": True,
 }
 
@@ -89,7 +89,9 @@ def load_autoencoder(config: DiffusionRunConfig):
 def model_kwargs(config: DiffusionRunConfig, channels: int, sample_size: int):
     """Canonical architecture name and the kwargs the registry builds it from."""
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
-    kwargs = {**config.model.config, **suffix_flags}
+    kwargs = apply_precision_policy(
+        architecture, {**config.model.config, **suffix_flags},
+        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     if kwargs.get('use_hilbert') and kwargs.get('use_zigzag'):
         raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
     if architecture == 'diffusers_unet_simple':
