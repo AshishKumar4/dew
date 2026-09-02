@@ -103,6 +103,8 @@ class SimpleTrainer:
         self.checkpoint_base_path = checkpoint_base_path
         self.profile_steps = profile_steps
         self.profile_warmup_steps = profile_warmup_steps
+        self._profile_seen_steps = 0
+        self._profile_complete = False
         self.log_every = log_every
         self.max_bad_loss_steps = max_bad_loss_steps
         # Measured off the compiled step, once per run.
@@ -451,9 +453,7 @@ class SimpleTrainer:
         last_log_time = time.time()
         steps_since_log = 0
         compiled_step = None
-        # Compilation and the first steps say nothing about how the loop runs
-        # once it is warm, so the trace skips them.
-        profile_start = self.profile_warmup_steps if self.profile_steps else None
+        # One profiler window per run; its warmup continues across epochs.
         tracing = False
         traced_steps = 0
 
@@ -462,12 +462,14 @@ class SimpleTrainer:
             if compiled_step is None:
                 compiled_step = self._compiled_step(
                     train_step_fn, train_state, rng_state, batch)
-            if not tracing and i == profile_start:
+            if (not tracing and not self._profile_complete and self.profile_steps
+                    and self._profile_seen_steps >= self.profile_warmup_steps):
                 jax.profiler.start_trace(self.profile_path())
                 tracing = True
 
             train_state, loss, aux, rng_state, is_finite = compiled_step(
                 train_state, rng_state, batch)
+            self._profile_seen_steps += 1
             # No stale alias may outlive the step: its buffers were donated.
             self.state, self.rngstate = train_state, rng_state
             self.dataset_state = getattr(train_ds, 'source_state', None)
@@ -532,6 +534,7 @@ class SimpleTrainer:
         """Close the profiler window once its last step has actually landed."""
         loss.block_until_ready()
         jax.profiler.stop_trace()
+        self._profile_complete = True
         print(f"Wrote profile for {traced_steps} steps to {self.profile_path()}")
 
     def _check_finite(self, worst_bad_run, current_step):

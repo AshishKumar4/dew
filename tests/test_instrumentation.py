@@ -183,6 +183,32 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path):
     second = make_trainer(tmp_path / "short", profile_steps=1, profile_warmup_steps=0)
     second.fit(data_dict(), training_steps_per_epoch=2, epochs=1, val_steps_per_epoch=0)
     assert any(files for _, _, files in os.walk(second.profile_path()))
+def test_profiler_runs_only_once_across_epochs(tmp_path, monkeypatch):
+    trainer = make_trainer(tmp_path, profile_steps=1, profile_warmup_steps=0)
+    starts = []
+    stops = []
+    monkeypatch.setattr(jax.profiler, "start_trace", lambda *a, **k: starts.append(1))
+    monkeypatch.setattr(jax.profiler, "stop_trace", lambda: stops.append(1))
+
+    trainer.fit(data_dict(), training_steps_per_epoch=1, epochs=3,
+                val_steps_per_epoch=0)
+
+    assert len(starts) == 1
+    assert len(stops) == 1
+
+
+def test_profiler_warmup_can_cross_an_epoch_boundary(tmp_path, monkeypatch):
+    trainer = make_trainer(tmp_path, profile_steps=1, profile_warmup_steps=2)
+    started_at = []
+    monkeypatch.setattr(
+        jax.profiler, "start_trace",
+        lambda *a, **k: started_at.append(int(trainer.state.step)))
+    monkeypatch.setattr(jax.profiler, "stop_trace", lambda: None)
+
+    trainer.fit(data_dict(), training_steps_per_epoch=1, epochs=3,
+                val_steps_per_epoch=0)
+
+    assert started_at == [2]
 
 
 def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
