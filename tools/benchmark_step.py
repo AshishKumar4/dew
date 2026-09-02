@@ -17,7 +17,7 @@ Usage:
     python tools/benchmark_step.py --preset small --json-out /tmp/bench.json
     python tools/benchmark_step.py --preset small --architectures simple_dit unet
     python tools/benchmark_step.py --architectures causal_transformer \\
-        --attention-impl pallas
+        --attention-impl cudnn
     python tools/benchmark_step.py --architectures unet \\
         --xla-flags=--xla_gpu_triton_gemm_any=true
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
@@ -212,7 +212,7 @@ class BenchmarkConfig:
     steps: int = 10
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
     """Model compute dtype for --preset small; losses stay fp32 either way."""
-    attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu', 'pallas'] = 'auto'
+    attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
     xla_flags: Optional[str] = None
     """Appended to XLA_FLAGS before the first JAX call, as TrainerConfig.xla_flags

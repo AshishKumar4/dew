@@ -11,7 +11,6 @@ import einops
 import functools
 import math
 from .blocks import kernel_init
-from dew.telemetry.devices import register_pallas_device
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -116,49 +115,6 @@ def cudnn_supports(query, key) -> Optional[str]:
     return None
 
 
-def pallas_supports(query, key, *, mask=None, sliding_window=None) -> Optional[str]:
-    """Why the triton flash kernel cannot take this call, or None if it can.
-
-    Every clause is a limit of jax.experimental.pallas.ops.gpu.attention.mha
-    as it ships in 0.11.1, measured on this hardware rather than guessed:
-
-    - 16-bit inputs. fp32 compiles but spends twice the shared memory and gets
-      no tensor cores, and 'xla' is the path for it.
-    - No mask and no window: the kernel takes causality as a flag and has no
-      bias argument, so a materialized mask (decoding against a KV cache) has
-      nowhere to go.
-    - Equal query and key lengths. Cross-attention runs forward, but the fused
-      backward pass splits both sequences into the same number of blocks and
-      refuses unequal ones, so a differentiable call needs self-attention.
-    - Sequence a multiple of the 128-wide query block, or a power of two below
-      it: the block is min(128, S) and the triton lowering only takes
-      power-of-two shapes. 77 text tokens are neither.
-    - head_dim at most 128. The kernel pads it to a power of two, and 160 asks
-      for 224 KiB of shared memory against the 99 KiB an AD10x SM has.
-
-    Head grouping is not on the list: the caller repeats grouped key/value
-    heads out before the call, as it does for the reference and TPU paths.
-    """
-    q_len, head_dim = query.shape[-3], query.shape[-1]
-    kv_len = key.shape[-3]
-    if query.dtype not in (jnp.bfloat16, jnp.float16):
-        return f"needs bf16 or fp16 inputs, the query is {query.dtype}"
-    if mask is not None:
-        return "takes no mask; it only knows the causal flag"
-    if sliding_window is not None:
-        return "has no sliding-window argument"
-    if q_len != kv_len:
-        return ("needs the query and key lengths to match for its backward "
-                f"pass, got {q_len} and {kv_len}")
-    block = min(128, q_len)
-    if q_len % block or block & (block - 1):
-        return ("needs the sequence length to be a multiple of 128 or a "
-                f"power of two below it, got {q_len}")
-    if 2 ** (head_dim - 1).bit_length() > 128:
-        return f"runs out of shared memory above head_dim 128, got {head_dim}"
-    return None
-
-
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
                                  causal=False, sliding_window=None, mask=None):
@@ -185,12 +141,6 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
-    - 'pallas': the triton flash kernel from
-      jax.experimental.pallas.ops.gpu.attention, forward and backward, with
-      the same explicit scale and an fp32 softmax inside the kernel. It takes
-      fewer shapes than cudnn does; `pallas_supports` says which, and a call
-      it cannot serve raises rather than falling back, so a run asking for
-      this kernel gets it or gets told.
 
     causal restricts query i to keys 0..i, top-left aligned exactly as jax's
     is_causal is; sliding_window=w narrows that to the w most recent keys. Both
@@ -270,24 +220,6 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         out = flash_attention(q, k, v, ab=bias, causal=causal,
                               sm_scale=1.0 / math.sqrt(query.shape[-1]))
         return jnp.moveaxis(out, -3, -2)
-    if implementation == 'pallas':
-        if not register_pallas_device():
-            raise ValueError(
-                "attention_impl 'pallas' is the triton flash kernel and needs a "
-                f"cuda device, this process is on {jax.default_backend()}. Use "
-                "'auto' to get the right kernel per backend.")
-        heads = query.shape[-2]
-        key = repeat_kv_heads(key, heads)
-        value = repeat_kv_heads(value, heads)
-        refused = pallas_supports(query, key, mask=mask, sliding_window=sliding_window)
-        if refused:
-            raise ValueError(
-                f"attention_impl 'pallas' cannot serve this call: the kernel "
-                f"{refused}. Use attention_impl 'cudnn' (or 'auto'), which takes "
-                "any shape.")
-        from jax.experimental.pallas.ops.gpu.attention import mha
-        return mha(query, key, value, segment_ids=None, causal=causal,
-                   sm_scale=1.0 / math.sqrt(query.shape[-1]))
     raise ValueError(f"Unknown attention implementation: {implementation}")
 
 
@@ -310,7 +242,7 @@ class NormalAttention(nn.Module):
     # kernel_init: Callable = kernel_init(1.0)
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
-    attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu' | 'pallas'
+    attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
     causal: bool = False
     max_seq_len: Optional[int] = None  # KV cache length, required to decode
 
