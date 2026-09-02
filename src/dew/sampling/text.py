@@ -67,6 +67,10 @@ def generate(model, params, prompt, max_new_tokens: int, *, rng,
     prompt = jnp.asarray(prompt, jnp.int32)
     if prompt.ndim != 2:
         raise ValueError(f"prompt must be [B, P] token ids, got shape {prompt.shape}")
+    if 'params' not in params:
+        raise ValueError(
+            "generate takes the full variables dict ({'params': ...}), the same "
+            "thing model.init returns and the trainer state carries.")
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
     if max_new_tokens == 0:
