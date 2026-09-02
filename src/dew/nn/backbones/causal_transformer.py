@@ -255,6 +255,12 @@ class CausalTransformer(nn.Module):
     force_fp32_for_softmax: bool = True
     attention_impl: Optional[str] = None
 
+    def __post_init__(self):
+        if self.layer_types is not None:
+            object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        super().__post_init__()
+
+
     @property
     def kv_heads(self) -> int:
         return self.num_heads if self.num_kv_heads is None else self.num_kv_heads
