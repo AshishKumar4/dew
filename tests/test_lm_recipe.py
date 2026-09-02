@@ -81,6 +81,17 @@ def trainer_config(tmp_path, **kwargs):
                          compilation_cache_dir=None, **kwargs)
 
 
+def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
+    """generate decodes into a cache sized at build time, so a long sample has
+    to fit in it even when it outruns the training context."""
+    recipe = load_recipe()
+    config = recipe.LmRunConfig(sequence_length=64)
+
+    assert recipe.context_length(config, None) == 64
+    assert recipe.context_length(config, {"prompt": [1, 2, 3], "max_new_tokens": 8}) == 64
+    assert recipe.context_length(config, {"prompt": [1, 2, 3], "max_new_tokens": 100}) == 103
+
+
 def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
     recipe = load_recipe()
     dataset = write_token_files(tmp_path / "tokens", vocab_size=VOCAB)
