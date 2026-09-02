@@ -24,12 +24,32 @@ python tools/tokenize_text.py --input data/shakespeare.txt \
 
 One id longer than the context on purpose: the inputs are `text[:, :-1]` and the targets are `text[:, 1:]`, so a batch carries its own labels and nothing has to be shifted twice.
 
+## Packed documents
+
+A flat stream has no document boundaries, so a fixed window can straddle two unrelated texts: attention runs across the seam and RoPE never restarts. `--pack` closes every document (input file) with the tokenizer's eos id and records that id in `meta.json` as `eos_id`:
+
+```bash
+python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --tokenizer byte --pack
+```
+
+`data.pack_sequences` then selects `dew.data.dataloaders.get_packed_token_dataset_grain`, which is grain's `Dataset` API rather than its `DataLoader` for the reason grain gives for switching: packing. `dew.data.sources.text.TokenDocumentSource` reads a record as one document, documents longer than the window are cut into consecutive pieces first (grain's packer refuses an over-long element), and `grain.experimental.FirstFitPackIterDataset` fills windows of `seq_len + 1` with whole documents. A batch is then
+
+```python
+{"text": int32[B, seq_len + 1],
+ "text_segment_ids": int32[B, seq_len + 1],   # which document, 0 for padding
+ "text_positions": int32[B, seq_len + 1]}     # position inside that document
+```
+
+Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel choice changes: cuDNN takes causality as a flag and turns any explicit mask into a materialized `[B, N, T, S]` bias, so a segment-masked batch runs on the xla kernel instead, which takes the mask itself. Passing neither argument leaves every unpacked run bit-identical.
+
+Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts documents rather than windows, because how many windows a document set fills depends on which lengths first-fit puts together.
+
 ## The objective
 
 `dew.objectives.lm.LMObjective(model, seq_len, vocab_size=..., pad_id=None, samples=None)` is the whole learning problem:
 
 - `loss` runs the model on the inputs, casts the logits to float32 and returns the mean cross entropy of the targets. Float32 is deliberate: a bfloat16 logsumexp over a large vocabulary loses enough precision to move the loss and the gradient with it. The scalar comes with `ce`, `perplexity` and `token_accuracy`, which the trainer logs under `train/`.
-- `pad_id` excludes padded targets from the mean. It defaults to `None` because packed token files have no padding, and masking an id that is really in the data would drop those tokens from the average.
+- `pad_id` excludes padded targets from the mean. It defaults to `None` because a fixed-window token file has no padding, and masking an id that is really in the data would drop those tokens from the average. A packed batch needs no pad id: `text_segment_ids` says which slots are padding, and those targets are excluded whatever the id.
 - `ema` averages the whole parameter tree at `--trainer.ema-decay`, and the EMA copy is what validation reads.
 - `input_shapes` is `{"tokens": ((seq_len,), jnp.int32)}`. This is how a run needs no `DiffusionInputConfig`: `ObjectiveTrainer(..., objective=objective, input_config=None)` takes the init batch from the objective, and the `(shape, dtype)` pair is what keeps token ids from being initialised as floats. An objective that declares neither is rejected at construction.
 
