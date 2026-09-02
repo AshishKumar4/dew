@@ -404,7 +404,7 @@ def test_prompts_that_cannot_be_batched_are_rejected():
         empty.make_validation_step()
 
 
-def test_log_validation_artifacts_reports_perplexity_and_decoded_text():
+def test_log_validation_artifacts_reports_decoded_text():
     objective = make_objective(samples={
         "prompt": [1, 2], "max_new_tokens": 3,
         "decode": lambda ids: "|".join(str(i) for i in ids)})
@@ -415,20 +415,21 @@ def test_log_validation_artifacts_reports_perplexity_and_decoded_text():
         "tokens": jnp.asarray([[1, 2, 0, 1, 2]], jnp.int32),
     }, step=7)
 
-    assert run.logged["val/perplexity"] == pytest.approx(float(np.exp(1.5)), rel=1e-5)
+    assert list(run.logged) == ["val/samples"]
     assert run.logged["val/samples"].data == [[0, "1|2|0|1|2"]]
 
 
-def test_log_validation_artifacts_without_samples_logs_only_perplexity():
+def test_log_validation_artifacts_without_samples_is_empty():
     run = WandbRecorder()
     make_objective().log_validation_artifacts(run, {"ce": jnp.asarray(0.5)}, step=1)
-    assert list(run.logged) == ["val/perplexity"]
+    assert run.logged == {}
 
 
 def test_perplexity_metric_reads_the_cross_entropy_artifact():
     metric = get_perplexity_metric()
     assert metric.name == "perplexity" and metric.higher_is_better is False
-    assert metric.function({"ce": jnp.asarray(2.0)}, None) == pytest.approx(np.exp(2.0), rel=1e-5)
+    assert metric.function({"ce": jnp.asarray(2.0)}, None) == pytest.approx(2.0)
+    assert metric.reducer([0.0, 2.0]) == pytest.approx(np.exp(1.0))
 
 
 def test_the_validation_loop_scores_perplexity(tmp_path):
@@ -441,3 +442,21 @@ def test_the_validation_loop_scores_perplexity(tmp_path):
         trainer.state, token_batch(batch=BATCH))["ce"])
     assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(
         float(np.exp(ce)), rel=1e-4)
+
+
+def test_validation_exponentiates_after_averaging_cross_entropy(tmp_path):
+    trainer = make_trainer(tmp_path)
+    cross_entropies = iter([jnp.asarray(0.0), jnp.asarray(2.0)])
+
+    trainer.validation_loop(
+        trainer.state,
+        lambda state, batch: {"ce": next(cross_entropies)},
+        None,
+        val_steps_per_epoch=2,
+        current_step=0,
+    )
+
+    expected = np.exp(np.mean([0.0, 2.0]))
+    wrong = np.mean(np.exp([0.0, 2.0]))
+    assert expected != pytest.approx(wrong)
+    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(expected)
