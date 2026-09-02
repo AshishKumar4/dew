@@ -14,6 +14,7 @@ OPTIMIZER_MAP = {
     'adam': optax.adam,
     'adamw': optax.adamw,
     'lamb': optax.lamb,
+    'muon': optax.contrib.muon,
 }
 
 
