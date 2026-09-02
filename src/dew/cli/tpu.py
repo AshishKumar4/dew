@@ -152,12 +152,13 @@ def _git_root() -> Path:
     return Path(done.stdout.strip())
 
 
-def _rsync_argv(root: Path, user: str, host: str, excludes: Sequence[str]) -> list[str]:
+def _rsync_argv(root: Path, user: str, host: str, excludes: Sequence[str],
+                delete: bool) -> list[str]:
     key = Path.home() / ".ssh/google_compute_engine"
     remote_shell = (f"ssh -i {key} -o StrictHostKeyChecking=no "
                     "-o UserKnownHostsFile=/dev/null")
     return [
-        "rsync", "-az", "--delete", "--exclude=.git",
+        "rsync", "-az", *(["--delete"] if delete else []), "--exclude=.git",
         # Per-directory merge rule: every .gitignore in the tree excludes.
         "--filter=:- .gitignore",
         *(f"--exclude={pattern}" for pattern in excludes),
@@ -166,13 +167,19 @@ def _rsync_argv(root: Path, user: str, host: str, excludes: Sequence[str]) -> li
     ]
 
 
-def _sync(tpu: Tpu, cfg: config.TpuConfig, count: int, excludes: Sequence[str]) -> tuple[Path, int]:
-    """Copy the git working tree to ~/<repo> on every worker."""
+def _sync(tpu: Tpu, cfg: config.TpuConfig, count: int, excludes: Sequence[str],
+          delete: bool = False) -> tuple[Path, int]:
+    """Copy the git working tree to ~/<repo> on every worker.
+
+    delete mirrors: rsync then removes anything under ~/<repo> that the local
+    tree does not have. Excluded paths are left alone either way, so
+    checkpoints and datasets on a worker survive a mirror as well.
+    """
     root = _git_root()
     user = cfg.ssh_user or getpass.getuser()
     hosts = _hosts(tpu, count)
     jobs = [
-        (f"[worker {index}] ", _rsync_argv(root, user, host, excludes))
+        (f"[worker {index}] ", _rsync_argv(root, user, host, excludes, delete))
         for index, host in enumerate(hosts)
     ]
     return root, exit_code(tpu.gcloud.fanout(jobs))
@@ -513,12 +520,14 @@ class Sync(Base):
         tyro.conf.arg(metavar="PATTERN"),
     ] = ()
     """Extra rsync exclude patterns. .gitignore is already honoured. Repeatable."""
+    delete: bool = False
+    """Also remove files under ~/<repo> that the local tree does not have."""
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
         tpu = _tpu(self, cfg, gcloud, self.name)
         count, _ = _slice(tpu, cfg)
-        root, code = _sync(tpu, cfg, count, self.exclude)
+        root, code = _sync(tpu, cfg, count, self.exclude, self.delete)
         if not code:
             emit(f"{root} is on {count} worker(s) at ~/{root.name}")
         return code
@@ -542,6 +551,8 @@ class Setup(Base):
     """Python version of the venv."""
     type: Kind = None
     """Accelerator type to expect, for the device check in a dry run."""
+    delete: bool = False
+    """With --from-source, mirror the tree instead of only adding to it."""
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
@@ -550,7 +561,7 @@ class Setup(Base):
 
         source = ""
         if self.from_source:
-            root, code = _sync(tpu, cfg, count, ())
+            root, code = _sync(tpu, cfg, count, (), self.delete)
             if code:
                 return code
             source = root.name
@@ -602,6 +613,8 @@ class Train(Base):
     """Name of the TPU."""
     job: Job = ""
     """Name of the job. A timestamp by default."""
+    delete: bool = False
+    """Mirror the tree instead of only adding to it."""
 
     def run(self, rest: list[str]) -> int:
         if not rest:
@@ -609,7 +622,7 @@ class Train(Base):
         cfg, gcloud = _open(self)
         tpu = _tpu(self, cfg, gcloud, self.name)
         count, _ = _slice(tpu, cfg)
-        root, code = _sync(tpu, cfg, count, ())
+        root, code = _sync(tpu, cfg, count, (), self.delete)
         if code:
             return code
         job = self.job or _job_id(self.name)
