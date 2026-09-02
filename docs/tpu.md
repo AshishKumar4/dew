@@ -99,8 +99,10 @@ there. It installs uv, a Python venv at `~/dew-venv`, `jax[tpu]`, and either the
 synced tree in editable mode (`--from-source`) or a release
 (`--version 0.2.1`). It raises the open file limit, writes `~/.dew-env` with
 `TOKENIZERS_PARALLELISM=false` and `WANDB_CACHE_DIR`, and mounts the bucket from
-your config with gcsfuse. Each step checks whether it is already done, so
-running setup again changes nothing.
+your config with gcsfuse. Each step checks whether it is already done, so a
+second run creates nothing again. The two installs are the exception: they
+resolve against PyPI every time, so a `jax[tpu]` or `dew-ml` release since the
+last run lands in the venv. Pass `--version` to hold dew-ml at one release.
 
 The last step is the check that matters on a pod slice: every worker must see
 the whole slice.

@@ -616,7 +616,8 @@ def test_a_repo_path_with_a_space_reaches_the_remote_shell_quoted(fake, monkeypa
     fake.offer("slice", "us-central2-b")
     monkeypatch.setattr(tpu_cli, "_git_root", lambda: Path("/tmp/my repo"))
     assert run("train", "slice", "--job", "run-1", "--", "recipes/lm/train.py") == 0
-    assert fake.rsync_calls()[0][-1] == "you@34.0.0.1:~/'my repo'/"
+    assert sorted(call[-1] for call in fake.rsync_calls()) == [
+        "you@34.0.0.1:~/'my repo'/", "you@34.0.0.2:~/'my repo'/"]
     # The inner command is quoted again for bash -c, so read it back as a shell
     # word instead of matching the escaped form.
     tokens = shlex.split(ssh_commands(fake.gcloud_calls())[0])
