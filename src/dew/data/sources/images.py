@@ -3,7 +3,6 @@ import jax.numpy as jnp
 import grain.python as pygrain
 from dew.inputs.processors import AutoTextTokenizer
 from typing import Dict, Any, Callable, List, Optional
-import random
 import augmax
 import jax
 import os
@@ -95,14 +94,13 @@ def labelizer_oxford_flowers102(path):
     with open(path, "r") as f:
         textlabels = [i.strip() for i in f.readlines()]
 
-    def load_labels(sample):
+    def load_labels(sample, rng: np.random.Generator):
         raw = textlabels[int(sample['label'])]
-        # randomly select a prompt template
-        template = random.choice(PROMPT_TEMPLATES)
-        # format the template with the label
-        caption = template.format(raw)
-        # return the caption
-        return caption
+        # The template comes from the record's rng, like the augmentation: a
+        # module-global random.choice made a record's caption depend on how
+        # many workers and processes produced the batch.
+        template = PROMPT_TEMPLATES[int(rng.integers(len(PROMPT_TEMPLATES)))]
+        return template.format(raw)
     return load_labels
 
 
@@ -202,7 +200,7 @@ class ImageTFDSAugmenter(DataAugmenter):
                                   interpolation=interpolation)
                 image = augment_image(augments, image, rng)
                 
-                caption = labelizer(element)
+                caption = labelizer(element, rng)
                 results = self.tokenize(caption)
                 return {
                     "image": image,
@@ -232,15 +230,23 @@ class ImageGCSSource(DataSource):
         """
         self.source = source
     
-    def get_source(self, path_override: str = "/home/mrwhite0racle/gcs_mount") -> Any:
+    def get_source(self, path_override: str) -> Any:
         """Get the GCS data source.
         
         Args:
-            path_override: Base path for GCS mounts.
+            path_override: Base path the records live under, normally a bucket
+                mount. Required: a personal mount point is nobody else's
+                default.
             
         Returns:
             A grain ArrayRecordDataSource.
         """
+        if not path_override:
+            raise ValueError(
+                "ImageGCSSource needs an explicit dataset path: its records live "
+                f"under <dataset_path>/{self.source}, and an unset one used to "
+                "reach os.path.join(None, ...) here."
+            )
         records_path = os.path.join(path_override, self.source)
         records = [os.path.join(records_path, i) for i in os.listdir(
             records_path) if 'array_record' in i]
@@ -258,15 +264,24 @@ class CombinedImageGCSSource(DataSource):
         """
         self.sources = sources
     
-    def get_source(self, path_override: str = "/home/mrwhite0racle/gcs_mount") -> Any:
+    def get_source(self, path_override: str) -> Any:
         """Get the combined GCS data source.
         
         Args:
-            path_override: Base path for GCS mounts.
+            path_override: Base path the records live under, normally a bucket
+                mount. Required: a personal mount point is nobody else's
+                default.
             
         Returns:
             A grain ArrayRecordDataSource.
         """
+        if not path_override:
+            raise ValueError(
+                "CombinedImageGCSSource needs an explicit dataset path: its "
+                "records live under <dataset_path>/<source> for each of its "
+                f"{len(self.sources)} sources, and an unset one used to reach "
+                "os.path.join(None, ...) here."
+            )
         records_paths = [os.path.join(path_override, source) for source in self.sources]
         records = []
         for records_path in records_paths:
@@ -281,9 +296,9 @@ class ImageGCSAugmenter(DataAugmenter):
         """Initialize a GCS image augmenter.
         
         Args:
-            labelizer: Function to extract text labels from samples.
+            labelizer: Function mapping a sample and its record rng to a text label.
         """
-        self.labelizer = labelizer or (lambda sample: sample['txt'])
+        self.labelizer = labelizer or (lambda sample, rng: sample['txt'])
     
     def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.Transformation]:
         """Create a transform for GCS image datasets.
@@ -318,7 +333,7 @@ class ImageGCSAugmenter(DataAugmenter):
                 image = cv2.imdecode(image, cv2.IMREAD_UNCHANGED)
                 image = self.image_augmenter(image)
                 image = augment_image(augments, image, rng)
-                caption = labelizer(element).decode('utf-8')
+                caption = labelizer(element, rng).decode('utf-8')
                 results = self.auto_tokenize(caption)
                 return {
                     "image": image,
