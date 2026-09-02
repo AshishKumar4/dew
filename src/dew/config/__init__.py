@@ -67,6 +67,11 @@ class DataConfig:
     read_thread_count: int = 140
     read_buffer_size: int = 96
     worker_buffer_size: int = 100
+    sequence_length: Optional[int] = None
+    """Tokens per training window, when the dataset is a tokenized text
+    directory from tools/tokenize_text.py."""
+    tokenizer: Optional[str] = None
+    """Tokenizer behind that directory: 'byte' or an HF tokenizer name."""
 
 
 @dataclasses.dataclass(frozen=True)
