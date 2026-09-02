@@ -11,6 +11,7 @@ has none and has to have its text conditioning reconstructed from `arguments`.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -151,12 +152,11 @@ def test_pipeline_generates_from_a_local_checkpoint(tmp_path):
     trainer.save(epoch=0, step=1)
     trainer.wait_for_checkpoints()
 
-    state, best_state = load_from_checkpoint(
-        get_latest_checkpoint(trainer.checkpoint_path()))
+    state = load_from_checkpoint(get_latest_checkpoint(trainer.checkpoint_path()))
     assert state is not None and {"params", "ema_params"} <= set(state)
 
     pipeline = DiffusionInferencePipeline.create(
-        config=parse_config(current_config()), state=state, best_state=best_state)
+        config=parse_config(current_config()), state=state)
     samples = pipeline.generate_samples(
         num_samples=2,
         resolution=RES,
@@ -179,7 +179,7 @@ def test_pipeline_can_sample_from_the_ema_parameters(tmp_path):
     trainer.save(epoch=0, step=1)
     trainer.wait_for_checkpoints()
 
-    state, _ = load_from_checkpoint(get_latest_checkpoint(trainer.checkpoint_path()))
+    state = load_from_checkpoint(get_latest_checkpoint(trainer.checkpoint_path()))
     pipeline = DiffusionInferencePipeline.create(
         config=parse_config(current_config()), state=state)
     samples = pipeline.generate_samples(
@@ -191,10 +191,27 @@ def test_pipeline_can_sample_from_the_ema_parameters(tmp_path):
 
 
 def test_missing_checkpoint_is_reported(tmp_path):
-    """A load that failed must say so rather than hand back an empty pair that
+    """A load that failed must say so rather than hand back an empty state that
     reads as a successful one."""
     with pytest.raises(FileNotFoundError):
         load_from_checkpoint(str(tmp_path / "nothing-here"))
+
+
+def test_load_from_checkpoint_picks_the_best_step(tmp_path):
+    """'best' is the step whose epoch loss was lowest, which is not the newest
+    one as soon as a run gets worse."""
+    trainer = make_trainer(tmp_path, name="inference-best")
+    trainer.save(epoch=0, step=1, metrics={"loss": 0.2})
+    trainer.state = trainer.state.apply_gradients(
+        grads=jax.tree.map(jnp.ones_like, trainer.state.params))
+    trainer.save(epoch=1, step=2, metrics={"loss": 0.8})
+    trainer.wait_for_checkpoints()
+
+    best = load_from_checkpoint(trainer.checkpoint_path(), step="best")
+    latest = load_from_checkpoint(trainer.checkpoint_path())
+    assert int(best["step"]) == 0, "step 2 came back as the best"
+    assert int(latest["step"]) == 1
+    assert int(load_from_checkpoint(trainer.checkpoint_path(), step=1)["step"]) == 0
 
 
 # --------------------------------------------------------------------------
