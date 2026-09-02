@@ -130,7 +130,7 @@ def test_grad_accum_steps_wraps_the_optimizer_and_reaches_the_trainer(tmp_path, 
         data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
         optim=OptimConfig(learning_rate=1e-3, grad_accum_steps=2),
         trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None, multi_host=False),
         predictor={"predictor_features": 8, "num_layers": 1, "num_heads": 2},
     ))
 
@@ -457,7 +457,7 @@ def test_diffusion_entrypoint_runs_without_wandb(tmp_path, monkeypatch):
         }),
         data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
         trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None, multi_host=False),
         val_metrics=[],
         validation_prompts=str(prompts),
     ))

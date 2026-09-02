@@ -483,7 +483,7 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
         }),
         data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
         trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None, multi_host=False),
         predictor={"predictor_features": 16, "num_layers": 1, "num_heads": 2},
         probe_classes=classes,
     )
