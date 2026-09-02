@@ -110,6 +110,43 @@ def map_config_strings(config: dict):
     return config
 
 
+def apply_precision_policy(architecture: str, config: dict, *,
+                           dtype: str, attention_impl: str) -> dict:
+    """Write a run's compute dtype and attention kernel into a model config.
+
+    The two knobs live on --model.dtype and --model.attention-impl and land
+    here, so the config a run logs is the config it ran. Values stay strings
+    for map_config_strings to resolve; 'reference' is the reference kernel,
+    which the modules spell as None. Params are unaffected: they stay float32.
+
+    The UNets keep per-stage attention settings in nested attention_configs
+    dicts, which do not inherit the model dtype (a missing or None dtype there
+    computes attention in fp32) and whose force_fp32_for_softmax defaults to
+    False, which no fused kernel can honor. So the policy reaches into them.
+    """
+    duplicate = sorted(set(config) & {'dtype', 'attention_impl'})
+    if duplicate:
+        raise ValueError(
+            f"--model.config carries {duplicate}, which the precision policy "
+            "owns. Set --model.dtype and --model.attention-impl instead.")
+
+    canonical, _ = canonicalize_architecture(architecture)
+    model_class = MODEL_REGISTRY.get(canonical)
+    if model_class is None:
+        # third-party wrappers take a compute dtype and expose no attention seam
+        return {**config, 'dtype': dtype}
+
+    kwargs = {**config, 'dtype': dtype,
+              'attention_impl': None if attention_impl == 'reference' else attention_impl}
+    stages = {f.name: f for f in dataclasses.fields(model_class)}.get('attention_configs')
+    if stages is not None:
+        kwargs['attention_configs'] = [
+            None if stage is None
+            else {**stage, 'dtype': dtype, 'force_fp32_for_softmax': True}
+            for stage in config.get('attention_configs', stages.default)]
+    return kwargs
+
+
 def build_model(architecture: str, config: dict):
     """Construct a model from an architecture name and a plain config dict.
 
