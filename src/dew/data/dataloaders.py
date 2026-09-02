@@ -770,8 +770,17 @@ def get_packed_token_dataset_grain(
         if shuffle:
             documents = documents.shuffle(seed)
         documents = documents.repeat(num_epochs)
+        reads = documents.to_iter_dataset()
+        if worker_count:
+            # The workers read documents, and the packer stays behind them in
+            # this process: grain runs a whole pipeline per worker, so packing
+            # inside them would fill bins from one worker's slice of the
+            # documents and make the windows depend on worker_count.
+            reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
+                num_workers=worker_count,
+                per_worker_buffer_size=worker_buffer_size))
         packed = FirstFitPackIterDataset(
-            documents.to_iter_dataset(),
+            reads,
             length_struct={"text": window},
             num_packing_bins=num_packing_bins,
             seed=seed,
@@ -780,12 +789,7 @@ def get_packed_token_dataset_grain(
             shuffle_bins=shuffle,
             padding_struct={"text": 0},
         )
-        batched = packed.batch(batch, drop_remainder=True)
-        if worker_count:
-            batched = batched.mp_prefetch(pygrain.MultiprocessingOptions(
-                num_workers=worker_count,
-                per_worker_buffer_size=worker_buffer_size))
-        return batched
+        return packed.batch(batch, drop_remainder=True)
 
     return {
         "train": lambda: build_loader(train_path, local_batch_size, True),

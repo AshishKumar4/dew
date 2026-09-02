@@ -41,6 +41,8 @@ class TokenizeArgs:
     """Directory to write train.bin, val.bin and meta.json into."""
     tokenizer: str = "byte"
     """'byte' for utf-8 bytes, else a huggingface tokenizer name."""
+    val_fraction: float = 0.01
+    """Fraction of the token stream held out, from its head, as validation."""
     pack: bool = False
     """Terminate every document (input file) with the tokenizer's eos id, so
     `get_packed_token_dataset_grain` can split the stream back into documents;
