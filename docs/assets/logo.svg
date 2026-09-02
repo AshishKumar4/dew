@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="dew">
+  <defs>
+    <linearGradient id="gl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7fe6d8"/><stop offset="1" stop-color="#12a394"/>
+    </linearGradient>
+    <mask id="ml">
+      <rect x="-40" y="-50" width="80" height="120" fill="#fff"/>
+      <ellipse cx="-11" cy="16" rx="5.5" ry="11" transform="rotate(-22 -11 16)" fill="#000"/>
+    </mask>
+  </defs>
+  <g transform="translate(128.00 128.00) scale(2.1500) translate(0 -7.5)">
+    <path mask="url(#ml)" fill="url(#gl)"
+          d="M -2.6 -37.5 A 3 3 0 0 1 2.6 -37.5 L 27.713 6 A 32 32 0 1 1 -27.713 6 Z"/>
+  </g>
+</svg>
