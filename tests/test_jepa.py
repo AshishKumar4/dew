@@ -209,6 +209,20 @@ def test_video_objective_trains(mask, rng):
     assert float(loss_of(params)) < initial * 0.9
 
 
+def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
+    """The MSE and its gradient are the numbers the optimizer sees, so they
+    must not be quantized to the models' bf16 compute dtype."""
+    objective = JepaObjective(make_encoder(dtype=jnp.bfloat16),
+                              make_predictor(dtype=jnp.bfloat16), mask,
+                              sample_data_key="image",
+                              sample_data_shape=(RES, RES, 3))
+    params = objective.init_params(rng)
+    loss, aux = objective.loss(params, params, {"image": images()},
+                               jax.random.PRNGKey(7), 0)
+    assert loss.dtype == jnp.float32
+    assert all(a.dtype == jnp.float32 for a in aux.values())
+
+
 def solid_colour_images(rs, n):
     """One random colour per image, so a target block is fully determined by
     anything else in the same image and by nothing in any other image."""
