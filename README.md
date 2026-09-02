@@ -28,6 +28,13 @@ Dew separates what you train from how you train it. An objective defines the par
 
 The models, schedules, samplers and metrics are plain Flax and JAX. Each can be used on its own.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
+    <img src="docs/assets/architecture-light.svg" alt="Dew modules by layer" width="100%">
+  </picture>
+</p>
+
 This is a personal research project, not a product. Expect sharp edges.
 
 ```python
@@ -49,12 +56,14 @@ trainer = ObjectiveTrainer(
     rngs=jax.random.PRNGKey(0), name="flowers", checkpoint_base_path="./checkpoints",
 )
 state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 32, epochs=50)
+# state.params, state.ema_params, state.opt_state; checkpoints under ./checkpoints/flowers
 ```
 
 ### Contents
 
 * [Diffusion](#diffusion)
 * [JEPA](#jepa)
+* [End-to-end examples](#end-to-end-examples)
 * [Objectives](#objectives)
 * [Scaling](#scaling)
 * [Data](#data)
@@ -118,6 +127,7 @@ sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs,
                                 guidance_scale=4.0, guidance_start=0.1, guidance_stop=0.9)
 images = sampler.generate_samples(params=state.ema_params, num_samples=4, resolution=128,
                                   diffusion_steps=50, conditioning=["a water lily", "a rose"])
+# images.shape == (4, 128, 128, 3), values in [-1, 1]
 ```
 
 The samplers are `DDPMSampler`, `DDIMSampler`, `EulerSampler`, `EulerAncestralSampler`, `HeunSampler`, `RK4Sampler` and `MultiStepDPM`. All of them take the same arguments.
@@ -161,11 +171,186 @@ trainer = ObjectiveTrainer(
 
 The probes fit a linear classifier and a kNN classifier on the frozen embeddings of each validation batch and report their accuracy. `jepa_video_encoder` and a `factorized=True` predictor do the same for video.
 
+## End-to-end examples
+
+The scripts in [`examples/`](examples/) go from a dataset to a trained model, samples on disk and exported weights. Each runs as a smoke test in the suite with a tiny configuration, so they stay correct.
+
+[`examples/train_diffusion.py`](examples/train_diffusion.py) trains a text-to-image DiT on Oxford Flowers, samples four prompts into `samples.png` and exports the EMA weights as safetensors:
+
+```python
+"""Train a text-to-image diffusion model on Oxford Flowers, sample from it, export the weights.
+
+    python examples/train_diffusion.py --epochs 200 --image-size 128
+    python examples/train_diffusion.py --epochs 1 --steps-per-epoch 20 --image-size 32   # smoke run
+"""
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import jax
+import numpy as np
+import optax
+import tyro
+from PIL import Image
+
+from dew.data.dataloaders import get_dataset_grain
+from dew.diffusion.transforms import get_diffusion_preset
+from dew.image_ops import denormalize_images
+from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
+from dew.inputs.encoders import CLIPTextEncoder
+from dew.interop import save_hf_layout
+from dew.registry import apply_precision_policy, build_model
+from dew.sampling import EulerAncestralSampler
+from dew.training import ObjectiveTrainer
+
+
+@dataclass
+class Config:
+    dataset: str = "oxford_flowers102"
+    image_size: int = 128
+    batch_size: int = 32
+    epochs: int = 200
+    steps_per_epoch: int | None = None
+    learning_rate: float = 2e-4
+    fsdp_size: int = 1
+    model: dict = field(default_factory=lambda: dict(patch_size=4, emb_features=512, num_layers=12, num_heads=8))
+    prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
+    out: Path = Path("runs/flowers")
+
+
+def text_conditioned_inputs(image_size: int) -> DiffusionInputConfig:
+    """The sample and its conditions: an image, conditioned on a CLIP text embedding."""
+    text_encoder = CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14")
+    return DiffusionInputConfig(
+        sample_data_key="image",
+        sample_data_shape=(image_size, image_size, 3),
+        conditions=[ConditionalInputConfig(encoder=text_encoder)],
+    )
+
+
+def main(config: Config, data=None, inputs=None):
+    data = data or get_dataset_grain(config.dataset, batch_size=config.batch_size, image_scale=config.image_size)
+    inputs = inputs or text_conditioned_inputs(config.image_size)
+
+    # A preset is a training schedule, a sampling schedule and a prediction transform that belong together.
+    train_schedule, sample_schedule, transform = get_diffusion_preset("edm")
+    model_config = apply_precision_policy("simple_dit", config.model, dtype="bfloat16", attention_impl="auto")
+    model = build_model("simple_dit", model_config)
+
+    trainer = ObjectiveTrainer(
+        model, optax.adamw(config.learning_rate), input_config=inputs,
+        noise_schedule=train_schedule, model_output_transform=transform,
+        rngs=jax.random.PRNGKey(0), name=config.out.name, checkpoint_base_path=str(config.out / "checkpoints"),
+        fsdp_size=config.fsdp_size,
+    )
+    steps = config.steps_per_epoch or data["train_len"] // config.batch_size
+    state = trainer.fit(data, training_steps_per_epoch=steps, epochs=config.epochs,
+                        sampler_class=EulerAncestralSampler, sampling_noise_schedule=sample_schedule)
+
+    sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs, guidance_scale=3.0)
+    images = sampler.generate_samples(params=state.ema_params, num_samples=len(config.prompts),
+                                      resolution=config.image_size, diffusion_steps=50,
+                                      conditioning=list(config.prompts))
+    grid = np.concatenate(np.asarray(denormalize_images(images)), axis=1)
+    Image.fromarray(grid).save(config.out / "samples.png")
+
+    save_hf_layout(state.ema_params, config={"architecture": "simple_dit", **model_config}, directory=config.out / "export")
+    return state
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Config))
+```
+
+[`examples/train_jepa.py`](examples/train_jepa.py) trains an I-JEPA encoder and reports linear and kNN probe accuracy on every validation pass:
+
+```python
+"""Train an I-JEPA encoder on Oxford Flowers and probe its embeddings with a linear and a kNN classifier.
+
+    python examples/train_jepa.py --epochs 300 --image-size 224
+    python examples/train_jepa.py --epochs 1 --steps-per-epoch 20 --image-size 32 --patch-size 4   # smoke run
+"""
+from dataclasses import dataclass
+from pathlib import Path
+
+import jax
+import optax
+import tyro
+
+from dew.data.dataloaders import get_dataset_grain
+from dew.inputs import DiffusionInputConfig
+from dew.interop import save_params
+from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.jepa.probes import get_knn_probe_metric, get_linear_probe_metric
+from dew.registry import apply_precision_policy, build_model
+from dew.training import ObjectiveTrainer
+
+
+@dataclass
+class Config:
+    dataset: str = "oxford_flowers102"
+    classes: int = 102
+    image_size: int = 224
+    patch_size: int = 16
+    batch_size: int = 64
+    epochs: int = 300
+    steps_per_epoch: int | None = None
+    learning_rate: float = 1e-3
+    emb_features: int = 384
+    num_layers: int = 12
+    num_heads: int = 6
+    out: Path = Path("runs/ijepa-flowers")
+
+
+def main(config: Config, data=None):
+    data = data or get_dataset_grain(config.dataset, batch_size=config.batch_size, image_scale=config.image_size)
+    grid = (config.image_size // config.patch_size,) * 2
+
+    # The context encoder is the model being trained. The predictor maps its embeddings of the
+    # visible patches to the target encoder's embeddings of the masked blocks.
+    encoder_config = apply_precision_policy("jepa_encoder", dict(
+        patch_size=config.patch_size, emb_features=config.emb_features,
+        num_layers=config.num_layers, num_heads=config.num_heads,
+    ), dtype="bfloat16", attention_impl="auto")
+    encoder = build_model("jepa_encoder", encoder_config)
+    predictor = build_model("jepa_predictor", dict(
+        grid=grid, emb_features=config.emb_features, predictor_features=config.emb_features // 2,
+        num_layers=max(1, config.num_layers // 2), num_heads=config.num_heads,
+        dtype=encoder_config["dtype"], attention_impl=encoder_config["attention_impl"],
+    ))
+    objective = JepaObjective(encoder, predictor, mask=multi_block_mask(grid),
+                              sample_data_key="image", sample_data_shape=(config.image_size, config.image_size, 3))
+
+    trainer = ObjectiveTrainer(
+        encoder, optax.adamw(config.learning_rate), objective=objective,
+        input_config=DiffusionInputConfig(sample_data_key="image",
+                                          sample_data_shape=(config.image_size, config.image_size, 3), conditions=[]),
+        eval_metrics=[get_linear_probe_metric(config.classes), get_knn_probe_metric(config.classes)],
+        rngs=jax.random.PRNGKey(0), name=config.out.name, checkpoint_base_path=str(config.out / "checkpoints"),
+    )
+    steps = config.steps_per_epoch or data["train_len"] // config.batch_size
+    state = trainer.fit(data, training_steps_per_epoch=steps, epochs=config.epochs, val_steps_per_epoch=1)
+
+    # The EMA of the context encoder is the encoder to keep.
+    save_params(state.ema_params["params"]["context_encoder"], config.out / "encoder.safetensors")
+    return state
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Config))
+```
+
 ## Objectives
 
 An objective is a class with four methods. `init_params` builds the parameter tree, which can hold several modules. `loss` returns a scalar and a dict of metrics. `make_validation_step` returns the function that runs at the end of each epoch. `log_validation_artifacts` sends its output to Weights & Biases. `ema` says which part of the tree gets an exponential moving average, and how fast.
 
-This objective trains a byte-level language model:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/seam-dark.svg">
+    <img src="docs/assets/seam-light.svg" alt="The trainer calls the objective at four points" width="100%">
+  </picture>
+</p>
+
+This objective trains a byte-level language model on the trainer as it ships today:
 
 ```python
 import jax.numpy as jnp, optax
@@ -198,11 +383,25 @@ The trainer compiles `loss` into a sharded training step, applies the optimizer,
 
 The trainer places everything on a two-dimensional mesh named `(data, fsdp)`. The batch is split across all devices. With `fsdp_size=1` the parameters are replicated, which is data parallelism. With `fsdp_size=N` every parameter and optimizer moment larger than `fsdp_min_param_size` is split across `N` devices along its largest divisible axis, and the rest stay replicated. One compiled step serves both, with input and output shardings declared to XLA and the state buffers donated.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/mesh-dark.svg">
+    <img src="docs/assets/mesh-light.svg" alt="The (data, fsdp) mesh on two hosts" width="100%">
+  </picture>
+</p>
+
 ```python
 trainer = ObjectiveTrainer(model, optimizer, ..., fsdp_size=4, grad_accum_steps=2)
 ```
 
-On a TPU pod or any multi-process run, every host runs the same script. `--trainer.multi-host` joins the processes into one JAX runtime before the model is built. The data pipeline shards records by process, so each host reads its own part of the dataset.
+On a TPU pod or any multi-process run, every host runs the same script. The recipes join the processes into one JAX runtime before the model is built, from the cluster environment; a failure to join stops the run instead of training on one host. The data pipeline shards records by process, so each host reads its own part of the dataset.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/training-loop-dark.svg">
+    <img src="docs/assets/training-loop-light.svg" alt="The training loop" width="100%">
+  </picture>
+</p>
 
 Checkpoints are written asynchronously with Orbax. The latest checkpoint and the best checkpoint by validation loss are both kept. The position of the data iterator is saved with them, so a resumed run continues from the next unseen batch. `checkpoint_every_steps` adds a fixed cadence between epoch boundaries.
 
@@ -212,7 +411,7 @@ Models compute in bf16 with fp32 parameters by default in the recipes, and atten
 |---|---|
 | FSDP degree | `--trainer.fsdp-size 4` |
 | Gradient accumulation | `--optim.grad-accum-steps 2` |
-| Multi-host | `--trainer.multi-host` |
+| Process pool | `--trainer.multi-host` to require it, `--trainer.no-multi-host` to skip it |
 | Compute dtype | `--model.dtype bfloat16` |
 | Attention kernel | `--model.attention-impl auto` |
 | Checkpoint cadence | `--trainer.checkpoint-every-steps 2000` |
@@ -221,6 +420,13 @@ Models compute in bf16 with fp32 parameters by default in the recipes, and atten
 ## Data
 
 The data pipeline is built on [Grain](https://github.com/google/grain). A dataset is a random-access source plus a transform. The sources cover TFDS datasets, ArrayRecord shards on a GCS mount, local video directories, VoxCeleb2, and URLs streamed while training. Decoding, resizing and augmentation run as Grain transforms that draw randomness from the record's own generator. A record gets the same augmentation and the same caption on any number of workers and hosts.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-dark.svg">
+    <img src="docs/assets/pipeline-light.svg" alt="From a data source to the mesh" width="100%">
+  </picture>
+</p>
 
 ```python
 from dew.config import DataConfig
@@ -296,14 +502,14 @@ Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[strea
 To work on Dew itself:
 
 ```bash
-git clone --recurse-submodules git@github.com:AshishKumar4/dew.git
+git clone --recurse-submodules https://github.com/AshishKumar4/dew.git
 cd dew && pip install -e ".[test]"
 JAX_PLATFORMS=cpu pytest -m "not network" -q
 ```
 
 The tests simulate 8 devices on CPU, so the sharding tests run on any machine.
 
-`dew` on PyPI is an unused placeholder, so the package is `dew-ml` for now.
+`dew` on PyPI is an unused placeholder from 2016, so the package is `dew-ml` for now.
 
 ## Documentation
 

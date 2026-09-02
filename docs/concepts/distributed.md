@@ -30,7 +30,7 @@ Loss health is watched on device: a non-finite streak counter rides along with t
 
 `shard_batch(sharding, batch)` assembles this process's slice of each array into a globally sharded array with `jax.make_array_from_process_local_data`, which is what makes the multi-host case identical to the single-host one.
 
-A multi-process run has to join the process pool before any of that: `--trainer.multi-host` is what makes a recipe call `jax.distributed.initialize()`, and a failure to join stops the run rather than training one process on a slice of the data and calling it a full run.
+A multi-process run has to join the process pool before any of that. The recipes call `jax.distributed.initialize()`, which finds the coordinator from the environment on TPU pods and clusters; on a machine with no cluster environment the call reports that and the run continues on one process. Any other failure stops the run rather than training one process on a slice of the data and calling it a full run. `--trainer.multi-host` requires the pool, `--trainer.no-multi-host` never asks for it.
 
 `DevicePrefetchIterator(iterator, sharding, depth=2)` runs that transfer a few batches ahead of the loop on a background thread. Without it the host-to-device copy sits on the critical path, because the loop only starts moving batch N+1 after step N has been dispatched. Exceptions raised in the thread are re-raised on the consumer's side rather than swallowed.
 

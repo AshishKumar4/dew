@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6e7681"/></marker></defs>
+  <text x="24" y="36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">8 devices on 2 hosts, mesh (data=4, fsdp=2)</text>
+  <rect x="24" y="60" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="36" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 0</text>
+  <text x="36" y="104" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 0<tspan fill="#2fb8a8" dx="12">param shard 0</tspan></text>
+  <rect x="236" y="60" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="248" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 1</text>
+  <text x="248" y="104" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 0<tspan fill="#2fb8a8" dx="12">param shard 1</tspan></text>
+  <rect x="24" y="132" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="36" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 2</text>
+  <text x="36" y="176" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 1<tspan fill="#2fb8a8" dx="12">param shard 0</tspan></text>
+  <rect x="236" y="132" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="248" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 3</text>
+  <text x="248" y="176" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 1<tspan fill="#2fb8a8" dx="12">param shard 1</tspan></text>
+  <rect x="24" y="204" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="36" y="228" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 4</text>
+  <text x="36" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 2<tspan fill="#2fb8a8" dx="12">param shard 0</tspan></text>
+  <rect x="236" y="204" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="248" y="228" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 5</text>
+  <text x="248" y="248" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 2<tspan fill="#2fb8a8" dx="12">param shard 1</tspan></text>
+  <rect x="24" y="276" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="36" y="300" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 6</text>
+  <text x="36" y="320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 3<tspan fill="#2fb8a8" dx="12">param shard 0</tspan></text>
+  <rect x="236" y="276" width="200" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="248" y="300" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#e6edf3">device 7</text>
+  <text x="248" y="320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1">batch shard 3<tspan fill="#2fb8a8" dx="12">param shard 1</tspan></text>
+  <path d="M 454 60 L 464 60 L 464 192 L 454 192" fill="none" stroke="#30363d" stroke-width="1.25"/>
+  <text x="474" y="130.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">host 0</text>
+  <path d="M 454 204 L 464 204 L 464 336 L 454 336" fill="none" stroke="#30363d" stroke-width="1.25"/>
+  <text x="474" y="274.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">host 1</text>
+  <text x="24" y="360" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">rows: the data axis, one quarter of the global batch each</text>
+  <text x="24" y="380" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">columns: the fsdp axis, one half of every large parameter and optimizer moment each</text>
+  <rect x="640" y="60" width="536" height="68" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="658" y="90" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">batch</text>
+  <text x="658" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">split along data; each host builds it from its own records</text>
+  <rect x="640" y="142" width="536" height="68" rx="8" fill="#0f2a27" stroke="#2fb8a8" stroke-width="1.25"/>
+  <text x="658" y="172" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">large parameters</text>
+  <text x="658" y="194" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">split along fsdp on the largest divisible axis</text>
+  <rect x="640" y="224" width="536" height="68" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.25"/>
+  <text x="658" y="254" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#e6edf3">small parameters</text>
+  <text x="658" y="276" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#9198a1">replicated on every device</text>
+  <text x="640" y="322" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">fsdp_size=1 leaves one column: plain data parallelism, same code path.</text>
+</svg>
