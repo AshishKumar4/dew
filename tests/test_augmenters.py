@@ -11,16 +11,24 @@ These tests run in the bare venv: torchvision is blocked in sys.modules to
 prove nothing in the module's import or construction path reaches it.
 """
 
+import hashlib
 import os
+import random
 import struct
 import subprocess
 import sys
 from pathlib import Path
 
+from absl import flags
 import cv2
 import grain.python as pygrain
 import numpy as np
 import pytest
+
+# grain's worker processes read absl flags; a test that never ran absl.app
+# would trip UnparsedFlagAccessError at any worker_count > 0.
+if not flags.FLAGS.is_parsed():
+    flags.FLAGS.mark_as_parsed()
 
 # Any import of torchvision from here on raises ImportError; the module under
 # test must import, construct and augment regardless.
@@ -34,18 +42,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LABELS = ("pink rose", "yellow tulip", "white lily", "blue orchid")
 SCALE = 48
 DRAWS = 32
+RECORDS = 16
 
 
 class _StubTokenizer:
-    """Offline stand-in for the CLIP tokenizer the real transform builds."""
+    """Offline stand-in for the CLIP tokenizer the real transform builds.
+
+    The ids are a digest of the caption, so a caption stays comparable after a
+    trip through grain's worker processes.
+    """
 
     def __init__(self, tensor_type="np"):
         self.tensor_type = tensor_type
 
     def __call__(self, caption):
+        digest = hashlib.blake2s(caption.encode(), digest_size=8).digest()
         return {
-            "input_ids": np.zeros((1, 8), np.int32),
-            "attention_mask": np.ones((1, 8), np.int32),
+            "input_ids": np.frombuffer(digest, np.int32)[None, :],
+            "attention_mask": np.ones((1, 2), np.int32),
         }
 
 
@@ -244,20 +258,80 @@ def test_unset_mode_defaults_to_flip_jitter(kind, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_augmentation_repeats_from_the_same_record_rng(kind, tmp_path, monkeypatch):
-    """The same record must get the same augmentation whatever the worker or
-    process count, and the numpy global RNG must stay untouched."""
+def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path, monkeypatch):
+    """The same record must get the same augmentation and the same caption
+    whatever the worker or process count, and neither global RNG may move."""
     monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
     first = _make_transform(kind, labels_file, monkeypatch)
     other = _make_transform(kind, labels_file, monkeypatch)
 
-    global_state = np.random.get_state()[1]
+    numpy_state = np.random.get_state()[1]
+    python_state = random.getstate()
     one = first.random_map(element, _record_rng(7))
     # an unrelated record in between must not disturb the next one
     other.random_map(_element_for(kind, seed=1), _record_rng(999))
     two = other.random_map(element, _record_rng(7))
 
     np.testing.assert_array_equal(one["image"], two["image"])
-    assert np.array_equal(global_state, np.random.get_state()[1])
+    np.testing.assert_array_equal(one["text"]["input_ids"], two["text"]["input_ids"])
+    assert np.array_equal(numpy_state, np.random.get_state()[1])
+    assert random.getstate() == python_state
+
+
+def test_the_caption_template_comes_from_the_record_rng(tmp_path):
+    """A module-global random.choice picked the template, so a record's caption
+    moved with the worker and process count while its image did not."""
+    labelizer = images.labelizer_oxford_flowers102(str(_write_labels(tmp_path)))
+    element = {"label": 1}
+
+    captions = [labelizer(element, _record_rng(draw)) for draw in range(DRAWS)]
+
+    assert len(set(captions)) > 1  # the rng really does pick the template
+    assert set(captions) <= {t.format(LABELS[1]) for t in images.PROMPT_TEMPLATES}
+    assert labelizer(element, _record_rng(3)) == captions[3]
+
+
+# ---------------------------------------------------------------------------------
+# Loader level: a record does not depend on how many workers produced it
+# ---------------------------------------------------------------------------------
+
+def _by_record(transform_cls, source, worker_count):
+    """label -> (image, caption ids) for every record of one epoch.
+
+    Keyed by label rather than compared batch for batch: grain gives each
+    worker its own slice of the index stream, so batch composition follows
+    worker_count while record content must not.
+    """
+    sampler = pygrain.IndexSampler(num_records=len(source), shuffle=True, seed=7,
+                                   num_epochs=1, shard_options=pygrain.NoSharding())
+    loader = pygrain.DataLoader(
+        data_source=source,
+        sampler=sampler,
+        operations=[transform_cls(), pygrain.Batch(4, drop_remainder=True)],
+        worker_count=worker_count,
+    )
+    records = {}
+    for batch in loader:
+        for position, label in enumerate(batch["label"]):
+            records[int(label)] = (batch["image"][position].tobytes(),
+                                   batch["text"]["input_ids"][position].tobytes())
+    return records
+
+
+def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
+    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+    # One label per record, so a batch says which records it carries.
+    labels_file = tmp_path / "indexed_labels.txt"
+    labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
+    source = [{"image": _synthetic_image(i), "label": i} for i in range(RECORDS)]
+    transform_cls = ImageTFDSAugmenter(
+        label_path=str(labels_file)).create_transform(image_scale=SCALE)
+
+    serial = _by_record(transform_cls, source, worker_count=0)
+    parallel = _by_record(transform_cls, source, worker_count=2)
+
+    assert sorted(serial) == list(range(RECORDS))
+    assert serial == parallel

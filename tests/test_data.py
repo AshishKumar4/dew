@@ -27,7 +27,9 @@ from dew.data.registry import mediaDatasetMap
 from dew.data.sources.audio_utils import _read_wav_mono, read_audio_ffmpeg
 from dew.data.sources.av_utils import choose_clip_start
 from dew.data.sources.base import DataAugmenter, DataSource, MediaDataset
-from dew.data.sources.images import ImageTFDSAugmenter, gcs_filters
+from dew.data.sources.images import (
+    CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, gcs_filters,
+)
 from dew.data.sources import videos as videos_module
 from dew.data.sources.videos import AudioVideoAugmenter, VideoLocalSource
 from dew.data.sources.voxceleb2 import VoxCeleb2Source
@@ -64,6 +66,16 @@ def test_unknown_registry_keys_are_rejected():
         DataAugmenter.create("video_gcs")
     with pytest.raises(ValueError, match="Unknown source type"):
         DataSource.create("audio_gcs")
+
+
+@pytest.mark.parametrize("source_cls", [ImageGCSSource, CombinedImageGCSSource])
+def test_gcs_sources_require_an_explicit_dataset_path(source_cls):
+    """The default was one developer's bucket mount, and an unset path reached
+    os.path.join(None, ...) instead of saying anything."""
+    parameter = inspect.signature(source_cls.get_source).parameters["path_override"]
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(ValueError, match="explicit dataset path"):
+        source_cls().get_source(None)
 
 
 # ---------------------------------------------------------------------------------
@@ -229,6 +241,64 @@ def test_legacy_grain_loader_takes_a_validation_batch_size():
     assert parameters["val_batch_size"].default == 32
     assert "val_worker_count" in parameters
 
+
+@pytest.fixture
+def fake_legacy_dataset(monkeypatch):
+    """Register a dependency-free legacy image dataset named "fake"."""
+    source = _ListSource(32)
+    augmenter = _PassthroughAugmenter()
+    monkeypatch.setitem(dataloaders.datasetMap, "fake", {
+        "source": source.get_source,
+        "augmenter": lambda image_scale, method: augmenter.create_transform(),
+    })
+    return source
+
+
+def test_legacy_grain_loader_holds_the_validation_records_out_of_training(fake_legacy_dataset):
+    """Validation used to read the whole source, so FID and CLIP were measured
+    on records the model had trained on."""
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_batch_size=4, val_count=8,
+        worker_count=0, val_worker_count=0, num_epochs=1, seed=0)
+
+    assert data["val_len"] == 8
+    assert data["train_len"] == 24
+
+    val_indices = [i for batch in _indices(data["val"](), 2) for i in batch]
+    train_indices = [i for batch in _indices(data["train"](), 3) for i in batch]
+
+    assert val_indices == list(range(8))  # canonical order, its own sampler
+    assert set(train_indices).isdisjoint(val_indices)
+    assert len(train_indices) == 24 and train_indices != sorted(train_indices)
+
+
+def test_legacy_grain_loader_without_val_count_keeps_validating_on_every_record(fake_legacy_dataset):
+    data = dataloaders.get_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                         worker_count=0, val_worker_count=0, num_epochs=1)
+    assert data["train_len"] == 32 and data["val_len"] == 32
+
+
+def test_legacy_grain_loader_rejects_impossible_val_counts(fake_legacy_dataset):
+    with pytest.raises(ValueError, match="val_count"):
+        dataloaders.get_dataset_grain("fake", dataset_source="/tmp", val_count=32)
+
+
+def test_a_run_config_holds_out_a_validation_split_on_both_grain_paths(monkeypatch):
+    """Recipe runs get the disjoint split without asking for it."""
+    from dew.config import DataConfig
+
+    captured = {}
+    for factory in ("get_dataset_grain", "get_media_dataset_grain"):
+        monkeypatch.setattr(dataloaders, factory,
+                            lambda name, **kwargs: captured.setdefault(name, kwargs))
+
+    dataloaders.load_data(DataConfig(dataset="oxford_flowers102", loader="grain"))
+    dataloaders.load_data(DataConfig(dataset="voxceleb2", loader="grain"))
+
+    defaults = DataConfig()
+    expected = defaults.val_steps_per_epoch * defaults.batch_size
+    assert captured["oxford_flowers102"]["val_count"] == expected
+    assert captured["voxceleb2"]["val_count"] == expected
 
 # ---------------------------------------------------------------------------------
 # WAV decoding
@@ -508,3 +578,41 @@ def test_image_collate_resizes_mixed_shapes_to_the_largest(monkeypatch):
     assert out["image"].shape == (2, 20, 24, 3)
     assert out["image"][0].min() == 200 and out["image"][1].min() == 100
     assert out["text"]["input_ids"].shape == (2, 4)
+
+
+def test_image_collate_raises_on_a_malformed_sample(monkeypatch):
+    """The whole-batch try/except returned zeros captioned "Error processing
+    image" for any failure, and a batch of zeros trains as data."""
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+    batch = [
+        {"image": np.full((16, 16, 3), 200, np.uint8), "caption": "fine"},
+        {"image": "not an array", "caption": "broken"},
+    ]
+
+    with pytest.raises(AttributeError):
+        collate(batch)
+
+
+def test_collate_raises_on_a_sample_without_a_caption(monkeypatch):
+    """A missing caption used to collate as the empty string."""
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    image_collate = dataloaders.generate_collate_fn("image")
+    video_collate = dataloaders.generate_collate_fn("video")
+
+    with pytest.raises(KeyError, match="caption"):
+        image_collate([{"image": np.zeros((8, 8, 3), np.uint8)}])
+    with pytest.raises(KeyError, match="caption"):
+        video_collate([{"video": np.zeros((2, 8, 8, 3), np.uint8)}])
+
+
+def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("video")
+    batch = [
+        {"video": np.zeros((2, 8, 8, 3), np.uint8), "caption": "fine"},
+        {"video": None, "caption": "broken"},
+    ]
+
+    with pytest.raises(AttributeError):
+        collate(batch)
