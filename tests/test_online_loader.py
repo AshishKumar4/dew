@@ -1,15 +1,18 @@
 """Streaming loader tests: what reaches the model when fetching goes wrong.
 
 The shared environment has no HF `datasets`, which is the point of one of
-these: importing the streaming stack must not need the `streaming` extra. The
-rest replace the fetcher pool with a stub producer, so nothing here touches the
-network or a process pool.
+these: importing the streaming stack must not need the `streaming` extra. Most
+of the rest replace the fetcher pool with a stub producer; the two that do run
+the real worker pool stub the fetch instead. Nothing here touches the network,
+and every url is under .invalid so a stray fetch could not reach a host.
 """
 
+import multiprocessing
 import queue
 import threading
 
 import numpy as np
+import PIL.Image
 import pytest
 
 from dew.data import online_loader
@@ -21,6 +24,9 @@ BATCH = 4
 # Comfortably longer than the iterator's timeout below, so the slow producer
 # really does make it wait.
 SLOW = 0.15
+# The pool tests: 12 rows over 2 workers, one batch per pass.
+POOL_ROWS = 12
+POOL_BATCH = 8
 
 
 @pytest.fixture
@@ -53,16 +59,62 @@ def _iterator(monkeypatch, producer, queue_timeout=0.05):
 
 
 class _StubDataset:
-    """As much of an HF dataset as the loader's constructor reads."""
+    """As much of an HF dataset as the loader and the fetcher pool read.
 
-    def __init__(self, size):
+    Column oriented like HF's, so a shard is a dict of lists. `passes` bounds
+    the producer's otherwise endless loop, so a test's worker pool shuts down
+    with it.
+    """
+
+    def __init__(self, size, passes=1):
         self.size = size
+        self.passes = passes
 
     def shard(self, num_shards, index):
         return self
 
+    def shuffle(self, seed=0):
+        if seed > self.passes:
+            raise RuntimeError("stub dataset ran out of passes")
+        return self
+
     def __len__(self):
         return self.size
+
+    def __getitem__(self, window):
+        indices = range(*window.indices(self.size))
+        return {"url": [f"https://example.invalid/{i}.jpg" for i in indices],
+                "caption": [f"caption {i}" for i in indices]}
+
+
+def _url_index(url):
+    return int(url.rsplit("/", 1)[1].split(".")[0])
+
+
+def _fetch_stub(url, timeout=None, retries=0):
+    """A synthetic image the default processor accepts: over the minimum size,
+    square, and not a solid colour."""
+    pixels = np.random.RandomState(_url_index(url)).randint(0, 256, (48, 48, 3), np.uint8)
+    return PIL.Image.fromarray(pixels)
+
+
+def _fetch_stub_every_third_fails(url, timeout=None, retries=0):
+    return None if _url_index(url) % 3 == 2 else _fetch_stub(url)
+
+
+def _pool_iterator(passes):
+    """A MediaBatchIterator on the real fetcher pool."""
+    return MediaBatchIterator(_StubDataset(POOL_ROWS, passes=passes),
+                              batch_size=POOL_BATCH, num_workers=2, num_threads=2,
+                              image_shape=(64, 64), min_image_shape=(32, 32),
+                              queue_timeout=10)
+
+
+def _require_fork():
+    """The stub fetch reaches the pool workers by fork inheritance; a spawned
+    worker would re-import the real module and go looking for a network."""
+    if multiprocessing.get_context().get_start_method() != "fork":
+        pytest.skip("the fetch stub only reaches forked workers")
 
 
 # ---------------------------------------------------------------------------------
@@ -189,6 +241,41 @@ def test_batches_keep_flowing_until_the_collate_error(monkeypatch, stop):
     with pytest.raises(RuntimeError, match="streaming data loader died"):
         next(loader)
 
+
+# ---------------------------------------------------------------------------------
+# The real worker pool, with the fetch stubbed
+# ---------------------------------------------------------------------------------
+
+def test_the_worker_pool_delivers_real_samples(monkeypatch):
+    """parallel_media_loader passed its multiprocessing.Queue to pool.map as an
+    argument, which multiprocessing refuses to pickle, so the pool died before
+    its first fetch and every batch was fabricated zeros."""
+    _require_fork()
+    monkeypatch.setattr(online_loader, "fetch_single_image", _fetch_stub)
+
+    batch = next(_pool_iterator(passes=2))
+
+    assert len(batch) == POOL_BATCH
+    assert all(sample["image"].shape == (64, 64, 3) for sample in batch)
+    assert all(int(sample["image"].max()) > 0 for sample in batch)
+    assert {sample["caption"] for sample in batch} <= {
+        f"caption {index}" for index in range(POOL_ROWS)}
+
+
+def test_drops_in_the_worker_processes_reach_the_iterators_counter(monkeypatch):
+    _require_fork()
+    monkeypatch.setattr(online_loader, "fetch_single_image",
+                        _fetch_stub_every_third_fails)
+
+    iterator = _pool_iterator(passes=6)
+    batches = [next(iterator) for _ in range(3)]
+
+    assert all(len(batch) == POOL_BATCH for batch in batches)
+    assert all("image" in sample for batch in batches for sample in batch)
+    # A pass over the 12 rows queues 8 samples and 4 markers, and pool.map
+    # finishes a pass before the next starts, so three batches of real samples
+    # come with 12 markers, give or take one pass of cross-process flush order.
+    assert 8 <= iterator.dropped <= 16
 
 # ---------------------------------------------------------------------------------
 # The streaming extra
