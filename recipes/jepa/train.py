@@ -26,7 +26,7 @@ from dew.inputs import DiffusionInputConfig
 from dew.objectives.jepa import (
     JepaObjective, multi_block_mask, get_linear_probe_metric, get_knn_probe_metric,
 )
-from dew.registry import build_model, canonicalize_architecture
+from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
 from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
 
@@ -71,16 +71,19 @@ class JepaRunConfig(RunConfig):
 def build_encoder(config: JepaRunConfig):
     """The encoder, and the config the registry built it from."""
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
-    encoder_config = {**config.model.config, **suffix_flags}
+    encoder_config = apply_precision_policy(
+        architecture, {**config.model.config, **suffix_flags},
+        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     if encoder_config.get('use_hilbert') and encoder_config.get('use_zigzag'):
         raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
     return build_model(architecture, encoder_config), encoder_config
 
 
-def build_predictor(config: JepaRunConfig, encoder, grid, is_video: bool):
+def build_predictor(config: JepaRunConfig, encoder_config: dict, encoder, grid,
+                    is_video: bool):
     """The predictor that reads the encoder's embeddings, and its config."""
     predictor_config = {
-        **{k: v for k, v in config.model.config.items() if k in SHARED_MODEL_KEYS},
+        **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
         **config.predictor,
         "grid": grid,
         "factorized": is_video,
@@ -123,7 +126,8 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
 
     encoder, encoder_config = build_encoder(config)
     grid = (config.data.image_size // encoder.patch_size,) * 2
-    predictor, predictor_config = build_predictor(config, encoder, grid, is_video)
+    predictor, predictor_config = build_predictor(
+        config, encoder_config, encoder, grid, is_video)
 
     mask = multi_block_mask(
         grid,
