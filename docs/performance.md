@@ -14,13 +14,13 @@ XLA_FLAGS=<flags> python tools/benchmark_step.py --preset small \
     --architectures <arch> --warmup 3 --steps 10
 ```
 
-Conditions: jax 0.11.1 / jaxlib 0.11.1 (CUDA 13), driver 595.84, RTX 4080
-16 GiB, single device, bf16 compute, adam, 3 warmup and 10 measured steps, one
-architecture per process. The card was idle before each measurement
-(`nvidia-smi --query-compute-apps=pid` showing only the desktop's pid), at
-210 MHz and 30 W at rest and 2760 MHz and 120-220 W under load. An XLA flag
-is read once when a backend opens, so every flag configuration ran in a fresh
-process.
+Conditions: jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
+595.84, RTX 4080 16 GiB, single device, bf16 compute, adam, 3 warmup and 10
+measured steps, one architecture per process. The card was idle before each
+measurement (`nvidia-smi --query-compute-apps=pid` showing only the
+desktop's pid), at 210 MHz and 30 W at rest and 2760 MHz and 120-220 W under
+load. An XLA flag is read once when a backend opens, so every flag
+configuration ran in a fresh process.
 
 ## The attention kernels
 
@@ -134,49 +134,19 @@ scheduling flags were measured. No flag that relaxes precision was tested and
 none would be adopted, because an adopted change has to keep a fixed-seed
 20-step loss trajectory within 1e-5.
 
-## Ceilings
+## The unet's 1.7%
 
-Measured, not adopted. These say where the remaining room is.
-
-### fp8 against bf16
-
-`/tmp/Kernels/ceilings.py matmul`, square matmuls with fp32 accumulation
-through `preferred_element_type`.
-
-| dtype | n | ms | TFLOP/s |
-|---|---|---|---|
-| bfloat16 | 4096 | 1.52 | 90.3 |
-| float8_e4m3fn | 4096 | 0.80 | 171.0 |
-| bfloat16 | 8192 | 10.84 | 101.4 |
-| float8_e4m3fn | 8192 | 5.64 | 194.9 |
-
-fp8 is 1.9 times bf16 on this card and needs no code beyond the cast, which
-makes it the largest single ceiling here. It is also the one that cannot be
-adopted under the no-tradeoff rule without a scaling scheme and a numerics
-argument, since e4m3 carries 3 mantissa bits. The bf16 number is also the
-honest ceiling for `train/mfu`: 101.4 TFLOP/s measured against the 97.5 the
-utilisation column divides by, so a row reading 100% would be right.
-
-### RMSNorm and SwiGLU
-
-The question was whether XLA leaves them as separate kernels, in which case
-the pallas `rms_norm` op would be worth trying. It does not. A 4096-token
-1024-wide block with a 2816-wide gated MLP compiles to four kernels:
+Measured, not adopted: where the remaining room is on the least utilised
+architecture of the preset.
 
 ```
-%fusion.11              rms_norm: mean of squares, rsqrt, scale, convert
-%gemm_fusion_dot        gate and up projections, merged into one 5632-wide gemm
-%loop_convert_fusion    silu(gate) * up
-%gemm_fusion_dot_general.5   down projection
+python tools/benchmark_step.py --preset small --architectures unet \
+    --batch-size 16 --warmup 3 --steps 10
 ```
 
-Both constructs are already one kernel each, and XLA merged the two MLP
-projections into a single gemm. The block runs at 69.9 TFLOP/s of the 101.4
-ceiling, and the norm is 0.040 ms of its 1.113 ms, so a perfect norm kernel
-could take back at most 3.6% of an MLP block. No comparison against
-`ops/gpu/rms_norm.py` was run: there is nothing unfused for it to win.
-
-### The unet's 1.7%
+once per batch size, and again with
+`--xla-flags=--xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUBLASLT,CUDNN,CUSTOM_CALL,WHILE`
+for the extended rows.
 
 | run | batch | ms/step | GFLOP/step | util |
 |---|---|---|---|---|
@@ -191,61 +161,3 @@ Utilisation moves from 1.69% to 1.83%: the batch is not what holds this model
 at 2% of peak. A convolutional stack at 64 channels moves far more activation
 bytes per FLOP than a transformer does, and that ratio does not improve with
 batch. Command buffers are worth 1.4% at batch 16 and nothing at batch 64.
-
-### Compile time and scan over layers
-
-A 28-layer 1024-wide `causal_transformer` at 1024 tokens, batch 2, which is
-140 ms per step at 38% utilisation:
-
-| compile | seconds |
-|---|---|
-| no persistent cache | 11.7 |
-| cold cache (writing) | 12.3 |
-| warm cache | 2.2 |
-
-Twelve seconds for 28 layers, and 2.2 with the cache the trainer enables by
-default. Scan over layers would trade a lower unrolled compile time for a
-different step; there is no compile-time argument for it at this depth.
-
-### fp32 matmuls and TF32
-
-XLA:GPU answers an fp32 dot at DEFAULT precision with TF32 tensor cores: 10
-mantissa bits, not 23. `jax_default_matmul_precision` is None in this repo, so
-that is what the fp32 matmuls in a bf16 step get. `dot_general` operand
-dtypes in the lowered training step:
-
-| architecture | bf16 x bf16 | f32 x f32 | f32 x bf16 |
-|---|---|---|---|
-| simple_dit | 131 | 8 | 0 |
-| causal_transformer | 63 | 3 | 0 |
-| unet | 115 | 5 | 10 |
-| jepa_encoder | 217 | 0 | 6 |
-
-The f32 pairs are the projections a model keeps in fp32 on purpose: the
-language model's `lm_head` (`dtype=jnp.float32` at
-`causal_transformer.py:337`, and the tied-embedding path which casts both
-operands), and the DiT's conditioning and output projections. The mixed pairs
-are the fp32 attention logits on the xla path. Every one of them carries
-`precision=DEFAULT`, so every one runs at TF32.
-
-What the precision costs, at 4096 x 4096 x 4096 and at the real shapes,
-against a float64 reference:
-
-| dot | default ms | highest ms | cost | max abs error, default | highest |
-|---|---|---|---|---|---|
-| 4096 cube | 3.06 | 4.11 | 1.34x | 1.10e-1 | 9.2e-4 |
-| lm_head, 8192 x 768 x 50304 | 13.06 | 19.75 | 1.51x | 5.4e-2 | 2.3e-4 |
-| DiT adaLN, 16 x 384 x 1536 | 0.058 | 0.054 | 0.94x | 2.3e-2 | 7.1e-5 |
-| DiT output, 4096 x 384 x 48 | 0.059 | 0.067 | 1.13x | 2.8e-2 | 7.1e-5 |
-
-`precision='high'` measures the same error as DEFAULT, which confirms both
-are TF32.
-
-The finding: where this repo asks for fp32 it gets TF32. For the small
-projections the difference is free (0.054 against 0.058 ms), so passing
-`precision='highest'` there costs nothing and honors what the code asks for.
-For the language model's head it is not free: the forward dot alone goes from
-13.06 to 19.75 ms, 9% of a 75.7 ms step, and the step holds three of these
-dots. Nothing was changed here: `lm_head` and the DiT heads are not this
-wave's files, and the choice between 11 mantissa bits and 9% of the step
-belongs with the objective that wants fp32 logits.
