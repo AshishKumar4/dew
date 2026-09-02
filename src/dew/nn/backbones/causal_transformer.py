@@ -161,29 +161,39 @@ class CausalSelfAttention(nn.Module):
         key = apply_rotary(key, freqs_cos, freqs_sin)
 
         causal, mask = True, None
+        implementation = self.attention_impl
+        window = None if decode else self.sliding_window
         if append is not None:
             key, value = append(key, value)
             mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
             causal = False
         elif segment_ids is not None:
             # Attention stays inside each packed document: the segment ids
-            # build the block-diagonal mask on top of causality, and padding
-            # (segment 0) sees nothing. The fused cudnn kernel turns a bool
-            # mask into a materialized [B, N, T, S] bias, whose shape and
-            # sequence-parity constraints give up the memory win that motivated
-            # it (jax/_src/nn/functions.py routes every mask on the cudnn path
-            # through combine_bias_and_mask), so a packed batch runs the xla
-            # path unless the caller pinned something else.
+            # make the mask block-diagonal, padding (segment 0) sees nothing,
+            # and causality (with the layer's window) travels in the same mask
+            # rather than as the kernels' flag.
             segment_ids = jnp.asarray(segment_ids)
-            causal = False
-            mask = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                    & (segment_ids[:, :, None] != 0))[:, None]
+            inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
+                      & (segment_ids[:, :, None] != 0))[:, None]
+            mask = jnp.logical_and(
+                inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
+            causal, window = False, None
+            if implementation in ('auto', 'cudnn'):
+                # cuDNN takes causality and windows as flags, not masks: jax
+                # turns any mask on that path into a materialized [B, N, T, S]
+                # additive bias (combine_bias_and_mask in
+                # jax/_src/cudnn/fused_attention_stablehlo.py), which needs
+                # even sequence lengths while training and reads grouped-query
+                # heads as MLA, supported only from Hopper on. The xla kernel
+                # takes the mask itself and runs the same fp32 softmax, so a
+                # packed batch goes there instead of degrading silently.
+                implementation = 'xla'
 
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl, causal=causal,
-            sliding_window=None if decode else self.sliding_window, mask=mask)
+            implementation=implementation, causal=causal,
+            sliding_window=window, mask=mask)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 

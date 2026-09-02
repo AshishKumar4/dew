@@ -85,12 +85,16 @@ class TokenDocumentSource:
     """Random access over a flat `.bin` of token ids, one document per record.
 
     A document is the span from after the previous `eos_id` through its own,
-    so the eos tokens are the record separators and every document ends with
-    one. The dtype and `eos_id` come from the sibling `meta.json` (the
-    tokenize tool records them when run with --pack-seq-len); `eos_id` there
-    is required, since without it the stream has no boundaries to find.
-    The memmap is never loaded into memory: a worker reads only the span it
-    is asked for.
+    so the eos tokens are the record separators. The tail after the last eos
+    is a document too: a train/val split cuts the stream wherever the token
+    fraction falls, and dropping the piece past the last boundary would lose
+    those tokens silently.
+
+    The dtype and `eos_id` come from the sibling `meta.json` (the tokenize
+    tool records them when run with --pack); `eos_id` is required, since
+    without it the stream has no boundaries to find. Finding the boundaries
+    reads the file once at construction; after that a worker touches only the
+    span it is asked for.
     """
 
     def __init__(self, path: str, eos_id: Optional[int] = None):
@@ -108,17 +112,21 @@ class TokenDocumentSource:
         if eos_id is None:
             raise ValueError(
                 f"{meta_path} records no eos_id: document boundaries are the "
-                "eos tokens the tokenize tool writes with --pack-seq-len")
+                "eos tokens tools/tokenize_text.py writes with --pack")
         self.eos_id = int(eos_id)
 
         self._tokens = np.memmap(self.path, dtype=self.dtype, mode="r")
-        ends = np.flatnonzero(self._tokens == self.eos_id)
+        ends = (np.flatnonzero(self._tokens == self.eos_id) + 1).astype(np.int64)
         if len(ends) == 0:
             raise ValueError(
                 f"{self.path} holds no eos id {self.eos_id}, so it has no "
                 "document boundaries")
-        # Exclusive span ends; record i is tokens[prev_end : ends[i]].
-        self._ends = (ends + 1).astype(np.int64)
+        if ends[-1] < len(self._tokens):
+            ends = np.append(ends, len(self._tokens))
+        # Exclusive span ends; record i is tokens[starts[i] : ends[i]].
+        self._ends = ends
+        self._starts = np.concatenate([[0], ends[:-1]])
+        self.lengths = self._ends - self._starts
 
     def __len__(self) -> int:
         return len(self._ends)
@@ -126,9 +134,8 @@ class TokenDocumentSource:
     def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
         if not 0 <= index < len(self):
             raise IndexError(index)
-        start = 0 if index == 0 else self._ends[index - 1]
-        end = self._ends[index]
-        return {"text": self._tokens[start:end].astype(np.int32)}
+        window = self._tokens[self._starts[index]:self._ends[index]]
+        return {"text": window.astype(np.int32)}
 
     def __getstate__(self):
         # The memmap does not survive grain's pickle round trip to workers;

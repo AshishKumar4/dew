@@ -83,20 +83,37 @@ class LMObjective(Objective):
         shape, dtype = shape_and_dtype(self.input_shapes["tokens"])
         return self.model.init(rng, jnp.zeros((1, *shape), dtype))
 
-    def shifted_cross_entropy(self, params, tokens, train: bool = False, rngs=None):
-        """Next-token cross entropy over a `[B, seq_len + 1]` batch, and its telemetry."""
+    def shifted_cross_entropy(self, params, tokens, train: bool = False, rngs=None,
+                              segment_ids=None, positions=None):
+        """Next-token cross entropy over a `[B, seq_len + 1]` batch, and its telemetry.
+
+        A packed batch carries `segment_ids` for the same rows: the last token
+        of a document does not predict the first of the next one, so that
+        transition is dropped from the loss and the accuracy, and the model
+        reads the per-document `positions` for its rotary angles.
+        """
         if tokens.shape[-1] != self.seq_len + 1:
             raise ValueError(
                 f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
-        logits = self.model.apply(params, inputs, train=train, rngs=rngs)
+        logits = self.model.apply(params, inputs, train=train, rngs=rngs,
+                                  positions=None if positions is None else positions[:, :-1],
+                                  segment_ids=None if segment_ids is None else segment_ids[:, :-1])
         logits = logits.astype(jnp.float32)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
         correct = (jnp.argmax(logits, axis=-1) == targets).astype(losses.dtype)
 
         weights = (jnp.ones_like(losses) if self.pad_id is None
                    else (targets != self.pad_id).astype(losses.dtype))
+        if segment_ids is not None:
+            # A target counts only inside a document: the first token of the
+            # next packed document, the padding after the last one (segment 0,
+            # which the seg==seg comparison alone would keep), and every
+            # cross-boundary transition drop out of loss and accuracy alike.
+            weights = weights * (
+                (segment_ids[:, 1:] == segment_ids[:, :-1])
+                & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -109,7 +126,12 @@ class LMObjective(Objective):
 
     def loss(self, params, ema_params, batch, rng, step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-        return self.shifted_cross_entropy(params, tokens, train=True, rngs={"dropout": rng})
+        segment_ids = batch.get("text_segment_ids")
+        segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
+        positions = batch.get("text_positions")
+        positions = None if positions is None else jnp.asarray(positions, jnp.int32)
+        return self.shifted_cross_entropy(params, tokens, train=True, rngs={"dropout": rng},
+                                          segment_ids=segment_ids, positions=positions)
 
     def make_validation_step(self, **kwargs) -> Callable[[Any, Any], Dict[str, Any]]:
         """Teacher-forced cross entropy, plus the sampled text when asked for.
@@ -127,12 +149,18 @@ class LMObjective(Objective):
             from dew.sampling.text import generate
 
         teacher_forced_ce = jax.jit(
-            lambda params, tokens: self.shifted_cross_entropy(params, tokens)[0])
+            lambda params, tokens, segment_ids=None, positions=None:
+                self.shifted_cross_entropy(params, tokens,
+                                           segment_ids=segment_ids, positions=positions)[0])
 
         def validate(val_state, batch):
             params = validation_params(val_state)
             tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-            artifacts = {"ce": teacher_forced_ce(params, tokens)}
+            segment_ids = batch.get("text_segment_ids")
+            segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
+            positions = batch.get("text_positions")
+            positions = None if positions is None else jnp.asarray(positions, jnp.int32)
+            artifacts = {"ce": teacher_forced_ce(params, tokens, segment_ids, positions)}
             if samples is not None:
                 artifacts["tokens"] = generate(
                     self.model, params, prompt, max_new_tokens,
