@@ -112,6 +112,10 @@ class TrainerConfig:
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     fsdp_size: int = 1
     fsdp_min_param_size: Optional[int] = None
+    logical_axis_rules: Optional[JsonDict] = None
+    """Replaces the logical-axis-to-mesh-axis table, e.g. {"mlp": "fsdp"}. Unset uses DEFAULT_LOGICAL_AXIS_RULES, which reproduces the shape heuristic."""
+    sharding_tolerance: float = 0.02
+    """Fail the run when more than this fraction of shardable parameter elements ended up replicated. 1.0 disables the check."""
     ema_decay: float = 0.999
     best_tracker_metric: Optional[str] = None
     profile_steps: int = 0
@@ -126,6 +130,8 @@ class TrainerConfig:
     wandb_offline: bool = False
 
     def __post_init__(self):
+        if not 0.0 <= self.sharding_tolerance <= 1.0:
+            raise ValueError("sharding_tolerance must be between 0 and 1")
         if self.resume_last_run is not None and self.wandb_project is None:
             raise ValueError(
                 "resume_last_run is a wandb run id and needs wandb_project set "

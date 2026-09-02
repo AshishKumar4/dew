@@ -20,8 +20,9 @@ from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
 from .distributed import (
-    DEFAULT_MIN_SHARD_SIZE, DevicePrefetchIterator, batch_sharding, build_mesh,
-    shard_batch, state_sharding_tree,
+    DEFAULT_MIN_SHARD_SIZE, DEFAULT_SHARDING_TOLERANCE, DevicePrefetchIterator,
+    LogicalAxisRuleConfig, assert_params_sufficiently_sharded, batch_sharding,
+    build_mesh, shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
 from dataclasses import dataclass
@@ -75,6 +76,8 @@ class SimpleTrainer:
                  train_start_step_override: int = None,
                  fsdp_size: int = 1,
                  fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
+                 logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
+                 sharding_tolerance: float = DEFAULT_SHARDING_TOLERANCE,
                  compilation_cache_dir: str = None,
                  profile_steps: int = 0,
                  profile_warmup_steps: int = 2,
@@ -95,6 +98,8 @@ class SimpleTrainer:
         self.batch_sharding = batch_sharding(self.mesh)
         self.replicated = NamedSharding(self.mesh, P())
         self.fsdp_min_param_size = fsdp_min_param_size
+        self.logical_axis_rules = logical_axis_rules
+        self.sharding_tolerance = sharding_tolerance
 
         self.model = model
         self.name = name
@@ -216,15 +221,20 @@ class SimpleTrainer:
         return ones
 
     def _build_state(self, init_fn) -> SimpleTrainState:
-        """Materialise a train state directly into its sharded layout.
+        """Materialise an unboxed train state directly into its sharded layout.
 
-        The sharding is derived from the abstract state, so optimizer moments
-        and EMA copies inherit their params' layout through tx.init without any
-        model or optimizer having to declare partitioning.
+        Logical metadata is read from the abstract state before it is removed.
+        Optimizer moments and EMA copies retain the axes of their parameters.
         """
+        abstract_state = jax.eval_shape(init_fn)
         self.state_sharding = state_sharding_tree(
-            self.mesh, jax.eval_shape(init_fn), self.fsdp_min_param_size)
-        return jax.jit(init_fn, out_shardings=self.state_sharding)()
+            self.mesh, abstract_state, self.fsdp_min_param_size,
+            self.logical_axis_rules)
+        assert_params_sufficiently_sharded(
+            nn.unbox(abstract_state.params), self.state_sharding.params,
+            self.mesh, self.sharding_tolerance, self.fsdp_min_param_size)
+        return jax.jit(
+            lambda: nn.unbox(init_fn()), out_shardings=self.state_sharding)()
 
     def generate_states(
         self,

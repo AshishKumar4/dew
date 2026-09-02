@@ -212,6 +212,8 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
         use_dynamic_scale=config.optim.use_dynamic_scale,
         fsdp_size=config.trainer.fsdp_size,
         fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
+        logical_axis_rules=config.trainer.logical_axis_rules,
+        sharding_tolerance=config.trainer.sharding_tolerance,
         compilation_cache_dir=config.trainer.compilation_cache_dir,
         profile_steps=config.trainer.profile_steps,
         log_every=config.trainer.log_every,

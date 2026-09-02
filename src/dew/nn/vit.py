@@ -24,17 +24,28 @@ class PatchEmbedding(nn.Module):
     embedding_dim: int
     dtype: Any = jnp.float32
     precision: Any = jax.lax.Precision.HIGH
+    logical_axes: bool = False
 
     @nn.compact
     def __call__(self, x):
         batch, height, width, channels = x.shape
         assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
-        x = nn.Conv(features=self.embedding_dim,
-                    kernel_size=(self.patch_size, self.patch_size),
-                    strides=(self.patch_size, self.patch_size),
-                    dtype=self.dtype,
-                    precision=self.precision)(x)
+        kernel_init = nn.linear.default_kernel_init
+        bias_init = nn.initializers.zeros
+        if self.logical_axes:
+            kernel_init = nn.with_partitioning(
+                kernel_init, (None, None, None, "embed"))
+            bias_init = nn.with_partitioning(bias_init, ("embed",))
+        x = nn.Conv(
+            features=self.embedding_dim,
+            kernel_size=(self.patch_size, self.patch_size),
+            strides=(self.patch_size, self.patch_size),
+            dtype=self.dtype,
+            precision=self.precision,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+        )(x)
         x = jnp.reshape(x, (batch, -1, self.embedding_dim))
         return x
 
@@ -193,7 +204,9 @@ class AdaLNParams(nn.Module): # Renamed for clarity
             features=6 * self.features,
             dtype=self.dtype,
             precision=self.precision,
-            kernel_init=nn.initializers.zeros,
+            kernel_init=nn.with_partitioning(
+                nn.initializers.zeros, ("embed", "modulation")),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, ("modulation",)),
             name="ada_proj"
         )(nn.silu(conditioning))
         # Return all params (or split if preferred, but maybe return tuple/dict)

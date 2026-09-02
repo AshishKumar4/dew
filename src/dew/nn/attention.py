@@ -220,17 +220,30 @@ class NormalAttention(nn.Module):
     attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
     causal: bool = False
     max_seq_len: Optional[int] = None  # KV cache length, required to decode
+    logical_axes: bool = False
 
     def setup(self):
-        inner_dim = self.dim_head * self.heads
+        kernel_init = nn.linear.default_kernel_init
+        qkv_bias_init = nn.initializers.zeros
+        out_bias_init = nn.initializers.zeros
+        out_kernel_init = nn.linear.default_kernel_init
+        if self.logical_axes:
+            kernel_init = nn.with_partitioning(
+                kernel_init, ("embed", "heads", "head_dim"))
+            qkv_bias_init = nn.with_partitioning(
+                qkv_bias_init, ("heads", "head_dim"))
+            out_kernel_init = nn.with_partitioning(
+                out_kernel_init, ("heads", "head_dim", "embed"))
+            out_bias_init = nn.with_partitioning(out_bias_init, ("embed",))
         dense = functools.partial(
             nn.DenseGeneral,
-            features=[self.heads, self.dim_head], 
-            axis=-1, 
-            precision=self.precision, 
-            use_bias=self.use_bias, 
-            # kernel_init=self.kernel_init, 
-            dtype=self.dtype
+            features=[self.heads, self.dim_head],
+            axis=-1,
+            precision=self.precision,
+            use_bias=self.use_bias,
+            kernel_init=kernel_init,
+            bias_init=qkv_bias_init,
+            dtype=self.dtype,
         )
         self.query = dense(name="to_q")
         self.key = dense(name="to_k")
@@ -241,14 +254,14 @@ class NormalAttention(nn.Module):
             self.k_norm = nn.RMSNorm(dtype=self.dtype, name="k_norm")
 
         self.proj_attn = nn.DenseGeneral(
-            self.query_dim, 
-            axis=(-2, -1), 
-            precision=self.precision, 
-            use_bias=self.use_bias, 
-            dtype=self.dtype, 
+            self.query_dim,
+            axis=(-2, -1),
+            precision=self.precision,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            kernel_init=out_kernel_init,
+            bias_init=out_bias_init,
             name="to_out_0",
-            # kernel_init=self.kernel_init
-            # kernel_init=jax.nn.initializers.xavier_uniform()
         )
 
     @nn.compact

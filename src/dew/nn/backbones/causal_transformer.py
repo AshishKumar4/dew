@@ -105,11 +105,32 @@ class CausalSelfAttention(nn.Module):
 
     def setup(self):
         dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
-        self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-        self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj')
+            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
+            precision=self.precision)
+        self.q_proj = dense(
+            self.num_heads * self.head_dim,
+            kernel_init=nn.with_partitioning(
+                nn.linear.default_kernel_init, ("embed", "heads")),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, ("heads",)),
+            name='q_proj')
+        self.k_proj = dense(
+            self.num_kv_heads * self.head_dim,
+            kernel_init=nn.with_partitioning(
+                nn.linear.default_kernel_init, ("embed", "kv")),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, ("kv",)),
+            name='k_proj')
+        self.v_proj = dense(
+            self.num_kv_heads * self.head_dim,
+            kernel_init=nn.with_partitioning(
+                nn.linear.default_kernel_init, ("embed", "kv")),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, ("kv",)),
+            name='v_proj')
+        self.o_proj = dense(
+            self.emb_features,
+            kernel_init=nn.with_partitioning(
+                nn.linear.default_kernel_init, ("attention", "embed")),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, ("embed",)),
+            name='o_proj')
         if self.qk_norm:
             self.q_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
@@ -170,9 +191,16 @@ class GatedMLP(nn.Module):
                 f"mlp must be 'swiglu' or 'geglu', got {self.activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-        self.gate_proj = dense(self.hidden_features, name='gate_proj')
-        self.up_proj = dense(self.hidden_features, name='up_proj')
-        self.down_proj = dense(self.out_features, name='down_proj')
+        expand_init = nn.with_partitioning(
+            nn.linear.default_kernel_init, ("embed", "mlp"))
+        contract_init = nn.with_partitioning(
+            nn.linear.default_kernel_init, ("mlp", "embed"))
+        self.gate_proj = dense(
+            self.hidden_features, kernel_init=expand_init, name='gate_proj')
+        self.up_proj = dense(
+            self.hidden_features, kernel_init=expand_init, name='up_proj')
+        self.down_proj = dense(
+            self.out_features, kernel_init=contract_init, name='down_proj')
 
     def __call__(self, x):
         gate = self.gate_proj(x)
@@ -308,6 +336,8 @@ class CausalTransformer(nn.Module):
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
+            embedding_init=nn.with_partitioning(
+                nn.linear.default_embed_init, ("vocab", "embed")),
             dtype=self.dtype, name='embed_tokens')
         self.layers = [
             DecoderBlock(
@@ -348,6 +378,8 @@ class CausalTransformer(nn.Module):
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
+                kernel_init=nn.with_partitioning(
+                    nn.linear.default_kernel_init, ("embed", "vocab")),
                 precision=self.precision, name='lm_head')
 
     def __call__(self, tokens, train: bool = False, decode: bool = False):
