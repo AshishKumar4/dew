@@ -50,7 +50,7 @@ datasetMap = {
         "augmenter": gcs_augmenters,
     },
 
-    # --- older entries from the msml605 project, paths may not exist on the current bucket ---
+    # --- older GCS entries; the paths may not exist on the current bucket ---
     "cc12m": {
         "source": data_source_gcs('arrayrecord2/cc12m'),
         "augmenter": gcs_augmenters,
