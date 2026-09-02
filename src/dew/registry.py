@@ -19,6 +19,7 @@ from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.backbones.unet3d import UNet3D
 from dew.nn.backbones.jepa import JepaEncoder, JepaVideoEncoder, JepaPredictor
+from dew.nn.backbones.causal_transformer import CausalTransformer
 
 MODEL_REGISTRY = {
     'unet': Unet,
@@ -33,6 +34,7 @@ MODEL_REGISTRY = {
     'jepa_encoder': JepaEncoder,
     'jepa_video_encoder': JepaVideoEncoder,
     'jepa_predictor': JepaPredictor,
+    'causal_transformer': CausalTransformer,
 }
 
 ARCHITECTURE_SUFFIX_FLAGS = {

@@ -6,6 +6,7 @@ from .heun_sampler import HeunSampler
 from .rk4_sampler import RK4Sampler
 from .multistep_dpm import MultiStepDPM
 from .pipelines import InferencePipeline, DiffusionInferencePipeline
+from .text import generate
 from .loading import (
     parse_config,
     load_from_checkpoint,
@@ -27,6 +28,7 @@ __all__ = [
     "MultiStepDPM",
     "InferencePipeline",
     "DiffusionInferencePipeline",
+    "generate",
     "parse_config",
     "load_from_checkpoint",
     "load_from_wandb_run",

@@ -12,12 +12,98 @@ import functools
 import math
 from .blocks import kernel_init
 
+def repeat_kv_heads(x, num_heads: int):
+    """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
+
+    Query head n reads key/value head n // (N // K), the grouping
+    jax.nn.dot_product_attention uses internally, so the same param tree runs
+    on the kernels that group heads themselves and on the ones that need the
+    keys materialized.
+    """
+    kv_heads = x.shape[-2]
+    if kv_heads == num_heads:
+        return x
+    if num_heads % kv_heads:
+        raise ValueError(
+            f"grouped-query attention needs the query heads ({num_heads}) to be "
+            f"a multiple of the key/value heads ({kv_heads}).")
+    return jnp.repeat(x, num_heads // kv_heads, axis=-2)
+
+
+def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
+    """Boolean [1, 1, T, S] mask keeping keys at or before each query's position.
+
+    query_positions are absolute: jnp.arange(T) for a plain forward pass, and
+    the cache slots the queries occupy when decoding against a KV cache, where
+    a query's row index is no longer its position. sliding_window=w narrows the
+    mask to the w most recent keys (the query itself plus the w-1 before it),
+    which is what a sliding attention layer means.
+    """
+    q_pos = jnp.asarray(query_positions)[:, None]
+    k_pos = jnp.arange(kv_len)[None, :]
+    mask = k_pos <= q_pos
+    if sliding_window is not None:
+        mask = jnp.logical_and(mask, k_pos > q_pos - sliding_window)
+    return mask[None, None]
+
+
+def open_kv_cache(module: nn.Module, key, max_seq_len):
+    """Fixed-size KV cache in the flax MultiHeadDotProductAttention style.
+
+    Declares cached_key/cached_value/cache_index in the 'cache' collection,
+    sized from `key` at the full decode length, and returns the absolute
+    positions of the tokens this step appends together with the writer that
+    appends them. Positions come out before the write because rotary positions
+    have to rotate the keys going into the cache, not the ones already in it.
+
+    The writer advances the index by the number of tokens written, so one code
+    path covers a whole-prompt prefill and the single-token steps after it. The
+    first call only allocates: a freshly initialised model hands back a zeroed
+    cache at index 0 rather than one with a dummy token in slot 0.
+    """
+    if max_seq_len is None:
+        raise ValueError(
+            "decoding needs max_seq_len: the KV cache is allocated once, at the "
+            "full decode length, and never grows.")
+    batch, length, heads, head_dim = key.shape
+    if length > max_seq_len:
+        raise ValueError(
+            f"{length} tokens do not fit a KV cache of {max_seq_len}.")
+    allocated = module.has_variable('cache', 'cached_key')
+    cached_key = module.variable('cache', 'cached_key', jnp.zeros,
+                                 (batch, max_seq_len, heads, head_dim), key.dtype)
+    cached_value = module.variable('cache', 'cached_value', jnp.zeros,
+                                   (batch, max_seq_len, heads, head_dim), key.dtype)
+    cache_index = module.variable('cache', 'cache_index',
+                                  lambda: jnp.array(0, jnp.int32))
+    index = cache_index.value
+
+    def append(key, value):
+        if not allocated:
+            return key, value
+        zero = jnp.array(0, index.dtype)
+        cached_key.value = jax.lax.dynamic_update_slice(
+            cached_key.value, key.astype(cached_key.value.dtype),
+            (zero, index, zero, zero))
+        cached_value.value = jax.lax.dynamic_update_slice(
+            cached_value.value, value.astype(cached_value.value.dtype),
+            (zero, index, zero, zero))
+        cache_index.value = index + length
+        return cached_key.value, cached_value.value
+
+    return index + jnp.arange(length), append
+
+
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True, implementation=None):
+                                 force_fp32_for_softmax=True, implementation=None,
+                                 causal=False, sliding_window=None, mask=None):
     """The one attention kernel path for every attention module.
 
-    Inputs are [B, S, H, D]. The param trees of the callers never change with
-    the implementation, so checkpoints are interchangeable across hardware:
+    Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
+    query (grouped-query attention); the paths that cannot group heads
+    themselves get them repeated out. The param trees of the callers never
+    change with the implementation, so checkpoints are interchangeable across
+    hardware:
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
@@ -31,10 +117,29 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
+
+    causal restricts query i to keys 0..i, top-left aligned exactly as jax's
+    is_causal is; sliding_window=w narrows that to the w most recent keys. Both
+    are structural, over the row index, so decoding against a KV cache passes
+    `mask` instead (built by causal_attention_mask over the cache slots): a
+    step's single query sits at the cache index, not at row 0. The fused
+    kernels take causality and the window as flags rather than a materialized
+    mask, which is where their memory win comes from; the pallas kernel has no
+    mask argument, so an explicit mask rides in there as an additive bias.
     """
+    if sliding_window is not None and sliding_window < 1:
+        raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+
     if implementation is None:
+        heads = query.shape[-2]
+        key = repeat_kv_heads(key, heads)
+        value = repeat_kv_heads(value, heads)
+        if causal or sliding_window is not None:
+            structural = causal_attention_mask(
+                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+            mask = structural if mask is None else jnp.logical_and(mask, structural)
         return nn.dot_product_attention(
-            query, key, value, dtype=dtype, broadcast_dropout=False,
+            query, key, value, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
@@ -63,14 +168,32 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
-        return jax.nn.dot_product_attention(query, key, value, implementation=implementation)
+        # A left window of l means the l+1 most recent keys on both the xla and
+        # the cudnn path, which is the window this function counts.
+        return jax.nn.dot_product_attention(
+            query, key, value, mask=mask, is_causal=causal,
+            local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
+            implementation=implementation)
     if implementation == 'tpu':
         from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+        heads = query.shape[-2]
+        key = repeat_kv_heads(key, heads)
+        value = repeat_kv_heads(value, heads)
         # pallas wants [B, H, S, D]
         q = jnp.moveaxis(query, -2, -3)
         k = jnp.moveaxis(key, -2, -3)
         v = jnp.moveaxis(value, -2, -3)
-        out = flash_attention(q, k, v, None, sm_scale=1.0 / math.sqrt(query.shape[-1]))
+        bias = None
+        if mask is not None or sliding_window is not None:
+            if sliding_window is not None:
+                band = causal_attention_mask(
+                    jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+                mask = band if mask is None else jnp.logical_and(mask, band)
+            bias = jnp.broadcast_to(
+                jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
+                (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
+        out = flash_attention(q, k, v, ab=bias, causal=causal,
+                              sm_scale=1.0 / math.sqrt(query.shape[-1]))
         return jnp.moveaxis(out, -3, -2)
     raise ValueError(f"Unknown attention implementation: {implementation}")
 
@@ -78,6 +201,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 class NormalAttention(nn.Module):
     """
     Simple implementation of the normal attention.
+
+    causal makes it a decoder attention (query i sees keys 0..i). decode=True
+    on a call runs it against a fixed-size KV cache instead, allocated at
+    max_seq_len: the first call writes the whole prompt, later calls append one
+    token each. Neither flag touches the param tree, so a model trained without
+    either reloads into a decoding one unchanged.
     """
     query_dim: int
     heads: int = 4
@@ -89,6 +218,8 @@ class NormalAttention(nn.Module):
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
     attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
+    causal: bool = False
+    max_seq_len: Optional[int] = None  # KV cache length, required to decode
 
     def setup(self):
         inner_dim = self.dim_head * self.heads
@@ -121,7 +252,7 @@ class NormalAttention(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, x, context=None):
+    def __call__(self, x, context=None, decode: bool = False):
         # x has shape [B, H, W, C]
         orig_x_shape = x.shape
         if len(x.shape) == 4:
@@ -136,11 +267,20 @@ class NormalAttention(nn.Module):
         if self.qk_norm:
             query = self.q_norm(query)
             key = self.k_norm(key)
-        
+
+        causal, mask = self.causal, None
+        if decode:
+            # Position lives in the cache slot now, not in the row index, so
+            # causality travels as a mask rather than the kernels' flag.
+            positions, append = open_kv_cache(self, key, self.max_seq_len)
+            key, value = append(key, value)
+            mask = causal_attention_mask(positions, key.shape[-3])
+            causal = False
+
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl,
+            implementation=self.attention_impl, causal=causal, mask=mask,
         )
         proj = self.proj_attn(hidden_states)
         proj = proj.reshape(orig_x_shape)
