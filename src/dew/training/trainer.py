@@ -175,7 +175,7 @@ class SimpleTrainer:
         # here guesses which way the caller meant it: resuming and starting
         # over are both fine, and both have to be asked for.
         written_step = self.checkpointer.latest_step()
-        if written_step is not None and load_from_checkpoint is None and checkpoint_step is None:
+        if written_step is not None and load_from_checkpoint is None:
             raise ValueError(
                 f"{self.checkpoint_path()} already holds checkpoints up to step "
                 f"{written_step}. Resume them with --trainer.load-from-checkpoint "
@@ -433,7 +433,7 @@ class SimpleTrainer:
         process_index = jax.process_index()
         log_every = self.log_every
 
-        epoch_loss = 0
+        epoch_loss = jnp.zeros((), jnp.float32)
         current_epoch = current_step // train_steps_per_epoch
 
         # Both counters live on device so the loop never blocks on a result.
@@ -554,8 +554,7 @@ class SimpleTrainer:
             "train/step_time_ms": step_time * 1000,
             "train/samples_per_sec": self.global_batch_size / step_time,
         }
-        mfu = model_flops_utilization(self.flops_per_step, step_time,
-                                      self.mesh.devices.size)
+        mfu = model_flops_utilization(self.flops_per_step, step_time)
         if mfu is not None:
             metrics["train/mfu"] = mfu
         return metrics

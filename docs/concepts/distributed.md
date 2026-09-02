@@ -46,7 +46,7 @@ Restoring builds a template from the freshly initialized state, so shapes, dtype
 
 ## Throughput
 
-`dew.telemetry.instrumentation` measures rather than estimates. `step_flops(jitted, *args)` asks the compiler for the cost analysis of the compiled step. `model_flops_utilization(flops_per_step, step_time, device_count)` turns that into a fraction of peak using a small table of vendor dense bf16 numbers; hardware that is not in the table reports nothing rather than a made-up number. `enable_compilation_cache(path)` persists compiled executables so a restart skips XLA compilation.
+`dew.telemetry.instrumentation` measures rather than estimates. `step_flops(jitted, *args)` asks the compiler for the per-device cost analysis of the compiled step. `model_flops_utilization(flops_per_step, step_time)` turns that into a fraction of one device's peak using a small table of vendor dense bf16 numbers; hardware that is not in the table reports nothing rather than a made-up number. `enable_compilation_cache(path)` persists compiled executables so a restart skips XLA compilation.
 
 That cache is on by default: `--trainer.compilation-cache-dir` starts at `default_compilation_cache_dir()` (`$XDG_CACHE_HOME/dew/xla`, or `~/.cache/dew/xla`), and `--trainer.compilation-cache-dir None` turns it off. On a DiT-B it takes the time to the first step from 55s to 5s and leaves the step itself alone.
 
