@@ -681,6 +681,115 @@ def get_token_dataset_grain(
     }
 
 
+def _document_chunks(source, chunk_len: int):
+    """Every document as consecutive chunks of at most `chunk_len` tokens.
+
+    Grain's packer refuses an element longer than the bin, so a document that
+    outgrows the window is split first; each chunk becomes its own segment in
+    the packed row, which keeps attention inside the chunk and RoPE running
+    from the chunk's own 0.
+    """
+    from grain.python import MapDataset
+
+    class _SplitMapDataset(MapDataset):
+        def __init__(self, parent, n):
+            super().__init__(parent)
+            self._chunk_len = n
+
+        @property
+        def _parent_ds(self):
+            return self._parent
+
+
+        def __len__(self):
+            return sum(
+                -(-len(self._parent_ds[i]["text"]) // self._chunk_len)
+                for i in range(len(self._parent_ds)))
+
+        def __getitem__(self, index: int):
+            if not 0 <= index < len(self):
+                raise IndexError(index)
+            ahead = 0
+            for i in range(len(self._parent_ds)):
+                chunks = -(-len(self._parent_ds[i]["text"]) // self._chunk_len)
+                if ahead + chunks > index:
+                    within = index - ahead
+                    text = self._parent_ds[i]["text"]
+                    start = within * self._chunk_len
+                    return {"text": text[start : start + self._chunk_len]}
+                ahead += chunks
+            raise IndexError(index)
+
+    return _SplitMapDataset(source, chunk_len)
+
+
+def get_packed_token_dataset_grain(
+    train_path: str,
+    val_path: str,
+    batch_size: int,
+    seq_len: int,
+    seed: int = 0,
+    worker_count: int = 32,
+    read_thread_count: int = 64,
+    read_buffer_size: int = 50,
+    worker_buffer_size: int = 20,
+    num_epochs: Optional[int] = None,
+    val_batch_size: Optional[int] = None,
+    num_packing_bins: int = 4,
+):
+    """Grain loaders that pack whole documents into `seq_len + 1` windows.
+
+    Documents come from `TokenDocumentSource`, which splits the token stream
+    at the eos id the tokenize tool writes between files. Each document (in
+    chunks, when it outgrows the window) is one element the packer adds to
+    the first bin with room, and every emitted window carries
+    `text_segment_ids` (which document each token is from, 0 for padding)
+    and `text_positions` (the token's position inside its document), so the
+    model can stop attention and the loss at document boundaries. This is
+    the `Dataset` API rather than `DataLoader` for exactly grain's stated
+    reason to switch: packing.
+
+    Shards by JAX process like every other grain path, by slicing the
+    document set before packing - one bin per process would otherwise have
+    every process pack the same documents.
+
+    Returns:
+        The standard loader dict: "train" fn, "train_len", "val" fn,
+        "val_len", "local_batch_size", "global_batch_size".
+    """
+    from .sources.text import TokenDocumentSource
+
+    local_batch_size = batch_size // jax.process_count()
+    window = seq_len + 1
+    val_bins = val_batch_size or local_batch_size
+
+    def build_loader(path, bins, shuffle):
+        source = TokenDocumentSource(path)
+        documents = _document_chunks(source, window)
+        documents = documents[jax.process_index()::jax.process_count()]
+        if shuffle:
+            documents = documents.shuffle(seed)
+        if num_epochs is not None:
+            documents = documents.repeat(num_epochs)
+        packed = FirstFitPackIterDataset(
+            documents.to_iter_dataset(),
+            length_struct={"text": window},
+            num_packing_bins=bins,
+            seed=seed,
+            padding_struct={"text": 0},
+        )
+        return packed.batch(local_batch_size, drop_remainder=True)
+
+    return {
+        "train": lambda: build_loader(train_path, num_packing_bins, True),
+        "train_len": len(TokenDocumentSource(train_path)),
+        "val": lambda: build_loader(val_path, val_bins, False),
+        "val_len": len(TokenDocumentSource(val_path)),
+        "local_batch_size": local_batch_size,
+        "global_batch_size": batch_size,
+    }
+
+
 def _token_dataset_dir(name: Optional[str]) -> Optional[str]:
     """`name` if it names a tokenized-corpora directory, else None.
 
@@ -706,7 +815,8 @@ def load_data(config: DataConfig) -> dict:
 
     A dataset that is a directory of tokenized text (train.bin [+ val.bin]
     from tools/tokenize_text.py) takes the token loader ahead of all of
-    that, and needs DataConfig.sequence_length.
+    that, and needs DataConfig.sequence_length. With pack_sequences the
+    windows are whole documents packed by grain instead of fixed strides.
     """
     token_dir = _token_dataset_dir(config.dataset)
     if token_dir is not None:
@@ -718,7 +828,9 @@ def load_data(config: DataConfig) -> dict:
             )
         root = Path(token_dir)
         val_bin = root / "val.bin"
-        return get_token_dataset_grain(
+        factory = (get_packed_token_dataset_grain if config.pack_sequences
+                   else get_token_dataset_grain)
+        return factory(
             str(root / "train.bin"),
             str(val_bin if val_bin.is_file() else root / "train.bin"),
             batch_size=config.batch_size,
