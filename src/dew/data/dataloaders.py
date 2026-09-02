@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import grain.python as pygrain
 from typing import Dict, Any, Optional, Union, List, Callable, TYPE_CHECKING
+from pathlib import Path
 import numpy as np
 import jax
 import cv2
@@ -598,6 +599,102 @@ def get_media_dataset_online(
     }
 
 
+def get_token_dataset_grain(
+    train_path: str,
+    val_path: str,
+    batch_size: int,
+    seq_len: int,
+    seed: int = 0,
+    worker_count: int = 32,
+    read_thread_count: int = 64,
+    read_buffer_size: int = 50,
+    worker_buffer_size: int = 20,
+    num_epochs: Optional[int] = None,
+    val_batch_size: Optional[int] = None,
+):
+    """Grain loaders over a tokenized corpus (see `dew.data.sources.text`).
+
+    Train shuffles a seeded IndexSampler over the windows of train.bin; val
+    reads val.bin in file order through its own unshuffled sampler, so the
+    two splits are disjoint files and validation is reproducible. Both
+    shard by JAX process like every other grain path.
+
+    Returns:
+        The standard loader dict: "train" fn, "train_len", "val" fn,
+        "val_len", "local_batch_size", "global_batch_size".
+    """
+    from .sources.text import TokenFileSource
+
+    train_source = TokenFileSource(train_path, seq_len)
+    val_source = TokenFileSource(val_path, seq_len)
+    local_batch_size = batch_size // jax.process_count()
+
+    train_sampler = pygrain.IndexSampler(
+        num_records=len(train_source),
+        shuffle=True,
+        seed=seed,
+        num_epochs=num_epochs,
+        shard_options=pygrain.ShardByJaxProcess(),
+    )
+    val_sampler = pygrain.IndexSampler(
+        num_records=len(val_source),
+        shuffle=False,
+        seed=seed,
+        num_epochs=num_epochs,
+        shard_options=pygrain.ShardByJaxProcess(),
+    )
+
+    def get_trainset():
+        loader = pygrain.DataLoader(
+            data_source=train_source,
+            sampler=train_sampler,
+            operations=[pygrain.Batch(local_batch_size, drop_remainder=True)],
+            worker_count=worker_count,
+            read_options=pygrain.ReadOptions(
+                read_thread_count, read_buffer_size
+            ),
+            worker_buffer_size=worker_buffer_size,
+        )
+        return loader
+
+    def get_valset():
+        loader = pygrain.DataLoader(
+            data_source=val_source,
+            sampler=val_sampler,
+            operations=[pygrain.Batch(val_batch_size or local_batch_size, drop_remainder=True)],
+            worker_count=worker_count,
+            read_options=pygrain.ReadOptions(
+                read_thread_count, read_buffer_size
+            ),
+            worker_buffer_size=worker_buffer_size,
+        )
+        return loader
+
+    return {
+        "train": get_trainset,
+        "train_len": len(train_source),
+        "val": get_valset,
+        "val_len": len(val_source),
+        "local_batch_size": local_batch_size,
+        "global_batch_size": batch_size,
+    }
+
+
+def _token_dataset_dir(name: Optional[str]) -> Optional[str]:
+    """`name` if it names a tokenized-corpora directory, else None.
+
+    A dataset entry in a registry can shadow a directory someone happens to
+    name the same, so the registered factories keep precedence and this
+    dispatch only fires on an explicit, existing directory.
+    """
+    if not name or name in datasetMap or name in mediaDatasetMap:
+        return None
+    root = Path(name)
+    if root.is_dir() and (root / "train.bin").is_file():
+        return name
+    return None
+
+
 def load_data(config: DataConfig) -> dict:
     """Dataset iterators for a run config: which factory, and with what knobs.
 
@@ -605,7 +702,33 @@ def load_data(config: DataConfig) -> dict:
     dataset is registered for it, and only falls back to the online streamer
     for datasets registered solely there - the name alone once decided this
     ('online' in the dataset name), which chose a loader from spelling.
+
+    A dataset that is a directory of tokenized text (train.bin [+ val.bin]
+    from tools/tokenize_text.py) takes the token loader ahead of all of
+    that, and needs DataConfig.sequence_length.
     """
+    token_dir = _token_dataset_dir(config.dataset)
+    if token_dir is not None:
+        if not config.sequence_length:
+            raise ValueError(
+                f"dataset '{config.dataset}' is a tokenized text directory "
+                "(train.bin present); it needs data.sequence_length set, in "
+                "tokens per training window"
+            )
+        root = Path(token_dir)
+        val_bin = root / "val.bin"
+        return get_token_dataset_grain(
+            str(root / "train.bin"),
+            str(val_bin if val_bin.is_file() else root / "train.bin"),
+            batch_size=config.batch_size,
+            seq_len=config.sequence_length,
+            seed=config.dataset_seed,
+            worker_count=config.worker_count,
+            read_thread_count=config.read_thread_count,
+            read_buffer_size=config.read_buffer_size,
+            worker_buffer_size=config.worker_buffer_size,
+        )
+
     name = config.dataset
     if config.loader == 'grain':
         online = False
