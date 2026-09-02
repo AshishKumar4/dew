@@ -60,26 +60,43 @@ def main():
         sys.exit(1)
     checkpoint_dir, output_dir = sys.argv[1], sys.argv[2]
 
-    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     manager = orbax.checkpoint.CheckpointManager(
-        checkpoint_dir, checkpointer,
-        orbax.checkpoint.CheckpointManagerOptions(create=False))
+        checkpoint_dir,
+        options=orbax.checkpoint.CheckpointManagerOptions(create=False),
+        item_handlers=orbax.checkpoint.PyTreeCheckpointHandler())
     step = manager.latest_step()
     print(f"Converting checkpoint at step {step} from {checkpoint_dir}")
     ckpt = manager.restore(step)
 
-    # An older checkpoint holds a second train state under 'best_state'; the
-    # converted one keeps a single state and lets orbax retention name the
-    # best step.
-    ckpt.pop('best_state', None)
+    best_state = ckpt.pop('best_state', None)
     if ckpt.get('state') is not None:
         ckpt['state'] = convert_state(ckpt['state'])
         print("Converted state")
 
     out_manager = orbax.checkpoint.CheckpointManager(
-        output_dir, orbax.checkpoint.PyTreeCheckpointer(),
-        orbax.checkpoint.CheckpointManagerOptions(create=True))
-    out_manager.save(step, ckpt)
+        output_dir, options=orbax.checkpoint.CheckpointManagerOptions(
+            create=True, best_fn=lambda metrics: metrics['loss'], best_mode='min'))
+    latest_metrics = None
+    if best_state is not None:
+        best_state = convert_state(best_state)
+        best_step = int(np.asarray(best_state['step']))
+        if best_step > step:
+            raise ValueError(
+                f"best_state step {best_step} is newer than checkpoint step {step}")
+        best_metrics = {'loss': float(np.asarray(ckpt['best_loss']))}
+        if best_step < step:
+            best_ckpt = {**ckpt, 'state': best_state}
+            out_manager.save(
+                best_step, args=orbax.checkpoint.args.PyTreeSave(best_ckpt),
+                metrics=best_metrics, force=True)
+            out_manager.wait_until_finished()
+            print(f"Saved best checkpoint to {output_dir} at step {best_step}")
+        else:
+            latest_metrics = best_metrics
+
+    out_manager.save(
+        step, args=orbax.checkpoint.args.PyTreeSave(ckpt),
+        metrics=latest_metrics, force=True)
     out_manager.wait_until_finished()
     print(f"Saved converted checkpoint to {output_dir} at step {step}")
 

@@ -10,11 +10,15 @@ current one, which carries a serialized input_config, and the older one, which
 has none and has to have its text conditioning reconstructed from `arguments`.
 """
 
+from pathlib import Path
+import subprocess
+import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import orbax.checkpoint as ocp
 
 from dew import sampling as inference
 from dew.sampling import (
@@ -222,6 +226,34 @@ def test_a_single_step_directory_is_its_own_best_checkpoint(tmp_path):
 
     state = load_from_checkpoint(step_dir, step="best")
     assert int(state["step"]) == 0
+def test_legacy_converter_preserves_the_best_state(tmp_path):
+    source = tmp_path / "legacy"
+    output = tmp_path / "converted"
+
+    def state(step, marker):
+        params = {
+            "params": {"patch_embed": {"kernel": np.array([marker], np.float32)}}}
+        return {"step": np.array(step, np.int32), "params": params,
+                "ema_params": params}
+
+    manager = ocp.CheckpointManager(
+        source, options=ocp.CheckpointManagerOptions(create=True))
+    manager.save(3, args=ocp.args.PyTreeSave({
+        "state": state(3, 3.0),
+        "best_state": state(1, 1.0),
+        "best_loss": np.array(0.25),
+        "rngs": np.array([0, 1], np.uint32),
+        "epoch": 2,
+    }), force=True)
+    manager.wait_until_finished()
+
+    tool = Path(__file__).parents[1] / "tools" / "convert_legacy_checkpoint.py"
+    subprocess.run([sys.executable, str(tool), str(source), str(output)], check=True)
+
+    latest = load_from_checkpoint(str(output), step="latest")
+    best = load_from_checkpoint(str(output), step="best")
+    assert float(latest["params"]["params"]["embed"]["patch_embed"]["kernel"][0]) == 3.0
+    assert float(best["params"]["params"]["embed"]["patch_embed"]["kernel"][0]) == 1.0
 
 
 # --------------------------------------------------------------------------
