@@ -449,8 +449,7 @@ def default_feature_extractor(sample: Dict[str, Any]) -> Dict[str, Any]:
             break
     
     if url is None:
-        print("No URL found in sample, keys:", sample.keys())
-        return {"url": None, "caption": None}
+        raise ValueError(f"No URL found in sample with keys {list(sample)}")
     
     # Extract caption
     caption = None
@@ -460,7 +459,7 @@ def default_feature_extractor(sample: Dict[str, Any]) -> Dict[str, Any]:
             break
     
     if caption is None:
-        caption = "No caption available"
+        raise ValueError(f"No caption found in sample with keys {list(sample)}")
         
     return {
         "url": url,
@@ -539,7 +538,7 @@ def map_batch(
         urls, captions = features["url"], features["caption"]
         
         if urls is None or captions is None:
-            return
+            raise ValueError("feature extractor returned no URLs or captions")
         
         # Process samples in parallel
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
@@ -549,6 +548,7 @@ def map_batch(
         # Log the error
         print(f"Error mapping batch: {e}")
         traceback.print_exc()
+        raise
 
 
 # The sample queue each pool worker inherited through the Pool initializer. A
