@@ -1,18 +1,15 @@
 """The language-model recipe: a config in, a trained trainer out.
 
-The backbone, the text sampler and the token loader are built in sibling
-worktrees. The first test therefore drives the recipe with a stub model and a
-stub loader, which is exactly the wiring the recipe owns: the vocabulary read
-off meta.json, the sequence length written onto the data config, the objective,
-the perplexity metric and the trainer with no input config. The second runs the
-whole real path over token files on disk and skips until those modules land.
+The first test drives the recipe with a stub model and a stub loader, which is
+exactly the wiring the recipe owns: the vocabulary read off meta.json, the
+sequence length written onto the data config, the objective, the perplexity
+metric and the trainer with no input config. The second runs the whole real
+path over token files on disk.
 """
 
 import importlib.util
 import json
-from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Optional
 
 import jax.numpy as jnp
 import numpy as np
@@ -22,10 +19,6 @@ from dew.config import DataConfig, ModelConfig, OptimConfig, TrainerConfig
 from test_lm_objective import BATCH, SEQ, VOCAB, TinyCausalLM, cycle_batches
 
 RECIPE = Path(__file__).resolve().parents[1] / "recipes" / "lm" / "train.py"
-
-# DataConfig grows sequence_length and tokenizer with the token loader; until
-# then the recipe cannot write the run's context length onto the data config.
-TOKEN_FIELDS_LANDED = {"sequence_length", "tokenizer"} <= {f.name for f in fields(DataConfig)}
 
 
 def load_recipe():
@@ -48,18 +41,10 @@ def write_token_files(directory, vocab_size, train_tokens=4096, val_tokens=1024)
     return directory
 
 
-@dataclass(frozen=True)
-class TokenDataConfig(DataConfig):
-    """DataConfig as the token loader extends it, for testing ahead of it."""
-
-    sequence_length: Optional[int] = None
-    tokenizer: Optional[str] = None
-
-
 def test_the_run_writes_its_sequence_length_onto_the_data_config():
     recipe = load_recipe()
     config = recipe.LmRunConfig(
-        data=TokenDataConfig(dataset="tokens", batch_size=4),
+        data=DataConfig(dataset="tokens", batch_size=4),
         trainer=TrainerConfig(compilation_cache_dir=None),
         sequence_length=128, tokenizer="gpt2")
 
@@ -92,6 +77,18 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
     assert recipe.context_length(config, {"prompt": [1, 2, 3], "max_new_tokens": 100}) == 103
 
 
+def test_the_computed_context_cannot_be_overridden_by_model_config():
+    recipe = load_recipe()
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {"max_seq_len": 8}),
+        sequence_length=64,
+    )
+
+    _, model_config = recipe.build_lm(config, vocab_size=256, max_seq_len=103)
+
+    assert model_config["max_seq_len"] == 103
+
+
 def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
     recipe = load_recipe()
     dataset = write_token_files(tmp_path / "tokens", vocab_size=VOCAB)
@@ -108,8 +105,6 @@ def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
 
     monkeypatch.setattr(recipe, "build_model", fake_build_model)
     monkeypatch.setattr(recipe, "load_data", fake_load_data)
-    if not TOKEN_FIELDS_LANDED:
-        monkeypatch.setattr(recipe, "token_data_config", lambda config: config.data)
 
     config = recipe.LmRunConfig(
         model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1}),
@@ -126,9 +121,8 @@ def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
     assert built["config"]["vocab_size"] == VOCAB
     assert built["config"]["max_seq_len"] == SEQ
     assert built["config"]["dtype"] == "bfloat16", "the precision policy was skipped"
-    if TOKEN_FIELDS_LANDED:
-        assert built["data_config"].sequence_length == SEQ
-        assert built["data_config"].tokenizer == "byte"
+    assert built["data_config"].sequence_length == SEQ
+    assert built["data_config"].tokenizer == "byte"
 
     assert trainer.objective.tag == "lm"
     assert trainer.objective.seq_len == SEQ and trainer.objective.vocab_size == VOCAB
@@ -164,13 +158,6 @@ def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path, m
 
 def test_the_recipe_trains_on_tokenized_files(tmp_path):
     """The real path end to end: registry model, token loader, sampled text."""
-    pytest.importorskip("dew.nn.backbones.causal_transformer")
-    pytest.importorskip("dew.sampling.text")
-    pytest.importorskip("dew.data.sources.text")
-    pytest.importorskip("dew.data.text")
-    if not TOKEN_FIELDS_LANDED:
-        pytest.skip("DataConfig grows sequence_length with the token loader")
-
     recipe = load_recipe()
     dataset = write_token_files(tmp_path / "tokens", vocab_size=256)
     config = recipe.LmRunConfig(

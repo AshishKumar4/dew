@@ -1,17 +1,14 @@
 """Language modelling: the shifted cross entropy, and a trainer with no input config.
 
-The backbone and the text sampler are built in sibling worktrees, so the model
-here is a small causal stack that honors the same contract (int32 ids in,
-float32 logits out, a `train` flag for dropout) and `dew.sampling.text.generate`
-is recorded rather than run. What is under test is the objective: that the loss
-is the cross entropy of the shifted sequence and nothing else, that padding is
-excluded only when a pad id is named, and that the trainer drives it on both a
-data-parallel and an FSDP mesh without a DiffusionInputConfig to describe the
-inputs.
+The model here is a small causal stack that honors the backbone's contract
+(int32 ids in, float32 logits out, a `train` flag for dropout) and
+`dew.sampling.text.generate` is recorded rather than run, so what is under
+test is the objective: that the loss is the cross entropy of the shifted
+sequence and nothing else, that padding is excluded only when a pad id is
+named, and that the trainer drives it on both a data-parallel and an FSDP mesh
+without a DiffusionInputConfig to describe the inputs. The real sampler runs
+in test_lm_recipe.
 """
-
-import sys
-import types
 
 import jax
 import jax.numpy as jnp
@@ -146,11 +143,7 @@ def make_val_state(params, ema_params=None, rngs=None):
 
 @pytest.fixture
 def recorded_generate(monkeypatch):
-    """Stand in for `dew.sampling.text.generate` and record how it was called.
-
-    The sampler lands from a sibling worktree; this pins the call the objective
-    makes against the agreed signature, and the real one runs in test_lm_recipe.
-    """
+    """Stand in for `dew.sampling.text.generate` and record how it was called."""
     calls = []
 
     def generate(model, params, prompt, max_new_tokens, *, rng, temperature=1.0,
@@ -161,12 +154,8 @@ def recorded_generate(monkeypatch):
         return jnp.concatenate(
             [prompt, jnp.zeros((prompt.shape[0], max_new_tokens), jnp.int32)], axis=1)
 
-    try:
-        import dew.sampling.text as text_sampler
-    except ImportError:
-        text_sampler = types.ModuleType("dew.sampling.text")
-        monkeypatch.setitem(sys.modules, "dew.sampling.text", text_sampler)
-    monkeypatch.setattr(text_sampler, "generate", generate, raising=False)
+    import dew.sampling.text as text_sampler
+    monkeypatch.setattr(text_sampler, "generate", generate)
     return calls
 
 
@@ -261,12 +250,14 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
         def __call__(self, tokens, train: bool = False):
             embedded = nn.Embed(self.vocab_size, self.emb_features,
                                 dtype=jnp.bfloat16)(tokens)
-            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded).astype(jnp.float32)
+            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded)
 
     objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
     params = objective.init_params(jax.random.PRNGKey(0))
+    logits = objective.model.apply(params, token_batch()[TEXT_KEY][:, :-1])
     loss, aux = objective.loss(params, params, token_batch(), jax.random.PRNGKey(0), 0)
 
+    assert logits.dtype == jnp.bfloat16
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
     assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
 
@@ -413,7 +404,7 @@ def test_prompts_that_cannot_be_batched_are_rejected():
         empty.make_validation_step()
 
 
-def test_log_validation_artifacts_reports_perplexity_and_decoded_text():
+def test_log_validation_artifacts_reports_decoded_text():
     objective = make_objective(samples={
         "prompt": [1, 2], "max_new_tokens": 3,
         "decode": lambda ids: "|".join(str(i) for i in ids)})
@@ -424,20 +415,21 @@ def test_log_validation_artifacts_reports_perplexity_and_decoded_text():
         "tokens": jnp.asarray([[1, 2, 0, 1, 2]], jnp.int32),
     }, step=7)
 
-    assert run.logged["val/perplexity"] == pytest.approx(float(np.exp(1.5)), rel=1e-5)
+    assert list(run.logged) == ["val/samples"]
     assert run.logged["val/samples"].data == [[0, "1|2|0|1|2"]]
 
 
-def test_log_validation_artifacts_without_samples_logs_only_perplexity():
+def test_log_validation_artifacts_without_samples_is_empty():
     run = WandbRecorder()
     make_objective().log_validation_artifacts(run, {"ce": jnp.asarray(0.5)}, step=1)
-    assert list(run.logged) == ["val/perplexity"]
+    assert run.logged == {}
 
 
 def test_perplexity_metric_reads_the_cross_entropy_artifact():
     metric = get_perplexity_metric()
     assert metric.name == "perplexity" and metric.higher_is_better is False
-    assert metric.function({"ce": jnp.asarray(2.0)}, None) == pytest.approx(np.exp(2.0), rel=1e-5)
+    assert metric.function({"ce": jnp.asarray(2.0)}, None) == pytest.approx(2.0)
+    assert metric.reducer([0.0, 2.0]) == pytest.approx(np.exp(1.0))
 
 
 def test_the_validation_loop_scores_perplexity(tmp_path):
@@ -450,3 +442,21 @@ def test_the_validation_loop_scores_perplexity(tmp_path):
         trainer.state, token_batch(batch=BATCH))["ce"])
     assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(
         float(np.exp(ce)), rel=1e-4)
+
+
+def test_validation_exponentiates_after_averaging_cross_entropy(tmp_path):
+    trainer = make_trainer(tmp_path)
+    cross_entropies = iter([jnp.asarray(0.0), jnp.asarray(2.0)])
+
+    trainer.validation_loop(
+        trainer.state,
+        lambda state, batch: {"ce": next(cross_entropies)},
+        None,
+        val_steps_per_epoch=2,
+        current_step=0,
+    )
+
+    expected = np.exp(np.mean([0.0, 2.0]))
+    wrong = np.mean(np.exp([0.0, 2.0]))
+    assert expected != pytest.approx(wrong)
+    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(expected)
