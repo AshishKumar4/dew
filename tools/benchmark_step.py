@@ -16,6 +16,10 @@ Usage:
     python tools/benchmark_step.py --preset cpu-smoke
     python tools/benchmark_step.py --preset small --json-out /tmp/bench.json
     python tools/benchmark_step.py --preset small --architectures simple_dit unet
+    python tools/benchmark_step.py --architectures causal_transformer \\
+        --attention-impl pallas
+    python tools/benchmark_step.py --architectures unet \\
+        --xla-flags=--xla_gpu_triton_gemm_any=true
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
         "num_heads": 8}, "batch_size": 32, "image_size": 32, "fsdp_size": 2}]'
@@ -41,7 +45,8 @@ from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew.registry import MODEL_REGISTRY, build_model
+from dew.registry import MODEL_REGISTRY, apply_precision_policy, build_model
+from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import compiled_flops
 from dew.training import ObjectiveTrainer
 from dew.training.distributed import DevicePrefetchIterator
@@ -94,6 +99,8 @@ class Case:
 
     architecture: str
     config: dict = field(default_factory=dict)
+    dtype: str = 'float32'
+    """Compute dtype, written into the model config by the precision policy."""
     batch_size: int = 8
     fsdp_size: int = 1
     image_size: int = 32
@@ -147,15 +154,14 @@ def small_cases(dtype: str) -> list[Case]:
     (256 image tokens at 64px/patch 4) and real widths, but few layers.
     """
     dit = {"patch_size": 4, "emb_features": 384, "num_layers": 6, "num_heads": 6,
-           "mlp_ratio": 4, "dtype": dtype}
+           "mlp_ratio": 4}
     unet = {"emb_features": 256, "feature_depths": [64, 128, 256],
-            "attention_configs": [None, {"heads": 4, "dtype": dtype},
-                                  {"heads": 4, "dtype": dtype}],
-            "num_res_blocks": 2, "num_middle_res_blocks": 1, "dtype": dtype}
+            "attention_configs": [None, {"heads": 4}, {"heads": 4}],
+            "num_res_blocks": 2, "num_middle_res_blocks": 1}
     encoder = {"patch_size": 4, "emb_features": 384, "num_layers": 6, "num_heads": 6,
-               "mlp_ratio": 4, "dtype": dtype}
+               "mlp_ratio": 4}
     predictor = {"grid": (16, 16), "emb_features": 384, "predictor_features": 192,
-                 "num_layers": 3, "num_heads": 6, "mlp_ratio": 4, "dtype": dtype}
+                 "num_layers": 3, "num_heads": 6, "mlp_ratio": 4}
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
@@ -165,8 +171,7 @@ def small_cases(dtype: str) -> list[Case]:
         Case("simple_mmdit", dit, batch_size=16, image_size=64),
         Case("hierarchical_mmdit",
              {"base_patch_size": 2, "emb_features": (192, 384, 576),
-              "num_layers": (2, 2, 2), "num_heads": (3, 6, 9), "mlp_ratio": 4,
-              "dtype": dtype},
+              "num_layers": (2, 2, 2), "num_heads": (3, 6, 9), "mlp_ratio": 4},
              batch_size=16, image_size=64),
         Case("hybrid_dit", {**dit, "ssm_state_dim": 64, "ssm_attention_ratio": "3:1"},
              batch_size=16, image_size=64),
@@ -179,10 +184,10 @@ def small_cases(dtype: str) -> list[Case]:
              batch_size=4, image_size=64, frames=8),
         # GPT-2 small's width and heads at a quarter of its depth, 512-token windows
         Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                                    "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512,
-                                    "dtype": dtype},
+                                    "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512},
              batch_size=16, seq_len=512),
     ]
+    cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
     # jepa_predictor has no step of its own: it is built through the registry
     # inside the two JEPA cases above.
     covered = {case.architecture for case in cases} | {"jepa_predictor"}
@@ -207,6 +212,12 @@ class BenchmarkConfig:
     steps: int = 10
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
     """Model compute dtype for --preset small; losses stay fp32 either way."""
+    attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu', 'pallas'] = 'auto'
+    """Attention kernel, through the same precision policy a recipe uses."""
+    xla_flags: Optional[str] = None
+    """Appended to XLA_FLAGS before the first JAX call, as TrainerConfig.xla_flags
+    is. A flag only takes effect in a process that has not opened a backend
+    yet, so a sweep runs one configuration per process."""
     batch_size: Optional[int] = None
     """Override every case's batch size."""
     fsdp_size: Optional[int] = None
@@ -265,9 +276,19 @@ def text_condition() -> ConditionalInputConfig:
     )
 
 
-def build_trainer(case: Case, checkpoint_dir: str) -> ObjectiveTrainer:
-    """The trainer a recipe would build for this case, minus wandb and data."""
-    model = build_model(case.architecture, case.config)
+def build_trainer(case: Case, checkpoint_dir: str,
+                  attention_impl: str = 'auto') -> ObjectiveTrainer:
+    """The trainer a recipe would build for this case, minus wandb and data.
+
+    The model goes through the same precision policy the recipes use, so the
+    dtype and the attention kernel land in the nested unet attention configs
+    too, and a row of this table is a row a real run would produce.
+    """
+    def built(architecture: str, config: dict):
+        return build_model(architecture, apply_precision_policy(
+            architecture, config, dtype=case.dtype, attention_impl=attention_impl))
+
+    model = built(case.architecture, case.config)
     sample_key = "video" if case.frames else "image"
     optimizer = optax.adam(1e-4)
     common = dict(
@@ -291,7 +312,7 @@ def build_trainer(case: Case, checkpoint_dir: str) -> ObjectiveTrainer:
         grid = (case.image_size // patch, case.image_size // patch)
         predictor_config = {**case.predictor, "grid": grid}
         objective = JepaObjective(
-            model, build_model("jepa_predictor", predictor_config),
+            model, built("jepa_predictor", predictor_config),
             multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
             sample_key, case.sample_shape,
         )
@@ -352,7 +373,7 @@ def parameter_count(params) -> int:
 def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     """Warm up, then time the compiled step over a fixed number of steps."""
     peak_before = device_peak_bytes()
-    trainer = build_trainer(case, config.checkpoint_dir)
+    trainer = build_trainer(case, config.checkpoint_dir, config.attention_impl)
     trainer.global_batch_size = case.batch_size
 
     train_step = trainer._define_train_step(batch_size=case.batch_size)
@@ -382,6 +403,9 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "batch_size": case.batch_size,
         "fsdp_size": case.fsdp_size,
         "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
+        "dtype": case.dtype,
+        "attention_impl": config.attention_impl,
+        "xla_flags": config.xla_flags,
         "devices": trainer.mesh.devices.size,
         "device_kind": jax.devices()[0].device_kind,
         "params": parameter_count(state.params),
@@ -460,8 +484,11 @@ def write_json(rows: list[dict], path: str):
 
 
 def main(config: BenchmarkConfig):
+    apply_xla_flags(config.xla_flags)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
+    print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
+          f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
     rows = run(config)
     print()
     print(format_table(rows))

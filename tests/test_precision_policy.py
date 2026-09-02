@@ -48,6 +48,20 @@ def test_auto_resolves_to_cudnn_on_gpu(implementations, monkeypatch):
     assert implementations == ['cudnn']
 
 
+def test_auto_leaves_cudnn_for_the_shapes_it_cannot_train(implementations, monkeypatch):
+    """cudnn's fused kernel has no backward pass for an odd sequence length,
+    and 77 CLIP text tokens are odd: with 'auto' meaning plain cudnn, every
+    cross-attending model raised NotImplementedError on its first training
+    step."""
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    query = jnp.ones((1, 256, 2, 8), jnp.bfloat16)
+    context = jnp.ones((1, 77, 2, 8), jnp.bfloat16)
+
+    scaled_dot_product_attention(query, context, context, implementation='auto')
+    scaled_dot_product_attention(query, query, query, implementation='auto')
+    assert implementations == ['xla', 'cudnn']
+
+
 def test_auto_runs_the_kernel_it_resolved_to():
     q, k, v = qkv()
     assert jnp.array_equal(
@@ -216,3 +230,29 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
     out = model.apply(params, *args)
     assert out.dtype in (jnp.bfloat16, jnp.float32)
     assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
+
+
+@pytest.mark.parametrize("precision", [jax.lax.Precision.HIGH, 'highest'])
+def test_pallas_rejects_precision_it_cannot_honor(precision):
+    """The triton kernel runs its softmax in fp32 and takes no precision
+    argument, same as the other fused paths."""
+    with pytest.raises(ValueError, match="precision"):
+        scaled_dot_product_attention(*qkv(), precision=precision,
+                                     implementation='pallas')
+
+
+def test_pallas_rejects_bf16_softmax():
+    with pytest.raises(ValueError, match="force_fp32_for_softmax"):
+        scaled_dot_product_attention(*qkv(), force_fp32_for_softmax=False,
+                                     implementation='pallas')
+
+
+def test_policy_passes_pallas_to_the_model_and_its_nested_stages():
+    """'pallas' is a run-level kernel choice like the others, so it has to
+    reach the unet's nested attention configs too."""
+    applied = apply_precision_policy('unet', {}, dtype="bfloat16",
+                                     attention_impl="pallas")
+    model = build_model('unet', applied)
+    assert model.attention_impl == 'pallas'
+    assert all(stage is None or stage["force_fp32_for_softmax"] is True
+               for stage in model.attention_configs)

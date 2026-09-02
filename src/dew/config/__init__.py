@@ -43,8 +43,9 @@ class ModelConfig:
     config: JsonDict = dataclasses.field(default_factory=dict)
     dtype: Literal["float32", "bfloat16"] = "bfloat16"
     """Compute dtype; params stay float32."""
-    attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
-    """Attention kernel; 'auto' is cudnn on gpu, xla elsewhere."""
+    attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu", "pallas"] = "auto"
+    """Attention kernel; 'auto' is cudnn on gpu, xla elsewhere. 'pallas' is the
+    triton flash kernel, which takes fewer shapes: see docs/performance.md."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,6 +125,10 @@ class TrainerConfig:
     """Unset runs without wandb: nothing is logged and nothing is published."""
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
+    xla_flags: Optional[str] = None
+    """Extra XLA_FLAGS for this run, appended to the environment by
+    `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
+    themselves; see docs/performance.md for what was measured."""
 
     def __post_init__(self):
         if self.resume_last_run is not None and self.wandb_project is None:

@@ -51,3 +51,5 @@ Restoring builds a template from the freshly initialized state, so shapes, dtype
 That cache is on by default: `--trainer.compilation-cache-dir` starts at `default_compilation_cache_dir()` (`$XDG_CACHE_HOME/dew/xla`, or `~/.cache/dew/xla`), and `--trainer.compilation-cache-dir None` turns it off. On a DiT-B it takes the time to the first step from 55s to 5s and leaves the step itself alone.
 
 The trainer logs `train/samples_per_sec` and the MFU it could compute alongside the loss, on the same logging cadence.
+
+`--trainer.xla-flags` appends to `XLA_FLAGS` for the run. `prepare_process` applies it, which is a recipe's first line, because XLA reads that variable once when it opens a backend: a flag set after the first JAX call does nothing. A library user who never runs a recipe sets `XLA_FLAGS` in the environment instead. The default is None, and `docs/performance.md` has the sweep behind that default.
