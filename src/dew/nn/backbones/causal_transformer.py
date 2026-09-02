@@ -59,18 +59,34 @@ class RMSNorm(nn.Module):
 def rotary_freqs(positions, head_dim: int, theta: float):
     """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
 
-    Computed in fp32 so a token gets the same rotation whether it arrives in a
-    prefill or comes back as a single decode step.
+    `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
+    documents each restart at 0); the angle axes line up with the trailing
+    [B, S] either way. Computed in fp32 so a token gets the same rotation
+    whether it arrives in a prefill or comes back as a single decode step.
     """
     inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-    angles = jnp.asarray(positions, jnp.float32)[:, None] * inv_freq[None, :]
+    positions = jnp.asarray(positions, jnp.float32)
+    if positions.ndim == 1:
+        angles = positions[:, None] * inv_freq[None, :]
+    else:
+        angles = positions[:, :, None] * inv_freq[None, None, :]
     return jnp.cos(angles), jnp.sin(angles)
 
 
 def apply_rotary(x, freqs_cos, freqs_sin):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders."""
-    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)[None, :, None, :]
-    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)[None, :, None, :]
+    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
+
+    The freqs are [S, D] for one sequence, or [B, S, D] when a packed batch
+    restarts positions per document.
+    """
+    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
+    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
+    if cos.ndim == 3:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+    else:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
     fp32 = x.astype(jnp.float32)
     x1, x2 = jnp.split(fp32, 2, axis=-1)
     rotated = jnp.concatenate([-x2, x1], axis=-1)
@@ -119,7 +135,8 @@ class CausalSelfAttention(nn.Module):
                 dtype=self.dtype, name='k_norm')
 
     @nn.compact
-    def __call__(self, x, decode: bool = False):
+    def __call__(self, x, decode: bool = False,
+                 positions=None, segment_ids=None):
         B, S, _ = x.shape
         query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
         key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
@@ -129,12 +146,16 @@ class CausalSelfAttention(nn.Module):
             key = self.k_norm(key)
 
         # The cache slot carries position while decoding, so the rotation and
-        # the mask both read it instead of the row index of the token.
+        # the mask both read it instead of the row index of the token. A
+        # packed batch supplies the position inside its document instead of
+        # the row index, which is what restarts RoPE at every boundary.
         append = None
         if decode:
             positions, append = open_kv_cache(self, key, self.max_seq_len)
-        else:
+        elif positions is None:
             positions = jnp.arange(S)
+        else:
+            positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
         query = apply_rotary(query, freqs_cos, freqs_sin)
         key = apply_rotary(key, freqs_cos, freqs_sin)
@@ -144,6 +165,19 @@ class CausalSelfAttention(nn.Module):
             key, value = append(key, value)
             mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
             causal = False
+        elif segment_ids is not None:
+            # Attention stays inside each packed document: the segment ids
+            # build the block-diagonal mask on top of causality, and padding
+            # (segment 0) sees nothing. The fused cudnn kernel turns a bool
+            # mask into a materialized [B, N, T, S] bias, whose shape and
+            # sequence-parity constraints give up the memory win that motivated
+            # it (jax/_src/nn/functions.py routes every mask on the cudnn path
+            # through combine_bias_and_mask), so a packed batch runs the xla
+            # path unless the caller pinned something else.
+            segment_ids = jnp.asarray(segment_ids)
+            causal = False
+            mask = ((segment_ids[:, :, None] == segment_ids[:, None, :])
+                    & (segment_ids[:, :, None] != 0))[:, None]
 
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
@@ -211,8 +245,10 @@ class DecoderBlock(nn.Module):
             name='mlp')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x, train: bool = False, decode: bool = False):
-        mixed = self.self_attn(self.input_layernorm(x), decode=decode)
+    def __call__(self, x, train: bool = False, decode: bool = False,
+                 positions=None, segment_ids=None):
+        mixed = self.self_attn(self.input_layernorm(x), decode=decode,
+                               positions=positions, segment_ids=segment_ids)
         x = x + self.dropout(mixed, deterministic=not train)
         hidden = self.mlp(self.post_attention_layernorm(x))
         return x + self.dropout(hidden, deterministic=not train)
@@ -350,12 +386,14 @@ class CausalTransformer(nn.Module):
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
                 precision=self.precision, name='lm_head')
 
-    def __call__(self, tokens, train: bool = False, decode: bool = False):
+    def __call__(self, tokens, train: bool = False, decode: bool = False,
+                 positions=None, segment_ids=None):
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
         for layer in self.layers:
-            x = layer(x, train=train, decode=decode)
+            x = layer(x, train=train, decode=decode,
+                      positions=positions, segment_ids=segment_ids)
         x = self.norm(x)
 
         # fp32 head, as in the DiT output projection: the loss is computed in fp32
