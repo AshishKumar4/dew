@@ -36,6 +36,19 @@ jobs:
     - name: Test with pytest
       run: |
         JAX_PLATFORMS=cpu pytest -m "not network" -q -ra --junitxml=pytest-report.xml
+    - name: Annotate failures
+      if: always()
+      run: |
+        python - <<'EOF'
+        import xml.etree.ElementTree as ET
+        root = ET.parse("pytest-report.xml").getroot()
+        for case in root.iter("testcase"):
+            for kind in ("failure", "error"):
+                node = case.find(kind)
+                if node is not None:
+                    detail = " | ".join(line.strip() for line in (node.text or "").strip().splitlines()[-3:])
+                    print(f"::error title={case.get('classname')}.{case.get('name')}::{(node.get('message') or '')[:400]} || {detail[:600]}")
+        EOF
     - name: Upload the test report
       if: always()
       uses: actions/upload-artifact@v4
