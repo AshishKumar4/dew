@@ -483,15 +483,15 @@ CI runs the test suite on CPU on every push, and the GPU lane runs on an RTX 408
 
 ### Instructions
 
-Dew needs Python 3.11 or later. The base install comes with a CPU-only JAX; install the [JAX build](https://docs.jax.dev/en/latest/installation.html) for your accelerator as well.
+Dew needs Python 3.11 or later. There is no release on PyPI yet; install from the repository. The base install comes with a CPU-only JAX; install the [JAX build](https://docs.jax.dev/en/latest/installation.html) for your accelerator as well.
 
-| Platform   | Instructions                             |
-|------------|------------------------------------------|
-| CPU        | `pip install dew-ml`                     |
-| NVIDIA GPU | `pip install dew-ml "jax[cuda12]"`       |
-| Google TPU | `pip install dew-ml "jax[tpu]"`          |
+| Platform   | Instructions                                                                 |
+|------------|------------------------------------------------------------------------------|
+| CPU        | `pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"`               |
+| NVIDIA GPU | `pip install "dew-ml @ git+https://github.com/AshishKumar4/dew" "jax[cuda12]"` |
+| Google TPU | `pip install "dew-ml @ git+https://github.com/AshishKumar4/dew" "jax[tpu]"`    |
 
-Optional extras: `dew-ml[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors. The package imports as `dew`; the bare `dew` name on PyPI is an unused placeholder, so the distribution is `dew-ml` for now.
+Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors, as in `"dew-ml[tfds,metrics] @ git+https://github.com/AshishKumar4/dew"`. The package imports as `dew`. The first release will ship as `dew-ml`; the bare `dew` name on PyPI is an unused placeholder.
 
 To work on Dew itself:
 
