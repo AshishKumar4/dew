@@ -28,70 +28,25 @@ process.
 heads is 524288 in every row. Forward only, and forward with the gradient
 wrt q, k and v, in milliseconds.
 
-| S | D | causal | reference fwd | xla fwd | cudnn fwd | pallas fwd | reference bwd | xla bwd | cudnn bwd | pallas bwd |
-|------|-----|-------|------|------|------|------|------|------|------|------|
-| 256 | 64 | no | 4.36 | 3.99 | 0.62 | **0.58** | 8.52 | 9.50 | **3.95** | 4.95 |
-| 256 | 64 | yes | 4.64 | 4.11 | 0.63 | **0.54** | 9.44 | 10.24 | 3.97 | **3.34** |
-| 256 | 128 | no | 6.77 | 10.43 | 1.22 | **0.95** | 18.31 | 11.95 | **10.33** | 16.48 |
-| 256 | 128 | yes | 7.49 | 7.43 | 2.13 | **1.07** | 20.47 | 15.09 | 13.62 | **11.66** |
-| 1024 | 64 | no | 19.65 | 21.67 | **1.63** | 3.48 | 37.91 | 35.24 | **10.35** | 30.27 |
-| 1024 | 64 | yes | 16.36 | 19.57 | 1.15 | **1.06** | 34.62 | 31.06 | **5.89** | 9.55 |
-| 1024 | 128 | no | 13.88 | 13.27 | 3.24 | **3.23** | 28.64 | 32.56 | **15.42** | 31.78 |
-| 1024 | 128 | yes | 13.90 | 13.43 | 2.22 | **2.03** | 29.05 | 33.51 | **10.57** | 17.65 |
-| 4096 | 64 | no | oom | oom | 6.53 | **6.38** | oom | oom | **24.31** | 48.92 |
-| 4096 | 64 | yes | oom | oom | 3.93 | **3.54** | oom | oom | **14.87** | 17.66 |
-| 4096 | 128 | no | oom | oom | **12.12** | 12.53 | oom | oom | **46.89** | 115.50 |
-| 4096 | 128 | yes | oom | oom | 6.96 | **6.43** | oom | oom | **26.38** | 52.67 |
+| S | D | causal | reference fwd | xla fwd | cudnn fwd | reference bwd | xla bwd | cudnn bwd |
+|------|-----|-------|------|------|------|------|------|------|
+| 256 | 64 | no | 4.36 | 3.99 | 0.62 | 8.52 | 9.50 | 3.95 |
+| 256 | 64 | yes | 4.64 | 4.11 | 0.63 | 9.44 | 10.24 | 3.97 |
+| 256 | 128 | no | 6.77 | 10.43 | 1.22 | 18.31 | 11.95 | 10.33 |
+| 256 | 128 | yes | 7.49 | 7.43 | 2.13 | 20.47 | 15.09 | 13.62 |
+| 1024 | 64 | no | 19.65 | 21.67 | 1.63 | 37.91 | 35.24 | 10.35 |
+| 1024 | 64 | yes | 16.36 | 19.57 | 1.15 | 34.62 | 31.06 | 5.89 |
+| 1024 | 128 | no | 13.88 | 13.27 | 3.24 | 28.64 | 32.56 | 15.42 |
+| 1024 | 128 | yes | 13.90 | 13.43 | 2.22 | 29.05 | 33.51 | 10.57 |
+| 4096 | 64 | no | oom | oom | 6.53 | oom | oom | 24.31 |
+| 4096 | 64 | yes | oom | oom | 3.93 | oom | oom | 14.87 |
+| 4096 | 128 | no | oom | oom | 12.12 | oom | oom | 46.89 |
+| 4096 | 128 | yes | oom | oom | 6.96 | oom | oom | 26.38 |
 
 The reference and xla paths materialize the S x S logits, so they run out of
-16 GiB at S=4096 and are 3 to 12 times slower than either fused kernel
-everywhere they fit. Between the two fused kernels: the triton kernel wins
-almost every forward pass, by 3% to 50%, and loses almost every backward
-pass, by 20% to 150%. The two exceptions are both causal at S=256, which is
-the only place it wins forward and backward together.
-
-Training is a forward and a backward, so cudnn is the kernel for it. The
-triton kernel is worth selecting for a forward-only workload of a shape it
-supports.
-
-### What the triton kernel accepts
-
-`jax.experimental.pallas.ops.gpu.attention.mha` as it ships in 0.11.1, with
-the limits measured rather than assumed (`dew.nn.attention.pallas_supports`
-carries the same list, and a call it cannot serve raises):
-
-- bf16 or fp16. fp32 compiles and runs, at twice the shared memory and no
-  tensor cores.
-- No mask and no sliding window. The kernel takes causality as a flag and has
-  no bias argument, so decoding against a KV cache cannot use it.
-- Equal query and key lengths. Cross-attention runs forward, and the fused
-  backward pass refuses unequal lengths.
-- Sequence length a multiple of 128, or a power of two below it. 77 text
-  tokens are neither, and neither is 96 or 192.
-- head_dim at most 128. At 160 the kernel asks for 224 KiB of shared memory
-  against the 99 KiB an AD10x SM has.
-
-Pallas' triton backend also keeps a table of device kinds and refuses to
-compile for a card that is missing from it. 0.11.1 lists the RTX 4090 and not
-the RTX 4080, which is the same architecture at compute capability 8.9.
-`dew.telemetry.devices.register_pallas_device` fills that gap from the
-capability the device already reports, through the same hook jax uses for
-ROCm cards, and `scaled_dot_product_attention` calls it when a run asks for
-this kernel.
-
-### Parity
-
-`tests/test_kernels.py` compares the triton kernel against the reference
-einsum path at [2, 256, 8, 64] in bf16, forward and gradient, with a
-tolerance of 2e-2. Measured maxima:
-
-| comparison | causal | max abs difference |
-|---|---|---|
-| forward | no | 6.0e-3 |
-| forward | yes | 1.3e-2 |
-| dq, dk, dv (unit cotangent) | no | 7.8e-3 |
-| dq, dk, dv (unit cotangent) | yes | 1.6e-2 |
-| forward, 8 query heads over 2 kv heads | yes | 9.4e-3 |
+16 GiB at S=4096 and are 3 to 12 times slower than the fused kernel
+everywhere they fit. cudnn is the kernel for a GPU run, forward and
+backward, which is why `'auto'` reaches for it wherever it can.
 
 ## Which kernel 'auto' picks
 
@@ -126,30 +81,6 @@ which is the price of training at all. It changes no numbers: a fixed-seed
 20-step loss trajectory under `'auto'` is bitwise identical to the same run
 under the kernel 'auto' selected, both for a rerouted model (simple_mmdit,
 max delta 0.0) and for one that stays on cudnn (simple_dit, max delta 0.0).
-
-## Does the triton kernel win the training step
-
-`tools/benchmark_step.py --attention-impl {cudnn,pallas}` on the two
-architectures whose attention it can serve. Milliseconds per step.
-
-| case | tokens | cudnn | pallas | change |
-|---|---|---|---|---|
-| simple_dit 64px | 256 | 6.93 | 7.11 | +2.6% |
-| simple_dit 128px | 1024 | 27.30 | 26.99 | -1.1% |
-| causal_transformer | 512 | 75.68 | 75.05 | -0.8% |
-| causal_transformer | 1024 | 150.21 | 149.31 | -0.6% |
-
-The kernel is up to twice as fast in the causal forward pass and the step
-moves by under 1%, because attention is a small share of these steps: the
-projections and, for the language model, the 50304-wide vocabulary matmul
-dominate. The adoption bar for `'auto'` was 10% everywhere the kernel
-applies, so `'auto'` stays on cudnn.
-
-`'pallas'` is selectable and stays that way. Two things to know before
-selecting it: it is 0.6% to 1.1% faster on a long-sequence causal step and
-2.6% slower on a short one, and it does not reproduce the cudnn numbers. A
-fixed-seed 20-step causal_transformer trajectory diverges by 2.8e-4 in the
-loss, which is above the 1e-5 an adopted change is held to.
 
 ## XLA flags
 
