@@ -133,7 +133,7 @@ def get_dataset_grain(
     worker_buffer_size=20,
     seed=0,
     dataset_source="/mnt/gcs_mount/arrayrecord2/cc12m/",
-    val_batch_size=32,
+    val_batch_size=None,
     val_worker_count=8,
     val_count=None,
 ):
@@ -152,7 +152,8 @@ def get_dataset_grain(
         worker_buffer_size: Size of the worker buffer.
         seed: Random seed.
         dataset_source: Source path for the dataset.
-        val_batch_size: Batch size for the validation loader.
+        val_batch_size: Batch size for the validation loader. Defaults to the
+            process-local training batch size.
         val_worker_count: Number of worker processes for the validation loader.
         val_count: Records held out from the head of the source, in canonical
             order, as the validation split; the train loader then covers the
@@ -221,7 +222,7 @@ def get_dataset_grain(
     def get_valset():
         transformations = [
             augmenter(),
-            pygrain.Batch(val_batch_size, drop_remainder=True),
+            pygrain.Batch(val_batch_size or local_batch_size, drop_remainder=True),
         ]
 
         loader = pygrain.DataLoader(
