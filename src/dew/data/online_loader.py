@@ -4,7 +4,6 @@ import multiprocessing
 import threading
 from multiprocessing import Queue
 import time
-import albumentations as A
 import queue
 import cv2
 from functools import lru_cache, partial
@@ -220,17 +219,23 @@ def default_image_processor(
         downscale = max(original_width, original_height) > max(image_shape)
         interpolation = downscale_interpolation if downscale else upscale_interpolation
 
-        # Resize while keeping aspect ratio
-        image = A.longest_max_size(image, max(image_shape), interpolation=interpolation)
-        
-        # Pad to target shape
-        image = A.pad(
-            image,
-            min_height=image_shape[0],
-            min_width=image_shape[1],
-            border_mode=cv2.BORDER_CONSTANT,
-            value=[255, 255, 255],
-        )
+        # Resize the longest side to the target, keeping the aspect ratio.
+        # albumentations 2.x has neither longest_max_size nor pad any more, and
+        # cv2 is the resize path everywhere else in the data layer.
+        scale = max(image_shape) / max(original_height, original_width)
+        resized = (max(1, round(original_width * scale)),
+                   max(1, round(original_height * scale)))
+        image = cv2.resize(image, resized, interpolation=interpolation)
+
+        # Pad to the target shape, centred, on white
+        pad_height = max(0, image_shape[0] - image.shape[0])
+        pad_width = max(0, image_shape[1] - image.shape[1])
+        if pad_height or pad_width:
+            top, left = pad_height // 2, pad_width // 2
+            image = cv2.copyMakeBorder(
+                image, top, pad_height - top, left, pad_width - left,
+                cv2.BORDER_CONSTANT, value=(255, 255, 255),
+            )
         
         return image, original_height, original_width
         
@@ -546,6 +551,25 @@ def map_batch(
         traceback.print_exc()
 
 
+# The sample queue each pool worker inherited through the Pool initializer. A
+# multiprocessing.Queue can only cross a process boundary while the process is
+# being created, so handing it to pool.map as an argument raised "Queue objects
+# should only be shared between processes through inheritance" before the pool
+# had fetched anything.
+_worker_queue = None
+
+
+def _init_media_worker(data_queue: Queue):
+    """Pool initializer: keep the queue this process inherited."""
+    global _worker_queue
+    _worker_queue = data_queue
+
+
+def _map_shard(batch: Dict[str, Any], **kwargs):
+    """Pool entry point: map one shard onto this process's queue."""
+    map_batch(batch, data_queue=_worker_queue, **kwargs)
+
+
 def parallel_media_loader(
     dataset: Dataset,
     data_queue: Queue,
@@ -588,8 +612,7 @@ def parallel_media_loader(
     """
     # Create mapping function
     map_batch_fn = partial(
-        map_batch,
-        data_queue=data_queue,
+        _map_shard,
         media_type=media_type,
         num_threads=num_threads,
         image_shape=image_shape,
@@ -611,7 +634,8 @@ def parallel_media_loader(
     print(f"Local Shard length: {shard_len}")
     
     # Process dataset in parallel
-    with multiprocessing.Pool(num_workers) as pool:
+    with multiprocessing.Pool(num_workers, initializer=_init_media_worker,
+                              initargs=(data_queue,)) as pool:
         iteration = 0
         while True:
             # Create shards for each worker
