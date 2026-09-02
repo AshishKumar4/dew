@@ -54,8 +54,9 @@ def _user_agent() -> str:
 
 # A queue entry under this key is a fetch the workers dropped (dead URL, too
 # small, wrong aspect ratio). The iterator counts them and moves on, so a run
-# can read its drop rate instead of inferring it from throughput.
-DROPPED_SAMPLE = "dropped"
+# can read its drop rate instead of inferring it from throughput. The name is
+# reserved: a feature extractor could plausibly emit one called "dropped".
+DROPPED_SAMPLE = "__dropped__"
 
 
 class ResourceManager:
