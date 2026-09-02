@@ -73,14 +73,26 @@ def token_data_config(config: LmRunConfig) -> DataConfig:
                    tokenizer=config.tokenizer)
 
 
-def build_lm(config: LmRunConfig, vocab_size: int):
+def context_length(config: LmRunConfig, samples: Optional[dict]) -> int:
+    """How far the position table and the KV cache have to reach.
+
+    Generation decodes into a cache sized once at build time, so a sampling
+    budget longer than the training context is what decides the model's
+    max_seq_len rather than the sequence length being trained on.
+    """
+    if samples is None:
+        return config.sequence_length
+    return max(config.sequence_length,
+               len(samples["prompt"]) + samples["max_new_tokens"])
+
+
+def build_lm(config: LmRunConfig, vocab_size: int, max_seq_len: int):
     """The model, and the config the registry built it from."""
     architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
     model_config = apply_precision_policy(
         architecture,
-        # The token files decide the vocabulary, so that one is not overridable;
-        # the position table only has to span the context being trained on.
-        {"max_seq_len": config.sequence_length, **config.model.config, **suffix_flags,
+        # The token files decide the vocabulary, so that one is not overridable.
+        {"max_seq_len": max_seq_len, **config.model.config, **suffix_flags,
          "vocab_size": vocab_size},
         dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     return build_model(architecture, model_config), model_config
@@ -141,13 +153,15 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
     steps_per_epoch = (config.trainer.steps_per_epoch
                        or data['train_len'] // config.data.batch_size)
 
-    model, model_config = build_lm(config, vocab_size)
+    samples = build_samples(config)
+    model, model_config = build_lm(config, vocab_size,
+                                   context_length(config, samples))
     objective = LMObjective(
         model,
         config.sequence_length,
         vocab_size=vocab_size,
         ema_decay=config.trainer.ema_decay,
-        samples=build_samples(config),
+        samples=samples,
     )
 
     name = config.trainer.name or (
