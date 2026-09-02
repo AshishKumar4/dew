@@ -7,10 +7,10 @@ Dew is the project published as FlaxDiff, renamed and restructured once the trai
 ## Install
 
 ```bash
-pip install dew-ml
+pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-The package installs as `dew-ml` and imports as `dew`. Extras pull in the heavier dependencies only when you need them: `av` for video and audio readers, `metrics` for FID, `streaming` for the URL-streaming loader, `tfds` for TFDS datasets, `interop` for safetensors.
+There is no release on PyPI yet. The package will ship as `dew-ml` and imports as `dew`. Extras pull in the heavier dependencies only when you need them: `av` for video and audio readers, `metrics` for FID, `streaming` for the URL-streaming loader, `tfds` for TFDS datasets, `interop` for safetensors.
 
 ## A training run
 
