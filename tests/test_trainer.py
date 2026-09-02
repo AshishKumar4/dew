@@ -213,8 +213,27 @@ def test_best_step_is_the_lowest_epoch_loss(tmp_path):
     assert trainer.checkpointer.best_step() == 2
     assert set(trainer.checkpointer.all_steps()) == {2, 4}
 
-    reopened = make_trainer(tmp_path, name="best")
+    reopened = make_trainer(tmp_path, name="best",
+                            load_from_checkpoint=str(tmp_path / "best"))
     assert reopened.checkpointer.best_step() == 2, "the metric did not survive a reopen"
+
+
+def test_a_populated_checkpoint_directory_is_not_written_over(tmp_path):
+    """A second run into the same directory used to train a whole epoch and
+    then die in the save, because orbax refuses to overwrite a step. Resuming
+    and starting fresh are both fine; neither is guessed."""
+    trainer = make_trainer(tmp_path, name="taken")
+    trainer.save(epoch=0, step=2)
+    trainer.wait_for_checkpoints()
+
+    with pytest.raises(ValueError, match="already holds checkpoints up to step 2"):
+        make_trainer(tmp_path, name="taken")
+
+    resumed = make_trainer(tmp_path, name="taken",
+                           load_from_checkpoint=trainer.checkpoint_path())
+    assert resumed.latest_step == 2
+    # A directory of its own is the other way out, and an empty one is fine
+    assert make_trainer(tmp_path, name="untaken").checkpointer.latest_step() is None
 
 
 def test_resume_from_a_checkpoint_that_stored_its_own_best_state(tmp_path):

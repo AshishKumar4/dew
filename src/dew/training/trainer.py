@@ -15,6 +15,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
 from typing import Dict, Callable, Any, Tuple, Optional
 from dew.random_state import RandomMarkovState
+from dew.objectives.base import shape_and_dtype
 from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
@@ -169,6 +170,18 @@ class SimpleTrainer:
             create=True, enable_async_checkpointing=True)
         self.checkpointer = ocp.CheckpointManager(self.checkpoint_path(), options=options)
 
+        # A run into a directory that already holds steps trains a whole epoch
+        # and only then discovers that orbax will not overwrite one. Nothing
+        # here guesses which way the caller meant it: resuming and starting
+        # over are both fine, and both have to be asked for.
+        written_step = self.checkpointer.latest_step()
+        if written_step is not None and load_from_checkpoint is None and checkpoint_step is None:
+            raise ValueError(
+                f"{self.checkpoint_path()} already holds checkpoints up to step "
+                f"{written_step}. Resume them with --trainer.load-from-checkpoint "
+                f"{self.checkpoint_path()}, or give this run a directory of its own "
+                f"with --trainer.name. Nothing has been deleted.")
+
         self.rngstate = RandomMarkovState(rngs)
         self.rngstate, subkey = self.rngstate.get_random_key()
 
@@ -194,7 +207,11 @@ class SimpleTrainer:
             print(f"Overriding start step to {self.latest_step}")
 
     def get_input_ones(self):
-        return {k: jnp.ones((1, *v)) for k, v in self.input_shapes.items()}
+        ones = {}
+        for key, entry in self.input_shapes.items():
+            shape, dtype = shape_and_dtype(entry)
+            ones[key] = jnp.ones((1, *shape), dtype)
+        return ones
 
     def _build_state(self, init_fn) -> SimpleTrainState:
         """Materialise a train state directly into its sharded layout.

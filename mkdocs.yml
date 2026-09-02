@@ -13,6 +13,7 @@ nav:
       - The objectives seam: concepts/objectives.md
       - Distributed training: concepts/distributed.md
       - The data pipeline: concepts/data.md
+      - Language models: concepts/language_models.md
   - Recipes: recipes.md
   - API: api.md
   - Gallery: gallery.md
