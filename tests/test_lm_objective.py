@@ -250,12 +250,14 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
         def __call__(self, tokens, train: bool = False):
             embedded = nn.Embed(self.vocab_size, self.emb_features,
                                 dtype=jnp.bfloat16)(tokens)
-            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded).astype(jnp.float32)
+            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded)
 
     objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
     params = objective.init_params(jax.random.PRNGKey(0))
+    logits = objective.model.apply(params, token_batch()[TEXT_KEY][:, :-1])
     loss, aux = objective.loss(params, params, token_batch(), jax.random.PRNGKey(0), 0)
 
+    assert logits.dtype == jnp.bfloat16
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
     assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
 
