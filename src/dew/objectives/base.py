@@ -13,7 +13,7 @@ telemetry) can surface them without the trainer knowing what they mean.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import jax
 
@@ -30,11 +30,25 @@ class EMASpec:
     path: Tuple[str, ...] = ()
 
 
+def shape_and_dtype(entry) -> Tuple[Tuple[int, ...], Any]:
+    """Split an `input_shapes` entry into its shape and the dtype it inits as.
+
+    An entry is a plain shape, which inits as float32, or a `(shape, dtype)`
+    pair for an input that is not: a language model is fed int32 token ids.
+    """
+    if len(entry) == 2 and isinstance(entry[0], (tuple, list)) and not isinstance(entry[1], int):
+        return tuple(entry[0]), entry[1]
+    return tuple(entry), None
+
+
 class Objective(ABC):
     """The learning problem: parameters, loss, EMA policy, validation artifacts."""
 
     tag: str = "objective"  # names the checkpoint artifact this run publishes
     ema: EMASpec
+    input_shapes: Optional[Dict[str, Any]] = None
+    """Shapes of the init batch, for a trainer given no input_config; each entry
+    is a shape, or a `(shape, dtype)` pair when float32 is the wrong dtype."""
 
     @abstractmethod
     def init_params(self, rng: jax.Array) -> Any:
