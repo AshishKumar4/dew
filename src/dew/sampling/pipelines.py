@@ -10,9 +10,7 @@ if TYPE_CHECKING:
     # dew.training import here would cycle through the diffusion objective
     # back into this package's samplers.
     from dew.training import SimpleTrainState, TrainState
-from dew.sampling import (
-    DiffusionSampler,
-)
+from dew.sampling.common import DiffusionSampler
 from dew.diffusion.schedules import (
     NoiseScheduler,
 )
