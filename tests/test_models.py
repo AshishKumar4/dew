@@ -257,3 +257,26 @@ def test_unet3d_temporal_mixing_after_training_signal(rng):
     out_a = model.apply(params, x, temb, textcontext)
     out_b = model.apply(params, x.at[:, 0].add(1.0), temb, textcontext)
     assert not jnp.allclose(out_a[:, 2], out_b[:, 2]), "no information flow across frames"
+
+
+def test_non_symmetric_attention_configs_init(rng):
+    """attention_configs is per stage and need not be symmetric: a stage that
+    is None must not decide anything for the stages that are not."""
+    from dew.nn.backbones.unet3d import UNet3D
+
+    config = dict(
+        emb_features=64,
+        feature_depths=[16, 32],
+        attention_configs=[{"heads": 2, "dtype": jnp.float32,
+                            "use_projection": False, "use_self_and_cross": False}, None],
+        num_res_blocks=1,
+        num_middle_res_blocks=1,
+    )
+    temb = jnp.ones((2,))
+    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
+
+    image = jax.random.normal(rng, (2, 16, 16, 3))
+    Unet(**config).init(rng, image, temb, textcontext)
+
+    video = jax.random.normal(rng, (2, 3, 16, 16, 3))
+    UNet3D(**config, temporal_heads=2).init(rng, video, temb, textcontext)
