@@ -32,9 +32,8 @@ CAPTION_TOKENS = 77
 # oxford_flowers102 is 8189 images across its three splits, and the loader
 # reads split="all".
 RECORDS = 8189
-# get_dataset_grain's own default, which load_data has no config field to
-# override, so a validation batch is 32 images whatever batch_size says.
-VAL_BATCH = 32
+# Validation uses the run's local batch size and holds out four batches.
+VAL_BATCH = BATCH
 VAL_RECORDS = 4 * BATCH
 
 
