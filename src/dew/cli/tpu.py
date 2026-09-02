@@ -692,16 +692,20 @@ class Spawn(Base):
             Create(name=name, type=self.type, spot=self.spot, queued=self.queued,
                    zone=zone, dry_run=self.dry_run).run([])
             emit(f"[{name}] setup")
-            Setup(name=name, extras=self.extras, type=self.type,
-                  zone=zone, dry_run=self.dry_run).run([])
+            code = Setup(name=name, extras=self.extras, type=self.type,
+                         zone=zone, dry_run=self.dry_run).run([])
+            if code:
+                return name, f"failed: setup exit {code}", "-"
             if not command:
                 return name, "ready", "-"
             tpu = _tpu(self, cfg, gcloud, name)
             count, _ = _slice(tpu, cfg, self.type or "")
             job = _job_id(name)
             emit(f"[{name}] run {job}")
-            tpu.fanout([(index, tpu_setup.detached(command, job, index))
-                        for index in range(count)])
+            code = exit_code(tpu.fanout([(index, tpu_setup.detached(command, job, index))
+                                         for index in range(count)]))
+            if code:
+                return name, f"failed: run exit {code}", "-"
             return name, "ready", job
 
         rows = []

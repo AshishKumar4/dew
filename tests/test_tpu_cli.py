@@ -573,6 +573,17 @@ def test_spawn_reports_a_tpu_that_failed(fake, capsys):
     assert "failed" in capsys.readouterr().out
 
 
+def test_spawn_does_not_launch_when_setup_fails_the_device_check(fake, capsys):
+    """The device check is why setup has an exit code. A worker that sees half
+    the slice has to stop the run, not be reported ready with a job."""
+    for name in ("sw-0", "sw-1"):
+        fake.offer(name, "us-central2-b", devices="8 8")
+    assert run("spawn", "sw", "2", "--", "python", "t.py") == 1
+    rows = [line.split() for line in capsys.readouterr().out.splitlines()]
+    assert ["sw-0", "failed:", "setup", "exit", "1", "-"] in rows
+    assert not any("dew-runs" in command for command in ssh_commands(fake.gcloud_calls()))
+
+
 # ----------------------------------------------------------------------- dry run
 
 
