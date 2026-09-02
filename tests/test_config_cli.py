@@ -329,26 +329,35 @@ def test_resume_last_run_without_a_project_is_an_error():
     assert resumed.resume_last_run == "9xk2p1"
 
 
-def test_prepare_process_joins_the_process_pool_only_when_asked(monkeypatch):
-    """A pod run whose initialize() failed used to keep going on one process:
-    a slice of the devices over a slice of the data, reported as a full run."""
+def test_prepare_process_joins_the_pool_when_a_cluster_is_configured(monkeypatch):
+    """A pod run whose initialize() failed used to keep going on one process, and a
+    pod run that forgot a flag would have done the same. The default asks the
+    environment; only the single-host signature is allowed to continue."""
     monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "unset")
     joins = []
     monkeypatch.setattr(jax.distributed, "initialize", lambda *a, **k: joins.append(a))
 
     prepare_process("flip_only")
-    assert joins == []
+    assert len(joins) == 1
     assert os.environ["FLAXDIFF_AUGMENT_MODE"] == "flip_only"
 
-    prepare_process("flip_only", multi_host=True)
+    prepare_process("flip_only", multi_host=False)
     assert len(joins) == 1
 
-    def refuse(*args, **kwargs):
+    def single_host(*args, **kwargs):
         raise ValueError("coordinator_address should be defined.")
 
-    monkeypatch.setattr(jax.distributed, "initialize", refuse)
+    monkeypatch.setattr(jax.distributed, "initialize", single_host)
+    prepare_process("flip_only")
     with pytest.raises(ValueError, match="coordinator_address"):
         prepare_process("flip_only", multi_host=True)
+
+    def half_configured(*args, **kwargs):
+        raise ValueError("num_processes must be defined")
+
+    monkeypatch.setattr(jax.distributed, "initialize", half_configured)
+    with pytest.raises(ValueError, match="num_processes"):
+        prepare_process("flip_only")
 
 
 TOKENIZED = []

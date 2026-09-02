@@ -56,6 +56,7 @@ trainer = ObjectiveTrainer(
     rngs=jax.random.PRNGKey(0), name="flowers", checkpoint_base_path="./checkpoints",
 )
 state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 32, epochs=50)
+# state.params, state.ema_params, state.opt_state; checkpoints under ./checkpoints/flowers
 ```
 
 ### Contents
@@ -126,6 +127,7 @@ sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs,
                                 guidance_scale=4.0, guidance_start=0.1, guidance_stop=0.9)
 images = sampler.generate_samples(params=state.ema_params, num_samples=4, resolution=128,
                                   diffusion_steps=50, conditioning=["a water lily", "a rose"])
+# images.shape == (4, 128, 128, 3), values in [-1, 1]
 ```
 
 The samplers are `DDPMSampler`, `DDIMSampler`, `EulerSampler`, `EulerAncestralSampler`, `HeunSampler`, `RK4Sampler` and `MultiStepDPM`. All of them take the same arguments.
@@ -348,7 +350,7 @@ An objective is a class with four methods. `init_params` builds the parameter tr
   </picture>
 </p>
 
-This objective trains a byte-level language model:
+This objective trains a byte-level language model on the trainer as it ships today:
 
 ```python
 import jax.numpy as jnp, optax
@@ -392,7 +394,7 @@ The trainer places everything on a two-dimensional mesh named `(data, fsdp)`. Th
 trainer = ObjectiveTrainer(model, optimizer, ..., fsdp_size=4, grad_accum_steps=2)
 ```
 
-On a TPU pod or any multi-process run, every host runs the same script. `--trainer.multi-host` joins the processes into one JAX runtime before the model is built. The data pipeline shards records by process, so each host reads its own part of the dataset.
+On a TPU pod or any multi-process run, every host runs the same script. The recipes join the processes into one JAX runtime before the model is built, from the cluster environment; a failure to join stops the run instead of training on one host. The data pipeline shards records by process, so each host reads its own part of the dataset.
 
 <p align="center">
   <picture>
@@ -409,7 +411,7 @@ Models compute in bf16 with fp32 parameters by default in the recipes, and atten
 |---|---|
 | FSDP degree | `--trainer.fsdp-size 4` |
 | Gradient accumulation | `--optim.grad-accum-steps 2` |
-| Multi-host | `--trainer.multi-host` |
+| Process pool | `--trainer.multi-host` to require it, `--trainer.no-multi-host` to skip it |
 | Compute dtype | `--model.dtype bfloat16` |
 | Attention kernel | `--model.attention-impl auto` |
 | Checkpoint cadence | `--trainer.checkpoint-every-steps 2000` |
@@ -500,14 +502,14 @@ Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[strea
 To work on Dew itself:
 
 ```bash
-git clone --recurse-submodules git@github.com:AshishKumar4/dew.git
+git clone --recurse-submodules https://github.com/AshishKumar4/dew.git
 cd dew && pip install -e ".[test]"
 JAX_PLATFORMS=cpu pytest -m "not network" -q
 ```
 
 The tests simulate 8 devices on CPU, so the sharding tests run on any machine.
 
-`dew` on PyPI is an unused placeholder, so the package is `dew-ml` for now.
+`dew` on PyPI is an unused placeholder from 2016, so the package is `dew-ml` for now.
 
 ## Documentation
 
