@@ -281,8 +281,13 @@ def test_stop_then_start(fake):
     fake.offer("slice", "us-central2-b")
     assert run("stop", "slice") == 0
     assert run("start", "slice") == 0
-    verbs = [call[3] for call in fake.gcloud_calls()]
-    assert verbs == ["describe", "stop", "start", "describe"]
+    assert only(fake.gcloud_calls(), "stop") == [gcloud(
+        "compute", "tpus", "tpu-vm", "stop", "slice", "--zone=us-central2-b")]
+    assert only(fake.gcloud_calls(), "start") == [gcloud(
+        "compute", "tpus", "tpu-vm", "start", "slice", "--zone=us-central2-b")]
+    # start waits for READY again, so it describes afterwards.
+    assert [call[3] for call in fake.gcloud_calls()] == [
+        "describe", "stop", "start", "describe"]
 
 
 def test_list_reads_every_configured_zone(fake, capsys):
@@ -291,7 +296,9 @@ def test_list_reads_every_configured_zone(fake, capsys):
                                       schedulingConfig={"spot": True},
                                       networkEndpoints=NODE["networkEndpoints"][:1])]})
     assert run("list") == 0
-    assert zones_seen(fake.gcloud_calls(), "list") == list(CONFIG.zones)
+    assert fake.gcloud_calls() == [gcloud(
+        "compute", "tpus", "tpu-vm", "list", f"--zone={zone}", "--format=json")
+        for zone in CONFIG.zones]
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].split() == ["NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE", "SPOT"]
     assert lines[1].split() == ["one", "v5e-8", "READY", "-", "1", "us-east1-d", "yes"]
@@ -305,6 +312,12 @@ def test_list_says_so_when_there_is_nothing(fake, capsys):
 def test_describe_shows_the_fields_and_the_workers(fake, capsys):
     fake.offer("slice", "us-central2-b")
     assert run("describe", "slice") == 0
+    assert fake.gcloud_calls() == [
+        gcloud("compute", "tpus", "tpu-vm", "describe", "slice", "--zone=us-central2-b",
+               "--format=value(name)"),
+        gcloud("compute", "tpus", "tpu-vm", "describe", "slice", "--zone=us-central2-b",
+               "--format=json"),
+    ]
     rows = [line.split() for line in capsys.readouterr().out.splitlines()]
     assert ["name", "slice"] in rows
     assert ["state", "READY"] in rows
