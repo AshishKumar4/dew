@@ -7,7 +7,6 @@ import jax
 import cv2
 from dew.inputs.processors import AutoTextTokenizer
 from .registry import datasetMap, onlineDatasetMap, mediaDatasetMap
-import traceback
 # NOTE: .online_loader is imported lazily inside the two `*_online` factories.
 # It needs HF `datasets`, which the grain paths must not require.
 from functools import partial
@@ -31,165 +30,83 @@ def generate_collate_fn(media_type="image"):
         media_type: Type of media ("image" or "video").
         
     Returns:
-        A collate function for the specified media type.
+        A collate function for the specified media type. A malformed sample
+        raises: a batch that silently became zeros trained as data.
     """
     auto_tokenize = AutoTextTokenizer(tensor_type="np")
     
     def image_collate(batch):
-        try:
-            # Check if batch is valid
-            if not batch or len(batch) == 0:
-                print("Warning: Empty batch received")
-                # Return an empty batch with the correct structure
-                return {
-                    "image": np.zeros((0, 0, 0, 3), dtype=np.float32),
-                    "text": {
-                        "input_ids": np.zeros((0, 0), dtype=np.int32),
-                        "attention_mask": np.zeros((0, 0), dtype=np.int32),
-                    }
-                }
-                
-            captions = [sample.get("caption", "") for sample in batch]
-            results = auto_tokenize(captions)
-            
-            # Check if all images have the same shape
-            image_shapes = [sample["image"].shape for sample in batch]
-            if len(set(str(shape) for shape in image_shapes)) > 1:
-                # Different shapes: resize everything to the largest. cv2 takes (width, height).
-                target_h = max(shape[0] for shape in image_shapes)
-                target_w = max(shape[1] for shape in image_shapes)
-                images = np.stack([
-                    cv2.resize(sample["image"], (target_w, target_h))
-                    if sample["image"].shape[:2] != (target_h, target_w) else sample["image"]
-                    for sample in batch
-                ], axis=0)
-            else:
-                # All same shape, can just stack
-                images = np.stack([sample["image"] for sample in batch], axis=0)
-                
-            return {
-                "image": images,
-                "text": {
-                    "input_ids": results['input_ids'],
-                    "attention_mask": results['attention_mask'],
-                }
+        captions = [sample["caption"] for sample in batch]
+        results = auto_tokenize(captions)
+
+        # Check if all images have the same shape
+        image_shapes = [sample["image"].shape for sample in batch]
+        if len(set(str(shape) for shape in image_shapes)) > 1:
+            # Different shapes: resize everything to the largest. cv2 takes (width, height).
+            target_h = max(shape[0] for shape in image_shapes)
+            target_w = max(shape[1] for shape in image_shapes)
+            images = np.stack([
+                cv2.resize(sample["image"], (target_w, target_h))
+                if sample["image"].shape[:2] != (target_h, target_w) else sample["image"]
+                for sample in batch
+            ], axis=0)
+        else:
+            # All same shape, can just stack
+            images = np.stack([sample["image"] for sample in batch], axis=0)
+
+        return {
+            "image": images,
+            "text": {
+                "input_ids": results['input_ids'],
+                "attention_mask": results['attention_mask'],
             }
-        except Exception as e:
-            print("Error in image collate function", e)
-            traceback.print_exc()
-            # Return a fallback batch
-            return fallback_batch(batch, media_type="image")
-            
+        }
+
     def video_collate(batch):
-        try:
-            # Check if batch is valid
-            if not batch or len(batch) == 0:
-                print("Warning: Empty batch received")
-                # Return an empty batch with the correct structure
-                return {
-                    "video": np.zeros((0, 0, 0, 0, 3), dtype=np.float32),
-                    "text": {
-                        "input_ids": np.zeros((0, 0), dtype=np.int32),
-                        "attention_mask": np.zeros((0, 0), dtype=np.int32),
-                    }
-                }
-                
-            captions = [sample.get("caption", "") for sample in batch]
-            results = auto_tokenize(captions)
-            
-            # Check if all videos have the same shape
-            video_shapes = [sample["video"].shape for sample in batch]
-            if len(set(str(shape) for shape in video_shapes)) > 1:
-                # Get max dimensions
-                max_frames = max(shape[0] for shape in video_shapes)
-                max_height = max(shape[1] for shape in video_shapes)
-                max_width = max(shape[2] for shape in video_shapes)
-                
-                # Resize videos to the same shape
-                videos = []
-                for sample in batch:
-                    video = sample["video"]
-                    num_frames, height, width = video.shape[:3]
-                    
-                    if height != max_height or width != max_width:
-                        # Resize each frame
-                        resized_frames = np.array([
-                            cv2.resize(frame, (max_width, max_height))
-                            for frame in video
-                        ])
-                        video = resized_frames
-                    
-                    if num_frames < max_frames:
-                        # Pad with duplicates of the last frame
-                        padding = np.tile(video[-1:], (max_frames - num_frames, 1, 1, 1))
-                        video = np.concatenate([video, padding], axis=0)
-                    
-                    videos.append(video)
-                
-                videos = np.stack(videos, axis=0)
-            else:
-                # All videos have the same shape, can just stack
-                videos = np.stack([sample["video"] for sample in batch], axis=0)
-                
-            return {
-                "video": videos,
-                "text": {
-                    "input_ids": results['input_ids'],
-                    "attention_mask": results['attention_mask'],
-                }
+        captions = [sample["caption"] for sample in batch]
+        results = auto_tokenize(captions)
+
+        # Check if all videos have the same shape
+        video_shapes = [sample["video"].shape for sample in batch]
+        if len(set(str(shape) for shape in video_shapes)) > 1:
+            # Get max dimensions
+            max_frames = max(shape[0] for shape in video_shapes)
+            max_height = max(shape[1] for shape in video_shapes)
+            max_width = max(shape[2] for shape in video_shapes)
+
+            # Resize videos to the same shape
+            videos = []
+            for sample in batch:
+                video = sample["video"]
+                num_frames, height, width = video.shape[:3]
+
+                if height != max_height or width != max_width:
+                    # Resize each frame
+                    video = np.array([
+                        cv2.resize(frame, (max_width, max_height))
+                        for frame in video
+                    ])
+
+                if num_frames < max_frames:
+                    # Pad with duplicates of the last frame
+                    padding = np.tile(video[-1:], (max_frames - num_frames, 1, 1, 1))
+                    video = np.concatenate([video, padding], axis=0)
+
+                videos.append(video)
+
+            videos = np.stack(videos, axis=0)
+        else:
+            # All videos have the same shape, can just stack
+            videos = np.stack([sample["video"] for sample in batch], axis=0)
+
+        return {
+            "video": videos,
+            "text": {
+                "input_ids": results['input_ids'],
+                "attention_mask": results['attention_mask'],
             }
-        except Exception as e:
-            print("Error in video collate function", e)
-            traceback.print_exc()
-            # Return a fallback batch
-            return fallback_batch(batch, media_type="video")
-    
-    def fallback_batch(batch, media_type="image"):
-        """Create a fallback batch when an error occurs."""
-        try:
-            batch_size = len(batch) if batch else 1
-            if media_type == "video":
-                # Create a small valid video batch
-                dummy_video = np.zeros((batch_size, 4, 32, 32, 3), dtype=np.uint8)
-                dummy_text = auto_tokenize(["Error processing video"] * batch_size)
-                return {
-                    "video": dummy_video,
-                    "text": {
-                        "input_ids": dummy_text['input_ids'],
-                        "attention_mask": dummy_text['attention_mask'],
-                    }
-                }
-            else:
-                # Create a small valid image batch
-                dummy_image = np.zeros((batch_size, 32, 32, 3), dtype=np.uint8)
-                dummy_text = auto_tokenize(["Error processing image"] * batch_size)
-                return {
-                    "image": dummy_image,
-                    "text": {
-                        "input_ids": dummy_text['input_ids'],
-                        "attention_mask": dummy_text['attention_mask'],
-                    }
-                }
-        except Exception as e:
-            print("Error creating fallback batch", e)
-            # Last resort fallback
-            if media_type == "video":
-                return {
-                    "video": np.zeros((1, 4, 32, 32, 3), dtype=np.uint8),
-                    "text": {
-                        "input_ids": np.zeros((1, 16), dtype=np.int32),
-                        "attention_mask": np.zeros((1, 16), dtype=np.int32),
-                    }
-                }
-            else:
-                return {
-                    "image": np.zeros((1, 32, 32, 3), dtype=np.uint8),
-                    "text": {
-                        "input_ids": np.zeros((1, 16), dtype=np.int32),
-                        "attention_mask": np.zeros((1, 16), dtype=np.int32),
-                    }
-                }
-            
+        }
+
     if media_type == "video":
         return video_collate
     else:  # Default to image
@@ -217,6 +134,7 @@ def get_dataset_grain(
     dataset_source="/mnt/gcs_mount/arrayrecord2/cc12m/",
     val_batch_size=32,
     val_worker_count=8,
+    val_count=None,
 ):
     """Legacy function for getting grain dataset loaders for images.
     
@@ -235,6 +153,10 @@ def get_dataset_grain(
         dataset_source: Source path for the dataset.
         val_batch_size: Batch size for the validation loader.
         val_worker_count: Number of worker processes for the validation loader.
+        val_count: Records held out from the head of the source, in canonical
+            order, as the validation split; the train loader then covers the
+            rest. None (default) validates over every record, training data
+            included.
         
     Returns:
         Dictionary with train dataset function and metadata.
@@ -243,19 +165,34 @@ def get_dataset_grain(
     data_source = dataset["source"](dataset_source)
     augmenter = dataset["augmenter"](image_scale, method)
     local_batch_size = batch_size // jax.process_count()
+    dataset_length = len(data_source) if count is None else count
+
+    # A held-out slice off the head keeps the two loaders disjoint, so FID and
+    # CLIP are not measured on records the model trained on.
+    train_source = val_source = data_source
+    train_length = val_length = dataset_length
+    if val_count:
+        if not 0 < val_count < dataset_length:
+            raise ValueError(
+                f"val_count must be within 1..{dataset_length - 1} records for "
+                f"'{data_name}', got {val_count}"
+            )
+        val_source = _SourceSlice(data_source, 0, val_count)
+        train_source = _SourceSlice(data_source, val_count, dataset_length)
+        train_length, val_length = len(train_source), len(val_source)
 
     train_sampler = pygrain.IndexSampler(
-        num_records=len(data_source) if count is None else count,
+        num_records=train_length,
         shuffle=True,
         seed=seed,
         num_epochs=num_epochs,
         shard_options=pygrain.ShardByJaxProcess(),
     )
 
-    # Validation reads the same records in canonical order: sharing the
-    # shuffled train sampler made "validation" a random slice of training data.
+    # Validation reads its records in canonical order: sharing the shuffled
+    # train sampler made "validation" a random slice of training data.
     val_sampler = pygrain.IndexSampler(
-        num_records=len(data_source) if count is None else count,
+        num_records=val_length,
         shuffle=False,
         seed=seed,
         num_epochs=num_epochs,
@@ -269,7 +206,7 @@ def get_dataset_grain(
         transformations.append(pygrain.Batch(local_batch_size, drop_remainder=True))
 
         loader = pygrain.DataLoader(
-            data_source=data_source,
+            data_source=train_source,
             sampler=train_sampler,
             operations=transformations,
             worker_count=worker_count,
@@ -287,7 +224,7 @@ def get_dataset_grain(
         ]
 
         loader = pygrain.DataLoader(
-            data_source=data_source,
+            data_source=val_source,
             sampler=val_sampler,
             operations=transformations,
             worker_count=val_worker_count,
@@ -300,9 +237,9 @@ def get_dataset_grain(
 
     return {
         "train": get_trainset,
-        "train_len": len(data_source),
+        "train_len": train_length,
         "val": get_valset,
-        "val_len": len(data_source),
+        "val_len": val_length,
         "local_batch_size": local_batch_size,
         "global_batch_size": batch_size,
     }
@@ -679,6 +616,9 @@ def load_data(config: DataConfig) -> dict:
 
     read_thread_count = config.read_thread_count
     worker_buffer_size = config.worker_buffer_size
+    # Enough records for one full validation pass, held out from training so
+    # the loop's metrics are not read back off the training records.
+    val_count = config.val_steps_per_epoch * config.batch_size
     if online:
         print("Using Online Dataset Generator")
         # Streaming reads are slower per shard than arrayrecord grain reads,
@@ -702,6 +642,7 @@ def load_data(config: DataConfig) -> dict:
             read_buffer_size=config.read_buffer_size,
             worker_buffer_size=worker_buffer_size,
             seed=config.dataset_seed, dataset_source=config.dataset_path,
+            val_count=val_count,
         )
     return get_media_dataset_grain(
         name,
@@ -710,4 +651,5 @@ def load_data(config: DataConfig) -> dict:
         read_buffer_size=config.read_buffer_size,
         worker_buffer_size=worker_buffer_size,
         seed=config.dataset_seed, dataset_source=config.dataset_path,
+        val_count=val_count,
     )

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import multiprocessing
 import threading
 from multiprocessing import Queue
@@ -5,14 +7,11 @@ import time
 import albumentations as A
 import queue
 import cv2
-from functools import partial
-from typing import Any, Dict, List, Tuple, Optional, Union, Callable
+from functools import lru_cache, partial
+from typing import Any, Dict, List, Tuple, Optional, Union, Callable, TYPE_CHECKING
 
 import numpy as np
-from functools import partial
 
-from datasets import load_dataset, concatenate_datasets, Dataset, load_from_disk
-from datasets.utils.file_utils import get_datasets_user_agent
 from concurrent.futures import ThreadPoolExecutor
 import io
 import urllib
@@ -21,7 +20,42 @@ import os
 import PIL.Image
 import traceback
 
-USER_AGENT = get_datasets_user_agent()
+if TYPE_CHECKING:
+    from datasets import Dataset
+
+_STREAMING_HINT = (
+    "the online streaming loader needs HF datasets: pip install 'dew-ml[streaming]'"
+)
+
+
+def _hf_datasets():
+    """The HF `datasets` module, imported on use.
+
+    At module scope it would make `import dew.data.online_loader` (and every
+    dew.data name that resolves through it) require the streaming extra, which
+    only loading the dataset itself actually needs.
+    """
+    try:
+        import datasets
+    except ImportError as exc:
+        raise ImportError(_STREAMING_HINT) from exc
+    return datasets
+
+
+@lru_cache(maxsize=1)
+def _user_agent() -> str:
+    """The user agent HF datasets advertises, resolved on the first fetch."""
+    try:
+        from datasets.utils.file_utils import get_datasets_user_agent
+    except ImportError as exc:
+        raise ImportError(_STREAMING_HINT) from exc
+    return get_datasets_user_agent()
+
+
+# A queue entry under this key is a fetch the workers dropped (dead URL, too
+# small, wrong aspect ratio). The iterator counts them and moves on, so a run
+# can read its drop rate instead of inferring it from throughput.
+DROPPED_SAMPLE = "dropped"
 
 
 class ResourceManager:
@@ -56,7 +90,7 @@ def fetch_single_image(image_url: str, timeout: Optional[int] = None, retries: i
             request = urllib.request.Request(
                 image_url,
                 data=None,
-                headers={"user-agent": USER_AGENT},
+                headers={"user-agent": _user_agent()},
             )
             with urllib.request.urlopen(request, timeout=timeout) as req:
                 image = PIL.Image.open(io.BytesIO(req.read()))
@@ -95,7 +129,7 @@ def fetch_single_video(video_url: str, timeout: Optional[int] = None, retries: i
             request = urllib.request.Request(
                 video_url,
                 data=None,
-                headers={"user-agent": USER_AGENT},
+                headers={"user-agent": _user_agent()},
             )
             with urllib.request.urlopen(request, timeout=timeout) as req:
                 with open(tmp_path, 'wb') as f:
@@ -301,6 +335,7 @@ def map_image_sample(
         # Fetch the image
         image = fetch_single_image(url, timeout=timeout, retries=retries)
         if image is None:
+            data_queue.put({DROPPED_SAMPLE: url})
             return
 
         # Process the image
@@ -311,6 +346,7 @@ def map_image_sample(
         )
 
         if image is None:
+            data_queue.put({DROPPED_SAMPLE: url})
             return
 
         # Put the processed sample in the queue
@@ -325,6 +361,7 @@ def map_image_sample(
     except Exception as e:
         # Log the error
         print(f"Error mapping image sample {url}: {e}")
+        data_queue.put({DROPPED_SAMPLE: url})
 
 
 def map_video_sample(
@@ -359,6 +396,7 @@ def map_video_sample(
         # Fetch the video frames
         frames = fetch_single_video(url, timeout=timeout, retries=retries, max_frames=num_frames*2)
         if frames is None or len(frames) == 0:
+            data_queue.put({DROPPED_SAMPLE: url})
             return
 
         # Process the video
@@ -370,6 +408,7 @@ def map_video_sample(
         )
 
         if video is None:
+            data_queue.put({DROPPED_SAMPLE: url})
             return
 
         # Put the processed sample in the queue
@@ -384,6 +423,7 @@ def map_video_sample(
     except Exception as e:
         # Log the error
         print(f"Error mapping video sample {url}: {e}")
+        data_queue.put({DROPPED_SAMPLE: url})
 
 
 def default_feature_extractor(sample: Dict[str, Any]) -> Dict[str, Any]:
@@ -587,7 +627,13 @@ def parallel_media_loader(
 
 
 class MediaBatchIterator:
-    """Iterator for batches of media samples."""
+    """Iterator for batches of media samples.
+
+    Every batch is `batch_size` samples the fetcher really produced. A quiet
+    queue is not a batch: while the producer lives the iterator keeps waiting,
+    and once it is gone iteration ends, or raises if it died of an exception.
+    `dropped` counts the fetches its workers threw away.
+    """
     
     def __init__(
         self,
@@ -609,6 +655,7 @@ class MediaBatchIterator:
         downscale_interpolation: int = cv2.INTER_AREA,
         feature_extractor: Callable = default_feature_extractor,
         resource_manager: Optional[ResourceManager] = None,
+        queue_timeout: float = 60.0,
     ):
         """Initialize a media batch iterator.
         
@@ -631,11 +678,17 @@ class MediaBatchIterator:
             downscale_interpolation: Interpolation method for downscaling.
             feature_extractor: Function to extract features from samples.
             resource_manager: Resource manager to use. Will create one if None.
+            queue_timeout: Seconds without a sample before the producer is
+                checked for life.
         """
         self.dataset = dataset
         self.batch_size = batch_size
         self.media_type = media_type
-        
+        self.queue_timeout = queue_timeout
+        self.dropped = 0
+        self._producer_error = None
+        self._waiting_logged = False
+
         # Create or use resource manager
         self.resource_manager = resource_manager or ResourceManager()
         self.data_queue = self.resource_manager.get_data_queue()
@@ -660,9 +713,17 @@ class MediaBatchIterator:
             downscale_interpolation=downscale_interpolation,
             feature_extractor=feature_extractor
         )
-        
+
+        # The producer's exception is kept rather than printed and forgotten:
+        # __next__ re-raises it instead of waiting on a queue nobody fills.
+        def produce():
+            try:
+                loader(dataset)
+            except Exception as error:
+                self._producer_error = error
+
         # Start loader in background thread
-        self.thread = threading.Thread(target=loader, args=(dataset,), daemon=True)
+        self.thread = threading.Thread(target=produce, daemon=True)
         self.thread.start()
 
     def __iter__(self):
@@ -670,150 +731,35 @@ class MediaBatchIterator:
 
     def __next__(self):
         """Get the next batch of samples."""
-        def fetcher(_):
+        batch = []
+        while len(batch) < self.batch_size:
             try:
-                return self.data_queue.get(timeout=60)  # Add timeout to prevent hanging
-            except:
-                # Return a dummy sample on timeout
-                if self.media_type == "video":
-                    return {
-                        "url": "timeout",
-                        "caption": "Timeout occurred while waiting for sample",
-                        "video": np.zeros((4, 32, 32, 3), dtype=np.uint8),
-                        "original_height": 32,
-                        "original_width": 32,
-                    }
-                else:
-                    return {
-                        "url": "timeout",
-                        "caption": "Timeout occurred while waiting for sample",
-                        "image": np.zeros((32, 32, 3), dtype=np.uint8),
-                        "original_height": 32,
-                        "original_width": 32,
-                    }
-                
-        # Fetch batch in parallel
-        with ThreadPoolExecutor(max_workers=self.batch_size) as executor:
-            batch = list(executor.map(fetcher, range(self.batch_size)))
-            
+                sample = self.data_queue.get(timeout=self.queue_timeout)
+            except queue.Empty:
+                self._check_producer()
+                continue
+            if DROPPED_SAMPLE in sample:
+                self.dropped += 1
+                continue
+            batch.append(sample)
         return batch
+
+    def _check_producer(self):
+        """Raise when there is nothing left to wait for; a live producer is
+        only slow, and its samples are worth more than zeros."""
+        if self.thread.is_alive():
+            if not self._waiting_logged:
+                self._waiting_logged = True
+                print(f"No sample in {self.queue_timeout}s, still fetching "
+                      f"({self.dropped} dropped so far)")
+            return
+        if self._producer_error is not None:
+            raise RuntimeError("the media fetcher died") from self._producer_error
+        raise StopIteration
 
     def __len__(self):
         """Get the number of batches in the dataset."""
         return len(self.dataset) // self.batch_size
-
-
-def default_image_collate(batch):
-    """Default collate function for image batches.
-    
-    Args:
-        batch: Batch of samples to collate.
-        
-    Returns:
-        Collated batch.
-    """
-    urls = [sample["url"] for sample in batch]
-    captions = [sample["caption"] for sample in batch]
-    
-    # Check if all images have the same shape
-    image_shapes = [sample["image"].shape for sample in batch]
-    if len(set(str(shape) for shape in image_shapes)) > 1:
-        # Get max height and width
-        max_height = max(shape[0] for shape in image_shapes)
-        max_width = max(shape[1] for shape in image_shapes)
-        
-        # Resize all images to the same shape
-        images = []
-        for sample in batch:
-            image = sample["image"]
-            height, width = image.shape[:2]
-            
-            if height != max_height or width != max_width:
-                # Pad with white
-                padded_image = np.ones((max_height, max_width, 3), dtype=image.dtype) * 255
-                padded_image[:height, :width] = image
-                images.append(padded_image)
-            else:
-                images.append(image)
-                
-        images = np.stack(images, axis=0)
-    else:
-        # All images have the same shape, just stack them
-        images = np.stack([sample["image"] for sample in batch], axis=0)
-    
-    return {
-        "url": urls,
-        "caption": captions,
-        "image": images,
-    }
-
-
-def default_video_collate(batch):
-    """Default collate function for video batches.
-    
-    Args:
-        batch: Batch of samples to collate.
-        
-    Returns:
-        Collated batch.
-    """
-    urls = [sample["url"] for sample in batch]
-    captions = [sample["caption"] for sample in batch]
-    
-    # Check if all videos have the same shape
-    video_shapes = [sample["video"].shape for sample in batch]
-    if len(set(str(shape) for shape in video_shapes)) > 1:
-        # Get max dimensions
-        max_frames = max(shape[0] for shape in video_shapes)
-        max_height = max(shape[1] for shape in video_shapes)
-        max_width = max(shape[2] for shape in video_shapes)
-        
-        # Resize all videos to the same shape
-        videos = []
-        for sample in batch:
-            video = sample["video"]
-            num_frames, height, width = video.shape[:3]
-            
-            if num_frames != max_frames or height != max_height or width != max_width:
-                # Create a new video tensor with the max dimensions
-                padded_video = np.zeros((max_frames, max_height, max_width, 3), dtype=video.dtype)
-                
-                # Copy the original video frames
-                padded_video[:num_frames, :height, :width] = video
-                
-                # If we need more frames, duplicate the last frame
-                if num_frames < max_frames:
-                    padded_video[num_frames:] = padded_video[num_frames-1:num_frames]
-                    
-                videos.append(padded_video)
-            else:
-                videos.append(video)
-                
-        videos = np.stack(videos, axis=0)
-    else:
-        # All videos have the same shape, just stack them
-        videos = np.stack([sample["video"] for sample in batch], axis=0)
-    
-    return {
-        "url": urls,
-        "caption": captions,
-        "video": videos,
-    }
-
-
-def get_default_collate(media_type="image"):
-    """Get the default collate function for a media type.
-    
-    Args:
-        media_type: Type of media ("image" or "video").
-        
-    Returns:
-        Collate function for the specified media type.
-    """
-    if media_type == "video":
-        return default_video_collate
-    else:  # Default to image
-        return default_image_collate
 
 
 def dataMapper(map: Dict[str, Any]):
@@ -833,14 +779,20 @@ def dataMapper(map: Dict[str, Any]):
     return _map
 
 
+# Sentinel the prefetch thread leaves behind when it stops, so a consumer
+# waiting on the batch queue hears about it now rather than in 60 seconds.
+_STREAM_END = object()
+
+
 class OnlineStreamingDataLoader:
     """Data loader for streaming media data from online sources.
 
     Repeat contract: this loader is an endless stream. The worker pool in
     `parallel_media_loader` walks its shards in a `while True` loop, reshuffling
     the dataset between passes, and `__next__` retries rather than stopping when
-    the queue is briefly empty - so iteration only ends by raising StopIteration
-    if the background loader thread has died. Callers bound training themselves
+    the queue is briefly empty - so iteration ends only once the background
+    loader thread is gone: StopIteration if it ran out, and the thread's own
+    exception if it failed. Callers bound training themselves
     (steps per epoch); `for batch in loader` never terminates on its own.
 
     Sharding is decided once, at construction: the dataset is sharded by
@@ -891,7 +843,8 @@ class OnlineStreamingDataLoader:
             global_process_count: Total number of processes.
             global_process_index: Index of this process.
             prefetch: Number of batches to prefetch.
-            collate_fn: Function to collate samples into batches.
+            collate_fn: Function to collate samples into batches. Defaults to
+                the data layer's collate for this media type.
             timeout: Timeout for fetching.
             retries: Number of retries for fetching.
             image_processor: Function to process images.
@@ -903,22 +856,24 @@ class OnlineStreamingDataLoader:
         """
         # Load dataset from path if needed
         if isinstance(dataset, str):
+            hf = _hf_datasets()
             dataset_path = dataset
             print(f"Loading dataset from path: {dataset_path}")
             if "gs://" in dataset:
-                dataset = load_from_disk(dataset_path)
+                dataset = hf.load_from_disk(dataset_path)
             else:
-                dataset = load_dataset(dataset_path, split=default_split)
+                dataset = hf.load_dataset(dataset_path, split=default_split)
         elif isinstance(dataset, list):
+            hf = _hf_datasets()
             if isinstance(dataset[0], str):
                 print("Loading multiple datasets from paths")
                 dataset = [
-                    load_from_disk(dataset_path) if "gs://" in dataset_path 
-                    else load_dataset(dataset_path, split=default_split) 
+                    hf.load_from_disk(dataset_path) if "gs://" in dataset_path 
+                    else hf.load_dataset(dataset_path, split=default_split) 
                     for dataset_path in dataset
                 ]
             print(f"Concatenating {len(dataset)} datasets")
-            dataset = concatenate_datasets(dataset)
+            dataset = hf.concatenate_datasets(dataset)
             dataset = dataset.shuffle(seed=0)
             
         # Shard dataset for distributed training
@@ -931,7 +886,13 @@ class OnlineStreamingDataLoader:
         
         # Choose default collate function if not provided
         if collate_fn is None:
-            collate_fn = get_default_collate(media_type)
+            # The data layer has one collate implementation; it lives next to
+            # the grain factories, which reach back into this module for the
+            # streaming loader, so the import goes here rather than at module
+            # scope.
+            from .dataloaders import generate_collate_fn
+
+            collate_fn = generate_collate_fn(media_type)
         
         # Create media batch iterator
         self.iterator = MediaBatchIterator(
@@ -960,20 +921,17 @@ class OnlineStreamingDataLoader:
 
         # Create batch queue for prefetching
         self.batch_queue = queue.Queue(prefetch)
-        
+        self._loader_error = None
+        self._stream_ended = False
+
         # Start batch loader thread
         def batch_loader():
             try:
                 for batch in self.iterator:
-                    try:
-                        if batch:
-                            self.batch_queue.put(collate_fn(batch))
-                    except Exception as e:
-                        print(f"Error collating batch: {e}")
-                        traceback.print_exc()
-            except Exception as e:
-                print(f"Error in batch loader thread: {e}")
-                traceback.print_exc()
+                    self.batch_queue.put(collate_fn(batch))
+            except Exception as error:
+                self._loader_error = error
+            self.batch_queue.put(_STREAM_END)
 
         self.loader_thread = threading.Thread(target=batch_loader, daemon=True)
         self.loader_thread.start()
@@ -984,13 +942,27 @@ class OnlineStreamingDataLoader:
 
     def __next__(self):
         """Get the next batch."""
-        try:
-            return self.batch_queue.get(timeout=60)  # Add timeout to prevent hanging
-        except queue.Empty:
-            if not self.loader_thread.is_alive():
-                raise StopIteration("Loader thread died")
-            print("Timeout waiting for batch, retrying...")
-            return self.__next__()
+        while True:
+            if self._stream_ended:
+                self._raise_stream_end()
+            try:
+                batch = self.batch_queue.get(timeout=60)
+            except queue.Empty:
+                if not self.loader_thread.is_alive():
+                    self._stream_ended = True
+                    self._raise_stream_end()
+                print("Timeout waiting for batch, retrying...")
+                continue
+            if batch is _STREAM_END:
+                self._stream_ended = True
+                self._raise_stream_end()
+            return batch
+
+    def _raise_stream_end(self):
+        """The batch loader is gone: hand on its exception, or stop."""
+        if self._loader_error is not None:
+            raise RuntimeError("the streaming data loader died") from self._loader_error
+        raise StopIteration
 
     def __len__(self):
         """Get the number of samples in the dataset."""
