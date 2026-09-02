@@ -16,6 +16,8 @@ from typing import Annotated, Any, Literal, Mapping, Optional, Self
 
 import tyro
 
+from dew.telemetry.instrumentation import default_compilation_cache_dir
+
 JsonDict = Annotated[
     dict[str, Any],
     tyro.constructors.PrimitiveConstructorSpec(
@@ -45,14 +47,17 @@ class ModelConfig:
 class DataConfig:
     """Which dataset, at what resolution, through which loader."""
 
-    dataset: str = "laiona_coco"
-    dataset_path: str = "/home/mrwhite0racle/gcs_mount"
+    dataset: str = "oxford_flowers102"
+    dataset_path: Optional[str] = None
+    """Root the dataset's source resolves its files against; TFDS datasets
+    ignore it and read from the TFDS data dir."""
     dataset_seed: int = 0
     batch_size: int = 32
     image_size: int = 128
     val_steps_per_epoch: int = 4
     loader: Literal["auto", "grain", "online"] = "auto"
-    """'auto' reads the dataset name: anything containing 'online' streams."""
+    """'auto' reads the registries: a name registered only for streaming
+    streams, anything else goes through grain."""
     augmentation_mode: Literal["none", "flip_only", "flip_jitter"] = "flip_jitter"
     worker_count: int = 32
     read_thread_count: int = 140
@@ -94,16 +99,29 @@ class TrainerConfig:
     checkpoint_every_steps: Optional[int] = None
     """Save a checkpoint every N global steps, not only at epoch boundaries."""
     distributed_training: bool = True
+    multi_host: bool = False
+    """Join the JAX process pool with jax.distributed.initialize(); failures
+    raise. Required on TPU pods and any other multi-process run."""
     fsdp_size: int = 1
     fsdp_min_param_size: Optional[int] = None
     ema_decay: float = 0.999
     best_tracker_metric: Optional[str] = None
     profile_steps: int = 0
-    compilation_cache_dir: Optional[str] = None
+    compilation_cache_dir: Optional[str] = dataclasses.field(
+        default_factory=default_compilation_cache_dir)
+    """Persisted XLA cache, so a restart skips recompiling the step. None
+    compiles from scratch every run."""
     log_every: int = 100
-    wandb_project: str = "mlops-msml605-project"
-    wandb_entity: str = "umd-projects"
+    wandb_project: Optional[str] = None
+    """Unset runs without wandb: nothing is logged and nothing is published."""
+    wandb_entity: Optional[str] = None
     wandb_offline: bool = False
+
+    def __post_init__(self):
+        if self.resume_last_run is not None and self.wandb_project is None:
+            raise ValueError(
+                "resume_last_run is a wandb run id and needs wandb_project set "
+                "to resolve it")
 
 
 def _rebuild(cls, values: Mapping[str, Any]):

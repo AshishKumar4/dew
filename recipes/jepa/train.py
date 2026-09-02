@@ -47,8 +47,7 @@ class JepaRunConfig(RunConfig):
 
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
-    data: DataConfig = field(
-        default_factory=lambda: DataConfig(dataset="oxford_flowers102", batch_size=64))
+    data: DataConfig = field(default_factory=lambda: DataConfig(batch_size=64))
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             learning_rate=1e-3, learning_rate_peak=1.5e-3, learning_rate_end=1e-6))
@@ -104,7 +103,8 @@ def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
 
 
 def main(config: JepaRunConfig) -> ObjectiveTrainer:
-    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline)
+    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
+                    config.trainer.multi_host)
 
     checkpoint_dir = config.trainer.checkpoint_dir
     if config.trainer.checkpoint_fs == 'gcs':
@@ -167,23 +167,25 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
         f"lr-{config.optim.learning_rate}/date-{datetime.now().strftime('%Y-%m-%d_%H:%M:%S')}")
     print("Experiment_Name:", name)
 
-    wandb_config: dict[str, Any] = {
-        "project": config.trainer.wandb_project,
-        "entity": config.trainer.wandb_entity,
-        "name": name,
-        "config": {
-            "encoder": encoder_config,
-            "predictor": predictor_config,
-            "architecture": architecture,
-            "mask": {"grid": grid, "block_shapes": mask.block_shapes,
-                     "block_area": mask.block_area, "num_context": mask.num_context},
-            "dataset": {"name": config.data.dataset, "length": data['train_len']},
-            "arguments": run_summary(config, encoder_config),
-            "run_config": config.to_dict(),
-        },
-    }
-    if config.trainer.resume_last_run is not None:
-        wandb_config['id'] = config.trainer.resume_last_run
+    wandb_config: Optional[dict[str, Any]] = None
+    if config.trainer.wandb_project is not None:
+        wandb_config = {
+            "project": config.trainer.wandb_project,
+            "entity": config.trainer.wandb_entity,
+            "name": name,
+            "config": {
+                "encoder": encoder_config,
+                "predictor": predictor_config,
+                "architecture": architecture,
+                "mask": {"grid": grid, "block_shapes": mask.block_shapes,
+                         "block_area": mask.block_area, "num_context": mask.num_context},
+                "dataset": {"name": config.data.dataset, "length": data['train_len']},
+                "arguments": run_summary(config, encoder_config),
+                "run_config": config.to_dict(),
+            },
+        }
+        if config.trainer.resume_last_run is not None:
+            wandb_config['id'] = config.trainer.resume_last_run
 
     trainer = ObjectiveTrainer(
         model=encoder,

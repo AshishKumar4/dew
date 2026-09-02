@@ -30,6 +30,8 @@ Loss health is watched on device: a non-finite streak counter rides along with t
 
 `shard_batch(sharding, batch)` assembles this process's slice of each array into a globally sharded array with `jax.make_array_from_process_local_data`, which is what makes the multi-host case identical to the single-host one.
 
+A multi-process run has to join the process pool before any of that: `--trainer.multi-host` is what makes a recipe call `jax.distributed.initialize()`, and a failure to join stops the run rather than training one process on a slice of the data and calling it a full run.
+
 `DevicePrefetchIterator(iterator, sharding, depth=2)` runs that transfer a few batches ahead of the loop on a background thread. Without it the host-to-device copy sits on the critical path, because the loop only starts moving batch N+1 after step N has been dispatched. Exceptions raised in the thread are re-raised on the consumer's side rather than swallowed.
 
 If the underlying iterator can report a position (grain's can), the prefetcher tracks the position of the batch it most recently handed out, not the one the thread has raced ahead to. That is what makes a mid-epoch resume land on the next unseen batch.
@@ -45,5 +47,7 @@ Restoring builds a template from the freshly initialized state, so shapes, dtype
 ## Throughput
 
 `dew.telemetry.instrumentation` measures rather than estimates. `step_flops(jitted, *args)` asks the compiler for the cost analysis of the compiled step. `model_flops_utilization(flops_per_step, step_time, device_count)` turns that into a fraction of peak using a small table of vendor dense bf16 numbers; hardware that is not in the table reports nothing rather than a made-up number. `enable_compilation_cache(path)` persists compiled executables so a restart skips XLA compilation.
+
+That cache is on by default: `--trainer.compilation-cache-dir` starts at `default_compilation_cache_dir()` (`$XDG_CACHE_HOME/dew/xla`, or `~/.cache/dew/xla`), and `--trainer.compilation-cache-dir None` turns it off. On a DiT-B it takes the time to the first step from 55s to 5s and leaves the step itself alone.
 
 The trainer logs `train/samples_per_sec` and the MFU it could compute alongside the loss, on the same logging cadence.

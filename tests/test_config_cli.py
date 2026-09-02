@@ -1,23 +1,29 @@
 """The typed run config: serialization, CLI parsing, and what reaches the trainer."""
 
+import collections
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 import tyro
 
 from dew.config import DataConfig, ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data.dataloaders import load_data
+from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
+from dew.inputs.encoders import ConditioningEncoder
 from dew.registry import build_model
-from dew.training import build_optimizer
+from dew.training import build_optimizer, prepare_process
 
 RECIPES = Path(__file__).resolve().parents[1] / "recipes"
 RES = 32
 PATCH = 4
+TOKENS = 5
 
 
 def load_recipe(name: str):
@@ -124,7 +130,7 @@ def test_grad_accum_steps_wraps_the_optimizer_and_reaches_the_trainer(tmp_path, 
         data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
         optim=OptimConfig(learning_rate=1e-3, grad_accum_steps=2),
         trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path)),
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
         predictor={"predictor_features": 8, "num_layers": 1, "num_heads": 2},
     ))
 
@@ -274,3 +280,181 @@ def test_load_data_dispatches_over_the_registries(monkeypatch):
     calls.clear()
     load_data(DataConfig(dataset="voxceleb2", loader="auto"))
     assert calls[0][0] == "media"
+
+
+# --- what a run does when nothing is configured ---------------------------
+
+def test_compilation_cache_dir_defaults_into_the_cache_home(tmp_path, monkeypatch):
+    """The cache is worth ~50s of the ~55s time-to-first-step on a DiT-B and
+    changes nothing about the step, so it is on unless a run says otherwise."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert TrainerConfig().compilation_cache_dir == str(tmp_path / "dew" / "xla")
+
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert TrainerConfig().compilation_cache_dir == str(Path.home() / ".cache/dew/xla")
+
+    off = tyro.cli(RunConfig, args=["--trainer.compilation-cache-dir", "None"])
+    assert off.trainer.compilation_cache_dir is None
+
+
+def test_defaults_name_no_person_and_no_course_project(monkeypatch):
+    """The library's defaults used to be one laptop's bucket mount and one
+    course project's wandb team, so a fresh clone trained on neither."""
+    # The cache dir is the one default read from the environment, and every
+    # path this machine offers has the username in it; pin it to a neutral one
+    # so the check is about the config rather than about who is logged in.
+    monkeypatch.setenv("XDG_CACHE_HOME", "/tmp/xdg-cache-home")
+    configs = [RunConfig(),
+               load_recipe("diffusion").DiffusionRunConfig(),
+               load_recipe("jepa").JepaRunConfig()]
+
+    for config in configs:
+        recorded = json.dumps(config.to_dict())
+        for personal in ("mrwhite0racle", "umd-projects", "msml605"):
+            assert personal not in recorded
+
+    assert DataConfig().dataset == "oxford_flowers102"
+    assert DataConfig().dataset_path is None
+    assert TrainerConfig().wandb_project is None
+    assert TrainerConfig().wandb_entity is None
+
+
+def test_resume_last_run_without_a_project_is_an_error():
+    """It is a wandb run id: with no project there is nothing to resume, and
+    the run used to start over from step 0 instead of saying so."""
+    with pytest.raises(ValueError, match="wandb_project"):
+        TrainerConfig(resume_last_run="9xk2p1")
+
+    resumed = TrainerConfig(resume_last_run="9xk2p1", wandb_project="dew")
+    assert resumed.resume_last_run == "9xk2p1"
+
+
+def test_prepare_process_joins_the_process_pool_only_when_asked(monkeypatch):
+    """A pod run whose initialize() failed used to keep going on one process:
+    a slice of the devices over a slice of the data, reported as a full run."""
+    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "unset")
+    joins = []
+    monkeypatch.setattr(jax.distributed, "initialize", lambda *a, **k: joins.append(a))
+
+    prepare_process("flip_only")
+    assert joins == []
+    assert os.environ["FLAXDIFF_AUGMENT_MODE"] == "flip_only"
+
+    prepare_process("flip_only", multi_host=True)
+    assert len(joins) == 1
+
+    def refuse(*args, **kwargs):
+        raise ValueError("coordinator_address should be defined.")
+
+    monkeypatch.setattr(jax.distributed, "initialize", refuse)
+    with pytest.raises(ValueError, match="coordinator_address"):
+        prepare_process("flip_only", multi_host=True)
+
+
+TOKENIZED = []
+
+
+class StubTextEncoder(ConditioningEncoder):
+    """A text encoder shaped like the CLIP one, with nothing to download."""
+
+    @property
+    def key(self):
+        return "text"
+
+    def tokenize(self, prompts):
+        TOKENIZED.append(list(prompts))
+        # A transformers tokenizer hands back a UserDict, which jax.tree counts
+        # as a single leaf
+        return collections.UserDict({
+            "input_ids": np.zeros((len(prompts), TOKENS), np.int32),
+            "attention_mask": np.ones((len(prompts), TOKENS), np.int32),
+        })
+
+    def encode_from_tokens(self, tokens):
+        return jnp.zeros((len(tokens["input_ids"]), TOKENS, 8), jnp.float32)
+
+    def serialize(self):
+        return {"modelname": self.model}
+
+    @staticmethod
+    def deserialize(serialized_config):
+        return StubTextEncoder(model=serialized_config["modelname"], tokenizer=None)
+
+
+def stub_input_config(config):
+    """build_input_config without CLIP-L/14's weights."""
+    return DiffusionInputConfig(
+        sample_data_key='image',
+        sample_data_shape=(config.data.image_size, config.data.image_size, 3),
+        conditions=[ConditionalInputConfig(
+            encoder=StubTextEncoder(model="stub", tokenizer=None),
+            conditioning_data_key='text',
+            pretokenized=True,
+            unconditional_input="",
+            model_key_override="textcontext",
+        )],
+    )
+
+
+def fake_captioned_dataset(*args, **kwargs):
+    def batches():
+        rs = np.random.RandomState(0)
+        while True:
+            yield {"image": jnp.asarray(rs.uniform(0, 255, (4, RES, RES, 3))),
+                   "text": {"input_ids": np.zeros((4, TOKENS), np.int32),
+                            "attention_mask": np.ones((4, TOKENS), np.int32)}}
+    return {"train": batches, "val": batches, "train_len": 16,
+            "local_batch_size": 4, "global_batch_size": 4}
+
+
+def test_validation_prompts_feed_fixed_caption_batches(tmp_path):
+    diffusion = load_recipe("diffusion")
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("a water lily\n\n a photo of a rose\n")
+
+    batch_source, count = diffusion.validation_prompt_batches(
+        str(prompts), StubTextEncoder(model="stub", tokenizer=None),
+        batch_size=4, steps=2)
+    batches = list(batch_source())
+
+    assert count == 2
+    # A short list wraps: val_steps_per_epoch always has batches to score
+    assert len(batches) == 2
+    assert batches[0]["text"]["input_ids"].shape == (4, TOKENS)
+    # Tokens have to arrive as arrays, or shard_batch cannot place them
+    assert len(jax.tree.leaves(batches[0])) == 2
+
+    empty = tmp_path / "empty.txt"
+    empty.write_text("\n \n")
+    with pytest.raises(ValueError, match="No prompts"):
+        diffusion.validation_prompt_batches(
+            str(empty), StubTextEncoder(model="stub", tokenizer=None), 4, 2)
+
+
+def test_diffusion_entrypoint_runs_without_wandb(tmp_path, monkeypatch):
+    """The recipe end to end with no wandb project: nothing is logged, and
+    validation samples the prompt file rather than a machine-local pickle."""
+    diffusion = load_recipe("diffusion")
+    monkeypatch.setattr(diffusion, "load_data", fake_captioned_dataset)
+    monkeypatch.setattr(diffusion, "build_input_config", stub_input_config)
+    TOKENIZED.clear()
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("a water lily\na photo of a rose\n")
+
+    trainer = diffusion.main(diffusion.DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {
+            "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
+            "mlp_ratio": 1,
+        }),
+        data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
+        trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
+        val_metrics=[],
+        validation_prompts=str(prompts),
+    ))
+
+    assert trainer.wandb is None
+    assert trainer.state.step == 2
+    # The prompt file, wrapped to the batch size, reached the sampler on both
+    # the sanity pass and the epoch-end one
+    assert TOKENIZED.count(["a water lily", "a photo of a rose"] * 2) == 2
