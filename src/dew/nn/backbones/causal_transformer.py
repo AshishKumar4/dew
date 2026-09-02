@@ -351,12 +351,7 @@ class CausalTransformer(nn.Module):
                 precision=self.precision, name='lm_head')
 
     def __call__(self, tokens, train: bool = False, decode: bool = False):
-        x = self.embed_tokens(tokens)
-        if self.embedding_scale:
-            x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
-        for layer in self.layers:
-            x = layer(x, train=train, decode=decode)
-        x = self.norm(x)
+        x = self.hidden_states(tokens, train=train, decode=decode)
 
         # fp32 head, as in the DiT output projection: the loss is computed in fp32
         if self.tie_embeddings:
@@ -371,6 +366,33 @@ class CausalTransformer(nn.Module):
             cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
             logits = cap * jnp.tanh(logits / cap)
         return logits
+
+    def hidden_states(self, tokens, train: bool = False, decode: bool = False):
+        """The final normalised states, `[B, S, D]`: everything the forward
+        pass does before the head projection.
+
+        A loss that pairs this with `head_weight` scores tokens without ever
+        holding the full `[B, S, vocab]` logits tensor.
+        """
+        x = self.embed_tokens(tokens)
+        if self.embedding_scale:
+            x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
+        for layer in self.layers:
+            x = layer(x, train=train, decode=decode)
+        return self.norm(x)
+
+    def head_weight(self, params):
+        """The `[D, vocab]` head matrix in fp32, as the forward multiplies it.
+
+        `params` is the parameter tree the forward runs under, so this is a
+        plain read: a tied head is the embedding table transposed, an untied
+        one is `lm_head`'s kernel, which is `[D, vocab]` already. The Gemma
+        embedding scale multiplies the input embeddings only, so it has no
+        place here.
+        """
+        if self.tie_embeddings:
+            return params['embed_tokens']['embedding'].astype(jnp.float32).T
+        return params['lm_head']['kernel'].astype(jnp.float32)
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
