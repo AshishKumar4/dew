@@ -285,6 +285,81 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
 
 
+def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
+    """The point of chunking, read off the optimized HLO.
+
+    The vocabulary here is 512 wide over 16 tokens, and the head is 32 wide,
+    so a `[tokens, vocab]` tensor is unmistakable in the text. The
+    full-vocabulary loss below is compiled too: it is what makes this grep a
+    test rather than a string that happens not to appear.
+    """
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    vocab, batch, seq = 512, 2, 8
+    model = CausalTransformer(vocab_size=vocab, emb_features=32, num_layers=1,
+                              num_heads=4, mlp_ratio=2, max_seq_len=16,
+                              dtype=jnp.bfloat16)
+    objective = LMObjective(model, seq, vocab_size=vocab, head_chunks=4)
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens = jnp.zeros((batch, seq + 1), jnp.int32)
+    batch_dict = {TEXT_KEY: tokens}
+
+    def chunked(p):
+        return objective.loss(p, p, batch_dict, jax.random.PRNGKey(0), 0)
+
+    def full_vocabulary(p):
+        logits = model.apply(p, tokens[:, :-1])
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+        correct = (jnp.argmax(logits, axis=-1) == tokens[:, 1:]).astype(losses.dtype)
+        return jnp.mean(losses), {"token_accuracy": jnp.mean(correct)}
+
+    def compiled_text(loss_fn):
+        return jax.jit(jax.value_and_grad(loss_fn, has_aux=True)).lower(
+            params).compile().as_text()
+
+    whole_row = (f"f32[{batch * seq},{vocab}]", f"f32[{batch},{seq},{vocab}]")
+    chunked_text, full_text = compiled_text(chunked), compiled_text(full_vocabulary)
+
+    assert any(shape in full_text for shape in whole_row), (
+        "the full-vocabulary step lost its logits tensor, so this grep proves nothing")
+    assert not any(shape in chunked_text for shape in whole_row)
+    assert f"f32[{batch * seq},{vocab // 4}]" in chunked_text, "no chunk tile either"
+
+    reduced_over_the_vocabulary = [
+        line for line in chunked_text.splitlines()
+        if ("reduce" in line and f",{vocab}]" in line)]
+    assert reduced_over_the_vocabulary == []
+
+
+def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
+    """The frozen metric, against the implementation it replaced."""
+    objective = make_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    batch = token_batch()
+    targets = np.asarray(batch[TEXT_KEY][:, 1:])
+
+    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+
+    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
+    expected = (np.argmax(np.asarray(logits), axis=-1) == targets).mean()
+    assert float(aux["token_accuracy"]) == pytest.approx(expected)
+
+
+def test_padded_tokens_are_left_out_of_the_accuracy_too():
+    objective = make_objective(pad_id=0)
+    params = objective.init_params(jax.random.PRNGKey(0))
+    batch = token_batch(seed=3)
+    targets = np.asarray(batch[TEXT_KEY][:, 1:])
+    assert (targets == 0).any(), "this batch has no padding to skip"
+
+    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+
+    logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
+    kept = targets != 0
+    expected = ((np.argmax(logits, axis=-1) == targets) & kept).sum() / kept.sum()
+    assert float(aux["token_accuracy"]) == pytest.approx(expected)
+
+
 # --- what the trainer needs ------------------------------------------------
 
 def test_input_shapes_declare_one_int32_token_sequence():
