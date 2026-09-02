@@ -3,21 +3,23 @@
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
   <img src="docs/assets/banner-light.svg" alt="dew" width="360">
 </picture>
+
+<h1>Dew: a general training framework for JAX and Flax</h1>
+
+<a href="https://github.com/AshishKumar4/dew/actions/workflows/ci.yml"><img src="https://github.com/AshishKumar4/dew/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB" alt="Python 3.11+"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2aa7a1" alt="MIT"></a>
+
+<p>
+<a href="#diffusion"><b>Diffusion</b></a>
+| <a href="#jepa"><b>JEPA</b></a>
+| <a href="#language-models"><b>Language models</b></a>
+| <a href="#objectives"><b>Objectives</b></a>
+| <a href="#scaling"><b>Scaling</b></a>
+| <a href="#installation"><b>Install guide</b></a>
+| <a href="docs/index.md"><b>Documentation</b></a>
+</p>
 </div>
-
-# Dew: a general training framework for JAX and Flax
-
-[![CI](https://github.com/AshishKumar4/dew/actions/workflows/ci.yml/badge.svg)](https://github.com/AshishKumar4/dew/actions/workflows/ci.yml)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB)](pyproject.toml)
-[![MIT](https://img.shields.io/badge/license-MIT-2aa7a1)](LICENSE)
-
-[**Diffusion**](#diffusion)
-| [**JEPA**](#jepa)
-| [**Language models**](#language-models)
-| [**Objectives**](#objectives)
-| [**Scaling**](#scaling)
-| [**Install guide**](#installation)
-| [**Documentation**](docs/index.md)
 
 ## What is Dew?
 
