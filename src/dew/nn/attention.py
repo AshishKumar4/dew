@@ -97,12 +97,13 @@ def open_kv_cache(module: nn.Module, key, max_seq_len):
 def cudnn_supports(query, key) -> Optional[str]:
     """Why the fused cudnn kernel cannot take this call, or None if it can.
 
-    One rule, and it only bites while training: cudnn's flash kernel has no
-    backward pass for an odd query or key length, and jax raises
-    NotImplementedError from inside the gradient. The forward pass takes any
-    length, so a sampling-only trace would get away with it and the first
-    training step would not. 77 CLIP text tokens are odd, which is every
-    cross-attention call in this repo.
+    One rule: cudnn's flash kernel has no backward pass for an odd query or
+    key length, and jax raises NotImplementedError from inside the gradient.
+    The check sees shapes, not the trace, so every call of an odd length is
+    refused, forward-only ones included: single-token decode has q_len 1 and
+    leaves cudnn for xla, which costs the fused kernel's speed and changes no
+    numbers (both run the softmax in fp32). 77 CLIP text tokens are odd,
+    which is every cross-attention call in this repo.
 
     The other cudnn limits (head_dim a multiple of 8 and at most 128 before
     Hopper) fail the forward pass too, so they cannot silently ruin a run and
@@ -128,7 +129,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
-    - 'auto': on a gpu backend 'cudnn' for the shapes cudnn can train and
+    - 'auto': on a gpu backend 'cudnn' for the shapes cudnn supports and
       'xla' for the rest (`cudnn_supports`), 'xla' anywhere else. Resolved per
       trace, so a config logged as 'auto' still runs on the next machine, and
       per call, since one model can hold both a shape cudnn takes and a shape

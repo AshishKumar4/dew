@@ -58,7 +58,7 @@ out of jax. 77 CLIP text tokens are odd, and so is 256+77 concatenated.
 Before this wave `attention_impl='auto'` meant plain cudnn on a GPU, so six
 of the twelve architectures in the small preset could not train on this card
 at their default settings. `'auto'` now picks cudnn only for the shapes
-cudnn can train and xla for the rest (`dew.nn.attention.cudnn_supports`),
+cudnn supports and xla for the rest (`dew.nn.attention.cudnn_supports`),
 per call rather than per run, since one model holds both kinds of shape.
 Explicit `'cudnn'` still raises: a run that names a kernel gets that kernel.
 
@@ -81,6 +81,12 @@ which is the price of training at all. It changes no numbers: a fixed-seed
 20-step loss trajectory under `'auto'` is bitwise identical to the same run
 under the kernel 'auto' selected, both for a rerouted model (simple_mmdit,
 max delta 0.0) and for one that stays on cudnn (simple_dit, max delta 0.0).
+
+The rule reads shapes, so it applies to a forward-only call as well. Decode
+asks for one query position at a time, so sampling from a language model
+runs on xla where it used to run on cudnn. Both kernels accumulate the
+logits and run the softmax in fp32, so the samples are the same; the speed
+of that path was not measured.
 
 ## XLA flags
 

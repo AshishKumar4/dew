@@ -511,7 +511,7 @@ On a TPU pod or any multi-process run, every host runs the same script. The reci
 
 Checkpoints are written asynchronously with Orbax. The latest checkpoint and the best checkpoint by validation loss are both kept. The position of the data iterator is saved with them, so a resumed run continues from the next unseen batch. `checkpoint_every_steps` adds a fixed cadence between epoch boundaries.
 
-Models compute in bf16 with fp32 parameters by default in the recipes, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"` picks cuDNN on GPUs). On an RTX 4080, a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory.
+Models compute in bf16 with fp32 parameters by default in the recipes, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"` picks cuDNN on a GPU for the shapes cuDNN supports and XLA for the rest). On an RTX 4080, a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory.
 
 | Setting | Recipe flag |
 |---|---|
