@@ -10,6 +10,7 @@ from flax import struct                # Flax dataclasses
 import time
 import os
 import orbax.checkpoint as ocp
+from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
 from typing import Dict, Callable, Any, Tuple, Optional
@@ -45,10 +46,12 @@ class SimpleTrainState(train_state.TrainState):
     metrics: Metrics
     dynamic_scale: dynamic_scale_lib.DynamicScale
 
+def _epoch_loss(metrics):
+    return metrics['loss']
+
 @dataclass
 class SimpleTrainer:
     state: SimpleTrainState
-    best_state: Any
     best_loss: float
     model: nn.Module
     ema_decay: float = 0.999
@@ -151,10 +154,19 @@ class SimpleTrainer:
                 self.wandb_sweep = api.sweep(f"{self.wandb.entity}/{self.wandb.project}/{self.wandb.sweep_id}")
                 print(f"Running sweep {self.wandb_sweep.id} with id {self.wandb.sweep_id}")
             
-        # checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        # The latest few steps so a resume has something recent, plus the one
+        # step with the lowest epoch loss. BestN reads `reverse=True` as
+        # "smallest metric wins"; best_fn is what writes the metric into the
+        # step directory, so best_step() still resolves on a reopened manager.
         options = ocp.CheckpointManagerOptions(
-            max_to_keep=max_checkpoints_to_keep, create=True,
-            enable_async_checkpointing=True)
+            preservation_policy=preservation.AnyPreservationPolicy([
+                preservation.LatestN(n=max_checkpoints_to_keep),
+                preservation.BestN(get_metric_fn=_epoch_loss, n=1,
+                                   keep_checkpoints_without_metrics=False,
+                                   reverse=True),
+            ]),
+            best_fn=_epoch_loss, best_mode='min',
+            create=True, enable_async_checkpointing=True)
         self.checkpointer = ocp.CheckpointManager(self.checkpoint_path(), options=options)
 
         self.rngstate = RandomMarkovState(rngs)
@@ -166,9 +178,6 @@ class SimpleTrainer:
         else:
             self.state = train_state
             self.state_sharding = jax.tree.map(lambda x: x.sharding, train_state)
-        # Host-side copy: aliasing a live train state here would pin its buffers
-        # and block donating them to the training step.
-        self.best_state = self.get_np_tree(self.state)
         # Position of the data iterator, carried through checkpoints so a resume
         # continues mid-epoch instead of replaying from the top.
         self.dataset_state = None
@@ -222,9 +231,6 @@ class SimpleTrainer:
     def get_state(self):
         return self.get_np_tree(self.state)
 
-    def get_best_state(self):
-        return self.best_state
-
     def get_rngstate(self):
         return self.get_np_tree(self.rngstate)
 
@@ -247,15 +253,14 @@ class SimpleTrainer:
         Restoring untyped used to silently discard opt_state and reset the step
         counter (and with it the lr schedule) on every resume.
 
-        The template must name exactly the keys the checkpoint holds: asking for
-        one it lacks is an error, and checkpoints predating iterator tracking -
-        or written from an iterator that cannot report a position - have no
-        dataset_state.
+        The template names only the keys this run restores. Checkpoints
+        predating iterator tracking - or written from an iterator that cannot
+        report a position - have no dataset_state; older ones carry a second
+        train state under 'best_state', which nothing here reads.
         """
         template = {
             'rngs': self.get_rngstate(),
             'state': jax.eval_shape(lambda: self.state),
-            'best_state': self.best_state,
             'best_loss': np.array(self.best_loss),
             'epoch': 0,
         }
@@ -284,11 +289,12 @@ class SimpleTrainer:
 
         target = checkpoint_path if load_directly_from_dir else step
         template, restore_args = self._checkpoint_template(manager.item_metadata(target).keys())
-        ckpt = manager.restore(
-            target, args=ocp.args.PyTreeRestore(item=template, restore_args=restore_args))
+        # partial_restore: a key the checkpoint holds and the template does not
+        # is skipped instead of refused.
+        ckpt = manager.restore(target, args=ocp.args.PyTreeRestore(
+            item=template, restore_args=restore_args, partial_restore=True))
 
         self.state = ckpt['state']
-        self.best_state = ckpt['best_state']
         self.rngstate = ckpt['rngs']
         stored_position = ckpt.get('dataset_state')
         self.dataset_state = (
@@ -301,7 +307,7 @@ class SimpleTrainer:
         print(f"Loaded model from checkpoint at step {step}", self.best_loss)
         return step
 
-    def save(self, epoch=0, step=0, state=None, rngstate=None):
+    def save(self, epoch=0, step=0, state=None, rngstate=None, metrics=None):
         print(f"Saving model at epoch {epoch} step {step}")
         # Sharded arrays go straight to orbax: gathering them onto the host
         # first would serialise the whole state through one process and undo
@@ -309,7 +315,6 @@ class SimpleTrainer:
         ckpt = {
             'rngs': self.get_rngstate() if rngstate is None else self.get_np_tree(rngstate),
             'state': self.state if state is None else state,
-            'best_state': self.best_state,
             'best_loss': np.array(self.best_loss),
             'epoch': epoch,
         }
@@ -321,7 +326,9 @@ class SimpleTrainer:
         # loss, and printing it while the run carries on hides exactly that.
         # The write is async, so a failure inside it surfaces from
         # wait_for_checkpoints() rather than here.
-        self.checkpointer.save(step, args=ocp.args.PyTreeSave(ckpt), force=True)
+        # A save with no metric cannot become the best checkpoint.
+        self.checkpointer.save(step, args=ocp.args.PyTreeSave(ckpt), metrics=metrics,
+                               force=True)
         self.last_saved_step = step
 
     def _define_train_step(self, **kwargs):
@@ -600,11 +607,10 @@ class SimpleTrainer:
                 )
                 print(colored(f"Validation done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
             
-            avg_loss = epoch_loss / train_steps_per_epoch
+            avg_loss = float(epoch_loss / train_steps_per_epoch)
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
-                self.best_state = self.get_np_tree(train_state)
-                self.save(current_epoch, current_step)
+                self.save(current_epoch, current_step, metrics={'loss': avg_loss})
                 
             if process_index == 0:
                 if self.wandb is not None:

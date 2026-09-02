@@ -34,7 +34,6 @@ class InferencePipeline:
     name: str = None
     model: nn.Module = None
     state: SimpleTrainState = None
-    best_state: SimpleTrainState = None
 
 @dataclass
 class DiffusionInferencePipeline(InferencePipeline):
@@ -45,7 +44,6 @@ class DiffusionInferencePipeline(InferencePipeline):
     """
     artifact: Any = None
     state: TrainState = None
-    best_state: TrainState = None
     rngstate: Optional[RandomMarkovState] = None
     noise_schedule: NoiseScheduler = None
     model_output_transform: DiffusionPredictionTransform = None
@@ -75,23 +73,21 @@ class DiffusionInferencePipeline(InferencePipeline):
         Returns:
             DiffusionInferencePipeline instance
         """
-        states, config, run, artifact = load_from_wandb_run(
+        state, config, run, artifact = load_from_wandb_run(
             wandb_run,
             project=project,
             entity=entity,
         )
-            
-        if states is None:
+
+        if state is None:
             raise ValueError("Failed to load model parameters from wandb.")
-        
-        state, best_state = states
+
         parsed_config = parse_config(config)
-        
+
         # Create the pipeline
         pipeline = cls.create(
             config=parsed_config,
             state=state,
-            best_state=best_state,
             rngstate=RandomMarkovState(jax.random.PRNGKey(42)),
             run=run,
             artifact=artifact,
@@ -119,25 +115,23 @@ class DiffusionInferencePipeline(InferencePipeline):
         Returns:
             DiffusionInferencePipeline instance
         """
-        states, config, run, artifact = load_from_wandb_registry(
+        state, config, run, artifact = load_from_wandb_registry(
             modelname=modelname,
             project=project,
             entity=entity,
             version=version,
             registry=registry,
         )
-        
-        if states is None:
+
+        if state is None:
             raise ValueError("Failed to load model parameters from wandb.")
-        
-        state, best_state = states
+
         parsed_config = parse_config(config)
-        
+
         # Create the pipeline
         pipeline = cls.create(
             config=parsed_config,
             state=state,
-            best_state=best_state,
             rngstate=RandomMarkovState(jax.random.PRNGKey(42)),
             run=run,
             artifact=artifact,
@@ -149,7 +143,6 @@ class DiffusionInferencePipeline(InferencePipeline):
         cls,
         config: Dict[str, Any],
         state: Dict[str, Any],
-        best_state: Optional[Dict[str, Any]] = None,
         rngstate: Optional[RandomMarkovState] = None,
         run=None,
         artifact=None,
@@ -162,7 +155,6 @@ class DiffusionInferencePipeline(InferencePipeline):
             artifact=artifact,
             model=config['model'],
             state=state,
-            best_state=best_state,
             rngstate=rngstate,
             noise_schedule=config['noise_schedule'],
             model_output_transform=config['prediction_transform'],
@@ -227,7 +219,6 @@ class DiffusionInferencePipeline(InferencePipeline):
         end_step: int = 0,
         steps_override=None,
         priors=None,
-        use_best_params: bool = False,
         use_ema: bool = False,
     ):
         # Setup RNG
@@ -240,17 +231,11 @@ class DiffusionInferencePipeline(InferencePipeline):
         )
         print(f"Generating samples: steps={diffusion_steps}, num_samples={num_samples}, guidance={guidance_scale}")
         
-        if use_best_params:
-            state = self.best_state
-        else:
-            state = self.state
-            
         if use_ema:
-            params = state['ema_params']
+            params = self.state['ema_params']
         else:
-            params = state['params']
-            
-             
+            params = self.state['params']
+
         return sampler.generate_samples(
             params=params,
             num_samples=num_samples,

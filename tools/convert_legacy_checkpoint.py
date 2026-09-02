@@ -68,10 +68,13 @@ def main():
     print(f"Converting checkpoint at step {step} from {checkpoint_dir}")
     ckpt = manager.restore(step)
 
-    for key in ('state', 'best_state'):
-        if key in ckpt and ckpt[key] is not None:
-            ckpt[key] = convert_state(ckpt[key])
-            print(f"Converted {key}")
+    # An older checkpoint holds a second train state under 'best_state'; the
+    # converted one keeps a single state and lets orbax retention name the
+    # best step.
+    ckpt.pop('best_state', None)
+    if ckpt.get('state') is not None:
+        ckpt['state'] = convert_state(ckpt['state'])
+        print("Converted state")
 
     out_manager = orbax.checkpoint.CheckpointManager(
         output_dir, orbax.checkpoint.PyTreeCheckpointer(),

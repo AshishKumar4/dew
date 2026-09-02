@@ -516,10 +516,11 @@ class ObjectiveTrainer(SimpleTrainer):
 
         return False, False
             
-    def save(self, epoch=0, step=0, state=None, rngstate=None):
+    def save(self, epoch=0, step=0, state=None, rngstate=None, metrics=None):
         # Persistence first and unguarded: if the checkpoint did not land, the
         # run has to hear about it.
-        super().save(epoch=epoch, step=step, state=state, rngstate=rngstate)
+        super().save(epoch=epoch, step=step, state=state, rngstate=rngstate,
+                     metrics=metrics)
 
         if self.wandb is None:
             return
@@ -543,7 +544,9 @@ class ObjectiveTrainer(SimpleTrainer):
             self.push_to_registry(aliases=aliases)
             print("Model pushed to registry successfully with aliases:", aliases)
             # Only delete after a successful registry push - the local
-            # checkpoint is the only copy otherwise
+            # checkpoint is the only copy otherwise. Every pushed step is
+            # deleted, including the best one, so with a registry configured
+            # the artifact versions are the retention, not the local store.
             shutil.rmtree(checkpoint, ignore_errors=True)
             print(f"Checkpoint deleted at {checkpoint}")
         except Exception as e:

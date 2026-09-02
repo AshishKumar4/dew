@@ -3,9 +3,12 @@ import jax.numpy as jnp
 import json
 import os
 import warnings
+from typing import Literal
 
 import wandb
-from orbax.checkpoint import CheckpointManager, CheckpointManagerOptions, PyTreeCheckpointer
+from orbax.checkpoint import (
+    CheckpointManager, CheckpointManagerOptions, PyTreeCheckpointHandler,
+)
 
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model, canonicalize_architecture, map_config_strings
@@ -142,23 +145,53 @@ def parse_config(config, overrides=None):
     
     return result
 
+def _epoch_loss(metrics):
+    return metrics['loss']
+
 def load_from_checkpoint(
     checkpoint_dir: str,
+    step: int | Literal['latest', 'best'] = 'latest',
 ):
-    """Restore (state, best_state) from a single orbax checkpoint directory.
+    """Restore one train state from an orbax checkpoint directory.
+
+    `checkpoint_dir` is either a manager directory holding step
+    subdirectories or a single step directory, which is what an unpacked
+    wandb artifact is.
+
+    'best' is the step whose epoch loss was the lowest of those recorded.
+    Checkpoints that record no loss carry their own copy of the best state,
+    and that copy is what 'best' means for them.
 
     Raises if the checkpoint cannot be read: the callers below decide what a
-    failed load means, and reporting it as an empty pair made an unusable
+    failed load means, and reporting it as an empty state made an unusable
     pipeline look like a successful one.
     """
-    checkpointer = PyTreeCheckpointer()
-    options = CheckpointManagerOptions(create=False)
-    # Convert checkpoint_dir to absolute path
     checkpoint_dir = os.path.abspath(checkpoint_dir)
-    manager = CheckpointManager(checkpoint_dir, checkpointer, options)
-    ckpt = manager.restore(checkpoint_dir)
+    manager = CheckpointManager(
+        checkpoint_dir,
+        options=CheckpointManagerOptions(
+            create=False, best_fn=_epoch_loss, best_mode='min'),
+        item_handlers=PyTreeCheckpointHandler())
+    steps = manager.all_steps()
+    # A single step directory is its own restore target.
+    latest = manager.latest_step() if steps else checkpoint_dir
+
+    if step == 'best':
+        best = manager.best_step() if steps else None
+        if best is not None:
+            print(f"Loading best checkpoint (step {best}) from {checkpoint_dir}")
+            return manager.restore(best)['state']
+        stored = manager.restore(latest)
+        if 'best_state' not in stored:
+            raise ValueError(
+                f"No best step recorded in {checkpoint_dir}: no epoch loss is "
+                "checkpointed there and no best state is stored")
+        return stored['best_state']
+
+    target = latest if step == 'latest' else step
+    ckpt = manager.restore(target)
     print(f"Loaded checkpoint from local dir {checkpoint_dir}")
-    return ckpt.get('state'), ckpt.get('best_state')
+    return ckpt['state']
 
 def load_from_wandb_run(
     run,
@@ -168,10 +201,14 @@ def load_from_wandb_run(
     """
     Loads model from a wandb run's latest model artifact.
 
-    Returns (states, config, run, artifact); every element is None if the
+    An artifact holds a single step directory, uploaded when the run saved a
+    checkpoint it had just improved on, so its latest step is also its best
+    and 'latest' is the only choice to make here.
+
+    Returns (state, config, run, artifact); every element is None if the
     lookup failed, so a caller can tell a miss from a load.
     """
-    states = None
+    state = None
     config = None
     artifact = None
     try:
@@ -191,12 +228,11 @@ def load_from_wandb_run(
         artifact = run.use_artifact(wandb.Api().artifact(wandb_modelname))
         ckpt_dir = artifact.download()
         print(f"Loaded model from wandb: {wandb_modelname} at path {ckpt_dir}")
-        # Load the model from the checkpoint directory
-        states = load_from_checkpoint(ckpt_dir)
+        state = load_from_checkpoint(ckpt_dir, step='latest')
         config = run.config
     except Exception as e:
         print(f"Warning: Failed to load model from wandb: {e}")
-    return states, config, run, artifact
+    return state, config, run, artifact
 
 def load_from_wandb_registry(
     modelname: str,
@@ -208,10 +244,14 @@ def load_from_wandb_registry(
     """
     Loads model from wandb model registry.
 
-    Returns (states, config, run, artifact); every element is None if the
+    A registry version is one uploaded step directory, and the versions are
+    linked when the run improved on its own best loss, so the version asked
+    for is what selects between them rather than a step lookup.
+
+    Returns (state, config, run, artifact); every element is None if the
     lookup failed, so a caller can tell a miss from a load.
     """
-    states = None
+    state = None
     config = None
     run = None
     artifact = None
@@ -219,10 +259,9 @@ def load_from_wandb_registry(
         artifact = wandb.Api().artifact(f"{registry}/{modelname}:{version}")
         ckpt_dir = artifact.download()
         print(f"Loaded model from wandb registry: {modelname} at path {ckpt_dir}")
-        # Load the model from the checkpoint directory
-        states = load_from_checkpoint(ckpt_dir)
+        state = load_from_checkpoint(ckpt_dir, step='latest')
         run = artifact.logged_by()
         config = run.config
     except Exception as e:
         print(f"Warning: Failed to load model from wandb: {e}")
-    return states, config, run, artifact
+    return state, config, run, artifact
