@@ -209,6 +209,20 @@ def test_video_objective_trains(mask, rng):
     assert float(loss_of(params)) < initial * 0.9
 
 
+def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
+    """The MSE and its gradient are the numbers the optimizer sees, so they
+    must not be quantized to the models' bf16 compute dtype."""
+    objective = JepaObjective(make_encoder(dtype=jnp.bfloat16),
+                              make_predictor(dtype=jnp.bfloat16), mask,
+                              sample_data_key="image",
+                              sample_data_shape=(RES, RES, 3))
+    params = objective.init_params(rng)
+    loss, aux = objective.loss(params, params, {"image": images()},
+                               jax.random.PRNGKey(7), 0)
+    assert loss.dtype == jnp.float32
+    assert all(a.dtype == jnp.float32 for a in aux.values())
+
+
 def solid_colour_images(rs, n):
     """One random colour per image, so a target block is fully determined by
     anything else in the same image and by nothing in any other image."""
@@ -456,14 +470,44 @@ def test_registry_builds_the_jepa_models(architecture):
     assert model.emb_features == 32 and model.scan_order == 'hilbert'
 
 
+def load_recipe():
+    """The recipe module, loaded from its path the way the CLI runs it."""
+    spec = importlib.util.spec_from_file_location(
+        "jepa_train_recipe", Path(__file__).resolve().parents[1] / "recipes" / "jepa" / "train.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_predictor_follows_the_run_precision_policy():
+    """The predictor is as much part of the run as the encoder: one dtype knob,
+    one kernel knob, and a predictor JSON holds no second opinion on either."""
+    from dew.config import ModelConfig
+
+    recipe = load_recipe()
+    model = ModelConfig("jepa_encoder", {
+        "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
+        "mlp_ratio": 2}, dtype="bfloat16", attention_impl="xla")
+    predictor_json = {"predictor_features": 16, "num_layers": 1, "num_heads": 2}
+
+    config = recipe.JepaRunConfig(model=model, predictor=predictor_json)
+    encoder, encoder_config = recipe.build_encoder(config)
+    predictor, _ = recipe.build_predictor(config, encoder_config, encoder, GRID, False)
+    assert predictor.dtype is jnp.bfloat16
+    assert predictor.attention_impl == "xla"
+
+    with pytest.raises(ValueError, match="--model.dtype"):
+        recipe.build_predictor(
+            recipe.JepaRunConfig(model=model,
+                                 predictor={**predictor_json, "dtype": "float32"}),
+            encoder_config, encoder, GRID, False)
+
+
 def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
     """Registry -> mask -> objective -> trainer -> probes, as the recipe wires them."""
     from dew.config import DataConfig, ModelConfig, TrainerConfig
 
-    spec = importlib.util.spec_from_file_location(
-        "jepa_train_recipe", Path(__file__).resolve().parents[1] / "recipes" / "jepa" / "train.py")
-    training_jepa = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(training_jepa)
+    training_jepa = load_recipe()
 
     classes = 4
 
