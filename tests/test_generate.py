@@ -52,6 +52,20 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
                             temperature=0))
 
 
+def test_layer_types_from_json_can_generate(rng):
+    model = tiny(
+        layer_types=["full_attention", "sliding_attention"],
+        sliding_window=4,
+    )
+    prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
+    params = model.init(rng, prompt)
+
+    generated = generate(
+        model, params, prompt, 2, rng=jax.random.PRNGKey(1), temperature=0)
+
+    assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
+
+
 def test_sampling_stays_in_the_vocab_and_reacts_to_the_rng(rng):
     model = tiny()
     prompt = jax.random.randint(rng, (4, 4), 0, VOCAB)

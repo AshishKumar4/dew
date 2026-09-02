@@ -95,6 +95,7 @@ class CausalSelfAttention(nn.Module):
     rope_theta: float = 10000.0
     qk_norm: bool = True
     norm_eps: float = 1e-5
+    scale_offset: bool = False
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     dtype: Optional[Dtype] = None
@@ -110,8 +111,12 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.qk_norm:
-            self.q_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='q_norm')
-            self.k_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='k_norm')
+            self.q_norm = RMSNorm(
+                epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                dtype=self.dtype, name='q_norm')
+            self.k_norm = RMSNorm(
+                epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                dtype=self.dtype, name='k_norm')
 
     @nn.compact
     def __call__(self, x, decode: bool = False):
@@ -255,6 +260,12 @@ class CausalTransformer(nn.Module):
     force_fp32_for_softmax: bool = True
     attention_impl: Optional[str] = None
 
+    def __post_init__(self):
+        if self.layer_types is not None:
+            object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        super().__post_init__()
+
+
     @property
     def kv_heads(self) -> int:
         return self.num_heads if self.num_kv_heads is None else self.num_kv_heads
@@ -313,6 +324,7 @@ class CausalTransformer(nn.Module):
                                 else self.rope_theta),
                     qk_norm=self.qk_norm,
                     norm_eps=self.norm_eps,
+                    scale_offset=self.scale_offset,
                     sliding_window=(self.sliding_window
                                     if layer_type == 'sliding_attention' else None),
                     attention_bias=self.attention_bias,
