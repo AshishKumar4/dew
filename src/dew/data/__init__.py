@@ -64,6 +64,17 @@ _EXPORTS = {
     "gather_video_paths": ".sources.videos",
     "gather_video_paths_iter": ".sources.videos",
     "VoxCeleb2Source": ".sources.voxceleb2",
+    # text / language-model data
+    "get_token_dataset_grain": ".dataloaders",
+    "TokenFileSource": ".sources.text",
+    "ByteTokenizer": ".text",
+    "HFTokenizer": ".text",
+    "VideoTFDSSource": ".sources.videos",
+    "VideoLocalSource": ".sources.videos",
+    "AudioVideoAugmenter": ".sources.videos",
+    "gather_video_paths": ".sources.videos",
+    "gather_video_paths_iter": ".sources.videos",
+    "VoxCeleb2Source": ".sources.voxceleb2",
 }
 
 __all__ = sorted(_EXPORTS)
