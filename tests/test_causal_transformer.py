@@ -7,6 +7,8 @@ guards the config surface the HF decoders need (grouped-query heads, sliding
 layers, the Gemma flags) and the param tree the interop map renames.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -154,6 +156,76 @@ def test_param_tree_mirrors_the_hf_decoder_layout(rng):
         + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
     # tie_embeddings=True is the reason there is no lm_head to rename
     assert 'lm_head' not in params
+
+
+def head_before_the_seam(self, tokens, train: bool = False, decode: bool = False):
+    """`CausalTransformer.__call__` as it read before `hidden_states` existed.
+
+    Applied with `method=`, so the logits the split forward returns can be
+    compared against the ones the single method returned.
+    """
+    x = self.embed_tokens(tokens)
+    if self.embedding_scale:
+        x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
+    for layer in self.layers:
+        x = layer(x, train=train, decode=decode)
+    x = self.norm(x)
+
+    if self.tie_embeddings:
+        logits = jnp.einsum(
+            '...d,vd->...v', x.astype(jnp.float32),
+            self.embed_tokens.embedding.astype(jnp.float32),
+            precision=self.precision)
+    else:
+        logits = self.lm_head(x)
+    logits = logits.astype(jnp.float32)
+    if self.final_logit_softcap is not None:
+        cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
+        logits = cap * jnp.tanh(logits / cap)
+    return logits
+
+
+SEAM_CONFIGS = [
+    {},
+    {'tie_embeddings': False},
+    {'dtype': jnp.bfloat16},
+    {'dtype': jnp.bfloat16, 'tie_embeddings': False},
+    {'embedding_scale': True, 'final_logit_softcap': 5.0},
+    {'embedding_scale': True, 'final_logit_softcap': 5.0, 'tie_embeddings': False},
+]
+
+
+@pytest.mark.parametrize("config", SEAM_CONFIGS)
+def test_splitting_the_head_off_left_the_logits_alone(rng, config):
+    """Every byte of the forward pass, against a copy of the code it replaced."""
+    model = tiny(**config)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+
+    assert jnp.array_equal(model.apply(params, ids),
+                           model.apply(params, ids, method=head_before_the_seam))
+
+
+@pytest.mark.parametrize("config", SEAM_CONFIGS)
+def test_hidden_states_times_head_weight_are_the_logits(rng, config):
+    """The seam the chunked loss multiplies: states, head matrix, softcap."""
+    model = tiny(**config)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+
+    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
+    head = model.apply(params, params['params'], method=CausalTransformer.head_weight)
+    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
+                        precision=model.precision)
+    if model.final_logit_softcap is not None:
+        cap = jnp.asarray(model.final_logit_softcap, jnp.float32)
+        logits = cap * jnp.tanh(logits / cap)
+
+    assert hidden.shape == (ids.shape[0], SEQ, model.emb_features)
+    assert head.shape == (model.emb_features, VOCAB) and head.dtype == jnp.float32
+    reference = model.apply(params, ids)
+    largest = jnp.abs(reference).max()
+    assert jnp.abs(logits - reference).max() <= 1e-5 * largest
 
 
 def test_untied_head_adds_lm_head_and_nothing_else(rng):
