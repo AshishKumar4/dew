@@ -103,9 +103,8 @@ class TrainerConfig:
     checkpoint_every_steps: Optional[int] = None
     """Save a checkpoint every N global steps, not only at epoch boundaries."""
     distributed_training: bool = True
-    multi_host: bool = False
-    """Join the JAX process pool with jax.distributed.initialize(); failures
-    raise. Required on TPU pods and any other multi-process run."""
+    multi_host: Optional[bool] = None
+    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     fsdp_size: int = 1
     fsdp_min_param_size: Optional[int] = None
     ema_decay: float = 0.999

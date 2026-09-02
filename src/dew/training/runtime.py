@@ -7,17 +7,21 @@ this once at the top of main().
 
 import os
 import resource
+from typing import Optional
 
 import jax
 
 
 def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
-                    multi_host: bool = False):
-    """Raise the fd/core limits, join the device pool, set the env vars.
+                    multi_host: Optional[bool] = None):
+    """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
-    multi_host joins the JAX process pool, and a failure to join is fatal: a
-    pod run that quietly falls back to one process trains on a slice of the
-    data with a slice of the devices and reports it as a full run.
+    jax.distributed.initialize() finds the coordinator from the environment on
+    TPU pods and Slurm/GKE clusters. On a machine with no cluster environment
+    it raises the one ValueError below, which is the single-host signature;
+    every other failure means a pod run would otherwise continue on one host,
+    so it propagates. multi_host=True requires the pool, multi_host=False
+    never asks for it.
     """
     # The image augmenters read this at MapTransform construction time
     os.environ['FLAXDIFF_AUGMENT_MODE'] = augmentation_mode
@@ -29,8 +33,13 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
 
-    if multi_host:
-        jax.distributed.initialize()
-        print(f"Joined the JAX process pool: process {jax.process_index()} "
-              f"of {jax.process_count()}")
+    if multi_host is not False:
+        try:
+            jax.distributed.initialize()
+        except ValueError as e:
+            if multi_host or "coordinator_address" not in str(e):
+                raise
+        else:
+            print(f"Joined the JAX process pool: process {jax.process_index()} "
+                  f"of {jax.process_count()}")
     print(f"Number of devices: {jax.device_count()}")
