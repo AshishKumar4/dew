@@ -189,6 +189,15 @@ def test_checkpoint_every_steps_saves_on_its_own_cadence(tmp_path):
     assert trainer.last_saved_step == 6
     assert set(trainer.checkpointer.all_steps()) == {2, 4, 6}
     assert trainer.checkpointer.best_step() is None, "a cadence save became the best"
+def test_checkpoint_at_epoch_boundary_records_the_epoch_loss(tmp_path):
+    trainer = make_trainer(tmp_path, name="boundary", max_checkpoints_to_keep=4)
+    data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
+
+    trainer.fit(data, training_steps_per_epoch=2, epochs=1,
+                val_steps_per_epoch=0, checkpoint_every_steps=2)
+
+    assert trainer.checkpointer.all_steps() == [2]
+    assert trainer.checkpointer.best_step() == 2
 
 
 # --------------------------------------------------------------------------

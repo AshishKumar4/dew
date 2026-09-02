@@ -431,6 +431,27 @@ def test_resume_continues_mid_epoch(tmp_path):
     fresh = DevicePrefetchIterator(iter(grain_image_loader()), resumed.batch_sharding)
     first = np.asarray(next(fresh)["image"])
     assert not np.array_equal(np.asarray(next(resumed_iter)["image"]), first)
+def test_fit_resumes_only_the_unfinished_part_of_an_epoch(tmp_path):
+    data = {"train": grain_image_loader, "train_len": BATCH * 64,
+            "local_batch_size": BATCH, "global_batch_size": BATCH}
+    trainer = make_trainer(tmp_path, "resume-partial", distributed_training=True)
+    source = DevicePrefetchIterator(data["train"](), trainer.batch_sharding)
+    train_step = trainer._define_train_step(batch_size=BATCH)
+    _, current_step, state, rng_state = trainer.train_loop(
+        trainer.state, train_step, source, 2, 0, trainer.rngstate)
+    trainer.latest_step = current_step
+    trainer.state, trainer.rngstate = state, rng_state
+    trainer.save(epoch=0, step=current_step)
+    trainer.wait_for_checkpoints()
+
+    resumed = make_trainer(
+        tmp_path, "resume-partial", distributed_training=True,
+        load_from_checkpoint=trainer.checkpoint_path())
+    state = resumed.fit(
+        data, training_steps_per_epoch=6, epochs=1, val_steps_per_epoch=0)
+
+    assert int(state.step) == 6
+    assert resumed.latest_step == 6
 
 
 def test_load_tolerates_checkpoints_without_iterator_state(tmp_path):
