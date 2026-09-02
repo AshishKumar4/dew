@@ -465,7 +465,6 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
     training_jepa = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(training_jepa)
 
-    monkeypatch.setenv("WANDB_MODE", "disabled")
     classes = 4
 
     def fake_dataset(*args, **kwargs):
@@ -484,7 +483,7 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
         }),
         data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
         trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path)),
+                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None),
         predictor={"predictor_features": 16, "num_layers": 1, "num_heads": 2},
         probe_classes=classes,
     )
@@ -492,3 +491,5 @@ def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
 
     assert trainer.objective.tag == 'jepa'
     assert trainer.state.step == 2
+    # No wandb project configured, so the run never opened one
+    assert trainer.wandb is None
