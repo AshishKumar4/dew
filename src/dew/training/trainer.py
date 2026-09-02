@@ -435,6 +435,7 @@ class SimpleTrainer:
 
         epoch_loss = jnp.zeros((), jnp.float32)
         current_epoch = current_step // train_steps_per_epoch
+        steps_this_call = train_steps_per_epoch - current_step % train_steps_per_epoch
 
         # Both counters live on device so the loop never blocks on a result.
         # `worst_bad_run` remembers the longest streak of non-finite losses seen
@@ -443,7 +444,7 @@ class SimpleTrainer:
         worst_bad_run = jnp.zeros((), jnp.int32)
 
         if process_index == 0:
-            pbar = tqdm.tqdm(total=train_steps_per_epoch, desc=f'\t\tEpoch {current_epoch}', ncols=100, unit='step')
+            pbar = tqdm.tqdm(total=steps_this_call, desc=f'\t\tEpoch {current_epoch}', ncols=100, unit='step')
         else:
             pbar = None
 
@@ -456,7 +457,7 @@ class SimpleTrainer:
         tracing = False
         traced_steps = 0
 
-        for i in range(train_steps_per_epoch):
+        for i in range(steps_this_call):
             batch = next(train_ds)
             if compiled_step is None:
                 compiled_step = self._compiled_step(
@@ -509,7 +510,8 @@ class SimpleTrainer:
 
             # On its own clock, not the logging one: nested inside the log tick,
             # a cadence that did not divide log_every never fired at all.
-            if save_every and current_step % save_every == 0:
+            if (save_every and current_step % save_every == 0
+                    and i + 1 < steps_this_call):
                 self.save(current_epoch, current_step, train_state, rng_state)
 
         if tracing:
@@ -589,10 +591,10 @@ class SimpleTrainer:
                 
         while self.latest_step < epochs * train_steps_per_epoch:
             current_epoch = self.latest_step // train_steps_per_epoch
+            start_step = self.latest_step
+            resumed_partial_epoch = bool(start_step % train_steps_per_epoch)
             print(f"\nEpoch {current_epoch}/{epochs}")
             start_time = time.time()
-            epoch_loss = 0
-            
             epoch_loss, current_step, train_state, rng_state = self.train_loop(
                 train_state,
                 train_step,
@@ -609,7 +611,8 @@ class SimpleTrainer:
             self.state = train_state
             self.rngstate = rng_state
             total_time = end_time - start_time
-            avg_time_per_step = total_time / train_steps_per_epoch
+            steps_ran = current_step - start_step
+            avg_time_per_step = total_time / steps_ran
             
             if val_steps_per_epoch > 0:
                 print(f"Validation started for process index {process_index}")
@@ -623,11 +626,13 @@ class SimpleTrainer:
                 )
                 print(colored(f"Validation done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
             
-            avg_loss = float(epoch_loss / train_steps_per_epoch)
-            if avg_loss < self.best_loss:
+            avg_loss = float(epoch_loss / steps_ran)
+            if not resumed_partial_epoch and avg_loss < self.best_loss:
                 self.best_loss = avg_loss
                 self.save(current_epoch, current_step, metrics={'loss': avg_loss})
-                
+            elif (checkpoint_every_steps
+                  and current_step % checkpoint_every_steps == 0):
+                self.save(current_epoch, current_step)
             if process_index == 0:
                 if self.wandb is not None:
                     self.wandb.log({
