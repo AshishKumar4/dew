@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
@@ -18,7 +19,7 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.telemetry.instrumentation import (
-    enable_compilation_cache, model_flops_utilization, step_flops,
+    compiled_flops, enable_compilation_cache, model_flops_utilization, step_flops,
 )
 
 RES = 8
@@ -77,16 +78,50 @@ def test_throughput_metrics_ignore_a_zero_interval(tmp_path):
 
 def test_mfu_is_skipped_on_unknown_hardware():
     # CPU is deliberately absent from the peak-FLOPs table
-    assert model_flops_utilization(1e12, 1.0, 8) is None
+    assert model_flops_utilization(1e12, 1.0) is None
 
 
-def test_mfu_scales_with_time_and_devices(monkeypatch):
+def test_mfu_uses_the_per_device_flop_count(monkeypatch):
     from dew.telemetry import instrumentation
     monkeypatch.setitem(instrumentation.PEAK_FLOPS_PER_DEVICE,
                         jax.devices()[0].device_kind, 100.0)
-    assert instrumentation.model_flops_utilization(50.0, 1.0, 1) == pytest.approx(0.5)
-    assert instrumentation.model_flops_utilization(50.0, 1.0, 2) == pytest.approx(0.25)
-    assert instrumentation.model_flops_utilization(50.0, 2.0, 1) == pytest.approx(0.25)
+    assert instrumentation.model_flops_utilization(50.0, 1.0) == pytest.approx(0.5)
+    assert instrumentation.model_flops_utilization(50.0, 2.0) == pytest.approx(0.25)
+
+
+def test_compiled_flops_is_per_device_under_spmd():
+    devices = jax.devices()
+    mesh = jax.make_mesh((len(devices),), ("data",), devices=devices)
+    split = NamedSharding(mesh, P("data"))
+    replicated = NamedSharding(mesh, P())
+    batch, width = len(devices), 32
+    x = jax.device_put(jnp.ones((batch, width)), split)
+    weight = jax.device_put(jnp.ones((width, width)), replicated)
+    executable = jax.jit(
+        lambda values, kernel: values @ kernel,
+        in_shardings=(split, replicated), out_shardings=split,
+    ).lower(x, weight).compile()
+
+    whole_batch_flops = 2 * batch * width * width
+    assert compiled_flops(executable) == pytest.approx(
+        whole_batch_flops / len(devices))
+
+
+def test_epoch_loss_accumulates_bfloat16_losses_in_float32(tmp_path, monkeypatch):
+    trainer = make_trainer(tmp_path, log_every=1000)
+
+    def step(state, rng_state, batch):
+        del batch
+        loss = jnp.array(1.5, jnp.bfloat16)
+        return state, loss, {}, rng_state, jnp.array(True)
+
+    monkeypatch.setattr(trainer, "_compiled_step", lambda *_: step)
+    steps = 400
+    epoch_loss, *_ = trainer.train_loop(
+        trainer.state, object(), iter([None] * steps), steps, 0, trainer.rngstate)
+
+    assert epoch_loss.dtype == jnp.float32
+    assert float(epoch_loss / steps) == pytest.approx(1.5)
 
 
 def test_fit_reports_throughput_to_wandb(tmp_path):

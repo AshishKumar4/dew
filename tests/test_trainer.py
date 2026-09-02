@@ -228,6 +228,8 @@ def test_a_populated_checkpoint_directory_is_not_written_over(tmp_path):
 
     with pytest.raises(ValueError, match="already holds checkpoints up to step 2"):
         make_trainer(tmp_path, name="taken")
+    with pytest.raises(ValueError, match="already holds checkpoints up to step 2"):
+        make_trainer(tmp_path, name="taken", checkpoint_step=2)
 
     resumed = make_trainer(tmp_path, name="taken",
                            load_from_checkpoint=trainer.checkpoint_path())

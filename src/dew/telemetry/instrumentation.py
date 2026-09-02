@@ -51,15 +51,19 @@ def step_flops(jitted, *args, **kwargs) -> Optional[float]:
 
 
 def model_flops_utilization(
-    flops_per_step: Optional[float], step_time: float, device_count: int
+    flops_per_step: Optional[float], step_time: float
 ) -> Optional[float]:
-    """Fraction of the cluster's peak FLOPs the training step actually achieved."""
+    """Fraction of one device's dense peak achieved by its executable.
+
+    XLA cost analysis reports the work in one SPMD partition. Its denominator
+    is therefore one device's peak, not the whole mesh's peak.
+    """
     if not flops_per_step or step_time <= 0:
         return None
     peak = PEAK_FLOPS_PER_DEVICE.get(jax.devices()[0].device_kind)
     if peak is None:
         return None
-    return flops_per_step / step_time / (peak * device_count)
+    return flops_per_step / step_time / peak
 
 
 def default_compilation_cache_dir() -> str:
