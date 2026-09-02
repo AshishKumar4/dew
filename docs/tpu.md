@@ -74,7 +74,9 @@ WORKER  INTERNAL IP  EXTERNAL IP
 
 Add `--spot` for a preemptible slice, `--queued` to go through the queued
 resources API, `--disk NAME` to attach a persistent disk (mounted on the worker
-at `/mnt/persist`).
+at `/mnt/persist`). A disk is named by its full resource path, so `--disk`
+needs a project: `project` in `tpu.toml`, or whatever `gcloud config
+get-value project` answers.
 
 ### 3. Set up every worker
 

@@ -127,6 +127,17 @@ class Gcloud:
             return default
         return json.loads(result.out)
 
+    def config_value(self, name: str) -> str:
+        """Read one value from the local gcloud config.
+
+        Runs in a dry run too: it reads and changes nothing, and the argv a dry
+        run prints can depend on the answer.
+        """
+        done = subprocess.run([self.executable, "config", "get-value", name],
+                              capture_output=True, text=True)
+        value = done.stdout.strip()
+        return "" if done.returncode or value == "(unset)" else value
+
     def stream(self, argv: Sequence[str], prefix: str = "") -> Result:
         """Run one command, tagging every output line with a prefix."""
         argv = list(argv)
