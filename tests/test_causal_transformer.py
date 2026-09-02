@@ -270,6 +270,61 @@ def test_local_rope_only_moves_the_sliding_layers(rng):
     assert not jnp.allclose(model.apply(params, ids), other_theta.apply(params, ids))
 
 
+def param_paths(params):
+    return {'.'.join(str(entry.key) for entry in path)
+            for path, _ in jax.tree_util.tree_flatten_with_path(params)[0]}
+
+
+def test_sandwich_norms_add_exactly_the_two_output_norms(rng):
+    """Gemma's second pair of norms is additive: the pre-norms keep their names
+    and their roles, so a checkpoint without them loads into the same tree."""
+    ids = tokens(rng)
+    plain = tiny().init(rng, ids)['params']
+    sandwiched = tiny(sandwich_norms=True).init(rng, ids)['params']
+
+    assert param_paths(sandwiched) - param_paths(plain) == {
+        f'layers_{index}.{norm}.scale' for index in (0, 1)
+        for norm in ('attention_output_norm', 'mlp_output_norm')}
+    assert not param_paths(plain) - param_paths(sandwiched)
+    assert sandwiched['layers_0']['attention_output_norm']['scale'].shape == (32,)
+
+
+def test_sandwich_norms_normalize_what_the_residual_adds(rng):
+    """The two norms sit on the sublayer outputs, which makes each residual
+    contribution scale-free: a ten times larger o_proj and down_proj leave the
+    logits where they were, and without the norms they move them."""
+    ids = tokens(rng)
+    model = tiny(sandwich_norms=True)
+    params = model.init(rng, ids)
+
+    amplified = ('o_proj', 'down_proj')
+    louder = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf * 10.0 if path[-2].key in amplified else leaf, params)
+
+    def gap(model):
+        return float(jnp.max(jnp.abs(model.apply(params, ids) - model.apply(louder, ids))))
+
+    # exact in real arithmetic, fp32 rounding through the norm is the residue
+    assert gap(model) < 1e-3
+    assert gap(tiny()) > 0.1
+
+
+def test_attention_scale_defaults_to_the_head_dim_scale(rng):
+    """None is 1/sqrt(head_dim), the scale every kernel applies itself: asking
+    for that number explicitly must not move a bit, and Gemma's
+    query_pre_attn_scalar must move the logits."""
+    ids = tokens(rng)
+    model = tiny(head_dim=16)
+    params = model.init(rng, ids)
+
+    explicit = tiny(head_dim=16, attention_scale=16 ** -0.5)
+    assert jnp.array_equal(model.apply(params, ids), explicit.apply(params, ids))
+
+    # query_pre_attn_scalar 16 on head_dim 16 heads, as Gemma3 sets it
+    gemma = tiny(head_dim=16, attention_scale=16 ** -0.5 * 2)
+    assert not jnp.allclose(model.apply(params, ids), gemma.apply(params, ids))
+
+
 def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
     model = tiny(dropout_rate=0.5)
     ids = tokens(rng)
