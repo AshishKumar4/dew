@@ -7,8 +7,8 @@ separately by `tools/benchmark_data.py`.
 
 FLOPs come off the compiled executable through
 `dew.telemetry.instrumentation.compiled_flops`, and `util` is the same figure
-the trainer logs as `train/mfu`: measured FLOPs over the device's dense bf16
-peak (97.5 TFLOP/s for this card).
+the trainer logs as `train/mfu`: the step's measured FLOPs divided by the step
+time and by one device's dense bf16 peak (97.5 TFLOP/s for this card).
 
 ## `--preset small` on one RTX 4080
 

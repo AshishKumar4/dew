@@ -56,7 +56,7 @@ The public modules, and what each one is for.
 | `dew.inputs` | `DiffusionInputConfig`, `ConditionalInputConfig`, `ConditioningEncoder` |
 | `dew.inputs.encoders` | `TextEncoder`, `CLIPTextEncoder`, `AudioEncoder`, `HFAudioEncoder` |
 | `dew.inputs.processors` | `AutoTextTokenizer`, `AutoAudioProcessor`, `defaultTextEncodeModel` |
-| `dew.data` | lazy re-exports of the loaders, sources and augmenters, so `import dew.data` costs nothing |
+| `dew.data` | lazy re-exports of the loader factories, sources, augmenters and tokenizers, so `import dew.data` costs nothing; `load_data` and the name registries are not among them |
 | `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_token_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
 | `dew.data.text` | `ByteTokenizer`, `HFTokenizer` |
 | `dew.data.sources.text` | `TokenFileSource` |

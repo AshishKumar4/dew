@@ -1,8 +1,8 @@
 # dew
 
-Dew is a library of tools (schedulers, samplers, models, data loaders, trainers) for training generative models in JAX and Flax. The focus is on understandability and readability over performance. It covers image and video diffusion, flow matching, latent diffusion with a VAE, and I-JEPA/V-JEPA self-supervised training, all through one trainer with data-parallel and FSDP sharding.
+Dew is a library of tools (schedulers, samplers, models, data loaders, trainers) for training generative models in JAX and Flax. The focus is on understandability and readability over performance. It covers image and video diffusion, flow matching, latent diffusion with a VAE, I-JEPA/V-JEPA self-supervised training and autoregressive language models, all through one trainer with data-parallel and FSDP sharding.
 
-Dew is the project published as FlaxDiff, renamed and restructured once the trainer stopped being about diffusion alone: what to optimize is now an objective you plug in.
+Dew is the successor to FlaxDiff, restructured once the trainer stopped being about diffusion alone: what to optimize is now an objective you plug in.
 
 ## Install
 

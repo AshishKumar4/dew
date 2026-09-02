@@ -39,4 +39,4 @@
 
 ## Related projects
 - [MaxText](https://github.com/AI-Hypercomputer/maxtext) and [Levanter](https://github.com/stanford-crfm/levanter) are mature JAX trainers for language models and worth looking at if language models are all you need. Dew is a lot smaller, and also covers diffusion and JEPA.
-- [verl](https://github.com/verl-project/verl) (RL post-training) and [vLLM](https://github.com/vllm-project/vllm) (serving) both read Hugging Face model directories, and `dew.interop.save_hf_layout` writes one, which is how a model trained here gets to them.
+- [verl](https://github.com/verl-project/verl) (RL post-training) and [vLLM](https://github.com/vllm-project/vllm) (serving) both read Hugging Face model directories, and `dew.interop.save_hf_layout` writes that pair of files. It renames nothing: the names on disk are the module names in the tree and the config is dew's own, so reading an export in either of them still needs a per-family translation.
