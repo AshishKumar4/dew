@@ -5,7 +5,9 @@ Reads a single file or every *.txt under a directory (recursively), encodes it
 with the byte tokenizer or a huggingface one, splits the token stream by
 --val-fraction (validation is the head of the stream, in file order) and
 writes the nanoGPT-style output that `dew.data.sources.text.TokenFileSource`
-and `get_token_dataset_grain` read back.
+and `get_token_dataset_grain` read back. With --pack-seq-len an EOS id is
+written between the input files, so the packed loader can treat each file as
+one document; meta.json then records the id under `eos_id`.
 
 The corpus is processed one line-bounded chunk at a time: tokens are encoded,
 written and dropped, so a corpus larger than memory costs disk, never RAM.
@@ -39,8 +41,10 @@ class TokenizeArgs:
     """Directory to write train.bin, val.bin and meta.json into."""
     tokenizer: str = "byte"
     """'byte' for utf-8 bytes, else a huggingface tokenizer name."""
-    val_fraction: float = 0.01
-    """Fraction of the token stream held out, from its head, as validation."""
+    pack_seq_len: int = 0
+    """Write an EOS id between documents (files) when positive, so
+    `get_packed_token_dataset_grain` can split the stream back into them;
+    meta.json then records the id under `eos_id`. 0 keeps the bare stream."""
 
 
 def iter_text_chunks(paths, chunk_chars=CHUNK_CHARS):
@@ -122,10 +126,18 @@ def main(args: TokenizeArgs):
     total = 0
     try:
         with open(scratch, "wb") as handle:
+            eos = tokenizer.eos_id if args.pack_seq_len > 0 else None
+            first = True
             for chunk in iter_text_chunks(paths):
                 ids = tokenizer.encode(chunk)
                 if not ids:
                     continue
+                if not first and eos is not None:
+                    # A document ends where its file ends: the packing loader
+                    # splits the stream at this id, and the loss drops the
+                    # transition across it.
+                    ids = ids + [eos]
+                first = False
                 handle.write(np.asarray(ids, dtype=dtype).tobytes())
                 total += len(ids)
         if total < 2:
@@ -144,7 +156,7 @@ def main(args: TokenizeArgs):
         "vocab_size": tokenizer.vocab_size,
         "dtype": dtype.name,
         "train_tokens": train_len,
-        "val_tokens": val_len,
+        "eos_id": tokenizer.eos_id if args.pack_seq_len > 0 else None,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
