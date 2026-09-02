@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -28,17 +29,28 @@ POLL_SECONDS = 10
 
 Positional = tyro.conf.Positional
 
-
-def Optional(what: type, metavar: str) -> object:
-    """An optional flag that shows a name instead of {None}|STR in --help."""
-    return Annotated[what | None, tyro.conf.arg(metavar=metavar)]
+#: Optional flags, named so --help reads like documentation instead of {None}|STR.
+Zone = Annotated[str | None, tyro.conf.arg(metavar="ZONE")]
+Zones = Annotated[str | None, tyro.conf.arg(metavar="ZONES")]
+Project = Annotated[str | None, tyro.conf.arg(metavar="PROJECT")]
+Kind = Annotated[str | None, tyro.conf.arg(metavar="TYPE")]
+Version = Annotated[str | None, tyro.conf.arg(metavar="VERSION")]
+User = Annotated[str | None, tyro.conf.arg(metavar="USER")]
+Bucket = Annotated[str | None, tyro.conf.arg(metavar="BUCKET")]
+Disk = Annotated[str | None, tyro.conf.arg(metavar="DISK")]
+PyVersion = Annotated[str | None, tyro.conf.arg(metavar="X.Y")]
+Worker = Annotated[str, tyro.conf.arg(metavar="N|all")]
+Job = Annotated[str, tyro.conf.arg(metavar="JOB")]
+Extras = Annotated[str, tyro.conf.arg(metavar="LIST")]
+Release = Annotated[str, tyro.conf.arg(metavar="VERSION")]
 
 
 @dataclasses.dataclass(kw_only=True)
 class Base:
     """Flags shared by every command that talks to a TPU."""
 
-    zone: Optional(str, "ZONE") = None
+    zone: Zone = None
+    """Zone of the TPU. Searched across the configured zones when omitted."""
     dry_run: bool = False
     """Print the commands that would run, then exit."""
 
@@ -187,21 +199,21 @@ def _job_id(name: str) -> str:
 class Init:
     """Write ~/.config/dew/tpu.toml from flags, asking for what is missing."""
 
-    project: Optional(str, "PROJECT") = None
+    project: Project = None
     """Google Cloud project that owns the TPUs."""
-    zones: Optional(str, "ZONES") = None
+    zones: Zones = None
     """Zones to search, in order, comma separated."""
-    accelerator_type: Optional(str, "TYPE") = None
+    accelerator_type: Kind = None
     """Default accelerator type, for example v5e-8."""
-    runtime_version: Optional(str, "VERSION") = None
+    runtime_version: Version = None
     """Runtime version, or auto to pick it from the accelerator generation."""
-    ssh_user: Optional(str, "USER") = None
+    ssh_user: User = None
     """User to log in as. Empty lets gcloud choose."""
-    gcs_bucket: Optional(str, "BUCKET") = None
+    gcs_bucket: Bucket = None
     """Bucket to mount with gcsfuse during setup."""
-    data_disk: Optional(str, "DISK") = None
+    data_disk: Disk = None
     """Persistent disk to attach on create."""
-    python_version: Optional(str, "X.Y") = None
+    python_version: PyVersion = None
     """Python version of the venv on the workers."""
     dry_run: bool = False
     """Print the config that would be written, then exit."""
@@ -236,15 +248,15 @@ class Create(Base):
 
     name: Positional[str]
     """Name of the TPU."""
-    type: Optional(str, "TYPE") = None
+    type: Kind = None
     """Accelerator type, for example v5e-16."""
     spot: bool = False
     """Ask for a spot TPU, which costs less and can be preempted."""
     queued: bool = False
     """Go through the queued resources API instead of creating directly."""
-    version: Optional(str, "VERSION") = None
+    version: Version = None
     """Runtime version, or auto to pick it from the accelerator generation."""
-    disk: Optional(str, "DISK") = None
+    disk: Disk = None
     """Persistent disk to attach, mounted on the worker at /mnt/persist."""
 
     def run(self, rest: list[str]) -> int:
@@ -422,11 +434,11 @@ class Run(Base):
 
     name: Positional[str]
     """Name of the TPU."""
-    worker: str = "all"
+    worker: Worker = "all"
     """Worker index, or all for every worker at once."""
     detach: bool = False
     """Start the command under nohup and return the job id."""
-    job: str = ""
+    job: Job = ""
     """Name of the detached job. A timestamp by default."""
 
     def run(self, rest: list[str]) -> int:
@@ -453,7 +465,7 @@ class Logs(Base):
     """Name of the TPU."""
     job: Positional[str]
     """Job id that run or train printed."""
-    worker: str = "0"
+    worker: Worker = "0"
     """Worker to read, or all for every worker."""
     follow: bool = False
     """Keep the log open and print new lines."""
@@ -479,7 +491,7 @@ class Copy(Base):
     """Local path."""
     dst: Positional[str]
     """Remote path."""
-    worker: str = "all"
+    worker: Worker = "all"
     """Worker to copy to, or all."""
 
     def run(self, rest: list[str]) -> int:
@@ -520,15 +532,15 @@ class Setup(Base):
     """Name of the TPU."""
     from_source: bool = False
     """Sync the working tree and install it in editable mode."""
-    version: str = ""
+    version: Release = ""
     """Release of dew-ml to install. The newest by default."""
-    extras: str = ""
+    extras: Extras = ""
     """Extras to install, for example tfds,av."""
-    gcs_bucket: Optional(str, "BUCKET") = None
+    gcs_bucket: Bucket = None
     """Bucket to mount with gcsfuse."""
-    python_version: Optional(str, "X.Y") = None
+    python_version: PyVersion = None
     """Python version of the venv."""
-    type: Optional(str, "TYPE") = None
+    type: Kind = None
     """Accelerator type to expect, for the device check in a dry run."""
 
     def run(self, rest: list[str]) -> int:
@@ -588,7 +600,7 @@ class Train(Base):
 
     name: Positional[str]
     """Name of the TPU."""
-    job: str = ""
+    job: Job = ""
     """Name of the job. A timestamp by default."""
 
     def run(self, rest: list[str]) -> int:
@@ -660,13 +672,13 @@ class Spawn(Base):
     """Name prefix. The TPUs are base-0, base-1 and so on."""
     count: Positional[int]
     """How many TPUs to create."""
-    type: Optional(str, "TYPE") = None
+    type: Kind = None
     """Accelerator type for all of them."""
     spot: bool = False
     """Ask for spot TPUs."""
     queued: bool = False
     """Go through the queued resources API."""
-    extras: str = ""
+    extras: Extras = ""
     """Extras to install during setup."""
 
     def run(self, rest: list[str]) -> int:
