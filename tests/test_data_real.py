@@ -35,6 +35,7 @@ RECORDS = 8189
 # get_dataset_grain's own default, which load_data has no config field to
 # override, so a validation batch is 32 images whatever batch_size says.
 VAL_BATCH = 32
+VAL_RECORDS = 4 * BATCH
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +50,8 @@ def labels_of(batch):
 
 
 def test_train_batches_carry_resized_images_and_tokenized_captions(flowers):
-    assert flowers["train_len"] == RECORDS
+    assert flowers["train_len"] == RECORDS - VAL_RECORDS
+    assert flowers["val_len"] == VAL_RECORDS
     assert flowers["local_batch_size"] == BATCH
 
     train = iter(flowers["train"]())
