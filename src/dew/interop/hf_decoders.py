@@ -55,9 +55,9 @@ _IGNORED_FIELDS = {
 # A gemma3 multimodal config describes a vision tower and a splicer too; only
 # the text decoder maps, and these are the fields that name the rest.
 _IGNORED_MULTIMODAL_FIELDS = {
-    'architectures', 'boi_token_index', 'eoi_token_index', 'eos_token_id',
-    'image_token_index', 'mm_tokens_per_image', 'model_type', 'torch_dtype',
-    'transformers_version', 'vision_config',
+    'architectures', 'boi_token_index', 'dtype', 'eoi_token_index',
+    'eos_token_id', 'image_token_index', 'mm_tokens_per_image', 'model_type',
+    'text_config', 'torch_dtype', 'transformers_version', 'vision_config',
 }
 
 
@@ -98,15 +98,15 @@ def _rope(hf_config: Mapping[str, Any], used: set) -> Tuple[float, Optional[floa
                              'rope_parameters.sliding_attention') or theta)
         return theta, (None if local == theta else local)
 
-    scaling = hf_config.get('rope_scaling')
-    if scaling is not None:
-        theta_from_scaling = _rope_theta(scaling, 'rope_scaling')
-        if theta_from_scaling is None:
-            _refuse(f"rope_scaling {dict(scaling)!r}",
-                    "it carries no rope_theta to read")
-    theta = (_rope_theta(rope_parameters, 'rope_parameters')
-             if rope_parameters is not None else None)
-    theta = theta or theta_from_scaling or float(hf_config.get('rope_theta', 10000.0))
+    # Flat spellings: either field may carry the base frequency, and either
+    # may carry a scaling type, which _rope_theta refuses when it is not plain.
+    theta = None
+    for field in ('rope_parameters', 'rope_scaling'):
+        entry = hf_config.get(field)
+        if isinstance(entry, Mapping):
+            theta = _rope_theta(entry, field) or theta
+    if theta is None:
+        theta = float(hf_config.get('rope_theta', 10000.0))
     local = hf_config.get('rope_local_base_freq')
     return theta, (None if local is None else float(local))
 
@@ -244,22 +244,30 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     return config
 
 
-# Where a layer's sublayers and norms sit in the two trees. Gemma's two
-# output norms are the renames: HF's post_attention_layernorm normalizes the
-# attention output where every other family puts its MLP-input pre-norm, and
-# its pre_feedforward_layernorm normalizes the MLP output where ours puts the
-# residual the MLP adds to.
-_LAYER_MODULES = {
+# Where a layer's norms sit in the two trees. Without the sandwich the names
+# are the same; with it three of the four move, because HF names its norms
+# after the sublayer they follow while dew names them after what they
+# normalize: HF's post_attention_layernorm normalizes the attention output
+# (our attention_output_norm), its pre_feedforward_layernorm is the MLP's
+# pre-norm (our post_attention_layernorm) and its post_feedforward_layernorm
+# normalizes the MLP output (our mlp_output_norm).
+_PRE_NORMS = {
     'input_layernorm': 'input_layernorm',
-    'pre_feedforward_layernorm': 'post_attention_layernorm',
-    'self_attn': 'self_attn',
-    'mlp': 'mlp',
+    'post_attention_layernorm': 'post_attention_layernorm',
+}
+_SANDWICH_NORMS = {
+    'input_layernorm': 'input_layernorm',
     'post_attention_layernorm': 'attention_output_norm',
+    'pre_feedforward_layernorm': 'post_attention_layernorm',
     'post_feedforward_layernorm': 'mlp_output_norm',
 }
-_SUBLAYERS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj',
-                            'q_norm', 'k_norm'),
-              'mlp': ('gate_proj', 'up_proj', 'down_proj')}
+_PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
+                'mlp': ('gate_proj', 'up_proj', 'down_proj')}
+_HEAD_NORMS = ('q_norm', 'k_norm')
+
+
+def _norm_names(sandwich: bool) -> Dict[str, str]:
+    return _SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
 def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
@@ -268,7 +276,7 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
     None means the tensor has no place in the tree: the tied lm_head a
     checkpoint carries as a copy of the embedding. A name the map cannot
     explain at all raises, so an unfamiliar checkpoint fails here instead of
-    producing a half-loaded model.
+    loading a model with half its weights.
     """
     parts = hf_name.split('.')
     if parts == ['model', 'norm', 'weight']:
@@ -278,27 +286,20 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
 
-    if len(parts) == 4 and parts[0] == 'model' and parts[1] == 'layers':
-        layer, module, leaf = parts[2:]
-        if (not layer.isdigit() or module not in _LAYER_MODULES
-                or leaf != 'weight' or _LAYER_MODULES[module] in _SUBLAYERS):
-            raise ValueError(f"unknown tensor name {hf_name!r}")
-        return (f'layers_{layer}', _LAYER_MODULES[module], 'scale')
-
-    if len(parts) == 5 and parts[0] == 'model' and parts[1] == 'layers':
-        layer, module, sublayer, leaf = parts[2:]
-        if not layer.isdigit() or module not in _LAYER_MODULES:
-            raise ValueError(f"unknown tensor name {hf_name!r}")
-        ours = _LAYER_MODULES[module]
-        if module in _SUBLAYERS:
-            if sublayer not in _SUBLAYERS[module] or leaf not in ('weight', 'bias'):
-                raise ValueError(f"unknown tensor name {hf_name!r}")
-            # torch Linear stores [out, in]; nn.Dense keeps [in, out] in .kernel
-            return (f'layers_{layer}', ours, sublayer,
-                    'kernel' if leaf == 'weight' else 'bias')
-        if sublayer or leaf != 'weight':
-            raise ValueError(f"unknown tensor name {hf_name!r}")
-        return (f'layers_{layer}', ours, 'scale')
+    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+        layer, module, leaf = f'layers_{parts[2]}', parts[3], parts[-1]
+        if module in _PROJECTIONS and len(parts) == 6:
+            sublayer = parts[4]
+            if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
+                # torch Linear holds [out, in]; nn.Dense keeps [in, out]
+                return (layer, module, sublayer,
+                        'kernel' if leaf == 'weight' else 'bias')
+            if (module == 'self_attn' and sublayer in _HEAD_NORMS
+                    and leaf == 'weight'):
+                return (layer, module, sublayer, 'scale')
+        norms = _norm_names(bool(config.get('sandwich_norms')))
+        if len(parts) == 5 and module in norms and leaf == 'weight':
+            return (layer, norms[module], 'scale')
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
@@ -543,7 +544,10 @@ def _export_config(model) -> Dict[str, Any]:
 
 
 def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
-    """One flattened dew param path into its HF tensor name, or None."""
+    """One flattened dew param path into its HF tensor name, or None.
+
+    None is the tied lm_head: the embedding it copies is written instead.
+    """
     parts = dew_name.split('.')
     if parts == ['norm', 'scale']:
         return 'model.norm.weight'
@@ -552,17 +556,19 @@ def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
     if parts == ['lm_head', 'kernel']:
         return None if config['tie_word_embeddings'] else 'lm_head.weight'
 
-    if len(parts) == 4 and parts[0].startswith('layers_'):
-        layer, module, sublayer, leaf = parts
-        index = layer.removeprefix('layers_')
-        ours_to_hf = {ours: hf for hf, ours in _LAYER_MODULES.items()}
-        hf_module = ours_to_hf[module]
-        if module in ('self_attn', 'mlp'):
-            return f'model.layers.{index}.{hf_module}.{sublayer}.' + (
-                'weight' if leaf == 'kernel' else 'bias')
-        if leaf != 'scale':
-            raise ValueError(f"unknown parameter path {dew_name!r}")
-        return f'model.layers.{index}.{hf_module}.weight'
+    if parts[0].startswith('layers_'):
+        index = parts[0].removeprefix('layers_')
+        module, leaf = parts[1], parts[-1]
+        if len(parts) == 4 and module in _PROJECTIONS:
+            if parts[2] in _PROJECTIONS[module] and leaf in ('kernel', 'bias'):
+                return (f'model.layers.{index}.{module}.{parts[2]}.'
+                        + ('weight' if leaf == 'kernel' else 'bias'))
+            if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
+                return f'model.layers.{index}.self_attn.{parts[2]}.weight'
+        theirs = {ours: hf for hf, ours in
+                  _norm_names(config['model_type'] == _GEMMA).items()}
+        if len(parts) == 3 and module in theirs and leaf == 'scale':
+            return f'model.layers.{index}.{theirs[module]}.weight'
     raise ValueError(f"unknown parameter path {dew_name!r}")
 
 

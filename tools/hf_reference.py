@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import get_safetensors_metadata
+from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig,
     Qwen3Config, Qwen3ForCausalLM,
@@ -116,7 +116,11 @@ def write_tiny(name: str, model: torch.nn.Module) -> None:
 
 
 def write_tensor_table(directory: Path) -> None:
-    """The real checkpoint's tensor names, shapes and dtypes, no weights."""
+    """The real checkpoint's config, tensor names, shapes and dtypes.
+
+    No weights: the hub serves this table without them, so a test can hold
+    the parameter tree of a 1.5 GB checkpoint to account.
+    """
     metadata = get_safetensors_metadata(REAL_MODEL)
     tensors = {}
     for file_metadata in metadata.files_metadata.values():
@@ -124,7 +128,10 @@ def write_tensor_table(directory: Path) -> None:
             tensors[tensor_name] = {"shape": list(info.shape), "dtype": info.dtype}
     payload = {"repo": REAL_MODEL, "tensors": dict(sorted(tensors.items()))}
     (directory / "tensors.json").write_text(json.dumps(payload, indent=1) + "\n")
-    print(f"{directory / 'tensors.json'}: {len(tensors)} tensors")
+
+    config = hf_hub_download(REAL_MODEL, "config.json")
+    (directory / "config.json").write_text(Path(config).read_text())
+    print(f"{directory / 'tensors.json'}: {len(tensors)} tensors, with config.json")
 
 
 def write_real_reference(directory: Path) -> None:
