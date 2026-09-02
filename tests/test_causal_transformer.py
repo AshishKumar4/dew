@@ -238,6 +238,24 @@ def test_gemma_flags_scale_the_embeddings_and_cap_the_logits(rng):
     assert jnp.all(jnp.isfinite(logits))
 
 
+def test_gemma_zero_qk_norm_weights_are_identity(rng):
+    ids = tokens(rng)
+    qwen = tiny(num_layers=1, scale_offset=False)
+    gemma = tiny(num_layers=1, scale_offset=True)
+    qwen_params = qwen.init(rng, ids)
+    gemma_params = gemma.init(rng, ids)
+
+    for name in ("q_norm", "k_norm"):
+        qwen_scale = qwen_params["params"]["layers_0"]["self_attn"][name]["scale"]
+        gemma_scale = gemma_params["params"]["layers_0"]["self_attn"][name]["scale"]
+        assert jnp.all(qwen_scale == 1.0)
+        gemma_params["params"]["layers_0"]["self_attn"][name]["scale"] = (
+            jnp.zeros_like(gemma_scale))
+
+    assert jnp.allclose(gemma.apply(gemma_params, ids), qwen.apply(qwen_params, ids),
+                        atol=1e-6)
+
+
 def test_local_rope_only_moves_the_sliding_layers(rng):
     """rope_local_theta is Gemma3's second rope base: it must reach the sliding
     layers and leave the full-attention ones alone."""
