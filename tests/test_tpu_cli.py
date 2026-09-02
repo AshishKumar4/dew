@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -586,7 +587,7 @@ def test_train_syncs_detaches_on_all_workers_then_follows_worker_zero(fake, caps
     commands = ssh_commands(fake.gcloud_calls())
     started = [
         "mkdir -p $HOME/dew-runs/run-1 && "
-        f"nohup bash -c '{env_prefix()}cd ~/{REPO.name} && python recipes/lm/train.py "
+        f"nohup bash -c '{env_prefix()}cd $HOME/{REPO.name} && python recipes/lm/train.py "
         "--trainer.epochs 4 --trainer.multi-host True' "
         f"> $HOME/dew-runs/run-1/worker-{worker}.log 2>&1 < /dev/null & "
         'echo "job run-1 pid $!"'
@@ -594,6 +595,32 @@ def test_train_syncs_detaches_on_all_workers_then_follows_worker_zero(fake, caps
     assert sorted(commands[:2]) == started
     assert commands[2] == "tail -f -n 200 $HOME/dew-runs/run-1/worker-0.log"
     assert "following worker 0" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [
+    ("train", "slice", "--job", "j 1", "--", "recipes/lm/train.py"),
+    ("run", "slice", "--detach", "--job", "j;1", "--", "true"),
+    ("logs", "slice", "../etc/passwd"),
+])
+def test_a_job_name_that_would_break_the_remote_path_is_refused(fake, argv):
+    """The job is a directory under ~/dew-runs and a redirect target, so a name
+    with a space or a separator sends the log somewhere logs cannot read it."""
+    fake.offer("slice", "us-central2-b")
+    flags, rest = tpu_cli._split(argv)
+    with pytest.raises(SystemExit, match="job"):
+        run(*flags, *(["--", *rest] if rest else []))
+    assert not any("dew-runs" in command for command in ssh_commands(fake.gcloud_calls()))
+
+
+def test_a_repo_path_with_a_space_reaches_the_remote_shell_quoted(fake, monkeypatch):
+    fake.offer("slice", "us-central2-b")
+    monkeypatch.setattr(tpu_cli, "_git_root", lambda: Path("/tmp/my repo"))
+    assert run("train", "slice", "--job", "run-1", "--", "recipes/lm/train.py") == 0
+    assert fake.rsync_calls()[0][-1] == "you@34.0.0.1:~/'my repo'/"
+    # The inner command is quoted again for bash -c, so read it back as a shell
+    # word instead of matching the escaped form.
+    tokens = shlex.split(ssh_commands(fake.gcloud_calls())[0])
+    assert "cd $HOME/'my repo' &&" in tokens[tokens.index("-c") + 1]
 
 
 def test_spawn_creates_sets_up_and_runs_on_each_tpu(fake, capsys):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import getpass
+import re
 import shlex
 import subprocess
 import sys
@@ -26,6 +27,9 @@ from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
 READY_TIMEOUT = 1800
 POLL_SECONDS = 10
+
+#: What a job name may contain: it is a directory under ~/dew-runs.
+JOB_NAME = re.compile(r"[A-Za-z0-9._-]+")
 
 Positional = tyro.conf.Positional
 
@@ -179,7 +183,7 @@ def _rsync_argv(root: Path, user: str, host: str, excludes: Sequence[str],
         "--filter=:- .gitignore",
         *(f"--exclude={pattern}" for pattern in excludes),
         "-e", remote_shell,
-        f"{root}/", f"{user}@{host}:~/{root.name}/",
+        f"{root}/", f"{user}@{host}:~/{shlex.quote(root.name)}/",
     ]
 
 
@@ -213,6 +217,19 @@ def _hosts(tpu: Tpu, count: int) -> list[str]:
 
 def _job_id(name: str) -> str:
     return f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+
+
+def _job(job: str, name: str) -> str:
+    """A job name that is a directory under ~/dew-runs, or the timestamped one.
+
+    gcloud already restricts TPU names to this alphabet, so the default is
+    always fine; a name from --job or from logs is what needs checking.
+    """
+    job = job or _job_id(name)
+    if not JOB_NAME.fullmatch(job):
+        raise SystemExit("a job name takes letters, digits, dot, dash and "
+                         f"underscore, got {job!r}")
+    return job
 
 
 # -------------------------------------------------------------------- commands
@@ -473,7 +490,7 @@ class Run(Base):
         command = shlex.join(rest)
         if not self.detach:
             return exit_code(tpu.fanout([(index, tpu_setup.wrap(command)) for index in workers]))
-        job = self.job or _job_id(self.name)
+        job = _job(self.job, self.name)
         results = tpu.fanout([
             (index, tpu_setup.detached(command, job, index)) for index in workers])
         emit(f"job {job}: dew-tpu logs {self.name} {job} --follow")
@@ -497,10 +514,11 @@ class Logs(Base):
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
+        job = _job(self.job, self.name)
         tpu = _tpu(self, cfg, gcloud, self.name)
         workers = _workers(self.worker, tpu, cfg)
         return exit_code(tpu.fanout([
-            (index, tpu_setup.tail(self.job, index, self.follow, self.lines))
+            (index, tpu_setup.tail(job, index, self.follow, self.lines))
             for index in workers]))
 
 
@@ -635,16 +653,16 @@ class Train(Base):
     def run(self, rest: list[str]) -> int:
         if not rest:
             raise SystemExit("dew-tpu train NAME -- recipes/lm/train.py [FLAGS]")
+        job = _job(self.job, self.name)
         cfg, gcloud = _open(self)
         tpu = _tpu(self, cfg, gcloud, self.name)
         count, _ = _slice(tpu, cfg)
         root, code = _sync(tpu, cfg, count, (), self.delete)
         if code:
             return code
-        job = self.job or _job_id(self.name)
         command = shlex.join(["python", *rest, "--trainer.multi-host", "True"])
         results = tpu.fanout([
-            (index, tpu_setup.detached(command, job, index, cwd=f"~/{root.name}"))
+            (index, tpu_setup.detached(command, job, index, home_dir=root.name))
             for index in range(count)])
         code = exit_code(results)
         if code:

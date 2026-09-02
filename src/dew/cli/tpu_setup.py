@@ -11,7 +11,8 @@ import shlex
 #: Paths the remote side owns. The commands agree on these and nothing else.
 VENV = "$HOME/dew-venv"
 ENV_FILE = "$HOME/.dew-env"
-RUNS_DIR = "$HOME/dew-runs"
+RUNS = "dew-runs"
+RUNS_DIR = f"$HOME/{RUNS}"
 MOUNT_PATH = "$HOME/gcs_mount"
 DISK_MOUNT = "/mnt/persist"
 
@@ -171,16 +172,29 @@ def wrap(command: str) -> str:
     return f". {ENV_FILE} 2>/dev/null; {command}"
 
 
+def home_path(*parts: str) -> str:
+    """A path under the worker's home, each part quoted for the remote shell.
+
+    $HOME stays outside the quotes so the shell still expands it. A part that
+    needs no quoting is left as it is, which is every job name the CLI accepts.
+    """
+    return "$HOME/" + "/".join(shlex.quote(part) for part in parts)
+
+
 def log_path(job: str, worker: int) -> str:
-    return f"{RUNS_DIR}/{job}/worker-{worker}.log"
+    return home_path(RUNS, job, f"worker-{worker}.log")
 
 
-def detached(command: str, job: str, worker: int, cwd: str = "") -> str:
-    """Start a command under nohup and return once it is running."""
-    inner = wrap(f"cd {cwd} && {command}" if cwd else command)
+def detached(command: str, job: str, worker: int, home_dir: str = "") -> str:
+    """Start a command under nohup and return once it is running.
+
+    home_dir is a directory under the worker's home to run in, which is where
+    `sync` puts the working tree.
+    """
+    inner = wrap(f"cd {home_path(home_dir)} && {command}" if home_dir else command)
     log = log_path(job, worker)
     return (
-        f"mkdir -p {RUNS_DIR}/{job} && "
+        f"mkdir -p {home_path(RUNS, job)} && "
         f"nohup bash -c {shlex.quote(inner)} > {log} 2>&1 < /dev/null & "
         f'echo "job {job} pid $!"'
     )
