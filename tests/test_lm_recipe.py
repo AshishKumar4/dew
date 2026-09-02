@@ -69,6 +69,17 @@ def test_the_run_writes_its_sequence_length_onto_the_data_config():
     assert data_config.dataset == "tokens" and data_config.batch_size == 4
 
 
+def trainer_config(tmp_path, **kwargs):
+    """Trainer settings for a recipe run inside the test process.
+
+    multi_host is off because prepare_process otherwise asks
+    jax.distributed.initialize() for a process pool, which a test that has
+    already touched JAX cannot join.
+    """
+    return TrainerConfig(distributed_training=False, multi_host=False,
+                         checkpoint_dir=str(tmp_path / "checkpoints"),
+                         compilation_cache_dir=None, **kwargs)
+
 
 def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
     recipe = load_recipe()
@@ -93,9 +104,7 @@ def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
         model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1}),
         data=DataConfig(dataset=str(dataset), batch_size=BATCH, val_steps_per_epoch=1),
         optim=OptimConfig(learning_rate=3e-3),
-        trainer=TrainerConfig(epochs=1, steps_per_epoch=3, distributed_training=False,
-                              checkpoint_dir=str(tmp_path / "checkpoints"),
-                              compilation_cache_dir=None),
+        trainer=trainer_config(tmp_path, epochs=1, steps_per_epoch=3),
         sequence_length=SEQ,
         sample_tokens=0,
     )
@@ -135,7 +144,7 @@ def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path, m
 
     config = recipe.LmRunConfig(
         data=DataConfig(dataset=str(dataset)),
-        trainer=TrainerConfig(compilation_cache_dir=None),
+        trainer=trainer_config(tmp_path),
         tokenizer="gpt2",
     )
     with pytest.raises(ValueError, match="written with byte"):
@@ -158,9 +167,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path):
                           {"emb_features": 32, "num_layers": 2, "num_heads": 2}),
         data=DataConfig(dataset=str(dataset), batch_size=4, val_steps_per_epoch=1,
                         worker_count=0),
-        trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path / "checkpoints"),
-                              compilation_cache_dir=None),
+        trainer=trainer_config(tmp_path, epochs=1, steps_per_epoch=2),
         sequence_length=32,
         sample_prompt="the ",
         sample_tokens=8,
