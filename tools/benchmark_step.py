@@ -40,6 +40,7 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
 from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.objectives.lm import LMObjective
 from dew.registry import MODEL_REGISTRY, build_model
 from dew.telemetry.instrumentation import compiled_flops
 from dew.training import ObjectiveTrainer
@@ -100,11 +101,17 @@ class Case:
     """Video models take (frames, H, W, C) samples; 0 means images."""
     predictor: Optional[dict] = None
     """Set for JEPA: the architecture is an encoder and this builds its predictor."""
+    seq_len: int = 0
+    """Set for language models: batches are token windows of this length, not images."""
     fsdp_min_param_size: int = 2 ** 16
 
     @property
     def is_jepa(self) -> bool:
         return self.predictor is not None
+
+    @property
+    def is_lm(self) -> bool:
+        return self.seq_len > 0
 
     @property
     def sample_shape(self) -> tuple:
@@ -127,6 +134,9 @@ def cpu_smoke_cases() -> list[Case]:
              predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
                         "num_layers": 1, "num_heads": 2, "mlp_ratio": 2},
              batch_size=8, image_size=16, fsdp_min_param_size=256),
+        Case("causal_transformer", {"vocab_size": 256, "emb_features": 32, "num_layers": 2,
+                                    "num_heads": 2, "mlp_ratio": 2, "max_seq_len": 16},
+             batch_size=8, seq_len=16, fsdp_min_param_size=256),
     ]
 
 
@@ -167,6 +177,11 @@ def small_cases(dtype: str) -> list[Case]:
         Case("jepa_video_encoder", {**encoder, "num_layers": 4},
              predictor={**predictor, "num_layers": 2, "factorized": True},
              batch_size=4, image_size=64, frames=8),
+        # GPT-2 small's width and heads at a quarter of its depth, 512-token windows
+        Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
+                                    "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512,
+                                    "dtype": dtype},
+             batch_size=16, seq_len=512),
     ]
     # jepa_predictor has no step of its own: it is built through the registry
     # inside the two JEPA cases above.
@@ -267,6 +282,10 @@ def build_trainer(case: Case, checkpoint_dir: str) -> ObjectiveTrainer:
         checkpoint_base_path=checkpoint_dir,
     )
 
+    if case.is_lm:
+        objective = LMObjective(model, case.seq_len, vocab_size=case.config["vocab_size"])
+        return ObjectiveTrainer(input_config=None, objective=objective, **common)
+
     if case.is_jepa:
         patch = case.config.get("patch_size", 16)
         grid = (case.image_size // patch, case.image_size // patch)
@@ -297,11 +316,15 @@ def build_trainer(case: Case, checkpoint_dir: str) -> ObjectiveTrainer:
 def batches(case: Case):
     """One host batch, reused: the loader is benchmarked by benchmark_data.py."""
     rng = np.random.default_rng(0)
-    sample_key = "video" if case.frames else "image"
-    batch = {sample_key: rng.integers(
-        0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)}
-    if not case.is_jepa:
-        batch["text"] = np.ones((case.batch_size, TEXT_TOKENS), np.int32)
+    if case.is_lm:
+        batch = {"text": rng.integers(0, case.config["vocab_size"],
+                                      size=(case.batch_size, case.seq_len + 1)).astype(np.int32)}
+    else:
+        sample_key = "video" if case.frames else "image"
+        batch = {sample_key: rng.integers(
+            0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)}
+        if not case.is_jepa:
+            batch["text"] = np.ones((case.batch_size, TEXT_TOKENS), np.int32)
     while True:
         yield batch
 
@@ -358,7 +381,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "architecture": case.architecture,
         "batch_size": case.batch_size,
         "fsdp_size": case.fsdp_size,
-        "sample_shape": list(case.sample_shape),
+        "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
         "devices": trainer.mesh.devices.size,
         "device_kind": jax.devices()[0].device_kind,
         "params": parameter_count(state.params),

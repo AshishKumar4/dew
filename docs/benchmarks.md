@@ -33,9 +33,10 @@ driver 595.84, RTX 4080 16 GiB, dew at `2cc0bff`. Every model in bf16
 | unet_3d            | 8x64x64x3 |     4 |  11,045,699 |    37.1 |     107.7 |      145.8 |  4.0% |     1.72 |     114.1 |     5 |
 | jepa_encoder       | 64x64x3   |    16 |  12,149,568 |    12.0 |    1329.0 |      261.3 | 22.3% |     0.69 |      46.2 |     5 |
 | jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    21.5 |     186.0 |      621.6 | 29.6% |     1.26 |      76.8 |     5 |
+| causal_transformer | 512 tokens |    16 |  66,950,784 |    83.8 |     190.9 |     1320.1 | 16.2% |     5.80 |      19.5 |    10 |
 
 `jepa_predictor` has no step of its own: it is built through the registry and
-trained inside the two JEPA rows.
+trained inside the two JEPA rows. The `causal_transformer` row is GPT-2 small's width at three layers with a 50k vocabulary, measured on 2026-09-02 after the language model wave landed; its FLOPs are dominated by the vocabulary projection.
 
 `*` marks a peak that is an upper bound rather than that row's own figure. The
 allocator's high-water mark is monotonic for the life of a process and has no
