@@ -662,8 +662,10 @@ class Spawn(Base):
     """Extras to install during setup."""
 
     def run(self, rest: list[str]) -> int:
+        cfg, gcloud = _open(self)
         names = [f"{self.base}-{index}" for index in range(self.count)]
         zone = self.zone
+        command = shlex.join(rest)
 
         def one(name: str) -> tuple[str, str, str]:
             emit(f"[{name}] create")
@@ -672,13 +674,15 @@ class Spawn(Base):
             emit(f"[{name}] setup")
             Setup(name=name, extras=self.extras, type=self.type,
                   zone=zone, dry_run=self.dry_run).run([])
-            job = ""
-            if rest:
-                job = _job_id(name)
-                emit(f"[{name}] run {job}")
-                Run(name=name, worker="all", detach=True, job=job,
-                    zone=zone, dry_run=self.dry_run).run(rest)
-            return name, "ready", job or "-"
+            if not command:
+                return name, "ready", "-"
+            tpu = _tpu(self, cfg, gcloud, name)
+            count, _ = _slice(tpu, cfg, self.type or "")
+            job = _job_id(name)
+            emit(f"[{name}] run {job}")
+            tpu.fanout([(index, tpu_setup.detached(command, job, index))
+                        for index in range(count)])
+            return name, "ready", job
 
         rows = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, self.count)) as pool:
