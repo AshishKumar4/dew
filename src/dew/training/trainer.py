@@ -15,6 +15,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
 from typing import Dict, Callable, Any, Tuple, Optional
 from dew.random_state import RandomMarkovState
+from dew.objectives.base import shape_and_dtype
 from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
@@ -194,7 +195,11 @@ class SimpleTrainer:
             print(f"Overriding start step to {self.latest_step}")
 
     def get_input_ones(self):
-        return {k: jnp.ones((1, *v)) for k, v in self.input_shapes.items()}
+        ones = {}
+        for key, entry in self.input_shapes.items():
+            shape, dtype = shape_and_dtype(entry)
+            ones[key] = jnp.ones((1, *shape), dtype)
+        return ones
 
     def _build_state(self, init_fn) -> SimpleTrainState:
         """Materialise a train state directly into its sharded layout.

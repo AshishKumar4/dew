@@ -60,17 +60,17 @@ from dew.eval.common import EvaluationMetric
 class ObjectiveTrainer(SimpleTrainer):
     """Runs an Objective: gradients, sharding, EMA, checkpoints and logging.
 
-    Handles image data (4D tensors: B,H,W,C) and video data (5D tensors:
-    B,T,H,W,C), any number of conditioning inputs and any model architecture.
-    What the loss is stays with the objective, which defaults to diffusion over
-    `model`.
+    Handles image data (4D tensors: B,H,W,C), video data (5D tensors:
+    B,T,H,W,C) and token sequences (2D tensors: B,S), any number of
+    conditioning inputs and any model architecture. What the loss is stays with
+    the objective, which defaults to diffusion over `model`.
     """
     
     def __init__(self,
                  model: nn.Module,
                  optimizer: optax.GradientTransformation,
-                 input_config: DiffusionInputConfig,
                  rngs: jax.random.PRNGKey,
+                 input_config: Optional[DiffusionInputConfig] = None,
                  noise_schedule: NoiseScheduler = None,
                  objective: Objective = None,
                  unconditional_prob: float = 0.12,
@@ -92,7 +92,9 @@ class ObjectiveTrainer(SimpleTrainer):
         Args:
             model: Neural network model
             optimizer: Optimization algorithm
-            input_config: Configuration for input data, including keys, shapes and conditioning inputs
+            input_config: How a batch maps onto the model's inputs, with its
+                shapes and conditioning. Diffusion needs one; an objective that
+                declares its own input_shapes (a language model's token ids) does not.
             rngs: Random number generator keys
             noise_schedule: Noise scheduler for the default diffusion objective
             objective: What to optimize. Defaults to diffusion over `model`.
@@ -106,15 +108,22 @@ class ObjectiveTrainer(SimpleTrainer):
                 otherwise the EMA runs on a different clock than the params.
             **kwargs: Additional arguments for parent class
         """
-        input_shapes = input_config.get_input_shapes(
-            autoencoder=autoencoder,
-        )
+        if input_config is not None:
+            input_shapes = input_config.get_input_shapes(
+                autoencoder=autoencoder,
+            )
+        elif objective is not None and objective.input_shapes is not None:
+            input_shapes = objective.input_shapes
+        else:
+            raise ValueError(
+                "ObjectiveTrainer needs an input_config, or an objective that "
+                "declares input_shapes")
         self.eval_metrics = eval_metrics
         if grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be at least 1, got {grad_accum_steps}")
         self.grad_accum_steps = grad_accum_steps
 
-        if native_resolution is None:
+        if native_resolution is None and input_config is not None:
             sample_shape = input_config.sample_data_shape
             native_resolution = sample_shape[-2]
             if autoencoder is not None:
@@ -137,7 +146,7 @@ class ObjectiveTrainer(SimpleTrainer):
 
         if wandb_config is not None:
             # If input_config is not in wandb_config, add it
-            if 'input_config' not in wandb_config['config']:
+            if input_config is not None and 'input_config' not in wandb_config['config']:
                 wandb_config['config']['input_config'] = input_config.serialize()
             # If model is not in wandb_config, add it
             if 'model' not in wandb_config['config']:
@@ -147,10 +156,12 @@ class ObjectiveTrainer(SimpleTrainer):
                 wandb_config['config']['autoencoder_opts'] = json.dumps(autoencoder.serialize())
 
             # Names the wandb model artifact, so runs of different objectives on
-            # the same dataset and resolution do not collide
+            # the same dataset and resolution do not collide. A run with no
+            # input_config has no resolution to be named by.
             dataset_name = wandb_config['config']['arguments']['dataset']
-            self.modelname = (
-                f"{objective.tag}-{dataset_name}-res{input_config.sample_data_shape[-2]}")
+            resolution = ('' if input_config is None
+                          else f"-res{input_config.sample_data_shape[-2]}")
+            self.modelname = f"{objective.tag}-{dataset_name}{resolution}"
             print("Model name:", self.modelname)
             wandb_config['config']['modelname'] = self.modelname
 
