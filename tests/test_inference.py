@@ -214,6 +214,16 @@ def test_load_from_checkpoint_picks_the_best_step(tmp_path):
     assert int(load_from_checkpoint(trainer.checkpoint_path(), step=1)["step"]) == 0
 
 
+def test_a_single_step_directory_is_its_own_best_checkpoint(tmp_path):
+    trainer = make_trainer(tmp_path, name="single-best")
+    trainer.save(epoch=0, step=1, metrics={"loss": 0.2})
+    trainer.wait_for_checkpoints()
+    step_dir = get_latest_checkpoint(trainer.checkpoint_path())
+
+    state = load_from_checkpoint(step_dir, step="best")
+    assert int(state["step"]) == 0
+
+
 # --------------------------------------------------------------------------
 # parse_config across config generations
 # --------------------------------------------------------------------------

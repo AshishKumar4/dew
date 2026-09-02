@@ -158,9 +158,8 @@ def load_from_checkpoint(
     subdirectories or a single step directory, which is what an unpacked
     wandb artifact is.
 
-    'best' is the step whose epoch loss was the lowest of those recorded.
-    Checkpoints that record no loss carry their own copy of the best state,
-    and that copy is what 'best' means for them.
+    'best' is the manager step with the lowest recorded epoch loss. A single
+    step directory is its own best; a legacy best_state inside it still wins.
 
     Raises if the checkpoint cannot be read: the callers below decide what a
     failed load means, and reporting it as an empty state made an unusable
@@ -177,7 +176,10 @@ def load_from_checkpoint(
     latest = manager.latest_step() if steps else checkpoint_dir
 
     if step == 'best':
-        best = manager.best_step() if steps else None
+        if not steps:
+            stored = manager.restore(latest)
+            return stored.get('best_state', stored['state'])
+        best = manager.best_step()
         if best is not None:
             print(f"Loading best checkpoint (step {best}) from {checkpoint_dir}")
             return manager.restore(best)['state']
