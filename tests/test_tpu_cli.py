@@ -311,9 +311,10 @@ def test_stop_then_start(fake):
         "compute", "tpus", "tpu-vm", "stop", "slice", "--zone=us-central2-b")]
     assert only(fake.gcloud_calls(), "start") == [gcloud(
         "compute", "tpus", "tpu-vm", "start", "slice", "--zone=us-central2-b")]
-    # start waits for READY again, so it describes afterwards.
+    # Each command confirms where the TPU is with a describe, and start waits
+    # for READY afterwards.
     assert [call[3] for call in fake.gcloud_calls()] == [
-        "describe", "stop", "start", "describe"]
+        "describe", "stop", "describe", "start", "describe"]
 
 
 def test_list_reads_every_configured_zone(fake, capsys):
@@ -706,7 +707,33 @@ def test_zone_search_follows_the_configured_order_and_caches(fake):
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "europe-west4-a"}
     fake.calls_path.unlink()
     assert run("describe", "slice") == 0
-    assert zones_seen(fake.gcloud_calls(), "describe") == ["europe-west4-a"]
+    assert zones_seen(fake.gcloud_calls(), "describe") == [
+        "europe-west4-a", "europe-west4-a"]
+
+
+def test_a_cached_zone_that_stopped_answering_is_replaced(fake):
+    """A TPU recreated in another zone used to make every command fail with
+    'not in Z. Pass --zone' until the cache file was edited by hand."""
+    tpu_config.cache_zone("slice", "us-east1-d")
+    fake.offer("slice", "europe-west4-a")
+    assert run("describe", "slice") == 0
+    assert zones_seen(fake.gcloud_calls(), "describe") == [
+        "us-east1-d", "us-central2-b", "europe-west4-a", "europe-west4-a"]
+    assert json.loads((config_dir() / "zones.json").read_text()) == {
+        "slice": "europe-west4-a"}
+
+
+def test_a_tpu_that_is_nowhere_leaves_no_cache_entry_behind(fake):
+    tpu_config.cache_zone("ghost", "us-east1-d")
+    with pytest.raises(SystemExit, match="ghost is in none of"):
+        run("describe", "ghost")
+    assert json.loads((config_dir() / "zones.json").read_text()) == {}
+
+
+def test_a_worker_that_is_not_an_index_says_which_flag_is_wrong(fake):
+    fake.offer("slice", "us-central2-b")
+    with pytest.raises(SystemExit, match="--worker"):
+        run("run", "slice", "--worker", "x", "--", "uptime")
 
 
 def test_the_zone_flag_skips_the_search_and_is_not_cached(fake):
