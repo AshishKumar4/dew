@@ -146,7 +146,6 @@ class LMObjective(Objective):
         return validate
 
     def log_validation_artifacts(self, wandb, artifacts, step: int):
-        wandb.log({"val/perplexity": float(jnp.exp(artifacts["ce"]))}, step=step)
         tokens = artifacts.get("tokens")
         if tokens is None:
             return

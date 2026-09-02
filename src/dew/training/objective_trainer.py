@@ -344,9 +344,11 @@ class ObjectiveTrainer(SimpleTrainer):
                         self.objective.log_validation_artifacts(
                             self.wandb, artifacts, current_step)
 
-            # Flatten the metrics
             if metrics:
-                metrics = {k: np.mean(v) for k, v in metrics.items()}
+                metrics = {
+                    metric.name: metric.reducer(metrics[metric.name])
+                    for metric in self.eval_metrics
+                }
                 # Update the best validation metrics (min or max per metric direction)
                 for key, value in metrics.items():
                     final_key = f"val/{key}"
