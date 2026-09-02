@@ -49,6 +49,10 @@ if program == "rsync":
 
 group = argv[:3]
 verb = argv[3] if len(argv) > 3 else ""
+if argv[:2] == ["config", "get-value"]:
+    print(state.get("gcloud_project", ""))
+    raise SystemExit(0)
+
 if group == ["compute", "tpus", "queued-resources"]:
     raise SystemExit(0)
 if group != ["compute", "tpus", "tpu-vm"]:
@@ -258,6 +262,27 @@ def test_create_spot_queued_disk_and_explicit_version(fake):
         "source=projects/my-project/zones/europe-west4-a/disks/disk-1",
         f"--metadata-from-file=startup-script={script}")
     assert "mount /dev/sdb /mnt/persist" in script.read_text()
+
+
+def test_create_disk_reads_the_project_from_gcloud_when_the_config_has_none(fake):
+    """The disk source is the only argv that needs the project spelled out, and
+    an empty one builds projects//zones/... which gcloud rejects at create."""
+    tpu_config.save(replace(CONFIG, project=""))
+    fake.state["gcloud_project"] = "from-gcloud"
+    fake.flush()
+    fake.offer("slice", "us-central2-b")
+    assert run("create", "slice", "--disk", "d1") == 0
+    created = only(fake.gcloud_calls(), "create")[0]
+    assert ("--data-disk=mode=read-write,"
+            "source=projects/from-gcloud/zones/us-central2-b/disks/d1") in created
+
+
+def test_create_disk_says_so_when_no_project_is_configured_anywhere(fake):
+    tpu_config.save(replace(CONFIG, project=""))
+    fake.offer("slice", "us-central2-b")
+    with pytest.raises(SystemExit, match="needs a project"):
+        run("create", "slice", "--disk", "d1")
+    assert only(fake.gcloud_calls(), "create") == []
 
 
 def test_delete_removes_the_queued_resource_that_holds_the_node(fake):

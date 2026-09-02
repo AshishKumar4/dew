@@ -63,6 +63,22 @@ def _open(cmd: Base) -> tuple[config.TpuConfig, Gcloud]:
     return cfg, Gcloud(project=cfg.project, dry_run=cmd.dry_run)
 
 
+def _project(gcloud: Gcloud, cfg: config.TpuConfig) -> str:
+    """The project a disk source has to name.
+
+    Every other argv leaves --project off when the config has none and lets
+    gcloud use its own default. A disk source is a full resource path, so the
+    name has to be spelled out here.
+    """
+    if cfg.project:
+        return cfg.project
+    found = gcloud.config_value("project")
+    if not found:
+        raise SystemExit("--disk needs a project: set project in "
+                         f"{config.config_path()} or run gcloud config set project")
+    return found
+
+
 def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) -> str:
     """The zone a TPU lives in: the flag, the cache, or the first zone that has it."""
     if wanted:
@@ -286,7 +302,7 @@ class Create(Base):
         if self.spot:
             args.append("--spot")
         if disk:
-            source = f"projects/{cfg.project}/zones/{zone}/disks/{disk}"
+            source = f"projects/{_project(gcloud, cfg)}/zones/{zone}/disks/{disk}"
             args.append(f"--data-disk=mode=read-write,source={source}")
             args.append(f"--metadata-from-file=startup-script={_startup_script()}")
         gcloud.run(gcloud.argv(*args), capture=False, check=True)
