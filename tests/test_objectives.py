@@ -33,6 +33,16 @@ def tree_fingerprint(tree):
                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
 
 
+def tree_magnitude(tree):
+    """Sum of absolute values: no cancellation, so a relative tolerance means what it says.
+
+    Adam's moments sum to ~1e-5 from terms of order one, and that residual moves
+    by 0.2% between CPUs; the magnitude moves by 1e-13.
+    """
+    return sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(tree)
+               if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
+
+
 def make_trainer(tmp_path, **kwargs):
     train_schedule, _, transform = get_diffusion_preset("edm")
     return ObjectiveTrainer(
@@ -68,7 +78,7 @@ def test_diffusion_objective_reproduces_the_inlined_train_step(tmp_path):
     # what the objective computes would move it by orders of magnitude more.
     assert tree_fingerprint(state.params) == pytest.approx(8.209761425852776, rel=1e-6)
     assert tree_fingerprint(state.ema_params) == pytest.approx(8.22020611886387, rel=1e-6)
-    assert tree_fingerprint(state.opt_state) == pytest.approx(-1.3229545587499768e-05, rel=1e-4)
+    assert tree_magnitude(state.opt_state) == pytest.approx(2.6127838217179895, rel=1e-6)
 
 
 def test_train_step_returns_auxiliary_metrics(tmp_path):
