@@ -7,9 +7,12 @@ the model keeps the future out of a prediction.
 
 Cross entropy is computed in float32 even when the model runs in bfloat16: a
 bf16 logsumexp over a large vocabulary loses enough precision to move the loss
-and, through it, the gradient. Padding is excluded only when the run names the
-pad id, because packed token files have no padding and masking out a real id
-would quietly drop those tokens from the average.
+and, through it, the gradient. It is also computed one vocabulary chunk at a
+time, because the full `[tokens, vocab]` logits tensor is the largest thing in
+a step and every pass over it costs bandwidth; `chunked` holds the arithmetic
+and the reason. Padding is excluded only when the run names the pad id,
+because packed token files have no padding and masking out a real id would
+quietly drop those tokens from the average.
 
 Validation reports the teacher-forced cross entropy, which the perplexity
 metric scores, and the text the model writes from a fixed prompt, which is the
@@ -21,9 +24,9 @@ from typing import Any, Callable, Dict, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew.objectives.base import EMASpec, Objective, shape_and_dtype
+from dew.objectives.lm.chunked import chunked_cross_entropy
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -61,9 +64,14 @@ class LMObjective(Objective):
         vocab_size: int,
         ema_decay: float = 0.999,
         pad_id: Optional[int] = None,
+        head_chunks: int = 4,
         samples: Optional[Dict[str, Any]] = None,
     ):
-        """`samples` configures the text logged at validation: a `prompt` of
+        """`head_chunks` is how many vocabulary slices the loss scores a batch
+        in; four is the measured best on one RTX 4080 at vocabulary 50,304,
+        see docs/research/lm-head.md.
+
+        `samples` configures the text logged at validation: a `prompt` of
         int32 ids (one, or several of equal length), `max_new_tokens`, a
         `temperature` (0 is greedy), an optional `top_k`, and the `decode`
         that turns ids back into a string. Unset logs no text."""
@@ -71,6 +79,7 @@ class LMObjective(Objective):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
         self.pad_id = pad_id
+        self.head_chunks = head_chunks
         self.samples = samples
         self.ema = EMASpec(decay=lambda step: ema_decay)
 
@@ -90,10 +99,15 @@ class LMObjective(Objective):
                 f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
-        logits = self.model.apply(params, inputs, train=train, rngs=rngs)
-        logits = logits.astype(jnp.float32)
-        losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-        correct = (jnp.argmax(logits, axis=-1) == targets).astype(losses.dtype)
+        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
+                                  method=type(self.model).hidden_states)
+        head = self.model.apply(params, params["params"],
+                                method=type(self.model).head_weight)
+        losses, predicted = chunked_cross_entropy(
+            hidden, head, targets, self.head_chunks,
+            softcap=self.model.final_logit_softcap,
+            precision=self.model.precision)
+        correct = (predicted == targets).astype(losses.dtype)
 
         weights = (jnp.ones_like(losses) if self.pad_id is None
                    else (targets != self.pad_id).astype(losses.dtype))

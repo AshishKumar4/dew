@@ -10,6 +10,8 @@ without a DiffusionInputConfig to describe the inputs. The real sampler runs
 in test_lm_recipe.
 """
 
+from typing import Optional
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -35,9 +37,12 @@ TINY = 64
 class TinyCausalLM(nn.Module):
     """A small causal transformer, standing in for `causal_transformer`.
 
-    Same call contract as the real backbone: int32 ids `[B, S]` in, float32
-    logits `[B, S, vocab]` out, `train` gating dropout, and no path from a
-    position to a later one.
+    Same contract as the real backbone: int32 ids `[B, S]` in, float32 logits
+    `[B, S, vocab]` out, `train` gating dropout, no path from a position to a
+    later one, and the head split off behind `hidden_states` and
+    `head_weight` so the loss can score a vocabulary slice at a time. The
+    head carries no bias, which is what makes `hidden @ head_weight` the
+    whole projection.
     """
 
     vocab_size: int
@@ -45,9 +50,22 @@ class TinyCausalLM(nn.Module):
     num_layers: int = 2
     max_seq_len: int = 64
     dropout_rate: float = 0.0
+    final_logit_softcap: Optional[float] = None
+    precision = None
+
+    def setup(self):
+        self.lm_head = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.float32,
+                                name="lm_head")
+
+    def __call__(self, tokens, train: bool = False):
+        logits = self.lm_head(self.hidden_states(tokens, train=train))
+        if self.final_logit_softcap is not None:
+            cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
+            logits = cap * jnp.tanh(logits / cap)
+        return logits.astype(jnp.float32)
 
     @nn.compact
-    def __call__(self, tokens, train: bool = False):
+    def hidden_states(self, tokens, train: bool = False):
         length = tokens.shape[1]
         positions = self.param("positions", nn.initializers.normal(0.02),
                                (self.max_seq_len, self.emb_features))
@@ -67,7 +85,10 @@ class TinyCausalLM(nn.Module):
             h = nn.LayerNorm()(x)
             x = x + nn.Dense(self.emb_features)(nn.gelu(nn.Dense(2 * self.emb_features)(h)))
 
-        return nn.Dense(self.vocab_size)(nn.LayerNorm()(x)).astype(jnp.float32)
+        return nn.LayerNorm()(x)
+
+    def head_weight(self, params):
+        return params["lm_head"]["kernel"].astype(jnp.float32)
 
 
 class WandbRecorder:
@@ -247,17 +268,19 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     """Params stay fp32 and the loss is fp32 even when the model computes in bf16."""
     class Bf16LM(TinyCausalLM):
         @nn.compact
-        def __call__(self, tokens, train: bool = False):
-            embedded = nn.Embed(self.vocab_size, self.emb_features,
-                                dtype=jnp.bfloat16)(tokens)
-            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded)
+        def hidden_states(self, tokens, train: bool = False):
+            return nn.Embed(self.vocab_size, self.emb_features,
+                            dtype=jnp.bfloat16)(tokens)
 
     objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
     params = objective.init_params(jax.random.PRNGKey(0))
-    logits = objective.model.apply(params, token_batch()[TEXT_KEY][:, :-1])
+    inputs = token_batch()[TEXT_KEY][:, :-1]
+    hidden = objective.model.apply(params, inputs,
+                                   method=Bf16LM.hidden_states)
     loss, aux = objective.loss(params, params, token_batch(), jax.random.PRNGKey(0), 0)
 
-    assert logits.dtype == jnp.bfloat16
+    assert hidden.dtype == jnp.bfloat16
+    assert objective.model.apply(params, inputs).dtype == jnp.float32
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
     assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
 
