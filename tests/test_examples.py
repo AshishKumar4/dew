@@ -79,3 +79,23 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
 
     assert int(state.step) == 3
     assert (config.out / "encoder.safetensors").stat().st_size > 0
+
+
+def test_train_lm_example_trains_and_generates(tmp_path):
+    example = load_example("train_lm")
+    tokens = tmp_path / "tokens"
+    tokens.mkdir()
+    rs = np.random.RandomState(0)
+    for name, n in (("train.bin", 40_000), ("val.bin", 4_000)):
+        (tokens / name).write_bytes(rs.randint(97, 123, n).astype(np.uint8).tobytes())
+    (tokens / "meta.json").write_text('{"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}')
+    config = example.Config(
+        tokens=tokens, sequence_length=32, batch_size=8, epochs=1, steps_per_epoch=3,
+        emb_features=32, num_layers=1, num_heads=2, prompt="ab", sample_tokens=8, out=tmp_path / "run")
+    config.out.mkdir()
+
+    state = example.main(config)
+
+    assert int(state.step) == 3
+    text = (config.out / "sample.txt").read_text()
+    assert text.startswith("ab") and len(text) > 2

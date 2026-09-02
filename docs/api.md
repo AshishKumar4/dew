@@ -19,6 +19,7 @@ The public modules, and what each one is for.
 | `dew.objectives` | `Objective`, `EMASpec` |
 | `dew.objectives.diffusion` | `DiffusionObjective` |
 | `dew.objectives.jepa` | `JepaObjective`, `MultiBlockMask`, `representation_health`, `get_linear_probe_metric`, `get_knn_probe_metric` |
+| `dew.objectives.lm` | `LMObjective` |
 
 ## Diffusion
 
@@ -35,6 +36,7 @@ The public modules, and what each one is for.
 | `dew.registry` | `build_model`, `apply_precision_policy`, `canonicalize_architecture`, `map_config_strings`, `MODEL_REGISTRY` |
 | `dew.nn.backbones` | `Unet`, `UNet3D`, `UViT`, `SimpleUDiT`, `SimpleDiT`, `SimpleMMDiT`, `HierarchicalMMDiT`, `HybridSSMAttentionDiT`, `VideoDiT` |
 | `dew.nn.backbones.jepa` | `JepaEncoder`, `JepaVideoEncoder`, `JepaPredictor` |
+| `dew.nn.backbones.causal_transformer` | `CausalTransformer` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
 | `dew.nn` | `attention`, `blocks`, `dit`, `vit`, `ssm`, `scan_orders` |
 
@@ -45,6 +47,7 @@ The public modules, and what each one is for.
 | `dew.sampling` | `DiffusionSampler`, `DDPMSampler`, `DDIMSampler`, `EulerSampler`, `EulerAncestralSampler`, `HeunSampler`, `RK4Sampler`, `MultiStepDPM` |
 | `dew.sampling.pipelines` | `InferencePipeline`, `DiffusionInferencePipeline` |
 | `dew.sampling.loading` | `load_from_checkpoint`, `load_from_wandb_run`, `load_from_wandb_registry`, `parse_config` |
+| `dew.sampling.text` | `generate` |
 
 ## Inputs and data
 
@@ -54,7 +57,9 @@ The public modules, and what each one is for.
 | `dew.inputs.encoders` | `TextEncoder`, `CLIPTextEncoder`, `AudioEncoder`, `HFAudioEncoder` |
 | `dew.inputs.processors` | `AutoTextTokenizer`, `AutoAudioProcessor`, `defaultTextEncodeModel` |
 | `dew.data` | lazy re-exports of the loaders, sources and augmenters, so `import dew.data` costs nothing |
-| `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
+| `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_token_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
+| `dew.data.text` | `ByteTokenizer`, `HFTokenizer` |
+| `dew.data.sources.text` | `TokenFileSource` |
 | `dew.data.registry` | `datasetMap`, `onlineDatasetMap`, `mediaDatasetMap` |
 | `dew.data.sources.base` | `DataSource`, `DataAugmenter`, `MediaDataset` |
 | `dew.data.sources.images`, `.videos`, `.voxceleb2` | the TFDS, GCS, local video and VoxCeleb2 implementations |
@@ -63,7 +68,7 @@ The public modules, and what each one is for.
 
 | Module | Contents |
 | --- | --- |
-| `dew.eval` | `EvaluationMetric`, `get_fid_metric`, `get_clip_metric`, `get_clip_score_metric`, `get_psnr_metric`, `get_ssim_metric`, `psnr`, `ssim`, `frechet_distance` |
+| `dew.eval` | `EvaluationMetric`, `get_fid_metric`, `get_clip_metric`, `get_clip_score_metric`, `get_psnr_metric`, `get_ssim_metric`, `get_perplexity_metric`, `psnr`, `ssim`, `frechet_distance` |
 | `dew.interop` | `save_params`, `load_params`, `save_hf_layout` |
 | `dew.random_state` | `MarkovState`, `RandomMarkovState` |
 | `dew.image_ops` | `clip_images`, `denormalize_images` |

@@ -1,6 +1,6 @@
 # Recipes
 
-A recipe is a training entry point: it reads a config, builds the model, the data and the objective, and runs `ObjectiveTrainer.fit`. There are two, `recipes/diffusion/train.py` and `recipes/jepa/train.py`, and both expose `main(config)` which returns the trainer.
+A recipe is a training entry point: it reads a config, builds the model, the data and the objective, and runs `ObjectiveTrainer.fit`. There are three, `recipes/diffusion/train.py`, `recipes/jepa/train.py` and `recipes/lm/train.py`, and each exposes `main(config)`, which returns the trainer.
 
 ## The config tree
 
@@ -48,3 +48,13 @@ trainer = main(config)
 ```
 
 Use this when the run is part of a larger script, a sweep, or a notebook. For a one-off, the command line is the same thing with less typing.
+
+## Language models
+
+```bash
+python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte --val-fraction 0.02
+python recipes/lm/train.py --data.dataset data/shakespeare --sequence-length 256 \
+    --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}' --sample-prompt "ROMEO:" --sample-tokens 200
+```
+
+`data.dataset` is the directory the tokenize tool wrote. The vocabulary comes from its `meta.json`, so it is not a flag. Validation logs the perplexity and, when `--sample-prompt` is set, the text the EMA model writes after it.

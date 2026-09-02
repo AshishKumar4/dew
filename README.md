@@ -22,9 +22,9 @@
 
 ## What is Dew?
 
-Dew is a general framework for training machine learning models in JAX and Flax. It trains diffusion models, flow matching models, JEPA encoders, and your own architectures and objectives, sharded across devices and hosts. One trainer, one data pipeline and one set of primitives serve all of them.
+Dew is a general framework for training machine learning models in JAX and Flax. It trains diffusion models, flow matching models, JEPA encoders, language models, and your own architectures and objectives, sharded across devices and hosts. One trainer, one data pipeline and one set of primitives serve all of them.
 
-Dew separates what you train from how you train it. An objective defines the parameters, the loss and the validation step. The trainer defines the device mesh, the compiled step, gradient accumulation, EMA, checkpoints and logging. Diffusion and JEPA are the objectives that ship with Dew. A language model is [a few more lines](#objectives).
+Dew separates what you train from how you train it. An objective defines the parameters, the loss and the validation step. The trainer defines the device mesh, the compiled step, gradient accumulation, EMA, checkpoints and logging. Diffusion, JEPA and autoregressive language modelling are the objectives that ship with Dew; [writing another](#objectives) takes a class with a loss.
 
 The models, schedules, samplers and metrics are plain Flax and JAX. Each can be used on its own.
 
@@ -63,6 +63,7 @@ state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 32, epoc
 
 * [Diffusion](#diffusion)
 * [JEPA](#jepa)
+* [Language models](#language-models)
 * [End-to-end examples](#end-to-end-examples)
 * [Objectives](#objectives)
 * [Scaling](#scaling)
@@ -170,6 +171,31 @@ trainer = ObjectiveTrainer(
 ```
 
 The probes fit a linear classifier and a kNN classifier on the frozen embeddings of each validation batch and report their accuracy. `jepa_video_encoder` and a `factorized=True` predictor do the same for video.
+
+## Language models
+
+`CausalTransformer` is a decoder with the parts current open models use: RMSNorm, grouped-query attention, rotary positions, a gated MLP, q/k normalisation, and optional sliding-window layers, embedding scaling and logit softcapping, so Qwen and Gemma checkpoints map onto it by renaming keys. Its parameter tree follows the Hugging Face layout (`layers_0.self_attn.q_proj`, `layers_0.mlp.gate_proj`, ...). `LMObjective` is next-token cross entropy in fp32 with perplexity and token accuracy as metrics; at validation it also generates text.
+
+```python
+from dew.data.dataloaders import get_token_dataset_grain
+from dew.objectives.lm import LMObjective
+from dew.registry import build_model
+from dew.sampling.text import generate
+
+data = get_token_dataset_grain("data/shakespeare/train.bin", "data/shakespeare/val.bin", batch_size=64, seq_len=256)
+model = build_model("causal_transformer", dict(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
+                                              max_seq_len=512, dtype="bfloat16", attention_impl="auto"))
+objective = LMObjective(model, seq_len=256, vocab_size=256)
+
+trainer = ObjectiveTrainer(model, optax.adamw(1e-3), objective=objective, input_config=None,
+                           rngs=jax.random.PRNGKey(0), name="shakespeare")
+state = trainer.fit(data, training_steps_per_epoch=300, epochs=4)
+
+tokens = generate(model, state.ema_params, prompt, max_new_tokens=300, rng=jax.random.PRNGKey(0),
+                  temperature=0.8, top_k=40)       # prompt: int32 [B, P]; returns int32 [B, P + 300]
+```
+
+`generate` prefills the KV cache on the prompt and decodes in one `lax.scan`, 0.9 ms per token for a 12-layer 512-wide model on an RTX 4080. Batches come from `tools/tokenize_text.py`, which writes flat token files with a byte-level or any Hugging Face tokenizer; `TokenFileSource` reads them by memory map, so a corpus is never held in Python. On Tiny Shakespeare the setup above reaches validation perplexity 4.6 in four epochs. The details are in [docs/concepts/language_models.md](docs/concepts/language_models.md).
 
 ## End-to-end examples
 
@@ -339,6 +365,86 @@ if __name__ == "__main__":
     main(tyro.cli(Config))
 ```
 
+[`examples/train_lm.py`](examples/train_lm.py) trains a byte-level language model on a tokenized corpus and writes a sample:
+
+```python
+"""Train a byte-level language model on a tokenized corpus, then generate from it.
+
+Tokenize first (Tiny Shakespeare takes a second):
+
+    python tools/tokenize_text.py --input shakespeare.txt --out data/shakespeare --tokenizer byte --val-fraction 0.02
+    python examples/train_lm.py --tokens data/shakespeare --epochs 4
+    python examples/train_lm.py --tokens data/shakespeare --epochs 1 --steps-per-epoch 20 --num-layers 1   # smoke run
+"""
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import optax
+import tyro
+
+from dew.data.dataloaders import get_token_dataset_grain
+from dew.data.text import ByteTokenizer
+from dew.objectives.lm import LMObjective
+from dew.registry import apply_precision_policy, build_model
+from dew.sampling.text import generate
+from dew.training import ObjectiveTrainer
+
+
+@dataclass
+class Config:
+    tokens: Path = Path("data/shakespeare")
+    sequence_length: int = 256
+    batch_size: int = 64
+    epochs: int = 4
+    steps_per_epoch: int = 300
+    learning_rate: float = 1e-3
+    emb_features: int = 384
+    num_layers: int = 6
+    num_heads: int = 6
+    prompt: str = "ROMEO:"
+    sample_tokens: int = 300
+    out: Path = Path("runs/shakespeare")
+
+
+def main(config: Config):
+    meta = json.loads((config.tokens / "meta.json").read_text())
+    tokenizer = ByteTokenizer()
+    data = get_token_dataset_grain(
+        config.tokens / "train.bin", config.tokens / "val.bin",
+        batch_size=config.batch_size, seq_len=config.sequence_length, worker_count=4,
+    )
+
+    # The KV cache is sized when the model is built, so the context covers the longest sample.
+    model_config = apply_precision_policy("causal_transformer", dict(
+        vocab_size=meta["vocab_size"], emb_features=config.emb_features,
+        num_layers=config.num_layers, num_heads=config.num_heads,
+        max_seq_len=max(config.sequence_length, len(config.prompt) + config.sample_tokens),
+    ), dtype="bfloat16", attention_impl="auto")
+    model = build_model("causal_transformer", model_config)
+    objective = LMObjective(model, config.sequence_length, vocab_size=meta["vocab_size"])
+
+    trainer = ObjectiveTrainer(
+        model, optax.adamw(config.learning_rate), objective=objective, input_config=None,
+        rngs=jax.random.PRNGKey(0), name=config.out.name, checkpoint_base_path=str(config.out / "checkpoints"),
+    )
+    state = trainer.fit(data, training_steps_per_epoch=config.steps_per_epoch, epochs=config.epochs)
+
+    prompt = jnp.asarray([tokenizer.encode(config.prompt)], jnp.int32)
+    tokens = generate(model, state.ema_params, prompt, max_new_tokens=config.sample_tokens,
+                      rng=jax.random.PRNGKey(0), temperature=0.8, top_k=40)
+    text = tokenizer.decode(tokens[0])
+    (config.out / "sample.txt").write_text(text)
+    print(text)
+    return state
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Config))
+```
+
 ## Objectives
 
 An objective is a class with four methods. `init_params` builds the parameter tree, which can hold several modules. `loss` returns a scalar and a dict of metrics. `make_validation_step` returns the function that runs at the end of each epoch. `log_validation_artifacts` sends its output to Weights & Biases. `ema` says which part of the tree gets an exponential moving average, and how fast.
@@ -350,34 +456,34 @@ An objective is a class with four methods. `init_params` builds the parameter tr
   </picture>
 </p>
 
-This objective trains a byte-level language model on the trainer as it ships today:
+`LMObjective`, the language model objective that ships with Dew, is the pattern in full:
 
 ```python
-import jax.numpy as jnp, optax
-from dew.objectives import Objective, EMASpec
-
 class LMObjective(Objective):
     tag = "lm"
 
-    def __init__(self, model, seq_len):
-        self.model, self.seq_len = model, seq_len
-        self.ema = EMASpec(decay=lambda step: 0.999)
+    def __init__(self, model, seq_len, *, vocab_size, ema_decay=0.999, pad_id=None, samples=None):
+        self.model, self.seq_len, self.vocab_size, self.pad_id, self.samples = model, seq_len, vocab_size, pad_id, samples
+        self.ema = EMASpec(decay=lambda step: ema_decay)
+
+    @property
+    def input_shapes(self):
+        return {"tokens": ((self.seq_len,), jnp.int32)}     # what the trainer builds its init batch from
 
     def init_params(self, rng):
-        return self.model.init(rng, jnp.zeros((1, self.seq_len), jnp.int32))["params"]
+        return self.model.init(rng, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, params, ema_params, batch, rng, step):
-        logits = self.model.apply({"params": params}, batch["text"][:, :-1])
-        ce = optax.softmax_cross_entropy_with_integer_labels(logits, batch["text"][:, 1:]).mean()
-        return ce, {"ce": ce}
+        tokens = batch["text"]
+        logits = self.model.apply(params, tokens[:, :-1]).astype(jnp.float32)
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:]).mean()
+        return ce, {"ce": ce, "perplexity": jnp.exp(ce)}
 
     def make_validation_step(self, **kwargs):
-        return lambda val_state, batch: self.loss(val_state.params, None, batch, None, 0)[0]
-
-trainer = ObjectiveTrainer(model, optax.adamw(1e-3), objective=LMObjective(model, seq_len=256), ...)
+        ...  # teacher-forced cross entropy, plus generate() from the EMA parameters when samples is set
 ```
 
-The trainer compiles `loss` into a sharded training step, applies the optimizer, moves the EMA on every optimizer update, and checkpoints the parameters, the EMA and the optimizer state. `DiffusionObjective` and `JepaObjective` are written the same way.
+The trainer compiles `loss` into a sharded training step, applies the optimizer, moves the EMA on every optimizer update, and checkpoints the parameters, the EMA and the optimizer state. `DiffusionObjective` and `JepaObjective` are written the same way. An objective that declares `input_shapes` needs no `DiffusionInputConfig`.
 
 ## Scaling
 
@@ -440,7 +546,7 @@ batch = next(data["train"]())          # {"image": (32, 128, 128, 3) uint8, "tex
 
 ## Recipes
 
-`recipes/diffusion/train.py` and `recipes/jepa/train.py` are the complete training programs. A run is a `RunConfig` with `model`, `data`, `optim` and `trainer` parts, and [tyro](https://github.com/brentyi/tyro) turns it into a command line: `--trainer.fsdp-size 4` sets `config.trainer.fsdp_size`. Architecture arguments go to `--model.config` as JSON and straight to `build_model`.
+`recipes/diffusion/train.py`, `recipes/jepa/train.py` and `recipes/lm/train.py` are the complete training programs. A run is a `RunConfig` with `model`, `data`, `optim` and `trainer` parts, and [tyro](https://github.com/brentyi/tyro) turns it into a command line: `--trainer.fsdp-size 4` sets `config.trainer.fsdp_size`. Architecture arguments go to `--model.config` as JSON and straight to `build_model`.
 
 ```bash
 python recipes/diffusion/train.py --data.dataset oxford_flowers102 --data.image-size 128 \
@@ -450,6 +556,9 @@ python recipes/diffusion/train.py --data.dataset oxford_flowers102 --data.image-
 
 python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102 \
     --model.config '{"patch_size": 16, "emb_features": 384}'
+
+python recipes/lm/train.py --data.dataset data/shakespeare --sequence-length 256 \
+    --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}' --sample-prompt "ROMEO:"
 
 python recipes/diffusion/train.py --help
 ```
@@ -513,14 +622,16 @@ The tests simulate 8 devices on CPU, so the sharding tests run on any machine.
 
 ## Documentation
 
-* Concepts: [objectives](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md)
+* Concepts: [objectives](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md), [language models](docs/concepts/language_models.md)
 * [API reference](docs/api.md) and [recipes](docs/recipes.md)
 * [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a notebook that builds diffusion from scratch without the library
 * [Gallery](docs/gallery.md), [references](docs/references.md), [migrating from FlaxDiff](docs/from-flaxdiff.md)
 
 ## Roadmap
 
-* Autoregressive and diffusion language model objectives
+* Loading Qwen3 and Gemma 3 checkpoints into `CausalTransformer`, with logit parity tests against the reference implementation; then the Qwen3.5 linear-attention hybrid and Gemma 4
+* GPU kernels measured against the current ones: Pallas flash attention, fused RMSNorm and SwiGLU, FP8 matmuls
+* Diffusion language models
 * Audio conditioned video models
 * Multi-host validation on a TPU pod
 * FID-50k
