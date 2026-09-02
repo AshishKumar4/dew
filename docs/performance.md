@@ -17,10 +17,10 @@ XLA_FLAGS=<flags> python tools/benchmark_step.py --preset small \
 Conditions: jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
 595.84, RTX 4080 16 GiB, single device, bf16 compute, adam, 3 warmup and 10
 measured steps, one architecture per process. The card was idle before each
-measurement (`nvidia-smi --query-compute-apps=pid` showing only the
-desktop's pid), at 210 MHz and 30 W at rest and 2760 MHz and 120-220 W under
-load. An XLA flag is read once when a backend opens, so every flag
-configuration ran in a fresh process.
+measurement (`nvidia-smi --query-compute-apps=process_name` showing only
+gnome-remote-desktop-daemon, the desktop itself), at 210 MHz and 30 W at rest
+and 2760 MHz and 120-220 W under load. An XLA flag is read once when a
+backend opens, so every flag configuration ran in a fresh process.
 
 ## The attention kernels
 
