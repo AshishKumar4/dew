@@ -15,6 +15,7 @@ nav:
       - The data pipeline: concepts/data.md
       - Language models: concepts/language_models.md
   - Recipes: recipes.md
+  - Benchmarks: benchmarks.md
   - API: api.md
   - Gallery: gallery.md
   - References: references.md
