@@ -20,34 +20,42 @@
 
 ## Overview
 
-Dew is a general framework for training ML models in JAX and Flax. You can train diffusion models, flow matching models, JEPA encoders, and your own architectures and objectives, fully sharded across devices and hosts, on one set of primitives: a trainer, data pipelines, objectives, samplers and evaluation. Language models come next.
+Dew is a general framework for training machine learning models in JAX and Flax. It trains diffusion models, flow matching models, JEPA encoders, and your own architectures and objectives, sharded across devices and hosts. One set of primitives does all of this: a trainer, data pipelines, objectives, samplers and evaluation. Language models come next.
 
 Dew includes:
 
-* **Objectives** (`dew.objectives`): `DiffusionObjective` for pixel and latent diffusion with min-SNR weighting, and `JepaObjective` for I-JEPA and V-JEPA with collapse telemetry and probes. An objective defines `init_params`, `loss` and a validation step.
-* **Models** (`dew.nn`): UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT and JEPA encoders, a vendored Stable Diffusion VAE, Hilbert and zigzag patch orders. One attention module that runs on the reference, XLA, cuDNN or TPU kernel with the same parameters.
-* **Diffusion maths** (`dew.diffusion`): linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules; epsilon, x0, v, flow and Karras prediction transforms; presets that pair them.
+* **Objectives** (`dew.objectives`): `DiffusionObjective` for pixel and latent diffusion, and `JepaObjective` for I-JEPA and V-JEPA. An objective defines the parameters, the loss and the validation step. The trainer does the rest.
+* **Models** (`dew.nn`): UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT and JEPA encoders. A Stable Diffusion VAE. One attention module that runs on the reference, XLA, cuDNN or TPU kernel with the same parameters.
+* **Diffusion maths** (`dew.diffusion`): linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules. Epsilon, x0, v, flow and Karras prediction transforms. Presets that pair a schedule with a transform.
 * **Samplers** (`dew.sampling`): DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM, with interval-limited classifier-free guidance.
-* **Trainer** (`dew.training`): data parallel and FSDP on a `(data, fsdp)` mesh, gradient accumulation, EMA, bf16 compute over fp32 parameters, async Orbax checkpoints with mid-epoch resume, Weights & Biases logging, profiling and MFU.
+* **Trainer** (`dew.training`): data parallel and FSDP on one mesh, gradient accumulation, EMA, bf16 compute with fp32 parameters, async Orbax checkpoints that resume mid-epoch, Weights & Biases logging, profiling and MFU.
 * **Data** (`dew.data`): Grain pipelines over TFDS, GCS ArrayRecord, local video, VoxCeleb2 and URL streams, with deterministic augmentation.
-* **Evaluation and interop**: FID, CLIP score, PSNR and SSIM; safetensors export in the Hugging Face layout that transformers, vLLM and verl read.
+* **Evaluation and export** (`dew.eval`, `dew.interop`): FID, CLIP score, PSNR and SSIM. Safetensors export in the Hugging Face layout, for transformers, vLLM and verl.
 
 Dew is the successor to [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). It is a personal research project. Expect sharp edges.
 
 ## Quick install
 
+Dew needs Python 3.11 or later.
+
 ```bash
-pip install dew-ml             # imports as dew
-pip install "jax[cuda12]"      # or "jax[tpu]"; the base install is CPU only
+pip install dew-ml
 ```
 
-Extras: `[tfds]` datasets, `[av]` video and audio, `[streaming]` URL streaming, `[metrics]` FID, `[interop]` safetensors.
+The base install comes with a CPU-only JAX. For a GPU or a TPU, install the matching [JAX build](https://docs.jax.dev/en/latest/installation.html):
+
+```bash
+pip install "jax[cuda12]"   # NVIDIA GPUs
+pip install "jax[tpu]"      # Cloud TPUs
+```
+
+Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors.
 
 `dew` on PyPI is an unused placeholder, so the package is `dew-ml` for now.
 
 ## What does Dew look like?
 
-Text conditioned diffusion on Oxford Flowers:
+Train a text-to-image diffusion model on Oxford Flowers:
 
 ```python
 import jax, optax
@@ -61,7 +69,7 @@ from dew.training import ObjectiveTrainer
 
 data = get_dataset_grain("oxford_flowers102", batch_size=16, image_scale=128)
 text = CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14")
-input_config = DiffusionInputConfig(
+inputs = DiffusionInputConfig(
     sample_data_key="image", sample_data_shape=(128, 128, 3),
     conditions=[ConditionalInputConfig(encoder=text)],
 )
@@ -69,19 +77,23 @@ train_schedule, sample_schedule, transform = get_diffusion_preset("edm")
 model = build_model("simple_dit", dict(emb_features=512, num_layers=8, num_heads=8, patch_size=8))
 
 trainer = ObjectiveTrainer(
-    model=model, optimizer=optax.adamw(2e-4), input_config=input_config,
+    model=model, optimizer=optax.adamw(2e-4), input_config=inputs,
     noise_schedule=train_schedule, model_output_transform=transform,
     rngs=jax.random.PRNGKey(4), name="flowers-edm", checkpoint_base_path="./checkpoints",
 )
 state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 16, epochs=100,
                     sampler_class=EulerAncestralSampler, sampling_noise_schedule=sample_schedule)
+```
 
-sampler = EulerAncestralSampler(model, sample_schedule, transform, input_config, guidance_scale=3.0)
+Sample from it:
+
+```python
+sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs, guidance_scale=3.0)
 images = sampler.generate_samples(params=state.ema_params, num_samples=2, resolution=128,
                                   diffusion_steps=50, conditioning=["a water lily", "a rose"])
 ```
 
-The recipes run the same trainer from the command line. Every config field is a flag.
+Run the same training from the command line. Every config field is a flag:
 
 ```bash
 python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.architecture simple_dit \
@@ -89,7 +101,7 @@ python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.archi
 python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102
 ```
 
-An objective is a class with a loss. This one trains a small language model with the same trainer:
+Add an objective. The trainer accepts any class with these methods:
 
 ```python
 class LMObjective(Objective):
@@ -129,9 +141,9 @@ class LMObjective(Objective):
 
 ## Documentation
 
-* [The objectives seam](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md)
+* Concepts: [objectives](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md)
 * [API reference](docs/api.md) and [recipes](docs/recipes.md)
-* [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a from-scratch notebook independent of the library
+* [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a notebook that builds diffusion from scratch without the library
 * [Gallery](docs/gallery.md), [references](docs/references.md), [migrating from FlaxDiff](docs/from-flaxdiff.md)
 
 ## Roadmap
@@ -155,7 +167,7 @@ The tests simulate 8 devices on CPU, so the sharding tests run on any machine.
 
 **This project is partially supported by [Google TPU Research Cloud](https://sites.research.google/trc/about/). I would like to thank the Google Cloud TPU team for providing me with the resources to train the bigger text-conditional models in multi-host distributed settings.**
 
-Dew builds on [JAX](https://github.com/jax-ml/jax), [Flax](https://github.com/google/flax), [Optax](https://github.com/google-deepmind/optax), [Orbax](https://github.com/google/orbax), [Grain](https://github.com/google/grain), [tyro](https://github.com/brentyi/tyro), [albumentations](https://github.com/albumentations-team/albumentations) and [Weights & Biases](https://github.com/wandb/wandb). The VAE and parts of the attention code come from [diffusers](https://github.com/huggingface/diffusers), the InceptionV3 from [jax-fid](https://github.com/matthias-wright/jax-fid), and the Karras samplers follow [k-diffusion](https://github.com/crowsonkb/k-diffusion) and the [EDM](https://github.com/NVlabs/edm) reference code.
+Dew builds on [JAX](https://github.com/jax-ml/jax), [Flax](https://github.com/google/flax), [Optax](https://github.com/google-deepmind/optax), [Orbax](https://github.com/google/orbax), [Grain](https://github.com/google/grain), [tyro](https://github.com/brentyi/tyro), [albumentations](https://github.com/albumentations-team/albumentations) and [Weights & Biases](https://github.com/wandb/wandb). The VAE and parts of the attention code come from [diffusers](https://github.com/huggingface/diffusers). The InceptionV3 comes from [jax-fid](https://github.com/matthias-wright/jax-fid). The Karras samplers follow [k-diffusion](https://github.com/crowsonkb/k-diffusion) and the [EDM](https://github.com/NVlabs/edm) reference code.
 
 ## License
 
