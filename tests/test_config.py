@@ -133,6 +133,7 @@ def test_registry_builds_every_architecture():
         "unet_3d": {"feature_depths": [16, 32], "attention_configs": [None, None],
                     "num_res_blocks": 1, "num_middle_res_blocks": 1,
                     "activation": "swish", "norm_groups": 4, "temporal_heads": 2},
+        "causal_transformer": {"vocab_size": 32, "max_seq_len": 16},
     }
     for name in MODEL_REGISTRY:
         config = {**base, **per_arch.get(name, {})}
