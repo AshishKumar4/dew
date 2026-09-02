@@ -1,17 +1,14 @@
 """Language modelling: the shifted cross entropy, and a trainer with no input config.
 
-The backbone and the text sampler are built in sibling worktrees, so the model
-here is a small causal stack that honors the same contract (int32 ids in,
-float32 logits out, a `train` flag for dropout) and `dew.sampling.text.generate`
-is recorded rather than run. What is under test is the objective: that the loss
-is the cross entropy of the shifted sequence and nothing else, that padding is
-excluded only when a pad id is named, and that the trainer drives it on both a
-data-parallel and an FSDP mesh without a DiffusionInputConfig to describe the
-inputs.
+The model here is a small causal stack that honors the backbone's contract
+(int32 ids in, float32 logits out, a `train` flag for dropout) and
+`dew.sampling.text.generate` is recorded rather than run, so what is under
+test is the objective: that the loss is the cross entropy of the shifted
+sequence and nothing else, that padding is excluded only when a pad id is
+named, and that the trainer drives it on both a data-parallel and an FSDP mesh
+without a DiffusionInputConfig to describe the inputs. The real sampler runs
+in test_lm_recipe.
 """
-
-import sys
-import types
 
 import jax
 import jax.numpy as jnp
@@ -146,11 +143,7 @@ def make_val_state(params, ema_params=None, rngs=None):
 
 @pytest.fixture
 def recorded_generate(monkeypatch):
-    """Stand in for `dew.sampling.text.generate` and record how it was called.
-
-    The sampler lands from a sibling worktree; this pins the call the objective
-    makes against the agreed signature, and the real one runs in test_lm_recipe.
-    """
+    """Stand in for `dew.sampling.text.generate` and record how it was called."""
     calls = []
 
     def generate(model, params, prompt, max_new_tokens, *, rng, temperature=1.0,
@@ -161,12 +154,8 @@ def recorded_generate(monkeypatch):
         return jnp.concatenate(
             [prompt, jnp.zeros((prompt.shape[0], max_new_tokens), jnp.int32)], axis=1)
 
-    try:
-        import dew.sampling.text as text_sampler
-    except ImportError:
-        text_sampler = types.ModuleType("dew.sampling.text")
-        monkeypatch.setitem(sys.modules, "dew.sampling.text", text_sampler)
-    monkeypatch.setattr(text_sampler, "generate", generate, raising=False)
+    import dew.sampling.text as text_sampler
+    monkeypatch.setattr(text_sampler, "generate", generate)
     return calls
 
 
