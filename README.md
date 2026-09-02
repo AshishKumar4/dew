@@ -493,7 +493,8 @@ Dew needs Python 3.11 or later. There is no release on PyPI yet; install from th
 
 Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors, as in `"dew-ml[tfds,metrics] @ git+https://github.com/AshishKumar4/dew"`. The package imports as `dew`. The first release will ship as `dew-ml`; the bare `dew` name on PyPI is an unused placeholder.
 
-To work on Dew itself:
+To work on Dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md) first: it states the design rules, the reference-parity requirement for every port, and what a merge needs.
+
 
 ```bash
 git clone --recurse-submodules https://github.com/AshishKumar4/dew.git
