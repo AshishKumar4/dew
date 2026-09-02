@@ -103,6 +103,8 @@ class SimpleTrainer:
         self.checkpoint_base_path = checkpoint_base_path
         self.profile_steps = profile_steps
         self.profile_warmup_steps = profile_warmup_steps
+        self._profile_seen_steps = 0
+        self._profile_complete = False
         self.log_every = log_every
         self.max_bad_loss_steps = max_bad_loss_steps
         # Measured off the compiled step, once per run.
@@ -175,7 +177,7 @@ class SimpleTrainer:
         # here guesses which way the caller meant it: resuming and starting
         # over are both fine, and both have to be asked for.
         written_step = self.checkpointer.latest_step()
-        if written_step is not None and load_from_checkpoint is None and checkpoint_step is None:
+        if written_step is not None and load_from_checkpoint is None:
             raise ValueError(
                 f"{self.checkpoint_path()} already holds checkpoints up to step "
                 f"{written_step}. Resume them with --trainer.load-from-checkpoint "
@@ -433,8 +435,9 @@ class SimpleTrainer:
         process_index = jax.process_index()
         log_every = self.log_every
 
-        epoch_loss = 0
+        epoch_loss = jnp.zeros((), jnp.float32)
         current_epoch = current_step // train_steps_per_epoch
+        steps_this_call = train_steps_per_epoch - current_step % train_steps_per_epoch
 
         # Both counters live on device so the loop never blocks on a result.
         # `worst_bad_run` remembers the longest streak of non-finite losses seen
@@ -443,30 +446,30 @@ class SimpleTrainer:
         worst_bad_run = jnp.zeros((), jnp.int32)
 
         if process_index == 0:
-            pbar = tqdm.tqdm(total=train_steps_per_epoch, desc=f'\t\tEpoch {current_epoch}', ncols=100, unit='step')
+            pbar = tqdm.tqdm(total=steps_this_call, desc=f'\t\tEpoch {current_epoch}', ncols=100, unit='step')
         else:
             pbar = None
 
         last_log_time = time.time()
         steps_since_log = 0
         compiled_step = None
-        # Compilation and the first steps say nothing about how the loop runs
-        # once it is warm, so the trace skips them.
-        profile_start = self.profile_warmup_steps if self.profile_steps else None
+        # One profiler window per run; its warmup continues across epochs.
         tracing = False
         traced_steps = 0
 
-        for i in range(train_steps_per_epoch):
+        for i in range(steps_this_call):
             batch = next(train_ds)
             if compiled_step is None:
                 compiled_step = self._compiled_step(
                     train_step_fn, train_state, rng_state, batch)
-            if not tracing and i == profile_start:
+            if (not tracing and not self._profile_complete and self.profile_steps
+                    and self._profile_seen_steps >= self.profile_warmup_steps):
                 jax.profiler.start_trace(self.profile_path())
                 tracing = True
 
             train_state, loss, aux, rng_state, is_finite = compiled_step(
                 train_state, rng_state, batch)
+            self._profile_seen_steps += 1
             # No stale alias may outlive the step: its buffers were donated.
             self.state, self.rngstate = train_state, rng_state
             self.dataset_state = getattr(train_ds, 'source_state', None)
@@ -509,7 +512,8 @@ class SimpleTrainer:
 
             # On its own clock, not the logging one: nested inside the log tick,
             # a cadence that did not divide log_every never fired at all.
-            if save_every and current_step % save_every == 0:
+            if (save_every and current_step % save_every == 0
+                    and i + 1 < steps_this_call):
                 self.save(current_epoch, current_step, train_state, rng_state)
 
         if tracing:
@@ -530,6 +534,7 @@ class SimpleTrainer:
         """Close the profiler window once its last step has actually landed."""
         loss.block_until_ready()
         jax.profiler.stop_trace()
+        self._profile_complete = True
         print(f"Wrote profile for {traced_steps} steps to {self.profile_path()}")
 
     def _check_finite(self, worst_bad_run, current_step):
@@ -554,8 +559,7 @@ class SimpleTrainer:
             "train/step_time_ms": step_time * 1000,
             "train/samples_per_sec": self.global_batch_size / step_time,
         }
-        mfu = model_flops_utilization(self.flops_per_step, step_time,
-                                      self.mesh.devices.size)
+        mfu = model_flops_utilization(self.flops_per_step, step_time)
         if mfu is not None:
             metrics["train/mfu"] = mfu
         return metrics
@@ -590,10 +594,10 @@ class SimpleTrainer:
                 
         while self.latest_step < epochs * train_steps_per_epoch:
             current_epoch = self.latest_step // train_steps_per_epoch
+            start_step = self.latest_step
+            resumed_partial_epoch = bool(start_step % train_steps_per_epoch)
             print(f"\nEpoch {current_epoch}/{epochs}")
             start_time = time.time()
-            epoch_loss = 0
-            
             epoch_loss, current_step, train_state, rng_state = self.train_loop(
                 train_state,
                 train_step,
@@ -610,7 +614,8 @@ class SimpleTrainer:
             self.state = train_state
             self.rngstate = rng_state
             total_time = end_time - start_time
-            avg_time_per_step = total_time / train_steps_per_epoch
+            steps_ran = current_step - start_step
+            avg_time_per_step = total_time / steps_ran
             
             if val_steps_per_epoch > 0:
                 print(f"Validation started for process index {process_index}")
@@ -624,11 +629,13 @@ class SimpleTrainer:
                 )
                 print(colored(f"Validation done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
             
-            avg_loss = float(epoch_loss / train_steps_per_epoch)
-            if avg_loss < self.best_loss:
+            avg_loss = float(epoch_loss / steps_ran)
+            if not resumed_partial_epoch and avg_loss < self.best_loss:
                 self.best_loss = avg_loss
                 self.save(current_epoch, current_step, metrics={'loss': avg_loss})
-                
+            elif (checkpoint_every_steps
+                  and current_step % checkpoint_every_steps == 0):
+                self.save(current_epoch, current_step)
             if process_index == 0:
                 if self.wandb is not None:
                     self.wandb.log({

@@ -235,11 +235,13 @@ def test_media_dataset_grain_passes_media_scale_to_the_video_transform(fake_medi
     assert kwargs["frame_size"] == 64 and kwargs["sequence_length"] == 4
 
 
-def test_legacy_grain_loader_takes_a_validation_batch_size():
-    """The legacy val path hardcoded 32 and reused the shuffled train sampler."""
-    parameters = inspect.signature(dataloaders.get_dataset_grain).parameters
-    assert parameters["val_batch_size"].default == 32
-    assert "val_worker_count" in parameters
+def test_legacy_grain_loader_defaults_validation_to_the_local_batch(fake_legacy_dataset):
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_count=16,
+        worker_count=0, val_worker_count=0, num_epochs=1, seed=0)
+
+    assert _indices(data["val"](), 3) == [
+        list(range(8)), list(range(8, 16))]
 
 
 @pytest.fixture

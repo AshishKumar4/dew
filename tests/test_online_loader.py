@@ -286,3 +286,17 @@ def test_loading_a_dataset_by_path_asks_for_the_streaming_extra():
     loading a dataset needs it, and it has to say so."""
     with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
         OnlineStreamingDataLoader("some/hf/dataset")
+def test_feature_extractor_rejects_missing_required_columns():
+    with pytest.raises(ValueError, match="URL"):
+        online_loader.default_feature_extractor({"caption": ["caption"]})
+    with pytest.raises(ValueError, match="caption"):
+        online_loader.default_feature_extractor({"url": ["https://example.invalid/0.jpg"]})
+
+
+def test_batch_mapping_propagates_feature_extractor_errors():
+    def broken(sample):
+        raise RuntimeError("bad shard schema")
+
+    with pytest.raises(RuntimeError, match="bad shard schema"):
+        online_loader.map_batch({}, queue.Queue(), num_threads=1,
+                               feature_extractor=broken)
