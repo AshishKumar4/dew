@@ -77,6 +77,18 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
     assert recipe.context_length(config, {"prompt": [1, 2, 3], "max_new_tokens": 100}) == 103
 
 
+def test_the_computed_context_cannot_be_overridden_by_model_config():
+    recipe = load_recipe()
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {"max_seq_len": 8}),
+        sequence_length=64,
+    )
+
+    _, model_config = recipe.build_lm(config, vocab_size=256, max_seq_len=103)
+
+    assert model_config["max_seq_len"] == 103
+
+
 def test_the_recipe_wires_the_objective_and_the_trainer(tmp_path, monkeypatch):
     recipe = load_recipe()
     dataset = write_token_files(tmp_path / "tokens", vocab_size=VOCAB)
