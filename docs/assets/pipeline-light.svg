@@ -1,41 +1,23 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="150" viewBox="0 0 1200 150" role="img">
   <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8c959f"/></marker></defs>
-  <rect x="24" y="24" width="196" height="142" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
-  <text x="40" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">sources</text>
-  <text x="40" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">TFDS, GCS ArrayRecord</text>
-  <text x="40" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">local video, VoxCeleb2</text>
-  <text x="40" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">URL streams</text>
-  <rect x="252" y="24" width="236" height="142" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
-  <text x="268" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">grain, per process</text>
-  <text x="268" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">seeded IndexSampler</text>
-  <text x="268" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">ShardByJaxProcess</text>
-  <text x="268" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">decode, augment, batch</text>
-  <text x="268" y="131" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">seeded from the record rng</text>
-  <rect x="520" y="24" width="212" height="142" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
-  <text x="536" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">onto the mesh</text>
-  <text x="536" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">DevicePrefetchIterator</text>
-  <text x="536" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">NamedSharding (data, fsdp)</text>
-  <text x="536" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">iterator state saved</text>
-  <rect x="764" y="24" width="232" height="142" rx="10" fill="#e6fbf7" stroke="#2fb8a8" stroke-width="1.25"/>
-  <text x="780" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">train step</text>
-  <text x="780" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">Objective.loss -&gt; loss, aux</text>
-  <text x="780" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">grad, optax, EMA</text>
-  <text x="780" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">one compile, donated buffers</text>
-  <rect x="1028" y="24" width="148" height="142" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.25"/>
-  <text x="1044" y="51" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">outputs</text>
-  <text x="1044" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">orbax: latest, best</text>
-  <text x="1044" y="93" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">wandb</text>
-  <text x="1044" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">profiler, MFU</text>
-  <line x1="220" y1="95.0" x2="250" y2="95.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <line x1="488" y1="95.0" x2="518" y2="95.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <line x1="732" y1="95.0" x2="762" y2="95.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <line x1="996" y1="95.0" x2="1026" y2="95.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <rect x="520" y="236" width="476" height="104" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
-  <text x="536" y="263" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15.5" font-weight="600" fill="#1f2328" xml:space="preserve">validation, each epoch</text>
-  <text x="536" y="286" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">Objective.make_validation_step: samplers with CFG, JEPA probes</text>
-  <text x="536" y="305" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e" xml:space="preserve">EvaluationMetric: FID, CLIP score, PSNR, SSIM</text>
-  <path d="M 880 166 L 880 234" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <path d="M 996 288 L 1102 288 L 1102 168" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
-  <path d="M 1103 166 L 1103 400 L 370 400 L 370 168" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)" stroke-dasharray="5 5"/>
-  <text x="736" y="388" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="middle">resume: state, EMA, optimizer, rng and the iterator position</text>
+  <rect x="24.0" y="24" width="203.2" height="76" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
+  <text x="42.0" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">sources</text>
+  <text x="42.0" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">TFDS, GCS, video, URLs</text>
+  <line x1="231.2" y1="62.0" x2="257.2" y2="62.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="261.2" y="24" width="203.2" height="76" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
+  <text x="279.2" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">grain</text>
+  <text x="279.2" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">shard, decode, augment, batch</text>
+  <line x1="468.4" y1="62.0" x2="494.4" y2="62.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="498.4" y="24" width="203.2" height="76" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
+  <text x="516.4" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">mesh</text>
+  <text x="516.4" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">NamedSharding on (data, fsdp)</text>
+  <line x1="705.5999999999999" y1="62.0" x2="731.5999999999999" y2="62.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="735.5999999999999" y="24" width="203.2" height="76" rx="8" fill="#e6fbf7" stroke="#2fb8a8" stroke-width="1.25"/>
+  <text x="753.5999999999999" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">train step</text>
+  <text x="753.5999999999999" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">objective loss, grad, EMA</text>
+  <line x1="942.8" y1="62.0" x2="968.8" y2="62.0" stroke="#8c959f" stroke-width="1.4" marker-end="url(#a)"/>
+  <rect x="972.8" y="24" width="203.2" height="76" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.25"/>
+  <text x="990.8" y="54" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#1f2328">checkpoints</text>
+  <text x="990.8" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#59636e">Orbax, latest and best</text>
+  <text x="24" y="130" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e" text-anchor="start">One training step. Every host runs it on its own shard of the data.</text>
 </svg>

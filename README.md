@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-    <img src="docs/assets/banner-light.svg" alt="dew" width="720">
+    <img src="docs/assets/banner-light.svg" alt="dew" width="640">
   </picture>
 </p>
 
@@ -11,42 +11,41 @@
   <img src="https://img.shields.io/badge/license-MIT-2aa7a1" alt="MIT">
 </p>
 
-Dew trains models from scratch in JAX and Flax. It grew out of [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff), my diffusion library, and keeps all of it. What you optimize is now a plug-in, so one trainer, one data pipeline and one sharding and checkpointing setup serve diffusion models, JEPA encoders and, next, language models.
-
-**This project is partially supported by [Google TPU Research Cloud](https://sites.research.google/trc/about/). I would like to thank the Google Cloud TPU team for providing me with the resources to train the bigger text-conditional models in multi-host distributed settings.**
-
-## How it fits together
-
-An objective owns the parameters, the loss and the validation step. The trainer owns the mesh, the jitted step, EMA, gradient accumulation, checkpoints and logging, and never looks inside the objective.
-
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
-    <img src="docs/assets/architecture-light.svg" alt="Dew modules" width="100%">
-  </picture>
+  <a href="#overview">Overview</a> |
+  <a href="#quick-install">Quick install</a> |
+  <a href="#what-does-dew-look-like">What does Dew look like?</a> |
+  <a href="#documentation">Documentation</a>
 </p>
 
-Every host runs the same pipeline on its own shard of the data. The mesh joins them.
+## Overview
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-dark.svg">
-    <img src="docs/assets/pipeline-light.svg" alt="One training run" width="100%">
-  </picture>
-</p>
+Dew is a framework for training models from scratch in JAX and Flax. The trainer, data pipeline, sharding and checkpointing are shared; the training objective is the plug-in. Diffusion and JEPA ship today, language models are on the roadmap.
 
-## Install
+Dew includes:
+
+* **Objectives** (`dew.objectives`): `DiffusionObjective` for pixel and latent diffusion with min-SNR weighting, and `JepaObjective` for I-JEPA and V-JEPA with collapse telemetry and probes. An objective defines `init_params`, `loss` and a validation step.
+* **Models** (`dew.nn`): UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT and JEPA encoders, a vendored Stable Diffusion VAE, Hilbert and zigzag patch orders. One attention path over the reference, XLA, cuDNN and TPU kernels with an identical parameter tree.
+* **Diffusion maths** (`dew.diffusion`): linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules; epsilon, x0, v, flow and Karras prediction transforms; presets that pair them.
+* **Samplers** (`dew.sampling`): DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM, with interval-limited classifier-free guidance.
+* **Trainer** (`dew.training`): data parallel and FSDP on a `(data, fsdp)` mesh, gradient accumulation, EMA, bf16 compute over fp32 parameters, async Orbax checkpoints with mid-epoch resume, Weights & Biases logging, profiling and MFU.
+* **Data** (`dew.data`): Grain pipelines over TFDS, GCS ArrayRecord, local video, VoxCeleb2 and URL streams, with augmentation seeded per record.
+* **Evaluation and interop**: FID, CLIP score, PSNR and SSIM; safetensors export in the Hugging Face layout that transformers, vLLM and verl read.
+
+Dew is the successor to [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff) and carries its history. It is a personal research project, not a product. Expect sharp edges, and please open an issue when you find one.
+
+## Quick install
 
 ```bash
 pip install dew-ml             # imports as dew
 pip install "jax[cuda12]"      # or "jax[tpu]"; the base install is CPU only
 ```
 
-Extras: `[tfds]` datasets, `[av]` video and audio, `[streaming]` URL streaming, `[metrics]` FID, `[interop]` safetensors. To work on it: `git clone --recurse-submodules` and `pip install -e ".[test]"`.
+Extras: `[tfds]` datasets, `[av]` video and audio, `[streaming]` URL streaming, `[metrics]` FID, `[interop]` safetensors.
 
-The `dew` name on PyPI is an empty placeholder from 2015. I have asked for it. Until then the package is `dew-ml`.
+The `dew` name on PyPI is a fileless placeholder from 2015. A PEP 541 request is pending; the package is `dew-ml` until it resolves.
 
-## Quickstart
+## What does Dew look like?
 
 Text conditioned diffusion on Oxford Flowers:
 
@@ -61,9 +60,10 @@ from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer
 
 data = get_dataset_grain("oxford_flowers102", batch_size=16, image_scale=128)
+text = CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14")
 input_config = DiffusionInputConfig(
     sample_data_key="image", sample_data_shape=(128, 128, 3),
-    conditions=[ConditionalInputConfig(encoder=CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14"))],
+    conditions=[ConditionalInputConfig(encoder=text)],
 )
 train_schedule, sample_schedule, transform = get_diffusion_preset("edm")
 model = build_model("simple_dit", dict(emb_features=512, num_layers=8, num_heads=8, patch_size=8))
@@ -81,7 +81,7 @@ images = sampler.generate_samples(params=state.ema_params, num_samples=2, resolu
                                   diffusion_steps=50, conditioning=["a water lily", "a rose"])
 ```
 
-The recipes wrap the same trainer in a typed config. Every field is a flag, and `--help` prints the tree.
+The recipes expose the same trainer as a typed command line. Every config field is a flag; `--help` prints the tree.
 
 ```bash
 python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.architecture simple_dit \
@@ -89,9 +89,7 @@ python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.archi
 python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102
 ```
 
-## Objectives
-
-Anything with a loss trains. This byte-level language model ran through the trainer as it is:
+A new objective is a class with a loss. This one trains a byte-level language model through the unmodified trainer:
 
 ```python
 class LMObjective(Objective):
@@ -113,59 +111,52 @@ class LMObjective(Objective):
         return lambda val_state, batch: self.loss(val_state.params, None, batch, None, 0)[0]
 ```
 
-`ObjectiveTrainer(model, optimizer, objective=LMObjective(model, seq_len), ...)`, then `fit`. The seam is described in [docs/concepts/objectives.md](docs/concepts/objectives.md).
+## Architecture
 
-## What's inside
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
+    <img src="docs/assets/architecture-light.svg" alt="Dew modules by layer" width="100%">
+  </picture>
+</p>
 
-| | |
-|---|---|
-| `dew.nn` | UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT, JEPA encoders. Hilbert and zigzag scan orders. SD VAE and a small autoencoder. One attention path (reference, XLA, cuDNN, TPU) with one parameter tree. |
-| `dew.diffusion` | Schedules: linear, cosine, exp, sqrt, Karras VE, EDM, flow matching. Transforms: epsilon, x0, v, flow, Karras. `get_diffusion_preset` pairs them. |
-| `dew.objectives` | `DiffusionObjective` (pixel or latent, min-SNR weighting). `JepaObjective` (I-JEPA, V-JEPA, collapse telemetry, probes). |
-| `dew.sampling` | DDPM, DDIM, Euler, Euler ancestral, Heun, RK4, multistep DPM. Interval-limited CFG. Pipelines that rebuild a model from its run record. |
-| `dew.training` | Data parallel and FSDP on a `(data, fsdp)` mesh. One compile per run. EMA on the update clock. Async orbax checkpoints, latest and best, mid-epoch resume. wandb, profiler, MFU. bf16 compute over fp32 params by default. |
-| `dew.data` | grain pipelines over TFDS, GCS ArrayRecord, local video, VoxCeleb2 and URL streams. Augmentation seeded per record. CLIP text and HF audio conditioning. |
-| `dew.eval` | FID, CLIP score, PSNR, SSIM. |
-| `dew.interop` | Flax params to and from safetensors. `save_hf_layout` writes what transformers, vLLM and verl read. |
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pipeline-dark.svg">
+    <img src="docs/assets/pipeline-light.svg" alt="A training step" width="100%">
+  </picture>
+</p>
 
-Full tables in [docs/api.md](docs/api.md).
+## Documentation
 
-## Testing
-
-```bash
-JAX_PLATFORMS=cpu pytest -m "not network" -q
-```
-
-`conftest.py` gives XLA 8 host devices, so the FSDP, data parallel, checkpoint and resume tests run on any machine. The model, sampler and trainer files also run on a real GPU without the override.
-
-## Docs
-
-- [Concepts](docs/concepts/): the objectives seam, distributed training, the data pipeline
-- [Recipes](docs/recipes.md) and the [API](docs/api.md)
-- [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a notebook written from scratch, independent of the library
-- [Gallery](docs/gallery.md), [references](docs/references.md), [coming from FlaxDiff](docs/from-flaxdiff.md)
+* [The objectives seam](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md)
+* [API reference](docs/api.md) and [recipes](docs/recipes.md)
+* [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a from-scratch notebook independent of the library
+* [Gallery](docs/gallery.md), [references](docs/references.md), [migrating from FlaxDiff](docs/from-flaxdiff.md)
 
 ## Roadmap
 
-- Autoregressive and diffusion language model objectives
-- Audio conditioned video models end to end
-- Multi-host validation on a TPU pod
-- FID-50k
+* Autoregressive and diffusion language model objectives
+* Audio conditioned video models
+* Multi-host validation on a TPU pod
+* FID-50k
 
-## Gallery
+## Development
 
-![Text to image](images/medium_epoch5.png)
+```bash
+git clone --recurse-submodules git@github.com:AshishKumar4/dew.git
+cd dew && pip install -e ".[test]"
+JAX_PLATFORMS=cpu pytest -m "not network" -q
+```
 
-Text to image at 128px on Laion-Aesthetics 12M, CC12M, MS COCO and a COYO-700M subset, trained on a TPU-v4-32. More in [docs/gallery.md](docs/gallery.md).
+The test suite requests 8 XLA host devices, so the FSDP, data parallel and resume tests run on any machine. The model, sampler and trainer tests also run on a GPU without the override.
 
 ## Acknowledgements
 
-Built on JAX, Flax, Optax, Orbax, Grain, tyro, albumentations and Weights & Biases. The VAE and parts of the attention code come from diffusers, the InceptionV3 from jax-fid, and the Karras samplers follow k-diffusion and the EDM code. Papers and blogs are in [docs/references.md](docs/references.md).
+**This project is partially supported by [Google TPU Research Cloud](https://sites.research.google/trc/about/). I would like to thank the Google Cloud TPU team for providing me with the resources to train the bigger text-conditional models in multi-host distributed settings.**
 
-## About
-
-I started this as a hobby project to learn Flax and the maths behind diffusion models. My day job is Golang systems engineering with some applied ML, so the code reflects a learning journey. Please open an issue if you find mistakes. Pull requests are welcome.
+Dew builds on [JAX](https://github.com/jax-ml/jax), [Flax](https://github.com/google/flax), [Optax](https://github.com/google-deepmind/optax), [Orbax](https://github.com/google/orbax), [Grain](https://github.com/google/grain), [tyro](https://github.com/brentyi/tyro), [albumentations](https://github.com/albumentations-team/albumentations) and [Weights & Biases](https://github.com/wandb/wandb). The VAE and parts of the attention code come from [diffusers](https://github.com/huggingface/diffusers), the InceptionV3 from [jax-fid](https://github.com/matthias-wright/jax-fid), and the Karras samplers follow [k-diffusion](https://github.com/crowsonkb/k-diffusion) and the [EDM](https://github.com/NVlabs/edm) reference code.
 
 ## License
 
-MIT.
+[MIT](LICENSE)
