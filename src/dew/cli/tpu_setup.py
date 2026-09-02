@@ -1,7 +1,10 @@
 """The scripts dew-tpu runs on the workers.
 
 The setup script is rendered, not checked in: the Python version, the extras
-and the source mode are its parameters. Running it twice changes nothing.
+and the source mode are its parameters. Every step is guarded, so a second run
+re-creates nothing, but the two `uv pip install` lines resolve against PyPI
+each time: a jax[tpu] or dew-ml release since the last run is installed.
+`setup --version` pins the dew-ml side.
 """
 
 from __future__ import annotations
@@ -135,16 +138,15 @@ def render(
     python_version: str,
     package_spec: str,
     editable: bool = False,
-    jax_spec: str = JAX_SPEC,
     gcs_bucket: str = "",
 ) -> str:
     """The setup script for one worker."""
     header = [
         "#!/bin/bash",
-        "# Rendered by dew-tpu setup. A second run changes nothing.",
+        "# Rendered by dew-tpu setup.",
         "set -euo pipefail",
         f"PYTHON_VERSION={shlex.quote(python_version)}",
-        f"JAX_SPEC={shlex.quote(jax_spec)}",
+        f"JAX_SPEC={shlex.quote(JAX_SPEC)}",
         f"PACKAGE_SPEC={shlex.quote(package_spec)}",
         f"EDITABLE={int(editable)}",
         f"GCS_BUCKET={shlex.quote(gcs_bucket)}",

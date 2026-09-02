@@ -15,6 +15,9 @@ import sys
 import threading
 from collections.abc import Iterable, Sequence
 
+#: The binary every command in this module goes through.
+GCLOUD = "gcloud"
+
 _PRINT = threading.Lock()
 
 
@@ -93,14 +96,13 @@ def _segment(path: str, key: str) -> str:
 class Gcloud:
     """Builds gcloud argv, runs it, reads its JSON."""
 
-    def __init__(self, project: str = "", dry_run: bool = False, executable: str = "gcloud"):
+    def __init__(self, project: str = "", dry_run: bool = False):
         self.project = project
         self.dry_run = dry_run
-        self.executable = executable
 
     def argv(self, *args: str) -> list[str]:
         """A gcloud command line, with the project when the config names one."""
-        line = [self.executable, *args]
+        line = [GCLOUD, *args]
         if self.project:
             line.append(f"--project={self.project}")
         return line
@@ -133,7 +135,7 @@ class Gcloud:
         Runs in a dry run too: it reads and changes nothing, and the argv a dry
         run prints can depend on the answer.
         """
-        done = subprocess.run([self.executable, "config", "get-value", name],
+        done = subprocess.run([GCLOUD, "config", "get-value", name],
                               capture_output=True, text=True)
         value = done.stdout.strip()
         return "" if done.returncode or value == "(unset)" else value
