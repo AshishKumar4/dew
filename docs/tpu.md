@@ -44,7 +44,9 @@ python_version = "3.12"
 
 `zones` is a search order. When you leave `--zone` off a command, dew-tpu asks
 each zone in turn for the TPU and remembers the answer in
-`~/.config/dew/zones.json`, so it only searches once per name.
+`~/.config/dew/zones.json`, so the next command starts with the zone that
+worked. A TPU that has moved, or been recreated somewhere else, makes that
+zone stop answering and the search runs again from the top.
 
 ### 2. Create the slice
 

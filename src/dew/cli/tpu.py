@@ -84,22 +84,27 @@ def _project(gcloud: Gcloud, cfg: config.TpuConfig) -> str:
 
 
 def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) -> str:
-    """The zone a TPU lives in: the flag, the cache, or the first zone that has it."""
+    """The zone a TPU lives in: the flag, or the first zone that answers for it.
+
+    The cache is where the search starts, not a substitute for it: a TPU
+    deleted and recreated elsewhere would otherwise leave every command asking
+    the old zone until the cache file was edited by hand.
+    """
     if wanted:
         # Not cached: an unverified flag would send every later command astray.
         return wanted
     cached = config.cached_zone(name)
-    if cached:
-        return cached
     if gcloud.dry_run:
-        return cfg.zones[0]
-    for zone in cfg.zones:
+        return cached or cfg.zones[0]
+    order = cfg.zones if not cached else (cached, *(z for z in cfg.zones if z != cached))
+    for zone in order:
         found = gcloud.run(gcloud.argv(
             "compute", "tpus", "tpu-vm", "describe", name,
             f"--zone={zone}", "--format=value(name)"))
         if found.ok:
             config.cache_zone(name, zone)
             return zone
+    config.forget_zone(name)
     raise SystemExit(f"{name} is in none of {', '.join(cfg.zones)}")
 
 
@@ -125,6 +130,8 @@ def _slice(tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> tuple[int, s
 def _workers(spec: str, tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> list[int]:
     """`all` means every worker in the slice, anything else is one index."""
     if spec != "all":
+        if not spec.isdigit():
+            raise SystemExit(f"--worker takes a worker index or all, got {spec!r}")
         return [int(spec)]
     return list(range(_slice(tpu, cfg, type_hint)[0]))
 
