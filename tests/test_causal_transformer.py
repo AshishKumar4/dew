@@ -342,3 +342,144 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
 def test_rejected_configs(rng, config, message):
     with pytest.raises(ValueError, match=message):
         tiny(**config).init(rng, tokens(rng))
+
+
+# --- packed batches -------------------------------------------------------
+
+def packed_pair(rng, first=6, second=6):
+    """A two-document row, with the segment ids and positions grain emits."""
+    ids = tokens(rng, length=first + second)
+    segment_ids = jnp.asarray([[1] * first + [2] * second] * ids.shape[0])
+    positions = jnp.asarray(
+        [list(range(first)) + list(range(second))] * ids.shape[0])
+    return ids, segment_ids, positions
+
+
+def test_positions_default_to_the_row_index(rng):
+    """Passing nothing has to be what passing the row index means, or every
+    unpacked run would change the day this argument arrived."""
+    model = tiny()
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+
+    row_index = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
+    assert jnp.array_equal(model.apply(params, ids),
+                           model.apply(params, ids, positions=row_index))
+
+
+def test_packed_attention_stays_causal_inside_a_document(rng):
+    """The segment mask must sit on top of causality, not replace it."""
+    model = tiny()
+    ids, segment_ids, positions = packed_pair(rng)
+    params = model.init(rng, ids)
+    baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+
+    cut = 4
+    rewritten = ids.at[:, cut:6].set((ids[:, cut:6] + 5) % VOCAB)
+    changed = model.apply(params, rewritten, positions=positions,
+                          segment_ids=segment_ids)
+    assert jnp.array_equal(baseline[:, :cut], changed[:, :cut])
+    assert not jnp.allclose(baseline[:, cut:6], changed[:, cut:6])
+
+
+def test_packed_attention_never_crosses_a_document(rng):
+    model = tiny()
+    ids, segment_ids, positions = packed_pair(rng)
+    params = model.init(rng, ids)
+    baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+
+    other = ids.at[:, 6:].set((ids[:, 6:] + 7) % VOCAB)
+    changed = model.apply(params, other, positions=positions,
+                          segment_ids=segment_ids)
+    assert jnp.array_equal(baseline[:, :6], changed[:, :6])
+    assert not jnp.allclose(baseline[:, 6:], changed[:, 6:])
+
+
+def test_a_packed_document_reads_like_the_document_alone(rng):
+    """The second document's logits cannot depend on sitting after the first:
+    same tokens, same per-document positions, same output."""
+    model = tiny()
+    ids, segment_ids, positions = packed_pair(rng)
+    params = model.init(rng, ids)
+    packed = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+
+    alone = model.apply(params, ids[:, 6:])
+    assert jnp.max(jnp.abs(packed[:, 6:] - alone)) < 1e-5
+
+
+def test_padding_in_a_packed_row_reaches_no_query(rng):
+    model = tiny()
+    ids = tokens(rng, length=8)
+    segment_ids = jnp.asarray([[1] * 5 + [0] * 3] * ids.shape[0])
+    positions = jnp.asarray([list(range(5)) + [0] * 3] * ids.shape[0])
+    params = model.init(rng, ids)
+    baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+
+    # Rewriting the padded tail cannot move a real token's logits, and the
+    # padded rows themselves stay finite rather than dividing by an empty
+    # softmax.
+    padded = ids.at[:, 5:].set((ids[:, 5:] + 11) % VOCAB)
+    changed = model.apply(params, padded, positions=positions,
+                          segment_ids=segment_ids)
+    assert jnp.array_equal(baseline[:, :5], changed[:, :5])
+    assert jnp.all(jnp.isfinite(changed))
+
+
+def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
+    """cuDNN takes causality as a flag and turns any mask into a materialized
+    bias, so packed batches ride the xla kernel instead. Pinning cudnn here is
+    what proves the routing: this host has no cudnn to fall back on, so an
+    unpacked batch is refused while a packed one runs."""
+    # The param tree does not depend on the kernel, so the tree comes from a
+    # twin whose init is allowed to run: initialising the cudnn model itself
+    # would trip the same refusal before the test could make its point.
+    model = tiny(attention_impl='cudnn')
+    ids, segment_ids, positions = packed_pair(rng)
+    params = tiny().init(rng, ids)
+
+    with pytest.raises(ValueError, match="cudnn attention needs bf16"):
+        model.apply(params, ids)
+
+    logits = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    assert logits.shape == (ids.shape[0], ids.shape[1], VOCAB)
+    assert jnp.all(jnp.isfinite(logits))
+
+
+@pytest.mark.parametrize("overrides", [
+    {},
+    {"attention_impl": 'xla'},
+    {"num_kv_heads": 2, "attention_impl": 'xla'},
+])
+def test_packed_kernels_agree_with_the_reference(rng, overrides):
+    reference = tiny()
+    other = tiny(**overrides)
+    ids, segment_ids, positions = packed_pair(rng)
+    params = reference.init(rng, ids)
+    if "num_kv_heads" in overrides:
+        params = other.init(rng, ids)
+        reference = tiny(num_kv_heads=2)
+    expected = reference.apply(params, ids, positions=positions,
+                               segment_ids=segment_ids)
+    actual = other.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    # Largest difference observed on CPU: 1.4e-06.
+    assert jnp.max(jnp.abs(expected - actual)) < 1e-4
+
+
+def test_a_sliding_layer_packs_without_widening_its_window(rng):
+    """A packed row folds the window into the same mask, so a sliding layer
+    still forgets past it: two layers of a window of 3 reach 5 tokens back
+    inside the document, and the boundary stops the reach early."""
+    model = tiny(layer_types=('sliding_attention',) * 2, sliding_window=3)
+    ids, segment_ids, positions = packed_pair(rng)
+    params = model.init(rng, ids)
+    baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+
+    flipped = 1
+    changed = model.apply(
+        params, ids.at[:, flipped].set((ids[:, flipped] + 5) % VOCAB),
+        positions=positions, segment_ids=segment_ids)
+    moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
+    # Five tokens of reach, but the second document starts at 6, so the token
+    # at 1 moves 1..5 and stops there rather than running into 6.
+    assert [int(index) for index in jnp.where(moved)[0]] == list(
+        range(flipped, flipped + 5))
