@@ -170,6 +170,7 @@ PER_ARCH = {
     "hierarchical_mmdit": {"emb_features": (16, 32), "num_layers": (1, 1),
                            "num_heads": (2, 2), "base_patch_size": 2},
     "jepa_predictor": {"grid": (4, 4), "predictor_features": 16},
+    "causal_transformer": {"vocab_size": 32, "max_seq_len": 16},
 }
 RES, FRAMES = 16, 2
 
@@ -183,6 +184,8 @@ def tiny_inputs(architecture, rng):
         return video, jnp.ones((1,)), text
     if architecture == "jepa_encoder":
         return (image,)
+    if architecture == "causal_transformer":
+        return (jnp.zeros((1, 8), jnp.int32),)
     if architecture == "jepa_video_encoder":
         return (video,)
     if architecture == "jepa_predictor":

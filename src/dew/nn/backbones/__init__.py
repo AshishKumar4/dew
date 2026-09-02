@@ -11,6 +11,7 @@ from typing import Any
 from .unet import Unet
 from .uvit import UViT, SimpleUDiT
 from .dit import SimpleDiT
+from .causal_transformer import CausalTransformer
 from .mmdit import SimpleMMDiT, HierarchicalMMDiT
 from .ssm_dit import HybridSSMAttentionDiT
 from .video_dit import VideoDiT
@@ -28,6 +29,8 @@ __all__ = [
     "SimpleMMDiT",
     "HierarchicalMMDiT",
     "HybridSSMAttentionDiT",
+    # Language backbones
+    "CausalTransformer",
     # Video backbones
     "VideoDiT",
     "UNet3D",
