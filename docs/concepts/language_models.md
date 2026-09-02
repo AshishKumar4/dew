@@ -35,7 +35,7 @@ One id longer than the context on purpose: the inputs are `text[:, :-1]` and the
 
 ## Generation
 
-`dew.sampling.text.generate(model, params, prompt, max_new_tokens, *, rng, temperature=1.0, top_k=None)` prefills the KV cache on the prompt and then runs one `lax.scan` over the decode steps, returning `int32[B, P + max_new_tokens]`. `temperature=0` is greedy; `top_k` truncates the distribution before sampling. `params` is the variables dict the trainer holds, so the EMA copy can be sampled from directly.
+`dew.sampling.text.generate(model, params, prompt, max_new_tokens, *, rng, temperature=1.0, top_k=None)` prefills the KV cache on the prompt and then runs one `lax.scan` over the decode steps, returning `int32[B, P + max_new_tokens]`. The prompt is `int32[B, P]`, `temperature=0` is greedy, and `top_k` truncates the distribution before sampling. `params` is the variables dict the trainer holds, so the EMA copy can be sampled from directly.
 
 The objective generates during validation when it is given a `samples` dict:
 
@@ -48,7 +48,7 @@ LMObjective(model, 256, vocab_size=meta["vocab_size"], samples={
 })
 ```
 
-The prompt is one sequence of ids or several of the same length, the sampling key is folded with the step so each validation writes different text, and `decode` is what turns the ids back into the string that gets logged.
+The prompt in `samples` is one sequence of ids or several of the same length, which the objective batches into the `[B, P]` that `generate` takes. The sampling key is folded with the step so each validation writes different text, and `decode` is what turns the ids back into the string that gets logged.
 
 ## Running it
 
@@ -59,7 +59,7 @@ python recipes/lm/train.py --data.dataset data/shakespeare-byte \
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its position table. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--trainer.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
+`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--trainer.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
 
 ## What a run reports
 
