@@ -170,6 +170,18 @@ class SimpleTrainer:
             create=True, enable_async_checkpointing=True)
         self.checkpointer = ocp.CheckpointManager(self.checkpoint_path(), options=options)
 
+        # A run into a directory that already holds steps trains a whole epoch
+        # and only then discovers that orbax will not overwrite one. Nothing
+        # here guesses which way the caller meant it: resuming and starting
+        # over are both fine, and both have to be asked for.
+        written_step = self.checkpointer.latest_step()
+        if written_step is not None and load_from_checkpoint is None and checkpoint_step is None:
+            raise ValueError(
+                f"{self.checkpoint_path()} already holds checkpoints up to step "
+                f"{written_step}. Resume them with --trainer.load-from-checkpoint "
+                f"{self.checkpoint_path()}, or give this run a directory of its own "
+                f"with --trainer.name. Nothing has been deleted.")
+
         self.rngstate = RandomMarkovState(rngs)
         self.rngstate, subkey = self.rngstate.get_random_key()
 
