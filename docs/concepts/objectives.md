@@ -32,6 +32,8 @@ class Objective(ABC):
 
 Validation is the objective's too: `make_validation_step(**kwargs)` returns a `(val_state, batch) -> artifacts` function, which the trainer runs and hands to whatever `EvaluationMetric` objects the run was given. `log_validation_artifacts` draws them if there is anything to draw.
 
+The `wandb` it receives is the run the trainer opened, and there is none unless `--trainer.wandb-project` (with `--trainer.wandb-entity` for a team's project) is set: an unconfigured run trains, validates and checkpoints locally without logging anywhere.
+
 ## The two objectives
 
 `dew.objectives.diffusion.DiffusionObjective` is the default: sample a noise level from the schedule, corrupt the sample, predict, transform the prediction, weight the per-sample losses by the schedule's weights. Its validation step is a sampler run, and its artifacts are generated images or videos. If an autoencoder is configured it encodes the batch first, which is how latent diffusion runs on the same path.

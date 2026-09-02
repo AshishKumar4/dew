@@ -62,6 +62,16 @@ def model_flops_utilization(
     return flops_per_step / step_time / (peak * device_count)
 
 
+def default_compilation_cache_dir() -> str:
+    """Where compiled executables go unless a run names somewhere else.
+
+    Under the user's cache home, which is where a directory that can be deleted
+    at any moment belongs: not in the repo and not next to the checkpoints.
+    """
+    home = os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache')
+    return os.path.expanduser(os.path.join(home, 'dew', 'xla'))
+
+
 def enable_compilation_cache(path: str):
     """Persist compiled executables so restarts skip XLA compilation.
 
