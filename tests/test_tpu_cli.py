@@ -447,16 +447,38 @@ def test_sync_rsyncs_the_working_tree_to_every_worker(fake, capsys):
     shell = (f"ssh -i {Path.home()}/.ssh/google_compute_engine "
              "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null")
     assert sorted(fake.rsync_calls()) == sorted(
-        ["-az", "--delete", "--exclude=.git", "--filter=:- .gitignore", "-e", shell,
+        ["-az", "--exclude=.git", "--filter=:- .gitignore", "-e", shell,
          f"{REPO}/", f"you@34.0.0.{worker + 1}:~/{REPO.name}/"] for worker in (0, 1))
     assert f"~/{REPO.name}" in capsys.readouterr().out
+
+
+def test_sync_mirrors_only_when_asked(fake):
+    """rsync --delete removes remote files that are not in the local tree, so a
+    worker's datasets and outputs survive a sync that did not ask to mirror."""
+    fake.offer("slice", "us-central2-b")
+    assert run("sync", "slice") == 0
+    assert "--delete" not in fake.rsync_calls()[0]
+    fake.calls_path.unlink()
+    assert run("sync", "slice", "--delete") == 0
+    assert fake.rsync_calls()[0][:2] == ["-az", "--delete"]
+
+
+def test_train_and_setup_from_source_do_not_mirror_by_default(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("train", "slice", "--job", "run-1", "--", "recipes/lm/train.py") == 0
+    assert run("setup", "slice", "--from-source") == 0
+    assert all("--delete" not in call for call in fake.rsync_calls())
+    fake.calls_path.unlink()
+    assert run("train", "slice", "--job", "run-2", "--delete", "--",
+               "recipes/lm/train.py") == 0
+    assert all("--delete" in call for call in fake.rsync_calls())
 
 
 def test_sync_adds_the_extra_excludes(fake):
     fake.offer("slice", "us-central2-b")
     assert run("sync", "slice", "--exclude", "wandb", "--exclude", "*.pth") == 0
     call = fake.rsync_calls()[0]
-    assert call[2:6] == ["--exclude=.git", "--filter=:- .gitignore",
+    assert call[1:5] == ["--exclude=.git", "--filter=:- .gitignore",
                          "--exclude=wandb", "--exclude=*.pth"]
 
 
@@ -598,7 +620,7 @@ def test_spawn_does_not_launch_when_setup_fails_the_device_check(fake, capsys):
     (("run", "slice", "--", "uptime"), "--worker=1"),
     (("logs", "slice", "job1"), "worker-0.log"),
     (("copy", "slice", "a", "b"), "compute tpus tpu-vm scp a you@slice:b"),
-    (("sync", "slice"), "rsync -az --delete"),
+    (("sync", "slice"), "rsync -az --exclude=.git"),
     (("setup", "slice"), "dew-setup.sh"),
     (("train", "slice", "--", "recipes/lm/train.py"), "--trainer.multi-host True"),
     (("status", "slice"), "uptime -p"),

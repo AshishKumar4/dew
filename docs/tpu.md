@@ -83,8 +83,8 @@ dew-tpu setup dew-16 --from-source --extras tfds
 ```
 
 ```
-rsync -az --delete --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-0-ip>:~/dew/'
-rsync -az --delete --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-1-ip>:~/dew/'
+rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-0-ip>:~/dew/'
+rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-1-ip>:~/dew/'
 gcloud compute tpus tpu-vm scp /home/you/.config/dew/setup-dew-16.sh 'you@dew-16:~/dew-setup.sh' --zone=us-central2-b --worker=all --project=dew-training
 gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=0 '--command=bash ~/dew-setup.sh' --project=dew-training
 gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=1 '--command=bash ~/dew-setup.sh' --project=dew-training
@@ -136,8 +136,8 @@ dew-tpu train dew-16 --job lm-1 -- recipes/lm/train.py --data.batch-size 64
 ```
 
 ```
-rsync -az --delete --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-0-ip>:~/dew/'
-rsync -az --delete --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-1-ip>:~/dew/'
+rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-0-ip>:~/dew/'
+rsync -az --exclude=.git '--filter=:- .gitignore' -e 'ssh -i /home/you/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' /home/you/dew/ 'you@<worker-1-ip>:~/dew/'
 gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=0 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd ~/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-0.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
 gcloud compute tpus tpu-vm ssh you@dew-16 --zone=us-central2-b --worker=1 '--command=mkdir -p $HOME/dew-runs/lm-1 && nohup bash -c '"'"'. $HOME/.dew-env 2>/dev/null; cd ~/dew && python recipes/lm/train.py --data.batch-size 64 --trainer.multi-host True'"'"' > $HOME/dew-runs/lm-1/worker-1.log 2>&1 < /dev/null & echo "job lm-1 pid $!"' --project=dew-training
 job lm-1 on 2 worker(s), following worker 0
@@ -231,7 +231,7 @@ that instead, which is the only way the node goes away for good.
 | `dew-tpu run NAME -- CMD` | Run CMD on every worker in parallel. `--worker N`, `--detach`. |
 | `dew-tpu logs NAME JOB` | The log of a detached job. `--follow`, `--worker all`. |
 | `dew-tpu copy NAME SRC DST` | Copy a file or directory to every worker. |
-| `dew-tpu sync NAME` | rsync the git working tree to `~/<repo>` on every worker. |
+| `dew-tpu sync NAME` | rsync the git working tree to `~/<repo>` on every worker. `--delete` also removes what the local tree does not have. |
 | `dew-tpu setup NAME` | uv, venv, `jax[tpu]`, dew, gcsfuse, ulimits, env, then the device check. |
 | `dew-tpu train NAME -- RECIPE` | sync, then the recipe on every worker, detached, following worker 0. |
 | `dew-tpu status NAME` | Per worker: uptime, dew processes, devices busy. |
