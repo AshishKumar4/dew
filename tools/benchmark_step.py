@@ -16,9 +16,9 @@ Usage:
     python tools/benchmark_step.py --preset cpu-smoke
     python tools/benchmark_step.py --preset small --json-out /tmp/bench.json
     python tools/benchmark_step.py --preset small --architectures simple_dit unet
-    python tools/benchmark_step.py --preset custom --architecture simple_dit \
-        --config '{"patch_size": 2, "emb_features": 512, "num_layers": 12, "num_heads": 8}' \
-        --batch-size 32 --image-size 32 --fsdp-size 2
+    python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
+        "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
+        "num_heads": 8}, "batch_size": 32, "image_size": 32, "fsdp_size": 2}]'
 """
 
 import contextlib
@@ -28,7 +28,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +36,6 @@ import numpy as np
 import optax
 import tyro
 
-from dew.config import JsonDict
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
@@ -45,6 +44,18 @@ from dew.registry import MODEL_REGISTRY, build_model
 from dew.telemetry.instrumentation import compiled_flops
 from dew.training import ObjectiveTrainer
 from dew.training.distributed import DevicePrefetchIterator
+
+JsonCases = Annotated[
+    list[dict[str, Any]],
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda args: json.loads(args[0]),
+        is_instance=lambda value: isinstance(value, list),
+        str_from_instance=lambda value: [json.dumps(value)],
+    ),
+]
+"""A list of case dicts, written as one JSON string on the command line."""
 
 # Stand-in for the CLIP-L/14 context: a benchmark of the model should not spend
 # its first minute downloading a text encoder, and the step cost only depends
@@ -172,7 +183,9 @@ def small_cases(dtype: str) -> list[Case]:
 class BenchmarkConfig:
     """Which cases to time, and how."""
 
-    preset: Literal['small', 'cpu-smoke', 'custom'] = 'small'
+    preset: Literal['small', 'cpu-smoke'] = 'small'
+    cases: JsonCases = field(default_factory=list)
+    """Explicit cases as a JSON list of Case fields; replaces the preset."""
     architectures: Optional[list[str]] = None
     """Keep only these cases from the preset."""
     warmup: int = 2
@@ -184,11 +197,7 @@ class BenchmarkConfig:
     fsdp_size: Optional[int] = None
     image_size: Optional[int] = None
     frames: Optional[int] = None
-    architecture: Optional[str] = None
-    """The single case built by --preset custom."""
-    config: JsonDict = field(default_factory=dict)
-    predictor: JsonDict = field(default_factory=dict)
-    """Non-empty makes the custom case a JEPA run over --architecture."""
+    """Frame count for the video cases; image cases are left alone."""
     checkpoint_dir: str = "/tmp/dew-benchmark-step"
     json_out: Optional[str] = None
     quiet: bool = True
@@ -196,11 +205,15 @@ class BenchmarkConfig:
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
-    if config.preset == 'custom':
-        if not config.architecture:
-            raise ValueError("--preset custom needs --architecture")
-        cases = [Case(config.architecture, dict(config.config),
-                      predictor=dict(config.predictor) or None)]
+    if config.cases:
+        fields = {f.name for f in dataclasses.fields(Case)}
+        for spec in config.cases:
+            unknown = sorted(set(spec) - fields)
+            if unknown:
+                raise ValueError(
+                    f"--cases entry has no such field {unknown}; "
+                    f"valid fields are {sorted(fields)}")
+        cases = [Case(**spec) for spec in config.cases]
     elif config.preset == 'cpu-smoke':
         cases = cpu_smoke_cases()
     else:
