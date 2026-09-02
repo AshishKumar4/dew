@@ -71,6 +71,9 @@ class DiffusionRunConfig(RunConfig):
         default_factory=lambda: {"modelname": "pcuenq/sd-vae-ft-mse-flax"})
     val_metrics: list[Literal['clip', 'clip_score', 'fid']] = field(
         default_factory=lambda: ['clip'])
+    validation_prompts: Optional[str] = None
+    """Text file of captions, one per line, sampled from at validation instead
+    of the dataset's own val split."""
     dataset_test: bool = False
     """Pull 2000 batches through the pipeline before training, for benchmarking."""
 
@@ -134,6 +137,29 @@ def build_eval_metrics(names: list[str]) -> list:
     return metrics
 
 
+def validation_prompt_batches(path: str, encoder, batch_size: int, steps: int):
+    """Validation batches of captions read from a file, and how many there are.
+
+    A fixed prompt list keeps the sampled grids comparable across runs, which a
+    shuffled val split does not, and it is the only validation a caption-less
+    dataset can offer a text-conditioned model.
+    """
+    with open(path) as handle:
+        prompts = [line.strip() for line in handle if line.strip()]
+    if not prompts:
+        raise ValueError(f"No prompts in {path}")
+
+    def get_val_dataset():
+        for step in range(steps):
+            start = step * batch_size
+            batch = [prompts[(start + i) % len(prompts)] for i in range(batch_size)]
+            # dict(): the tokenizer's own mapping is one pytree leaf, so the
+            # batch would never reach the devices field by field
+            yield {"text": dict(encoder.tokenize(batch))}
+
+    return get_val_dataset, len(prompts)
+
+
 def run_summary(config: DiffusionRunConfig, model_config: dict, arguments_hash: str) -> dict:
     """Flat view of the run, for the wandb config and the experiment name."""
     return {
@@ -167,7 +193,8 @@ def experiment_name(config: DiffusionRunConfig, summary: dict, latent: bool) -> 
 
 
 def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
-    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline)
+    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
+                    config.trainer.multi_host)
     print(f"Local devices: {jax.local_devices()}")
 
     data = load_data(config.data)
@@ -204,32 +231,34 @@ def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
     if config.trainer.checkpoint_fs == 'gcs':
         checkpoint_dir = f"gs://{checkpoint_dir}"
 
-    wandb_config: dict[str, Any] = {
-        "project": config.trainer.wandb_project,
-        "entity": config.trainer.wandb_entity,
-        "name": name,
-        "config": {
-            "model": model_config,
-            "architecture": architecture,
-            "dataset": {
-                "name": config.data.dataset,
-                "length": datalen,
-                "batches": batches,
+    wandb_config: Optional[dict[str, Any]] = None
+    if config.trainer.wandb_project is not None:
+        wandb_config = {
+            "project": config.trainer.wandb_project,
+            "entity": config.trainer.wandb_entity,
+            "name": name,
+            "config": {
+                "model": model_config,
+                "architecture": architecture,
+                "dataset": {
+                    "name": config.data.dataset,
+                    "length": datalen,
+                    "batches": batches,
+                },
+                "learning_rate": config.optim.learning_rate,
+                "batch_size": config.data.batch_size,
+                "epochs": config.trainer.epochs,
+                "input_shapes": input_config.get_input_shapes(autoencoder=autoencoder),
+                "input_config": input_config.serialize(),
+                "arguments": summary,
+                "run_config": run_config,
+                "autoencoder": config.autoencoder,
+                "autoencoder_opts": json.dumps(config.autoencoder_opts),
+                "arguments_hash": arguments_hash,
             },
-            "learning_rate": config.optim.learning_rate,
-            "batch_size": config.data.batch_size,
-            "epochs": config.trainer.epochs,
-            "input_shapes": input_config.get_input_shapes(autoencoder=autoencoder),
-            "input_config": input_config.serialize(),
-            "arguments": summary,
-            "run_config": run_config,
-            "autoencoder": config.autoencoder,
-            "autoencoder_opts": json.dumps(config.autoencoder_opts),
-            "arguments_hash": arguments_hash,
-        },
-    }
-    if config.trainer.resume_last_run is not None:
-        wandb_config['id'] = config.trainer.resume_last_run
+        }
+        if config.trainer.resume_last_run is not None:
+            wandb_config['id'] = config.trainer.resume_last_run
 
     trainer = ObjectiveTrainer(
         model,
@@ -263,18 +292,13 @@ def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
         print("Distributed Training enabled")
     print(f"Training on {config.data.dataset} dataset with {steps_per_epoch} steps per epoch")
 
-    # Hardcoding these cuz don't have much time for project submission
-    if config.data.dataset == 'laiona_coco':
-        import pickle
-        val_set = pickle.load(open(
-            "/home/mrwhite0racle/gcs_mount/datasets/laion12m+mscoco_filtered-new/validation_set_small.pkl",
-            "rb"))
-
-        def get_val_dataset():
-            for i in range(0, len(val_set)):
-                yield val_set[i]
-
-        data['val'], data['val_len'] = get_val_dataset, len(val_set)
+    if config.validation_prompts is not None:
+        data['val'], data['val_len'] = validation_prompt_batches(
+            config.validation_prompts,
+            input_config.conditions[0].encoder,
+            data['local_batch_size'],
+            config.data.val_steps_per_epoch,
+        )
 
     trainer.fit(
         data,

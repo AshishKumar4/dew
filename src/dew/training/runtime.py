@@ -11,12 +11,13 @@ import resource
 import jax
 
 
-def prepare_process(augmentation_mode: str, wandb_offline: bool = False):
+def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
+                    multi_host: bool = False):
     """Raise the fd/core limits, join the device pool, set the env vars.
 
-    jax.distributed.initialize() is still swallowed when it fails - a single
-    process must keep training - but the reason is printed so the failure is
-    at least visible.
+    multi_host joins the JAX process pool, and a failure to join is fatal: a
+    pod run that quietly falls back to one process trains on a slice of the
+    data with a slice of the devices and reports it as a full run.
     """
     # The image augmenters read this at MapTransform construction time
     os.environ['FLAXDIFF_AUGMENT_MODE'] = augmentation_mode
@@ -28,9 +29,8 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False):
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
 
-    print("Initializing JAX")
-    try:
+    if multi_host:
         jax.distributed.initialize()
-    except Exception as e:
-        print(f"jax.distributed.initialize() failed, continuing on one process: {e}")
+        print(f"Joined the JAX process pool: process {jax.process_index()} "
+              f"of {jax.process_count()}")
     print(f"Number of devices: {jax.device_count()}")
