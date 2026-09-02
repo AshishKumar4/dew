@@ -44,7 +44,8 @@ class ModelConfig:
     dtype: Literal["float32", "bfloat16"] = "bfloat16"
     """Compute dtype; params stay float32."""
     attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
-    """Attention kernel; 'auto' is cudnn on gpu, xla elsewhere."""
+    """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
+    supports and xla for the rest, xla on any other backend."""
 
 
 @dataclasses.dataclass(frozen=True)

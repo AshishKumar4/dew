@@ -81,7 +81,7 @@ The table above was measured before `benchmark_step.py` applied the run's
 precision policy, so every row there ran the reference einsum attention while
 a recipe would have run `attention_impl='auto'`. The tool now applies the
 policy, which is what these rows are: same models, same batches, `auto`
-attention (cudnn where cudnn can train the shape, xla elsewhere, see
+attention (cudnn where cudnn supports the shape, xla elsewhere, see
 `docs/performance.md`), no XLA flags, one architecture per process so every
 peak is its own. `change` is against the row above.
 
