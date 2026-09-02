@@ -181,7 +181,7 @@ trainer = ObjectiveTrainer(
 
 ## Language models
 
-`CausalTransformer` is a decoder with the parts current open models use: RMSNorm, grouped-query attention, rotary positions, a gated MLP, q/k normalisation, and optional sliding-window layers, embedding scaling and logit softcapping. Its parameter tree follows the Hugging Face layout, so Qwen and Gemma checkpoints map onto it by renaming keys. `LMObjective` is next-token cross entropy in fp32; at validation it reports perplexity and generates text.
+`CausalTransformer` is a decoder with the parts current open models use: RMSNorm, grouped-query attention, rotary positions, a gated MLP, q/k normalisation, and optional sliding-window layers, embedding scaling and logit softcapping. Its parameter tree follows the Hugging Face decoder layout. Qwen and Gemma checkpoint translators and parity tests are in progress; a checkpoint is not supported until those tests pass. `LMObjective` is next-token cross entropy in fp32; at validation it reports perplexity and generates text.
 
 ```python
 from dew.data.dataloaders import get_token_dataset_grain

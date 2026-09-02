@@ -8,8 +8,8 @@ the same fixed-size KV cache helpers.
 
 Parameter names mirror the HF decoder layout - embed_tokens,
 layers_N.{input_layernorm, self_attn.{q,k,v,o}_proj, post_attention_layernorm,
-mlp.{gate,up,down}_proj}, norm, lm_head - so loading a Qwen3 or Gemma3
-checkpoint is a key rename rather than a reshuffle of the tree.
+mlp.{gate,up,down}_proj}, norm, lm_head. A model family is supported only
+after its translator and same-weight reference parity test land.
 
 The block holds its token mixer in a slot: any module with the
 (x, decode=...) -> x signature of CausalSelfAttention becomes self_attn
