@@ -6,9 +6,9 @@ The public modules, and what each one is for.
 
 | Module | Contents |
 | --- | --- |
-| `dew.training` | `ObjectiveTrainer`, `SimpleTrainer`, `TrainState`, `SimpleTrainState`, `Metrics` |
+| `dew.training` | `ObjectiveTrainer`, `SimpleTrainer`, `TrainState`, `SimpleTrainState`, `build_optimizer`, `prepare_process` |
 | `dew.training.distributed` | `build_mesh`, `parameter_spec`, `state_sharding_tree`, `batch_sharding`, `shard_batch`, `DevicePrefetchIterator`, `DATA_AXIS`, `FSDP_AXIS`, `BATCH_SPEC`, `DEFAULT_MIN_SHARD_SIZE` |
-| `dew.telemetry.instrumentation` | `step_flops`, `model_flops_utilization`, `enable_compilation_cache`, `PEAK_FLOPS_PER_DEVICE` |
+| `dew.telemetry.instrumentation` | `step_flops`, `compiled_flops`, `model_flops_utilization`, `enable_compilation_cache`, `default_compilation_cache_dir`, `PEAK_FLOPS_PER_DEVICE` |
 | `dew.checkpoints.utils` | `get_latest_checkpoint`, `serialize_model` |
 | `dew.config` | `RunConfig`, `ModelConfig`, `DataConfig`, `OptimConfig`, `TrainerConfig` |
 
@@ -32,7 +32,7 @@ The public modules, and what each one is for.
 
 | Module | Contents |
 | --- | --- |
-| `dew.registry` | `build_model`, `canonicalize_architecture`, `map_config_strings`, `MODEL_REGISTRY` |
+| `dew.registry` | `build_model`, `apply_precision_policy`, `canonicalize_architecture`, `map_config_strings`, `MODEL_REGISTRY` |
 | `dew.nn.backbones` | `Unet`, `UNet3D`, `UViT`, `SimpleUDiT`, `SimpleDiT`, `SimpleMMDiT`, `HierarchicalMMDiT`, `HybridSSMAttentionDiT`, `VideoDiT` |
 | `dew.nn.backbones.jepa` | `JepaEncoder`, `JepaVideoEncoder`, `JepaPredictor` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
@@ -54,7 +54,7 @@ The public modules, and what each one is for.
 | `dew.inputs.encoders` | `TextEncoder`, `CLIPTextEncoder`, `AudioEncoder`, `HFAudioEncoder` |
 | `dew.inputs.processors` | `AutoTextTokenizer`, `AutoAudioProcessor`, `defaultTextEncodeModel` |
 | `dew.data` | lazy re-exports of the loaders, sources and augmenters, so `import dew.data` costs nothing |
-| `dew.data.dataloaders` | `get_dataset_grain`, `get_media_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
+| `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
 | `dew.data.registry` | `datasetMap`, `onlineDatasetMap`, `mediaDatasetMap` |
 | `dew.data.sources.base` | `DataSource`, `DataAugmenter`, `MediaDataset` |
 | `dew.data.sources.images`, `.videos`, `.voxceleb2` | the TFDS, GCS, local video and VoxCeleb2 implementations |
