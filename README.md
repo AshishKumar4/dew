@@ -20,19 +20,19 @@
 
 ## Overview
 
-Dew is a framework for training models from scratch in JAX and Flax. The trainer, data pipeline, sharding and checkpointing are shared; the training objective is the plug-in. Diffusion and JEPA ship today, language models are on the roadmap.
+Dew is a general framework for training ML models in JAX and Flax. You can train diffusion models, flow matching models, JEPA encoders, and your own architectures and objectives, fully sharded across devices and hosts, on one set of primitives: a trainer, data pipelines, objectives, samplers and evaluation. Language models come next.
 
 Dew includes:
 
 * **Objectives** (`dew.objectives`): `DiffusionObjective` for pixel and latent diffusion with min-SNR weighting, and `JepaObjective` for I-JEPA and V-JEPA with collapse telemetry and probes. An objective defines `init_params`, `loss` and a validation step.
-* **Models** (`dew.nn`): UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT and JEPA encoders, a vendored Stable Diffusion VAE, Hilbert and zigzag patch orders. One attention path over the reference, XLA, cuDNN and TPU kernels with an identical parameter tree.
+* **Models** (`dew.nn`): UNet, UNet3D, UViT, DiT, MMDiT, HierarchicalMMDiT, SSM-DiT, VideoDiT and JEPA encoders, a vendored Stable Diffusion VAE, Hilbert and zigzag patch orders. One attention module that runs on the reference, XLA, cuDNN or TPU kernel with the same parameters.
 * **Diffusion maths** (`dew.diffusion`): linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules; epsilon, x0, v, flow and Karras prediction transforms; presets that pair them.
 * **Samplers** (`dew.sampling`): DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM, with interval-limited classifier-free guidance.
 * **Trainer** (`dew.training`): data parallel and FSDP on a `(data, fsdp)` mesh, gradient accumulation, EMA, bf16 compute over fp32 parameters, async Orbax checkpoints with mid-epoch resume, Weights & Biases logging, profiling and MFU.
-* **Data** (`dew.data`): Grain pipelines over TFDS, GCS ArrayRecord, local video, VoxCeleb2 and URL streams, with augmentation seeded per record.
+* **Data** (`dew.data`): Grain pipelines over TFDS, GCS ArrayRecord, local video, VoxCeleb2 and URL streams, with deterministic augmentation.
 * **Evaluation and interop**: FID, CLIP score, PSNR and SSIM; safetensors export in the Hugging Face layout that transformers, vLLM and verl read.
 
-Dew is the successor to [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff) and carries its history. It is a personal research project, not a product. Expect sharp edges, and please open an issue when you find one.
+Dew is the successor to [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). It is a personal research project. Expect sharp edges.
 
 ## Quick install
 
@@ -43,7 +43,7 @@ pip install "jax[cuda12]"      # or "jax[tpu]"; the base install is CPU only
 
 Extras: `[tfds]` datasets, `[av]` video and audio, `[streaming]` URL streaming, `[metrics]` FID, `[interop]` safetensors.
 
-The `dew` name on PyPI is a fileless placeholder from 2015. A PEP 541 request is pending; the package is `dew-ml` until it resolves.
+`dew` on PyPI is an unused placeholder, so the package is `dew-ml` for now.
 
 ## What does Dew look like?
 
@@ -81,7 +81,7 @@ images = sampler.generate_samples(params=state.ema_params, num_samples=2, resolu
                                   diffusion_steps=50, conditioning=["a water lily", "a rose"])
 ```
 
-The recipes expose the same trainer as a typed command line. Every config field is a flag; `--help` prints the tree.
+The recipes run the same trainer from the command line. Every config field is a flag.
 
 ```bash
 python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.architecture simple_dit \
@@ -89,7 +89,7 @@ python recipes/diffusion/train.py --data.dataset oxford_flowers102 --model.archi
 python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102
 ```
 
-A new objective is a class with a loss. This one trains a byte-level language model through the unmodified trainer:
+An objective is a class with a loss. This one trains a small language model with the same trainer:
 
 ```python
 class LMObjective(Objective):
@@ -149,7 +149,7 @@ cd dew && pip install -e ".[test]"
 JAX_PLATFORMS=cpu pytest -m "not network" -q
 ```
 
-The test suite requests 8 XLA host devices, so the FSDP, data parallel and resume tests run on any machine. The model, sampler and trainer tests also run on a GPU without the override.
+The tests simulate 8 devices on CPU, so the sharding tests run on any machine.
 
 ## Acknowledgements
 
