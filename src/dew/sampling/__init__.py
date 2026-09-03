@@ -13,6 +13,7 @@ from .loading import (
     load_from_wandb_run,
     load_from_wandb_registry,
     get_wandb_run,
+    RestoredState,
 )
 
 __all__ = [
@@ -26,12 +27,11 @@ __all__ = [
     "HeunSampler",
     "RK4Sampler",
     "MultiStepDPM",
-    "InferencePipeline",
-    "DiffusionInferencePipeline",
     "generate",
     "parse_config",
     "load_from_checkpoint",
     "load_from_wandb_run",
     "load_from_wandb_registry",
     "get_wandb_run",
+    "RestoredState",
 ]

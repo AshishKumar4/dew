@@ -14,9 +14,10 @@ import orbax.checkpoint as ocp
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
-from typing import Dict, Callable, Any, Tuple, Optional
+from typing import Dict, Callable, Any, Tuple, Optional, Union
 from dew.random_state import RandomMarkovState
 from dew.objectives.base import shape_and_dtype
+from dew.checkpoints.utils import RestoredState
 from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, model_flops_utilization,
 )
@@ -64,7 +65,7 @@ class SimpleTrainer:
                  input_shapes: Dict[str, Tuple[int]],
                  optimizer: optax.GradientTransformation,
                  rngs: jax.random.PRNGKey,
-                 train_state: SimpleTrainState = None,
+                 train_state: Union[SimpleTrainState, RestoredState] = None,
                  name: str = "Simple",
                  load_from_checkpoint: str = None,
                  loss_fn=optax.l2_loss,
@@ -198,6 +199,13 @@ class SimpleTrainer:
         self.best_loss = 1e9
         if train_state is None:
             self.state = self.generate_states(optimizer, subkey, model, use_dynamic_scale)
+        elif isinstance(train_state, RestoredState):
+            # A checkpoint holds arrays without the model or optimizer that
+            # wrote them, so the types come from a fresh init and the values
+            # from the restored state, placed onto this run's shardings.
+            fresh = self.generate_states(optimizer, subkey, model, use_dynamic_scale)
+            self.state = jax.device_put(
+                train_state.restore_into(fresh), self.state_sharding)
         else:
             self.state = train_state
             self.state_sharding = jax.tree.map(lambda x: x.sharding, train_state)
@@ -209,6 +217,8 @@ class SimpleTrainer:
         self.last_saved_step = None
 
         self.latest_step = 0
+        if train_state is not None and not isinstance(train_state, SimpleTrainState):
+            self.latest_step = int(train_state.step)
         if load_from_checkpoint is not None:
             self.latest_step = self.load(load_from_checkpoint, checkpoint_step, load_directly_from_dir)
 

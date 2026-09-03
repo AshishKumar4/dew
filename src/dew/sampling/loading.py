@@ -10,6 +10,7 @@ from orbax.checkpoint import (
     CheckpointManager, CheckpointManagerOptions, PyTreeCheckpointHandler,
 )
 
+from dew.checkpoints.utils import RestoredState
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.registry import build_model, canonicalize_architecture, map_config_strings
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
@@ -151,7 +152,7 @@ def _epoch_loss(metrics):
 def load_from_checkpoint(
     checkpoint_dir: str,
     step: int | Literal['latest', 'best'] = 'latest',
-):
+) -> RestoredState:
     """Restore one train state from an orbax checkpoint directory.
 
     `checkpoint_dir` is either a manager directory holding step
@@ -164,6 +165,10 @@ def load_from_checkpoint(
     Raises if the checkpoint cannot be read: the callers below decide what a
     failed load means, and reporting it as an empty state made an unusable
     pipeline look like a successful one.
+
+    The state comes back as a RestoredState: the same arrays with the
+    TrainState's attribute names, so a restored run reads `restored.params`
+    where a live one reads `state.params`.
     """
     checkpoint_dir = os.path.abspath(checkpoint_dir)
     manager = CheckpointManager(
@@ -178,22 +183,23 @@ def load_from_checkpoint(
     if step == 'best':
         if not steps:
             stored = manager.restore(latest)
-            return stored.get('best_state', stored['state'])
+            return RestoredState.from_checkpoint(
+                stored.get('best_state', stored['state']))
         best = manager.best_step()
         if best is not None:
             print(f"Loading best checkpoint (step {best}) from {checkpoint_dir}")
-            return manager.restore(best)['state']
+            return RestoredState.from_checkpoint(manager.restore(best)['state'])
         stored = manager.restore(latest)
         if 'best_state' not in stored:
             raise ValueError(
                 f"No best step recorded in {checkpoint_dir}: no epoch loss is "
                 "checkpointed there and no best state is stored")
-        return stored['best_state']
+        return RestoredState.from_checkpoint(stored['best_state'])
 
     target = latest if step == 'latest' else step
     ckpt = manager.restore(target)
     print(f"Loaded checkpoint from local dir {checkpoint_dir}")
-    return ckpt['state']
+    return RestoredState.from_checkpoint(ckpt['state'])
 
 def load_from_wandb_run(
     run,
