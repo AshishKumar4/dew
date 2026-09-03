@@ -744,3 +744,126 @@ def test_the_training_stream_repeats_instead_of_ending(
     assert not ended and len(batches) == 3 * epoch
     assert sorted(first_epoch) == list(range(16, 32))
     assert set(later) == set(first_epoch), "the stream reads the same records again"
+
+
+# ---------------------------------------------------------------------------------
+# Determinism across worker counts, and a restart mid-epoch
+# ---------------------------------------------------------------------------------
+
+class _ImageSource(DataSource):
+    """Deterministic images and class labels, addressed by index."""
+
+    def __init__(self, length):
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        rng = np.random.RandomState(index)
+        return {"index": index,
+                "image": rng.randint(0, 256, (12, 12, 3), np.uint8),
+                "label": index % 5}
+
+    def get_source(self, path_override):
+        return self
+
+
+class _AugmentingAugmenter(DataAugmenter):
+    """The real augmentation pipeline and the real labelizer, no tokenizer.
+
+    Those two are what a worker count could move: both draw from grain's
+    per-record rng. Tokenizing a caption is deterministic and needs the hub.
+    """
+
+    def __init__(self, label_path):
+        self.label_path = label_path
+
+    def create_transform(self, image_scale=8, method=None):
+        augments = image_augmentations()
+        labelizer = labelizer_oxford_flowers102(self.label_path)
+
+        class Augmenting(pygrain.RandomMapTransform):
+            def random_map(self, element, rng):
+                return {"index": element["index"],
+                        "image": augment_image(augments, element["image"], rng),
+                        "caption": labelizer(element, rng)}
+
+        return Augmenting
+
+
+@pytest.fixture
+def augmenting_media_dataset(monkeypatch, tmp_path):
+    """A media dataset whose records really are augmented and captioned."""
+    labels = tmp_path / "label.labels.txt"
+    labels.write_text("\n".join(["rose", "tulip", "lotus", "orchid", "marigold"]))
+    dataset = MediaDataset(source=_ImageSource(16),
+                           augmenter=_AugmentingAugmenter(str(labels)),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "augmenting", dataset)
+    return dataset
+
+
+def _rows(batch):
+    """(index, pixels, caption) per record, so a comparison covers all three."""
+    return [(int(batch["index"][row]), batch["image"][row].tobytes(),
+             str(batch["caption"][row]))
+            for row in range(len(batch["index"]))]
+
+
+def _augmented(worker_count, batch=4, seed=3):
+    """{record index: (pixels, caption)} for one epoch at this worker count."""
+    data = get_media_dataset_grain("augmenting", dataset_source="/tmp",
+                                   batch_size=batch, worker_count=worker_count,
+                                   num_epochs=1, seed=seed)
+    records = {}
+    for b in data["train"]():
+        for row in range(len(b["index"])):
+            records[int(b["index"][row])] = (b["image"][row].tobytes(),
+                                             str(b["caption"][row]))
+    return records
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("worker_count", [1, 2, 4])
+def test_a_records_pixels_and_caption_do_not_depend_on_worker_count(
+        augmenting_media_dataset, worker_count):
+    """The flip, the colour jitter and the prompt template all come from the
+    per-record rng, which grain keys by record index, so the number of workers
+    that produced a batch cannot change what is in it."""
+    serial = _augmented(0)
+    parallel = _augmented(worker_count)
+
+    assert sorted(serial) == list(range(16))
+    assert serial == parallel
+
+
+def test_augmentation_really_moves_the_pixels(augmenting_media_dataset):
+    """Guards the test above: identical records at every worker count would
+    also be true of a pipeline that augmented nothing."""
+    records = _augmented(0)
+    source = _ImageSource(16)
+
+    assert any(records[i][0] != source[i]["image"].tobytes() for i in records)
+    assert len({caption for _, caption in records.values()}) > 1
+
+
+@pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
+        augmenting_media_dataset, worker_count):
+    """The trainer saves the iterator's position in its checkpoint, so a
+    restored run owes the epoch its unseen records, no more and no fewer."""
+    data = get_media_dataset_grain("augmenting", dataset_source="/tmp", batch_size=4,
+                                   worker_count=worker_count, num_epochs=1, seed=3)
+
+    interrupted = iter(data["train"]())
+    seen = _rows(next(interrupted))
+    state = interrupted.get_state()
+    unseen = [row for b in interrupted for row in _rows(b)]
+
+    restored = iter(data["train"]())
+    restored.set_state(state)
+    resumed = [row for b in restored for row in _rows(b)]
+
+    assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
+    assert sorted(index for index, _, _ in seen + resumed) == list(range(16))
