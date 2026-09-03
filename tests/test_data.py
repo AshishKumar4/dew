@@ -19,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import grain.python as pygrain
+import jax
 import numpy as np
 import pytest
 
@@ -401,6 +402,33 @@ def test_a_run_config_holds_out_a_validation_split_on_both_grain_paths(monkeypat
     expected = defaults.val_steps_per_epoch * defaults.batch_size
     assert captured["oxford_flowers102"]["val_count"] == expected
     assert captured["voxceleb2"]["val_count"] == expected
+
+
+# ---------------------------------------------------------------------------------
+# The global batch over JAX processes
+# ---------------------------------------------------------------------------------
+
+def test_a_global_batch_that_does_not_split_over_the_processes_is_refused(
+        tmp_path, monkeypatch):
+    """Integer division hid the remainder: 65 over eight processes trained on
+    64 records a step while global_batch_size reported 65, and 7 gave every
+    process a batch of nothing."""
+    tokens = np.arange(1, 8 * 64 + 2, dtype=np.uint16)
+    for name in ("train.bin", "val.bin"):
+        (tmp_path / name).write_bytes(tokens.tobytes())
+    monkeypatch.setattr(jax, "process_count", lambda: 8)
+
+    def loader(batch_size):
+        return dataloaders.get_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+            batch_size=batch_size, seq_len=8, worker_count=0)
+
+    for batch_size in (65, 7):
+        with pytest.raises(ValueError, match=r"batch_size.*8 JAX processes"):
+            loader(batch_size)
+    data = loader(64)
+    assert data["local_batch_size"] == 8 and data["global_batch_size"] == 64
+
 
 # ---------------------------------------------------------------------------------
 # WAV decoding

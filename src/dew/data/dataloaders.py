@@ -25,6 +25,22 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 
+def _local_batch_size(batch_size: int) -> int:
+    """The share of a global batch each JAX process batches for itself.
+
+    Every process batches its own shard and the run reports batch_size as
+    the global batch, so a remainder would train on fewer records a step
+    than the run reports, and a batch below the process count would give
+    every process a batch of nothing.
+    """
+    processes = jax.process_count()
+    if batch_size % processes:
+        raise ValueError(
+            f"batch_size {batch_size} does not split over {processes} JAX processes"
+        )
+    return batch_size // processes
+
+
 def generate_collate_fn(media_type="image"):
     """Generate a collate function based on media type.
     
@@ -171,7 +187,7 @@ def get_dataset_grain(
     dataset = datasetMap[data_name]
     data_source = dataset["source"](dataset_source)
     augmenter = dataset["augmenter"](image_scale, method)
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     dataset_length = len(data_source) if count is None else count
 
     # A held-out slice off the head keeps the two loaders disjoint, so FID and
@@ -270,7 +286,7 @@ def get_dataset_online(
     # `datasets`, which the grain paths above deliberately do without.
     from .online_loader import OnlineStreamingDataLoader
 
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     sources = onlineDatasetMap[data_name]["source"]
     dataloader = OnlineStreamingDataLoader(
             sources, 
@@ -488,8 +504,7 @@ def get_media_dataset_grain(
 
     augmenter = media_dataset.get_augmenter(**transform_kwargs)
 
-    # Calculate local batch size for distributed training
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
 
     # Create a sampler for the dataset
     if hasattr(data_source, "__len__"):
@@ -597,7 +612,7 @@ def get_media_dataset_online(
     Returns:
         Dictionary with train dataset function and metadata.
     """
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     
     # Get dataset sources
     if dataset_sources is None:
@@ -679,7 +694,7 @@ def get_token_dataset_grain(
 
     train_source = TokenFileSource(train_path, seq_len)
     val_source = TokenFileSource(val_path, seq_len)
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
 
     train_sampler = pygrain.IndexSampler(
         num_records=len(train_source),
@@ -807,7 +822,7 @@ def get_packed_token_dataset_grain(
 
     from .sources.text import TokenDocumentSource
 
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     window = seq_len + 1
 
     # One source per split, reused by its loader: finding the boundaries reads
