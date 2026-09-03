@@ -8,8 +8,8 @@ and every url is under .invalid so a stray fetch could not reach a host.
 """
 
 import multiprocessing
-import sys
 import queue
+import sys
 import threading
 
 import numpy as np
