@@ -115,7 +115,12 @@ def run_losses(trainer, steps, images):
 
 
 def indexed_loader(records: int, batch: int = BATCH):
-    """A checkpointable source whose batches say which records they hold."""
+    """A checkpointable source whose batches say which records they hold.
+
+    Sharded by process, as every grain loader in dew is, so a process's
+    position names its own shard and a resume has to hand it back to that
+    process and no other.
+    """
     import grain.python as pygrain
 
     class ToImage(pygrain.MapTransform):
@@ -126,7 +131,7 @@ def indexed_loader(records: int, batch: int = BATCH):
         data_source=pygrain.RangeDataSource(0, records, 1),
         sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
                                      num_epochs=1,
-                                     shard_options=pygrain.NoSharding()),
+                                     shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
         worker_count=0,
     )
@@ -304,11 +309,12 @@ def mode_fit(args) -> dict:
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored, restored_step = trainer.dataset_state, trainer.latest_step
-    loader = indexed_loader(args.records)
+    rows = BATCH // args.processes
+    loader = indexed_loader(args.records, rows)
     if args.block_after:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
     data = {"train": lambda: loader, "train_len": args.records,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
+            "local_batch_size": rows, "global_batch_size": BATCH}
     state = trainer.fit(data, training_steps_per_epoch=args.steps, epochs=1,
                         val_steps_per_epoch=0, checkpoint_every_steps=args.save_every)
     trainer.wait_for_checkpoints()

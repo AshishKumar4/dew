@@ -14,6 +14,7 @@ processes, so the global device count is the one the rest of the suite uses.
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -369,6 +370,79 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
+
+
+# --------------------------------------------------------------------------
+# Resuming a pool
+# --------------------------------------------------------------------------
+
+POOL_STEPS = 3
+
+
+def shard_of(position: str) -> int:
+    """The process whose shard a saved grain position belongs to."""
+    return int(re.search(r"shard_index=(\d+)", json.loads(position)["sampler"]).group(1))
+
+
+@pytest.fixture(scope="module")
+def pool_checkpoint(tmp_path_factory):
+    """A three-step fit on two processes, saved with each one's data position."""
+    directory = tmp_path_factory.mktemp("pool-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, name="pool", run_dir=directory / "run",
+                       fsdp_size=2, steps=POOL_STEPS, records=RECORDS)
+    for index, report in enumerate(reports):
+        assert report["written_steps"] == [POOL_STEPS]
+        assert shard_of(report["dataset_state"]) == index
+    return {"checkpoints": worker.checkpoint_dir(directory / "run", "pool"),
+            "reports": reports}
+
+
+@pytest.mark.distributed
+def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpoint):
+    """A checkpoint hands each process back the position that process wrote.
+
+    The steps-mode checkpoint tests above never call fit, so they save no
+    position and this could not show up there: a checkpoint holding one
+    position, which orbax writes from process 0, hands process 0's shard to
+    process 1, and grain refuses a sampler whose shard_index is not its own.
+    Process 1 died at load and process 0 followed in its next collective.
+    With one row per process the resumed pool has to land where a pool
+    nobody stopped lands, at the same final position with the same
+    parameters.
+    """
+    resumed = run_pool("fit", tmp_path / "resumed", 2, name="pool",
+                       run_dir=tmp_path / "resumed-run", fsdp_size=2,
+                       steps=2 * POOL_STEPS, records=RECORDS,
+                       load=pool_checkpoint["checkpoints"])
+    whole = run_pool("fit", tmp_path / "whole", 2, name="whole",
+                     run_dir=tmp_path / "whole-run", fsdp_size=2,
+                     steps=2 * POOL_STEPS, records=RECORDS)
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["restored_dataset_state"] == pool_checkpoint["reports"][index]["dataset_state"]
+        assert shard_of(report["restored_dataset_state"]) == index
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_checkpoint):
+    """One process cannot take over two processes' positions, and says so.
+
+    Each position is where one shard stopped, and a sampler over one shard
+    of one has no such place. Before the positions were per process this
+    surfaced as grain's repr comparison of two samplers; now it stops at load
+    with both counts in the message.
+    """
+    refused = spawn("fit", tmp_path / "single.json", fsdp_size=1, steps=2 * POOL_STEPS,
+                    records=RECORDS, name="single", run_dir=tmp_path / "single-run",
+                    load=pool_checkpoint["checkpoints"])
+    log = refused.communicate(timeout=600)[0]
+    assert refused.returncode != 0, "one process resumed a two-process position"
+    assert "position for each of 2 processes and this run has 1 process" in log
+    assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
 # --------------------------------------------------------------------------

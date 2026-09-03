@@ -119,7 +119,7 @@ If the underlying iterator can report a position (grain's can), the prefetcher t
 
 Saving is async and sharded arrays go straight to orbax; gathering them onto the host first would serialize the whole state through one process. `wait_for_checkpoints()` blocks until the writes have landed, and anything that reads a checkpoint back has to call it first.
 
-A checkpoint holds the train state, the rng state, the best loss, the epoch, and the data iterator's position when there is one (grain reports it as JSON bytes, which ride along as a uint8 array).
+A checkpoint holds the train state, the rng state, the best loss, the epoch, and the data iterator's position when there is one. Grain reports a position as JSON bytes, and every process has its own, because each reads its own shard of the data. Orbax writes a host array from process 0 alone, so before a save the positions are gathered onto every process into the checkpoint's one `position` entry: `rows`, a uint8 array with one row per process padded to the longest, and `lengths`, the unpadded length of each. On restore each process takes the row at its own `jax.process_index()`. A checkpoint written by a different process count is refused at load with both counts in the message, because a position is where one shard stopped and has no meaning on another shard count; only a checkpoint without a position resumes on any count.
 
 Restoring builds a template from the freshly initialized state, so shapes, dtypes and the step counter survive, and it passes `ArrayRestoreArgs` with this run's sharding for the state alone. A checkpoint written on one mesh therefore restores onto a different one, and the rest of the payload stays on the host.
 
