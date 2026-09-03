@@ -9,6 +9,7 @@ and every url is under .invalid so a stray fetch could not reach a host.
 
 import multiprocessing
 import queue
+import sys
 import threading
 
 import numpy as np
@@ -281,11 +282,18 @@ def test_drops_in_the_worker_processes_reach_the_iterators_counter(monkeypatch):
 # The streaming extra
 # ---------------------------------------------------------------------------------
 
-def test_loading_a_dataset_by_path_asks_for_the_streaming_extra():
+def test_loading_a_dataset_by_path_asks_for_the_streaming_extra(monkeypatch):
     """Importing this module must work without HF datasets; only actually
-    loading a dataset needs it, and it has to say so."""
+    loading a dataset needs it, and it has to say so.
+
+    The absence is simulated so the test states the behaviour whether or not
+    the extra is installed in the environment that runs it.
+    """
+    monkeypatch.setitem(sys.modules, "datasets", None)
     with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
         OnlineStreamingDataLoader("some/hf/dataset")
+
+
 def test_feature_extractor_rejects_missing_required_columns():
     with pytest.raises(ValueError, match="URL"):
         online_loader.default_feature_extractor({"caption": ["caption"]})
