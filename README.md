@@ -275,7 +275,7 @@ On a TPU pod every host runs the same script. The recipes join the hosts into on
 </picture>
 </div>
 
-Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"`: cuDNN flash attention on GPUs, XLA otherwise). Knobs the fused kernels cannot honor raise an error instead of being ignored. On an RTX 4080 a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory. The compiled step for that model keeps the device busy for the whole step, with no host synchronisation, so the remaining costs are compile time (cached across runs), sampling and checkpointing.
+Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"`: cuDNN flash attention on a GPU for the shapes cuDNN supports, XLA for the rest). Knobs the fused kernels cannot honor raise an error instead of being ignored. On an RTX 4080 a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory. The compiled step for that model keeps the device busy for the whole step, with no host synchronisation, so the remaining costs are compile time (cached across runs), sampling and checkpointing.
 
 | | Trainer argument | Recipe flag |
 |---|---|---|
