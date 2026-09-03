@@ -106,7 +106,7 @@ second run creates nothing again. The two installs are the exception: they
 resolve against PyPI every time, so a `jax[tpu]` or `dew-ml` release since the
 last run lands in the venv. Pass `--version` to hold dew-ml at one release.
 
-The last step is the check that matters on a pod slice: every worker must see
+The last step is the check that matters on a pod slice. Every worker must see
 the whole slice.
 
 ```
