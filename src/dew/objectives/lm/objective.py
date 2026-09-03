@@ -7,9 +7,12 @@ the model keeps the future out of a prediction.
 
 Cross entropy is computed in float32 even when the model runs in bfloat16: a
 bf16 logsumexp over a large vocabulary loses enough precision to move the loss
-and, through it, the gradient. Padding is excluded only when the run names the
-pad id, because packed token files have no padding and masking out a real id
-would quietly drop those tokens from the average.
+and, through it, the gradient. It is also computed one vocabulary chunk at a
+time, because the full `[tokens, vocab]` logits tensor is the largest thing in
+a step and every pass over it costs bandwidth; `chunked` holds the arithmetic
+and the reason. Padding is excluded only when the run names the pad id,
+because packed token files have no padding and masking out a real id would
+quietly drop those tokens from the average.
 
 Validation reports the teacher-forced cross entropy, which the perplexity
 metric scores, and the text the model writes from a fixed prompt, which is the
@@ -21,9 +24,9 @@ from typing import Any, Callable, Dict, Optional
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew.objectives.base import EMASpec, Objective, shape_and_dtype
+from dew.objectives.lm.chunked import chunked_cross_entropy
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -61,10 +64,15 @@ class LMObjective(Objective):
         vocab_size: int,
         ema_decay: float = 0.999,
         pad_id: Optional[int] = None,
+        head_chunks: int = 4,
         samples: Optional[Dict[str, Any]] = None,
         pretrained: Optional[Dict[str, Any]] = None,
     ):
-        """`samples` configures the text logged at validation: a `prompt` of
+        """`head_chunks` is how many vocabulary slices the loss scores a batch
+        in; four is the measured best on one RTX 4080 at vocabulary 50,304,
+        see docs/research/lm-head.md.
+
+        `samples` configures the text logged at validation: a `prompt` of
         int32 ids (one, or several of equal length), `max_new_tokens`, a
         `temperature` (0 is greedy), an optional `top_k`, and the `decode`
         that turns ids back into a string. Unset logs no text.
@@ -77,6 +85,7 @@ class LMObjective(Objective):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
         self.pad_id = pad_id
+        self.head_chunks = head_chunks
         self.samples = samples
         self.pretrained = pretrained
         self.ema = EMASpec(decay=lambda step: ema_decay)
@@ -96,20 +105,47 @@ class LMObjective(Objective):
         shape, dtype = shape_and_dtype(self.input_shapes["tokens"])
         return self.model.init(rng, jnp.zeros((1, *shape), dtype))
 
-    def shifted_cross_entropy(self, params, tokens, train: bool = False, rngs=None):
-        """Next-token cross entropy over a `[B, seq_len + 1]` batch, and its telemetry."""
+    def shifted_cross_entropy(self, params, tokens, train: bool = False, rngs=None,
+                              segment_ids=None, positions=None):
+        """Next-token cross entropy over a `[B, seq_len + 1]` batch, and its telemetry.
+
+        A packed batch carries `segment_ids` for the same rows: the last token
+        of a document does not predict the first of the next one, so that
+        transition is dropped from the loss and the accuracy, and the model
+        reads the per-document `positions` for its rotary angles.
+        """
         if tokens.shape[-1] != self.seq_len + 1:
             raise ValueError(
                 f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
-        logits = self.model.apply(params, inputs, train=train, rngs=rngs)
-        logits = logits.astype(jnp.float32)
-        losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-        correct = (jnp.argmax(logits, axis=-1) == targets).astype(losses.dtype)
+        # Only a packed batch names these, and only a model that packs takes
+        # them: an unpacked run calls the model exactly as it always did.
+        packing = {}
+        if positions is not None:
+            packing["positions"] = positions[:, :-1]
+        if segment_ids is not None:
+            packing["segment_ids"] = segment_ids[:, :-1]
+        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
+                                  method=type(self.model).hidden_states, **packing)
+        head = self.model.apply(params, params["params"],
+                                method=type(self.model).head_weight)
+        losses, predicted = chunked_cross_entropy(
+            hidden, head, targets, self.head_chunks,
+            softcap=self.model.final_logit_softcap,
+            precision=self.model.precision)
+        correct = (predicted == targets).astype(losses.dtype)
 
         weights = (jnp.ones_like(losses) if self.pad_id is None
                    else (targets != self.pad_id).astype(losses.dtype))
+        if segment_ids is not None:
+            # A target counts only inside a document: the first token of the
+            # next packed document, the padding after the last one (segment 0,
+            # which the seg==seg comparison alone would keep), and every
+            # cross-boundary transition drop out of loss and accuracy alike.
+            weights = weights * (
+                (segment_ids[:, 1:] == segment_ids[:, :-1])
+                & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -122,7 +158,12 @@ class LMObjective(Objective):
 
     def loss(self, params, ema_params, batch, rng, step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-        return self.shifted_cross_entropy(params, tokens, train=True, rngs={"dropout": rng})
+        segment_ids = batch.get("text_segment_ids")
+        segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
+        positions = batch.get("text_positions")
+        positions = None if positions is None else jnp.asarray(positions, jnp.int32)
+        return self.shifted_cross_entropy(params, tokens, train=True, rngs={"dropout": rng},
+                                          segment_ids=segment_ids, positions=positions)
 
     def make_validation_step(self, **kwargs) -> Callable[[Any, Any], Dict[str, Any]]:
         """Teacher-forced cross entropy, plus the sampled text when asked for.
@@ -140,12 +181,18 @@ class LMObjective(Objective):
             from dew.sampling.text import generate
 
         teacher_forced_ce = jax.jit(
-            lambda params, tokens: self.shifted_cross_entropy(params, tokens)[0])
+            lambda params, tokens, segment_ids=None, positions=None:
+                self.shifted_cross_entropy(params, tokens,
+                                           segment_ids=segment_ids, positions=positions)[0])
 
         def validate(val_state, batch):
             params = validation_params(val_state)
             tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-            artifacts = {"ce": teacher_forced_ce(params, tokens)}
+            segment_ids = batch.get("text_segment_ids")
+            segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
+            positions = batch.get("text_positions")
+            positions = None if positions is None else jnp.asarray(positions, jnp.int32)
+            artifacts = {"ce": teacher_forced_ce(params, tokens, segment_ids, positions)}
             if samples is not None:
                 artifacts["tokens"] = generate(
                     self.model, params, prompt, max_new_tokens,
