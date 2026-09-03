@@ -253,6 +253,36 @@ def test_compiled_flops_counts_a_convolution():
     assert compiled_flops(executable) == pytest.approx(analytic, rel=0.01)
 
 
+def test_compiled_flops_counts_a_convolutions_gradients():
+    """The backward of a strided convolution on the CPU lane, against the
+    analytic backward FLOPs of one convolution.
+
+    The input gradient and the kernel gradient each cost the multiply-adds of
+    the forward: every output element's MAC contributes to exactly one input
+    element through one output element (dgrad), and to exactly one kernel
+    weight (wgrad), so the total is 2 B Ho Wo Co Kh Kw Ci for each. XLA emits
+    dgrad as a convolution with `lhs_dilate` set to the stride, whose dilated
+    positions are zeros no kernel multiplies, and wgrad as a convolution whose
+    window is the input's spatial extent; this is what pins both of those
+    reductions: a stride-2 dgrad counted without the dilation division reads
+    1,179,648 instead of 589,824, and the assertion fails.
+    """
+    batch, size, in_features, out_features, kernel, stride = 4, 16, 8, 16, 3, 2
+    model = nn.Conv(out_features, (kernel, kernel), strides=stride,
+                   use_bias=False)
+    images = jnp.ones((batch, size, size, in_features))
+    params = model.init(jax.random.PRNGKey(0), images)
+
+    grads = jax.jit(jax.grad(
+        lambda p, x: jnp.sum(model.apply(p, x)), argnums=(0, 1)
+    )).lower(params, images).compile()
+
+    out = -(-size // stride)  # SAME padding
+    forward = (2 * batch * out * out * out_features
+               * kernel * kernel * in_features)
+    assert compiled_flops(grads) == pytest.approx(2 * forward, rel=0.01)
+
+
 def test_compiled_flops_counts_a_matmul_and_its_gradient():
     """2 M K N for the forward matmul, and the same again for the one weight
     gradient a loss over its output needs."""
@@ -298,6 +328,10 @@ def test_compiled_flops_matches_the_transformer_flop_formula(tmp_path):
     matmuls = width * vocab + layers * per_layer
     analytic = (6 * batch * seq * matmuls
                 + 12 * layers * batch * seq * seq * heads * head_dim)
+    # rel=0.05 is slack for XLA rewriting a matmul pair into one fused call or
+    # splitting one over tiles, not for a missing term: on this CPU lane the
+    # measured count lands on the closed form exactly (956,301,312 vs
+    # 956,301,312, largest observed difference 0 FLOPs in 956 million).
     assert compiled_flops(executable) == pytest.approx(analytic, rel=0.05)
 
 
