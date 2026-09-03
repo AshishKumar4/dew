@@ -275,8 +275,8 @@ def mode_steps(args) -> dict:
 
 def mode_fit(args) -> dict:
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
-    # What the checkpoint on disk said, before this run trains over it.
-    restored = trainer.dataset_state
+    # Where the checkpoint on disk left this run, read before fit trains past it.
+    restored, restored_step = trainer.dataset_state, trainer.latest_step
     loader = indexed_loader(args.records)
     if args.block_after:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
@@ -288,7 +288,7 @@ def mode_fit(args) -> dict:
     dump_params(args.out.with_suffix(".npz"), state.params)
     return {
         "step": int(as_numpy(state.step)),
-        "restored_step": trainer.latest_step if args.load else 0,
+        "restored_step": restored_step,
         "restored_dataset_state": None if restored is None else restored.decode(),
         "checkpoint_path": trainer.checkpoint_path(),
         "written_steps": sorted(int(step) for step in trainer.checkpointer.all_steps()),

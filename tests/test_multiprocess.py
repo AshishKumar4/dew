@@ -347,7 +347,7 @@ def kill_when_blocked(process, marker: Path, landed: Path, timeout=600) -> int:
     """SIGKILL the run once it is blocked mid-epoch with `landed` on disk.
 
     Waiting on the checkpoint rather than on a duration is what makes the step
-    the run dies past the same everywhere: the source has stopped handing out
+    the run dies past the same everywhere. The source has stopped handing out
     batches, so nothing can advance while this waits.
     """
     deadline = time.monotonic() + timeout
@@ -386,8 +386,8 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     The killed process trained five steps and had committed three, so the
     resume has to open on the fourth batch, not on the sixth (the two steps
     whose work was never saved) and not on the first. It then has to land on
-    the parameters of the run nobody killed: observed difference 0.0 on CPU,
-    tolerance rtol 2e-4 and atol 2e-5.
+    the parameters of the run nobody killed, to rtol 2e-4 and atol 2e-5, with
+    0.0 the largest difference observed on CPU.
     """
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
