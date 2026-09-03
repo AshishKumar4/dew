@@ -4,8 +4,9 @@ translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 wrappers around them fetch a repo (or read a local directory), read the
 safetensors shards as fp32 without torch, and build the model, so
-load_pretrained_decoder returns a (model, variables, hf_config) triple that a
-forward pass takes straight away.
+load_pretrained_decoder returns a (model, variables, config) triple that a
+forward pass takes straight away, config being the dew config the model was
+built from.
 
 The families covered are the ones CausalTransformer can express: llama, qwen3
 and gemma3_text. qwen2 is refused rather than half-loaded, since its q/k/v
@@ -404,14 +405,16 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
                             max_seq_len: Optional[int] = None,
                             revision: Optional[str] = None
                             ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
-    """A Hugging Face decoder checkpoint, as (model, variables, hf_config).
+    """A Hugging Face decoder checkpoint, as (model, variables, config).
 
     `name_or_dir` is a hub repo id or a local directory in the HF layout.
     The config is translated, the weights mapped onto that tree in fp32, and
     the model built with the run's precision policy, so `variables` fits the
     model and the policy's `dtype` reaches every module the same way it does
     in a training run. max_seq_len defaults to the config's context clamped
-    to 8192, because the KV cache is allocated at that length.
+    to 8192, because the KV cache is allocated at that length. `config` is
+    what the model was built from, in dew's own vocabulary, so a caller logs
+    the model it ran rather than the checkpoint's own fields.
     """
     directory = _snapshot(name_or_dir, revision)
     with open(directory / CONFIG_FILE) as handle:
@@ -429,7 +432,7 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
                                    dtype=dtype, attention_impl=attention_impl)
     model = build_model(architecture, built)
     _check_tree(params, model)
-    return model, {'params': params}, hf_config
+    return model, {'params': params}, built
 
 
 def save_pretrained_decoder(model, variables, directory, *,
