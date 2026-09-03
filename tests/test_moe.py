@@ -536,6 +536,24 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
         variables["params"], shardings["params"], mesh, min_shard_size=TINY_SHARD)
 
 
+def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
+    """Expert parallelism splits the experts and nothing else, so a model
+    whose experts are a fifth of it runs mostly replicated. The check has to
+    see that, which the fsdp-only rule could not: it returned as soon as the
+    fsdp axis was one.
+    """
+    model = build_model("moe", moe_config())
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    mesh = build_mesh(fsdp_size=1, expert_size=8)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
+
+    with pytest.raises(ValueError, match="replicated"):
+        assert_params_sufficiently_sharded(
+            variables["params"], shardings["params"], mesh,
+            min_shard_size=TINY_SHARD)
+
+
 def test_build_mesh_rejects_an_expert_size_the_devices_cannot_hold():
     with pytest.raises(ValueError, match="expert_size"):
         build_mesh(fsdp_size=4, expert_size=4)
