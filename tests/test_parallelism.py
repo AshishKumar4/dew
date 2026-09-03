@@ -6,22 +6,30 @@ one, otherwise the collectives GSPMD derived are not the ones we meant.
 """
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.inputs import DiffusionInputConfig
 from dew.eval.common import EvaluationMetric
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.diffusion.transforms import get_diffusion_preset
-from dew.training import ObjectiveTrainer
+from dew.training import ObjectiveTrainer, SimpleTrainer
 from dew.objectives.base import EMASpec, Objective
 from dew.training.distributed import (
-    DevicePrefetchIterator, batch_sharding, build_mesh, parameter_spec, shard_batch,
+    DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator,
+    assert_params_sufficiently_sharded, batch_sharding, build_mesh,
+    parameter_spec, shard_batch, state_sharding_tree,
 )
 
 RES = 8
@@ -90,6 +98,206 @@ def test_parameter_spec_shards_largest_divisible_axis():
 
 def test_parameter_spec_falls_back_to_replication_when_indivisible():
     assert parameter_spec((15, 15), fsdp_size=2, min_shard_size=16) == P()
+
+
+def declared_specs(variables, rules):
+    """Parameter specs on a two-way fsdp mesh under one rule table."""
+    shardings = state_sharding_tree(
+        build_mesh(fsdp_size=2), variables, min_shard_size=1,
+        logical_axis_rules=rules)
+    return jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
+
+
+def test_causal_transformer_axes_land_on_the_dimensions_they_name():
+    """One rule at a time: the dimension that moves is the one the table names,
+    which is what a declared axis has to mean."""
+    model = CausalTransformer(
+        vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+        num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+
+    vocab = declared_specs(variables, {"vocab": "fsdp"})
+    assert vocab["embed_tokens"]["embedding"] == P("fsdp")
+    assert vocab["lm_head"]["kernel"] == P(None, "fsdp")
+
+    # Grouped-query k and v are the 'kv' axis, q is 'heads': a rule for one
+    # must leave the other whole.
+    kv = declared_specs(variables, {"kv": "fsdp"})
+    attention = kv["layers_0"]["self_attn"]
+    assert attention["k_proj"]["kernel"] == P(None, "fsdp")
+    assert attention["v_proj"]["kernel"] == P(None, "fsdp")
+    assert attention["q_proj"]["kernel"] == P()
+
+    heads = declared_specs(variables, {"heads": "fsdp"})["layers_0"]["self_attn"]
+    assert heads["q_proj"]["kernel"] == P(None, "fsdp")
+    assert heads["k_proj"]["kernel"] == P()
+
+    out = declared_specs(variables, {"attention": "fsdp"})["layers_0"]["self_attn"]
+    assert out["o_proj"]["kernel"] == P("fsdp")
+
+    mlp = declared_specs(variables, {"mlp": "fsdp"})["layers_0"]["mlp"]
+    assert mlp["gate_proj"]["kernel"] == P(None, "fsdp")
+    assert mlp["up_proj"]["kernel"] == P(None, "fsdp")
+    assert mlp["down_proj"]["kernel"] == P("fsdp")
+
+    embed = declared_specs(variables, {"embed": "fsdp"})
+    assert embed["embed_tokens"]["embedding"] == P(None, "fsdp")
+    assert embed["lm_head"]["kernel"] == P("fsdp")
+
+
+def test_dit_axes_land_on_the_dimensions_they_name():
+    """The same for the DiT stack, whose attention kernels carry three axes."""
+    model = SimpleDiT(
+        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+
+    heads = declared_specs(variables, {"heads": "fsdp"})["dit_block_0"]["attention"]
+    assert heads["to_q"]["kernel"] == P(None, "fsdp")
+    assert heads["to_out_0"]["kernel"] == P("fsdp")
+
+    head_dim = declared_specs(
+        variables, {"head_dim": "fsdp"})["dit_block_0"]["attention"]
+    assert head_dim["to_q"]["kernel"] == P(None, None, "fsdp")
+    assert head_dim["to_out_0"]["kernel"] == P(None, "fsdp")
+
+    embed = declared_specs(variables, {"embed": "fsdp"})
+    assert embed["embed"]["patch_embed"]["Conv_0"]["kernel"] == P(None, None, None, "fsdp")
+    assert embed["conditioning"]["time_embed"]["layers_2"]["kernel"] == P(None, "fsdp")
+
+    modulation = declared_specs(variables, {"modulation": "fsdp"})
+    assert (modulation["dit_block_0"]["ada_params_module"]["ada_proj"]["kernel"]
+            == P(None, "fsdp"))
+
+    output = declared_specs(variables, {"output": "fsdp"})
+    assert output["output"]["final_proj"]["kernel"] == P(None, "fsdp")
+
+    mlp = declared_specs(variables, {"mlp": "fsdp"})
+    assert mlp["conditioning"]["time_embed"]["layers_2"]["kernel"] == P("fsdp")
+
+
+def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
+    """A module that keeps its name while its parameter gains a dimension has
+    to stop the derivation, not shard whichever dimensions the short name
+    happens to reach."""
+    variables = {"params": {"q_proj": {
+        "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
+    with pytest.raises(ValueError, match="q_proj"):
+        state_sharding_tree(build_mesh(fsdp_size=2), variables, min_shard_size=1)
+
+
+def test_rule_override_changes_only_declared_axes():
+    model = SimpleDiT(
+        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
+    abstract_variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+    specs = declared_specs(abstract_variables, {"mlp": "fsdp"})
+
+    assert specs["dit_block_0"]["mlp"]["layers_0"]["kernel"] == P(None, "fsdp")
+    assert specs["dit_block_0"]["mlp"]["layers_2"]["kernel"] == P("fsdp")
+    assert specs["dit_block_0"]["attention"]["to_q"]["kernel"] == P()
+    assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
+
+
+def test_default_logical_rules_keep_the_shape_heuristic():
+    model = SimpleDiT(
+        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
+    abstract_variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+    shardings = state_sharding_tree(
+        build_mesh(fsdp_size=2), abstract_variables, min_shard_size=1,
+        logical_axis_rules=DEFAULT_LOGICAL_AXIS_RULES)
+    expected = jax.tree.map(
+        lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1),
+        abstract_variables)
+    actual = jax.tree.map(lambda sharding: sharding.spec, shardings)
+    assert actual == expected
+
+
+def test_rules_may_name_a_mesh_axis_this_mesh_does_not_have():
+    """A table can carry the future tensor axis; today's mesh drops it."""
+    model = SimpleDiT(
+        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
+    abstract_variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+    shardings = state_sharding_tree(
+        build_mesh(fsdp_size=2), abstract_variables, min_shard_size=1,
+        logical_axis_rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"})["params"]
+
+    assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
+            == P(None, "fsdp"))
+    assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
+
+
+class IndivisibleModel(nn.Module):
+    """A parameter no mesh axis of size two can split."""
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(15, use_bias=False, name="indivisible")(x)
+
+
+def make_indivisible_trainer(tmp_path, tolerance):
+    return SimpleTrainer(
+        model=IndivisibleModel(),
+        input_shapes={"x": (15,)},
+        optimizer=optax.adam(1e-3),
+        rngs=jax.random.key(0),
+        distributed_training=True,
+        fsdp_size=2,
+        fsdp_min_param_size=1,
+        sharding_tolerance=tolerance,
+        checkpoint_base_path=str(tmp_path),
+        name=f"indivisible-{tolerance}",
+    )
+
+
+def test_sharding_tolerance_names_the_largest_replicated_parameter(tmp_path):
+    with pytest.raises(ValueError) as error:
+        make_indivisible_trainer(tmp_path, tolerance=0.02)
+
+    message = str(error.value)
+    assert "100.00%" in message and "2.00%" in message
+    assert "['params']['indivisible']['kernel']" in message
+    assert "(15, 15)" in message
+
+
+def test_sharding_tolerance_can_allow_intentional_replication(tmp_path):
+    trainer = make_indivisible_trainer(tmp_path, tolerance=1.0)
+    kernel = trainer.state.params["params"]["indivisible"]["kernel"]
+    assert kernel.sharding.spec == P()
+
+
+def test_unset_sharding_tolerance_takes_the_library_default(tmp_path):
+    """A config that names no tolerance has to reach the same 2% the library
+    declares, without the config repeating the number."""
+    with pytest.raises(ValueError) as error:
+        make_indivisible_trainer(tmp_path, tolerance=None)
+
+    assert "2.00%" in str(error.value)
+
+
+def test_sharding_tolerance_outside_zero_to_one_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        make_indivisible_trainer(tmp_path, tolerance=1.5)
+
+
+def test_odd_vocabulary_shards_the_embedding_on_its_other_axis():
+    """GPT-2's 50257 rows divide by nothing, so the rule that wins the
+    embedding cannot be taken: the width has to carry the shard, or a real run
+    stops on the tolerance check with 98% of the model replicated."""
+    model = CausalTransformer(
+        vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
+        num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    mesh = build_mesh(fsdp_size=2)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+
+    assert shardings["params"]["embed_tokens"]["embedding"].spec == P(None, "fsdp")
+    assert_params_sufficiently_sharded(
+        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
 
 
 def test_build_mesh_rejects_bad_fsdp_size():
@@ -226,10 +434,15 @@ def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
     assert sharded, "no parameter was sharded over the fsdp axis"
 
     for param in sharded:
-        biggest = max(param.shape)
         local = param.addressable_shards[0].data
         assert local.size == param.size // 2, "shard is not half the global param"
-        assert biggest // 2 in local.shape
+        # Exactly the dimension the spec names is halved. Which dimension that
+        # is belongs to the rules table, not to this test.
+        split = [axis for axis, (whole, part) in enumerate(
+            zip(param.shape, local.shape)) if whole != part]
+        assert len(split) == 1, f"{param.shape} -> {local.shape}"
+        assert param.shape[split[0]] // 2 == local.shape[split[0]]
+        assert param.sharding.spec[split[0]] == 'fsdp'
 
     # Adam moments and the EMA copy must follow the params they track, without
     # the optimizer or the model ever describing a layout.
@@ -240,6 +453,28 @@ def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
 
     ema_specs = [x.sharding.spec for x in jax.tree.leaves(trainer.state.ema_params)]
     assert param_specs == ema_specs
+
+
+def test_muon_masked_optimizer_state_shards_with_its_parameters(tmp_path):
+    """A masked optax transform leaves a MaskedNode where its group does not
+    apply, and muon's adam branch is always masked, so the derivation has to
+    carry a leaf that is not an array at all. optax.contrib.muon is what the
+    'muon' optimizer entry builds."""
+    trainer = make_trainer(tmp_path, "muon", distributed_training=True,
+                           fsdp_size=2, fsdp_min_param_size=TINY,
+                           optimizer=optax.contrib.muon(1e-3))
+
+    def is_placeholder(leaf):
+        return isinstance(leaf, optax.MaskedNode)
+
+    placeholders = [leaf for leaf in jax.tree.leaves(
+        trainer.state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
+    assert placeholders, "muon left no masked placeholder for the derivation to carry"
+
+    kernel = trainer.state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
+    assert kernel.sharding.spec == P(None, "fsdp")
+    moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.opt_state)}
+    assert kernel.sharding.spec in moment_specs
 
 
 def test_replicated_run_shards_nothing(tmp_path):
@@ -268,6 +503,96 @@ def test_sharded_checkpoint_roundtrips(tmp_path):
                              jax.tree.leaves(restored.state.params)):
         assert before.sharding.spec == after.sharding.spec
         np.testing.assert_allclose(np.asarray(before), np.asarray(after))
+
+
+# The last commit before parameters carried logical axes. A checkpoint written
+# by that code has to keep restoring: unboxing before the save is what keeps
+# the leaf names and the on-disk layout out of the annotations' reach.
+PRE_LOGICAL_AXES_REV = "139d241"
+
+PRE_LOGICAL_AXES_SAVE = '''
+"""Save a checkpoint with whatever dew is first on sys.path."""
+import sys
+
+import jax
+import numpy as np
+import optax
+
+import dew
+from dew.diffusion.transforms import get_diffusion_preset
+from dew.inputs import DiffusionInputConfig
+from dew.nn.backbones.dit import SimpleDiT
+from dew.training import ObjectiveTrainer
+
+run_dir, params_dump = sys.argv[1:]
+print(dew.__file__)
+schedule, _, transform = get_diffusion_preset("edm")
+trainer = ObjectiveTrainer(
+    model=SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                    mlp_ratio=1),
+    optimizer=optax.adam(1e-3),
+    noise_schedule=schedule,
+    model_output_transform=transform,
+    input_config=DiffusionInputConfig(
+        sample_data_key="image", sample_data_shape=(8, 8, 3), conditions=[]),
+    rngs=jax.random.PRNGKey(0),
+    name="pre-logical-axes",
+    wandb_config=None,
+    distributed_training=True,
+    fsdp_size=2,
+    fsdp_min_param_size=256,
+    checkpoint_base_path=run_dir,
+)
+# Off the initial values, so a restore that quietly re-initialised instead of
+# reading the file would show up as a mismatch rather than as a pass.
+trainer.state = trainer.state.replace(
+    params=jax.tree.map(lambda p: p + 0.25, trainer.state.params))
+trainer.save(epoch=0, step=3)
+trainer.wait_for_checkpoints()
+flat, _ = jax.tree_util.tree_flatten_with_path(trainer.state.params)
+np.savez(params_dump, **{jax.tree_util.keystr(path): np.asarray(value)
+                         for path, value in flat})
+'''
+
+
+def test_checkpoint_written_before_logical_axes_still_restores(tmp_path):
+    """Frozen checkpoint layout: the annotations must not reach the file."""
+    repository = Path(__file__).resolve().parents[1]
+    worktree = tmp_path / "pre-logical-axes-worktree"
+    subprocess.run(
+        ["git", "-C", str(repository), "worktree", "add", "--detach", "--quiet",
+         str(worktree), PRE_LOGICAL_AXES_REV],
+        check=True, capture_output=True, text=True)
+    try:
+        script = tmp_path / "save_pre_logical_axes.py"
+        script.write_text(PRE_LOGICAL_AXES_SAVE)
+        saved = subprocess.run(
+            [sys.executable, str(script), str(tmp_path / "run"),
+             str(tmp_path / "params.npz")],
+            check=True, capture_output=True, text=True, cwd=str(worktree),
+            env={**os.environ, "PYTHONPATH": str(worktree / "src"),
+                 "JAX_PLATFORMS": "cpu"})
+    finally:
+        subprocess.run(
+            ["git", "-C", str(repository), "worktree", "remove", "--force",
+             str(worktree)], capture_output=True, text=True)
+
+    # Without this the test could quietly compare this code against itself.
+    assert str(worktree) in saved.stdout, saved.stdout
+
+    written = np.load(tmp_path / "params.npz")
+    restored = make_trainer(
+        tmp_path, "pre-logical-axes", distributed_training=True, fsdp_size=2,
+        fsdp_min_param_size=TINY,
+        load_from_checkpoint=str(tmp_path / "run" / "pre-logical-axes"))
+    leaves = {
+        jax.tree_util.keystr(path): np.asarray(value)
+        for path, value in jax.tree_util.tree_flatten_with_path(
+            restored.state.params)[0]}
+
+    assert set(leaves) == set(written.files)
+    for name, value in leaves.items():
+        np.testing.assert_array_equal(value, written[name], err_msg=name)
 
 
 def test_gradient_accumulation_updates_only_on_the_boundary(tmp_path):

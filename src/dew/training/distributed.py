@@ -1,12 +1,15 @@
 """Device mesh, parameter sharding and host-to-device prefetch."""
 
 import json
+import math
 import queue
 import threading
-from typing import Iterator, Optional
+from collections.abc import Mapping, Sequence
+from typing import Iterator, Optional, TypeAlias
 
 import jax
 import numpy as np
+from flax import linen as nn
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 DATA_AXIS = 'data'
@@ -19,6 +22,115 @@ BATCH_SPEC = P((DATA_AXIS, FSDP_AXIS))
 # Below this many elements a parameter costs more in collectives than it saves
 # in memory, so it stays replicated.
 DEFAULT_MIN_SHARD_SIZE = 2 ** 16
+DEFAULT_SHARDING_TOLERANCE = 0.02
+
+MeshAxes: TypeAlias = str | tuple[str, ...] | None
+LogicalAxes: TypeAlias = tuple[Optional[str], ...]
+LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
+LogicalAxisRuleConfig: TypeAlias = (
+    Mapping[str, str | Sequence[str] | None] | LogicalAxisRules)
+
+# Rule order is precedence when two logical dimensions target the one fsdp axis.
+# It reproduces the largest-axis choice for the declared model shapes while
+# giving a config one place to redirect model semantics onto a future mesh.
+DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
+    ("vocab", FSDP_AXIS),
+    ("mlp", FSDP_AXIS),
+    ("modulation", FSDP_AXIS),
+    ("attention", FSDP_AXIS),
+    ("embed", FSDP_AXIS),
+    ("head_dim", FSDP_AXIS),
+    ("heads", FSDP_AXIS),
+    ("kv", FSDP_AXIS),
+    ("output", FSDP_AXIS),
+    ("expert", FSDP_AXIS),
+    ("batch", None),
+    ("sequence", None),
+    ("stage", None),
+)
+
+# What a parameter's dimensions are, keyed by the module path that ends in
+# these names, outermost dimension first. A parameter takes the trailing names
+# its rank can hold, so a kernel takes all of them and its bias the output
+# ones. Declaring them here rather than on the initializers keeps the models
+# plain flax modules whose init returns arrays, and reaches optimizer moments
+# and EMA copies for free: their paths end in their parameter's.
+DEFAULT_LOGICAL_PARAM_AXES: Mapping[tuple[str, ...], LogicalAxes] = {
+    ("embed_tokens",): ("vocab", "embed"),
+    ("lm_head",): ("embed", "vocab"),
+    ("q_proj",): ("embed", "heads"),
+    ("k_proj",): ("embed", "kv"),
+    ("v_proj",): ("embed", "kv"),
+    ("o_proj",): ("attention", "embed"),
+    ("gate_proj",): ("embed", "mlp"),
+    ("up_proj",): ("embed", "mlp"),
+    ("down_proj",): ("mlp", "embed"),
+    ("patch_embed", "Conv_0"): (None, None, None, "embed"),
+    ("to_q",): ("embed", "heads", "head_dim"),
+    ("to_k",): ("embed", "heads", "head_dim"),
+    ("to_v",): ("embed", "heads", "head_dim"),
+    ("to_out_0",): ("heads", "head_dim", "embed"),
+    ("ada_proj",): ("embed", "modulation"),
+    ("final_ada_proj",): ("embed", "modulation"),
+    ("final_proj",): ("embed", "output"),
+    ("mlp", "layers_0"): ("embed", "mlp"),
+    ("mlp", "layers_2"): ("mlp", "embed"),
+    ("time_embed", "layers_2"): ("mlp", "embed"),
+}
+
+
+def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
+    """One entry of a spec or a rule as the mesh axes it names."""
+    if assignment is None:
+        return ()
+    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
+
+
+def _parameter_path(path) -> tuple[str, ...]:
+    """The parameter's own path: the trailing run of dict keys under a leaf.
+
+    An optimizer state nests a copy of the parameter tree inside its own
+    structure, so what identifies a parameter is where its path ends.
+    """
+    names = []
+    for entry in reversed(path):
+        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
+            break
+        names.append(entry.key)
+    return tuple(reversed(names))
+
+
+def _logical_axes(path, ndim: int) -> Optional[LogicalAxes]:
+    """The declared axes of the parameter at `path`, or None for an unnamed one."""
+    module = _parameter_path(path)[:-1]
+    for length in range(len(module), 0, -1):
+        axes = DEFAULT_LOGICAL_PARAM_AXES.get(module[-length:])
+        if axes is None:
+            continue
+        if ndim > len(axes):
+            raise ValueError(
+                f"{'/'.join(module[-length:])} is declared {axes}, which cannot "
+                f"name the {ndim} dimensions of {'/'.join(_parameter_path(path))}")
+        return axes[len(axes) - ndim:]
+    return None
+
+
+def _normalize_logical_axis_rules(
+    rules: Optional[LogicalAxisRuleConfig], mesh: Mesh,
+) -> LogicalAxisRules:
+    """Rules as flax wants them, minus mesh axes this mesh does not have.
+
+    Dropping absent axes is what lets one table name a future 'tensor' or
+    'expert' mesh axis and still apply on today's (data, fsdp) mesh.
+    """
+    items = (DEFAULT_LOGICAL_AXIS_RULES if rules is None
+             else rules.items() if isinstance(rules, Mapping) else rules)
+    normalized = []
+    for logical_axis, mesh_axes in items:
+        axes = tuple(axis for axis in _mesh_axes(mesh_axes) if axis in mesh.axis_names)
+        normalized.append(
+            (logical_axis, axes[0] if len(axes) == 1 else axes or None))
+    return tuple(normalized)
 
 
 def build_mesh(fsdp_size: int = 1, devices: Optional[list] = None) -> Mesh:
@@ -55,15 +167,115 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     return P()
 
 
+def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: Mesh) -> P:
+    """The spec these logical axes ask for, reduced to one the shape can take.
+
+    A mesh axis of size 1 shards nothing, so it is dropped rather than left in
+    the spec where it would only obscure what is replicated. A dimension its
+    assigned axes do not divide evenly cannot be split at all, so its name is
+    dropped and the rules hand the axis to the next dimension that names it:
+    an odd vocabulary shards the embedding on its width instead of taking the
+    whole table out of the layout. Only a parameter no named dimension can
+    split stays whole, which the tolerance check turns into an error when it
+    matters.
+    """
+    names = list(axes)
+    while True:
+        assigned = [
+            tuple(axis for axis in _mesh_axes(assignment) if mesh.shape[axis] > 1)
+            for assignment in nn.logical_to_mesh_axes(tuple(names), rules)]
+        blocked = [
+            dimension for dimension, mesh_axes in enumerate(assigned)
+            if shape[dimension] % math.prod(mesh.shape[axis] for axis in mesh_axes)]
+        if not blocked:
+            break
+        for dimension in blocked:
+            names[dimension] = None
+    entries = [mesh_axes[0] if len(mesh_axes) == 1 else mesh_axes or None
+               for mesh_axes in assigned]
+    while entries and entries[-1] is None:
+        entries.pop()
+    return P(*entries)
+
+
 def state_sharding_tree(
-    mesh: Mesh, abstract_state, min_shard_size: int = DEFAULT_MIN_SHARD_SIZE
+    mesh: Mesh,
+    abstract_state,
+    min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
+    logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
 ):
-    """Map a train state of ShapeDtypeStructs to its NamedSharding tree."""
+    """Derive physical shardings from the declared parameter axes.
+
+    A leaf whose path no entry names retains the largest-divisible-axis
+    heuristic, so a model family can be declared at a time. Flax metadata, if a
+    caller's own module attached any, is removed here, because the state the
+    trainer materialises against this tree carries plain arrays.
+    """
+    rules = _normalize_logical_axis_rules(logical_axis_rules, mesh)
     fsdp_size = mesh.shape[FSDP_AXIS]
-    return jax.tree.map(
-        lambda x: NamedSharding(mesh, parameter_spec(x.shape, fsdp_size, min_shard_size)),
-        abstract_state,
-    )
+
+    def leaf_sharding(path, value):
+        axes = _logical_axes(path, value.ndim)
+        size = int(np.prod(value.shape, dtype=np.int64))
+        if axes is None:
+            spec = parameter_spec(value.shape, fsdp_size, min_shard_size)
+        elif fsdp_size == 1 or size < min_shard_size:
+            spec = P()
+        else:
+            spec = _mesh_spec(value.shape, axes, rules, mesh)
+        return NamedSharding(mesh, spec)
+
+    return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(abstract_state))
+
+
+def assert_params_sufficiently_sharded(
+    params, shardings, mesh: Mesh,
+    tolerance: float = DEFAULT_SHARDING_TOLERANCE,
+    min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
+) -> None:
+    """Reject an FSDP layout that left too much of the model replicated.
+
+    MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
+    fsdp axis divides none of the model's dimensions, which the shape
+    heuristic otherwise absorbs in silence.
+
+    MaxText measures excess per-chip memory over perfect sharding across every
+    parameter. Here the same ratio is taken over the parameters the threshold
+    policy meant to shard: anything below min_shard_size is replicated on
+    purpose, so counting it would fire on models that are merely small.
+    """
+    if not 0.0 <= tolerance <= 1.0:
+        raise ValueError(
+            f"sharding_tolerance must be between 0 and 1, got {tolerance}")
+    if mesh.shape[FSDP_AXIS] == 1:
+        return
+
+    path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+    shardable_elements = 0
+    replicated = []
+    for (path, param), sharding in zip(
+            path_leaves, jax.tree.leaves(shardings), strict=True):
+        elements = int(np.prod(param.shape, dtype=np.int64))
+        if elements < min_shard_size:
+            continue
+        shardable_elements += elements
+        if any(FSDP_AXIS in _mesh_axes(assignment) for assignment in sharding.spec):
+            continue
+        replicated.append((elements, jax.tree_util.keystr(path), param.shape))
+
+    if not shardable_elements:
+        return
+    fraction = sum(elements for elements, _, _ in replicated) / shardable_elements
+    if fraction <= tolerance:
+        return
+
+    details = "\n".join(
+        f"  {name}: shape={tuple(shape)}, elements={elements}"
+        for elements, name, shape in sorted(replicated, reverse=True)[:5])
+    raise ValueError(
+        f"{fraction:.2%} of shardable parameter elements are replicated, over "
+        f"the sharding_tolerance of {tolerance:.2%}.\n"
+        f"Largest replicated parameters:\n{details}")
 
 
 def batch_sharding(mesh: Mesh) -> NamedSharding:

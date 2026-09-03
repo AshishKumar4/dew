@@ -10,13 +10,90 @@ The pieces live in `dew.training.distributed`.
 
 Batches split across every device on both axes at once: `BATCH_SPEC = P(('data', 'fsdp'))`. Only parameters distinguish the two axes.
 
+## Logical axes
+
+A logical axis name says what a parameter's dimension is, never where it goes. A DiT attention query kernel, shape `[embed, heads, head_dim]`, carries `("embed", "heads", "head_dim")`.
+
+`DEFAULT_LOGICAL_PARAM_AXES` declares them, keyed by the module path a parameter sits under and read outermost dimension first. A parameter takes the trailing names its rank can hold, so `("to_q",): ("embed", "heads", "head_dim")` names the query kernel's three dimensions and, from the same entry, its bias's two. A key matches the end of a path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's.
+
+The names are declared here rather than on the initializers because `nn.with_partitioning` hands a parameter back inside a `Partitioned` box and `model.init` then gives that box to the caller. Parameter trees are frozen and a caller reads plain arrays under the documented names, `save_params` among them. Declaring the names here also keeps sharding vocabulary on the trainer's side of the seam, where the mesh already lives. What it costs: a module rename does not carry its entry along, so `test_every_declared_parameter_axis_names_a_module_some_model_has` fails as soon as an entry stops naming a parameter of a registry model, and a caller's own module gets the shape heuristic unless its parameters sit under a declared name.
+
+Declared today: `CausalTransformer`'s token embedding, its attention and MLP projections and its untied head, and the DiT stack's patch embedding, attention, adaLN projections, MLP and output head. Through the shared modules that reaches `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit`, the MMDiT ada and output projections, UViT, the JEPA encoders and the attention blocks inside the U-Nets. The MMDiT and UViT blocks' own MLPs, the S5 layers and the rest of `blocks.py` fall back on shape.
+
+The vocabulary:
+
+| Axis | Meaning | Where it appears |
+| --- | --- | --- |
+| `embed` | model width | every kernel's contract or output axis |
+| `mlp` | feed-forward width | gate/up/down projections |
+| `heads` | query heads | q projections, attention out (with `head_dim`) |
+| `kv` | key/value heads | k and v projections in grouped-query attention |
+| `head_dim` | width of one head | attention projections carrying both head axes |
+| `vocab` | vocabulary rows | the embedding table and the untied LM head |
+| `modulation` | adaLN shift/scale/gate outputs | the per-block and final ada projections |
+| `output` | patch output channels | the zero-init output head |
+| `attention` | flattened attention input | the out projection's contract axis |
+| `expert` | mixture-of-experts rows | reserved, no model uses it yet |
+| `batch` | sample rows | activations only, never parameters |
+| `sequence` | token positions | activations only, never parameters |
+| `stage` | pipeline stage index | reserved, no model uses it yet |
+
+A parameter no entry names keeps the shape heuristic below, so a family can be declared at a time. Norms and other 1-D parameters are left alone: they are replicated either way. So is any dimension whose width the model does not choose, the raw patch content of the Hilbert projection and the conditioning encoder's feature width, because there is no honest name for it and the heuristic already picks the larger side, which for CLIP-L into a 384-wide DiT is the encoder's 768.
+
+## The rules table
+
+`DEFAULT_LOGICAL_AXIS_RULES` maps each name to mesh axes, in precedence order. On the current mesh it is:
+
+| Logical axis | Mesh axes |
+| --- | --- |
+| `vocab` | `fsdp` |
+| `mlp` | `fsdp` |
+| `modulation` | `fsdp` |
+| `attention` | `fsdp` |
+| `embed` | `fsdp` |
+| `head_dim` | `fsdp` |
+| `heads` | `fsdp` |
+| `kv` | `fsdp` |
+| `output` | `fsdp` |
+| `expert` | `fsdp` |
+| `batch` | none |
+| `sequence` | none |
+| `stage` | none |
+
+Rule order is precedence: when two logical dimensions of one parameter both claim the single `fsdp` axis, the earlier row wins and the other dimension is left whole. That is flax's and MaxText's semantics. The order is chosen so the winner is the dimension the shape heuristic used to pick, which is what makes the default table a no-op:
+
+| Kernel | Shape | Winner | Why it is also the largest |
+| --- | --- | --- | --- |
+| MLP expand/contract | `[embed, mlp]` | `mlp` | `mlp_ratio` is 2 or 4 in every shipped config |
+| adaLN projection | `[embed, modulation]` | `modulation` | six modulation vectors per block |
+| token embedding / LM head | `[vocab, embed]` | `vocab` | vocabularies are tens of thousands wide |
+| attention out | `[attention, embed]` | `attention` | `heads * head_dim == embed`, and the tie goes left |
+| q/k/v | `[embed, heads]`, `[embed, kv]` | `embed` | grouped-query `kv` is narrower; a tie goes left |
+| output head | `[embed, output]` | `embed` | `patch^2 * channels` is far below the model width |
+
+Precedence is fixed, so it cannot track the largest axis for every conceivable shape: a model narrower than its own output head, or an `mlp_ratio` of exactly 1, would land on the other dimension. That is a different split of the same parameter over the same axis, with identical memory, identical collectives and identical numbers, not a different model, and no shipped configuration reaches it. `test_default_logical_rules_match_previous_specs_for_every_registry_model` pins spec-for-spec equality with the old heuristic across every registry architecture at the sizes the suite builds, and the FSDP/DP parity tests pin the numbers.
+
+`--trainer.logical-axis-rules` takes a JSON object and replaces the table, e.g. `{"mlp": "fsdp"}`. A name set to `null`, or absent from the table, leaves that dimension whole. Mesh axes the current mesh does not have are dropped, so one table can name `tensor` today and mean it later.
+
+The table is the whole mechanism for future parallelism. Adding a `tensor` axis to the mesh and changing two rows (`"heads": "tensor"`, `"mlp": ["tensor"]`) moves every declared model to hybrid FSDP/tensor parallelism with no model edits, exactly as MaxText's `logical_axis_rules` does (`docs/research/google-jax-stack.md`, MaxText section). An `fsdp_transpose` axis would land in the same place.
+
+`state_sharding_tree(mesh, abstract_state, min_shard_size, logical_axis_rules)` implements the derivation, one pass over the abstract state: `_logical_axes` reads the declared names off each leaf's path, `nn.logical_to_mesh_axes` applies the rules table, and the result drops mesh axes of size 1. Below `min_shard_size` elements a declared parameter stays replicated. Deriving names and values in the same pass is what lets an optimizer state hold leaves that are not arrays at all, `optax.MaskedNode` under a masked transform among them.
+
+A dimension the assigned mesh axes do not divide evenly cannot be split, so its name is dropped and the rules hand the axis to the next dimension that names it. GPT-2's 50257 rows, Qwen's 151665 and Gemma's 256000 all make the `vocab` rule unusable on any real mesh, and the embedding then shards on `embed`, which is what the shape heuristic picked. Only a parameter where no named dimension divides stays whole, and the tolerance check below is what turns that into an error when it matters.
+
 ## Which parameters shard
 
 `parameter_spec(shape, fsdp_size, min_shard_size)` picks the largest axis that divides evenly by `fsdp_size` and shards it. Anything smaller than `min_shard_size` elements (`DEFAULT_MIN_SHARD_SIZE`, 65536) stays replicated: below that a parameter costs more in collectives than it saves in memory.
 
-`state_sharding_tree(mesh, abstract_state)` maps that over the whole train state, not just the params. Optimizer moments and the EMA copy have the same shapes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
+`state_sharding_tree` maps sharding over the whole train state, not just the params, declared and undeclared alike. Optimizer moments and the EMA copy carry the same axes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
 
-The state is then built straight into that layout: the trainer runs `jax.jit(init_fn, out_shardings=state_sharding)()`, so a model too large for one device is never materialized on one device.
+The state is then built straight into that layout: the trainer runs `jax.jit(lambda: nn.unbox(init_fn()), out_shardings=state_sharding)()`, so a model too large for one device is never materialized on one device, and any flax metadata a caller's own module attached is gone before the optimizer, the EMA or the checkpointer can see it.
+
+## Sharding tolerance
+
+`assert_params_sufficiently_sharded` is a startup assertion, run by the trainer whenever `fsdp_size > 1`: if more than `sharding_tolerance` of the shardable parameter elements ended up replicated, the run stops before step one, naming the fraction and the five largest replicated parameters by path, shape and element count. This is the guardrail against a mesh whose `fsdp` axis divides none of the model's dimensions, which the shape heuristic used to absorb in silence. `--trainer.sharding-tolerance 1.0` disables it.
+
+"Shardable" means at or above `min_shard_size`. The reference (`utils/sharding.py:605` `assert_params_sufficiently_sharded`, tolerance from `configs/base.yml:672-673`) is the same ratio — replicated elements over total, raise above the tolerance, name the five largest by `jax.tree_util.keystr` path — taken over every parameter, which it can do because it has no size threshold. Here a small parameter is replicated on purpose, so counting it would make the check fire on models that are merely small rather than badly laid out. MaxText also restricts the check to mesh axes that exist and are larger than one (`_get_nontrival_mesh_axes`); on a `(data, fsdp)` mesh that is `fsdp` alone, so the check is skipped entirely when `fsdp_size == 1`. The default tolerance is MaxText's 0.02.
 
 ## The step
 

@@ -34,6 +34,8 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import MODEL_REGISTRY, build_model
 from dew.training import ObjectiveTrainer
+from dew.training.distributed import (
+    DEFAULT_LOGICAL_PARAM_AXES, build_mesh, parameter_spec, state_sharding_tree)
 
 RES = 16
 FRAMES = 2
@@ -158,6 +160,51 @@ IDS = [case.architecture for case in CASES]
 def test_every_registry_architecture_is_trained_here():
     """The point of the file: a new architecture must arrive with a trained case."""
     assert COVERED == set(MODEL_REGISTRY)
+
+
+def model_variables(case: Case):
+    model = build_model(case.architecture, case.config)
+    rng = jax.random.key(0)
+    if case.is_lm:
+        return jax.eval_shape(
+            model.init, rng, jnp.ones((1, case.seq_len), jnp.int32))
+    if case.frames:
+        sample = jnp.ones((1, case.frames, RES, RES, 3), jnp.float32)
+    else:
+        sample = jnp.ones((1, RES, RES, 3), jnp.float32)
+    if case.is_jepa:
+        return jax.eval_shape(
+            model.init, rng, sample,
+            jnp.arange(MASK.num_context, dtype=jnp.int32)[None])
+    return jax.eval_shape(
+        model.init, rng, sample, jnp.ones((1,)),
+        None if case.is_jepa else jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)))
+
+
+@pytest.mark.parametrize("case", CASES, ids=IDS)
+def test_default_logical_rules_match_previous_specs_for_every_registry_model(case):
+    """The current two-axis mesh must not move any existing parameter leaf."""
+    variables = model_variables(case)
+    mesh = build_mesh(fsdp_size=4)
+    derived = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
+    expected = jax.tree.map(
+        lambda value: parameter_spec(value.shape, 4, TINY_SHARD), variables)
+    actual = jax.tree.map(lambda sharding: sharding.spec, derived)
+    assert actual == expected
+
+
+def test_every_declared_parameter_axis_names_a_module_some_model_has():
+    """A renamed module has to break the table, not silently stop matching it."""
+    # An untied lm_head is the one declared module the cases above do not build.
+    untied = [Case(case.architecture, {**case.config, "tie_embeddings": False},
+                   seq_len=case.seq_len) for case in CASES if case.is_lm]
+    modules = set()
+    for case in CASES + untied:
+        leaves, _ = jax.tree_util.tree_flatten_with_path(model_variables(case))
+        modules.update(tuple(entry.key for entry in path[:-1]) for path, _ in leaves)
+    unmatched = [key for key in DEFAULT_LOGICAL_PARAM_AXES
+                 if not any(module[-len(key):] == key for module in modules)]
+    assert unmatched == []
 
 
 def benchmark_tool():
