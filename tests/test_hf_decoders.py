@@ -240,10 +240,13 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
     export = tmp_path / name
 
     save_pretrained_decoder(model, variables, export, tokenizer_name="byte")
-    again, reloaded, hf_config = fp32_decoder(export)
+    again, reloaded, _ = fp32_decoder(export)
 
-    assert translate_config(hf_config) == translate_config(
-        json.loads((export / "config.json").read_text()))
+    # against the fixture's config, not the exported one read twice: a field
+    # the export changes and the model does not read back (the context length,
+    # the hidden_act spelling) shows up here
+    assert (translate_config(json.loads((export / "config.json").read_text()))
+            == translate_config(fixture_config(name)))
     assert again == model, "the exported config rebuilds a different model"
     for path, leaf in flat_tree(reloaded['params']).items():
         assert np.array_equal(np.asarray(leaf),
