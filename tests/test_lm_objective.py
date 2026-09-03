@@ -375,6 +375,25 @@ def test_the_ema_tracks_the_whole_parameter_tree():
     assert float(ema.decay(10_000)) == pytest.approx(0.995)
 
 
+def test_pretrained_weights_are_what_init_params_returns():
+    """Continued pretraining: the trainer's whole initial state is the
+    checkpoint, not a fresh init that happens to have the same shapes."""
+    objective = make_objective()
+    trained = objective.init_params(jax.random.PRNGKey(0))
+    loaded = jax.tree.map(lambda leaf: leaf + 1.0, trained)
+
+    resumed = make_objective(pretrained=loaded).init_params(jax.random.PRNGKey(1))
+
+    for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded)):
+        assert jnp.array_equal(restored, expected)
+
+
+def test_pretrained_params_without_the_variables_dict_are_refused():
+    params = make_objective().init_params(jax.random.PRNGKey(0))["params"]
+    with pytest.raises(ValueError, match="variables dict"):
+        make_objective(pretrained=params).init_params(jax.random.PRNGKey(0))
+
+
 def make_trainer(tmp_path, fsdp_size=1, seq=SEQ, learning_rate=3e-3, **objective_kwargs):
     model = TinyCausalLM(vocab_size=VOCAB)
     objective = LMObjective(model, seq, vocab_size=VOCAB, **objective_kwargs)

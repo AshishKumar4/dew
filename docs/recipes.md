@@ -58,3 +58,13 @@ python recipes/lm/train.py --data.dataset data/shakespeare --sequence-length 256
 ```
 
 `data.dataset` is the directory the tokenize tool wrote. The vocabulary comes from its `meta.json`, so it is not a flag. Validation logs the perplexity and, when `--sample-prompt` is set, the text the EMA model writes after it.
+
+`--pretrained` continues from a Hugging Face decoder instead of a fresh init:
+
+```bash
+python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-qwen3 --tokenizer Qwen/Qwen3-0.6B
+python recipes/lm/train.py --data.dataset data/corpus-qwen3 --pretrained Qwen/Qwen3-0.6B \
+    --tokenizer Qwen/Qwen3-0.6B --sequence-length 512 --data.batch-size 4 --optim.learning-rate 1e-5
+```
+
+It takes a hub repo id or a local directory in the HF layout, of the families `dew.interop.hf_decoders` covers (llama, qwen3, gemma3_text). The checkpoint decides the architecture, so `--model.config` may only carry `max_seq_len`, and the token files must have been written with the tokenizer the checkpoint expects.
