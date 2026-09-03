@@ -467,10 +467,15 @@ class CausalTransformer(nn.Module):
         """
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
-            # Gemma multiplies by embed_scale cast to the weight dtype
-            # (modeling_gemma3.py:117), which for a bf16 load is bf16, so the
-            # factor rounds with the activations: sqrt(1152) is 34.0 there.
-            x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
+            # Gemma casts embed_scale to the embedding weight dtype
+            # (modeling_gemma3.py:117). Dew's nn.Embed holds that table in
+            # fp32 and returns the compute dtype, so the factor keeps its
+            # fp32 value and only the product rounds with the activations.
+            # A factor rounded to bf16 would be 34.0 at hidden 1152, where
+            # sqrt(1152) is 33.94112549695428.
+            scaled = x * jnp.asarray(math.sqrt(self.emb_features),
+                                     self.embed_tokens.embedding.dtype)
+            x = scaled.astype(x.dtype)
         for layer in self.layers:
             x = layer(x, train=train, decode=decode,
                       positions=positions, segment_ids=segment_ids)

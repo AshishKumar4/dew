@@ -15,6 +15,7 @@ unless tensorflow_datasets imports and is marked network:
     /tmp/tfdsenv/bin/python -m pytest tests/test_data_real.py -q
 """
 
+import itertools
 import numpy as np
 import pytest
 
@@ -86,3 +87,18 @@ def test_validation_reads_different_records_in_a_stable_order(flowers):
     # shuffled train stream does not start there.
     assert labels_of(val) == labels_of(again)
     assert labels_of(val)[:BATCH] != train_labels
+
+
+def test_the_validation_pass_reads_the_split_once_and_stops(flowers):
+    """The pass is the four held-out batches and nothing after them.
+
+    grain's DataLoader batched inside each worker, and the loader defaults to
+    eight of them, so a batch came out of one worker's four records read
+    twice and the pass ran on for good. Two records of Flowers are never the
+    same image, so counting distinct rows counts records.
+    """
+    rows = [image.tobytes() for batch in itertools.islice(flowers["val"](), 8)
+            for image in batch["image"]]
+
+    assert len(rows) == VAL_RECORDS
+    assert len(set(rows)) == VAL_RECORDS, "the pass read a record twice"

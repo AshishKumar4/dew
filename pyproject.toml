@@ -43,10 +43,10 @@ dew-tpu = "dew.cli.tpu:main"
 test = [
     "pytest",
     "safetensors",
-    # test_hf_data.py; 3.6.0 is the last release whose dependency set works
-    # with the pyarrow it pulls (datasets 5.x + pyarrow 25 break inside
-    # datasets' own fingerprinting before any dew code runs).
-    "datasets==3.6.0",
+    # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
+    # unbounded so the suite runs the release `pip install dew-ml[streaming]`
+    # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.
+    "datasets",
 ]
 # AV/video sources and readers (lazy imports in dew.data)
 av = ["opencv-python", "decord", "moviepy", "av", "pillow"]

@@ -159,14 +159,17 @@ def test_param_tree_mirrors_the_hf_decoder_layout(rng):
 
 
 def head_before_the_seam(self, tokens, train: bool = False, decode: bool = False):
-    """`CausalTransformer.__call__` as it read before `hidden_states` existed.
+    """The forward pass with the head inline, as `__call__` read before
+    `hidden_states` existed.
 
     Applied with `method=`, so the logits the split forward returns can be
-    compared against the ones the single method returned.
+    compared against the ones the single method returns.
     """
     x = self.embed_tokens(tokens)
     if self.embedding_scale:
-        x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
+        scaled = x * jnp.asarray(math.sqrt(self.emb_features),
+                                 self.embed_tokens.embedding.dtype)
+        x = scaled.astype(x.dtype)
     for layer in self.layers:
         x = layer(x, train=train, decode=decode)
     x = self.norm(x)
@@ -381,33 +384,40 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     assert gap(tiny()) > 0.1
 
 
-def test_the_embedding_scale_rounds_with_the_activations(rng):
-    """Gemma multiplies the embedding by embed_scale cast to the weight dtype
-    (modeling_gemma3.py:117), and a bf16 checkpoint's weight dtype is bf16, so
-    at hidden 1152 the factor is bf16(33.941) = 34.0 and the multiply runs in
-    bf16.
+def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
+    """Gemma casts embed_scale to the embedding weight dtype
+    (modeling_gemma3.py:117). Dew's nn.Embed holds fp32 parameters and
+    returns the compute dtype, so under the bf16 policy a run uses the two
+    dtypes differ. At hidden 1152 the factor is 33.94112549695428, not
+    bf16(33.941) = 34.0, which is 1.7e-03 of every embedding.
 
-    Folding 34.0 into the embedding table gives the value the module has to
-    produce, and the head is untied so the fold only moves the input side. An
-    fp32 multiply by 33.941 lands on another bf16 value for a third of the
-    table, so it fails this.
+    Folding the factor into the table gives the value the module has to
+    produce. The table rounds to bf16 because the lookup rounds it, the fp32
+    factor multiplies that, and the product rounds once, so the residual
+    stream stays in the activation dtype; an fp32 product would carry the
+    whole stack in fp32 and land elsewhere. The head is untied so the fold
+    only moves the input side. The fp32 Gemma fixture parity test cannot see
+    any of this, since an fp32 policy rounds the factor to itself, and
+    gemma3-tiny is hidden 64, where the factor is 8.0 in either dtype.
     """
     features, ids = 1152, tokens(rng, length=4)
     shared = dict(emb_features=features, num_heads=8, num_layers=1,
                   tie_embeddings=False, dtype=jnp.bfloat16)
     scaled = tiny(embedding_scale=True, **shared)
     params = scaled.init(rng, ids)
+    assert params['params']['embed_tokens']['embedding'].dtype == jnp.float32
 
     def fold(factor):
         return jax.tree_util.tree_map_with_path(
             lambda path, leaf: leaf.astype(jnp.bfloat16) * factor
             if path[-2].key == 'embed_tokens' else leaf, params)
 
-    assert jnp.array_equal(scaled.apply(params, ids),
-                           tiny(**shared).apply(fold(jnp.bfloat16(34.0)), ids))
-    assert not jnp.array_equal(
+    assert jnp.array_equal(
         scaled.apply(params, ids),
         tiny(**shared).apply(fold(jnp.float32(math.sqrt(features))), ids))
+    assert not jnp.array_equal(
+        scaled.apply(params, ids),
+        tiny(**shared).apply(fold(jnp.bfloat16(34.0)), ids))
 
 
 def test_attention_scale_defaults_to_the_head_dim_scale(rng):
