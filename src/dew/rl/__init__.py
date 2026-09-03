@@ -15,19 +15,9 @@ and fails when either half of that stops being true.
 their notice; the rest of Dew is MIT.
 """
 
-from dew.rl.advantage import (
-    gae,
-    group_advantage,
-    masked_mean,
-    masked_whiten,
-    rloo_advantage,
-)
-from dew.rl.surrogate import (
-    clipped_surrogate,
-    k3_kl,
-    sequence_log_ratio,
-    token_log_ratio,
-    token_mean,
+from .advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
+from .surrogate import (
+    clipped_surrogate, k3_kl, sequence_log_ratio, token_log_ratio, token_mean,
 )
 
 __all__ = [
