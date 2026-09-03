@@ -65,6 +65,40 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
+    "slow: tests that spawn real grain worker processes or drain long streams",
+    "distributed: tests that need real processes with jax.distributed",
+]
+# A warning is a failure waiting to be reported, so the ones dew is
+# responsible for are errors. The module field is matched against the module
+# the warning is attributed to, which for a deprecated API is the caller, so
+# these cover dew calling something that is going away as well as dew's own
+# warnings. Third-party warnings stay visible and non-fatal; allowing one
+# needs a line here and a reason next to it.
+filterwarnings = [
+    'error::DeprecationWarning:dew($|\.)',
+    'error::PendingDeprecationWarning:dew($|\.)',
+    'error::FutureWarning:dew($|\.)',
+    # The suite is dew's code too.
+    'error::DeprecationWarning:(test_|conftest)',
+    'error::FutureWarning:(test_|conftest)',
+    # os.fork in a process that already runs JAX threads is the deadlock this
+    # suite exists to catch, so jax's own warning about it is an error
+    # wherever it comes from rather than scoped to dew.
+    'error:os\.fork\(\) was called:RuntimeWarning',
+    # CPython warns about the same fork from multiprocessing's start method,
+    # and that one is deliberately not listed. A pool forks on its own thread,
+    # where an error raised by a filter is swallowed, so making it an error
+    # would delete the message instead of failing the run. It has to stay
+    # visible, and a test that starts a pool has to assert it never appears.
+    # grain tears its worker pool down inside a multiprocessing finalizer, so
+    # CPython's resource tracker reports reentrant cleanup of the pool's own
+    # semaphores and shared memory. Those objects go with the worker process,
+    # and dew cannot close the pool earlier because a DataLoaderIterator has
+    # no close(). Ignored rather than shown, because nothing stays in the tail
+    # of a green run, and scoped to the tracker so a leak of ours still
+    # speaks. Counted 44 of them in the grain worker tests.
+    'ignore:ResourceTracker called reentrantly:UserWarning:multiprocessing\.resource_tracker',
+    'ignore:resource_tracker:UserWarning:multiprocessing\.resource_tracker',
 ]
 
 [tool.setuptools.dynamic]

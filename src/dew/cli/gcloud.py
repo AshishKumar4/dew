@@ -146,11 +146,16 @@ class Gcloud:
         if self.dry_run:
             emit(shlex.join(argv))
             return Result(tuple(argv), 0)
-        process = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in process.stdout:  # type: ignore[union-attr]
-            emit(prefix + line.rstrip("\n"))
-        return Result(tuple(argv), process.wait())
+        # Popen as a context manager closes the pipe it opened; leaving that
+        # to the collector leaked one file per streamed command, which a
+        # fanout over a pod does once per worker.
+        with subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            bufsize=1,
+        ) as process:
+            for line in process.stdout:  # type: ignore[union-attr]
+                emit(prefix + line.rstrip("\n"))
+            return Result(tuple(argv), process.wait())
 
     def fanout(
         self,

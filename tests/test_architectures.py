@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.sharding import PartitionSpec as P
 
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.eval.common import EvaluationMetric
@@ -35,7 +36,8 @@ from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import MODEL_REGISTRY, build_model
 from dew.training import ObjectiveTrainer
 from dew.training.distributed import (
-    DEFAULT_LOGICAL_PARAM_AXES, build_mesh, parameter_spec, state_sharding_tree)
+    DEFAULT_LOGICAL_PARAM_AXES, assert_params_sufficiently_sharded, build_mesh,
+    parameter_spec, state_sharding_tree)
 
 RES = 16
 FRAMES = 2
@@ -437,3 +439,110 @@ def test_architecture_trains_under_fsdp(case, tmp_path):
     assert param_specs == [leaf.sharding.spec
                            for leaf in jax.tree.leaves(state.ema_params)]
     assert fsdp_leaves(state.opt_state[0].mu), "no optimizer moment was sharded"
+
+
+# --------------------------------------------------------------------------
+# The sharding table as the fsdp axis widens
+# --------------------------------------------------------------------------
+
+def derived_specs(variables, fsdp_size):
+    mesh = build_mesh(fsdp_size=fsdp_size)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
+    return mesh, shardings, jax.tree.map(lambda sharding: sharding.spec, shardings)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
+@pytest.mark.parametrize("case", CASES, ids=IDS)
+def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsdp_size):
+    """Each architecture on a 2, 4 and 8 wide fsdp axis, not just the 4 above.
+
+    Three properties at once, because they share one derivation. The layout
+    has to be reproducible, or two processes deriving it would disagree and
+    the run would deadlock on mismatched collectives. Every dimension a spec
+    names has to be splittable that many ways, or jit rejects the layout. And
+    what the rules could not place has to stay inside the tolerance, or the
+    run is quietly training a replicated model on every device.
+    """
+    variables = model_variables(case)
+    mesh, shardings, specs = derived_specs(variables, fsdp_size)
+    assert specs == derived_specs(variables, fsdp_size)[2], "the derivation is not stable"
+
+    leaves = jax.tree_util.tree_flatten_with_path(variables["params"])[0]
+    for (path, value), sharding in zip(
+            leaves, jax.tree.leaves(shardings["params"]), strict=True):
+        for dimension, entry in enumerate(sharding.spec):
+            if not entry:
+                continue
+            size = value.shape[dimension]
+            where = f"{jax.tree_util.keystr(path)} {value.shape} -> {sharding.spec}"
+            assert size % fsdp_size == 0, f"{where} cannot split {fsdp_size} ways"
+            assert size > 1, f"{where} shards a dimension of one"
+
+    assert_params_sufficiently_sharded(
+        variables["params"], shardings["params"], mesh, min_shard_size=TINY_SHARD)
+
+
+# Three registry entries that between them cover the table: the language
+# model's named vocab and embed axes, the DiT's three-axis attention kernels,
+# and the U-Net, whose convolutions the table does not name at all.
+LAYOUT_CASES = [case for case in CASES
+                if case.architecture in ("causal_transformer", "simple_dit", "unet")]
+
+# One named parameter per case whose spec the rules table decides, written out
+# rather than derived, so a table that stops matching a module shows up here.
+NAMED_LEAF = {
+    "causal_transformer": (("embed_tokens", "embedding"), P("fsdp")),
+    "simple_dit": (("dit_block_0", "attention", "to_q", "kernel"), P("fsdp")),
+}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
+@pytest.mark.parametrize("case", LAYOUT_CASES,
+                         ids=[case.architecture for case in LAYOUT_CASES])
+def test_a_built_trainer_carries_the_layout_the_rules_derive(case, tmp_path, fsdp_size):
+    """The derivation through the path a run takes, not called on its own.
+
+    Every other sharding test calls state_sharding_tree and reads its return
+    value, so a layout that is derived correctly and never reaches the state
+    leaves all of them green. Dropping out_shardings from the jit in
+    _build_state is that mutation, and it passes the declared-axis tests and
+    the tolerance tests while every parameter here lands on one device.
+    Building the state is what these assertions read, and the build carries
+    the tolerance check at the library default with it.
+    """
+    trainer = make_trainer(case, tmp_path, fsdp_size, [])
+    leaves = jax.tree_util.tree_flatten_with_path(trainer.state.params)[0]
+    assert leaves, "the build produced no parameters"
+
+    named = NAMED_LEAF.get(case.architecture)
+    if named is not None:
+        path, expected = named
+        leaf = trainer.state.params["params"]
+        for key in path:
+            leaf = leaf[key]
+        assert getattr(leaf.sharding, "spec", None) == expected, f"{path} {leaf.shape}"
+
+    # The default table reproduces the shape heuristic, so every leaf of a
+    # built state has to match what the heuristic asks for on this width, and
+    # the arrays have to be split that way rather than merely labelled.
+    for path, leaf in leaves:
+        expected = parameter_spec(leaf.shape, fsdp_size, TINY_SHARD)
+        where = f"{jax.tree_util.keystr(path)} {leaf.shape} on {leaf.sharding}"
+        # A state materialised without the derived layout carries a single
+        # device sharding, which has no spec at all.
+        assert getattr(leaf.sharding, "spec", None) == expected, where
+        if any(expected):
+            assert leaf.addressable_shards[0].data.size == leaf.size // fsdp_size, where
+
+    # Moments and the EMA copy inherit their parameter's layout without the
+    # optimizer or the objective describing one.
+    assert ([leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.params)]
+            == [leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.ema_params)]
+            == [leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.opt_state[0].mu)])
+
+    assert_params_sufficiently_sharded(
+        trainer.state.params,
+        jax.tree.map(lambda leaf: leaf.sharding, trainer.state.params),
+        trainer.mesh, min_shard_size=TINY_SHARD)
