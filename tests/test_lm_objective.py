@@ -563,6 +563,39 @@ def test_the_validation_loop_scores_perplexity(tmp_path):
         float(np.exp(ce)), rel=1e-4)
 
 
+def test_a_validation_stream_that_ends_early_still_scores_the_epoch(tmp_path):
+    """A pass over a held-out split ends with the records, which is before
+    the val_steps_per_epoch batches the loop asks for whenever the split is
+    smaller than that. The StopIteration that ended the stream jumped past
+    the reduction, so an epoch reported no perplexity at all.
+    """
+    trainer = make_trainer(tmp_path)
+    batches = [token_batch(batch=BATCH, seed=seed) for seed in (0, 1)]
+
+    trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                            lambda: iter(batches), 8, 0)
+
+    val_step = trainer.objective.make_validation_step()
+    cross_entropies = [float(val_step(trainer.state, batch)["ce"])
+                       for batch in batches]
+    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(
+        float(np.exp(np.mean(cross_entropies))), rel=1e-4)
+
+
+def test_the_epoch_score_is_the_same_however_the_pass_ends(tmp_path):
+    """Two held-out batches are one epoch's score whether the loop asked for
+    two batches or for eight and the split ran out at two."""
+    batches = [token_batch(batch=BATCH, seed=seed) for seed in (0, 1)]
+
+    def perplexity(val_steps_per_epoch):
+        trainer = make_trainer(tmp_path / f"steps{val_steps_per_epoch}")
+        trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                                lambda: iter(batches), val_steps_per_epoch, 0)
+        return trainer.best_val_metrics["val/perplexity"]
+
+    assert perplexity(8) == pytest.approx(perplexity(2), rel=1e-6)
+
+
 def test_validation_exponentiates_after_averaging_cross_entropy(tmp_path):
     trainer = make_trainer(tmp_path)
     cross_entropies = iter([jnp.asarray(0.0), jnp.asarray(2.0)])
