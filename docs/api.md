@@ -9,7 +9,7 @@ The public modules, and what each one is for.
 | `dew.training` | `ObjectiveTrainer`, `SimpleTrainer`, `TrainState`, `SimpleTrainState`, `build_optimizer`, `prepare_process` |
 | `dew.training.distributed` | `build_mesh`, `parameter_spec`, `state_sharding_tree`, `batch_sharding`, `shard_batch`, `DevicePrefetchIterator`, `DATA_AXIS`, `FSDP_AXIS`, `BATCH_SPEC`, `DEFAULT_MIN_SHARD_SIZE` |
 | `dew.telemetry.instrumentation` | `step_flops`, `compiled_flops`, `model_flops_utilization`, `enable_compilation_cache`, `default_compilation_cache_dir`, `PEAK_FLOPS_PER_DEVICE` |
-| `dew.checkpoints.utils` | `get_latest_checkpoint`, `serialize_model` |
+| `dew.checkpoints.utils` | `get_latest_checkpoint`, `serialize_model`, `RestoredState` |
 | `dew.config` | `RunConfig`, `ModelConfig`, `DataConfig`, `OptimConfig`, `TrainerConfig` |
 
 ## Objectives
@@ -48,7 +48,7 @@ The public modules, and what each one is for.
 | --- | --- |
 | `dew.sampling` | `DiffusionSampler`, `DDPMSampler`, `DDIMSampler`, `EulerSampler`, `EulerAncestralSampler`, `HeunSampler`, `RK4Sampler`, `MultiStepDPM` |
 | `dew.sampling.pipelines` | `InferencePipeline`, `DiffusionInferencePipeline` |
-| `dew.sampling.loading` | `load_from_checkpoint`, `load_from_wandb_run`, `load_from_wandb_registry`, `parse_config` |
+| `dew.sampling.loading` | `load_from_checkpoint`, `load_from_wandb_run`, `load_from_wandb_registry`, `parse_config`, `RestoredState` |
 | `dew.sampling.text` | `generate` |
 
 ## Inputs and data
