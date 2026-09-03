@@ -98,51 +98,94 @@ def test_parameter_spec_falls_back_to_replication_when_indivisible():
     assert parameter_spec((15, 15), fsdp_size=2, min_shard_size=16) == P()
 
 
-def test_dit_and_causal_transformer_declare_logical_parameter_axes():
-    """The two annotated families name what a dimension is, not where it goes."""
-    dit = SimpleDiT(
-        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
-    dit_variables = jax.eval_shape(
-        dit.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
-    dit_specs = nn.get_partition_spec(dit_variables)["params"]
-    assert (dit_specs["embed"]["patch_embed"]["Conv_0"]["kernel"]
-            == P(None, None, None, "embed"))
-    assert (dit_specs["dit_block_0"]["attention"]["to_q"]["kernel"]
-            == P("embed", "heads", "head_dim"))
-    assert (dit_specs["dit_block_0"]["mlp"]["layers_0"]["kernel"]
-            == P("embed", "mlp"))
-    assert dit_specs["output"]["final_proj"]["kernel"] == P("embed", "output")
+def declared_specs(variables, rules):
+    """Parameter specs on a two-way fsdp mesh under one rule table."""
+    shardings = state_sharding_tree(
+        build_mesh(fsdp_size=2), variables, min_shard_size=1,
+        logical_axis_rules=rules)
+    return jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
-    lm = CausalTransformer(
+
+def test_causal_transformer_axes_land_on_the_dimensions_they_name():
+    """One rule at a time: the dimension that moves is the one the table names,
+    which is what a declared axis has to mean."""
+    model = CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
-    lm_variables = jax.eval_shape(
-        lm.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    lm_specs = nn.get_partition_spec(lm_variables)["params"]
-    assert lm_specs["embed_tokens"]["embedding"] == P("vocab", "embed")
-    assert (lm_specs["layers_0"]["self_attn"]["q_proj"]["kernel"]
-            == P("embed", "heads"))
-    assert (lm_specs["layers_0"]["self_attn"]["k_proj"]["kernel"]
-            == P("embed", "kv"))
-    assert (lm_specs["layers_0"]["mlp"]["gate_proj"]["kernel"]
-            == P("embed", "mlp"))
+        num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+
+    vocab = declared_specs(variables, {"vocab": "fsdp"})
+    assert vocab["embed_tokens"]["embedding"] == P("fsdp")
+    assert vocab["lm_head"]["kernel"] == P(None, "fsdp")
+
+    # Grouped-query k and v are the 'kv' axis, q is 'heads': a rule for one
+    # must leave the other whole.
+    kv = declared_specs(variables, {"kv": "fsdp"})
+    attention = kv["layers_0"]["self_attn"]
+    assert attention["k_proj"]["kernel"] == P(None, "fsdp")
+    assert attention["v_proj"]["kernel"] == P(None, "fsdp")
+    assert attention["q_proj"]["kernel"] == P()
+
+    heads = declared_specs(variables, {"heads": "fsdp"})["layers_0"]["self_attn"]
+    assert heads["q_proj"]["kernel"] == P(None, "fsdp")
+    assert heads["k_proj"]["kernel"] == P()
+
+    out = declared_specs(variables, {"attention": "fsdp"})["layers_0"]["self_attn"]
+    assert out["o_proj"]["kernel"] == P("fsdp")
+
+    mlp = declared_specs(variables, {"mlp": "fsdp"})["layers_0"]["mlp"]
+    assert mlp["gate_proj"]["kernel"] == P(None, "fsdp")
+    assert mlp["up_proj"]["kernel"] == P(None, "fsdp")
+    assert mlp["down_proj"]["kernel"] == P("fsdp")
+
+    embed = declared_specs(variables, {"embed": "fsdp"})
+    assert embed["embed_tokens"]["embedding"] == P(None, "fsdp")
+    assert embed["lm_head"]["kernel"] == P("fsdp")
 
 
-def test_rule_override_changes_only_annotated_axes():
+def test_dit_axes_land_on_the_dimensions_they_name():
+    """The same for the DiT stack, whose attention kernels carry three axes."""
+    model = SimpleDiT(
+        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+
+    heads = declared_specs(variables, {"heads": "fsdp"})["dit_block_0"]["attention"]
+    assert heads["to_q"]["kernel"] == P(None, "fsdp")
+    assert heads["to_out_0"]["kernel"] == P("fsdp")
+
+    head_dim = declared_specs(
+        variables, {"head_dim": "fsdp"})["dit_block_0"]["attention"]
+    assert head_dim["to_q"]["kernel"] == P(None, None, "fsdp")
+    assert head_dim["to_out_0"]["kernel"] == P(None, "fsdp")
+
+    embed = declared_specs(variables, {"embed": "fsdp"})
+    assert embed["embed"]["patch_embed"]["Conv_0"]["kernel"] == P(None, None, None, "fsdp")
+    assert embed["conditioning"]["time_embed"]["layers_2"]["kernel"] == P(None, "fsdp")
+
+    modulation = declared_specs(variables, {"modulation": "fsdp"})
+    assert (modulation["dit_block_0"]["ada_params_module"]["ada_proj"]["kernel"]
+            == P(None, "fsdp"))
+
+    output = declared_specs(variables, {"output": "fsdp"})
+    assert output["output"]["final_proj"]["kernel"] == P(None, "fsdp")
+
+    mlp = declared_specs(variables, {"mlp": "fsdp"})
+    assert mlp["conditioning"]["time_embed"]["layers_2"]["kernel"] == P("fsdp")
+
+
+def test_rule_override_changes_only_declared_axes():
     model = SimpleDiT(
         patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
     abstract_variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
-    shardings = state_sharding_tree(
-        build_mesh(fsdp_size=2), abstract_variables, min_shard_size=1,
-        logical_axis_rules={"mlp": "fsdp"})["params"]
+    specs = declared_specs(abstract_variables, {"mlp": "fsdp"})
 
-    assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
-            == P(None, "fsdp"))
-    assert (shardings["dit_block_0"]["mlp"]["layers_2"]["kernel"].spec
-            == P("fsdp"))
-    assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
-    assert shardings["embed"]["patch_embed"]["Conv_0"]["kernel"].spec == P()
+    assert specs["dit_block_0"]["mlp"]["layers_0"]["kernel"] == P(None, "fsdp")
+    assert specs["dit_block_0"]["mlp"]["layers_2"]["kernel"] == P("fsdp")
+    assert specs["dit_block_0"]["attention"]["to_q"]["kernel"] == P()
+    assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
 
 
 def test_default_logical_rules_keep_the_shape_heuristic():
@@ -155,7 +198,7 @@ def test_default_logical_rules_keep_the_shape_heuristic():
         logical_axis_rules=DEFAULT_LOGICAL_AXIS_RULES)
     expected = jax.tree.map(
         lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1),
-        nn.unbox(abstract_variables))
+        abstract_variables)
     actual = jax.tree.map(lambda sharding: sharding.spec, shardings)
     assert actual == expected
 
@@ -175,21 +218,17 @@ def test_rules_may_name_a_mesh_axis_this_mesh_does_not_have():
     assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
 
 
-class IndivisibleLogicalModel(nn.Module):
+class IndivisibleModel(nn.Module):
+    """A parameter no mesh axis of size two can split."""
+
     @nn.compact
     def __call__(self, x):
-        return nn.Dense(
-            15,
-            use_bias=False,
-            kernel_init=nn.with_partitioning(
-                nn.linear.default_kernel_init, ("embed", "mlp")),
-            name="indivisible",
-        )(x)
+        return nn.Dense(15, use_bias=False, name="indivisible")(x)
 
 
 def make_indivisible_trainer(tmp_path, tolerance):
     return SimpleTrainer(
-        model=IndivisibleLogicalModel(),
+        model=IndivisibleModel(),
         input_shapes={"x": (15,)},
         optimizer=optax.adam(1e-3),
         rngs=jax.random.key(0),

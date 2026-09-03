@@ -25,7 +25,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
 
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.eval.common import EvaluationMetric
@@ -35,7 +34,8 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import MODEL_REGISTRY, build_model
 from dew.training import ObjectiveTrainer
-from dew.training.distributed import build_mesh, parameter_spec, state_sharding_tree
+from dew.training.distributed import (
+    DEFAULT_LOGICAL_PARAM_AXES, build_mesh, parameter_spec, state_sharding_tree)
 
 RES = 16
 FRAMES = 2
@@ -188,10 +188,23 @@ def test_default_logical_rules_match_previous_specs_for_every_registry_model(cas
     mesh = build_mesh(fsdp_size=4)
     derived = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
     expected = jax.tree.map(
-        lambda value: parameter_spec(value.shape, 4, TINY_SHARD),
-        nn.unbox(variables))
+        lambda value: parameter_spec(value.shape, 4, TINY_SHARD), variables)
     actual = jax.tree.map(lambda sharding: sharding.spec, derived)
     assert actual == expected
+
+
+def test_every_declared_parameter_axis_names_a_module_some_model_has():
+    """A renamed module has to break the table, not silently stop matching it."""
+    # An untied lm_head is the one declared module the cases above do not build.
+    untied = [Case(case.architecture, {**case.config, "tie_embeddings": False},
+                   seq_len=case.seq_len) for case in CASES if case.is_lm]
+    modules = set()
+    for case in CASES + untied:
+        leaves, _ = jax.tree_util.tree_flatten_with_path(model_variables(case))
+        modules.update(tuple(entry.key for entry in path[:-1]) for path, _ in leaves)
+    unmatched = [key for key in DEFAULT_LOGICAL_PARAM_AXES
+                 if not any(module[-len(key):] == key for module in modules)]
+    assert unmatched == []
 
 
 def benchmark_tool():
