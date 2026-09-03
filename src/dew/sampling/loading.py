@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import json
 import os
-import warnings
 from typing import Literal
 
 import wandb
@@ -51,8 +50,6 @@ def parse_config(config, overrides=None):
         Dictionary containing model, sampler, scheduler, and other required components
         including DiffusionInputConfig for the general diffusion framework
     """
-    warnings.filterwarnings("ignore")
-    
     # Merge config with overrides if provided
     if overrides is not None:
         # Create a deep copy of config to avoid modifying the original
