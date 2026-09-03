@@ -65,6 +65,26 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
+    "slow: tests that spawn real grain worker processes or drain long streams",
+    "distributed: tests that need real processes with jax.distributed",
+]
+# A warning is a failure waiting to be reported, so the ones dew is
+# responsible for are errors. The module field is matched against the module
+# the warning is attributed to, which for a deprecated API is the caller, so
+# these cover dew calling something that is going away as well as dew's own
+# warnings. Third-party warnings stay visible and non-fatal; allowing one
+# needs a line here and a reason next to it.
+filterwarnings = [
+    'error::DeprecationWarning:dew($|\.)',
+    'error::PendingDeprecationWarning:dew($|\.)',
+    'error::FutureWarning:dew($|\.)',
+    # The suite is dew's code too.
+    'error::DeprecationWarning:(test_|conftest)',
+    'error::FutureWarning:(test_|conftest)',
+    # os.fork in a process that already runs JAX threads is the deadlock this
+    # suite exists to catch, whichever library calls it, so it fails wherever
+    # it comes from rather than being scoped to dew.
+    'error:os\.fork\(\) was called:RuntimeWarning',
 ]
 
 [tool.setuptools.dynamic]
