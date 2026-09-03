@@ -4,8 +4,11 @@ from .common import GeneralizedNoiseScheduler
 from dew.random_state import RandomMarkovState
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
-    def __init__(self, timesteps=1.0, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5, *args, **kwargs):
-        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data, *args, **kwargs)
+    def __init__(self, timesteps=1.0, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5,
+                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
+        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
+                         dtype=dtype, clip_min=clip_min, clip_max=clip_max,
+                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
         self.min_inv_rho = sigma_min ** (1 / rho)
         self.max_inv_rho = sigma_max ** (1 / rho)
         self.rho = rho
@@ -57,8 +60,11 @@ class EDMNoiseScheduler(KarrasVENoiseScheduler):
     reproduce an EDM1 run.
     """
     def __init__(self, timesteps, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5,
-                 P_mean=-0.4, P_std=1.0, *args, **kwargs):
-        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data, *args, **kwargs)
+                 P_mean=-0.4, P_std=1.0,
+                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
+        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho, sigma_data=sigma_data,
+                         dtype=dtype, clip_min=clip_min, clip_max=clip_max,
+                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
         self.P_mean = P_mean
         self.P_std = P_std
 

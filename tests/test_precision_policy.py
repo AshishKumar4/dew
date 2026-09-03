@@ -173,21 +173,28 @@ def test_logged_policy_values_round_trip_through_the_registry():
     assert mapped["attention_impl"] == "auto"
 
 
-TINY = {"emb_features": 32, "output_channels": 3, "patch_size": 4,
-        "num_layers": 1, "num_heads": 2, "precision": "default"}
+TINY = {"emb_features": 32, "precision": "default"}
+DIT = {"output_channels": 3, "patch_size": 4, "num_layers": 1, "num_heads": 2}
+UNET = {"output_channels": 3, "feature_depths": [8, 16],
+        "attention_configs": [None, {"heads": 2}],
+        "num_res_blocks": 1, "num_middle_res_blocks": 1, "norm_groups": 4}
+LM = {"num_layers": 1, "num_heads": 2, "vocab_size": 32, "max_seq_len": 16}
 PER_ARCH = {
-    "unet": {"feature_depths": [8, 16], "attention_configs": [None, {"heads": 2}],
-             "num_res_blocks": 1, "num_middle_res_blocks": 1, "norm_groups": 4},
-    "unet_3d": {"feature_depths": [8, 16], "attention_configs": [None, {"heads": 2}],
-                "num_res_blocks": 1, "num_middle_res_blocks": 1, "norm_groups": 4,
-                "temporal_heads": 2},
-    "uvit": {"num_layers": 2},
-    "simple_udit": {"num_layers": 2},
-    "hierarchical_mmdit": {"emb_features": (16, 32), "num_layers": (1, 1),
-                           "num_heads": (2, 2), "base_patch_size": 2},
-    "jepa_predictor": {"grid": (4, 4), "predictor_features": 16},
-    "causal_transformer": {"vocab_size": 32, "max_seq_len": 16},
-    "moe": {"vocab_size": 32, "max_seq_len": 16, "num_experts": 4, "top_k": 2},
+    "unet": UNET,
+    "unet_3d": {**UNET, "temporal_heads": 2},
+    "uvit": {**DIT, "num_layers": 2},
+    "simple_udit": {**DIT, "num_layers": 2},
+    "simple_dit": DIT,
+    "simple_mmdit": DIT,
+    "hybrid_dit": DIT,
+    "video_dit": DIT,
+    "hierarchical_mmdit": {"output_channels": 3, "emb_features": (16, 32),
+                           "num_layers": (1, 1), "num_heads": (2, 2), "base_patch_size": 2},
+    "jepa_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
+    "jepa_video_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
+    "jepa_predictor": {"num_layers": 1, "num_heads": 2, "grid": (4, 4), "predictor_features": 16},
+    "causal_transformer": LM,
+    "moe": {**LM, "num_experts": 4, "top_k": 2},
 }
 RES, FRAMES = 16, 2
 
@@ -217,7 +224,7 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
     and the optimizer state are unchanged. The unets and the jepa models hand
     back bf16; the DiT family casts its final projection to fp32 on purpose."""
     config = apply_precision_policy(
-        architecture, {**TINY, **PER_ARCH.get(architecture, {})},
+        architecture, {**TINY, **PER_ARCH[architecture]},
         dtype="bfloat16", attention_impl="auto")
     model = build_model(architecture, config)
     assert model.dtype is jnp.bfloat16

@@ -23,7 +23,6 @@ class SimpleDiT(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    learn_sigma: bool = False
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
@@ -72,7 +71,6 @@ class SimpleDiT(nn.Module):
         self.output = PatchSequenceOutput(
             patch_size=self.patch_size,
             output_channels=self.output_channels,
-            learn_sigma=self.learn_sigma,
             norm_epsilon=self.norm_epsilon,
             dtype=self.dtype,
             precision=self.precision,

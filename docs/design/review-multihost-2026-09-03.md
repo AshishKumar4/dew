@@ -1,4 +1,6 @@
-# Review of the September waves
+# Review of the September waves: multi-host and test adequacy
+
+Companion to `review-api-2026-09-03.md`, which read the same commit for ownership and API and fixed what it found in `3d30a35` through `b39c62a`. This review ran the recipes on real process pools and the tests under mutation. One finding overlaps: validation exceptions, fixed in `6b747dc` there and item 4 below.
 
 Five reviewers, one per area, read main at 102baa4 in throwaway worktrees and
 ran what they needed: real two-process pools over a loopback coordinator,
