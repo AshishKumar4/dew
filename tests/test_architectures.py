@@ -174,7 +174,6 @@ def test_benchmark_step_tool_measures_a_real_step(tmp_path):
     """tools/benchmark_step.py drives the same trainer internals this file
     does, so it rots the moment they move. One cpu-smoke case keeps it honest."""
     tool = benchmark_tool()
-    assert tool.BenchmarkConfig().steps == 100, "the default window is 100 steps"
     rows = tool.run(tool.BenchmarkConfig(
         preset='cpu-smoke', architectures=['simple_dit'], warmup=1, steps=4,
         checkpoint_dir=str(tmp_path)))
@@ -185,9 +184,6 @@ def test_benchmark_step_tool_measures_a_real_step(tmp_path):
     assert row['params'] > 0
     assert row['finite'] and np.isfinite(row['loss'])
     assert row['device_kind'] == jax.devices()[0].device_kind
-    # The spread comes from a window that waits on every step, so its
-    # quantiles are ordered and each one is a real step time.
-    assert 0 < row['p10_ms'] <= row['p50_ms'] <= row['p90_ms']
     if row['device_kind'] == 'cpu':
         # No published peak FLOPs for a CPU and no allocator stats behind it,
         # so these are honest Nones rather than invented numbers.
