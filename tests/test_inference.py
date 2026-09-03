@@ -1,8 +1,8 @@
 """Inference pipeline tests: a checkpoint on disk through to a sample.
 
 Everything below the artifact download works offline, so these drive the real
-pipeline from a checkpoint the trainer has just written - the same path a
-wandb run takes once the artifact has landed - and cover the wandb entry
+pipeline from a checkpoint the trainer has just written (the same path a
+wandb run takes once the artifact has landed), and cover the wandb entry
 points only where they report a failed lookup.
 
 parse_config is exercised against both generations of logged config: the
@@ -111,7 +111,7 @@ def legacy_config():
             "activation": "swish",
             "norm_groups": 4,
             "named_norms": False,
-            # a flag the model no longer accepts, as old configs carry
+            # a flag the model does not accept, as old configs carry
             "use_flash_attention": False,
         },
         "arguments": {
@@ -342,16 +342,16 @@ def test_package_exports_the_public_names():
 
 
 def test_base_pipeline_advertises_no_loader():
-    """Loading is the concrete pipeline's business; the base class used to
-    declare a from_wandb that only ever raised."""
+    """Loading is the concrete pipeline's business, so the base class declares
+    no from_wandb of its own."""
     assert not hasattr(InferencePipeline, "from_wandb")
     assert hasattr(DiffusionInferencePipeline, "from_wandb_run")
     assert hasattr(DiffusionInferencePipeline, "from_wandb_registry")
 
 
 def test_wandb_run_loader_reports_a_miss(monkeypatch):
-    """A run that cannot be found returns Nones. The artifact name used to be
-    referenced in the return before it was ever bound."""
+    """A run that cannot be found returns Nones, rather than raising on an
+    artifact name that was never bound."""
     monkeypatch.setattr(inference_utils, "get_wandb_run", lambda *a, **k: None)
 
     assert inference_utils.load_from_wandb_run(

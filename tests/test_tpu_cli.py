@@ -712,8 +712,9 @@ def test_zone_search_follows_the_configured_order_and_caches(fake):
 
 
 def test_a_cached_zone_that_stopped_answering_is_replaced(fake):
-    """A TPU recreated in another zone used to make every command fail with
-    'not in Z. Pass --zone' until the cache file was edited by hand."""
+    """A TPU recreated in another zone is found by the zone search, rather than
+    failing every command with 'not in Z. Pass --zone' until the cache file is
+    edited by hand."""
     tpu_config.cache_zone("slice", "us-east1-d")
     fake.offer("slice", "europe-west4-a")
     assert run("describe", "slice") == 0

@@ -551,8 +551,8 @@ Four distinct architectures behind those names:
 `GLM-5.3` adds an `indexer_types` list that alternates `full` and `shared`:
 `['full','full','full','shared','shared','shared','full','shared',...]`, so one
 indexer's top-k selection is reused by the next three MLA layers
-(`TF/models/glm5_next/configuration_glm5_next.py:44-46`). That is a cheap idea
-worth noting: the indexer is the expensive part of DSA and it is shared 4:1.
+(`TF/models/glm5_next/configuration_glm5_next.py:44-46`). That is a cheap idea,
+because the indexer is the expensive part of DSA and it is shared 4:1.
 
 `GLM-5.3-Flash` is the interesting one for Dew because it combines almost
 everything:
