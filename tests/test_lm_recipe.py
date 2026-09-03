@@ -15,6 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 from dew.config import DataConfig, ModelConfig, OptimConfig, TrainerConfig
 from test_lm_objective import (
     BATCH, SEQ, VOCAB, PackedTinyLM, TinyCausalLM, cycle_batches,

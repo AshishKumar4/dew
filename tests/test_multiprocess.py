@@ -24,6 +24,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 import multiprocess_worker as worker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

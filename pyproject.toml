@@ -42,6 +42,7 @@ dew-tpu = "dew.cli.tpu:main"
 [project.optional-dependencies]
 test = [
     "pytest",
+    "pytest-xdist",
     "safetensors",
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
     # unbounded so the suite runs the release `pip install dew-ml[streaming]`
@@ -67,6 +68,7 @@ markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
     "slow: tests that spawn real grain worker processes or drain long streams",
     "distributed: tests that need real processes with jax.distributed",
+    "mesh: tests that need the eight simulated CPU devices; the GPU lane deselects them",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
 # responsible for are errors. The module field is matched against the module

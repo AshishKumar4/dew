@@ -8,6 +8,9 @@ import numpy as np
 import optax
 import pytest
 
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
+
 from dew.inputs import DiffusionInputConfig
 from dew.objectives.jepa import (
     JepaEncoder, JepaVideoEncoder, JepaObjective, multi_block_mask,
