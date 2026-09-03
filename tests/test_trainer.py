@@ -422,6 +422,26 @@ def test_a_failing_metric_fails_the_validation_pass(tmp_path):
                                 batch_iterator, 1, 0)
 
 
+class UnreadableSplit:
+    """A validation split whose first record cannot be read."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise OSError("val.bin: Input/output error")
+
+
+def test_a_failing_validation_loader_fails_the_pass(tmp_path):
+    """A split that cannot be read has the same duty as a step that cannot
+    run. The train side already stops on a record it cannot read; the
+    validation side printed the error and scored nothing."""
+    trainer = make_trainer(tmp_path, name="failing-loader")
+    with pytest.raises(OSError, match="val.bin"):
+        trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                                UnreadableSplit, 1, 0)
+
+
 def test_a_failing_validation_step_fails_the_base_pass(tmp_path):
     """SimpleTrainer runs its own loop, with the same duty."""
     trainer = SimpleTrainer(

@@ -115,6 +115,8 @@ A multi-process run has to join the process pool before any of that. The recipes
 
 If the underlying iterator can report a position (grain's can), the prefetcher tracks the position of the batch it most recently handed out, not the one the thread has raced ahead to. That is what makes a mid-epoch resume land on the next unseen batch.
 
+A validation pass scores the same number of batches on every process. The token and packed splits are whole files strided per process, so one process can pack a batch more than another, and a process that left the pass while the others waited in its collectives would wedge the pool. Before the loop each process pulls up to `val_steps_per_epoch` batches, the counts are gathered, and every process scores the smallest; a process that holds more prints how many it left out.
+
 ## Checkpoints
 
 Saving is async and sharded arrays go straight to orbax; gathering them onto the host first would serialize the whole state through one process. `wait_for_checkpoints()` blocks until the writes have landed, and anything that reads a checkpoint back has to call it first.

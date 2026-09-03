@@ -153,18 +153,20 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     return directory
 
 
-def document_corpus(directory: Path, documents: int, length: int) -> Path:
+def document_corpus(directory: Path, documents: int, length) -> Path:
     """A corpus whose documents each say which document they are.
 
-    Document i is the token value i + 1 repeated, closed by the eos id 0, so
-    the values in a packed window name the documents packed into it and
-    padding, which is also 0, names none.
+    Document i is the token value i + 1 repeated `length` times (one length
+    for all, or one per document), closed by the eos id 0, so the values in a
+    packed window name the documents packed into it and padding, which is
+    also 0, names none.
     """
     directory.mkdir(parents=True, exist_ok=True)
+    lengths = [length] * documents if isinstance(length, int) else list(length)
     # The dtype has to stay uint16 through the join, or the file holds twice
     # the bytes and reads back as a different corpus entirely.
     stream = np.concatenate([
-        np.array([index + 1] * length + [0], np.uint16)
+        np.array([index + 1] * lengths[index] + [0], np.uint16)
         for index in range(documents)])
     assert stream.dtype == np.uint16
     (directory / "train.bin").write_bytes(stream.tobytes())
@@ -287,6 +289,32 @@ def test_processes_pack_disjoint_documents(tmp_path):
     for report in reports:
         assert report["local_batch_size"] == worker.BATCH // 2
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
+
+
+@pytest.mark.distributed
+def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
+    """Every process scores the batch count all of them have.
+
+    The packed split strides its documents over the processes and packs each
+    stride on its own. Of these 60 documents, 16 on process 0's stride and
+    20 on process 1's fill a window and the rest are one eos each, so the
+    strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each process
+    used to bound its own pass with an islice: asked for 5, process 1 issued
+    a fifth validation collective after process 0 had left the pass, and the
+    pool sat in it until the heartbeat killed both. The count is agreed
+    before the loop, so both score 4.
+    """
+    seq_len, val_steps = 8, 5
+    lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
+    corpus = document_corpus(tmp_path / "corpus", 60, lengths)
+    reports = run_pool("fit", tmp_path / "out", 2, name="uneven", run_dir=tmp_path / "run",
+                       fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
+                       seq_len=seq_len, val_steps=val_steps)
+
+    assert [report["val_available"] for report in reports] == [4, 5]
+    for report in reports:
+        assert report["val_batches"] == 4
+        assert report["step"] == 2
 
 
 # --------------------------------------------------------------------------

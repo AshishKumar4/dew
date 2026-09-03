@@ -24,7 +24,8 @@ from dew.telemetry.instrumentation import (
 from .distributed import (
     DEFAULT_MIN_SHARD_SIZE, DEFAULT_SHARDING_TOLERANCE, DevicePrefetchIterator,
     LogicalAxisRuleConfig, assert_params_sufficiently_sharded, batch_sharding,
-    build_mesh, gather_positions, own_position, shard_batch, state_sharding_tree,
+    build_mesh, gather_positions, minimum_across_processes, own_position, shard_batch,
+    state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
 
@@ -437,6 +438,27 @@ class SimpleTrainer:
             "input_shapes": self.input_shapes
         }
 
+    def _validation_batches(self, val_ds, val_steps_per_epoch) -> list:
+        """The batches a validation pass scores, the same count on every process.
+
+        val_steps_per_epoch bounds the pass, and a held-out split that runs
+        out first ends it, which is not an error to report. Where it runs out
+        differs by process: the token and packed splits are whole files
+        strided per process, so one process can hold a batch more than
+        another, and a process that left the pass while the others waited in
+        its collectives would wedge the pool. The count is agreed before the
+        loop, which is why the batches are pulled onto the host first; a pass
+        holds val_steps_per_epoch of them at most.
+        """
+        if val_ds is None:
+            return [None] * val_steps_per_epoch
+        batches = list(itertools.islice(iter(val_ds()), val_steps_per_epoch))
+        agreed = minimum_across_processes(len(batches))
+        if agreed < len(batches):
+            print(f"Validation on process {jax.process_index()} scores {agreed} of "
+                  f"its {len(batches)} batches, the count every process has")
+        return batches[:agreed]
+
     def validation_loop(
         self,
         val_state: SimpleTrainState,
@@ -446,11 +468,7 @@ class SimpleTrainer:
         current_step,
     ):
         process_index = jax.process_index()
-        
-        # val_steps_per_epoch bounds the pass, and a held-out split that runs
-        # out first ends it, which is not an error to report.
-        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
-                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
+        batches = self._validation_batches(val_ds, val_steps_per_epoch)
         for i, batch in enumerate(batches):
             if batch is not None:
                 batch = shard_batch(self.batch_sharding, batch)
