@@ -36,6 +36,8 @@ def qkv(dtype=jnp.bfloat16):
 
 
 def test_auto_resolves_to_xla_off_gpu(implementations):
+    if jax.default_backend() == 'gpu':
+        pytest.skip("this is the answer off a gpu; the next test is the gpu one")
     scaled_dot_product_attention(*qkv(), implementation='auto')
     assert implementations == ['xla']
 
