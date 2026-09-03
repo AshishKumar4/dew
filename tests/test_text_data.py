@@ -949,15 +949,18 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     interrupted = iter(loader()["train"]())
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
-    unseen = [row.tobytes() for batch in interrupted for row in batch["text"]]
+    rest, ended = _bounded(interrupted, 40)
+    unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
     restored = iter(loader()["train"]())
     restored.set_state(state)
-    resumed = [row.tobytes() for batch in restored for row in batch["text"]]
+    after, ended_again = _bounded(restored, 40)
+    resumed = [row.tobytes() for batch in after for row in batch["text"]]
 
     assert "object at 0x" not in json.loads(state)["data_source"], (
         "a source described by its address can only be restored in the process "
         "that saved it")
+    assert ended and ended_again
     assert resumed == unseen
     assert len(set(seen + resumed)) == 32, "the epoch reads every window once"
 
@@ -976,12 +979,14 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     interrupted = iter(loader()["val"]())
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
-    unseen = [row.tobytes() for batch in interrupted for row in batch["text"]]
+    rest, ended = _bounded(interrupted, 40)
+    unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
     restored = iter(loader()["val"]())
     restored.set_state(state)
-    resumed = [row.tobytes() for batch in restored for row in batch["text"]]
+    after, ended_again = _bounded(restored, 40)
+    resumed = [row.tobytes() for batch in after for row in batch["text"]]
 
-    assert unseen, "the interrupted pass had windows left to read"
+    assert unseen and ended and ended_again
     assert resumed == unseen
     assert len(set(seen + resumed)) == len(seen) + len(unseen), "a window came twice"

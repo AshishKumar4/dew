@@ -875,15 +875,18 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     interrupted = iter(loader()["train"]())
     seen = _rows(next(interrupted))
     state = interrupted.get_state()
-    unseen = [row for b in interrupted for row in _rows(b)]
+    rest, ended = _bounded(interrupted, 20)
+    unseen = [row for batch in rest for row in _rows(batch)]
 
     restored = iter(loader()["train"]())
     restored.set_state(state)
-    resumed = [row for b in restored for row in _rows(b)]
+    after, ended_again = _bounded(restored, 20)
+    resumed = [row for batch in after for row in _rows(batch)]
 
     assert "object at 0x" not in json.loads(state)["data_source"], (
         "a source described by its address can only be restored in the process "
         "that saved it")
+    assert ended and ended_again
     assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
     assert sorted(index for index, _, _ in seen + resumed) == list(range(8, 16))
 
