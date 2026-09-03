@@ -19,26 +19,11 @@ import os
 import PIL.Image
 import traceback
 
+# The lazy `datasets` import lives with the source that owns hub datasets.
+from .sources.hf import _STREAMING_HINT, _hf_datasets
+
 if TYPE_CHECKING:
     from datasets import Dataset
-
-_STREAMING_HINT = (
-    "the online streaming loader needs HF datasets: pip install 'dew-ml[streaming]'"
-)
-
-
-def _hf_datasets():
-    """The HF `datasets` module, imported on use.
-
-    At module scope it would make `import dew.data.online_loader` (and every
-    dew.data name that resolves through it) require the streaming extra, which
-    only loading the dataset itself actually needs.
-    """
-    try:
-        import datasets
-    except ImportError as exc:
-        raise ImportError(_STREAMING_HINT) from exc
-    return datasets
 
 
 @lru_cache(maxsize=1)

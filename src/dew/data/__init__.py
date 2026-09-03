@@ -48,6 +48,7 @@ _EXPORTS = {
     "ImageGCSAugmenter": ".sources.images",
     "get_oxford_valset": ".sources.images",
     "labelizer_oxford_flowers102": ".sources.images",
+    "labelizer_record_caption": ".sources.images",
     "image_augmenter": ".sources.images",
     "unpack_dict_of_byte_arrays": ".sources.images",
     "PROMPT_TEMPLATES": ".sources.images",
@@ -57,6 +58,8 @@ _EXPORTS = {
     "tfds_augmenters": ".sources.images",
     "gcs_augmenters": ".sources.images",
     "gcs_filters": ".sources.images",
+    # hub datasets: an Arrow-backed HF dataset read through grain
+    "HFDatasetSource": ".sources.hf",
     # video / audio-video sources
     "VideoTFDSSource": ".sources.videos",
     "VideoLocalSource": ".sources.videos",
