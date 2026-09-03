@@ -224,6 +224,13 @@ def test_multistep_dpm_reentrant():
     assert jnp.allclose(first, second, atol=1e-5)
 
 
+@pytest.mark.parametrize("sampler_class", [MultiStepDPM, RK4Sampler])
+def test_sigma_integrators_reject_a_vp_schedule(sampler_class):
+    """Both integrate dx/dsigma = eps, which only holds when alpha is 1."""
+    with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
+        make_vp_sampler(sampler_class)
+
+
 ############################################################################################################
 # Interval-limited classifier-free guidance (Kynkaanniemi et al. 2024)
 ############################################################################################################
