@@ -38,6 +38,7 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 - One behaviour per test, named for the behaviour. A test that would need its name changed when the implementation changes is testing the implementation.
 - Deterministic and on CPU. Fixed seeds, no wall-clock timing, no network unless marked. The GPU lane exists for kernels and dtypes, not for logic.
 - No silent skips. `importorskip` only for an optional dependency, never for the code under test; a test that skips because a module broke is a broken test.
+- Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
 - `tests/test_architectures.py` fails when a registry entry has no training case. Keep it that way.
 
 ## Writing
