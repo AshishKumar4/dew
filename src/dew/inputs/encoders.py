@@ -71,14 +71,13 @@ class CLIPTextEncoder(TextEncoder):
     """CLIP Text Encoder.
 
     The model is the vendored text tower in `dew.nn.text_encoders`, which reads
-    the checkpoint's safetensors itself. transformers 5 removed every Flax
-    class, so the `FlaxCLIPTextModel` this used to load no longer exists.
+    the checkpoint's safetensors itself, because transformers 5 ships no Flax
+    classes.
 
     `backend` stays in the serialized config, and 'jax' is the only value it
-    can take. The torch branch it used to allow could not run: `tokenize`
-    returns numpy arrays and transformers' `CLIPTextModel.forward` calls
-    `input_ids.size()` on them (modeling_clip.py:529), which raises before any
-    weight is read.
+    can take. A torch branch cannot run here: `tokenize` returns numpy arrays
+    and transformers' `CLIPTextModel.forward` calls `input_ids.size()` on them
+    (modeling_clip.py:529), which raises before any weight is read.
     """
     modelname: str
     backend: str
