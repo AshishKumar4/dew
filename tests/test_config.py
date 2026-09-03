@@ -77,6 +77,22 @@ def test_parse_config_noise_schedule_selection():
     assert type(cosine["noise_schedule"]).__name__ == "CosineNoiseScheduler"
 
 
+def test_parse_config_samples_with_the_trained_flow_shift():
+    """The recipe logs its whole run config; a flow run trained at shift 3.0
+    has to sample at shift 3.0, since the shift moves every timestep."""
+    config = make_config(arguments_overrides={"noise_schedule": "flow"})
+    config["run_config"] = {"noise_schedule": "flow", "flow_shift": 3.0, "min_snr_gamma": 5.0}
+
+    assert parse_config(config)["noise_schedule"].shift == 3.0
+
+
+def test_parse_config_flow_shift_defaults_for_configs_before_the_knob():
+    """A run logged before flow_shift existed trained at the preset default."""
+    config = make_config(arguments_overrides={"noise_schedule": "flow"})
+
+    assert parse_config(config)["noise_schedule"].shift == 1.0
+
+
 def test_parse_config_resolves_dotted_values():
     """Function paths like 'jax.nn.mish' (and the 'jax._src.nn.functions.silu'
     that old configs contain from the aliasing bug) must resolve to the actual
