@@ -382,12 +382,10 @@ class CausalTransformer(nn.Module):
     def __call__(self, tokens, train: bool = False, decode: bool = False):
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
-            # Gemma casts sqrt(hidden) to the embedding's own dtype, which is
-            # the parameter dtype, so the multiply happens in fp32 and only
-            # the product is narrowed. Scaling in bf16 instead would round the
-            # factor itself: sqrt(1152) becomes 34.0, off by 1.7e-3.
-            x = (x.astype(jnp.float32)
-                 * math.sqrt(self.emb_features)).astype(x.dtype)
+            # Gemma multiplies by embed_scale cast to the weight dtype
+            # (modeling_gemma3.py:117), which for a bf16 load is bf16, so the
+            # factor rounds with the activations: sqrt(1152) is 34.0 there.
+            x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
         for layer in self.layers:
             x = layer(x, train=train, decode=decode)
         x = self.norm(x)
