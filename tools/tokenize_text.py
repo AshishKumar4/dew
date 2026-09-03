@@ -5,9 +5,9 @@ Reads a single file or every *.txt under a directory (recursively), encodes it
 with the byte tokenizer or a huggingface one, splits the token stream by
 --val-fraction (validation is the head of the stream, in file order) and
 writes the nanoGPT-style output that `dew.data.sources.text.TokenFileSource`
-and `get_token_dataset_grain` read back. With --pack-seq-len an EOS id is
-written between the input files, so the packed loader can treat each file as
-one document; meta.json then records the id under `eos_id`.
+and `get_token_dataset_grain` read back. With --pack an EOS id is written
+after every input file, so the packed loader can treat each file as one
+document; meta.json then records the id under `eos_id`.
 
 The corpus is processed one line-bounded chunk at a time: tokens are encoded,
 written and dropped, so a corpus larger than memory costs disk, never RAM.
