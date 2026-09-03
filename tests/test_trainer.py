@@ -7,6 +7,7 @@ wandb and conditioning encoders.
 
 import os
 
+from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -14,10 +15,11 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 
+from dew.eval.common import EvaluationMetric
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
 from dew.diffusion.transforms import get_diffusion_preset
-from dew.training import ObjectiveTrainer
+from dew.training import ObjectiveTrainer, SimpleTrainer
 from dew.training import objective_trainer as gdt
 from dew.checkpoints.utils import get_latest_checkpoint
 
@@ -344,3 +346,41 @@ def test_registry_failure_leaves_the_checkpoint_alone(tmp_path, monkeypatch):
 
     assert trainer.checkpointer.latest_step() == 3
     assert os.path.exists(os.path.join(trainer.checkpoint_path(), "3"))
+
+
+# --------------------------------------------------------------------------
+# Validation failures
+# --------------------------------------------------------------------------
+
+class Affine(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(x)
+
+
+def test_a_failing_metric_fails_the_validation_pass(tmp_path):
+    """A metric that raises has to take the pass down with it. Printed and
+    swallowed, the pass ends with no scores and the run carries on as if it
+    had been evaluated."""
+    def divide_by_zero(artifacts, batch):
+        raise ZeroDivisionError("metric over an empty batch")
+
+    trainer = make_trainer(tmp_path, name="failing-metric", eval_metrics=[
+        EvaluationMetric(function=divide_by_zero, name="broken")])
+    with pytest.raises(ZeroDivisionError):
+        trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                                batch_iterator, 1, 0)
+
+
+def test_a_failing_validation_step_fails_the_base_pass(tmp_path):
+    """SimpleTrainer runs its own loop, with the same duty."""
+    trainer = SimpleTrainer(
+        model=Affine(), input_shapes={"x": (3,)}, optimizer=optax.sgd(0.1),
+        rngs=jax.random.PRNGKey(0), name="base", distributed_training=False,
+        checkpoint_base_path=str(tmp_path))
+
+    def divide_by_zero(state, batch):
+        raise ZeroDivisionError("validation over an empty batch")
+
+    with pytest.raises(ZeroDivisionError):
+        trainer.validation_loop(trainer.state, divide_by_zero, None, 1, 0)

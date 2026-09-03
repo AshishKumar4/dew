@@ -411,25 +411,21 @@ class SimpleTrainer:
         # out first ends it, which is not an error to report.
         batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
                    if val_ds else itertools.repeat(None, val_steps_per_epoch))
-        # Evaluation step
-        try:
-            for i, batch in enumerate(batches):
-                if batch is not None:
-                    batch = shard_batch(self.batch_sharding, batch)
-                if i == 0:
-                    print(f"Evaluation started for process index {process_index}")
-                metrics = val_step_fn(val_state, batch)
-                if self.wandb is not None:
-                    # metrics is a dict of metrics
-                    if metrics and type(metrics) == dict:
-                        for key, value in metrics.items():
-                            if isinstance(value, jnp.ndarray):
-                                value = np.array(value)
-                            self.wandb.log({
-                                f"val/{key}": value,
-                            }, step=current_step)
-        except Exception as e:
-            print("Error logging images to wandb", e)
+        for i, batch in enumerate(batches):
+            if batch is not None:
+                batch = shard_batch(self.batch_sharding, batch)
+            if i == 0:
+                print(f"Evaluation started for process index {process_index}")
+            metrics = val_step_fn(val_state, batch)
+            if self.wandb is not None:
+                # metrics is a dict of metrics
+                if metrics and type(metrics) == dict:
+                    for key, value in metrics.items():
+                        if isinstance(value, jnp.ndarray):
+                            value = np.array(value)
+                        self.wandb.log({
+                            f"val/{key}": value,
+                        }, step=current_step)
 
     def _compiled_step(self, train_step_fn: Callable, *args):
         """The training step's executable, compiled at most once per run.

@@ -321,68 +321,54 @@ class ObjectiveTrainer(SimpleTrainer):
                    if val_ds else itertools.repeat(None, val_steps_per_epoch))
         print(f"Validation loop started for process index {process_index} "
               f"with {jax.device_count()} devices.")
-        # Evaluation step
-        try:
-            metrics = {metric.name: [] for metric in self.eval_metrics} if self.eval_metrics else {}
-            for i, batch in enumerate(batches):
-                if batch is not None:
-                    batch = shard_batch(self.batch_sharding, batch)
-                artifacts = val_step_fn(val_state, batch)
+        metrics = {metric.name: [] for metric in self.eval_metrics} if self.eval_metrics else {}
+        for i, batch in enumerate(batches):
+            if batch is not None:
+                batch = shard_batch(self.batch_sharding, batch)
+            artifacts = val_step_fn(val_state, batch)
 
-                if self.eval_metrics is not None:
-                    for metric in self.eval_metrics:
-                        try:
-                            # Evaluate metrics
-                            metric_val = metric.function(artifacts, batch)
-                            metrics[metric.name].append(metric_val)
-                        except Exception as e:
-                            print("Error in evaluation metrics:", e)
-                            import traceback
-                            traceback.print_exc()
-                            pass
-                    
-                if i == 0:
-                    print(f"Evaluation started for process index {process_index}")
-                    if self.wandb is not None and self.wandb:
-                        self.objective.log_validation_artifacts(
-                            self.wandb, artifacts, current_step)
+            if self.eval_metrics is not None:
+                for metric in self.eval_metrics:
+                    metrics[metric.name].append(metric.function(artifacts, batch))
 
-            if metrics:
-                metrics = {
-                    metric.name: metric.reducer(metrics[metric.name])
-                    for metric in self.eval_metrics
-                    if metrics[metric.name]
-                }
-                # Update the best validation metrics (min or max per metric direction)
-                for key, value in metrics.items():
-                    final_key = f"val/{key}"
-                    higher_is_better = self.metric_higher_is_better.get(final_key, False)
-                    if final_key not in self.best_val_metrics:
-                        self.best_val_metrics[final_key] = value
-                    else:
-                        prev = self.best_val_metrics[final_key]
-                        self.best_val_metrics[final_key] = max(prev, value) if higher_is_better else min(prev, value)
-                # Log the best validation metrics
+            if i == 0:
+                print(f"Evaluation started for process index {process_index}")
                 if self.wandb is not None and self.wandb:
-                    # Log the metrics
-                    for key, value in metrics.items():
-                        if isinstance(value, jnp.ndarray):
-                            value = np.array(value)
-                        self.wandb.log({
-                            f"val/{key}": value,
-                        }, step=current_step)
-                    # Log the best validation metrics
-                    for key, value in self.best_val_metrics.items():
-                        if isinstance(value, jnp.ndarray):
-                            value = np.array(value)
-                        self.wandb.log({
-                            f"best_{key}": value,
-                        }, step=current_step)
-                print(f"Validation metrics for process index {process_index}: {metrics}")
-        except Exception as e:
-            print(f"Error during validation for process index {process_index}: {e}")
-            import traceback
-            traceback.print_exc()
+                    self.objective.log_validation_artifacts(
+                        self.wandb, artifacts, current_step)
+
+        if metrics:
+            metrics = {
+                metric.name: metric.reducer(metrics[metric.name])
+                for metric in self.eval_metrics
+                if metrics[metric.name]
+            }
+            # Update the best validation metrics (min or max per metric direction)
+            for key, value in metrics.items():
+                final_key = f"val/{key}"
+                higher_is_better = self.metric_higher_is_better.get(final_key, False)
+                if final_key not in self.best_val_metrics:
+                    self.best_val_metrics[final_key] = value
+                else:
+                    prev = self.best_val_metrics[final_key]
+                    self.best_val_metrics[final_key] = max(prev, value) if higher_is_better else min(prev, value)
+            # Log the best validation metrics
+            if self.wandb is not None and self.wandb:
+                # Log the metrics
+                for key, value in metrics.items():
+                    if isinstance(value, jnp.ndarray):
+                        value = np.array(value)
+                    self.wandb.log({
+                        f"val/{key}": value,
+                    }, step=current_step)
+                # Log the best validation metrics
+                for key, value in self.best_val_metrics.items():
+                    if isinstance(value, jnp.ndarray):
+                        value = np.array(value)
+                    self.wandb.log({
+                        f"best_{key}": value,
+                    }, step=current_step)
+            print(f"Validation metrics for process index {process_index}: {metrics}")
 
 
     def push_to_registry(
