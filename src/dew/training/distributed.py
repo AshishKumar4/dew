@@ -100,7 +100,7 @@ def _parameter_path(path) -> tuple[str, ...]:
     return tuple(reversed(names))
 
 
-def _logical_axes(path, ndim: int) -> Optional[LogicalAxes]:
+def logical_axes(path, ndim: int) -> Optional[LogicalAxes]:
     """The declared axes of the parameter at `path`, or None for an unnamed one."""
     module = _parameter_path(path)[:-1]
     for length in range(len(module), 0, -1):
@@ -215,7 +215,7 @@ def state_sharding_tree(
     fsdp_size = mesh.shape[FSDP_AXIS]
 
     def leaf_sharding(path, value):
-        axes = _logical_axes(path, value.ndim)
+        axes = logical_axes(path, value.ndim)
         size = int(np.prod(value.shape, dtype=np.int64))
         if axes is None:
             spec = parameter_spec(value.shape, fsdp_size, min_shard_size)

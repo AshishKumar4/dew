@@ -19,12 +19,14 @@ import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.config import OptimConfig
 from dew.inputs import DiffusionInputConfig
 from dew.eval.common import EvaluationMetric
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer, SimpleTrainer
+from dew.training.optim import build_optimizer
 from dew.objectives.base import EMASpec, Objective
 from dew.training.distributed import (
     DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator,
@@ -896,3 +898,71 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
 
     trainer.wait_for_checkpoints()
     assert trainer.checkpointer.latest_step() == 2
+
+
+# --------------------------------------------------------------------------
+# The optimizer parameter groups under sharding
+# --------------------------------------------------------------------------
+
+def muon_state_specs(variables, rules):
+    """Params and the moments of both optimizer groups, on a two-way mesh."""
+    solver = build_optimizer(
+        OptimConfig(optimizer="muon", learning_rate=1e-3), steps_per_epoch=10)
+    opt_state = jax.eval_shape(solver.init, variables)
+    shardings = state_sharding_tree(
+        build_mesh(fsdp_size=2), (variables, opt_state), min_shard_size=1,
+        logical_axis_rules=rules)
+    return jax.tree.map(lambda sharding: sharding.spec, shardings)
+
+
+def muon_moment_specs(opt_state_specs, param_specs):
+    """Per parameter, its own spec and the specs its moments were given.
+
+    A parameter is identified the way the derivation identifies it, by the
+    trailing run of its path, because each group nests a copy of the
+    parameter tree inside its own state. A group holds no leaf at all for a
+    parameter it does not step, so the moments found are the membership.
+    """
+    found = {tuple(entry.key for entry in path): (spec, [])
+             for path, spec in jax.tree_util.tree_flatten_with_path(param_specs)[0]}
+    for path, spec in jax.tree_util.tree_flatten_with_path(opt_state_specs)[0]:
+        names = []
+        for entry in reversed(path):
+            if not isinstance(entry, jax.tree_util.DictKey):
+                break
+            names.append(entry.key)
+        candidate = tuple(reversed(names))
+        if candidate in found:
+            found[candidate][1].append(spec)
+    return found
+
+
+def test_muon_group_moments_take_the_spec_their_parameter_declared():
+    """The split nests the parameter tree in two masked states, one per group.
+    Under a rule table that names one axis, a moment that fell back to the
+    shape heuristic would shard a parameter the table leaves whole, so the
+    assertion is that every moment of every parameter carries that
+    parameter's own spec, in both groups. The moment count says which group
+    stepped it: AdamW keeps two, Muon one.
+    """
+    model = CausalTransformer(
+        vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+        num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    param_specs, opt_state_specs = muon_state_specs(variables, {"mlp": "fsdp"})
+
+    params = param_specs["params"]
+    assert params["embed_tokens"]["embedding"] == P()
+    assert params["layers_0"]["mlp"]["down_proj"]["kernel"] == P("fsdp")
+    assert params["layers_0"]["mlp"]["up_proj"]["kernel"] == P(None, "fsdp")
+
+    moments = muon_moment_specs(opt_state_specs, param_specs)
+    for name, (declared, specs) in moments.items():
+        assert specs, f"{name} has no optimizer moment in either group"
+        assert set(specs) == {declared}, name
+
+    embedding = moments[("params", "embed_tokens", "embedding")]
+    kernel = moments[("params", "layers_0", "mlp", "down_proj", "kernel")]
+    assert len(embedding[1]) == 2 and embedding[0] == P()
+    assert len(kernel[1]) == 1 and kernel[0] == P("fsdp")
