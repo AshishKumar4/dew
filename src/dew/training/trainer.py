@@ -49,6 +49,11 @@ def _processes(count: int) -> str:
     return f"{count} process" + ("es" if count != 1 else "")
 
 
+def _is_uri(path: str) -> bool:
+    """A `<scheme>://` location, such as a gs:// bucket, which has no local form."""
+    return '://' in path
+
+
 # Define the TrainState
 class SimpleTrainState(train_state.TrainState):
     metrics: Metrics
@@ -280,10 +285,12 @@ class SimpleTrainer:
 
     def checkpoint_path(self):
         path = os.path.join(self.checkpoint_base_path, self.name.replace(' ', '_').lower())
-        # Convert the path to an absolute path
+        if _is_uri(path):
+            # orbax opens a bucket URI itself; abspath and makedirs would turn
+            # it into a local directory named gs:.
+            return path
         path = os.path.abspath(path)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
         return path
 
     def _checkpoint_template(self, stored_keys):

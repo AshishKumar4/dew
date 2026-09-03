@@ -310,6 +310,38 @@ def test_get_latest_checkpoint_reports_an_empty_directory(tmp_path):
         get_latest_checkpoint(str(tmp_path))
 
 
+# --------------------------------------------------------------------------
+# Where the checkpoints go
+# --------------------------------------------------------------------------
+
+class RecordingManager:
+    """Orbax as far as the constructor reads it, remembering where it was pointed.
+
+    A bucket URI is the one directory the trainer must hand over untouched,
+    and a test that let orbax open it would need a bucket.
+    """
+
+    def __init__(self, directory, **kwargs):
+        self.directory = directory
+
+    def latest_step(self):
+        return None
+
+
+def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
+    """`--trainer.checkpoint-fs gcs` prefixes the directory with gs://, and
+    checkpoint_path used to run it through abspath and makedirs: orbax got
+    <cwd>/gs:/bucket/... and a local directory named `gs:` appeared under the
+    working directory. A URI has no local form and goes through as it is."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trainer_module.ocp, "CheckpointManager", RecordingManager)
+    trainer = make_trainer("gs://bucket/checkpoints", name="Bucket Run")
+
+    assert trainer.checkpoint_path() == "gs://bucket/checkpoints/bucket_run"
+    assert trainer.checkpointer.directory == "gs://bucket/checkpoints/bucket_run"
+    assert not (tmp_path / "gs:").exists(), "a local directory named gs: was created"
+
+
 class ExplodingCheckpointer:
     """Orbax when the filesystem refuses the write.
 
