@@ -627,7 +627,7 @@ pointed the other way.
 | Generator or environment | `Env` protocol in `dew/rl/env.py`: `reset(rng) -> TimeStep`, `step(state, action) -> TimeStep`, both pure and jittable, `TimeStep` a `flax.struct.dataclass` of observation, reward, done and state | text and diffusion rollouts have no environment; the generator there is `dew.sampling` |
 | Rollout | `Objective.rollout(params, ema_params, batch, rng, step) -> batch`, host side, fixed shapes; implementations in `dew/rl/rollout.py` for text, environment and SDE sampling | offline algorithms (SFT, DPO) use the default, which returns the batch unchanged |
 | Rollout buffer | `ReplayBuffer` in `dew/rl/buffer.py`: a fixed-capacity device pytree with `insert` and `sample`, including sequence sampling for model-based use | every on-policy algorithm omits it |
-| Reward | a callable `(batch) -> array` and a weight, in a list on the objective; verifiable rewards in `dew/rl/reward.py` | when the environment supplies the reward it is already a batch column |
+| Reward | a host-side callable per sample, `(record, completion, completion_ids) -> float` for text and `(record, image) -> float` for images, in a list on the objective with weights; verifiable examples in `dew/rl/reward.py` | when the environment supplies the reward it is already a batch column |
 | Advantage estimator | functions in `dew/rl/advantage.py`: `group_mean`, `group_mean_unnormalised`, `rloo`, `gae`, `lambda_returns` | DPO and DiffusionNFT pass the reward through unchanged |
 | Update rule | functions in `dew/rl/surrogate.py`: `clipped_ratio`, `sequence_ratio`, `cispo`, `preference_logsigmoid`, `weighted_flow_matching`, `reverse_kl`, `reinforce_entropy` | never; this is the one primitive every algorithm uses |
 | Reference model | the existing EMA tree with `EMASpec(decay=lambda step: 1.0)` (`src/dew/objectives/base.py:21-31`), read in `loss` as `ema_params` | DiffusionNFT and Dreamer have no reference and set no spec |
@@ -858,6 +858,28 @@ are the first consumers of `dew.rl`, and the fact that a diffusion stage is the
 fifth row using the same primitives is the check that section 5's design is a
 framework rather than an LM-shaped special case.
 
+Where the two documents divide, so that neither repeats the other. This plan
+owns the package layout, the trainer's two changes, the telemetry keys and the
+Recipe layer. `docs/design/post-training.md` owns the six objective
+constructors, the chat and preference data paths, the reward signatures, the
+memory arithmetic and the build order. Two names for the same code are
+reconciled here: post-training.md's step 1, "`rl.py` plus fixtures" with
+`group_advantage`, the clipped surrogate and the k3 KL estimator
+(`docs/design/post-training.md:390`), is the first commit of `dew/rl/` in
+section 1.1's layout, landing as `advantage.py` and `surrogate.py`. A single
+`rl.py` is the smaller interface for those three functions and stops being
+smaller at the sixth, which is why the package is the shape and its first
+commit is that file's contents.
+
+The eight branches of post-training.md's build order
+(`docs/design/post-training.md:384-398`) decompose waves 4.12, 4.13 and 4.14 of
+this plan; that table is the finer-grained sequence and this one is the frame.
+The reward contract in section 5.2 is that document's, taken as written. What
+the per-sample shape gives up is one batched device call: a CLIP-style reward
+model pays a forward per sample instead of one per group. The trigger for an
+adapter, not a new contract, is a measured rollout in which reward forwards
+dominate; `dew/rl/reward.py` then gains one `batched(fn)` wrapper.
+
 ## 8. Tutorials and documentation
 
 One per capability, on real data, added by the wave that adds the capability. A
@@ -938,7 +960,7 @@ row is deferred without one.
 
 | # | Risk or unknown | Experiment that resolves it |
 | --- | --- | --- |
-| 10.1 | The synchronous rollout may dominate step time, making GRPO throughput unacceptable | 4.12's run reports `train/rollout_seconds` over `train/step_time_ms` at 0.6B, group 8, 256 new tokens. Above about 3, a decoupled sampler process is justified and is a new seam |
+| 10.1 | The synchronous rollout may dominate step time, making GRPO throughput unacceptable, and the rollout batch is bounded from the other side by the KV cache: 64 rows of 2048 tokens at 0.6B is about 14 GiB in bf16 (`docs/design/post-training.md:340`) | 4.12's run reports `train/rollout_seconds` over `train/step_time_ms` at 0.6B, group 8, 256 new tokens, with the cache size that made it fit. Above about 3, a decoupled sampler process is justified and is a new seam |
 | 10.2 | The grouped matmul may have no fast path on the hardware Dew has. tokamax's Triton and Mosaic paths do not lower on this Ada card (`docs/research/google-jax-stack.md:304-316`) | Before 4.7 writes the MoE block: benchmark `jax.lax.ragged_dot`, `tokamax.ragged_dot` and a dense masked reference at the 8-expert and 128-expert shapes, on the 4080 and on v5e-8. The winner is the default and the numbers go in `docs/performance.md` |
 | 10.3 | Tensor parallelism may not pay at Dew's scale, and `docs/research/frontier-training.md:208` argues it never will | 4.5's four-configuration table on v5e-16 at fixed global batch. If the tensor axis never wins, it stays a rules entry with no recommended use and the documentation says so |
 | 10.4 | Gemma 4 26B-A4B parity may be unreachable on available memory | Measure host RAM for a two-layer fp32 load of `google/gemma-4-26B-A4B-it` before 4.7. If it does not fit, parity is block-level plus a small-config end-to-end test, and the plan says that instead of promising logits |
