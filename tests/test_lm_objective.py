@@ -10,6 +10,8 @@ without a DiffusionInputConfig to describe the inputs. The real sampler runs
 in test_lm_recipe.
 """
 
+from typing import Optional
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -35,9 +37,12 @@ TINY = 64
 class TinyCausalLM(nn.Module):
     """A small causal transformer, standing in for `causal_transformer`.
 
-    Same call contract as the real backbone: int32 ids `[B, S]` in, float32
-    logits `[B, S, vocab]` out, `train` gating dropout, and no path from a
-    position to a later one.
+    Same contract as the real backbone: int32 ids `[B, S]` in, float32 logits
+    `[B, S, vocab]` out, `train` gating dropout, no path from a position to a
+    later one, and the head split off behind `hidden_states` and
+    `head_weight` so the loss can score a vocabulary slice at a time. The
+    head carries no bias, which is what makes `hidden @ head_weight` the
+    whole projection.
     """
 
     vocab_size: int
@@ -45,9 +50,24 @@ class TinyCausalLM(nn.Module):
     num_layers: int = 2
     max_seq_len: int = 64
     dropout_rate: float = 0.0
+    final_logit_softcap: Optional[float] = None
+    precision = None
+
+    def setup(self):
+        self.lm_head = nn.Dense(self.vocab_size, use_bias=False, dtype=jnp.float32,
+                                name="lm_head")
+
+    def __call__(self, tokens, train: bool = False, **packing):
+        # `packing` is the positions and segment ids a packed subclass reads;
+        # this model has no use for them and its hidden_states refuses them.
+        logits = self.lm_head(self.hidden_states(tokens, train=train, **packing))
+        if self.final_logit_softcap is not None:
+            cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
+            logits = cap * jnp.tanh(logits / cap)
+        return logits.astype(jnp.float32)
 
     @nn.compact
-    def __call__(self, tokens, train: bool = False):
+    def hidden_states(self, tokens, train: bool = False):
         length = tokens.shape[1]
         positions = self.param("positions", nn.initializers.normal(0.02),
                                (self.max_seq_len, self.emb_features))
@@ -67,7 +87,10 @@ class TinyCausalLM(nn.Module):
             h = nn.LayerNorm()(x)
             x = x + nn.Dense(self.emb_features)(nn.gelu(nn.Dense(2 * self.emb_features)(h)))
 
-        return nn.Dense(self.vocab_size)(nn.LayerNorm()(x)).astype(jnp.float32)
+        return nn.LayerNorm()(x)
+
+    def head_weight(self, params):
+        return params["lm_head"]["kernel"].astype(jnp.float32)
 
 
 class WandbRecorder:
@@ -247,19 +270,96 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     """Params stay fp32 and the loss is fp32 even when the model computes in bf16."""
     class Bf16LM(TinyCausalLM):
         @nn.compact
-        def __call__(self, tokens, train: bool = False):
-            embedded = nn.Embed(self.vocab_size, self.emb_features,
-                                dtype=jnp.bfloat16)(tokens)
-            return nn.Dense(self.vocab_size, dtype=jnp.bfloat16)(embedded)
+        def hidden_states(self, tokens, train: bool = False):
+            return nn.Embed(self.vocab_size, self.emb_features,
+                            dtype=jnp.bfloat16)(tokens)
 
     objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
     params = objective.init_params(jax.random.PRNGKey(0))
-    logits = objective.model.apply(params, token_batch()[TEXT_KEY][:, :-1])
+    inputs = token_batch()[TEXT_KEY][:, :-1]
+    hidden = objective.model.apply(params, inputs,
+                                   method=Bf16LM.hidden_states)
     loss, aux = objective.loss(params, params, token_batch(), jax.random.PRNGKey(0), 0)
 
-    assert logits.dtype == jnp.bfloat16
+    assert hidden.dtype == jnp.bfloat16
+    assert objective.model.apply(params, inputs).dtype == jnp.float32
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
     assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
+
+
+def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
+    """The point of chunking, read off the optimized HLO.
+
+    The vocabulary here is 512 wide over 16 tokens, and the head is 32 wide,
+    so a `[tokens, vocab]` tensor is unmistakable in the text. The
+    full-vocabulary loss below is compiled too: it is what makes this grep a
+    test rather than a string that happens not to appear.
+    """
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    vocab, batch, seq = 512, 2, 8
+    model = CausalTransformer(vocab_size=vocab, emb_features=32, num_layers=1,
+                              num_heads=4, mlp_ratio=2, max_seq_len=16,
+                              dtype=jnp.bfloat16)
+    objective = LMObjective(model, seq, vocab_size=vocab, head_chunks=4)
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens = jnp.zeros((batch, seq + 1), jnp.int32)
+    batch_dict = {TEXT_KEY: tokens}
+
+    def chunked(p):
+        return objective.loss(p, p, batch_dict, jax.random.PRNGKey(0), 0)
+
+    def full_vocabulary(p):
+        logits = model.apply(p, tokens[:, :-1])
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+        correct = (jnp.argmax(logits, axis=-1) == tokens[:, 1:]).astype(losses.dtype)
+        return jnp.mean(losses), {"token_accuracy": jnp.mean(correct)}
+
+    def compiled_text(loss_fn):
+        return jax.jit(jax.value_and_grad(loss_fn, has_aux=True)).lower(
+            params).compile().as_text()
+
+    whole_row = (f"f32[{batch * seq},{vocab}]", f"f32[{batch},{seq},{vocab}]")
+    chunked_text, full_text = compiled_text(chunked), compiled_text(full_vocabulary)
+
+    assert any(shape in full_text for shape in whole_row), (
+        "the full-vocabulary step lost its logits tensor, so this grep proves nothing")
+    assert not any(shape in chunked_text for shape in whole_row)
+    assert f"f32[{batch * seq},{vocab // 4}]" in chunked_text, "no chunk tile either"
+
+    reduced_over_the_vocabulary = [
+        line for line in chunked_text.splitlines()
+        if ("reduce" in line and f",{vocab}]" in line)]
+    assert reduced_over_the_vocabulary == []
+
+
+def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
+    """The frozen metric, against the implementation it replaced."""
+    objective = make_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    batch = token_batch()
+    targets = np.asarray(batch[TEXT_KEY][:, 1:])
+
+    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+
+    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
+    expected = (np.argmax(np.asarray(logits), axis=-1) == targets).mean()
+    assert float(aux["token_accuracy"]) == pytest.approx(expected)
+
+
+def test_padded_tokens_are_left_out_of_the_accuracy_too():
+    objective = make_objective(pad_id=0)
+    params = objective.init_params(jax.random.PRNGKey(0))
+    batch = token_batch(seed=3)
+    targets = np.asarray(batch[TEXT_KEY][:, 1:])
+    assert (targets == 0).any(), "this batch has no padding to skip"
+
+    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+
+    logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
+    kept = targets != 0
+    expected = ((np.argmax(logits, axis=-1) == targets) & kept).sum() / kept.sum()
+    assert float(aux["token_accuracy"]) == pytest.approx(expected)
 
 
 # --- what the trainer needs ------------------------------------------------
@@ -479,3 +579,199 @@ def test_validation_exponentiates_after_averaging_cross_entropy(tmp_path):
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)
     assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(expected)
+
+
+# --- packed batches --------------------------------------------------------
+
+class PackedTinyLM(TinyCausalLM):
+    """TinyCausalLM that honours the packing arguments the real backbone takes.
+
+    The loss reads `hidden_states`, so that is where the packing arguments
+    have to arrive; `__call__` forwards them, as `CausalTransformer` does.
+    """
+
+    @nn.compact
+    def hidden_states(self, tokens, train: bool = False, positions=None,
+                      segment_ids=None):
+        length = tokens.shape[1]
+        table = self.param("positions", nn.initializers.normal(0.02),
+                           (self.max_seq_len, self.emb_features))
+        index = jnp.arange(length) if positions is None else positions
+        x = nn.Embed(self.vocab_size, self.emb_features)(tokens) + table[index]
+        mask = jnp.tril(jnp.ones((length, length), bool))[None]
+        if segment_ids is not None:
+            mask = mask & ((segment_ids[:, :, None] == segment_ids[:, None, :])
+                           & (segment_ids[:, :, None] != 0))
+        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
+
+        for _ in range(self.num_layers):
+            h = nn.LayerNorm()(x)
+            query, key, value = (nn.Dense(self.emb_features)(h) for _ in range(3))
+            scores = query @ jnp.swapaxes(key, -1, -2) / np.sqrt(self.emb_features)
+            attention = jax.nn.softmax(jnp.where(mask, scores, -1e9), axis=-1)
+            x = x + dropout(nn.Dense(self.emb_features)(attention @ value))
+
+            h = nn.LayerNorm()(x)
+            x = x + nn.Dense(self.emb_features)(nn.gelu(nn.Dense(2 * self.emb_features)(h)))
+
+        return nn.LayerNorm()(x)
+
+
+def packed_objective(seq=SEQ, **kwargs):
+    return LMObjective(PackedTinyLM(vocab_size=VOCAB), seq, vocab_size=VOCAB, **kwargs)
+
+
+def documents(first=7, second=3, seq=SEQ):
+    """A packed row of two documents, plus the padding that follows them."""
+    rs = np.random.RandomState(11)
+    doc_a = rs.randint(1, VOCAB, first)
+    doc_b = rs.randint(1, VOCAB, second)
+    pad = np.zeros(seq + 1 - first - second, np.int64)
+    tokens = jnp.asarray(np.concatenate([doc_a, doc_b, pad])[None], jnp.int32)
+    segment_ids = jnp.asarray(
+        np.concatenate([np.full(first, 1), np.full(second, 2), pad])[None], jnp.int32)
+    positions = jnp.asarray(
+        np.concatenate([np.arange(first), np.arange(second), pad])[None], jnp.int32)
+    return tokens, segment_ids, positions, (doc_a, doc_b)
+
+
+def only_document(document, seq=SEQ):
+    """One document in a row of its own, right-padded to the same window."""
+    pad = np.zeros(seq + 1 - len(document), np.int64)
+    tokens = jnp.asarray(np.concatenate([document, pad])[None], jnp.int32)
+    segment_ids = jnp.asarray(
+        np.concatenate([np.full(len(document), 1), pad])[None], jnp.int32)
+    positions = jnp.asarray(
+        np.concatenate([np.arange(len(document)), pad])[None], jnp.int32)
+    return tokens, segment_ids, positions
+
+
+def counted_losses(objective, params, tokens, segment_ids, positions):
+    """Per-token losses and the weight the objective gives each of them."""
+    inputs, targets = tokens[:, :-1], tokens[:, 1:]
+    logits = objective.model.apply(params, inputs, positions=positions[:, :-1],
+                                   segment_ids=segment_ids[:, :-1])
+    losses = optax.softmax_cross_entropy_with_integer_labels(
+        logits.astype(jnp.float32), targets)
+    weights = ((segment_ids[:, 1:] == segment_ids[:, :-1])
+               & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
+    return np.asarray(losses[0]), np.asarray(weights[0])
+
+
+def test_a_packed_batch_ignores_the_boundary_and_the_padding():
+    objective = packed_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens, segment_ids, positions, (doc_a, _) = documents()
+
+    ce, aux = objective.shifted_cross_entropy(
+        params, tokens, segment_ids=segment_ids, positions=positions)
+
+    losses, weights = counted_losses(objective, params, tokens, segment_ids, positions)
+    # The last token of the first document predicts the first of the second,
+    # which is the one transition a packed row must not train on.
+    boundary = len(doc_a) - 1
+    assert weights[boundary] == 0
+    assert weights[:boundary].all() and weights[boundary + 1] == 1
+    assert weights[len(doc_a) + 2:].sum() == 0, "padding was trained on"
+    assert float(ce) == pytest.approx(
+        float((losses * weights).sum() / weights.sum()), rel=1e-6)
+    assert float(aux["token_accuracy"]) <= 1.0
+
+
+def test_a_packed_batch_scores_like_its_documents_alone():
+    """Packing is only a layout: the two documents' losses have to be the ones
+    they get on their own, and the boundary target is dropped on both sides."""
+    objective = packed_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens, segment_ids, positions, (doc_a, doc_b) = documents()
+
+    ce, _ = objective.shifted_cross_entropy(
+        params, tokens, segment_ids=segment_ids, positions=positions)
+
+    total, count = 0.0, 0.0
+    for document in (doc_a, doc_b):
+        alone = only_document(document)
+        losses, weights = counted_losses(objective, params, *alone)
+        total += float((losses * weights).sum())
+        count += float(weights.sum())
+
+    packed_losses, packed_weights = counted_losses(
+        objective, params, tokens, segment_ids, positions)
+    assert count == packed_weights.sum() == len(doc_a) + len(doc_b) - 2
+    # Position by position, so a mismatch says which target moved.
+    assert float(ce) == pytest.approx(total / count, rel=1e-5)
+    assert float(ce) == pytest.approx(
+        float((packed_losses * packed_weights).sum() / count), rel=1e-6)
+
+
+def test_a_packed_batch_scores_like_its_documents_through_the_chunked_head():
+    """Both rearrangements at once: the row is packed and the vocabulary is
+    scored in chunks. The loss has to be the one the documents get on their
+    own through the same chunked head, weighted by the targets each counts."""
+    objective = packed_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens, segment_ids, positions, (doc_a, doc_b) = documents()
+
+    packed, _ = objective.shifted_cross_entropy(
+        params, tokens, segment_ids=segment_ids, positions=positions)
+
+    total, count = 0.0, 0
+    for document in (doc_a, doc_b):
+        alone_tokens, alone_segments, alone_positions = only_document(document)
+        alone, _ = objective.shifted_cross_entropy(
+            params, alone_tokens, segment_ids=alone_segments,
+            positions=alone_positions)
+        # Every transition inside the document; its last target is padding.
+        counted = len(document) - 1
+        total += float(alone) * counted
+        count += counted
+
+    assert count == len(doc_a) + len(doc_b) - 2
+    # Largest relative difference observed on CPU: 7.1e-08.
+    assert float(packed) == pytest.approx(total / count, rel=1e-6)
+
+
+def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
+    objective = packed_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens, segment_ids, positions, _ = documents()
+    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
+             "text_positions": positions}
+
+    packed, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    unpacked, _ = objective.loss(params, params, {TEXT_KEY: tokens},
+                                 jax.random.PRNGKey(1), 0)
+
+    expected, _ = objective.shifted_cross_entropy(
+        params, tokens, train=True, rngs={"dropout": jax.random.PRNGKey(1)},
+        segment_ids=segment_ids, positions=positions)
+    assert float(packed) == pytest.approx(float(expected))
+    assert abs(float(packed) - float(unpacked)) > 1e-3, (
+        "the packed keys made no difference to the loss")
+
+
+def test_a_fixed_window_batch_is_scored_exactly_as_before():
+    """A batch without the packing keys has to give the loss it gave before
+    the packed path existed: the model is called without them, and every
+    target counts."""
+    objective = make_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    batch = token_batch()
+
+    loss, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+
+    tokens = np.asarray(batch[TEXT_KEY])
+    logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
+    assert float(loss) == pytest.approx(
+        reference_cross_entropy(logits, tokens[:, 1:]), rel=1e-5)
+
+
+def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
+    objective = packed_objective()
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens = jnp.zeros((2, SEQ + 1), jnp.int32)
+    segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
+
+    loss, aux = objective.shifted_cross_entropy(
+        params, tokens, segment_ids=segment_ids, positions=segment_ids)
+    assert float(loss) == 0.0 and bool(jnp.isfinite(aux["perplexity"]))

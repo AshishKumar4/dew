@@ -72,8 +72,11 @@ class DataConfig:
     """Tokens per training window, when the dataset is a tokenized text
     directory from tools/tokenize_text.py."""
     tokenizer: Optional[str] = None
-    """Tokenizer behind that directory: 'byte' or an HF tokenizer name."""
-
+    pack_sequences: bool = False
+    """Pack whole documents into the training windows instead of reading
+    fixed strides. The token files must then hold eos ids between documents
+    (tools/tokenize_text.py --pack), and every batch row carries
+    `text_segment_ids` / `text_positions` for the backbone's mask."""
 
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:

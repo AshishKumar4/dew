@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 
 from dew.config import DataConfig, ModelConfig, OptimConfig, TrainerConfig
-from test_lm_objective import BATCH, SEQ, VOCAB, TinyCausalLM, cycle_batches
+from test_lm_objective import (
+    BATCH, SEQ, VOCAB, PackedTinyLM, TinyCausalLM, cycle_batches,
+)
 
 RECIPE = Path(__file__).resolve().parents[1] / "recipes" / "lm" / "train.py"
 
@@ -37,6 +39,29 @@ def write_token_files(directory, vocab_size, train_tokens=4096, val_tokens=1024)
     (directory / "meta.json").write_text(json.dumps({
         "tokenizer": "byte", "vocab_size": vocab_size, "dtype": "uint16",
         "train_tokens": train_tokens, "val_tokens": val_tokens,
+    }))
+    return directory
+
+
+def write_packed_token_files(directory, vocab_size, train_lengths, val_lengths):
+    """A token directory shaped like tools/tokenize_text.py --pack writes it:
+    every document closed by the eos id meta.json records."""
+    directory.mkdir(parents=True, exist_ok=True)
+    rs = np.random.RandomState(0)
+    eos_id = vocab_size - 1
+
+    def stream(lengths):
+        return np.concatenate(
+            [np.append(rs.randint(0, eos_id, length - 1), eos_id)
+             for length in lengths]).astype(np.uint16)
+
+    train, val = stream(train_lengths), stream(val_lengths)
+    train.tofile(directory / "train.bin")
+    val.tofile(directory / "val.bin")
+    (directory / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "vocab_size": vocab_size, "dtype": "uint16",
+        "train_tokens": int(train.size), "val_tokens": int(val.size),
+        "eos_id": eos_id,
     }))
     return directory
 
@@ -179,6 +204,45 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path):
     assert trainer.checkpointer.latest_step() == 2
 
 
+def packed_run(tmp_path, monkeypatch, train_lengths, val_lengths, batch_size):
+    """A run over a packed corpus with the step count left to the loader."""
+    recipe = load_recipe()
+    dataset = write_packed_token_files(
+        tmp_path / "tokens", VOCAB, train_lengths, val_lengths)
+    monkeypatch.setattr(
+        recipe, "build_model",
+        lambda architecture, config: PackedTinyLM(vocab_size=config["vocab_size"]))
+    return recipe, recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1}),
+        data=DataConfig(dataset=str(dataset), batch_size=batch_size,
+                        val_steps_per_epoch=1, worker_count=0, pack_sequences=True),
+        trainer=trainer_config(tmp_path, epochs=1),
+        sequence_length=SEQ,
+        sample_tokens=0,
+    )
+
+
+def test_a_packed_corpus_of_one_document_still_has_steps_in_an_epoch(tmp_path, monkeypatch):
+    """steps_per_epoch comes from the loader's length when a run does not set
+    it, and a packed split is windows, not documents: one long document is an
+    epoch of several batches."""
+    # 16 windows of SEQ + 1, four rows to a batch.
+    recipe, config = packed_run(tmp_path, monkeypatch, [16 * (SEQ + 1)],
+                                [4 * (SEQ + 1)], batch_size=4)
+
+    trainer = recipe.main(config)
+
+    assert int(trainer.state.step) == 4
+    assert "val/perplexity" in trainer.best_val_metrics, "validation never scored"
+
+
+def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path, monkeypatch):
+    """An epoch of zero steps trains nothing and says nothing about it."""
+    recipe, config = packed_run(tmp_path, monkeypatch, [2 * (SEQ + 1)],
+                                [4 * (SEQ + 1)], batch_size=4)
+
+    with pytest.raises(ValueError, match="do not fill one batch"):
+        recipe.main(config)
 def tiny_export(directory, tokenizer_name="byte"):
     """A local checkpoint in the HF layout, as --pretrained takes one."""
     from dew.interop.hf_decoders import (

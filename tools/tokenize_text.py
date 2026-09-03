@@ -5,7 +5,9 @@ Reads a single file or every *.txt under a directory (recursively), encodes it
 with the byte tokenizer or a huggingface one, splits the token stream by
 --val-fraction (validation is the head of the stream, in file order) and
 writes the nanoGPT-style output that `dew.data.sources.text.TokenFileSource`
-and `get_token_dataset_grain` read back.
+and `get_token_dataset_grain` read back. With --pack an EOS id is written
+after every input file, so the packed loader can treat each file as one
+document; meta.json then records the id under `eos_id`.
 
 The corpus is processed one line-bounded chunk at a time: tokens are encoded,
 written and dropped, so a corpus larger than memory costs disk, never RAM.
@@ -41,6 +43,11 @@ class TokenizeArgs:
     """'byte' for utf-8 bytes, else a huggingface tokenizer name."""
     val_fraction: float = 0.01
     """Fraction of the token stream held out, from its head, as validation."""
+    pack: bool = False
+    """Terminate every document (input file) with the tokenizer's eos id, so
+    `get_packed_token_dataset_grain` can split the stream back into documents;
+    meta.json then records the id under `eos_id`. Off keeps the bare stream
+    the fixed-window loader reads."""
 
 
 def iter_text_chunks(paths, chunk_chars=CHUNK_CHARS):
@@ -115,6 +122,11 @@ def main(args: TokenizeArgs):
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = dtype_for(tokenizer.vocab_size)
 
+    eos = tokenizer.eos_id if args.pack else None
+    if args.pack and eos is None:
+        raise SystemExit(
+            f"--pack needs an eos id and tokenizer '{args.tokenizer}' has none")
+
     # One encode pass writes the whole stream to a scratch file; the split
     # point needs the total count, and slicing a memmap of it costs a linear
     # copy, not a second tokenization.
@@ -122,12 +134,21 @@ def main(args: TokenizeArgs):
     total = 0
     try:
         with open(scratch, "wb") as handle:
-            for chunk in iter_text_chunks(paths):
-                ids = tokenizer.encode(chunk)
-                if not ids:
-                    continue
-                handle.write(np.asarray(ids, dtype=dtype).tobytes())
-                total += len(ids)
+            for path in paths:
+                wrote_any = False
+                for chunk in iter_text_chunks([path]):
+                    ids = tokenizer.encode(chunk)
+                    if not ids:
+                        continue
+                    handle.write(np.asarray(ids, dtype=dtype).tobytes())
+                    total += len(ids)
+                    wrote_any = True
+                if wrote_any and eos is not None:
+                    # A document ends where its file ends. Every document is
+                    # terminated, including the last, because the packing
+                    # source reads a record as the span up to an eos.
+                    handle.write(np.asarray([eos], dtype=dtype).tobytes())
+                    total += 1
         if total < 2:
             raise SystemExit("the corpus tokenized to fewer than 2 tokens")
 
@@ -145,6 +166,7 @@ def main(args: TokenizeArgs):
         "dtype": dtype.name,
         "train_tokens": train_len,
         "val_tokens": val_len,
+        "eos_id": eos,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
