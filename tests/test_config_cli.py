@@ -164,9 +164,10 @@ def reference_optimizer(config: OptimConfig, steps_per_epoch: int):
 
 
 def test_library_build_optimizer_accepts_muon():
-    """The orthogonalized update flows to a matrix and the passthrough update
-    to a vector: `optax.contrib.muon` already partitions by ndim == 2, so the
-    map entry is all the adoption costs (google-jax-stack.md, Optax section)."""
+    """The orthogonalized update flows to a matrix and the AdamW update to a
+    vector, on a tree with no declared axes at all, which is what a library
+    caller passes. Which group each parameter of a Dew model lands in is
+    tests/test_optim.py's subject."""
     solver = build_optimizer(OptimConfig(optimizer="muon", learning_rate=1e-3), 10)
     params = {"w": jnp.ones((4, 6)), "b": jnp.zeros(6)}
     state = solver.init(params)
