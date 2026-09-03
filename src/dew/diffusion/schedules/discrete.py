@@ -15,8 +15,13 @@ class DiscreteNoiseScheduler(NoiseScheduler):
                     schedule_fn=None, 
                     p2_loss_weight_k:float=1,
                     p2_loss_weight_gamma:float=1,
-                    *args, **kwargs):
-        super().__init__(timesteps, *args, **kwargs)
+                    dtype=jnp.float32,
+                    clip_min=-1.0,
+                    clip_max=1.0,
+                    min_snr_gamma=None,
+                    prediction_transform=None):
+        super().__init__(timesteps, dtype=dtype, clip_min=clip_min, clip_max=clip_max,
+                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
         betas = schedule_fn(timesteps, beta_start, beta_end)
         alphas = 1 - betas
         alpha_cumprod = jnp.cumprod(alphas, axis=0)
