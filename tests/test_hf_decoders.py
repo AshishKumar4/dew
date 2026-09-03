@@ -252,6 +252,42 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
     assert generation['tokenizer_name'] == "byte"
 
 
+def biased_qwen3(rng):
+    """The qwen3-tiny shape with the q/k/v/o biases its own config leaves off.
+
+    nn.Dense starts a bias at zero, and zeros would let a mismapped bias name
+    through the round-trip, so every bias gets its own draw.
+    """
+    config = {**translate_config(fixture_config("qwen3-tiny")), 'attention_bias': True}
+    built = apply_precision_policy('causal_transformer', dict(config),
+                                   dtype='float32', attention_impl='reference')
+    model = build_model('causal_transformer', built)
+    leaves, structure = jax.tree_util.tree_flatten_with_path(
+        model.init(rng, jnp.zeros((1, 4), jnp.int32)))
+    return model, jax.tree_util.tree_unflatten(structure, [
+        jax.random.normal(jax.random.fold_in(rng, index), leaf.shape, leaf.dtype) * 0.2
+        if path[-1].key == 'bias' else leaf
+        for index, (path, leaf) in enumerate(leaves)])
+
+
+def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
+    """attention_bias is one flag for all four projections, which is what
+    Qwen3Attention builds from config.attention_bias (modeling_qwen3.py:225-236)
+    and Gemma3Attention from the same field (modeling_gemma3.py:322-333), so a
+    biased qk_norm model is exportable rather than a refusal."""
+    model, variables = biased_qwen3(rng)
+    export = tmp_path / "biased"
+
+    save_pretrained_decoder(model, variables, export)
+    again, reloaded, _ = fp32_decoder(export)
+
+    assert json.loads((export / "config.json").read_text())['attention_bias'] is True
+    assert again == model, "the exported config rebuilds a different model"
+    for path, leaf in flat_tree(reloaded['params']).items():
+        assert np.array_equal(np.asarray(leaf),
+                              np.asarray(flat_tree(variables['params'])[path])), path
+
+
 def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
     """No weights: the 311 names and shapes of Qwen3-0.6B against our tree.
 
@@ -311,18 +347,10 @@ def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     assert difference < 5e-3, f"max |top-32 logit difference| {difference:.3e}"
 
 
-@pytest.mark.skipif(not TORCH_VENV.exists(),
-                    reason="no torch venv at /tmp/hfref to load the export with")
-def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
-    """The export is a real HF checkpoint: transformers reads it and agrees."""
-    model, variables, _ = fp32_decoder(FIXTURES / "qwen3-tiny")
-    export = tmp_path / "exported"
-    save_pretrained_decoder(model, variables, export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+def transformers_logits(export, ids, tmp_path):
+    """What transformers computes for `ids` on the checkpoint at `export`."""
     script = """
-import json, sys
+import sys
 import numpy as np, torch
 from transformers import AutoModelForCausalLM
 directory, ids_path, out = sys.argv[1:4]
@@ -337,6 +365,36 @@ np.save(out, logits.to(torch.float32).numpy())
     np.save(ids_path, ids)
     subprocess.run([str(TORCH_VENV), "-c", script, str(export), str(ids_path), str(out)],
                    check=True, capture_output=True)
+    return np.load(out)
 
-    difference = float(np.max(np.abs(np.load(out) - ours)))
+
+@pytest.mark.skipif(not TORCH_VENV.exists(),
+                    reason="no torch venv at /tmp/hfref to load the export with")
+def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
+    """The export is a real HF checkpoint: transformers reads it and agrees."""
+    model, variables, _ = fp32_decoder(FIXTURES / "qwen3-tiny")
+    export = tmp_path / "exported"
+    save_pretrained_decoder(model, variables, export)
+
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+@pytest.mark.skipif(not TORCH_VENV.exists(),
+                    reason="no torch venv at /tmp/hfref to load the export with")
+def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
+    """Qwen3Attention builds q, k, v and o with bias=config.attention_bias
+    (modeling_qwen3.py:225-236), so the reference applies the biases where dew
+    does and a biased export is a checkpoint it reads."""
+    model, variables = biased_qwen3(rng)
+    export = tmp_path / "biased"
+    save_pretrained_decoder(model, variables, export)
+
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"

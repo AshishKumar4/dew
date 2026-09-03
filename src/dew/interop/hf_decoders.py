@@ -440,8 +440,8 @@ def save_pretrained_decoder(model, variables, directory, *,
     so a round-trip through dew hands transformers a checkpoint it accepts and
     a load hands back bitwise-equal parameters. model_type is gemma3_text when
     the sandwich norms are on, qwen3 when the q/k norms are, llama otherwise.
-    Only a llama export can carry attention biases, which is the one family
-    whose reference applies them to all four projections.
+    All three references build q/k/v/o with bias=config.attention_bias, so the
+    flag exports as it stands.
     """
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.interop.safetensors_io import save_hf_layout
@@ -518,13 +518,6 @@ def _export_config(model) -> Dict[str, Any]:
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
-    if model.attention_bias and model_type != 'llama':
-        # Llama applies config.attention_bias to all four projections, the
-        # same thing this flag means; qwen3 and gemma3_text attention is
-        # bias-free in transformers, so such an export would not load.
-        raise ValueError(
-            f"attention_bias=True cannot export as model_type {model_type}: "
-            "only llama carries biases on all four projections")
     if model.rope_local_theta is not None:
         if sandwich:
             config['rope_parameters'] = {
