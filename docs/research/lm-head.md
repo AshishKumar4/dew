@@ -109,7 +109,7 @@ last-bit difference in one step becomes a visibly different parameter in the
 next, and any reformulation that changes a matmul's shape changes those last
 bits. Run under `precision='highest'` on both sides, branch against main still
 drifts, to 2.22e-04. So twenty-step agreement at 1e-5 is below this
-hardware's reproducibility floor, and the honest statement is the first two
+hardware's reproducibility floor, and the statement is the first two
 checks plus this control, not a tolerance the machine cannot hold.
 
 | comparison | step 0 | worst over 20 steps |

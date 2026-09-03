@@ -29,7 +29,7 @@ The Dew seams referred to throughout:
 | data pipeline | `dew.data`, grain sources |
 | checkpointing | `dew.checkpoints` + `ObjectiveTrainer.save` (orbax step directories, registry push) |
 
-One split is applied throughout the synthesis: **what matters on a single 16 GB GPU or one TPU host** versus what only matters at thousands of chips. Dew is the former. Google's own reports draw this line sharply, so it is not a convenience split.
+One split is applied throughout the synthesis: what matters on a single 16 GB GPU or one TPU host versus what only matters at thousands of chips. Dew is the former. Google's own reports draw this line sharply, so it is not a convenience split.
 
 ---
 
@@ -211,4 +211,4 @@ Ordered by evidence of impact: how many independent labs, on their own numbers, 
 
 ### Where the record is silent
 
-For honesty's sake, the practices above rest on what the labs published. Still not found anywhere: Google's optimizer/LR/precision/token counts (all Gemma and Gemini); Qwen3's optimizer and cluster; GLM's cluster size for any model; gpt-oss's optimizer/LR/batch; MiniMax M2's pretraining infra; Llama 4's parallelism and MetaP values; Mercury's nearly everything. Any Dew default sourced from these families (for example a "Gemma-like" LR) has to come from MaxText configs, not from a report.
+The practices above rest on what the labs published. Still not found anywhere: Google's optimizer/LR/precision/token counts (all Gemma and Gemini); Qwen3's optimizer and cluster; GLM's cluster size for any model; gpt-oss's optimizer/LR/batch; MiniMax M2's pretraining infra; Llama 4's parallelism and MetaP values; Mercury's nearly everything. Any Dew default sourced from these families (for example a "Gemma-like" LR) has to come from MaxText configs, not from a report.
