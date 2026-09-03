@@ -68,26 +68,33 @@ class TextEncoder(ConditioningEncoder):
     
 @dataclass
 class CLIPTextEncoder(TextEncoder):
-    """CLIP Text Encoder."""
+    """CLIP Text Encoder.
+
+    The model is the vendored text tower in `dew.nn.text_encoders`, which reads
+    the checkpoint's safetensors itself. transformers 5 removed every Flax
+    class, so the `FlaxCLIPTextModel` this used to load no longer exists.
+
+    `backend` stays in the serialized config, and 'jax' is the only value it
+    can take. The torch branch it used to allow could not run: `tokenize`
+    returns numpy arrays and transformers' `CLIPTextModel.forward` calls
+    `input_ids.size()` on them (modeling_clip.py:529), which raises before any
+    weight is read.
+    """
     modelname: str
     backend: str
-    
+
     @staticmethod
     def from_modelname(modelname: str = "openai/clip-vit-large-patch14", backend: str="jax"):
-        from transformers import (
-            CLIPTextModel,
-            FlaxCLIPTextModel,
-            AutoTokenizer,
-        )
-        if backend == "jax":
-            model = FlaxCLIPTextModel.from_pretrained(
-                modelname, dtype=jnp.bfloat16)
-        else:
-            model = CLIPTextModel.from_pretrained(modelname)
-        tokenizer = AutoTokenizer.from_pretrained(modelname, dtype=jnp.float16)
+        if backend != "jax":
+            raise ValueError(
+                f"backend {backend!r} is not supported, 'jax' is the only one: "
+                "transformers' torch CLIPTextModel cannot read the numpy arrays "
+                "tokenize produces")
+        from transformers import AutoTokenizer
+        from dew.nn.text_encoders import CLIPTextModel
         return CLIPTextEncoder(
-            model=model,
-            tokenizer=tokenizer,
+            model=CLIPTextModel.from_pretrained(modelname),
+            tokenizer=AutoTokenizer.from_pretrained(modelname),
             modelname=modelname,
             backend=backend
         )
