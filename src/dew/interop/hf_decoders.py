@@ -15,10 +15,9 @@ silently computes something else.
 """
 
 import json
-import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -32,25 +31,25 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 # checkpoint would allocate one of those whether the caller asked or not.
 DEFAULT_MAX_SEQ_LEN = 8192
 
-# hidden_act / hidden_activation values, onto the GatedMLP activations.
-_ACTIVATIONS = {
-    'silu': 'swiglu',
-    'swish': 'swiglu',
-    'gelu_pytorch_tanh': 'geglu',
-    'gelu_new': 'geglu',
-}
+# hidden_act / hidden_activation values, onto the GatedMLP activations. These
+# are the two the covered families use; anything else is refused by name.
+_ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
 
 _QK_NORM_FAMILIES = ('qwen3', 'gemma3_text')
 _GEMMA = 'gemma3_text'
 
 _IGNORED_FIELDS = {
     'architectures', 'attention_dropout', 'attn_implementation', 'bos_token_id',
-    'dtype', 'eos_token_id', 'id2label', 'initializer_range', 'is_encoder_decoder',
-    'label2id', 'max_window_layers', 'mlp_bias', 'output_attentions',
-    'output_hidden_states', 'pad_token_id', 'pretraining_tp', 'problem_type',
-    'return_dict', 'use_cache', 'use_sliding_window',
-    'torch_dtype', 'transformers_version',
+    'cache_implementation', 'dtype', 'eos_token_id', 'id2label',
+    'initializer_range', 'is_encoder_decoder', 'label2id', 'max_window_layers',
+    'mlp_bias', 'output_attentions', 'output_hidden_states', 'pad_token_id',
+    'pretraining_tp', 'problem_type', 'return_dict', 'use_cache',
+    'use_sliding_window', 'torch_dtype', 'transformers_version',
 }
+
+# The fields above have no effect on an eval-time forward pass: metadata,
+# token ids, or runtime knobs of the reference implementation (Gemma 3 ships
+# cache_implementation 'hybrid', which describes transformers' KV cache).
 
 # A gemma3 multimodal config describes a vision tower and a splicer too; only
 # the text decoder maps, and these are the fields that name the rest.
@@ -181,7 +180,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     hidden = int(hf_config['hidden_size'])
     heads = int(hf_config['num_attention_heads'])
     kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = int(hf_config.get('head_dim', hidden // heads))
+    head_dim = int(hf_config.get('head_dim') or hidden // heads)
     used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
 
     activation = hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu'))
@@ -220,7 +219,11 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
         'qk_norm': model_type in _QK_NORM_FAMILIES,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
-        'tie_embeddings': bool(hf_config.get('tie_word_embeddings', False)),
+        # Gemma3TextConfig ties by default and the others do not, so a config
+        # that omits the field (gemma-3-1b-pt does) has to take its family's
+        # default rather than a single one here.
+        'tie_embeddings': bool(hf_config.get('tie_word_embeddings',
+                                             model_type == _GEMMA)),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
@@ -310,9 +313,21 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
     `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
     post_attention_layernorm and post_feedforward_layernorm land on the
-    sandwich norms, which is where Gemma applies them. A tied lm_head is
-    skipped, since the embedding it copies is the tree's leaf already.
+    sandwich norms, which is where Gemma applies them.
+
+    A tied checkpoint carries lm_head.weight as well, as a copy of the
+    embedding (Qwen3-0.6B does). The copy is checked and dropped: the tree has
+    one leaf for the two, and a checkpoint whose "tied" head is a different
+    matrix would otherwise load as a model that computes something else.
     """
+    tied_head = hf_tensors.get('lm_head.weight')
+    if config['tie_embeddings'] and tied_head is not None:
+        embedding = hf_tensors.get('model.embed_tokens.weight')
+        if embedding is None or not np.array_equal(tied_head, embedding):
+            raise ValueError(
+                "tie_word_embeddings is set but lm_head.weight is not the "
+                "embedding it claims to copy")
+
     params: Dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = _dew_path(name, config)
@@ -328,38 +343,40 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     return {'params': params}
 
 
-def _read_header(path: Path) -> Dict[str, Any]:
-    with open(path, 'rb') as handle:
-        length = int.from_bytes(handle.read(8), 'little')
-        return json.loads(handle.read(length))
+_DTYPES = {'F32': np.float32, 'F16': np.float16}
 
 
-_DTYPES = {'F32': np.float32, 'F16': np.float16, 'I64': np.int64,
-           'I32': np.int32, 'U8': np.uint8, 'BOOL': np.bool_}
-
-
-def _read_tensor(path: Path, header: Mapping[str, Any],
-                 name: str) -> np.ndarray:
-    """One tensor out of a safetensors file as fp32, without torch.
+def _read_shard(path: Path) -> Dict[str, np.ndarray]:
+    """Every tensor of one safetensors file as fp32, without torch.
 
     safetensors.numpy cannot read bfloat16 and most decoder checkpoints are
     bfloat16, so those leaves are widened here the way every bf16 reader does:
-    the 16 payload bits shifted into the top half of an fp32 word.
+    the 16 payload bits shifted into the top half of an fp32 word. The file is
+    opened once and read in header order, which is offset order.
     """
-    meta = header[name]
-    dtype, shape = meta['dtype'], tuple(meta['shape'])
-    start, end = meta['data_offsets']
-    header_length = int.from_bytes((path.read_bytes()[:8]), 'little')
+    tensors: Dict[str, np.ndarray] = {}
     with open(path, 'rb') as handle:
-        handle.seek(8 + header_length + start)
-        raw = handle.read(end - start)
-    if dtype == 'BF16':
-        widened = np.frombuffer(raw, dtype='<u2').astype(np.uint32) << 16
-        return widened.view(np.float32).reshape(shape)
-    if dtype not in _DTYPES:
-        raise ValueError(
-            f"tensor {name} has dtype {dtype}, which this loader cannot read")
-    return np.frombuffer(raw, dtype=_DTYPES[dtype]).reshape(shape)
+        length = int.from_bytes(handle.read(8), 'little')
+        header = json.loads(handle.read(length))
+        data = 8 + length
+        for name, meta in header.items():
+            if name == '__metadata__':
+                continue
+            dtype, shape = meta['dtype'], tuple(meta['shape'])
+            start, end = meta['data_offsets']
+            handle.seek(data + start)
+            raw = handle.read(end - start)
+            if dtype == 'BF16':
+                widened = np.frombuffer(raw, dtype='<u2').astype(np.uint32) << 16
+                tensors[name] = widened.view(np.float32).reshape(shape)
+            elif dtype in _DTYPES:
+                tensors[name] = np.frombuffer(
+                    raw, dtype=_DTYPES[dtype]).astype(np.float32).reshape(shape)
+            else:
+                raise ValueError(
+                    f"tensor {name} in {path.name} has dtype {dtype}, which this "
+                    "loader cannot read")
+    return tensors
 
 
 def _load_shards(directory: Path) -> Dict[str, np.ndarray]:
@@ -369,12 +386,7 @@ def _load_shards(directory: Path) -> Dict[str, np.ndarray]:
         raise FileNotFoundError(f"no *.safetensors under {directory}")
     tensors: Dict[str, np.ndarray] = {}
     for shard in shards:
-        header = _read_header(shard)
-        if shards[0].name == WEIGHTS_FILE and len(shards) > 1:
-            # a single-file export and sharded remnants do not mix
-            pass
-        tensors.update({name: _read_tensor(shard, header, name)
-                        for name in header if name != '__metadata__'})
+        tensors.update(_read_shard(shard))
     return tensors
 
 
@@ -417,11 +429,7 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
     built = apply_precision_policy(architecture, dict(config),
                                    dtype=dtype, attention_impl=attention_impl)
     model = build_model(architecture, built)
-    missing, unexpected = _tree_gaps(params, model)
-    if missing or unexpected:
-        raise ValueError(
-            f"the checkpoint and {architecture} disagree: missing {sorted(missing)}, "
-            f"unexpected {sorted(unexpected)}")
+    _check_tree(params, model)
     return model, {'params': params}, hf_config
 
 
@@ -446,13 +454,13 @@ def save_pretrained_decoder(model, variables, directory, *,
     config = _export_config(model)
 
     hf_tensors: Dict[str, np.ndarray] = {}
-    for name, leaf in _flat_params(params).items():
+    for name, leaf in _flatten(params).items():
         hf_name = _hf_name(name, config)
         if hf_name is None:
             continue
-        if name.endswith('.kernel') or name in ('lm_head.kernel',):
-            leaf = leaf.T
-        hf_tensors[hf_name] = np.ascontiguousarray(leaf)
+        leaf = np.asarray(leaf)
+        hf_tensors[hf_name] = np.ascontiguousarray(
+            leaf.T if name.endswith('.kernel') else leaf)
 
     os.makedirs(directory, exist_ok=True)
     save_hf_layout(hf_tensors, config, directory)
@@ -463,14 +471,19 @@ def save_pretrained_decoder(model, variables, directory, *,
         json.dump(generation_config, handle, indent=2)
 
 
-def _flat_params(params: Mapping[str, Any], prefix: str = '') -> Dict[str, np.ndarray]:
-    flat: Dict[str, np.ndarray] = {}
-    for key, value in params.items():
+def _flatten(tree: Mapping[str, Any], prefix: str = '') -> Dict[str, Any]:
+    """A params tree as '.'-joined names, leaves untouched.
+
+    Untouched matters: the shape check flattens a jax.eval_shape template,
+    whose leaves carry a shape but no data to convert.
+    """
+    flat: Dict[str, Any] = {}
+    for key, value in tree.items():
         name = f"{prefix}{key}"
         if isinstance(value, Mapping):
-            flat.update(_flat_params(value, f"{name}."))
+            flat.update(_flatten(value, f"{name}."))
         else:
-            flat[name] = np.asarray(value)
+            flat[name] = value
     return flat
 
 
@@ -506,12 +519,12 @@ def _export_config(model) -> Dict[str, Any]:
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
-    if model.attention_bias and model_type != 'qwen2':
-        # An attention-biased export cannot be qwen3 or llama, which have no
-        # such checkpoints in the wild; refuse rather than mislabel.
+    if model.attention_bias:
+        # qwen2 is the only family here whose checkpoints carry q/k/v/o
+        # biases, and this writer does not target its layout.
         raise ValueError(
-            "attention_bias=True exports as model_type qwen2, whose layout "
-            "this writer does not target")
+            "attention_bias=True has no family to export as: qwen3, llama and "
+            "gemma3_text checkpoints are bias-free")
     if model.rope_local_theta is not None:
         if sandwich:
             config['rope_parameters'] = {
@@ -572,18 +585,28 @@ def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
     raise ValueError(f"unknown parameter path {dew_name!r}")
 
 
-def _tree_gaps(params: Mapping[str, Any], model) -> Tuple[List[str], List[str]]:
-    """Leaves the checkpoint did not fill, and tree paths with no leaf."""
+def _check_tree(params: Mapping[str, Any], model) -> None:
+    """Refuse a tree the model would not accept, naming what is off.
+
+    jax.eval_shape builds the template without allocating it, so checking a
+    0.6B checkpoint costs shapes rather than a second copy of the weights.
+    """
     import jax
     import jax.numpy as jnp
 
-    template = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32))
-    expected = _flat_params(template['params'])
-    loaded = _flat_params(params)
+    template = jax.eval_shape(
+        lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
+    expected = {name: leaf.shape
+                for name, leaf in _flatten(template["params"]).items()}
+    loaded = _flatten(params)
+
     missing = sorted(set(expected) - set(loaded))
     unexpected = sorted(set(loaded) - set(expected))
-    if not missing and not unexpected:
-        mismatched = [name for name, shape in expected.items()
-                      if tuple(loaded[name].shape) != tuple(shape.shape)]
-        return [], mismatched
-    return missing, unexpected
+    mismatched = sorted(
+        f"{name} is {loaded[name].shape}, the model takes {shape}"
+        for name, shape in expected.items()
+        if name in loaded and loaded[name].shape != shape)
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"the checkpoint does not fit the model: missing {missing}, "
+            f"unexpected {unexpected}, mismatched {mismatched}")
