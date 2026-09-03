@@ -12,8 +12,9 @@ mlp.{gate,up,down}_proj}, norm, lm_head. A model family is supported only
 after its translator and same-weight reference parity test land.
 
 The block holds its token mixer in a slot: any module with the
-(x, decode=...) -> x signature of CausalSelfAttention becomes self_attn
-without the block changing, which is where a linear-attention mixer goes.
+(x, decode=..., positions=..., segment_ids=...) -> x signature of
+CausalSelfAttention becomes self_attn without the block changing, which is
+where a linear-attention mixer goes.
 """
 
 import functools
@@ -231,7 +232,8 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then gated MLP, both residual.
 
     `mixer` is a factory taking only a name; whatever it builds lands in the
-    tree as self_attn and only has to accept (x, decode=...).
+    tree as self_attn and has to accept (x, decode=..., positions=...,
+    segment_ids=...). The last two are None outside a packed batch.
     """
     mixer: Callable[..., nn.Module]
     emb_features: int
