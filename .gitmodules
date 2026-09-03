@@ -1,3 +1,0 @@
-[submodule "tpu-tools"]
-	path = tools/tpu
-	url = git@github.com:AshishKumar4/tpu-tools.git

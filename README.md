@@ -266,7 +266,7 @@ trainer = ObjectiveTrainer(model, optimizer, ..., fsdp_size=4, grad_accum_steps=
 # 8 devices: mesh (data=2, fsdp=4); every large parameter split four ways, the EMA and Adam moments with it
 ```
 
-On a TPU pod every host runs the same script. The recipes join the hosts into one JAX runtime from the cluster environment before the model is built, and stop with an error if they cannot. The data pipeline shards records by process, so each host reads its own part of the dataset; `--data.dataset-path` points at the GCS mount and `--trainer.checkpoint-fs gcs` writes checkpoints to a bucket. The [tools/tpu](tools/tpu/) scripts create, set up, start and stop TPU VMs and pods.
+On a TPU pod every host runs the same script. The recipes join the hosts into one JAX runtime from the cluster environment before the model is built, and stop with an error if they cannot. The data pipeline shards records by process, so each host reads its own part of the dataset; `--data.dataset-path` points at the GCS mount and `--trainer.checkpoint-fs gcs` writes checkpoints to a bucket. The `dew-tpu` command creates a slice, installs dew on every worker and starts a recipe on all of them; [docs/tpu.md](docs/tpu.md) is the walkthrough.
 
 <div align="center">
 <picture>
@@ -275,7 +275,7 @@ On a TPU pod every host runs the same script. The recipes join the hosts into on
 </picture>
 </div>
 
-Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"`: cuDNN flash attention on GPUs, XLA otherwise). Knobs the fused kernels cannot honor raise an error instead of being ignored. On an RTX 4080 a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory. The compiled step for that model keeps the device busy for the whole step, with no host synchronisation, so the remaining costs are compile time (cached across runs), sampling and checkpointing.
+Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the current hardware (`attention_impl="auto"`: cuDNN flash attention on a GPU for the shapes cuDNN supports, XLA for the rest). Knobs the fused kernels cannot honor raise an error instead of being ignored. On an RTX 4080 a 142M parameter DiT trains 2.3x faster this way than in fp32 with reference attention, with a third of the activation memory. The compiled step for that model keeps the device busy for the whole step, with no host synchronisation, so the remaining costs are compile time (cached across runs), sampling and checkpointing.
 
 | | Trainer argument | Recipe flag |
 |---|---|---|
@@ -559,7 +559,6 @@ Every family lands with the same proof: the reference implementation and Dew agr
 
 ### Tooling
 
-* A `dew tpu` command that creates, sets up and runs a recipe on every worker of a pod slice in one step, replacing the shell scripts in `tools/tpu`
 * The `dew` name on PyPI, and a first release on it
 
 ## Citing Dew
@@ -583,7 +582,7 @@ Dew builds on [JAX](https://github.com/jax-ml/jax), [Flax](https://github.com/go
 ## Reference documentation
 
 * [Concepts](docs/concepts/): [objectives](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md), [language models](docs/concepts/language_models.md)
-* [API reference](docs/api.md), [recipes](docs/recipes.md), [benchmarks](docs/benchmarks.md)
+* [API reference](docs/api.md), [recipes](docs/recipes.md), [benchmarks](docs/benchmarks.md), [TPUs](docs/tpu.md)
 * [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a notebook that builds diffusion from scratch without the library
 * [Gallery](docs/gallery.md) and [migrating from FlaxDiff](docs/from-flaxdiff.md)
 

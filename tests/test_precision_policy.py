@@ -36,6 +36,8 @@ def qkv(dtype=jnp.bfloat16):
 
 
 def test_auto_resolves_to_xla_off_gpu(implementations):
+    if jax.default_backend() == 'gpu':
+        pytest.skip("this is the answer off a gpu; the next test is the gpu one")
     scaled_dot_product_attention(*qkv(), implementation='auto')
     assert implementations == ['xla']
 
@@ -46,6 +48,20 @@ def test_auto_resolves_to_cudnn_on_gpu(implementations, monkeypatch):
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     scaled_dot_product_attention(*qkv(), implementation='auto')
     assert implementations == ['cudnn']
+
+
+def test_auto_leaves_cudnn_for_the_shapes_it_cannot_train(implementations, monkeypatch):
+    """cudnn's fused kernel has no backward pass for an odd sequence length,
+    and 77 CLIP text tokens are odd: with 'auto' meaning plain cudnn, every
+    cross-attending model raised NotImplementedError on its first training
+    step."""
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    query = jnp.ones((1, 256, 2, 8), jnp.bfloat16)
+    context = jnp.ones((1, 77, 2, 8), jnp.bfloat16)
+
+    scaled_dot_product_attention(query, context, context, implementation='auto')
+    scaled_dot_product_attention(query, query, query, implementation='auto')
+    assert implementations == ['xla', 'cudnn']
 
 
 def test_auto_runs_the_kernel_it_resolved_to():
