@@ -152,6 +152,28 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     return directory
 
 
+def document_corpus(directory: Path, documents: int, length: int) -> Path:
+    """A corpus whose documents each say which document they are.
+
+    Document i is the token value i + 1 repeated, closed by the eos id 0, so
+    the values in a packed window name the documents packed into it and
+    padding, which is also 0, names none.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    # The dtype has to stay uint16 through the join, or the file holds twice
+    # the bytes and reads back as a different corpus entirely.
+    stream = np.concatenate([
+        np.array([index + 1] * length + [0], np.uint16)
+        for index in range(documents)])
+    assert stream.dtype == np.uint16
+    (directory / "train.bin").write_bytes(stream.tobytes())
+    (directory / "val.bin").write_bytes(stream.tobytes())
+    (directory / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "vocab_size": documents + 1, "dtype": "uint16",
+        "eos_id": 0, "train_tokens": len(stream), "val_tokens": len(stream)}))
+    return directory
+
+
 @pytest.fixture(scope="module")
 def two_processes(tmp_path_factory):
     """The topology two real processes on one 4x2 mesh report."""
@@ -238,6 +260,32 @@ def test_processes_read_disjoint_shards_that_cover_the_corpus(tmp_path):
         assert report["global_batch_size"] == worker.BATCH
         assert report["local_batch_size"] == worker.BATCH // 2
         assert report["batches"] == records // worker.BATCH
+
+
+@pytest.mark.distributed
+def test_processes_pack_disjoint_documents(tmp_path):
+    """The packed loader shards by slicing documents, which is its own rule.
+
+    It cannot use ShardByJaxProcess, because sharding after the packer would
+    have every process pack the same documents into the same windows, so it
+    strides the document list instead. A process may only see documents from
+    its own stride, and never one of another's.
+    """
+    documents, seq_len = 24, 6
+    corpus = document_corpus(tmp_path / "corpus", documents, length=seq_len)
+    reports = run_pool("packed", tmp_path / "out", 2, tokens=corpus,
+                       seq_len=seq_len, workers=2)
+
+    packed = [report["documents"] for report in reports]
+    for index, seen in enumerate(packed):
+        assert seen, f"process {index} packed nothing"
+        # Document i is value i + 1, and the stride keeps i for process i % 2.
+        assert all((value - 1) % 2 == index for value in seen), seen
+    assert not set(packed[0]) & set(packed[1]), "both processes packed one document"
+    assert set(packed[0] + packed[1]) <= set(range(1, documents + 1))
+    for report in reports:
+        assert report["local_batch_size"] == worker.BATCH // 2
+        assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
 
 
 # --------------------------------------------------------------------------
