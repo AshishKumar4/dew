@@ -353,7 +353,7 @@ The diffusion recipe adds `noise_schedule`, `min_snr_gamma`, `flow_shift`, `auto
 
 A checkpoint holds the train state (parameters, EMA parameters, optimizer state, step), the random state, the best loss so far, the epoch, and the position of the data iterator. The trainer writes one at the end of every epoch, every `checkpoint_every_steps` steps if set, and once more when `fit` returns. Writes are asynchronous with Orbax; sharded arrays go from the devices to disk without passing through one host.
 
-Retention is Orbax's job: the latest `max_checkpoints_to_keep` checkpoints stay, and so does the one with the lowest mean training loss of its epoch, whichever step it is.
+Retention is Orbax's job. The latest `max_checkpoints_to_keep` checkpoints stay, and so does the one with the lowest mean training loss of its epoch, whichever step it is.
 
 ```bash
 python recipes/diffusion/train.py ... --trainer.load-from-checkpoint ./checkpoints/flowers-dit          # latest step
