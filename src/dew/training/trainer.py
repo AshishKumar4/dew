@@ -26,7 +26,6 @@ from .distributed import (
     build_mesh, shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
-from dataclasses import dataclass
 
 PROCESS_COLOR_MAP = {
     0: "green",
@@ -52,13 +51,7 @@ class SimpleTrainState(train_state.TrainState):
 def _epoch_loss(metrics):
     return metrics['loss']
 
-@dataclass
 class SimpleTrainer:
-    state: SimpleTrainState
-    best_loss: float
-    model: nn.Module
-    ema_decay: float = 0.999
-
     def __init__(self,
                  model: nn.Module,
                  input_shapes: Dict[str, Tuple[int]],
