@@ -19,7 +19,6 @@ Tolerances and the differences actually observed, fp32 on CPU:
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import jax
@@ -92,6 +91,29 @@ def test_a_multimodal_gemma3_config_translates_its_text_config():
     assert translate_config(wrapped) == translate_config(text_config)
 
 
+def test_the_real_gemma3_1b_config_translates():
+    """google/gemma-3-1b-pt is gated, so the fixture is the identical config
+    from a mirror. Nothing in it is beyond the field map."""
+    config = translate_config(fixture_config("gemma3-1b"))
+
+    assert config['emb_features'] == 1152 and config['num_layers'] == 26
+    assert (config['num_heads'], config['num_kv_heads']) == (4, 1)
+    assert config['head_dim'] == 256 and config['mlp_features'] == 6912
+    # the config names no tie_word_embeddings, and Gemma3TextConfig ties by
+    # default where Qwen and Llama do not
+    assert config['vocab_size'] == 262144 and config['tie_embeddings'] is True
+    assert config['attention_scale'] == pytest.approx(256 ** -0.5)
+    assert config['sliding_window'] == 512
+    assert (config['rope_theta'], config['rope_local_theta']) == (1e6, 1e4)
+    assert config['sandwich_norms'] and config['scale_offset']
+    # sliding_window_pattern 6: five sliding layers, then a full one
+    assert config['layer_types'][:6] == (
+        'sliding_attention',) * 5 + ('full_attention',)
+    assert config['layer_types'].count('full_attention') == 4
+    # the cache is clamped, the config asks for 32768
+    assert config['max_seq_len'] == 8192
+
+
 @pytest.mark.parametrize("field, value, message", [
     ('model_type', 'mamba', "model_type 'mamba'"),
     ('attn_logit_softcapping', 50.0, "attn_logit_softcapping"),
@@ -154,6 +176,12 @@ def test_the_tied_head_is_the_embedding_and_untied_heads_load():
 
     untied = translate_weights(tensors, {**config, 'tie_embeddings': False})['params']
     assert np.array_equal(untied['lm_head']['kernel'], embedding.T)
+
+    # Qwen3-0.6B really does ship both, byte for byte identical; a head that
+    # is not that copy means the checkpoint is not the tied model it says
+    different = {**tensors, 'lm_head.weight': embedding + 1.0}
+    with pytest.raises(ValueError, match="not the embedding it claims to copy"):
+        translate_weights(different, config)
 
 
 def test_an_unfamiliar_tensor_name_is_refused():
