@@ -401,6 +401,28 @@ def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
     assert param_specs == ema_specs
 
 
+def test_muon_masked_optimizer_state_shards_with_its_parameters(tmp_path):
+    """A masked optax transform leaves a MaskedNode where its group does not
+    apply, and muon's adam branch is always masked, so the derivation has to
+    carry a leaf that is not an array at all. optax.contrib.muon is what the
+    'muon' optimizer entry builds."""
+    trainer = make_trainer(tmp_path, "muon", distributed_training=True,
+                           fsdp_size=2, fsdp_min_param_size=TINY,
+                           optimizer=optax.contrib.muon(1e-3))
+
+    def is_placeholder(leaf):
+        return isinstance(leaf, optax.MaskedNode)
+
+    placeholders = [leaf for leaf in jax.tree.leaves(
+        trainer.state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
+    assert placeholders, "muon left no masked placeholder for the derivation to carry"
+
+    kernel = trainer.state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
+    assert kernel.sharding.spec == P(None, "fsdp")
+    moment_specs = {str(leaf.sharding.spec) for leaf in jax.tree.leaves(trainer.state.opt_state)}
+    assert str(kernel.sharding.spec) in moment_specs
+
+
 def test_replicated_run_shards_nothing(tmp_path):
     trainer = make_trainer(tmp_path, "dp-shapes", distributed_training=True, fsdp_size=1)
     for leaf in jax.tree.leaves(trainer.state.params):
