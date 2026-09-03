@@ -65,6 +65,8 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
     "network: tests that download pretrained weights from the HuggingFace Hub",
+    "slow: tests that spawn real grain worker processes or drain long streams",
+    "distributed: tests that need real processes with jax.distributed",
 ]
 
 [tool.setuptools.dynamic]
