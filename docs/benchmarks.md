@@ -5,111 +5,107 @@ What one training step costs, per architecture, measured through
 pass. Reproduce with `tools/benchmark_step.py`; the loader is measured
 separately by `tools/benchmark_data.py`.
 
-FLOPs come off the compiled executable through
-`dew.telemetry.instrumentation.compiled_flops`, and `util` is the same figure
-the trainer logs as `train/mfu`: the step's measured FLOPs divided by the step
-time and by one device's dense bf16 peak (97.5 TFLOP/s for this card).
+FLOPs are counted off the compiled executable's optimized HLO through
+`dew.telemetry.instrumentation.compiled_flops`: every `dot` and `convolution`,
+and the cuBLAS matmul, cuDNN convolution and cuDNN fused-attention custom calls
+a GPU backend hands them to, each from its own shapes. `util` is the same
+figure the trainer logs as `train/mfu`: the step's measured FLOPs divided by
+the step time and by one device's dense bf16 peak (97.5 TFLOP/s for this card).
 
 ## `--preset small` on one RTX 4080
 
 ```
-python tools/benchmark_step.py --preset small --steps 10 --json-out bench.json
+python tools/benchmark_step.py --preset small --architectures unet --json-out bench.json
 ```
 
 Run 2026-09-02, jax 0.11.1 / jaxlib 0.11.1 (CUDA), flax 0.12.9, optax 0.2.8,
-driver 595.84, RTX 4080 16 GiB, dew at `2cc0bff`. Every model in bf16
-(`dtype=bfloat16`), single device, `fsdp_size=1`, adam, 2 warmup steps.
+driver 595.84, RTX 4080 16 GiB, dew at `6b0f119`. Every model in bf16
+(`dtype=bfloat16`), single device, `fsdp_size=1`, adam, 2 warmup steps, 100
+steps per architecture. One invocation per architecture (`--architectures
+unet` and so on), so each row's peak memory is its own; `ms/step` times the
+loop the way a run dispatches it, and `p10 / p50 / p90 ms` come from a second
+window of the same length that waits on every step, which is where a long
+tail shows up.
 
-| architecture       | sample    | batch |      params | ms/step | samples/s | GFLOP/step |  util | peak GiB | compile s | steps |
-|--------------------|-----------|-------|-------------|---------|-----------|------------|-------|----------|-----------|-------|
-| unet               | 64x64x3   |    16 |  10,159,299 |    18.8 |     849.2 |       28.7 |  1.6% |     0.75 |      89.4 |    10 |
-| uvit               | 64x64x3   |    16 |  24,351,024 |    24.0 |     668.0 |      326.6 | 14.0% |    1.70* |      29.4 |    10 |
-| simple_udit        | 64x64x3   |    16 |  23,381,424 |    10.5 |    1520.0 |      326.2 | 31.8% |    1.04* |      25.6 |    10 |
-| simple_dit         | 64x64x3   |    16 |  19,835,568 |    10.4 |    1537.1 |      296.2 | 29.2% |    1.70* |      15.2 |    10 |
-| simple_mmdit       | 64x64x3   |    16 |  36,385,584 |    18.9 |     846.8 |      319.1 | 17.3% |    1.40* |      29.9 |    10 |
-| hierarchical_mmdit | 64x64x3   |    16 |  55,498,188 |    35.4 |     451.4 |      695.9 | 20.1% |    3.40* |     100.4 |    10 |
-| hybrid_dit         | 64x64x3   |    16 |  19,344,048 |    10.2 |    1564.0 |      223.0 | 22.4% |    3.40* |      22.9 |    10 |
-| video_dit          | 8x64x64x3 |     4 |  25,155,504 |    19.3 |     207.0 |      616.0 | 32.7% |    3.40* |      43.2 |    10 |
-| unet_3d            | 8x64x64x3 |     4 |  11,045,699 |    37.1 |     107.7 |      145.8 |  4.0% |     1.72 |     114.1 |     5 |
-| jepa_encoder       | 64x64x3   |    16 |  12,149,568 |    12.0 |    1329.0 |      261.3 | 22.3% |     0.69 |      46.2 |     5 |
-| jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    21.5 |     186.0 |      621.6 | 29.6% |     1.26 |      76.8 |     5 |
-| causal_transformer | 512 tokens |    16 |  66,950,784 |    83.8 |     190.9 |     1320.1 | 16.2% |     5.80 |      19.5 |    10 |
+| architecture       | sample    | batch |      params | ms/step | p10 / p50 / p90 ms | samples/s | GFLOP/step |  util | peak GiB | compile s |
+|--------------------|-----------|-------|-------------|---------|--------------------|-----------|------------|-------|----------|-----------|
+| unet               | 64x64x3   |    16 |  10,159,299 |    16.4 | 18.2 / 18.4 / 19.0 |     977.2 |      646.4 | 40.5% |     0.75 |      36.4 |
+| uvit               | 64x64x3   |    16 |  24,351,024 |    23.0 | 23.9 / 24.1 / 25.1 |     695.7 |      617.8 | 27.6% |     1.71 |       9.4 |
+| simple_udit        | 64x64x3   |    16 |  23,381,424 |     9.4 | 10.4 / 10.9 / 12.1 |    1696.4 |      363.1 | 39.5% |     1.05 |      10.5 |
+| simple_dit         | 64x64x3   |    16 |  19,835,568 |     7.9 |  8.8 / 9.1 / 10.0 |    2036.0 |      292.9 | 38.2% |     0.90 |       9.9 |
+| simple_mmdit       | 64x64x3   |    16 |  36,385,584 |    12.9 | 14.7 / 15.4 / 18.4 |    1240.0 |      383.7 | 30.5% |     1.40 |      16.3 |
+| hierarchical_mmdit | 64x64x3   |    16 |  55,498,188 |    32.7 | 38.1 / 38.8 / 39.2 |     489.3 |      737.4 | 23.1% |     3.38 |      36.9 |
+| hybrid_dit         | 64x64x3   |    16 |  19,344,048 |     8.9 |  9.6 / 10.0 / 10.6 |    1795.5 |      244.6 | 28.2% |     0.86 |      13.1 |
+| video_dit          | 8x64x64x3 |     4 |  25,155,504 |    17.3 | 18.3 / 18.7 / 19.6 |     231.8 |      760.0 | 45.2% |     1.59 |      12.6 |
+| unet_3d            | 8x64x64x3 |     4 |  11,045,699 |    33.9 | 36.7 / 37.2 / 39.6 |     117.8 |     1384.1 | 41.8% |     1.72 |      46.6 |
+| jepa_encoder       | 64x64x3   |    16 |  12,149,568 |     9.4 | 10.6 / 10.8 / 11.1 |    1699.1 |      297.3 | 32.4% |     0.70 |      13.7 |
+| jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    18.3 | 20.1 / 20.3 / 22.9 |     218.2 |      758.1 | 42.4% |     1.28 |      20.5 |
+| causal_transformer | 512 tokens |    16 |  66,950,784 |    83.0 | 83.7 / 83.8 / 84.0 |     192.7 |     3406.4 | 42.1% |     5.81 |      10.1 |
 
 `jepa_predictor` has no step of its own: it is built through the registry and
-trained inside the two JEPA rows. The `causal_transformer` row is GPT-2 small's width at three layers with a 50k vocabulary, measured on 2026-09-02 after the language model wave landed; its FLOPs are dominated by the vocabulary projection.
+trained inside the two JEPA rows. The `causal_transformer` row is GPT-2
+small's width at three layers with a 50k vocabulary; its FLOPs are dominated
+by the tied fp32 vocabulary projection and its gradients, which are cuBLAS
+custom calls.
 
-`*` marks a peak that is an upper bound rather than that row's own figure. The
-allocator's high-water mark is monotonic for the life of a process and has no
-reset hook, so only the first architecture in an invocation gets its own peak.
-Run one architecture per invocation (`--architectures unet`) for a clean
-number; the JSON also carries `case_peak_delta_bytes`.
-
-The table was assembled from three invocations rather than one sweep, which is
-why the step counts differ: 10 steps for the eight image and video diffusion
-rows, 5 for the last three. Rows measured while the host was busy with
-something else came out materially slower (`unet` read 54 ms/step under load
-against 18.8 ms idle), so every row here is from a run with the host
-otherwise idle.
+Every row was measured with the host otherwise idle; rows taken while
+something else ran came out materially slower (`unet` read 54 ms/step under
+load against 16.4 idle). The spread columns say how steady the host was: the
+video rows' p90 sits 6-13% over their p50, which is the scheduler, not the
+step.
 
 ### What the numbers say
 
 - The DiT family is the efficient shape on this card: `simple_dit`,
-  `simple_udit` and `hybrid_dit` all sit at 10 ms/step and 22-32% of peak,
+  `simple_udit` and `hybrid_dit` all sit under 10 ms/step at 28-40% of peak,
   which is where a 64px/patch-4 (256 token) workload should be.
-- `unet` is dispatch-bound, not compute-bound: 28.7 GFLOP/step is an order of
-  magnitude below the transformers here, and it still takes 18.8 ms, for 1.6%
-  utilisation. Convolutional stacks at this width are a long chain of small
-  kernels; batch or resolution has to grow before the card is busy.
-- `unet_3d` inherits the same problem and adds frames: 4% utilisation and the
-  slowest step in the table, against `video_dit` at 32.7% on the same
-  (8, 64, 64, 3) samples. For video, the factorized transformer is not a
-  stylistic preference.
+- `unet` does the most arithmetic of the image models relative to its time:
+  646 GFLOP/step in 16 ms is 40.5% of peak, ahead of the transformers at the
+  same resolution. The 1.6% an earlier version of this table reported was its
+  convolution arithmetic missing from the counter, not the card idling; the
+  same measurement with XLA's own `cost_analysis()` as the numerator still
+  shows 28.7 GFLOP/step, which is what that table had counted.
+- `unet_3d` is the slowest step in the table at 41.8%: its 3D convolutions
+  carry 1.38 TFLOP/step, more than twice `video_dit`'s 760 for the same
+  (8, 64, 64, 3) samples. For video, the factorized transformer buys a third
+  of the step time back.
 - `hierarchical_mmdit` is the largest model here (55 M) and the most expensive
-  step, as its 1024-token finest stage implies.
-- Compile dominates a short run: 15-114 s per architecture against 10-37 ms
-  per step. A sweep is mostly XLA, and a real run should set
+  diffusion step, as its 1024-token finest stage implies.
+- Compile dominates a short run: 9-47 s per architecture against 8-84 ms per
+  step. A sweep is mostly XLA, and a real run should set
   `compilation_cache_dir`.
 
-## `--preset small` on one RTX 4080, 2026-09-02, with the run's own attention kernel
+### What the counter used to say
 
-```
-python tools/benchmark_step.py --preset small --architectures <arch> \
-    --warmup 3 --steps 10 --json-out bench.json
-```
+The same executable, measured both ways on 2026-09-02, one compile each:
 
-The table above was measured before `benchmark_step.py` applied the run's
-precision policy, so every row there ran the reference einsum attention while
-a recipe would have run `attention_impl='auto'`. The tool now applies the
-policy, which is what these rows are: same models, same batches, `auto`
-attention (cudnn where cudnn supports the shape, xla elsewhere, see
-`docs/performance.md`), no XLA flags, one architecture per process so every
-peak is its own. `change` is against the row above.
+| architecture | `cost_analysis()` GFLOP | optimized HLO GFLOP | ratio |
+|---|---:|---:|---:|
+| unet | 28.7 | 646.4 | 22.50x |
+| unet_3d | 145.8 | 1384.1 | 9.50x |
+| causal_transformer | 1320.1 | 3406.4 | 2.58x |
+| uvit | 327.4 | 617.8 | 1.89x |
+| video_dit | 693.3 | 760.0 | 1.10x |
+| hybrid_dit | 223.7 | 244.6 | 1.09x |
+| jepa_video_encoder | 698.9 | 758.1 | 1.09x |
+| simple_mmdit | 355.4 | 383.7 | 1.08x |
+| jepa_encoder | 281.5 | 297.3 | 1.06x |
+| hierarchical_mmdit | 715.2 | 737.4 | 1.03x |
+| simple_udit | 360.8 | 363.1 | 1.01x |
+| simple_dit | 296.9 | 292.9 | 0.99x |
 
-| architecture       | sample    | batch |      params | ms/step | samples/s | GFLOP/step |  util | peak GiB | compile s | change |
-|--------------------|-----------|-------|-------------|---------|-----------|------------|-------|----------|-----------|--------|
-| unet               | 64x64x3   |    16 |  10,159,299 |    16.8 |     951.9 |       28.6 |  1.7% |     0.78 |      32.3 |   -11% |
-| uvit               | 64x64x3   |    16 |  24,351,024 |    21.3 |     750.3 |      290.3 | 14.0% |     1.29 |       6.1 |   -11% |
-| simple_udit        | 64x64x3   |    16 |  23,381,424 |     8.8 |    1828.0 |      326.0 | 38.2% |     0.80 |       8.1 |   -17% |
-| simple_dit         | 64x64x3   |    16 |  19,835,568 |     7.0 |    2293.9 |      208.4 | 30.6% |     0.69 |       6.4 |   -33% |
-| simple_mmdit       | 64x64x3   |    16 |  36,385,584 |    13.4 |    1189.7 |      355.3 | 27.1% |     1.40 |      14.8 |   -29% |
-| hierarchical_mmdit | 64x64x3   |    16 |  55,498,188 |    34.8 |     459.6 |      672.9 | 19.8% |     3.49 |      35.5 |    -2% |
-| hybrid_dit         | 64x64x3   |    16 |  19,344,048 |     9.6 |    1669.7 |      189.0 | 20.2% |     0.82 |      11.0 |    -6% |
-| video_dit          | 8x64x64x3 |     4 |  25,155,504 |    17.8 |     224.4 |      652.0 | 37.5% |     1.27 |      11.3 |    -8% |
-| unet_3d            | 8x64x64x3 |     4 |  11,045,699 |    34.5 |     116.1 |      145.4 |  4.3% |     1.77 |      46.3 |    -7% |
-| jepa_encoder       | 64x64x3   |    16 |  12,149,568 |     9.4 |    1701.3 |      244.1 | 26.6% |     0.64 |      12.5 |   -22% |
-| jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    21.3 |     187.8 |      693.1 | 33.4% |     1.20 |      17.8 |    -1% |
-| causal_transformer | 512 tokens |    16 |  66,950,784 |    75.7 |     211.4 |     1201.2 | 16.3% |     4.99 |       7.5 |   -10% |
-
-The GFLOP/step figures moved too, because the fused kernels do not
-materialize the logits the reference path did. Six of these architectures
-(unet, unet_3d, simple_mmdit, hierarchical_mmdit and the two jepa encoders)
-could not have produced a row at all under plain cudnn: it has no backward
-pass for their odd sequence lengths, which is what `auto` now routes around.
-
-Compile times fell for the same reason. `benchmark_step.py` passes no
-`compilation_cache_dir`, so both tables compile cold; a fused attention call
-is one custom call where the reference path was a chain of einsums for XLA to
-optimize.
+The missing arithmetic is wherever the backend put its kernels: convolution
+custom calls for the two UNets (1.8 and 9.5x), six cuBLAS calls for the tied
+fp32 vocabulary head and its gradients (2.58x), and a mix of both for `uvit`.
+The pure-transformer rows agree to a few percent either way, which is the
+elementwise work `cost_analysis()` counts and the matmul count does not. What
+remains below 1.0 (`simple_dit` at 0.99x) is the compiler's elementwise
+accounting on top of the matmuls, not missing kernels. Which side of these
+ratios a run lands on depends on what XLA chooses to keep visible, and it
+chooses differently between recompiles of the same code; the HLO count does
+not move. This matches the audit in
+`docs/research/benchmark-parity.md` (22.50x, 2.372x and 0.987x there, for the
+three architectures that work counted).
 
 ## `--preset cpu-smoke`
 

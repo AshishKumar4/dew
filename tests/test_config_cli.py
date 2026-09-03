@@ -160,6 +160,27 @@ def reference_optimizer(config: OptimConfig, steps_per_epoch: int):
     return solver
 
 
+def test_library_build_optimizer_accepts_muon():
+    """The orthogonalized update flows to a matrix and the passthrough update
+    to a vector: `optax.contrib.muon` already partitions by ndim == 2, so the
+    map entry is all the adoption costs (google-jax-stack.md, Optax section)."""
+    solver = build_optimizer(OptimConfig(optimizer="muon", learning_rate=1e-3), 10)
+    params = {"w": jnp.ones((4, 6)), "b": jnp.zeros(6)}
+    state = solver.init(params)
+    updates, state = solver.update(jax.tree.map(jnp.ones_like, params), state, params)
+    params = optax.apply_updates(params, updates)
+    assert not jnp.array_equal(params["w"], jnp.ones((4, 6)))
+    assert not jnp.array_equal(params["b"], jnp.zeros(6))
+    # The same wiring under jit and gradient accumulation, which is how a run
+    # actually wires it.
+    solver = build_optimizer(OptimConfig(optimizer="muon", learning_rate=1e-3,
+                                         grad_accum_steps=2), 10)
+    run = jax.jit(lambda g, s, p: solver.update(g, s, p))
+    _, _ = run(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
+    # The recipe config accepts the literal end to end.
+    tyro.cli(OptimConfig, args=["--optimizer", "muon", "--learning-rate", "1e-3"])
+
+
 def run_steps(solver, steps=9):
     """The updates a solver emits on a fixed gradient stream."""
     params = {"w": jnp.asarray([0.5, -0.25])}

@@ -134,10 +134,10 @@ scheduling flags were measured. No flag that relaxes precision was tested and
 none would be adopted, because an adopted change has to keep a fixed-seed
 20-step loss trajectory within 1e-5.
 
-## The unet's 1.7%
+## What batch size buys the unet
 
-Measured, not adopted: where the remaining room is on the least utilised
-architecture of the preset.
+Measured, not adopted: where the remaining room is on the architecture whose
+step is least sensitive to batch.
 
 ```
 python tools/benchmark_step.py --preset small --architectures unet \
@@ -148,16 +148,19 @@ once per batch size, and again with
 `--xla-flags=--xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUBLASLT,CUDNN,CUSTOM_CALL,WHILE`
 for the extended rows.
 
-| run | batch | ms/step | GFLOP/step | util |
-|---|---|---|---|---|
-| unet | 16 | 17.37 | 28.6 | 1.69% |
-| unet | 64 | 57.59 | 102.9 | 1.83% |
-| unet, command buffers extended | 16 | 17.12 | 28.6 | 1.71% |
-| unet, command buffers extended | 64 | 57.94 | 102.9 | 1.82% |
+| run | batch | ms/step |
+|---|---|---|
+| unet | 16 | 17.37 |
+| unet | 64 | 57.59 |
+| unet, command buffers extended | 16 | 17.12 |
+| unet, command buffers extended | 64 | 57.94 |
 
 Four times the batch costs 3.3 times the step, so about 4 ms of the 17.4 ms
-step (23%) does not scale with the batch and 0.84 ms per sample does.
-Utilisation moves from 1.69% to 1.83%: the batch is not what holds this model
-at 2% of peak. A convolutional stack at 64 channels moves far more activation
-bytes per FLOP than a transformer does, and that ratio does not improve with
-batch. Command buffers are worth 1.4% at batch 16 and nothing at batch 64.
+step (23%) does not scale with the batch and 0.84 ms per sample does. Command
+buffers are worth 1.4% at batch 16 and nothing at batch 64.
+
+These rows carried a utilisation column when they were measured, reading 1.7%,
+and that number was the counter rather than the card: XLA's `cost_analysis()`
+cannot see inside the cuDNN convolution calls the backend emits, and it
+undercounted this model 22.5 times. Counted off the optimized HLO the unet
+runs at 40.5% of peak, which `docs/benchmarks.md` reports.

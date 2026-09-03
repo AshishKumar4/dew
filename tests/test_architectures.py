@@ -175,7 +175,7 @@ def test_benchmark_step_tool_measures_a_real_step(tmp_path):
     does, so it rots the moment they move. One cpu-smoke case keeps it honest."""
     tool = benchmark_tool()
     rows = tool.run(tool.BenchmarkConfig(
-        preset='cpu-smoke', architectures=['simple_dit'], warmup=1, steps=2,
+        preset='cpu-smoke', architectures=['simple_dit'], warmup=1, steps=4,
         checkpoint_dir=str(tmp_path)))
 
     (row,) = rows
