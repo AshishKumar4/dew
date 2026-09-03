@@ -130,10 +130,13 @@ def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
             f"the token files were written with {meta['tokenizer']}, and "
             f"{config.pretrained} expects {expected}. Retokenize with "
             f"--tokenizer {expected}.")
-    if model.vocab_size != vocab_size:
+    # A decoder's embedding table is usually padded past the tokenizer's ids
+    # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
+    # requirement, not matching the count.
+    if model.vocab_size < vocab_size:
         raise ValueError(
-            f"{config.pretrained} has a vocabulary of {model.vocab_size} and the "
-            f"token files have {vocab_size}")
+            f"{config.pretrained} has room for {model.vocab_size} ids and the "
+            f"token files use {vocab_size}")
     return model, variables, hf_config
 
 
