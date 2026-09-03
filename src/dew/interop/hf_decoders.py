@@ -68,13 +68,22 @@ def _rope_theta(entry: Optional[Mapping[str, Any]], field: str) -> Optional[floa
     """One rope base frequency out of a rope_parameters entry, if it names one.
 
     Only plain rope ('default' or 'none') maps; a scaled variant changes what
-    the model computes, so the caller refuses it with the field named.
+    the model computes, so the caller refuses it with the field named. 'type'
+    is the older spelling of rope_type and transformers still reads it
+    (modeling_rope_utils.py:785, 839). Plain rope takes no field beyond those
+    two and rope_theta, which is what its validator accepts
+    (modeling_rope_utils.py:850-857), so a 'factor' or an
+    'original_max_position_embeddings' names a scaling whatever the type says.
     """
     if entry is None:
         return None
-    rope_type = entry.get('rope_type', 'default')
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         _refuse(f"{field} (rope_type {rope_type!r})",
+                "the backbone applies plain rotary positions at rope_theta")
+    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta'})
+    if scaling:
+        _refuse(f"{field} scaling fields {scaling}",
                 "the backbone applies plain rotary positions at rope_theta")
     theta = entry.get('rope_theta')
     return None if theta is None else float(theta)

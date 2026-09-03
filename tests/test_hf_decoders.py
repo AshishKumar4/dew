@@ -133,6 +133,22 @@ def test_a_config_field_with_no_counterpart_is_refused(field, value, message):
         translate_config(config)
 
 
+def test_a_rope_scaling_spelled_the_old_way_is_refused():
+    """transformers reads rope_type from the older 'type' key too
+    (modeling_rope_utils.py:785, 839), so a config that spells its Yarn
+    scaling that way scales there and must not load here as plain rope. A
+    bare factor names no type at all and is still a scaling."""
+    yarn = {**fixture_config("llama-tiny"),
+            'rope_scaling': {'type': 'yarn', 'factor': 4.0,
+                             'original_max_position_embeddings': 32}}
+    with pytest.raises(ValueError, match="rope_type 'yarn'"):
+        translate_config(yarn)
+
+    factor_only = {**fixture_config("llama-tiny"), 'rope_scaling': {'factor': 8.0}}
+    with pytest.raises(ValueError, match=r"rope_scaling scaling fields \['factor'\]"):
+        translate_config(factor_only)
+
+
 @pytest.mark.parametrize("name", TINY)
 def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
     """Same paths, same shapes, same dtypes as a freshly initialised model."""
