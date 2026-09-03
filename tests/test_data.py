@@ -272,6 +272,43 @@ def test_media_dataset_validation_split_rejects_impossible_sizes(fake_media_data
         get_media_dataset_grain("fake", dataset_source="/tmp", val_count=32)
 
 
+def test_a_source_without_a_length_needs_an_explicit_count(monkeypatch):
+    """The factory guessed a million records for such a source, so the
+    sampler drew indices past the data and train_len reported the guess."""
+    class Endless:
+        def __getitem__(self, index):
+            return {"index": index}
+
+    class UnsizedSource(DataSource):
+        def get_source(self, path_override):
+            return Endless()
+
+    monkeypatch.setitem(mediaDatasetMap, "unsized", MediaDataset(
+        source=UnsizedSource(), augmenter=_PassthroughAugmenter(), media_type="video"))
+
+    with pytest.raises(ValueError, match="count="):
+        get_media_dataset_grain("unsized", dataset_source="/tmp", worker_count=0)
+
+    data = get_media_dataset_grain("unsized", dataset_source="/tmp", batch_size=8,
+                                   count=16, worker_count=0, num_epochs=1)
+    assert data["train_len"] == 16
+    assert sorted(i for batch in _indices(data["train"](), 3) for i in batch) == list(range(16))
+
+
+@pytest.mark.parametrize("factory", ["media", "legacy"])
+def test_a_count_past_the_end_of_the_source_is_refused(
+        factory, fake_media_dataset, fake_legacy_dataset):
+    """A count above the source became the sampler's record count, and the
+    first index past the end raised inside a worker."""
+    with pytest.raises(ValueError, match="count 33"):
+        if factory == "media":
+            get_media_dataset_grain("fake", dataset_source="/tmp", count=33,
+                                    worker_count=0)
+        else:
+            dataloaders.get_dataset_grain("fake", dataset_source="/tmp", count=33,
+                                          worker_count=0)
+
+
 def test_media_dataset_grain_passes_media_scale_to_the_video_transform(fake_media_dataset):
     get_media_dataset_grain("fake", dataset_source="/tmp", media_scale=64,
                             sequence_length=4, worker_count=0)
