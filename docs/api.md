@@ -70,6 +70,6 @@ The public modules, and what each one is for.
 | Module | Contents |
 | --- | --- |
 | `dew.eval` | `EvaluationMetric`, `get_fid_metric`, `get_clip_metric`, `get_clip_score_metric`, `get_psnr_metric`, `get_ssim_metric`, `get_perplexity_metric`, `psnr`, `ssim`, `frechet_distance` |
-| `dew.interop` | `save_params`, `load_params`, `save_hf_layout` |
+| `dew.interop` | `save_params`, `load_params`, `save_hf_layout`, `push_to_hub`, `pull_from_hub` |
 | `dew.random_state` | `MarkovState`, `RandomMarkovState` |
 | `dew.image_ops` | `clip_images`, `denormalize_images` |
