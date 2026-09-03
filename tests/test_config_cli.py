@@ -48,7 +48,9 @@ def populated_config(cls=RunConfig, **objective_knobs):
                           use_dynamic_scale=True),
         trainer=TrainerConfig(name="run-{dataset}", epochs=3, steps_per_epoch=7,
                               checkpoint_every_steps=11,
-                              checkpoint_fs="gcs", fsdp_size=2, wandb_offline=True),
+                              checkpoint_fs="gcs", fsdp_size=2,
+                              logical_axis_rules={"mlp": "fsdp"},
+                              sharding_tolerance=0.1, wandb_offline=True),
         **objective_knobs,
     )
 
@@ -89,8 +91,9 @@ def test_tyro_parses_the_flags_into_the_same_config():
         "--optim.grad-accum-steps", "3", "--optim.use-dynamic-scale",
         "--trainer.name", "run-{dataset}", "--trainer.epochs", "3",
         "--trainer.steps-per-epoch", "7", "--trainer.checkpoint-every-steps", "11",
-        "--trainer.checkpoint-fs", "gcs",
-        "--trainer.fsdp-size", "2", "--trainer.wandb-offline",
+        "--trainer.checkpoint-fs", "gcs", "--trainer.fsdp-size", "2",
+        "--trainer.logical-axis-rules", '{"mlp": "fsdp"}',
+        "--trainer.sharding-tolerance", "0.1", "--trainer.wandb-offline",
     ])
     assert parsed == populated_config()
 

@@ -116,6 +116,10 @@ class TrainerConfig:
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     fsdp_size: int = 1
     fsdp_min_param_size: Optional[int] = None
+    logical_axis_rules: Optional[JsonDict] = None
+    """Replaces the logical-axis-to-mesh-axis table, e.g. {"mlp": "fsdp"}. Unset uses DEFAULT_LOGICAL_AXIS_RULES, which reproduces the shape heuristic."""
+    sharding_tolerance: Optional[float] = None
+    """Fail the run when more than this fraction of shardable parameter elements ended up replicated. 1.0 disables the check. Unset uses DEFAULT_SHARDING_TOLERANCE."""
     ema_decay: float = 0.999
     best_tracker_metric: Optional[str] = None
     profile_steps: int = 0
