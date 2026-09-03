@@ -22,6 +22,8 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.objectives.base import EMASpec, Objective
 from dew.training import ObjectiveTrainer, SimpleTrainer
 from dew.training import objective_trainer as gdt
+from dew.training import trainer as trainer_module
+from dew.training.distributed import DevicePrefetchIterator
 from dew.checkpoints.utils import get_latest_checkpoint
 
 RES = 8
@@ -459,3 +461,57 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(tmp_path, accum):
     np.testing.assert_allclose(w, 0.64, rtol=1e-6)    # 0.8 - 0.1 * 2 * 0.8
     np.testing.assert_allclose(ema, 0.77, rtol=1e-6)  # 0.5 * 0.9 + 0.5 * 0.64
     assert step == 2 * accum
+
+
+# --------------------------------------------------------------------------
+# Throughput logging
+# --------------------------------------------------------------------------
+
+class ManualClock:
+    """Stands in for the time module inside the trainer; the test moves it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+
+class RecordingRun:
+    """The slice of a wandb run the training loop logs to."""
+
+    def __init__(self):
+        self.logged = []
+
+    def log(self, metrics, step=None):
+        self.logged.append(dict(metrics))
+
+
+def test_the_first_log_tick_measures_steps_not_the_compile(tmp_path, monkeypatch):
+    """Every interval, the first one included, reports the time its steps
+    took. The first tick used to start its clock before the compile, so the
+    first train/step_time_ms and train/mfu of every run were the compile."""
+    trainer = make_trainer(tmp_path, name="tick", log_every=1)
+    clock = ManualClock()
+    monkeypatch.setattr(trainer_module, "time", clock)
+    compile_step = trainer._compiled_step
+
+    def compile_then_time_each_step(*args):
+        executable = compile_step(*args)
+        clock.now += 100.0
+
+        def timed(*step_args):
+            outputs = executable(*step_args)
+            clock.now += 1.0
+            return outputs
+        return timed
+
+    monkeypatch.setattr(trainer, "_compiled_step", compile_then_time_each_step)
+    trainer.wandb = RecordingRun()
+    source = DevicePrefetchIterator(batch_iterator(), trainer.batch_sharding)
+    trainer.train_loop(trainer.state, trainer._define_train_step(batch_size=8),
+                       source, 3, 0, trainer.rngstate)
+
+    step_times = [m["train/step_time_ms"] for m in trainer.wandb.logged
+                  if "train/step_time_ms" in m]
+    assert step_times == pytest.approx([1000.0, 1000.0, 1000.0])
