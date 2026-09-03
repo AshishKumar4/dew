@@ -6,11 +6,12 @@ clipping, and gradient accumulation over several micro-batches. That wiring
 is library behavior, so it lives here and the recipes call it.
 
 The 'muon' entry is the production parameter-group split the labs converged
-on (docs/research/frontier-training.md:183): AdamW on embeddings, heads and
-norms, Muon on the matrix projections. `optax.contrib.muon` owns the masked
-composition itself (it partitions with `optax.masked` per group,
-optax/contrib/_muon.py:694), so what Dew supplies is the parameter spec that
-tells it which group a parameter belongs to and which axes are its matrix.
+on (docs/research/frontier-training.md:183): AdamW on the embeddings, the
+head, the router and the norms, Muon on the matrices. `optax.contrib.muon`
+owns the masked composition itself (it partitions with `optax.masked` per
+group, optax/contrib/_muon.py:694), so what Dew supplies is the parameter
+spec that says which group a parameter belongs to and which of its axes are
+the matrix.
 """
 
 import jax
@@ -25,8 +26,8 @@ from dew.training import distributed
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
 # An expert dimension stacks whole matrices, one per expert, so it is a batch
-# axis: optax names neither side and orthogonalizes each expert on its own
-# (optax/contrib/_muon.py:57-70).
+# axis: it names neither side, and optax orthogonalizes each expert on its
+# own (optax/contrib/_muon.py:56-74).
 BATCH_AXES = frozenset({'exp'})
 
 # A parameter that maps into or out of a discrete index is a lookup rather
@@ -37,7 +38,9 @@ BATCH_AXES = frozenset({'exp'})
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
-def _matrix_sides(path, axes: distributed.LogicalAxes) -> tuple[tuple[int, ...], ...]:
+def _matrix_sides(
+    path, axes: distributed.LogicalAxes,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """The contracted axes and the output axes of a declared parameter.
 
     A dimension continues the side before it when the table leaves it unnamed,
