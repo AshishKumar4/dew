@@ -8,9 +8,12 @@ trainer compiles for a real run - same objective, same sharding, same donated
 state - so a number from this tool is a number from training, not from a
 hand-written forward pass.
 
-FLOPs come off the compiled executable (dew.telemetry.instrumentation), never
-from a parameter-count formula, and the utilisation is the same figure the
-trainer logs as train/mfu.
+FLOPs are counted off the compiled executable's optimized HLO
+(dew.telemetry.instrumentation), never from a parameter-count formula, and the
+utilisation is the same figure the trainer logs as train/mfu. Each case is
+timed twice over the same number of steps: once with the asynchronous dispatch
+a real run uses, which gives ms/step, and once waiting on every step, which
+gives the p10/p50/p90 spread.
 
 Usage:
     python tools/benchmark_step.py --preset cpu-smoke
@@ -213,7 +216,9 @@ class BenchmarkConfig:
     architectures: Optional[list[str]] = None
     """Keep only these cases from the preset."""
     warmup: int = 2
-    steps: int = 10
+    steps: int = 100
+    """Measured steps per case, timed twice: once dispatched asynchronously for
+    ms/step, once waiting per step for the p10/p50/p90 spread."""
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
     """Model compute dtype for --preset small; losses stay fp32 either way."""
     attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
@@ -417,6 +422,19 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     loss.block_until_ready()
     elapsed = time.perf_counter() - start
 
+    # A second window of the same length, waiting on every step, for the
+    # spread. The loop above dispatches asynchronously on purpose - that is
+    # how a run behaves - so timing its individual iterations would time the
+    # dispatch, not the step. These per-step numbers are therefore a different
+    # quantity from ms_per_step above, and each carries one synchronisation.
+    synced = []
+    for _ in range(config.steps):
+        step_start = time.perf_counter()
+        state, loss, _, rng, is_finite = compiled(state, rng, next(source))
+        loss.block_until_ready()
+        synced.append((time.perf_counter() - step_start) * 1e3)
+    p10, p50, p90 = np.percentile(synced, [10, 50, 90])
+
     flops = compiled_flops(compiled)
     throughput = trainer._throughput_metrics(elapsed, config.steps)
     peak = device_peak_bytes()
@@ -435,6 +453,9 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "measured_steps": config.steps,
         "compile_seconds": round(compile_seconds, 2),
         "ms_per_step": round(elapsed / config.steps * 1e3, 3),
+        "p10_ms": round(float(p10), 3),
+        "p50_ms": round(float(p50), 3),
+        "p90_ms": round(float(p90), 3),
         "samples_per_sec": round(throughput["train/samples_per_sec"], 2),
         "flops_per_step": flops,
         "utilization": throughput.get("train/mfu"),
@@ -456,6 +477,9 @@ TABLE_COLUMNS = (
     ("fsdp_size", "fsdp", 5, "{}"),
     ("params", "params", 12, "{:,}"),
     ("ms_per_step", "ms/step", 9, "{:.1f}"),
+    ("p10_ms", "p10", 7, "{:.1f}"),
+    ("p50_ms", "p50", 7, "{:.1f}"),
+    ("p90_ms", "p90", 7, "{:.1f}"),
     ("samples_per_sec", "samples/s", 10, "{:.1f}"),
     ("flops_per_step", "GFLOP/step", 11, "{:.1f}"),
     ("utilization", "util %", 7, "{:.1f}"),

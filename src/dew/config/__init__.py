@@ -82,7 +82,7 @@ class DataConfig:
 class OptimConfig:
     """Optimizer, learning-rate schedule and gradient handling."""
 
-    optimizer: Literal["adam", "adamw", "lamb"] = "adamw"
+    optimizer: Literal["adam", "adamw", "lamb", "muon"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
     learning_rate_schedule: Optional[Literal["cosine"]] = None
