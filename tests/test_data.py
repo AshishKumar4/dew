@@ -896,16 +896,21 @@ class _AugmentingAugmenter(DataAugmenter):
         return Augmenting
 
 
-@pytest.fixture
-def augmenting_media_dataset(monkeypatch, tmp_path):
-    """A media dataset whose records really are augmented and captioned."""
+def _register_augmenting(monkeypatch, tmp_path, length):
+    """Register "augmenting", a media dataset of `length` records whose
+    records really are augmented and captioned."""
     labels = tmp_path / "label.labels.txt"
     labels.write_text("\n".join(["rose", "tulip", "lotus", "orchid", "marigold"]))
-    dataset = MediaDataset(source=_ImageSource(16),
+    dataset = MediaDataset(source=_ImageSource(length),
                            augmenter=_AugmentingAugmenter(str(labels)),
                            media_type="image")
     monkeypatch.setitem(mediaDatasetMap, "augmenting", dataset)
     return dataset
+
+
+@pytest.fixture
+def augmenting_media_dataset(monkeypatch, tmp_path):
+    return _register_augmenting(monkeypatch, tmp_path, 16)
 
 
 def _rows(batch):
@@ -992,6 +997,57 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     assert ended and ended_again
     assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
     assert sorted(index for index, _, _ in seen + resumed) == list(range(8, 16))
+
+
+def _validated(val_count, batch, **read):
+    """{record index: (pixels, caption)} for one validation pass."""
+    data = get_media_dataset_grain("augmenting", dataset_source="/tmp",
+                                   batch_size=batch, worker_count=0, num_epochs=1,
+                                   seed=3, val_count=val_count, **read)
+    records = {}
+    for b in data["val"]():
+        for row in range(len(b["index"])):
+            records[int(b["index"][row])] = (b["image"][row].tobytes(),
+                                             str(b["caption"][row]))
+    return records
+
+
+def test_validation_pixels_do_not_depend_on_the_read_thread_count(monkeypatch, tmp_path):
+    """The validation pass transforms its records inside grain's prefetch
+    threads, and albumentations keeps the generators a call draws from on the
+    pipeline itself, so a pipeline shared by those threads had one record's
+    seed applied to another record's pixels: 75 to 82 of these 256 records
+    differed between a 32-thread pass and a serial one, pass to pass, before
+    each thread got a copy of its own. The captions come from the per-record
+    rng directly and never moved."""
+    _register_augmenting(monkeypatch, tmp_path, 512)
+
+    serial = _validated(256, 4, read_thread_count=1, read_buffer_size=1)
+    threaded = _validated(256, 4, read_thread_count=32, read_buffer_size=128)
+
+    assert sorted(serial) == list(range(256))
+    assert threaded == serial
+
+
+@pytest.mark.parametrize("process_count", [2, 8])
+def test_a_validation_record_does_not_depend_on_the_process_count(
+        monkeypatch, tmp_path, process_count):
+    """Process p of n validates records p, p + n, ... of the split. The rng
+    behind a record's flip, jitter and caption has to be keyed by its place in
+    the split, not in that slice, or the same seed validates one record with
+    one augmentation on a single host and another on a pod: keyed by the
+    slice, every record but the first differed at two processes."""
+    _register_augmenting(monkeypatch, tmp_path, 64)
+    alone = _validated(32, 8, read_thread_count=1, read_buffer_size=1)
+
+    together = {}
+    monkeypatch.setattr(jax, "process_count", lambda: process_count)
+    for index in range(process_count):
+        monkeypatch.setattr(jax, "process_index", lambda index=index: index)
+        together.update(_validated(32, 8, read_thread_count=1, read_buffer_size=1))
+
+    assert sorted(alone) == list(range(32))
+    assert together == alone
 
 
 # ---------------------------------------------------------------------------------
