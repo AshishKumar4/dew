@@ -1,19 +1,24 @@
-"""The vendored CLIP text tower against transformers' own.
+"""The vendored CLIP towers against transformers' own.
 
 The claim is parity, not plausibility: the same weights and the same token ids
 through the reference implementation and through dew have to produce the same
-hidden states and the same pooled row. tools/clip_reference.py writes the
-fixtures under torch and transformers, including a tiny random-weight
-checkpoint whose outputs are committed, so the comparison runs in CI without a
-download.
+hidden states and the same pooled row, and the same pixels the same projected
+image embedding. tools/clip_reference.py writes the fixtures under torch and
+transformers, including a tiny random-weight checkpoint whose outputs are
+committed, so the comparison runs in CI without a download.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - tiny checkpoint: max |hidden state difference| 1.4e-06, max |pooled
-  difference| 9.5e-07, tolerance 1e-4, on hidden states reaching 2.8.
+  difference| 9.5e-07, tolerance 1e-4, on hidden states reaching 2.8. Through
+  the projection heads, max |text embedding difference| 7.2e-07 on values
+  reaching 2.5 and max |image embedding difference| 4.8e-07 on values
+  reaching 2.8, the pixel values bit-identical.
 - clip-vit-large-patch14: max |hidden state difference| 1.9e-04 (mean 1.0e-06,
   median 6.0e-07), max |pooled difference| 4.8e-06, tolerance 1e-3, on hidden
-  states reaching 33.1.
+  states reaching 33.1. Through the heads, max |text embedding difference|
+  3.8e-06 on values reaching 14.2 and max |image embedding difference|
+  1.2e-05 (mean 1.1e-06) on values reaching 6.6.
 
 That last residue is fp32 rounding in CLIP's outlier channels, not a different
 computation, and the reference carries more of it than the gap between the two:
@@ -37,7 +42,8 @@ import pytest
 
 from dew.inputs.encoders import CLIPTextEncoder
 from dew.nn.text_encoders import (
-    CLIPTextModel, CLIPTextTransformer, translate_config, translate_weights,
+    CLIPModel, CLIPTextModel, CLIPTextTransformer, translate_clip_config,
+    translate_clip_weights, translate_config, translate_vision_config, translate_weights,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
@@ -59,6 +65,22 @@ def prompts(directory):
 
 def fixture_config(directory):
     return json.loads((directory / "config.json").read_text())
+
+
+def synthetic_images(directory):
+    """The uint8 images the fixture was run on, from the recipe it records."""
+    recipe = json.loads((directory / "prompts.json").read_text())["images"]
+    return np.random.RandomState(recipe["seed"]).randint(
+        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
+
+
+def image_processor(directory_or_repo):
+    from transformers import CLIPImageProcessorPil
+    return CLIPImageProcessorPil.from_pretrained(str(directory_or_repo))
+
+
+def largest_difference(actual, expected) -> float:
+    return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
 
 
 def test_tiny_checkpoint_matches_the_reference():
@@ -190,6 +212,63 @@ def test_legacy_eos_token_id_pools_the_argmax_row():
                           hidden[rows, np.argmax(ids, axis=-1)])
 
 
+def test_tiny_checkpoint_text_projection_matches_the_reference():
+    """`get_text_features` is the pooled row through `text_projection`, which
+    the metrics score with; the head is loaded out of the same file."""
+    expected = reference(TINY)
+    model = CLIPModel.from_pretrained(str(TINY))
+
+    embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
+
+    difference = largest_difference(embeds, expected["text_embeds"])
+    assert difference < TOLERANCE, f"max |text embedding difference| {difference:.3e}"
+
+
+def test_tiny_checkpoint_image_embeddings_match_the_reference():
+    """The vision tower on the reference's own pixel values, through
+    `visual_projection`. The images are taller than wide, so the processor's
+    resize and centre crop both run, and its pixel values have to be the
+    reference's exactly since it is the reference's own processor."""
+    expected = reference(TINY)
+    model = CLIPModel.from_pretrained(str(TINY))
+
+    pixel_values = image_processor(TINY)(
+        images=synthetic_images(TINY), return_tensors="np")["pixel_values"]
+    assert np.array_equal(pixel_values, expected["pixel_values"])
+    embeds = model.get_image_features(pixel_values)
+
+    difference = largest_difference(embeds, expected["image_embeds"])
+    assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
+
+
+def test_vision_attention_reaches_every_patch():
+    """The vision tower is not causal: the class row, which is pooled, attends
+    to every patch, so changing the pixels moves the pooled row. With the text
+    tower's causal mask reused here, position 0 would see nothing but itself
+    and the pooled row would not depend on the image at all."""
+    expected = reference(TINY)
+    model = CLIPModel.from_pretrained(str(TINY))
+    pixel_values = expected["pixel_values"]
+
+    baseline = model.module.apply(
+        model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
+    moved = model.module.apply(
+        model.variables, np.flip(pixel_values, axis=-1),
+        method=lambda clip, pixels: clip.vision_model(pixels))
+
+    assert np.max(np.abs(np.asarray(baseline.pooler_output)
+                         - np.asarray(moved.pooler_output))) > 0.1
+
+
+def test_pixel_values_of_another_size_are_refused():
+    """A checkpoint's position table covers one grid of patches; the reference
+    refuses any other image size rather than interpolating on its own."""
+    model = CLIPModel.from_pretrained(str(TINY))
+
+    with pytest.raises(ValueError, match="3x8x8"):
+        model.get_image_features(np.zeros((1, 3, 16, 16), np.float32))
+
+
 def test_the_real_config_translates_to_the_tower_it_describes():
     """openai/clip-vit-large-patch14 nests the text fields under text_config and
     carries the whole transformers 4.16 config dump around them."""
@@ -209,6 +288,25 @@ def test_a_text_only_config_translates_the_same_way():
     assert translate_config(nested) == translate_config(nested["text_config"])
 
 
+def test_the_real_config_translates_to_the_towers_it_describes():
+    """A full config carries both towers and the width of the heads; the
+    vision fields come from vision_config the way the text ones come from
+    text_config, and a CLIPVisionConfig on its own reads the same."""
+    config = translate_clip_config(fixture_config(REAL))
+
+    assert config == {
+        "text": translate_config(fixture_config(REAL)),
+        "vision": {
+            "hidden_size": 1024, "intermediate_size": 4096, "num_layers": 24,
+            "num_heads": 16, "image_size": 224, "patch_size": 14, "num_channels": 3,
+            "layer_norm_eps": 1e-5,
+        },
+        "projection_dim": 768,
+    }
+    nested = fixture_config(TINY)
+    assert translate_vision_config(nested) == translate_vision_config(nested["vision_config"])
+
+
 def test_a_config_asking_for_another_activation_is_refused():
     """quick-GELU is the only activation here, and a checkpoint trained with
     GELU would otherwise load into a model that computes something else."""
@@ -221,19 +319,43 @@ def test_a_config_asking_for_another_activation_is_refused():
 
 def test_an_unfamiliar_tensor_name_is_refused():
     """Skipping a name nobody mapped is how a checkpoint loads with half its
-    weights; the vision tower and the projection heads are skipped by name."""
+    weights. The text tower's loader skips the vision tower and the projection
+    heads by name; the full model's loader maps them and skips only the
+    buffers and the logit scale."""
     with pytest.raises(ValueError, match="text_model.encoder.layers.0.self_attn.qkv"):
         translate_weights({"text_model.encoder.layers.0.self_attn.qkv.weight":
                            np.zeros((3, 2), np.float32)})
+    with pytest.raises(ValueError, match="vision_model.embeddings.patch_embedding.bias"):
+        translate_clip_weights({"vision_model.embeddings.patch_embedding.bias":
+                                np.zeros((2,), np.float32)})
+    with pytest.raises(ValueError, match="logit_bias"):
+        translate_clip_weights({"logit_bias": np.zeros((), np.float32)})
 
-    skipped = translate_weights({
+    beside_the_text_tower = {
         "vision_model.embeddings.class_embedding": np.zeros((2,), np.float32),
         "visual_projection.weight": np.zeros((2, 2), np.float32),
         "text_projection.weight": np.zeros((2, 2), np.float32),
         "logit_scale": np.zeros((), np.float32),
         "text_model.embeddings.position_ids": np.zeros((1, 77), np.int64),
-    })
-    assert skipped == {}
+        "vision_model.embeddings.position_ids": np.zeros((1, 5), np.int64),
+    }
+    assert translate_weights(beside_the_text_tower) == {}
+    whole = translate_clip_weights(beside_the_text_tower)
+    assert {name: leaf.shape for name, leaf in whole.items() if leaf.__class__ is np.ndarray} == {}
+    assert sorted(whole) == ["text_projection", "vision_model", "visual_projection"]
+    assert sorted(whole["vision_model"]) == ["class_embedding"]
+
+
+def test_conv_kernels_land_in_linen_layout():
+    """torch Conv2d holds [out, in, kh, kw] and nn.Conv [kh, kw, in, out]; a
+    kernel handed over untransposed would convolve the wrong axes and only
+    fail parity, so the layout is pinned by value."""
+    kernel = np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5)
+    tree = translate_clip_weights({"vision_model.embeddings.patch_embedding.weight": kernel})
+
+    landed = tree["vision_model"]["patch_embedding"]["kernel"]
+    assert landed.shape == (4, 5, 3, 2)
+    assert landed[1, 2, 0, 1] == kernel[1, 0, 1, 2]
 
 
 def test_a_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
@@ -247,6 +369,19 @@ def test_a_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="missing"):
         CLIPTextModel.from_pretrained(str(tmp_path))
+
+
+def test_a_full_checkpoint_that_does_not_fit_its_config_is_refused(tmp_path):
+    """The same refusal for the vision tower: a config claiming a second
+    vision layer the file does not hold."""
+    for name in ("model.safetensors", "preprocessor_config.json"):
+        shutil.copyfile(TINY / name, tmp_path / name)
+    config = fixture_config(TINY)
+    config["vision_config"]["num_hidden_layers"] = 2
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="vision_model.layers_1"):
+        CLIPModel.from_pretrained(str(tmp_path))
 
 
 def real_checkpoint_is_available() -> bool:
@@ -280,3 +415,26 @@ def test_the_real_checkpoint_matches_the_reference():
                                  - expected["pooler_output"])))
     assert hidden < REAL_TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
     assert pooled < REAL_TOLERANCE, f"max |pooled difference| {pooled:.3e}"
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not real_checkpoint_is_available(),
+                    reason="openai/clip-vit-large-patch14 is neither cached nor "
+                           "DEW_NETWORK_TESTS=1")
+def test_the_real_checkpoint_embeddings_match_the_reference():
+    """Both heads of clip-vit-large-patch14, the twenty-four vision layers
+    behind one of them, against what transformers computes for the same
+    prompts and the same synthetic images."""
+    expected = reference(REAL)
+    repo = json.loads((REAL / "prompts.json").read_text())["repo"]
+    model = CLIPModel.from_pretrained(repo)
+
+    pixel_values = image_processor(repo)(
+        images=synthetic_images(REAL), return_tensors="np")["pixel_values"]
+    image_embeds = model.get_image_features(pixel_values)
+    text_embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
+
+    image = largest_difference(image_embeds, expected["image_embeds"])
+    text = largest_difference(text_embeds, expected["text_embeds"])
+    assert image < REAL_TOLERANCE, f"max |image embedding difference| {image:.3e}"
+    assert text < REAL_TOLERANCE, f"max |text embedding difference| {text:.3e}"
