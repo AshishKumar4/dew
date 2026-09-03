@@ -42,7 +42,21 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 
 ## Writing
 
-Plain sentences. Short. No em dashes. No words that sell (robust, seamless, leverage, cutting-edge, comprehensive). Tables for comparisons. The README and docs describe what the code does today; a claim without code behind it is a bug.
+Plain sentences, short, in the register of someone explaining their own work to a colleague. Tables for comparisons. The README and docs describe what the code does today; a claim without code behind it is a bug.
+
+These constructions are banned, in prose, docstrings, comments and commit messages. They are the patterns machine-written text falls into, and they make a document sound like nobody wrote it.
+
+- **Colon reveals.** A noun phrase, a colon, then a dramatic lowercase reveal: "Measured, not adopted: where the room is", "What it costs, stated: a run cannot", "One design, three parts:". Write the plain sentence. Colons are for lists, labels and quotes.
+- **Binary contrasts.** "This is not X, it is Y", "The question is not X but Y", "not just X but Y". State Y.
+- **Throat-clearing and faux insight.** "Here's the thing", "Let me be clear", "What most people get wrong", "the part everyone misses", "the uncomfortable truth is".
+- **Importance puffery.** "marks a pivotal moment", "plays a vital role", "underscores", "highlights", "showcases", "stands as a testament". State the fact.
+- **Trailing -ing clauses that pretend to explain.** "..., highlighting the team's commitment", "..., reflecting a broader shift". Say the consequence or cut it.
+- **Negative listing and dramatic fragmentation.** "Not a wrapper. Not a framework. A library." / "That's it. That's the whole thing."
+- **Fake-profound endings and recaps.** A closing metaphor or aphorism, or a paragraph that restates the section. End on the last concrete point.
+- **Weasel attribution.** "experts agree", "studies show", "widely regarded as". Name the source or cut the claim.
+- **Words that sell.** robust, seamless, leverage, utilize, delve, comprehensive, cutting-edge, elevate, harness, streamline, empower, paramount, intricate, transformative, ever-evolving.
+- **Em dashes.** None. Commas, periods and parentheses cover every case.
+- **Formatting decoration.** No emoji in headings, no bold mid-sentence for emphasis, no bullet list where two sentences read better, no heading over a two-sentence section.
 
 ## Before a merge
 
