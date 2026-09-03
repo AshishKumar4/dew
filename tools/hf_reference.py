@@ -16,7 +16,7 @@ Set up the venv and run it:
 
 What lands in tests/fixtures/hf:
 
-- qwen3-tiny/ and gemma3-tiny/: a random-weight checkpoint in the HF layout
+- qwen3-tiny/, gemma3-tiny/ and llama-tiny/: a random-weight checkpoint in the HF layout
   (config.json + model.safetensors), the 2 x 12 token ids it was run on, and
   the fp32 logits of the reference model in eval mode with eager attention.
   Small enough to live in git.
@@ -40,7 +40,7 @@ import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig,
-    Qwen3Config, Qwen3ForCausalLM,
+    LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -66,6 +66,22 @@ def tiny_qwen3() -> Qwen3ForCausalLM:
         rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu")
     torch.manual_seed(0)
     return Qwen3ForCausalLM(config)
+
+
+def tiny_llama() -> LlamaForCausalLM:
+    """Untied head and biased projections: the two switches Qwen3 leaves off.
+
+    Llama applies config.attention_bias to all four projections, which is
+    what CausalSelfAttention's one flag means, so a biased fixture is the
+    test that the bias path loads.
+    """
+    config = LlamaConfig(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+        tie_word_embeddings=False, rope_theta=5e5, max_position_embeddings=64,
+        rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu")
+    torch.manual_seed(0)
+    return LlamaForCausalLM(config)
 
 
 def tiny_gemma3() -> Gemma3ForCausalLM:
@@ -188,6 +204,7 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
+    write_tiny("llama-tiny", tiny_llama())
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)

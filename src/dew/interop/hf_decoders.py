@@ -7,9 +7,10 @@ safetensors shards as fp32 without torch, and build the model, so
 load_pretrained_decoder returns a (model, variables, hf_config) triple that a
 forward pass takes straight away.
 
-The families covered are the ones CausalTransformer can express: llama, qwen2,
-qwen3 and gemma3_text, including the text_config of a gemma3 multimodal
-checkpoint. A config field that changes what the model computes and has no dew
+The families covered are the ones CausalTransformer can express: llama, qwen3
+and gemma3_text, including the text_config of a gemma3 multimodal checkpoint.
+qwen2 is refused rather than half-loaded, since its q/k/v biases without an
+o_proj bias have no counterpart in the backbone's one attention_bias flag. A config field that changes what the model computes and has no dew
 counterpart raises a ValueError naming it, rather than loading a model that
 silently computes something else.
 """
@@ -112,39 +113,42 @@ def _rope(hf_config: Mapping[str, Any], used: set) -> Tuple[float, Optional[floa
 def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
     """Per-layer attention windows, derived the way the family's config does.
 
-    qwen2/qwen3 configs in the wild leave layer_types unset and derive it from
-    use_sliding_window, sliding_window and max_window_layers. gemma3_text
-    derives its sliding_window_pattern repetition when layer_types is missing.
-    A config that carries layer_types is taken at its word, for both.
+    A config that carries layer_types is taken at its word. Without it, qwen3
+    makes every layer from max_window_layers on sliding, and only when
+    use_sliding_window says so; gemma3_text repeats its sliding_window_pattern,
+    five sliding layers to one full; llama has no sliding layers at all.
     """
     layers = int(hf_config['num_hidden_layers'])
+    model_type = hf_config.get('model_type')
     layer_types = hf_config.get('layer_types')
     if layer_types is not None:
         used.add('layer_types')
         return tuple(layer_types)
 
-    if hf_config.get('model_type') in ('qwen2', 'qwen3'):
+    if model_type == 'qwen3':
         used.update(('use_sliding_window', 'sliding_window'))
-        if not hf_config.get('use_sliding_window', False):
-            return ('full_attention',) * layers
-        if hf_config.get('sliding_window') is None:
+        if (not hf_config.get('use_sliding_window', False)
+                or hf_config.get('sliding_window') is None):
             return ('full_attention',) * layers
         first_sliding = int(hf_config.get('max_window_layers', layers))
         return tuple('sliding_attention' if index >= first_sliding else 'full_attention'
                      for index in range(layers))
 
-    pattern = int(hf_config.get('sliding_window_pattern', 6))
-    used.add('sliding_window_pattern')
-    return tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
-                 for index in range(layers))
+    if model_type == _GEMMA:
+        pattern = int(hf_config.get('sliding_window_pattern', 6))
+        used.add('sliding_window_pattern')
+        return tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
+                     for index in range(layers))
+
+    return ('full_attention',) * layers
 
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
 
     Accepts the text decoder families CausalTransformer can express: llama,
-    qwen2, qwen3 and gemma3_text, plus a gemma3 multimodal config by reading
-    its text_config. Every field that changes what a forward pass computes and
+    qwen3 and gemma3_text, plus a gemma3 multimodal config by reading its
+    text_config. Every field that changes what a forward pass computes and
     has no dew counterpart raises, naming the field.
     """
     hf_config = dict(hf_config)
@@ -161,9 +165,16 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
                     "expected 'gemma3_text'")
 
     model_type = hf_config.get('model_type')
-    if model_type not in ('llama', 'qwen2', 'qwen3', 'gemma3_text'):
+    if model_type == 'qwen2':
+        # Qwen2 biases q/k/v and leaves o_proj bias-free (modeling_qwen2.py
+        # 189-192), and CausalSelfAttention has one attention_bias flag for
+        # all four projections, so its checkpoints cannot load unchanged.
+        _refuse("model_type 'qwen2'",
+                "its q/k/v projections carry biases and o_proj does not, which "
+                "the one attention_bias flag cannot say")
+    if model_type not in ('llama', 'qwen3', 'gemma3_text'):
         _refuse(f"model_type {model_type!r}",
-                "expected one of 'llama', 'qwen2', 'qwen3', 'gemma3_text'")
+                "expected one of 'llama', 'qwen3', 'gemma3_text'")
 
     if hf_config.get('use_bidirectional_attention', False):
         _refuse("use_bidirectional_attention=True", "the backbone is causal")
@@ -439,9 +450,9 @@ def save_pretrained_decoder(model, variables, directory, *,
     The inverse of load_pretrained_decoder: the same field map, run backwards,
     so a round-trip through dew hands transformers a checkpoint it accepts and
     a load hands back bitwise-equal parameters. model_type is gemma3_text when
-    the sandwich norms are on, qwen3 when the q/k norms are, llama otherwise;
-    attention-biased qwen2 checkpoints are not written, since the exported
-    family would not carry them.
+    the sandwich norms are on, qwen3 when the q/k norms are, llama otherwise.
+    Only a llama export can carry attention biases, which is the one family
+    whose reference applies them to all four projections.
     """
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.interop.safetensors_io import save_hf_layout
@@ -518,12 +529,13 @@ def _export_config(model) -> Dict[str, Any]:
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
-    if model.attention_bias:
-        # qwen2 is the only family here whose checkpoints carry q/k/v/o
-        # biases, and this writer does not target its layout.
+    if model.attention_bias and model_type != 'llama':
+        # Llama applies config.attention_bias to all four projections, the
+        # same thing this flag means; qwen3 and gemma3_text attention is
+        # bias-free in transformers, so such an export would not load.
         raise ValueError(
-            "attention_bias=True has no family to export as: qwen3, llama and "
-            "gemma3_text checkpoints are bias-free")
+            f"attention_bias=True cannot export as model_type {model_type}: "
+            "only llama carries biases on all four projections")
     if model.rope_local_theta is not None:
         if sandwich:
             config['rope_parameters'] = {

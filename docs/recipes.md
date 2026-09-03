@@ -67,4 +67,4 @@ python recipes/lm/train.py --data.dataset data/corpus-qwen3 --pretrained Qwen/Qw
     --tokenizer Qwen/Qwen3-0.6B --sequence-length 512 --data.batch-size 4 --optim.learning-rate 1e-5
 ```
 
-It takes a hub repo id or a local directory in the HF layout, of the families `dew.interop.hf_decoders` covers (llama, qwen2, qwen3, gemma3_text). The checkpoint decides the architecture, so `--model.config` may only carry `max_seq_len`, and the token files must have been written with the tokenizer the checkpoint expects.
+It takes a hub repo id or a local directory in the HF layout, of the families `dew.interop.hf_decoders` covers (llama, qwen3, gemma3_text). The checkpoint decides the architecture, so `--model.config` may only carry `max_seq_len`, and the token files must have been written with the tokenizer the checkpoint expects.

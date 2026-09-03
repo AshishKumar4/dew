@@ -8,8 +8,10 @@ whose logits are committed, so the comparison runs in CI without a download.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
-- qwen3-tiny  : max |logit difference| 8.4e-06, tolerance 1e-4
-- gemma3-tiny : max |logit difference| 3.4e-06, tolerance 1e-4
+- qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
+- gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
+- llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
+  biased projections)
 - Qwen3-0.6B  : max |top-32 logit difference| 1.4e-04, mean 1.2e-05, tolerance
   5e-3, and the argmax of all 48 positions equal. The larger residue is 28
   layers of a real checkpoint accumulating fp32 rounding, not a different
@@ -33,7 +35,7 @@ from dew.interop.hf_decoders import (
 from dew.registry import apply_precision_policy, build_model
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-TINY = ("qwen3-tiny", "gemma3-tiny")
+TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -116,6 +118,7 @@ def test_the_real_gemma3_1b_config_translates():
 
 @pytest.mark.parametrize("field, value, message", [
     ('model_type', 'mamba', "model_type 'mamba'"),
+    ('model_type', 'qwen2', "o_proj does not"),
     ('attn_logit_softcapping', 50.0, "attn_logit_softcapping"),
     ('use_bidirectional_attention', True, "use_bidirectional_attention"),
     ('hidden_activation', 'relu', "hidden_act 'relu'"),
