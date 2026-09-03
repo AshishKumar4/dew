@@ -253,3 +253,25 @@ def test_a_pretrained_checkpoint_from_another_tokenizer_is_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="expects gpt2"):
         recipe.main(config)
+
+
+def test_a_padded_embedding_table_is_not_a_vocabulary_mismatch(tmp_path):
+    """Qwen3 stores 151936 rows for 151669 tokens, and every real decoder pads
+    like that, so covering the ids is the requirement rather than matching."""
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=250)
+    export, _ = tiny_export(tmp_path / "checkpoint")
+
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {}, dtype="float32"),
+        data=DataConfig(dataset=str(dataset), batch_size=4, val_steps_per_epoch=1,
+                        worker_count=0),
+        trainer=trainer_config(tmp_path, epochs=1, steps_per_epoch=1),
+        sequence_length=32,
+        sample_tokens=0,
+        pretrained=str(export),
+    )
+    trainer = recipe.main(config)
+
+    assert trainer.model.vocab_size == 256 and trainer.objective.vocab_size == 250
+    assert int(trainer.state.step) == 1

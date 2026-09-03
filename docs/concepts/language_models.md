@@ -50,6 +50,41 @@ LMObjective(model, 256, vocab_size=meta["vocab_size"], samples={
 
 The prompt in `samples` is one sequence of ids or several of the same length, which the objective batches into the `[B, P]` that `generate` takes. The sampling key is folded with the step so each validation writes different text, and `decode` is what turns the ids back into the string that gets logged.
 
+## Pretrained checkpoints
+
+`dew.interop.hf_decoders` loads a Hugging Face decoder into the same `CausalTransformer` a from-scratch run trains, because the backbone's parameter names are the HF ones and its config surface covers what these families vary:
+
+```python
+from dew.interop import load_pretrained_decoder, save_pretrained_decoder
+
+model, variables, hf_config = load_pretrained_decoder("Qwen/Qwen3-0.6B")
+logits = model.apply(variables, tokens)              # [B, S, 151936] fp32
+save_pretrained_decoder(model, variables, "out/qwen3-tuned",
+                        tokenizer_name="Qwen/Qwen3-0.6B")
+```
+
+- `load_pretrained_decoder(name_or_dir, *, dtype='bfloat16', attention_impl='auto', max_seq_len=None, revision=None)` takes a hub repo id or a local directory in the HF layout. It downloads only `*.safetensors` and `*.json`, reads the shards as float32 without torch (`safetensors.numpy` cannot read bfloat16, so those leaves are widened here), and builds the model through the same `apply_precision_policy` a recipe uses, so `dtype` is the compute dtype and the parameters stay float32. `max_seq_len` defaults to the config's context clamped to 8192, since the KV cache is allocated at that length whether decoding uses it or not.
+- `translate_config(hf_config)` is the field map on its own, and `translate_weights(tensors, config)` the key map: `.weight` of a Linear becomes a transposed `.kernel`, a norm's `.weight` becomes `.scale`, `embed_tokens.weight` becomes `embed_tokens.embedding`, and a tied `lm_head.weight` is dropped after checking it really is the copy of the embedding it claims to be.
+- `save_pretrained_decoder(model, variables, directory, *, tokenizer_name=None)` writes `config.json`, `model.safetensors` and `generation_config.json` back in HF vocabulary: `gemma3_text` when the sandwich norms are on, `qwen3` when the q/k norms are, `llama` otherwise. transformers loads the result, and `load_pretrained_decoder` on it returns bitwise-equal parameters.
+
+What loads today is `llama`, `qwen2`, `qwen3` and `gemma3_text`, including the `text_config` of a multimodal `gemma3` checkpoint. Gemma needs four things beyond a Qwen: `sandwich_norms` for the norms on each sublayer's output (HF calls them `post_attention_layernorm` and `post_feedforward_layernorm`, which is why the rename exists), `scale_offset` for its `(1 + w)` norm scales, `embedding_scale` for the `sqrt(hidden)` on the embeddings, and `attention_scale` for `query_pre_attn_scalar ** -0.5` in place of `head_dim ** -0.5`.
+
+A config field that changes what the model computes and has no counterpart here is a `ValueError` naming the field, not a silent skip: `attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation that is neither silu nor tanh-gelu, and any `rope_scaling` other than plain rope (Llama 3's `llama3` scaling and Gemma 3 1B's `linear` factor of 8 are both refused). What does not load at all yet, for want of the layers rather than the names: Qwen3.5's GatedDeltaNet mixer, and Gemma 4's per-layer embeddings and cross-layer KV sharing.
+
+Parity is the acceptance bar for a family, not a nice-to-have. `tools/hf_reference.py` writes the fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 on CPU: 8.4e-06 max absolute difference on a random-weight Qwen3, 3.4e-06 on a random-weight Gemma3, and on the real Qwen3-0.6B weights the same argmax at all 48 prompt positions with 1.4e-04 max difference over the reference's top 32 logits per position.
+
+`recipes/lm/train.py --pretrained` continues training one of these:
+
+```bash
+python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-qwen3 \
+    --tokenizer Qwen/Qwen3-0.6B
+python recipes/lm/train.py --data.dataset data/corpus-qwen3 --pretrained Qwen/Qwen3-0.6B \
+    --tokenizer Qwen/Qwen3-0.6B --sequence-length 512 --data.batch-size 4 \
+    --optim.learning-rate 1e-5
+```
+
+The checkpoint decides every architecture field, so `--model.config` may carry `max_seq_len` and nothing else, and the token files have to come from the checkpoint's own tokenizer: a `meta.json` written with a different one stops the run instead of training the embedding table against ids that mean something else.
+
 ## Running it
 
 ```bash
