@@ -256,16 +256,21 @@ class ObjectiveTrainer(SimpleTrainer):
                 train_state = train_state.replace(dynamic_scale=dynamic_scale)
                 new_state = train_state.apply_gradients(grads=grads)
 
-                # Handle NaN/Inf gradients
+                # Overflowed gradients mean the update did not happen, so the
+                # step counter, which every schedule reads, stays with the
+                # params and the optimizer state.
                 select_fn = functools.partial(jnp.where, grads_finite)
                 new_state = new_state.replace(
+                    step=select_fn(new_state.step, train_state.step),
                     opt_state=jax.tree.map(select_fn, new_state.opt_state, train_state.opt_state),
                     params=jax.tree.map(select_fn, new_state.params, train_state.params)
                 )
+                ema_due = grads_finite
             else:
                 grad_fn = jax.value_and_grad(objective_loss, has_aux=True)
                 (loss, aux), grads = grad_fn(train_state.params)
                 new_state = train_state.apply_gradients(grads=grads)
+                ema_due = True
 
             # The EMA copy is sharded like the params it tracks, so averaging a
             # subtree stays a local read-modify-write on every device.
@@ -275,13 +280,16 @@ class ObjectiveTrainer(SimpleTrainer):
             # same clock: averaging every micro-step would blend in params that
             # never changed and advance the decay schedule accum times too fast.
             # The schedule is therefore indexed by completed updates, and the
-            # average only happens on the micro-step whose update lands.
+            # average only happens on the micro-step whose update lands. A
+            # rejected mixed-precision step is not an update either.
             update_index = train_state.step // accum
-            if accum == 1:
+            if accum > 1:
+                ema_due = ema_due & ((train_state.step + 1) % accum == 0)
+            if ema_due is True:
                 new_state = new_state.apply_ema(ema.decay(update_index), ema.path)
             else:
                 new_state = jax.lax.cond(
-                    (train_state.step + 1) % accum == 0,
+                    ema_due,
                     lambda s: s.apply_ema(ema.decay(update_index), ema.path),
                     lambda s: s,
                     new_state,

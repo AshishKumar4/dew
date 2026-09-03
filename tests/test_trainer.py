@@ -19,6 +19,7 @@ from dew.eval.common import EvaluationMetric
 from dew.inputs import DiffusionInputConfig
 from dew.nn.backbones.dit import SimpleDiT
 from dew.diffusion.transforms import get_diffusion_preset
+from dew.objectives.base import EMASpec, Objective
 from dew.training import ObjectiveTrainer, SimpleTrainer
 from dew.training import objective_trainer as gdt
 from dew.checkpoints.utils import get_latest_checkpoint
@@ -384,3 +385,77 @@ def test_a_failing_validation_step_fails_the_base_pass(tmp_path):
 
     with pytest.raises(ZeroDivisionError):
         trainer.validation_loop(trainer.state, divide_by_zero, None, 1, 0)
+
+
+# --------------------------------------------------------------------------
+# Rejected mixed-precision steps
+# --------------------------------------------------------------------------
+
+class ScaledObjective(Objective):
+    """loss = scale * sum(w^2), with the scale carried by the batch so that
+    one batch overflows the scaled float32 loss while the params stay sane."""
+
+    input_shapes = {"scale": ()}
+
+    def __init__(self):
+        self.ema = EMASpec(decay=lambda step: 0.5)
+
+    def init_params(self, rng):
+        return {"params": {"w": jnp.ones((2,))}}
+
+    def loss(self, params, ema_params, batch, rng, step):
+        return jnp.sum(params["params"]["w"] ** 2) * batch["scale"][0], {}
+
+    def make_validation_step(self, **kwargs):
+        return lambda val_state, batch: None
+
+
+def host(state):
+    # Copies, because the step donates the state it is handed.
+    return (np.array(state.params["params"]["w"]),
+            np.array(state.ema_params["params"]["w"]),
+            int(state.step))
+
+
+@pytest.mark.parametrize("accum", [1, 2])
+def test_a_rejected_dynamic_scale_step_leaves_no_trace(tmp_path, accum):
+    """A step whose scaled gradients overflowed is skipped, and skipped means
+    all of it. The params and the optimizer state are held; the step counter
+    and the EMA have to be held with them, or a rejected step ages every
+    schedule and averages in params that were never updated."""
+    optimizer = optax.sgd(0.1)
+    if accum > 1:
+        optimizer = optax.MultiSteps(optimizer, every_k_schedule=accum)
+    trainer = ObjectiveTrainer(
+        model=Affine(), optimizer=optimizer, rngs=jax.random.PRNGKey(0),
+        objective=ScaledObjective(), grad_accum_steps=accum, name="rejected",
+        checkpoint_base_path=str(tmp_path), distributed_training=False,
+        use_dynamic_scale=True)
+    train_step = trainer._define_train_step(batch_size=1)
+    good = {"scale": jnp.ones((1,), jnp.float32)}
+    # 1e35 * sum(w^2) * the 65536 loss scale is past float32's max.
+    bad = {"scale": jnp.full((1,), 1e35, jnp.float32)}
+
+    state, rng = trainer.state, trainer.rngstate
+    # One landed update (w = 1 - 0.1 * 2, ema = 0.5 + 0.5 * 0.8), then the
+    # micro-steps leading up to the next one, so the rejected step is the one
+    # whose update would have landed.
+    for _ in range(2 * accum - 1):
+        state, _, _, rng, _ = train_step(state, rng, good)
+    w, ema, step = host(state)
+    np.testing.assert_allclose(w, 0.8, rtol=1e-6)
+    np.testing.assert_allclose(ema, 0.9, rtol=1e-6)
+    assert step == 2 * accum - 1
+
+    state, _, _, rng, is_finite = train_step(state, rng, bad)
+    assert not bool(is_finite)
+    held_w, held_ema, held_step = host(state)
+    np.testing.assert_array_equal(held_w, w)
+    np.testing.assert_array_equal(held_ema, ema)
+    assert held_step == step
+
+    state, *_ = train_step(state, rng, good)
+    w, ema, step = host(state)
+    np.testing.assert_allclose(w, 0.64, rtol=1e-6)    # 0.8 - 0.1 * 2 * 0.8
+    np.testing.assert_allclose(ema, 0.77, rtol=1e-6)  # 0.5 * 0.9 + 0.5 * 0.64
+    assert step == 2 * accum
