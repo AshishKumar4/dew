@@ -16,6 +16,7 @@ import sys
 import wave
 from pathlib import Path
 
+import cv2
 import grain.python as pygrain
 import numpy as np
 import pytest
@@ -29,7 +30,8 @@ from dew.data.sources.av_utils import choose_clip_start
 from dew.data.sources.base import DataAugmenter, DataSource, MediaDataset
 from dew.data.sources.hf import HFDatasetSource
 from dew.data.sources.images import (
-    CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, gcs_filters,
+    CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, augment_image,
+    gcs_filters, image_augmentations, image_augmenter, labelizer_oxford_flowers102,
 )
 from dew.data.sources import videos as videos_module
 from dew.data.sources.videos import AudioVideoAugmenter, VideoLocalSource
@@ -653,3 +655,92 @@ def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
 
     with pytest.raises(AttributeError):
         collate(batch)
+
+
+# ---------------------------------------------------------------------------------
+# Stream termination: a validation pass ends, a training stream does not
+# ---------------------------------------------------------------------------------
+
+# Both grain factories build their validation sampler with the num_epochs a run
+# passes, which is None, so today a pass never ends and its records come round
+# again. wave/fix-val-split owns that sampler; the tests carrying this reason
+# state the contract its fix has to meet, and they fail until it lands.
+ENDLESS_VAL = "an endless validation pass; wave/fix-val-split owns the sampler"
+
+
+def _bounded(loader, limit):
+    """At most `limit` batches, and whether the stream ended inside them.
+
+    Bounded on purpose: an endless stream then fails a count instead of
+    hanging the suite.
+    """
+    iterator = iter(loader)
+    taken = list(itertools.islice(iterator, limit))
+    return taken, next(iterator, None) is None
+
+
+def test_a_media_validation_pass_ends_when_the_split_runs_out(fake_media_dataset):
+    """Sixteen held-out records at batch eight are two batches, then the end."""
+    data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                   val_count=16, worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+    assert indices == list(range(16))
+
+
+def test_a_legacy_validation_pass_ends_when_the_split_runs_out(fake_legacy_dataset):
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_count=16,
+        worker_count=0, val_worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+    assert indices == list(range(16))
+
+
+@pytest.mark.parametrize("worker_count", [0, 1, pytest.param(2, marks=pytest.mark.slow)])
+def test_a_validation_pass_covers_the_held_out_split_once_at_any_worker_count(
+        fake_media_dataset, worker_count):
+    """Every held-out record reaches the metrics once, and no record the model
+    trains on does.
+
+    Which batch a record lands in is worker_count's business, since each worker
+    batches its own slice of the sampler's indices. The set is not.
+    """
+    data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                   val_count=16, worker_count=worker_count)
+
+    batches, _ = _bounded(data["val"](), 2)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+    train, _ = _bounded(data["train"](), 2)
+
+    assert sorted(indices) == list(range(16))
+    assert {int(i) for batch in train for i in batch["index"]}.isdisjoint(indices)
+
+
+@pytest.mark.parametrize("factory", ["media", "legacy"])
+def test_the_training_stream_repeats_instead_of_ending(
+        factory, fake_media_dataset, fake_legacy_dataset):
+    """num_epochs is None in a run, and the trainer keeps asking for batches
+    long after one pass over the records."""
+    if factory == "media":
+        data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                       val_count=16, worker_count=0)
+    else:
+        data = dataloaders.get_dataset_grain(
+            "fake", dataset_source="/tmp", batch_size=8, val_count=16,
+            worker_count=0, val_worker_count=0)
+
+    epoch = data["train_len"] // 8  # the sixteen training records, in two batches
+    batches, ended = _bounded(data["train"](), 3 * epoch)
+    first_epoch = [int(i) for batch in batches[:epoch] for i in batch["index"]]
+    later = [int(i) for batch in batches[epoch:] for i in batch["index"]]
+
+    assert not ended and len(batches) == 3 * epoch
+    assert sorted(first_epoch) == list(range(16, 32))
+    assert set(later) == set(first_epoch), "the stream reads the same records again"
