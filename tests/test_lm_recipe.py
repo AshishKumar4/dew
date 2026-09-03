@@ -243,3 +243,126 @@ def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="do not fill one batch"):
         recipe.main(config)
+def tiny_export(directory, tokenizer_name="byte"):
+    """A local checkpoint in the HF layout, as --pretrained takes one."""
+    from dew.interop.hf_decoders import (
+        load_pretrained_decoder, save_pretrained_decoder,
+    )
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "qwen3-tiny"
+    model, variables, _ = load_pretrained_decoder(
+        str(fixture), dtype='float32', attention_impl='reference')
+    save_pretrained_decoder(model, variables, directory,
+                            tokenizer_name=tokenizer_name)
+    return directory, variables
+
+
+def test_the_recipe_continues_training_from_a_pretrained_checkpoint(tmp_path):
+    """--pretrained decides the architecture and the initial weights: the run
+    starts from the checkpoint's parameters, not from a fresh init."""
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=256)
+    export, variables = tiny_export(tmp_path / "checkpoint")
+
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {}, dtype="float32"),
+        data=DataConfig(dataset=str(dataset), batch_size=4, val_steps_per_epoch=1,
+                        worker_count=0),
+        trainer=trainer_config(tmp_path, epochs=1, steps_per_epoch=2),
+        sequence_length=32,
+        sample_tokens=0,
+        pretrained=str(export),
+    )
+    trainer = recipe.main(config)
+
+    # the checkpoint's own shape, none of the recipe's defaults
+    assert (trainer.model.emb_features, trainer.model.num_layers) == (64, 2)
+    assert trainer.model.vocab_size == 256 and trainer.model.qk_norm
+    started_from = trainer.objective.pretrained
+    assert started_from is not None
+    assert np.array_equal(
+        np.asarray(started_from["params"]["embed_tokens"]["embedding"]),
+        np.asarray(variables["params"]["embed_tokens"]["embedding"]))
+    assert int(trainer.state.step) == 2
+
+
+def test_a_pretrained_run_logs_the_config_it_built_the_model_from(tmp_path):
+    """model_config is what lands in wandb and what run_summary spreads into
+    arguments, so it has to be the dew config the model ran with, compute dtype
+    and attention kernel included, and it has to rebuild that model through the
+    config parser every other run's config goes through."""
+    from dew.registry import build_model
+
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=256)
+    export, _ = tiny_export(tmp_path / "checkpoint")
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {}, dtype="float32",
+                          attention_impl="reference"),
+        data=DataConfig(dataset=str(dataset), worker_count=0),
+        trainer=trainer_config(tmp_path),
+        sequence_length=32,
+        pretrained=str(export),
+    )
+
+    model, _, model_config = recipe.load_pretrained(
+        config, vocab_size=256, max_seq_len=32, meta=recipe.read_meta(str(dataset)))
+
+    assert model_config["dtype"] == "float32"
+    assert model_config["attention_impl"] is None, "'reference' is the kernel None"
+    assert build_model("causal_transformer", model_config) == model
+
+
+def test_a_pretrained_run_refuses_architecture_overrides(tmp_path):
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=256)
+    export, _ = tiny_export(tmp_path / "checkpoint")
+
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {"emb_features": 128}),
+        data=DataConfig(dataset=str(dataset), worker_count=0),
+        trainer=trainer_config(tmp_path),
+        sequence_length=32,
+        pretrained=str(export),
+    )
+    with pytest.raises(ValueError, match="emb_features"):
+        recipe.main(config)
+
+
+def test_a_pretrained_checkpoint_from_another_tokenizer_is_rejected(tmp_path):
+    """The ids on disk have to come from the checkpoint's own vocabulary."""
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=256)
+    export, _ = tiny_export(tmp_path / "checkpoint", tokenizer_name="gpt2")
+
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {}),
+        data=DataConfig(dataset=str(dataset), worker_count=0),
+        trainer=trainer_config(tmp_path),
+        sequence_length=32,
+        pretrained=str(export),
+    )
+    with pytest.raises(ValueError, match="expects gpt2"):
+        recipe.main(config)
+
+
+def test_a_padded_embedding_table_is_not_a_vocabulary_mismatch(tmp_path):
+    """Qwen3 stores 151936 rows for 151669 tokens, and every real decoder pads
+    like that, so covering the ids is the requirement rather than matching."""
+    recipe = load_recipe()
+    dataset = write_token_files(tmp_path / "tokens", vocab_size=250)
+    export, _ = tiny_export(tmp_path / "checkpoint")
+
+    config = recipe.LmRunConfig(
+        model=ModelConfig("causal_transformer", {}, dtype="float32"),
+        data=DataConfig(dataset=str(dataset), batch_size=4, val_steps_per_epoch=1,
+                        worker_count=0),
+        trainer=trainer_config(tmp_path, epochs=1, steps_per_epoch=1),
+        sequence_length=32,
+        sample_tokens=0,
+        pretrained=str(export),
+    )
+    trainer = recipe.main(config)
+
+    assert trainer.model.vocab_size == 256 and trainer.objective.vocab_size == 250
+    assert int(trainer.state.step) == 1
