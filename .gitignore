@@ -30,3 +30,5 @@ NEWREPO.md
 .claude/
 .venv/
 .worktrees/
+tutorials/executed/
+samples/

@@ -42,6 +42,7 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 - Assert the invariant, not the observation. A stream that should end must end (exactly ceil(N/batch) batches, then stop). Records that should be distinct must be distinct. Splits that should be disjoint must be disjoint. Metrics that should reach the tracker must reach it when the stream ends. State the property and let it fail.
 - Multiprocess and multi-device paths are tested with real processes and real meshes: worker_count above zero with workers actually running, iterator state through a restart, jax.distributed across spawned processes, loss parity between one process and many at the same seed. A single-process simulation of a mesh is necessary and not sufficient.
 - A warning is a failure waiting to be reported. If the suite emits one, either the code is wrong or the warning is noise that should be silenced at its source with a reason. Nothing stays in the tail of a green run.
+- Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
 - `tests/test_architectures.py` fails when a registry entry has no training case. Keep it that way.
 
 ## Writing

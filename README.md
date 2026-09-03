@@ -427,7 +427,7 @@ The scripts in [`examples/`](examples/) go from a dataset to a trained model, sa
 * [`train_jepa.py`](examples/train_jepa.py): an I-JEPA encoder with linear and kNN probes, the encoder saved on its own.
 * [`train_lm.py`](examples/train_lm.py): a byte-level language model on a tokenized corpus, a sample written after training.
 
-The notebooks in [`tutorials/`](tutorials/) build diffusion from scratch without the library. See [docs/recipes.md](docs/recipes.md) for the full config tree.
+The notebooks in [`tutorials/`](tutorials/) teach the library: [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it, [02](tutorials/02-train-a-diffusion-model.ipynb) trains a DiT through `ObjectiveTrainer`, and [04](tutorials/04-samplers-and-schedules.ipynb) compares the samplers on the trained checkpoint. A text-to-image tutorial with CLIP conditioning and classifier-free guidance follows the vendored text encoder. See [docs/recipes.md](docs/recipes.md) for the full config tree.
 
 ## Evaluation and export
 
@@ -585,7 +585,7 @@ Dew builds on [JAX](https://github.com/jax-ml/jax), [Flax](https://github.com/go
 
 * [Concepts](docs/concepts/): [objectives](docs/concepts/objectives.md), [distributed training](docs/concepts/distributed.md), [the data pipeline](docs/concepts/data.md), [language models](docs/concepts/language_models.md), [mixture of experts](docs/concepts/moe.md)
 * [API reference](docs/api.md), [recipes](docs/recipes.md), [benchmarks](docs/benchmarks.md), [TPUs](docs/tpu.md)
-* [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/simple%20diffusion%20flax.ipynb), a notebook that builds diffusion from scratch without the library
+* [Diffusion explained](https://nbviewer.org/github/AshishKumar4/dew/blob/main/tutorials/01-diffusion-from-scratch.ipynb), a notebook that builds diffusion from scratch without the library
 * [Gallery](docs/gallery.md) and [migrating from FlaxDiff](docs/from-flaxdiff.md)
 
 Dew is released under the [MIT license](LICENSE).
