@@ -427,7 +427,7 @@ The scripts in [`examples/`](examples/) go from a dataset to a trained model, sa
 * [`train_jepa.py`](examples/train_jepa.py): an I-JEPA encoder with linear and kNN probes, the encoder saved on its own.
 * [`train_lm.py`](examples/train_lm.py): a byte-level language model on a tokenized corpus, a sample written after training.
 
-The notebooks in [`tutorials/`](tutorials/) teach the library: [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it, [02](tutorials/02-train-a-diffusion-model.ipynb) trains a DiT through `ObjectiveTrainer`, and [04](tutorials/04-samplers-and-schedules.ipynb) compares the samplers on the trained checkpoint. A text-to-image tutorial with CLIP conditioning and classifier-free guidance follows the vendored text encoder. See [docs/recipes.md](docs/recipes.md) for the full config tree.
+The notebooks in [`tutorials/`](tutorials/) teach the library: [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it, [02](tutorials/02-train-a-diffusion-model.ipynb) trains a DiT through `ObjectiveTrainer`, [03](tutorials/03-text-to-image-with-guidance.ipynb) adds CLIP conditioning, classifier-free guidance and the SD-VAE latent option, and [04](tutorials/04-samplers-and-schedules.ipynb) compares the samplers on the trained checkpoint. See [docs/recipes.md](docs/recipes.md) for the full config tree.
 
 ## Evaluation and export
 
