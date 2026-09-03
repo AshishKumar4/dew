@@ -160,7 +160,8 @@ def get_dataset_grain(
         data_name: Name of the dataset in datasetMap.
         batch_size: Batch size for the dataset.
         image_scale: Size to scale images to.
-        count: Optional count limit for the dataset.
+        count: Records to use, from the head of the source; at most the
+            records it holds. None uses them all.
         num_epochs: Epochs the training stream repeats for, None for
             forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
@@ -188,6 +189,11 @@ def get_dataset_grain(
     data_source = dataset["source"](dataset_source)
     augmenter = dataset["augmenter"](image_scale, method)
     local_batch_size = _local_batch_size(batch_size)
+    if count is not None and count > len(data_source):
+        raise ValueError(
+            f"count {count} is more than the {len(data_source)} records of "
+            f"'{data_name}'"
+        )
     dataset_length = len(data_source) if count is None else count
 
     # A held-out slice off the head keeps the two loaders disjoint, so FID and
@@ -440,7 +446,9 @@ def get_media_dataset_grain(
         batch_size: Batch size for the dataset.
         media_scale: Size to scale media (image or video frames) to.
         sequence_length: Length of the sequence for video data.
-        count: Optional count limit for the dataset.
+        count: Records to use, from the head of the source; at most the
+            records it holds. None uses them all, and a source that reports
+            no length needs it set.
         num_epochs: Epochs the training stream repeats for, None for
             forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
@@ -506,12 +514,23 @@ def get_media_dataset_grain(
 
     local_batch_size = _local_batch_size(batch_size)
 
-    # Create a sampler for the dataset
-    if hasattr(data_source, "__len__"):
-        dataset_length = len(data_source) if count is None else count
+    # A source that reports no length gives the sampler nothing to bound its
+    # indices by, and a guessed length had it read past the data and report
+    # records nobody counted.
+    if count is None:
+        if not hasattr(data_source, "__len__"):
+            raise ValueError(
+                f"'{data_name}' reports no length, so it needs count= set to "
+                "the records it holds"
+            )
+        dataset_length = len(data_source)
     else:
-        # Some data sources like video files list don't have __len__
-        dataset_length = count if count is not None else 1000000  # Default large number
+        if hasattr(data_source, "__len__") and count > len(data_source):
+            raise ValueError(
+                f"count {count} is more than the {len(data_source)} records of "
+                f"'{data_name}'"
+            )
+        dataset_length = count
 
     train_source, val_source = data_source, None
     if val_count:
