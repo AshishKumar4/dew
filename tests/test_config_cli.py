@@ -141,6 +141,69 @@ def test_grad_accum_steps_wraps_the_optimizer_and_reaches_the_trainer(tmp_path, 
     assert isinstance(trainer.state.tx, optax.MultiSteps)
 
 
+def eight_device_batches(sample):
+    """A loader whose batches split over the eight simulated devices."""
+    def batches():
+        rs = np.random.RandomState(0)
+        while True:
+            yield sample(rs)
+    return {"train": batches, "val": batches, "train_len": 64,
+            "local_batch_size": 8, "global_batch_size": 8}
+
+
+def expert_parallel_run(name, tmp_path, monkeypatch):
+    """One step of a recipe at --trainer.expert-size 2, data faked, the model real."""
+    recipe = load_recipe(name)
+    trainer = TrainerConfig(epochs=1, steps_per_epoch=1, expert_size=2,
+                            checkpoint_dir=str(tmp_path), compilation_cache_dir=None,
+                            multi_host=False)
+    data = DataConfig(dataset=str(tmp_path), image_size=RES, batch_size=8,
+                      val_steps_per_epoch=1)
+    if name == "diffusion":
+        monkeypatch.setattr(recipe, "load_data", lambda config: eight_device_batches(
+            lambda rs: {"image": jnp.asarray(rs.uniform(0, 255, (8, RES, RES, 3))),
+                        "text": {"input_ids": np.zeros((8, TOKENS), np.int32),
+                                 "attention_mask": np.ones((8, TOKENS), np.int32)}}))
+        monkeypatch.setattr(recipe, "build_input_config", stub_input_config)
+        config = recipe.DiffusionRunConfig(
+            model=ModelConfig("simple_dit", {
+                "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
+                "mlp_ratio": 1}),
+            data=data, trainer=trainer, val_metrics=[])
+    elif name == "jepa":
+        monkeypatch.setattr(recipe, "load_data", lambda config: eight_device_batches(
+            lambda rs: {"image": jnp.asarray(rs.uniform(0, 255, (8, RES, RES, 3))),
+                        "label": jnp.asarray(rs.randint(0, 4, 8))}))
+        config = recipe.JepaRunConfig(
+            model=ModelConfig("jepa_encoder", {
+                "patch_size": PATCH, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                "mlp_ratio": 2}),
+            data=data, trainer=trainer,
+            predictor={"predictor_features": 8, "num_layers": 1, "num_heads": 2})
+    else:
+        monkeypatch.setattr(recipe, "read_meta",
+                            lambda dataset: {"tokenizer": "byte", "vocab_size": 256})
+        monkeypatch.setattr(recipe, "load_data", lambda config: eight_device_batches(
+            lambda rs: {"text": rs.randint(0, 256, (8, 9)).astype(np.int32)}))
+        config = recipe.LmRunConfig(
+            model=ModelConfig("causal_transformer",
+                              {"emb_features": 16, "num_layers": 1, "num_heads": 2}),
+            data=data, trainer=trainer, sequence_length=8, sample_tokens=0)
+    return recipe.main(config)
+
+
+@pytest.mark.parametrize("name", ["diffusion", "jepa", "lm"])
+def test_expert_size_reaches_the_recipes_mesh(name, tmp_path, monkeypatch):
+    """--trainer.expert-size parses and is documented, and every recipe dropped
+    it on the floor: an expert-parallel run trained on a mesh with an expert
+    axis of one, every expert replicated. On the eight simulated devices an
+    expert_size of 2 has to leave four for data."""
+    trainer = expert_parallel_run(name, tmp_path, monkeypatch)
+
+    assert dict(trainer.mesh.shape) == {"data": 4, "expert": 2, "fsdp": 1}
+    assert int(trainer.state.step) == 1
+
+
 def reference_optimizer(config: OptimConfig, steps_per_epoch: int):
     """The recipes' old inline construction, verbatim, for equivalence."""
     learning_rate = config.learning_rate
