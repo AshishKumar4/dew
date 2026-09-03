@@ -1,20 +1,26 @@
-"""safetensors round-trips for Flax parameter trees.
+"""safetensors round-trips for Flax parameter trees, and the hub round trip.
 
 The tree is nested and the file is flat, so what these tests hold onto is the
 '/'-joined naming: nesting, values and dtypes have to survive a save and a
 load, the names on disk have to be readable by a safetensors reader that knows
-nothing about dew, and a missing optional dependency has to say so.
+nothing about dew, and a missing optional dependency has to say so. The hub
+pair is tested against a recording stand-in for the hub client: what matters
+is the call it makes and the directory it hands over, and no test reaches the
+network.
 """
 
 import json
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop import load_params, save_hf_layout, save_params
+from dew.interop import (
+    hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params,
+)
 from dew.nn.backbones.dit import SimpleDiT
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
@@ -83,3 +89,72 @@ def test_missing_safetensors_names_the_extra(params, tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors", None)
     with pytest.raises(ImportError, match=r"dew-ml\[interop\]"):
         save_params(params, tmp_path / "model.safetensors")
+
+
+# ---------------------------------------------------------------------------------
+# Hub push and pull
+# ---------------------------------------------------------------------------------
+
+class _RecordingApi:
+    """Stands in for HfApi and keeps every call push_to_hub makes."""
+
+    def __init__(self):
+        self.created = []
+        self.uploaded = []
+
+    def create_repo(self, repo_id, **kwargs):
+        self.created.append((repo_id, kwargs))
+
+    def upload_folder(self, **kwargs):
+        self.uploaded.append(kwargs)
+
+
+@pytest.fixture
+def api(monkeypatch):
+    recording = _RecordingApi()
+    monkeypatch.setattr(hub, "HfApi", lambda: recording)
+    return recording
+
+
+def test_push_creates_the_repo_and_uploads_the_export_directory(params, tmp_path, api):
+    export = tmp_path / "export"
+    save_hf_layout(params, {"architecture": "simple_dit"}, export)
+
+    push_to_hub(export, "acme/dew-export")
+
+    assert api.created == [("acme/dew-export", {"private": False, "exist_ok": True})]
+    assert api.uploaded == [{
+        "repo_id": "acme/dew-export",
+        "folder_path": str(export),
+        "commit_message": "Upload dew export",
+    }]
+    uploaded = Path(api.uploaded[0]["folder_path"])
+    assert {entry.name for entry in uploaded.iterdir()} == {
+        "model.safetensors", "config.json"}
+
+
+def test_push_passes_the_private_flag_and_the_commit_message_through(params, tmp_path, api):
+    export = tmp_path / "export"
+    save_hf_layout(params, {"architecture": "simple_dit"}, export)
+
+    push_to_hub(export, "acme/held-back", private=True, commit_message="step 1000")
+
+    assert api.created == [("acme/held-back", {"private": True, "exist_ok": True})]
+    assert api.uploaded[0]["commit_message"] == "step 1000"
+
+
+def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path / "snapshot")
+
+    monkeypatch.setattr(hub, "snapshot_download", snapshot_download)
+
+    assert pull_from_hub("acme/dew-export", revision="v2") == tmp_path / "snapshot"
+    assert pull_from_hub("acme/dew-export") == tmp_path / "snapshot"
+    assert calls == [
+        {"repo_id": "acme/dew-export", "revision": "v2"},
+        {"repo_id": "acme/dew-export", "revision": None},
+    ]

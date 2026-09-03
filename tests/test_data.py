@@ -27,6 +27,7 @@ from dew.data.registry import mediaDatasetMap
 from dew.data.sources.audio_utils import _read_wav_mono, read_audio_ffmpeg
 from dew.data.sources.av_utils import choose_clip_start
 from dew.data.sources.base import DataAugmenter, DataSource, MediaDataset
+from dew.data.sources.hf import HFDatasetSource
 from dew.data.sources.images import (
     CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, gcs_filters,
 )
@@ -104,14 +105,20 @@ def test_gcs_filter_returns_a_usable_filter_transform():
 
 def test_importing_dew_data_pulls_in_no_heavy_dependencies():
     """`import dew.data` used to import online_loader, which imports HF
-    `datasets` at module scope and took the whole package down with it."""
+    `datasets` at module scope and took the whole package down with it.
+
+    The hub source has the same duty: naming a hub dataset resolves without
+    the streaming extra, only reading one needs it.
+    """
     probe = (
         "import sys, dew.data;"
         "heavy = [m for m in ('datasets', 'cv2', 'decord', 'jax',"
         " 'dew.data.online_loader', 'dew.data.dataloaders')"
         " if m in sys.modules];"
         "assert not heavy, heavy;"
-        "assert dew.data.MediaDataset.__name__ == 'MediaDataset'"
+        "assert dew.data.MediaDataset.__name__ == 'MediaDataset';"
+        "dew.data.HFDatasetSource(name='acme/pets');"
+        "assert 'datasets' not in sys.modules"
     )
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
     result = subprocess.run([sys.executable, "-c", probe], cwd=REPO_ROOT,
@@ -122,9 +129,23 @@ def test_importing_dew_data_pulls_in_no_heavy_dependencies():
 def test_lazy_exports_resolve_and_unknown_names_raise_attribute_error():
     assert dew.data.get_media_dataset_grain is get_media_dataset_grain
     assert dew.data.VoxCeleb2Source is VoxCeleb2Source
+    assert dew.data.HFDatasetSource is HFDatasetSource
     assert "get_dataset_grain" in dir(dew.data)
     with pytest.raises(AttributeError, match="has no attribute"):
         dew.data.get_dataset_from_thin_air
+
+
+def test_reading_a_hub_dataset_names_the_streaming_extra(monkeypatch):
+    """Naming one works anywhere; the first record is what needs HF datasets."""
+    source = HFDatasetSource(name="acme/pets")
+    monkeypatch.setitem(sys.modules, "datasets", None)
+    with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
+        len(source)
+
+
+def test_a_hub_dataset_name_without_a_dataset_says_so():
+    with pytest.raises(ValueError, match="hf:<dataset>:<split>"):
+        get_media_dataset_grain("hf:", worker_count=0)
 
 
 def test_online_dataset_factories_defer_the_streaming_import():
@@ -233,6 +254,20 @@ def test_media_dataset_grain_passes_media_scale_to_the_video_transform(fake_medi
                             sequence_length=4, worker_count=0)
     kwargs = fake_media_dataset.augmenter.transform_kwargs
     assert kwargs["frame_size"] == 64 and kwargs["sequence_length"] == 4
+
+
+def test_media_dataset_grain_keeps_video_arguments_out_of_an_image_transform(monkeypatch):
+    """An image augmenter takes an image_scale and nothing else; a clip length
+    reached create_transform and raised TypeError on every image dataset."""
+    dataset = MediaDataset(source=_ListSource(32), augmenter=_PassthroughAugmenter(),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "fake_image", dataset)
+
+    get_media_dataset_grain("fake_image", dataset_source="/tmp", media_scale=64,
+                            sequence_length=4, worker_count=0)
+
+    kwargs = dataset.augmenter.transform_kwargs
+    assert kwargs["image_scale"] == 64 and "sequence_length" not in kwargs
 
 
 def test_legacy_grain_loader_defaults_validation_to_the_local_batch(fake_legacy_dataset):
