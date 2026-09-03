@@ -5,5 +5,14 @@
     "a photograph of an astronaut riding a horse on the moon",
     "a dense oil painting of a harbour at dawn, fishing boats tied to a stone pier, gulls over the water, the town behind it still asleep, warm light on the rooftops and a cold blue shadow in the alleys"
   ],
-  "max_length": 77
+  "max_length": 77,
+  "images": {
+    "seed": 0,
+    "shape": [
+      3,
+      64,
+      48,
+      3
+    ]
+  }
 }

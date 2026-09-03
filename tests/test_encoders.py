@@ -3,7 +3,7 @@
 The base class must stay modality-agnostic: text and audio differ in both
 tokenization and embedding, and adding a modality must not require touching
 anything shared. These use stub processors/models so no weights are
-downloaded; the network-marked test covers a real HF audio model.
+downloaded.
 """
 
 import numpy as np
@@ -76,3 +76,18 @@ def test_audio_encoder_roundtrips_config():
     config = encoder.serialize()
     assert config == {"modelname": "facebook/wav2vec2-base-960h",
                       "backend": "jax", "sampling_rate": 24000}
+
+
+def test_the_audio_loader_says_what_it_cannot_do():
+    """from_modelname reached for FlaxAutoModel, which transformers 5 removed,
+    after downloading the feature extractor, so it failed on an ImportError
+    naming a class nobody here imports. A torch model would take the same
+    path and then fail on the numpy arrays tokenize produces. It refuses up
+    front now, names the model, and says what would make it work; deserialize
+    takes the same path, so a logged audio config cannot half-build an
+    encoder."""
+    with pytest.raises(NotImplementedError, match="vendor"):
+        HFAudioEncoder.from_modelname("facebook/wav2vec2-base-960h")
+    with pytest.raises(NotImplementedError, match="facebook/wav2vec2-base-960h"):
+        HFAudioEncoder.deserialize({"modelname": "facebook/wav2vec2-base-960h",
+                                    "backend": "jax", "sampling_rate": 16000})
