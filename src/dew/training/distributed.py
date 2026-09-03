@@ -1,4 +1,5 @@
-"""Device mesh, parameter sharding and host-to-device prefetch."""
+"""Device mesh, parameter sharding, host-to-device prefetch, and the values a
+process pool has to agree on."""
 
 import json
 import math
@@ -10,6 +11,7 @@ from typing import Iterator, Optional, TypeAlias
 import jax
 import numpy as np
 from flax import linen as nn
+from jax.experimental import multihost_utils
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 DATA_AXIS = 'data'
@@ -369,3 +371,43 @@ class DevicePrefetchIterator:
             raise item
         batch, self.source_state = item
         return batch
+
+
+# --------------------------------------------------------------------------
+# What every process has to agree on
+# --------------------------------------------------------------------------
+
+def broadcast_from_process_zero(value):
+    """`value` as process 0 holds it, on every process.
+
+    JSON-encodable values only. The bytes go out behind their length, because
+    a collective needs one shape on every process and the others do not know
+    how long process 0's value is.
+    """
+    payload = np.frombuffer(json.dumps(value).encode(), np.uint8)
+    length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), np.int64)))
+    if jax.process_index() != 0:
+        payload = np.zeros(length, np.uint8)
+    return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
+
+
+def gather_positions(position: bytes) -> dict:
+    """Every process's iterator position as one table, the checkpoint's `position`.
+
+    'rows' is a uint8 [process_count, longest] array with one row per
+    process, 'lengths' the unpadded length of each. A process holds the
+    position of its own shard of the data, and orbax writes a host array from
+    process 0 alone, so the rows are gathered onto every process before a
+    save. They differ in length, which is why the lengths ride along.
+    """
+    lengths = multihost_utils.process_allgather(np.asarray(len(position), np.int64))
+    row = np.zeros(int(lengths.max()), np.uint8)
+    row[:len(position)] = np.frombuffer(position, np.uint8)
+    return {'rows': multihost_utils.process_allgather(row), 'lengths': lengths}
+
+
+def own_position(table: dict) -> bytes:
+    """This process's row of a `gather_positions` table, without its padding."""
+    index = jax.process_index()
+    row = np.asarray(table['rows'][index], np.uint8)
+    return row[:int(table['lengths'][index])].tobytes()
