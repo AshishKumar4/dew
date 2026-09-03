@@ -110,6 +110,10 @@ class Case:
     """Set for JEPA: the architecture is an encoder and this builds its predictor."""
     seq_len: int = 0
     """Set for language models: batches are token windows of this length, not images."""
+    packed_documents: int = 0
+    """Set for language models: documents packed into every row, with the
+    segment ids and positions the packed loader emits; 0 feeds a fixed
+    window, which is what a stream of tokens gives."""
     fsdp_min_param_size: int = 2 ** 16
 
     @property
@@ -224,6 +228,10 @@ class BenchmarkConfig:
     image_size: Optional[int] = None
     frames: Optional[int] = None
     """Frame count for the video cases; image cases are left alone."""
+    packed_documents: Optional[int] = None
+    """Documents per row for the language-model cases; the others are left
+    alone. This is the packed loader's batch, which reroutes attention off the
+    fused kernel."""
     checkpoint_dir: str = "/tmp/dew-benchmark-step"
     json_out: Optional[str] = None
     quiet: bool = True
@@ -259,9 +267,11 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
     def apply(case: Case) -> Case:
         # An image model handed a (T, H, W, C) sample is not a shorter
         # benchmark, it is a rank error, so --frames only resizes the video
-        # cases.
+        # cases, and packing is a language model's batch.
         frames = {} if config.frames is None or case.frames == 0 else {'frames': config.frames}
-        return dataclasses.replace(case, **overrides, **frames)
+        packed = ({'packed_documents': config.packed_documents}
+                  if config.packed_documents is not None and case.is_lm else {})
+        return dataclasses.replace(case, **overrides, **frames, **packed)
 
     return [apply(case) for case in cases]
 
@@ -338,8 +348,20 @@ def batches(case: Case):
     """One host batch, reused: the loader is benchmarked by benchmark_data.py."""
     rng = np.random.default_rng(0)
     if case.is_lm:
+        width = case.seq_len + 1
         batch = {"text": rng.integers(0, case.config["vocab_size"],
-                                      size=(case.batch_size, case.seq_len + 1)).astype(np.int32)}
+                                      size=(case.batch_size, width)).astype(np.int32)}
+        if case.packed_documents:
+            # Equal documents tiling the row. A packed row from the loader is
+            # ragged and can end in padding; what the mask and the kernel cost
+            # see is how many segments the row carries, and equal ones make
+            # the case reproducible.
+            per_document = -(-width // case.packed_documents)
+            document = np.repeat(np.arange(case.packed_documents), per_document)[:width]
+            rows = (case.batch_size, 1)
+            batch["text_segment_ids"] = np.tile(document + 1, rows).astype(np.int32)
+            batch["text_positions"] = np.tile(
+                np.arange(width) - document * per_document, rows).astype(np.int32)
     else:
         sample_key = "video" if case.frames else "image"
         batch = {sample_key: rng.integers(
@@ -403,6 +425,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "batch_size": case.batch_size,
         "fsdp_size": case.fsdp_size,
         "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
+        "packed_documents": case.packed_documents,
         "dtype": case.dtype,
         "attention_impl": config.attention_impl,
         "xla_flags": config.xla_flags,
