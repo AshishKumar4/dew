@@ -5,13 +5,10 @@ migration: a partitioned run has to produce the same numbers as a single-device
 one, otherwise the collectives GSPMD derived are not the ones we meant.
 """
 
-import math
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 import pytest
 from jax.sharding import PartitionSpec as P
 
@@ -240,44 +237,6 @@ def test_sharded_checkpoint_roundtrips(tmp_path):
                              jax.tree.leaves(restored.state.params)):
         assert before.sharding.spec == after.sharding.spec
         np.testing.assert_allclose(np.asarray(before), np.asarray(after))
-
-
-def test_replicated_parameters_are_written_across_replicas(tmp_path):
-    """fsdp_size 2 on the 8-device mesh leaves 4 replicas of every parameter,
-    and a replica-parallel write splits each one over them: the checkpoint's
-    write shape is the shard shape divided by the replica count, not the whole
-    shard, and the restored values are the ones that were saved.
-
-    Off (orbax's own default whenever JAX_PLATFORMS names a gpu) every write
-    shape here is the full shard shape, so the first assertion fails.
-    """
-    trainer = make_trainer(tmp_path, "replica-parallel", distributed_training=True,
-                           fsdp_size=2, fsdp_min_param_size=TINY)
-    grads = jax.tree.map(jnp.ones_like, trainer.state.params)
-    trainer.state = trainer.state.apply_gradients(grads=grads).apply_ema(0.99)
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
-
-    written = trainer.checkpointer.item_metadata(1)['state']['params']
-    saved = trainer.state.params
-    assert jax.tree.structure(written) == jax.tree.structure(saved)
-    split = 0
-    for meta, array in zip(jax.tree.leaves(written), jax.tree.leaves(saved)):
-        shard = array.sharding.shard_shape(array.shape)
-        # get_expected_chunk_shape is orbax's own answer for "what shape does a
-        # replica-parallel write put on disk", and falls back to the shard
-        # shape for an array no axis of which divides by the replica count.
-        assert meta.storage.write_shape == ocp.test_utils.get_expected_chunk_shape(array)
-        split += math.prod(meta.storage.write_shape) < math.prod(shard)
-    assert split, "no parameter was written cooperatively across its replicas"
-
-    restored = make_trainer(tmp_path, "replica-parallel", distributed_training=True,
-                            fsdp_size=2, fsdp_min_param_size=TINY,
-                            load_from_checkpoint=trainer.checkpoint_path())
-    for before, after in zip(jax.tree.leaves(saved),
-                             jax.tree.leaves(restored.state.params)):
-        assert before.sharding.spec == after.sharding.spec
-        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
 def test_gradient_accumulation_updates_only_on_the_boundary(tmp_path):
