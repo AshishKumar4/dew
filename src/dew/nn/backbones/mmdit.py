@@ -147,7 +147,6 @@ class SimpleMMDiT(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    learn_sigma: bool = False
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
@@ -198,7 +197,6 @@ class SimpleMMDiT(nn.Module):
         self.output = PatchSequenceOutput(
             patch_size=self.patch_size,
             output_channels=self.output_channels,
-            learn_sigma=self.learn_sigma,
             modulated=True,
             norm_epsilon=self.norm_epsilon,
             dtype=self.dtype,
@@ -335,7 +333,6 @@ class HierarchicalMMDiT(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    learn_sigma: bool = False
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
@@ -429,7 +426,6 @@ class HierarchicalMMDiT(nn.Module):
         self.output = PatchSequenceOutput(
             patch_size=self.base_patch_size,
             output_channels=self.output_channels,
-            learn_sigma=self.learn_sigma,
             modulated=True,
             norm_epsilon=self.norm_epsilon,
             dtype=self.dtype,

@@ -87,6 +87,17 @@ def _blur(images, width=5):
     ).transpose(0, 2, 3, 1)
 
 
+def _uint8_batch(shape, key):
+    """A loader batch, the ramp image quantised to uint8 in 0..255."""
+    x = _ramp_image(shape, key)
+    return {'image': jnp.round((x + 1.0) * 127.5).clip(0, 255).astype(jnp.uint8)}
+
+
+def _normalised(batch):
+    """The batch on the objective's [-1, 1] scale, where the sampler's output lives."""
+    return (jnp.asarray(batch['image'], jnp.float32) - 127.5) / 127.5
+
+
 def test_psnr_of_identical_images_is_infinite(rng):
     x = _ramp_image((2, 32, 32, 3), rng)
     assert jnp.isinf(psnr(x, x, data_range=2.0))
@@ -179,10 +190,10 @@ def test_psnr_metric_factory_wires_up_the_trainer_contract(rng):
     assert isinstance(metric, EvaluationMetric)
     assert metric.name == 'psnr' and metric.higher_is_better is True
 
-    x = _ramp_image((2, 32, 32, 3), rng)
-    degraded = x + 0.1
-    assert float(metric.function(degraded, {'image': x})) == pytest.approx(
-        float(psnr(degraded, x, data_range=2.0)), rel=1e-5
+    batch = _uint8_batch((2, 32, 32, 3), rng)
+    degraded = _normalised(batch) + 0.1
+    assert float(metric.function(degraded, batch)) == pytest.approx(
+        float(psnr(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
     )
 
 
@@ -191,10 +202,45 @@ def test_ssim_metric_factory_wires_up_the_trainer_contract(rng):
     assert isinstance(metric, EvaluationMetric)
     assert metric.name == 'ssim' and metric.higher_is_better is True
 
-    x = _ramp_image((2, 32, 32, 3), rng)
-    degraded = _blur(x)
-    assert float(metric.function(degraded, {'image': x})) == pytest.approx(
-        float(ssim(degraded, x, data_range=2.0)), rel=1e-5
+    batch = _uint8_batch((2, 32, 32, 3), rng)
+    degraded = _blur(_normalised(batch))
+    assert float(metric.function(degraded, batch)) == pytest.approx(
+        float(ssim(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
+    )
+
+
+def test_psnr_metric_scores_a_perfect_reconstruction_as_infinite(rng):
+    """The trainer hands the metric the sampler's [-1, 1] output and the
+    loader's uint8 batch, and the same image on both sides has zero error."""
+    batch = _uint8_batch((2, 32, 32, 3), rng)
+    assert jnp.isinf(get_psnr_metric().function(_normalised(batch), batch))
+
+
+def test_ssim_metric_scores_a_perfect_reconstruction_as_one(rng):
+    batch = _uint8_batch((2, 32, 32, 3), rng)
+    assert float(get_ssim_metric().function(_normalised(batch), batch)) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
+    """A constant error of 51 grey levels is 0.4 on the [-1, 1] scale, and the
+    default data_range of 2.0 makes the score 10 log10(4 / 0.16)."""
+    batch = {'image': jnp.full((2, 8, 8, 3), 100, dtype=jnp.uint8)}
+    generated = jnp.full((2, 8, 8, 3), (151 - 127.5) / 127.5)
+    expected = 10.0 * np.log10(2.0**2 / 0.4**2)
+    assert float(get_psnr_metric().function(generated, batch)) == pytest.approx(expected, rel=1e-5)
+
+
+def test_ssim_metric_matches_the_closed_form_on_constant_images():
+    """Constant images collapse SSIM to (2 mu_x mu_y + C1) / (mu_x^2 + mu_y^2 + C1).
+    A zero sample against grey level 128 keeps both means near zero, so the score
+    depends on C1 = (0.01 * data_range)^2 and pins the default data_range of 2.0
+    together with the batch scale."""
+    batch = {'image': jnp.full((1, 16, 16, 1), 128, dtype=jnp.uint8)}
+    mu_y = (128 - 127.5) / 127.5
+    c1 = (0.01 * 2.0) ** 2
+    expected = c1 / (mu_y**2 + c1)
+    assert float(get_ssim_metric().function(jnp.zeros((1, 16, 16, 1)), batch)) == pytest.approx(
+        expected, rel=1e-4
     )
 
 

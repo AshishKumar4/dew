@@ -25,6 +25,22 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 
+def _local_batch_size(batch_size: int) -> int:
+    """The share of a global batch each JAX process batches for itself.
+
+    Every process batches its own shard and the run reports batch_size as
+    the global batch, so a remainder would train on fewer records a step
+    than the run reports, and a batch below the process count would give
+    every process a batch of nothing.
+    """
+    processes = jax.process_count()
+    if batch_size % processes:
+        raise ValueError(
+            f"batch_size {batch_size} does not split over {processes} JAX processes"
+        )
+    return batch_size // processes
+
+
 def generate_collate_fn(media_type="image"):
     """Generate a collate function based on media type.
     
@@ -114,12 +130,6 @@ def generate_collate_fn(media_type="image"):
     else:  # Default to image
         return image_collate
 
-class CaptionDeletionTransform(pygrain.MapTransform):
-    def map(self, element):
-        """Delete the caption from the element."""
-        if "caption" in element:
-            del element["caption"]
-        return element
 
 def get_dataset_grain(
     data_name="cc12m",
@@ -144,7 +154,8 @@ def get_dataset_grain(
         data_name: Name of the dataset in datasetMap.
         batch_size: Batch size for the dataset.
         image_scale: Size to scale images to.
-        count: Optional count limit for the dataset.
+        count: Records to use, from the head of the source; at most the
+            records it holds. None uses them all.
         num_epochs: Epochs the training stream repeats for, None for
             forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
@@ -171,7 +182,12 @@ def get_dataset_grain(
     dataset = datasetMap[data_name]
     data_source = dataset["source"](dataset_source)
     augmenter = dataset["augmenter"](image_scale, method)
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
+    if count is not None and count > len(data_source):
+        raise ValueError(
+            f"count {count} is more than the {len(data_source)} records of "
+            f"'{data_name}'"
+        )
     dataset_length = len(data_source) if count is None else count
 
     # A held-out slice off the head keeps the two loaders disjoint, so FID and
@@ -234,15 +250,11 @@ def get_dataset_online(
         data_name="combined_online",
         batch_size=64,
         image_scale=256,
-        count=None,
-        num_epochs=None,
         method=jax.image.ResizeMethod.LANCZOS3,
         worker_count=32,
         read_thread_count=64,
         read_buffer_size=50,
         worker_buffer_size=20,
-        seed=0,
-        dataset_source="/mnt/gcs_mount/arrayrecord2/cc12m/",
     ):
     """Legacy function for getting online streaming dataloader for images.
     
@@ -250,15 +262,11 @@ def get_dataset_online(
         data_name: Name of the dataset in onlineDatasetMap.
         batch_size: Batch size for the dataset.
         image_scale: Size to scale images to.
-        count: Optional count limit for the dataset.
-        num_epochs: Number of epochs to iterate.
         method: Interpolation method for resizing.
         worker_count: Number of worker processes.
         read_thread_count: Number of read threads.
         read_buffer_size: Size of the read buffer.
         worker_buffer_size: Size of the worker buffer.
-        seed: Random seed.
-        dataset_source: Source path for the dataset.
         
     Returns:
         Dictionary with train dataset function and metadata.
@@ -270,7 +278,7 @@ def get_dataset_online(
     # `datasets`, which the grain paths above deliberately do without.
     from .online_loader import OnlineStreamingDataLoader
 
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     sources = onlineDatasetMap[data_name]["source"]
     dataloader = OnlineStreamingDataLoader(
             sources, 
@@ -424,7 +432,9 @@ def get_media_dataset_grain(
         batch_size: Batch size for the dataset.
         media_scale: Size to scale media (image or video frames) to.
         sequence_length: Length of the sequence for video data.
-        count: Optional count limit for the dataset.
+        count: Records to use, from the head of the source; at most the
+            records it holds. None uses them all, and a source that reports
+            no length needs it set.
         num_epochs: Epochs the training stream repeats for, None for
             forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
@@ -488,15 +498,25 @@ def get_media_dataset_grain(
 
     augmenter = media_dataset.get_augmenter(**transform_kwargs)
 
-    # Calculate local batch size for distributed training
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
 
-    # Create a sampler for the dataset
-    if hasattr(data_source, "__len__"):
-        dataset_length = len(data_source) if count is None else count
+    # A source that reports no length gives the sampler nothing to bound its
+    # indices by, and a guessed length had it read past the data and report
+    # records nobody counted.
+    if count is None:
+        if not hasattr(data_source, "__len__"):
+            raise ValueError(
+                f"'{data_name}' reports no length, so it needs count= set to "
+                "the records it holds"
+            )
+        dataset_length = len(data_source)
     else:
-        # Some data sources like video files list don't have __len__
-        dataset_length = count if count is not None else 1000000  # Default large number
+        if hasattr(data_source, "__len__") and count > len(data_source):
+            raise ValueError(
+                f"count {count} is more than the {len(data_source)} records of "
+                f"'{data_name}'"
+            )
+        dataset_length = count
 
     train_source, val_source = data_source, None
     if val_count:
@@ -597,7 +617,7 @@ def get_media_dataset_online(
     Returns:
         Dictionary with train dataset function and metadata.
     """
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     
     # Get dataset sources
     if dataset_sources is None:
@@ -679,7 +699,7 @@ def get_token_dataset_grain(
 
     train_source = TokenFileSource(train_path, seq_len)
     val_source = TokenFileSource(val_path, seq_len)
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
 
     train_sampler = pygrain.IndexSampler(
         num_records=len(train_source),
@@ -807,7 +827,7 @@ def get_packed_token_dataset_grain(
 
     from .sources.text import TokenDocumentSource
 
-    local_batch_size = batch_size // jax.process_count()
+    local_batch_size = _local_batch_size(batch_size)
     window = seq_len + 1
 
     # One source per split, reused by its loader: finding the boundaries reads
@@ -882,7 +902,7 @@ def load_data(config: DataConfig) -> dict:
     for datasets registered solely there - the name alone once decided this
     ('online' in the dataset name), which chose a loader from spelling.
 
-    A dataset that is a directory of tokenized text (train.bin [+ val.bin]
+    A dataset that is a directory of tokenized text (train.bin and val.bin
     from tools/tokenize_text.py) takes the token loader ahead of all of
     that, and needs DataConfig.sequence_length. With pack_sequences the
     windows are whole documents packed by grain instead of fixed strides.
@@ -900,8 +920,14 @@ def load_data(config: DataConfig) -> dict:
             )
         root = Path(token_dir)
         val_bin = root / "val.bin"
-        train_bin = str(root / "train.bin")
-        val_bin = str(val_bin if val_bin.is_file() else root / "train.bin")
+        if not val_bin.is_file():
+            # Reading train.bin in its place scored the validation pass on the
+            # windows the model trains on.
+            raise ValueError(
+                f"dataset '{config.dataset}' has a train.bin but no val.bin; "
+                "tools/tokenize_text.py --val-fraction writes the held-out split"
+            )
+        train_bin, val_bin = str(root / "train.bin"), str(val_bin)
         if config.pack_sequences:
             # The Dataset API reads its source directly, so the DataLoader's
             # read threads and buffers have nothing to configure here.
@@ -949,7 +975,6 @@ def load_data(config: DataConfig) -> dict:
             worker_count=config.worker_count, read_thread_count=read_thread_count,
             read_buffer_size=config.read_buffer_size,
             worker_buffer_size=worker_buffer_size,
-            seed=config.dataset_seed, dataset_source=config.dataset_path,
         )
 
     if name in datasetMap:

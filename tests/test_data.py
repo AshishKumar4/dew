@@ -19,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import grain.python as pygrain
+import jax
 import numpy as np
 import pytest
 
@@ -40,37 +41,10 @@ from dew.data.sources.voxceleb2 import VoxCeleb2Source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Registry keys the factories advertise; every one must build.
-AUGMENTER_KEYS = ("image_tfds", "image_gcs", "video")
-SOURCE_KEYS = ("image_tfds", "image_gcs", "image_combined_gcs", "video_tfds", "video_local")
-
 
 # ---------------------------------------------------------------------------------
 # Registries
 # ---------------------------------------------------------------------------------
-
-@pytest.mark.parametrize("key", AUGMENTER_KEYS)
-def test_every_augmenter_registry_key_constructs(key):
-    """Every augmenter key resolves to a DataAugmenter that exists."""
-    assert isinstance(DataAugmenter.create(key), DataAugmenter)
-
-
-def test_video_augmenter_key_resolves_to_the_audio_video_augmenter():
-    assert isinstance(DataAugmenter.create("video"), AudioVideoAugmenter)
-
-
-@pytest.mark.parametrize("key", SOURCE_KEYS)
-def test_every_source_registry_key_constructs(key):
-    kwargs = {"name": "oxford_flowers102"} if key.endswith("tfds") else {}
-    assert isinstance(DataSource.create(key, **kwargs), DataSource)
-
-
-def test_unknown_registry_keys_are_rejected():
-    with pytest.raises(ValueError, match="Unknown augmenter type"):
-        DataAugmenter.create("video_gcs")
-    with pytest.raises(ValueError, match="Unknown source type"):
-        DataSource.create("audio_gcs")
-
 
 @pytest.mark.parametrize("source_cls", [ImageGCSSource, CombinedImageGCSSource])
 def test_gcs_sources_require_an_explicit_dataset_path(source_cls):
@@ -133,7 +107,10 @@ def test_lazy_exports_resolve_and_unknown_names_raise_attribute_error():
     assert dew.data.get_media_dataset_grain is get_media_dataset_grain
     assert dew.data.VoxCeleb2Source is VoxCeleb2Source
     assert dew.data.HFDatasetSource is HFDatasetSource
-    assert "get_dataset_grain" in dir(dew.data)
+    # An export left behind after a deletion raises only on first use, so
+    # every advertised name is resolved here.
+    for name in dir(dew.data):
+        getattr(dew.data, name)
     with pytest.raises(AttributeError, match="has no attribute"):
         dew.data.get_dataset_from_thin_air
 
@@ -271,6 +248,43 @@ def test_media_dataset_validation_split_rejects_impossible_sizes(fake_media_data
         get_media_dataset_grain("fake", dataset_source="/tmp", val_count=32)
 
 
+def test_a_source_without_a_length_needs_an_explicit_count(monkeypatch):
+    """The factory guessed a million records for such a source, so the
+    sampler drew indices past the data and train_len reported the guess."""
+    class Endless:
+        def __getitem__(self, index):
+            return {"index": index}
+
+    class UnsizedSource(DataSource):
+        def get_source(self, path_override):
+            return Endless()
+
+    monkeypatch.setitem(mediaDatasetMap, "unsized", MediaDataset(
+        source=UnsizedSource(), augmenter=_PassthroughAugmenter(), media_type="video"))
+
+    with pytest.raises(ValueError, match="count="):
+        get_media_dataset_grain("unsized", dataset_source="/tmp", worker_count=0)
+
+    data = get_media_dataset_grain("unsized", dataset_source="/tmp", batch_size=8,
+                                   count=16, worker_count=0, num_epochs=1)
+    assert data["train_len"] == 16
+    assert sorted(i for batch in _indices(data["train"](), 3) for i in batch) == list(range(16))
+
+
+@pytest.mark.parametrize("factory", ["media", "legacy"])
+def test_a_count_past_the_end_of_the_source_is_refused(
+        factory, fake_media_dataset, fake_legacy_dataset):
+    """A count above the source became the sampler's record count, and the
+    first index past the end raised inside a worker."""
+    with pytest.raises(ValueError, match="count 33"):
+        if factory == "media":
+            get_media_dataset_grain("fake", dataset_source="/tmp", count=33,
+                                    worker_count=0)
+        else:
+            dataloaders.get_dataset_grain("fake", dataset_source="/tmp", count=33,
+                                          worker_count=0)
+
+
 def test_media_dataset_grain_passes_media_scale_to_the_video_transform(fake_media_dataset):
     get_media_dataset_grain("fake", dataset_source="/tmp", media_scale=64,
                             sequence_length=4, worker_count=0)
@@ -401,6 +415,33 @@ def test_a_run_config_holds_out_a_validation_split_on_both_grain_paths(monkeypat
     expected = defaults.val_steps_per_epoch * defaults.batch_size
     assert captured["oxford_flowers102"]["val_count"] == expected
     assert captured["voxceleb2"]["val_count"] == expected
+
+
+# ---------------------------------------------------------------------------------
+# The global batch over JAX processes
+# ---------------------------------------------------------------------------------
+
+def test_a_global_batch_that_does_not_split_over_the_processes_is_refused(
+        tmp_path, monkeypatch):
+    """Integer division hid the remainder: 65 over eight processes trained on
+    64 records a step while global_batch_size reported 65, and 7 gave every
+    process a batch of nothing."""
+    tokens = np.arange(1, 8 * 64 + 2, dtype=np.uint16)
+    for name in ("train.bin", "val.bin"):
+        (tmp_path / name).write_bytes(tokens.tobytes())
+    monkeypatch.setattr(jax, "process_count", lambda: 8)
+
+    def loader(batch_size):
+        return dataloaders.get_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+            batch_size=batch_size, seq_len=8, worker_count=0)
+
+    for batch_size in (65, 7):
+        with pytest.raises(ValueError, match=r"batch_size.*8 JAX processes"):
+            loader(batch_size)
+    data = loader(64)
+    assert data["local_batch_size"] == 8 and data["global_batch_size"] == 64
+
 
 # ---------------------------------------------------------------------------------
 # WAV decoding

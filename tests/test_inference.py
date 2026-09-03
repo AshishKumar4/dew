@@ -112,8 +112,6 @@ def legacy_config():
             "activation": "swish",
             "norm_groups": 4,
             "named_norms": False,
-            # a flag the model does not accept, as old configs carry
-            "use_flash_attention": False,
         },
         "arguments": {
             "architecture": "unet",

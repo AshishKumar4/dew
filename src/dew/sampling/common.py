@@ -389,6 +389,3 @@ class DiffusionSampler:
             rngs, 
             (batch_size, sequence_length, image_size, image_size, image_channels)
         ) * variance
-    
-    # Alias for backward compatibility
-    generate_images = generate_samples

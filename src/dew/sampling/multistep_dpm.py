@@ -1,12 +1,16 @@
 import jax
 import jax.numpy as jnp
 from .common import DiffusionSampler
-from dew.diffusion.schedules import get_coeff_shapes_tuple
+from dew.diffusion.schedules import GeneralizedNoiseScheduler, get_coeff_shapes_tuple
 from dew.random_state import RandomMarkovState
 
 class MultiStepDPM(DiffusionSampler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if not isinstance(self.noise_schedule, GeneralizedNoiseScheduler):
+            raise ValueError(
+                f"MultiStepDPM integrates dx/dsigma = eps, which holds only when alpha is 1, "
+                f"so it needs a GeneralizedNoiseScheduler and not {type(self.noise_schedule).__name__}")
         self.history = []
 
     def generate_samples(self, *args, **kwargs):
