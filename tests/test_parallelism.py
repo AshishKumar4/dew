@@ -26,7 +26,8 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer, SimpleTrainer
 from dew.objectives.base import EMASpec, Objective
 from dew.training.distributed import (
-    DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator, batch_sharding, build_mesh,
+    DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator,
+    assert_params_sufficiently_sharded, batch_sharding, build_mesh,
     parameter_spec, shard_batch, state_sharding_tree,
 )
 
@@ -255,6 +256,23 @@ def test_sharding_tolerance_can_allow_intentional_replication(tmp_path):
     trainer = make_indivisible_trainer(tmp_path, tolerance=1.0)
     kernel = trainer.state.params["params"]["indivisible"]["kernel"]
     assert kernel.sharding.spec == P()
+
+
+def test_odd_vocabulary_shards_the_embedding_on_its_other_axis():
+    """GPT-2's 50257 rows divide by nothing, so the rule that wins the
+    embedding cannot be taken: the width has to carry the shard, or a real run
+    stops on the tolerance check with 98% of the model replicated."""
+    model = CausalTransformer(
+        vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
+        num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    mesh = build_mesh(fsdp_size=2)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+
+    assert shardings["params"]["embed_tokens"]["embedding"].spec == P(None, "fsdp")
+    assert_params_sufficiently_sharded(
+        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
 
 
 def test_build_mesh_rejects_bad_fsdp_size():
