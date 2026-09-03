@@ -5,10 +5,12 @@ run when a cached copy of the hub is reachable, matching the repo's policy
 that no test needs the network.
 """
 
+import itertools
 import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -232,6 +234,30 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
         [b["text"] for b in data["train"]()])}
     val_windows = {w.tobytes() for w in np.concatenate(val_batches)}
     assert not (train_windows & val_windows)
+
+
+@pytest.mark.parametrize("worker_count", [0, 2])
+def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_count):
+    """num_epochs is the training stream's, and a run leaves it None.
+
+    Validation read val.bin through a sampler carrying the same unbounded
+    epoch count, and grain's DataLoader batches inside each worker, so a pass
+    never ended and its batches repeated windows the worker had already read.
+    """
+    seq_len = 4
+    val_tokens = np.arange(900, 900 + 13 * seq_len, dtype=np.int64)  # 12 windows
+    _token_dir(tmp_path, train_tokens=5 * seq_len, val_tokens=len(val_tokens),
+               seq_len=seq_len)
+    (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
+
+    data = get_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=4, seq_len=seq_len, seed=0, worker_count=worker_count)
+
+    windows = [list(window) for batch in itertools.islice(data["val"](), 12)
+               for window in batch["text"]]
+    assert windows == [list(val_tokens[start:start + seq_len + 1])
+                       for start in range(0, 12 * seq_len, seq_len)]
 
 
 def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
@@ -528,6 +554,26 @@ def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
 
     iterator = iter(data["train"]())
     assert len([next(iterator)["text"] for _ in range(20)]) == 20
+
+
+def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
+    """The same num_epochs repeated the documents before packing for
+    validation as well, so a run that leaves it None never finished a
+    validation pass and scored some documents several times over."""
+    documents = [[i, i + 1] for i in range(10, 30, 2)]
+    _document_dir(tmp_path, documents)
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+
+    batches = list(itertools.islice(data["val"](), 20))
+    # Ten documents of three ids (the eos counts) pack three to a nine-id
+    # window, so four windows and two batches of two.
+    assert len(batches) == 2
+    read = Counter(int(token) for batch in batches for row in batch["text"]
+                   for token in row if token)
+    assert read == Counter(token for document in documents for token in document)
+
 
 
 def test_load_data_selects_packing_only_when_asked(tmp_path):
