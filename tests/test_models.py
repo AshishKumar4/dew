@@ -100,8 +100,7 @@ def test_hybrid_dit_forward(rng, kwargs):
 
 
 def test_uvit_hilbert_forward(rng):
-    """UViT used to apply the hilbert permutation twice on the way in but
-    invert it only once on the way out, scrambling every output spatially."""
+    """UViT takes the hilbert order and returns the shape it was given."""
     model = UViT(patch_size=4, emb_features=64, num_layers=4, num_heads=2, use_hilbert=True)
     x, temb, textcontext = small_inputs(rng)
     out = run_forward(model, rng, x, temb, textcontext)
@@ -120,7 +119,7 @@ def test_hilbert_patchify_roundtrip(rng):
 
 
 def test_dropout_is_active_in_train_mode(rng):
-    """--dropout_rate used to be threaded into every block and applied nowhere."""
+    """Dropout is applied in train mode, so `dropout_rate` reaches the blocks."""
     model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
                       mlp_ratio=2, dropout_rate=0.5)
     x, temb, textcontext = small_inputs(rng)

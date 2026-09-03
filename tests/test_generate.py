@@ -1,7 +1,7 @@
 """Text generation: the cached decode loop has to agree with the plain model.
 
-Greedy generation is the strict check - it must reproduce, token for token,
-what walking the argmax of a full forward pass produces - and the copy task is
+Greedy generation is the strict check, because it must reproduce, token for
+token, what walking the argmax of a full forward pass produces. The copy task is
 the end-to-end one: train a tiny decoder with plain optax, then read the
 sequence back out of generate().
 """

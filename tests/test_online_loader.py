@@ -123,8 +123,8 @@ def _require_fork():
 # ---------------------------------------------------------------------------------
 
 def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, stop, capsys):
-    """A queue timeout used to hand back zeros captioned "Timeout occurred
-    while waiting for sample", which then trained as data."""
+    """A queue timeout waits rather than handing back zeros captioned "Timeout
+    occurred while waiting for sample", which would train as data."""
     def slow(dataset, *, data_queue, **kwargs):
         for index in range(BATCH):
             stop.wait(SLOW)
@@ -197,8 +197,8 @@ def test_a_producer_that_dies_raises_its_own_error(monkeypatch):
 # ---------------------------------------------------------------------------------
 
 def test_a_collate_failure_surfaces_from_the_consumer(monkeypatch, stop):
-    """The batch worker used to print the exception and carry on, so a run kept
-    training on whatever the next iteration produced."""
+    """The batch worker's exception reaches the consumer, rather than being
+    printed while the run trains on whatever the next iteration produced."""
     def producer(dataset, *, data_queue, **kwargs):
         for index in range(BATCH):
             data_queue.put(_sample(index))

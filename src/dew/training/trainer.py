@@ -269,12 +269,12 @@ class SimpleTrainer:
 
         Shapes and types come from the freshly built state, so a checkpoint
         written on one mesh restores onto whatever mesh this run is using.
-        Restoring untyped used to silently discard opt_state and reset the step
+        Restoring untyped would silently discard opt_state and reset the step
         counter (and with it the lr schedule) on every resume.
 
         The template names only the keys this run restores. Checkpoints
-        predating iterator tracking - or written from an iterator that cannot
-        report a position - have no dataset_state; older ones carry a second
+        predating iterator tracking, or written from an iterator that cannot
+        report a position, have no dataset_state; older ones carry a second
         train state under 'best_state', which nothing here reads.
         """
         template = {
@@ -649,9 +649,9 @@ class SimpleTrainer:
                     
                 
         # The in-loop saves are conditional, so the state the run ends on may
-        # never have been written. It has to go out under its real step: the
-        # default of 0 used to leave a step-0 checkpoint holding the final
-        # weights, which a resume then restarts the schedule from.
+        # never have been written. It has to go out under its real step,
+        # because a step-0 checkpoint holding the final weights would make a
+        # resume restart the schedule from the beginning.
         if self.last_saved_step != self.latest_step:
             self.save(self.latest_step // train_steps_per_epoch, self.latest_step)
         self.wait_for_checkpoints()

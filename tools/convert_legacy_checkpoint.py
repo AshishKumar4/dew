@@ -15,7 +15,7 @@ jax's PRNG, whose default implementation changed in jax 0.5.0. Checkpoints
 trained before that already sample with subtly different time conditioning on
 modern jax; the frequencies are now fixed numpy values, so models trained
 from this version onward are stable. This script cannot repair the old
-provenance - expect slightly off conditioning on pre-0.5.0 checkpoints.
+provenance, so expect slightly off conditioning on pre-0.5.0 checkpoints.
 """
 
 import sys

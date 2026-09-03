@@ -7,7 +7,7 @@ class ContinuousNoiseScheduler(NoiseScheduler):
     Subclasses interpret ``steps`` however their parameterization requires (a
     [0, 1] progress variable, a raw sigma, ...) and implement ``get_rates``.
     ``timesteps`` is kept for interface compatibility with the discrete
-    schedulers — it is the upper end of the timestep domain (1.0 by default,
+    schedulers. It is the upper end of the timestep domain (1.0 by default,
     i.e. "fully noised") and doubles as the switch that makes
     ``generate_timesteps`` sample a float in [0, timesteps) instead of an
     integer index into a table. Continuous schedulers have no beta table, so

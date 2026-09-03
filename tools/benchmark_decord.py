@@ -2,8 +2,8 @@
 """
 Benchmark script to test for memory leaks and performance in decord library.
 
-This script specifically targets the read_av function and provides comprehensive
-memory usage tracking and performance metrics.
+This script targets the read_av function and tracks memory usage and
+performance metrics.
 """
 
 import os
