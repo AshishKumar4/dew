@@ -253,6 +253,33 @@ def mode_data(args) -> dict:
     }
 
 
+def mode_packed(args) -> dict:
+    import jax
+    from dew.data.dataloaders import get_packed_token_dataset_grain
+
+    tokens = Path(args.tokens)
+    data = get_packed_token_dataset_grain(
+        str(tokens / "train.bin"), str(tokens / "val.bin"),
+        batch_size=BATCH, seq_len=args.seq_len, num_epochs=1,
+        worker_count=args.workers, worker_buffer_size=1)
+
+    documents, windows = set(), 0
+    for batch in data["train"]():
+        text = np.asarray(batch["text"])
+        # Every document is one token value repeated, so the values in a
+        # window name the documents packed into it. Padding and the eos that
+        # closes a document are both zero and name nothing.
+        documents.update(int(value) for value in text[text > 0])
+        windows += len(text)
+    return {
+        "process_index": jax.process_index(),
+        "documents": sorted(documents),
+        "windows": windows,
+        "local_batch_size": data["local_batch_size"],
+        "train_len": data["train_len"],
+    }
+
+
 def mode_steps(args) -> dict:
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
     rows = BATCH // args.processes
@@ -296,8 +323,8 @@ def mode_fit(args) -> dict:
     }
 
 
-MODES = {"topology": mode_topology, "data": mode_data, "steps": mode_steps,
-         "fit": mode_fit}
+MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "steps": mode_steps, "fit": mode_fit}
 
 
 def parse_args(argv=None):
