@@ -123,6 +123,9 @@ class DiffusionObjective(Objective):
                 diffusion_steps=self.diffusion_steps,
                 end_step=0,
                 priors=None,
+                # Folded so successive validations start from different noise
+                # while any one step stays reproducible.
+                rngstate=RandomMarkovState(jax.random.fold_in(val_state.rngs, val_state.step)),
                 model_conditioning_inputs=tuple(model_conditioning_inputs),
             )
 

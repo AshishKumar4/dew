@@ -99,11 +99,13 @@ def get_ssim_metric(
 ) -> EvaluationMetric:
     """Mean SSIM between generated and reference frames, higher is better.
 
-    data_range must match the convention the trainer feeds the metric: 2.0
-    for the library's [-1, 1] samples, 255 for uint8 batches.
+    The trainer passes the sampler's [-1, 1] samples and the loader's uint8
+    batch. The batch is scaled the way the objective scales it, so both sides
+    span the [-1, 1] range that the default data_range of 2.0 describes.
     """
     def ssim_metric(generated: jnp.ndarray, batch):
-        return ssim(generated, jnp.asarray(batch["image"], dtype=jnp.float32), data_range, per_example)
+        reference = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
+        return ssim(generated, reference, data_range, per_example)
 
     return EvaluationMetric(
         function=ssim_metric,

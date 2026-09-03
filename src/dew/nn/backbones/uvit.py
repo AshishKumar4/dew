@@ -264,7 +264,6 @@ class SimpleUDiT(nn.Module):
     attention_impl: Optional[str] = None
     remat: bool = False
     norm_epsilon: float = 1e-5
-    learn_sigma: bool = False
     use_hilbert: bool = False
     norm_groups: int = 0
     activation: Callable = jax.nn.swish
@@ -366,12 +365,8 @@ class SimpleUDiT(nn.Module):
         self.final_norm = nn.LayerNorm(
             epsilon=self.norm_epsilon, dtype=self.dtype, name="final_norm")
 
-        output_dim = self.patch_size * self.patch_size * self.output_channels
-        if self.learn_sigma:
-            output_dim *= 2
-
         self.final_proj = nn.Dense(
-            features=output_dim,
+            features=self.patch_size * self.patch_size * self.output_channels,
             dtype=jnp.float32,
             precision=self.precision,
             kernel_init=nn.initializers.zeros,
@@ -423,16 +418,8 @@ class SimpleUDiT(nn.Module):
 
         if self.use_hilbert:
             assert hilbert_inv_idx is not None, "Hilbert inverse index missing"
-            if self.learn_sigma:
-                x_mean, x_logvar = jnp.split(x_out, 2, axis=-1)
-                x_image = hilbert_unpatchify(x_mean, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
-            else:
-                x_image = hilbert_unpatchify(x_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
+            x_image = hilbert_unpatchify(x_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
         else:
-            if self.learn_sigma:
-                x_mean, x_logvar = jnp.split(x_out, 2, axis=-1)
-                x_image = unpatchify(x_mean, channels=self.output_channels)
-            else:
-                x_image = unpatchify(x_out, channels=self.output_channels)
+            x_image = unpatchify(x_out, channels=self.output_channels)
 
         return x_image.astype(jnp.float32)

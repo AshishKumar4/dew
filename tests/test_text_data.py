@@ -324,6 +324,15 @@ def test_load_data_token_directory_requires_sequence_length(tmp_path):
                              worker_count=0))
 
 
+def test_load_data_refuses_a_token_directory_without_a_val_split(tmp_path):
+    """With val.bin missing the validation loader read train.bin, so every
+    pass scored windows the model was training on."""
+    _token_dir(tmp_path, train_tokens=64)
+    with pytest.raises(ValueError, match=r"val\.bin.*tokenize_text\.py --val-fraction"):
+        load_data(DataConfig(dataset=str(tmp_path), sequence_length=8,
+                             batch_size=4, worker_count=0))
+
+
 def test_load_data_does_not_dispatch_on_a_plain_directory(tmp_path):
     (tmp_path / "not_a_dataset.txt").write_text("hello")
     with pytest.raises(ValueError, match="not found in mediaDatasetMap"):

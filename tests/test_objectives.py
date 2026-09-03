@@ -93,6 +93,19 @@ def test_train_step_returns_auxiliary_metrics(tmp_path):
     assert isinstance(aux, dict)
 
 
+def test_validation_samples_follow_the_step(tmp_path):
+    """Successive validations draw fresh noise while a given step reproduces,
+    so the sampler seed has to come from the state's rngs folded with its step."""
+    trainer = make_trainer(tmp_path)
+    validate = trainer.objective.make_validation_step()
+    batch = next(batch_iterator())
+    state = trainer.state
+
+    first = validate(state, batch)
+    assert jnp.array_equal(validate(state, batch), first)
+    assert not jnp.allclose(validate(state.replace(step=state.step + 1), batch), first)
+
+
 class ConstantObjective(Objective):
     """Two independent parameter subtrees, so EMA scoping is observable."""
 
