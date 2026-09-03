@@ -129,15 +129,16 @@ Two flags are worth knowing about for a different reason:
   by default and worth 3% on the launch-heavy architecture. Passing a longer
   type list than the default does not add to that.
 
-Numerics were not part of any candidate: only kernel selection and
-scheduling flags were measured. No flag that relaxes precision was tested and
-none would be adopted, because an adopted change has to keep a fixed-seed
-20-step loss trajectory within 1e-5.
+No candidate flag changes numerics. The sweep covered kernel selection and
+scheduling only. No flag that relaxes precision was tested, and none would be
+adopted, because an adopted change has to keep a fixed-seed 20-step loss
+trajectory within 1e-5.
 
 ## What batch size buys the unet
 
-Measured, not adopted: where the remaining room is on the architecture whose
-step is least sensitive to batch.
+These numbers were measured and nothing was adopted from them. They show
+where the remaining room is on the architecture whose step is least sensitive
+to batch.
 
 ```
 python tools/benchmark_step.py --preset small --architectures unet \
