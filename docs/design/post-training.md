@@ -2,7 +2,7 @@
 
 Design, 2026-09-02. Not built. Every file and line cited against the main worktree unless the path starts with `.worktrees/`, which names the wave branch carrying that code.
 
-The owner's rule decides the whole shape: a modality is an Objective, so post-training is more objectives, and the user learns one thing. The trainer does not change.
+The owner's rule decides the whole shape. A modality is an Objective, so post-training is more objectives, and the user learns one thing. The trainer does not change.
 
 ```
 LMObjective(model)                                # pretraining, as today
@@ -16,7 +16,7 @@ All six run on the unchanged `ObjectiveTrainer` (`src/dew/training/objective_tra
 
 ## 1. Data paths
 
-Three paths, all Grain, all producing the batch contract the objectives consume. verl's parquet schema maps onto them (§1.4).
+The three paths are all Grain, and all produce the batch contract the objectives consume. verl's parquet schema maps onto them (§1.4).
 
 ### 1.1 Chat / SFT: records to packed rows with a role per token
 
@@ -133,16 +133,16 @@ What falls out for free:
 - **Checkpointing.** `ema_params` is saved, restored and sharded exactly like params (`SimpleTrainer.save` writes the whole state, `src/dew/training/trainer.py:329-351`; sharding is derived from the abstract state at `:218-227`). A resumed DPO run restores its reference with everything else, bit for bit.
 - **Sharding.** It is a full tree in `TrainState`, so FSDP shards it like params.
 
-What it costs, stated: a run cannot hold a moving EMA of the policy and a frozen reference at the same time. No objective in scope wants both (RL and DPO runs do not use a policy EMA; the frontier survey records no post-training recipe that does). The alternative considered, a masked subtree inside `params` (`optax.masked` over a `reference` key, generalizing JEPA's two-key tree at `.worktrees/../src/dew/objectives/jepa/objective.py:99-109`), was rejected: one extra full parameter copy in HBM, an optimizer wrapper, zero-valued gradient and update trees for the reference, and a new checkpoint layout. The EMA slot is already allocated and already checkpointed; using it costs nothing that is not already being paid.
+The cost is that a run cannot hold a moving EMA of the policy and a frozen reference at the same time. No objective in scope wants both (RL and DPO runs do not use a policy EMA; the frontier survey records no post-training recipe that does). The alternative considered, a masked subtree inside `params` (`optax.masked` over a `reference` key, generalizing JEPA's two-key tree at `.worktrees/../src/dew/objectives/jepa/objective.py:99-109`), was rejected: one extra full parameter copy in HBM, an optimizer wrapper, zero-valued gradient and update trees for the reference, and a new checkpoint layout. The EMA slot is already allocated and already checkpointed; using it costs nothing that is not already being paid.
 
-- **No per-step work.** `_define_train_step` omits the EMA path entirely when the objective's decay schedule is identically 1.0 (`decay(0) == 1.0` and `decay(2**31 - 1) == 1.0`, a compile-time branch), so a reference costs one copy in HBM and nothing per step. The skip is also safer than the lerp: `1.0 * ema + 0.0 * param` returns `ema` for finite params, but a NaN reaching the params would poison the frozen tree through `0 * NaN`, and the skip cannot. The test that ships with it: params and gradients identical with and without the skip, and the reference untouched after a step whose params were forced non-finite.
+- **No per-step work.** `_define_train_step` omits the EMA path entirely when the objective's decay schedule is identically 1.0 (`decay(0) == 1.0` and `decay(2**31 - 1) == 1.0`, a compile-time branch), so a reference costs one copy in HBM and nothing per step. The skip is also safer than the lerp: `1.0 * ema + 0.0 * param` returns `ema` for finite params, but a NaN reaching the params would poison the frozen tree through `0 * NaN`, and the skip cannot. The test that ships with it asserts identical params and gradients with and without the skip, and the reference untouched after a step whose params were forced non-finite.
 - **The EMA clock composes unchanged** for every other decay: `apply_ema` still runs per completed update under `MultiSteps` (`src/dew/training/objective_trainer.py:269-287`).
 
 **Precompute versus in-step.** In-step evaluation is the one path: `loss` runs the reference forward through the same code as the policy, per batch, no cache. TRL's `precompute_ref_log_probs` exists to free the reference model's memory during training (`trl/trainer/dpo_config.py:69-72`, `/tmp/design/trl`); under the EMA mechanism there is no separate model to free, so the option buys step time (one forward per step, roughly 1/3 of the policy's forward+backward cost) at the price of a stale-prone dataset cache that silently produces wrong losses if the data path changes. Not built; revisited only if a measured run shows reference forwards dominating the step. The memory arithmetic that would force this tradeoff elsewhere is in §8.
 
 ## 4. The rollout seam
 
-One optional method on `Objective`, mirroring `loss`:
+`Objective` gains one optional method, mirroring `loss`:
 
 ```python
 class Objective:
@@ -171,7 +171,7 @@ The mechanics fall out of what already exists:
 - **Fixed shapes.** The rollout's output shapes are constants of the run (`b`, `G`, `P`, `N`), so `_compiled_train_step` still compiles once. jax's shape-polymorphism is not needed.
 - **Grad accumulation.** One rollout per micro-batch: each micro-batch of `b` prompts expands to `b*G` rows, and a group never straddles a micro-batch. `MultiSteps` accumulates the micro-gradients and `loss` token-means within its own batch, exactly as SFT does under accumulation today (`src/dew/training/objective_trainer.py:106-109`). The group baseline is computed inside each micro-batch, which is the whole batch whenever `grad_accum_steps == 1`, the default.
 - **A pure function of the batch.** The returned batch carries rewards, advantages, old log-probs and the response mask as ordinary named arrays (§1.3, §6.6), so `loss` stays a function of the batch alone and nothing about RL reaches the trainer. The deletion test holds: delete `rollout` and every RL objective loses its data source; nothing else changes.
-- **Telemetry through the existing channels.** Reward mean and mean generation length ride the aux dict `loss` already returns, as `train/rollout_reward` and `train/rollout_gen_len` read from the batch's own columns (`src/dew/training/trainer.py:504-510` folds aux into `train/*`). Rollout seconds cannot come from the jitted aux, because there is no wall clock inside jit; the trainer times the host-side rollout call and merges `train/rollout_seconds` into the log tick the way `_throughput_metrics` already derives `train/step_time_ms` from host-side elapsed time (`src/dew/training/trainer.py:554-565`). No second return channel.
+- **Telemetry through the existing channels.** Reward mean and mean generation length ride the aux dict `loss` already returns, as `train/rollout_reward` and `train/rollout_gen_len` read from the batch's own columns (`src/dew/training/trainer.py:504-510` folds aux into `train/*`). Rollout seconds cannot come from the jitted aux, because there is no wall clock inside jit; the trainer times the host-side rollout call and merges `train/rollout_seconds` into the log tick the way `_throughput_metrics` already derives `train/step_time_ms` from host-side elapsed time (`src/dew/training/trainer.py:554-565`). There is no second return channel.
 - **EMA and checkpoints.** The EMA clock is untouched (§3); the trainer's `save`, resume and `dataset_state` are untouched; the rollout's RNG comes from the checkpointed stream, so a resumed run samples different, correctly-streamed continuations rather than replaying.
 - **Distributed.** The rollout runs per process on its slice of the global batch (the `DevicePrefetchIterator` hands each process its shard, `src/dew/training/distributed.py:78-126`), and `shard_batch` assembles the global array from process-local data, which is its documented job (`:72-76`). Rewards that need the whole group's samples per prompt are therefore computed per process, over that process's groups. This requires `data.batch_size` to be divisible by `jax.process_count() * G`, which the recipe states and asserts.
 
@@ -183,7 +183,7 @@ The mechanics fall out of what already exists:
 
 ## 5. Rewards
 
-Rewards are plain callables from outputs to scores. One signature per modality:
+Rewards are plain callables from outputs to scores. Each modality has one signature:
 
 ```python
 # text
@@ -196,7 +196,7 @@ def reward(record: dict, image: np.ndarray) -> float   # [H, W, 3] uint8
 
 **Where they run.** On the host, synchronously, inside the rollout, right after the device arrays are converted to numpy. This is verl's own default behaviour (`NaiveRewardManager` loops and decodes per sample on CPU), and the frontier's cheap verifiers (string match, Levenshtein, JPEG complexity) are host code anyway. A reward model is the same callable whose body calls a jitted device forward (a CLIP scorer is `dew.eval.images` plus a scorer head; the cached CLIP machinery already exists at `src/dew/eval/images.py:6-33`). Async reward workers (verl-omni's pool, `docs/algo/async_reward.md`) and HTTP scorer services are not built; they are vLLM-scale concerns, and the callable interface leaves room for them without a seam change.
 
-Two rewards ship with the objectives, as examples that double as tests: a GSM8K-style `math_verifier` (string match against `ground_truth` after `####`) and an OCR scorer built on an OCR model, both named in the owner's snippet. JPEG compressibility (`verl_omni/utils/reward_score/jpeg_compressibility.py:52-60`) is the model-free image example. Nothing else; rewards are user code.
+Two rewards ship with the objectives, as examples that double as tests: a GSM8K-style `math_verifier` (string match against `ground_truth` after `####`) and an OCR scorer built on an OCR model, both named in the owner's snippet. JPEG compressibility (`verl_omni/utils/reward_score/jpeg_compressibility.py:52-60`) is the model-free image example. Nothing else ships; rewards are user code.
 
 ## 6. The four new objectives
 
@@ -251,7 +251,7 @@ This is verl-omni's `DPOLoss.compute_loss` line for line (`verl_omni/trainer/dif
 
 The SDE rollout is a `DiffusionSampler` subclass, `SDERolloutSampler`, in `src/dew/sampling/sde.py`. Dew's sampler seam can produce everything FlowGRPO needs; one thing is missing and two are additions:
 
-- `take_next_step` receives `reconstructed_samples` and `pred_noise`, i.e. the model output after the prediction transform, not the raw velocity (`src/dew/sampling/common.py:149-163`). For the flow preset the transform is the identity on the output (`.worktrees/../src/dew/diffusion/transforms.py:95-106`), so the raw velocity is available as `eps - x0` or by passing it through; **the gap**: `take_next_step` never sees it, and the SDE mean is defined on it. Fix: thread `model_output` into `take_next_step` alongside `reconstructed_samples` and `pred_noise`. This touches every sampler's signature (the files in `src/dew/sampling/`), mechanically, because the base class signature changes once.
+- `take_next_step` receives `reconstructed_samples` and `pred_noise`, i.e. the model output after the prediction transform, not the raw velocity (`src/dew/sampling/common.py:149-163`). For the flow preset the transform is the identity on the output (`.worktrees/../src/dew/diffusion/transforms.py:95-106`), so the raw velocity is available as `eps - x0` or by passing it through; the gap is that `take_next_step` never sees it, and the SDE mean is defined on it. Fix: thread `model_output` into `take_next_step` alongside `reconstructed_samples` and `pred_noise`. This touches every sampler's signature (the files in `src/dew/sampling/`), mechanically, because the base class signature changes once.
 - The step itself, from the FlowGRPO paper (equation 8; `arXiv:2505.05470`): with flow convention `x_t = (1-t)x_0 + t*x_1` and Dew's rates `(alpha, sigma) = (1-t, t)` (`src/dew/diffusion/schedules/flow.py:45-47`), the SDE transition is
 
   `std_dev_t = sqrt(sigma / (1 - sigma)) * noise_level` (guarding `sigma == 1` with the schedule's second sigma, as the reference does)
@@ -261,7 +261,7 @@ The SDE rollout is a `DiffusionSampler` subclass, `SDERolloutSampler`, in `src/d
   `x_next = mean + std_dev_t * sqrt(-dt) * eps`
 
   This is verbatim `FlowMatchSDEDiscreteScheduler.sample_previous_step`'s `sde_type="sde"` branch (`verl_omni/pipelines/schedulers/flow_match_sde.py:214-243`, `/tmp/design/verl-omni`), with sigma playing t. Dew's `FlowMatchingScheduler.get_rates` returns `(1-t, t)` directly (`flow.py:45-47`), so `sigma` is the noise rate and no convention change is needed.
-- The per-step log-prob is the Gaussian density of `x_next` under `(mean, std_dev_t*sqrt(-dt))`, **mean-pooled over all non-batch dimensions** (the reference reduces with `.mean(dim=tuple(range(1, ndim)))`, `flow_match_sde.py:312-313`; verl-omni's own docs note diffusion log-probs are mean-pooled, `docs/algo/rollout_correction.md`). The normalizer constants are included, as the reference's default does.
+- The per-step log-prob is the Gaussian density of `x_next` under `(mean, std_dev_t*sqrt(-dt))`, mean-pooled over all non-batch dimensions (the reference reduces with `.mean(dim=tuple(range(1, ndim)))`, `flow_match_sde.py:312-313`; verl-omni's own docs note diffusion log-probs are mean-pooled, `docs/algo/rollout_correction.md`). The normalizer constants are included, as the reference's default does.
 - `SDERolloutSampler.take_next_step` computes the step from the shared distribution and returns it; a pure `step_distribution(x_t, v, t, t_next)` function beside it is what the rollout records and the loss recomputes under gradient. This is the split verl-omni enforces with `prev_sample=...` (replaying a trajectory to re-evaluate log-probs, `flow_match_sde.py:179-181`): one function defines the transition, both sides call it.
 
 **The rollout** (the objective's `rollout`):
@@ -328,7 +328,7 @@ Numbers for the two briefed models. Qwen3-0.6B from its config (`.worktrees/hf-d
 | + grads (transient) | 11.1 GiB | 11.1 GiB | 125.5 GiB |
 | + MultiSteps accumulator (grad_accum > 1) | 13.3 GiB | 13.3 GiB | 150.6 GiB |
 | policy activations, bf16, 2B rows x 1024 tokens | ~1-2 GiB | ~1-2 GiB | ~4-8 GiB |
-| fits full fine-tune | yes, tightly; grad accumulation off or small | yes, comfortably | **no**, not even without the accumulator |
+| fits full fine-tune | yes, tightly; grad accumulation off or small | yes, comfortably | no, not even without the accumulator |
 | reference at in-step | 0 (the ema tree is the reference and is already in the state) | 0 | 0 |
 | reference as precomputed log-probs | saves nothing in state; saves ~1 forward/step | same | saves ~1 forward/step, which does not fix the 100 GiB state |
 
@@ -340,20 +340,20 @@ Readings:
 
 ## 9. `pretrained=` and the one change to the surface
 
-`LMObjective` on wave/hf-decoders already takes `pretrained=<variables>` and returns them from `init_params` (`.worktrees/hf-decoders/src/dew/objectives/lm/objective.py`, diff `@@ -80,6 +87`). The four new objectives take the same argument, and `init_params` returns it. The owner's `reference=pretrained` is therefore realized as: **the reference is the policy's initial weights**, held frozen in the EMA slot.
+`LMObjective` on wave/hf-decoders already takes `pretrained=<variables>` and returns them from `init_params` (`.worktrees/hf-decoders/src/dew/objectives/lm/objective.py`, diff `@@ -80,6 +87`). The four new objectives take the same argument, and `init_params` returns it. The owner's `reference=pretrained` is therefore realized as the reference being the policy's initial weights, held frozen in the EMA slot.
 
-Honesty note, stated rather than hidden: the argument does not name a second model distinct from the starting point, because the mechanism holds one extra tree, and under §3 that tree is the initial weights. This covers TRL's default (reference = SFT model, `trl/trainer/dpo_trainer.py:1390-1403`), verl's default (a frozen copy of the actor's initial checkpoint), verl-omni's LoRA reference (adapters disabled = the base weights the run started from, `lora_adapter_mixin.py:172-178`), and Tunix's `ref_model` (a plain frozen `nnx.Module`, `tunix/sft/dpo/dpo_trainer.py:216-229`). It does not cover a reference that differs from the starting policy (iterative DPO round 2 referencing round 1 while starting from a further-trained policy). When a run needs that, the mechanism extends by seeding `ema_params` from a second tree in `generate_states` (one `TrainState.create(ema_params=reference_tree)` instead of `ema_params=params`), which is a contained change to one call site; it is not built now.
+The argument does not name a second model distinct from the starting point, because the mechanism holds one extra tree, and under §3 that tree is the initial weights. This covers TRL's default (reference = SFT model, `trl/trainer/dpo_trainer.py:1390-1403`), verl's default (a frozen copy of the actor's initial checkpoint), verl-omni's LoRA reference (adapters disabled = the base weights the run started from, `lora_adapter_mixin.py:172-178`), and Tunix's `ref_model` (a plain frozen `nnx.Module`, `tunix/sft/dpo/dpo_trainer.py:216-229`). It does not cover a reference that differs from the starting policy (iterative DPO round 2 referencing round 1 while starting from a further-trained policy). When a run needs that, the mechanism extends by seeding `ema_params` from a second tree in `generate_states` (one `TrainState.create(ema_params=reference_tree)` instead of `ema_params=params`), which is a contained change to one call site; it is not built now.
 
 ## 10. Rollout engine: Dew's own, and the crossover
 
-Research scale uses Dew's `generate` and the `DiffusionSampler`. The crossover to verl/vLLM is stated honestly:
+Research scale uses Dew's `generate` and the `DiffusionSampler`. The crossover to verl/vLLM:
 
 - `generate` decodes one token per `lax.scan` step over the full batch with a fixed-size cache (`.sampling/text.py:28-48`); it has no continuous batching, no paged KV and no prefix sharing. Its cost per decode step is the weights plus the cache read, so throughput falls as the batch shrinks, and a long prompt pays its cache every step.
 - vLLM buys continuous batching, paged attention and prefix caching; verl buys a colocated engine, sleep/wake memory management and resharding. Those matter when the model needs tensor parallelism (Dew's mesh has no TP axis and the frontier note records that it should not grow one, `docs/research/frontier-training.md:208`), or when rollout and training are pipelined across separate device pools, which is Tunix's `rl_cluster` layer (`tunix/rl/rl_cluster.py:257-393`).
-- The honest trigger is a measured one, not a parameter count: when the rollout's wall time dominates the gradient step on the hardware a run actually uses, measured by `train/step_time_ms` and a rollout timer in the aux metrics, the run has crossed. At Dew's scale (0.6B on one 16 GiB card, 7B on a few 80 GiB cards) the rollout of a research batch is minutes, and `generate`'s scan loop is a small fraction of it.
-- The experiment that decides it, named: the first 0.6B GRPO run reports `train/rollout_seconds` beside `train/step_time_ms` (§4). A ratio above about 3 justifies a decoupled sampler process, which is a new seam between the trainer and a serving engine, not a change to `Objective.rollout`; below it, the synchronous host rollout stands.
+- The trigger is a measured one, not a parameter count: when the rollout's wall time dominates the gradient step on the hardware a run actually uses, measured by `train/step_time_ms` and a rollout timer in the aux metrics, the run has crossed. At Dew's scale (0.6B on one 16 GiB card, 7B on a few 80 GiB cards) the rollout of a research batch is minutes, and `generate`'s scan loop is a small fraction of it.
+- The experiment that decides it is the first 0.6B GRPO run, which reports `train/rollout_seconds` beside `train/step_time_ms` (§4). A ratio above about 3 justifies a decoupled sampler process, which is a new seam between the trainer and a serving engine, not a change to `Objective.rollout`; below it, the synchronous host rollout stands.
 
-The interop path already exists and is the whole story: `save_pretrained_decoder` writes an HF layout Dew-trained weights (`.worktrees/hf-decoders/src/dew/interop/hf_decoders.py:446-481`), verl consumes HF checkpoints, and the parquet schemas in §1.4 are the data interchange both ways. Nothing in Dew wraps, embeds or imports verl, TRL or verl-omni; they are read as parity references and used as parallel projects at a different layer. Weights come back through `load_pretrained_decoder`.
+The interop path already exists: `save_pretrained_decoder` writes an HF layout Dew-trained weights (`.worktrees/hf-decoders/src/dew/interop/hf_decoders.py:446-481`), verl consumes HF checkpoints, and the parquet schemas in §1.4 are the data interchange both ways. Nothing in Dew wraps, embeds or imports verl, TRL or verl-omni; they are read as parity references and used as parallel projects at a different layer. Weights come back through `load_pretrained_decoder`.
 
 ## 11. Tunix: what to take, and why it is not a dependency
 
@@ -367,7 +367,7 @@ Not a dependency, for the reasons already on record (`docs/research/google-jax-s
 
 ## 12. Recipes
 
-One recipe file per objective is wrong: it multiplies entry points and re-describes the trainer knobs six times. The existing per-modality recipes grow an objective choice, and the config tree stays flat because tyro renders nested dataclasses as dotted flags (`recipes/lm/train.py` already subclasses `RunConfig` into `LmRunConfig`, `src/dew/config/__init__.py:151-167`):
+One recipe file per objective is wrong, because it multiplies entry points and re-describes the trainer knobs six times. The existing per-modality recipes grow an objective choice, and the config tree stays flat because tyro renders nested dataclasses as dotted flags (`recipes/lm/train.py` already subclasses `RunConfig` into `LmRunConfig`, `src/dew/config/__init__.py:151-167`):
 
 ```python
 @dataclass(frozen=True)
@@ -395,11 +395,11 @@ Each step is one reviewed branch, smallest-first, and nothing is built that a st
 | 7 | SDE sampler | `SDERolloutSampler`, `step_distribution`, threading `model_output` through `take_next_step` | the one change to existing sampler files, in its own branch with its own parity test |
 | 8 | `FlowGRPOObjective` | the rollout, the recorded-window batch, the objective | last: everything it consumes landed in 1, 4, 7 |
 
-Not built until a run needs it, with the trigger named: PPO value heads and GAE (trigger: a task where group-relative baselines demonstrably fail), a reward-model trainer (trigger: a preference dataset that needs one; Dew then trains it with `LMObjective` on pairs, which is SFT), multi-turn agents and tool use (trigger: an environment that produces the transcripts; then the chat path already parses them), LoRA (trigger: the 7B state arithmetic of §8 biting a real run), async reward workers (trigger: reward wall time dominating steps, §10's measured crossover), and `mu > 1` (trigger: a run that shows one-pass updates underusing a rollout).
+Nothing below is built until a run needs it, and each has its trigger: PPO value heads and GAE (trigger: a task where group-relative baselines demonstrably fail), a reward-model trainer (trigger: a preference dataset that needs one; Dew then trains it with `LMObjective` on pairs, which is SFT), multi-turn agents and tool use (trigger: an environment that produces the transcripts; then the chat path already parses them), LoRA (trigger: the 7B state arithmetic of §8 biting a real run), async reward workers (trigger: reward wall time dominating steps, §10's measured crossover), and `mu > 1` (trigger: a run that shows one-pass updates underusing a rollout).
 
 ## Appendix A: the concepts outline
 
-Carried into `docs/concepts/post_training.md` when the code lands, not before: `CONTRIBUTING.md` says the docs describe what the code does today, and this file is the design, not the feature. Headings, and the code block the page opens with, are the owner's six constructors (the block at the top of this file).
+This outline is carried into `docs/concepts/post_training.md` when the code lands, not before, because `CONTRIBUTING.md` says the docs describe what the code does today, and this file is the design, not the feature. Headings, and the code block the page opens with, are the owner's six constructors (the block at the top of this file).
 
 - **One trainer, more objectives**: the six constructors; the seams unchanged.
 - **Supervised fine-tuning is pretraining with a mask**: the chat data path; roles; why the mask includes the stop token.
