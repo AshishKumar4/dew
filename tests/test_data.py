@@ -867,3 +867,164 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
 
     assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
     assert sorted(index for index, _, _ in seen + resumed) == list(range(16))
+
+
+# ---------------------------------------------------------------------------------
+# Failure paths: a record that cannot be read stops the run
+# ---------------------------------------------------------------------------------
+
+class _RaisingSource(DataSource):
+    """Raises on record `bad`, or on every record when `bad` is None."""
+
+    def __init__(self, length, bad):
+        self.length = length
+        self.bad = bad
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if self.bad is None or index == self.bad:
+            raise RuntimeError(f"record {index} is unreadable")
+        return {"index": index}
+
+    def get_source(self, path_override):
+        return self
+
+
+def _raising_loader(monkeypatch, bad, worker_count, length=8, batch=2):
+    dataset = MediaDataset(source=_RaisingSource(length, bad),
+                           augmenter=_PassthroughAugmenter(), media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "raising", dataset)
+    return get_media_dataset_grain("raising", dataset_source="/tmp", batch_size=batch,
+                                   worker_count=worker_count, num_epochs=1)
+
+
+@pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_a_record_that_cannot_be_read_stops_the_stream(monkeypatch, worker_count):
+    """The source's own error has to reach the trainer. A pipeline that caught
+    it would train on whatever it substituted, and a worker's exception is the
+    easiest one to lose."""
+    data = _raising_loader(monkeypatch, bad=3, worker_count=worker_count)
+
+    delivered = []
+    with pytest.raises(RuntimeError, match="record 3 is unreadable"):
+        for batch in data["train"]():
+            delivered.extend(int(i) for i in batch["index"])
+
+    assert 3 not in delivered
+    assert all(index in range(8) for index in delivered), "no fabricated records"
+
+
+def test_a_source_that_fails_on_every_record_raises_instead_of_an_empty_batch(
+        monkeypatch):
+    data = _raising_loader(monkeypatch, bad=None, worker_count=0)
+
+    iterator = iter(data["train"]())
+    with pytest.raises(RuntimeError, match="is unreadable"):
+        next(iterator)
+
+
+# ---------------------------------------------------------------------------------
+# Adversarial shapes
+# ---------------------------------------------------------------------------------
+
+def test_a_dataset_of_one_record_yields_one_batch(monkeypatch):
+    dataset = MediaDataset(source=_ListSource(1), augmenter=_PassthroughAugmenter(),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "single", dataset)
+    data = get_media_dataset_grain("single", dataset_source="/tmp", batch_size=1,
+                                   worker_count=0, num_epochs=1)
+
+    batches, ended = _bounded(data["train"](), 2)
+
+    assert [[int(i) for i in b["index"]] for b in batches] == [[0]] and ended
+
+
+def test_a_validation_split_cannot_swallow_the_only_record(monkeypatch):
+    """One record and a held-out one would leave nothing to train on."""
+    dataset = MediaDataset(source=_ListSource(1), augmenter=_PassthroughAugmenter(),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "single", dataset)
+
+    with pytest.raises(ValueError, match="val_count"):
+        get_media_dataset_grain("single", dataset_source="/tmp", batch_size=1,
+                                worker_count=0, val_count=1)
+
+
+def test_the_image_augmenter_gives_a_grayscale_record_three_channels():
+    """A single-channel record has to come out the same shape as every other
+    one, or the batch it lands in cannot be stacked."""
+    gray = np.tile(np.arange(0, 128, 8, dtype=np.uint8), (16, 1))
+
+    out = image_augmenter(gray, 16, cv2.INTER_NEAREST)
+
+    assert out.shape == (16, 16, 3)
+    np.testing.assert_array_equal(out[..., 0], gray)
+    np.testing.assert_array_equal(out[..., 0], out[..., 2])
+
+
+def test_the_image_augmenter_drops_alpha_and_hands_back_rgb():
+    """Records arrive as BGR(A) from cv2; the model is trained on RGB."""
+    bgra = np.dstack([np.full((16, 16), 10, np.uint8), np.full((16, 16), 20, np.uint8),
+                      np.full((16, 16), 30, np.uint8), np.full((16, 16), 40, np.uint8)])
+
+    out = image_augmenter(bgra, 16, cv2.INTER_NEAREST)
+
+    assert out.shape == (16, 16, 3)
+    np.testing.assert_array_equal(out[0, 0], [30, 20, 10])
+
+
+def test_a_truncated_image_raises_rather_than_becoming_an_array():
+    """cv2.imdecode hands back None for a half-written jpeg, and None resized
+    to the training size would be a black record."""
+    whole = np.random.RandomState(0).randint(0, 256, (16, 16, 3), np.uint8)
+    encoded, buffer = cv2.imencode(".jpg", whole)
+    assert encoded
+    truncated = buffer.tobytes()[:len(buffer) // 2]
+
+    decoded = cv2.imdecode(np.frombuffer(truncated, np.uint8), cv2.IMREAD_UNCHANGED)
+
+    assert decoded is None
+    with pytest.raises(cv2.error):
+        image_augmenter(decoded, 16)
+
+
+def test_image_collate_stacks_a_batch_of_one(monkeypatch):
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+
+    out = collate([{"image": np.full((8, 8, 3), 7, np.uint8), "caption": "alone"}])
+
+    assert out["image"].shape == (1, 8, 8, 3)
+    assert out["text"]["input_ids"].shape == (1, 4)
+
+
+def test_image_collate_raises_when_a_grayscale_record_meets_colour_ones(monkeypatch):
+    """Resizing to the largest shape cannot rescue a record with no channels,
+    and a batch that quietly dropped it would train on the wrong captions."""
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+    batch = [
+        {"image": np.full((8, 8, 3), 7, np.uint8), "caption": "colour"},
+        {"image": np.full((8, 8), 7, np.uint8), "caption": "gray"},
+    ]
+
+    with pytest.raises(ValueError, match="same shape"):
+        collate(batch)
+
+
+@pytest.mark.network
+def test_an_overlong_caption_is_truncated_to_the_text_context():
+    """The tokenizer pads and truncates to CLIP's context, so one enormous
+    caption cannot widen a batch or make it ragged."""
+    from dew.inputs.processors import AutoTextTokenizer
+
+    tokenizer = AutoTextTokenizer(tensor_type="np")
+    context = tokenizer.tokenizer.model_max_length
+
+    out = tokenizer(["x" * 10000, "short"])
+
+    assert out["input_ids"].shape == (2, context)
+    assert int(out["attention_mask"][0].sum()) == context
+    assert int(out["attention_mask"][1].sum()) < context
