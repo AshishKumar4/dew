@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP
@@ -318,6 +319,26 @@ def routed_experts(num_experts=8, top_k=1, tokens=6, width=8, hidden=12,
     weights = jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32)
     variables = experts.init(jax.random.key(1), x, weights, indices)
     return experts, variables, x, weights, indices
+
+
+def test_every_expert_initialises_like_the_dense_projection_it_replaces():
+    """The expert dimension stacks whole matrices, so fan-in is one expert's
+    input width. Counting the stack in it would scale every expert's weights
+    down by sqrt(num_experts) and a from-scratch run would start quiet.
+    """
+    experts = ExpertMLP(num_experts=8, hidden_features=64, out_features=64)
+    variables = experts.init(
+        jax.random.key(1), jnp.zeros((4, 64)), jnp.ones((4, 1)),
+        jnp.zeros((4, 1), jnp.int32))
+    stacked = np.asarray(variables["params"]["gate_proj"]["kernel"])
+    dense = np.asarray(nn.initializers.lecun_normal()(
+        jax.random.key(1), (64, 64), jnp.float32))
+
+    assert stacked.shape == (8, 64, 64)
+    # Observed 0.1255 against the dense 0.1252 and the 1/sqrt(64) of 0.1250,
+    # where a fan-in over the whole stack would give 0.0442.
+    assert abs(stacked.std() - 1 / np.sqrt(64)) < 0.02 / np.sqrt(64)
+    assert abs(stacked.std() - dense.std()) < 0.05 * dense.std()
 
 
 def test_an_expert_no_token_reached_cannot_change_the_output():
