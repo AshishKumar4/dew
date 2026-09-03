@@ -201,7 +201,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["process_count"] == 2
         assert report["device_count"] == DEVICES
         assert report["local_device_count"] == DEVICES // 2
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "fsdp": 2}
+        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2}
         assert report["mesh_devices"] == DEVICES
         assert report["mesh_process_indices"] == [0, 1]
 
@@ -213,7 +213,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == DEVICES // 4
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "fsdp": 2}
+        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
 
@@ -394,7 +394,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "fsdp": 4}
+        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4}
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
