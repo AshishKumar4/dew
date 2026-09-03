@@ -74,7 +74,7 @@ dew/
   inputs/        conditioning encoders and input configs
   checkpoints/   checkpoint path and serialization helpers
   registry.py    architecture registry and precision policy
-  new rl/        advantage.py, surrogate.py, rollout.py, buffer.py, env.py, reward.py
+  new rl/        advantage.py, surrogate.py, env.py (protocol, adapter, scan), buffer.py, reward.py
   new recipes/   Stage, Recipe, manifest, runner
 recipes/         lm/train.py, diffusion/train.py, jepa/train.py: the run entrypoints
 ```
@@ -625,7 +625,7 @@ pointed the other way.
 | --- | --- | --- |
 | Policy | the objective's parameter tree and the model's `apply`; there is no `Policy` class | always |
 | Generator or environment | `Env` protocol in `dew/rl/env.py`: `reset(rng) -> TimeStep`, `step(state, action) -> TimeStep`, both pure and jittable, `TimeStep` a `flax.struct.dataclass` of observation, reward, done and state | text and diffusion rollouts have no environment; the generator there is `dew.sampling` |
-| Rollout | `Objective.rollout(params, ema_params, batch, rng, step) -> batch`, host side, fixed shapes; implementations in `dew/rl/rollout.py` for text, environment and SDE sampling | offline algorithms (SFT, DPO) use the default, which returns the batch unchanged |
+| Rollout | `Objective.rollout(params, ema_params, batch, rng, step) -> batch`, host side, fixed shapes. The body belongs to the objective: text through `dew.sampling.text.generate`, diffusion through the SDE sampler, control through `env_rollout` in `dew/rl/env.py`, which is the only rollout code in the package because it is the only piece two objectives share (`docs/design/post-training.md:393`) | offline algorithms (SFT, DPO) use the default, which returns the batch unchanged |
 | Rollout buffer | `ReplayBuffer` in `dew/rl/buffer.py`: a fixed-capacity device pytree with `insert` and `sample`, including sequence sampling for model-based use | every on-policy algorithm omits it |
 | Reward | a host-side callable per sample, `(record, completion, completion_ids) -> float` for text and `(record, image) -> float` for images, in a list on the objective with weights; verifiable examples in `dew/rl/reward.py` | when the environment supplies the reward it is already a batch column |
 | Advantage estimator | functions in `dew/rl/advantage.py`: `group_mean`, `group_mean_unnormalised`, `rloo`, `gae`, `lambda_returns` | DPO and DiffusionNFT pass the reward through unchanged |
@@ -720,7 +720,14 @@ The adapter is small: Playground environments already return an observation, a
 reward and a done flag from a jittable step, so the adapter renames fields into
 `TimeStep` and nothing more. Vectorisation is `jax.vmap` over the environment
 state, and the batch axis is sharded like any other batch
-(`src/dew/training/distributed.py:16`).
+(`src/dew/training/distributed.py:16`). `env_rollout(env, policy_apply, params, steps)`
+is a `lax.scan` over that pair of functions and lives in the same file as the
+protocol, because the protocol and the only loop over it are one idea. It is the
+one rollout helper in `dew.rl`: the text and diffusion rollout bodies belong to
+their objectives, which is post-training.md's decision (`docs/design/post-training.md:393`).
+
+`env_rollout` is also the seam a learned world model plugs into, which is the
+next section and the reason the loop is not written inside the PPO objective.
 
 ### 5.6 World models
 
