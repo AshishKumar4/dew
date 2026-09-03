@@ -6,9 +6,10 @@ for the softmax gradient. These tests hold the replacement to the code it
 replaced: the loss to 1e-5, both gradients to 1e-4, and the top-1 prediction
 exactly, including the tie that decides which of two equal logits wins.
 
-The mutation tests are the point of the file. Dropping the target term, or one
-chunk of the vocabulary, or weakening the tie comparison all leave a loss that
-still looks like a loss, so each one is written out and shown to fail.
+The mutation tests are the point of the file. Dropping the target term or one
+chunk of the vocabulary leaves a loss that still looks like a loss, so each
+one is fed through the real chunk loop and shown to fail the parity check.
+The tie rule has its own two tests, which is what a weaker comparison breaks.
 """
 
 import jax
@@ -18,6 +19,7 @@ import optax
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, vocabulary_chunks
 
 CHUNKS = [1, 2, 4, 8]
@@ -116,69 +118,54 @@ def test_a_flat_head_predicts_the_first_column():
 
 # --- the mutations, each one a loss that would still train ------------------
 
-def mutated_chunked(hidden, head, targets, chunks, *, drop_target=False,
-                    drop_chunk=None, ties_go_high=False):
-    """`chunked_cross_entropy` with one term removed, for the tests below."""
-    bounds = vocabulary_chunks(head.shape[1], chunks)
-    flat = hidden.astype(jnp.float32).reshape(-1, head.shape[0])
-    flat_targets = targets.reshape(-1)
-    total = jnp.full(flat_targets.shape, -jnp.inf, jnp.float32)
-    target_logit = jnp.zeros(flat_targets.shape, jnp.float32)
-    best = jnp.full(flat_targets.shape, -jnp.inf, jnp.float32)
-    predicted = jnp.zeros(flat_targets.shape, jnp.int32)
+def mutating_chunk_terms(monkeypatch, mutate):
+    """Run the real chunk loop with `mutate` applied to each tile's terms.
 
-    for index, (start, stop) in enumerate(bounds):
-        if index == drop_chunk:
-            continue
-        logits = flat @ head[:, start:stop]
-        total = jnp.logaddexp(total, jax.nn.logsumexp(logits, axis=-1))
-        inside = (flat_targets >= start) & (flat_targets < stop)
-        column = jnp.clip(flat_targets - start, 0, stop - start - 1)
-        picked = jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0]
-        if not drop_target:
-            target_logit = target_logit + jnp.where(inside, picked, 0.0)
-        chunk_best = jnp.max(logits, axis=-1)
-        better = chunk_best >= best if ties_go_high else chunk_best > best
-        best = jnp.where(better, chunk_best, best)
-        predicted = jnp.where(better, jnp.argmax(logits, axis=-1) + start, predicted)
+    `_chunk_terms` is what the loop reads a tile's logsumexp, target logit,
+    best logit and column from, so a mutation there is a mutation of the loss
+    that ships, not of a copy of it.
+    """
+    original = chunked._chunk_terms
 
-    return ((total - target_logit).reshape(targets.shape),
-            predicted.reshape(targets.shape))
+    def mutated(hidden, head_chunk, targets, start, stop, softcap, precision):
+        terms = original(hidden, head_chunk, targets, start, stop, softcap,
+                         precision)
+        return mutate(terms, start, stop)
+
+    monkeypatch.setattr(chunked, "_chunk_terms", mutated)
 
 
-def test_dropping_the_target_term_fails_the_parity_check():
+def test_dropping_the_target_term_fails_the_parity_check(monkeypatch):
     hidden, head, targets = inputs()
     expected = reference(hidden, head, targets)[0]
+    mutating_chunk_terms(
+        monkeypatch,
+        lambda terms, start, stop: (terms[0], jnp.zeros_like(terms[1]), *terms[2:]))
 
-    losses, _ = mutated_chunked(hidden, head, targets, 4, drop_target=True)
+    losses, _ = chunked_cross_entropy(hidden, head, targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
 
 
 @pytest.mark.parametrize("dropped", [0, 3])
-def test_dropping_one_chunk_fails_the_parity_check(dropped):
+def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
     hidden, head, targets = inputs()
     expected = reference(hidden, head, targets)[0]
+    skipped = vocabulary_chunks(head.shape[1], 4)[dropped]
 
-    losses, _ = mutated_chunked(hidden, head, targets, 4, drop_chunk=dropped)
+    def skip(terms, start, stop):
+        if (start, stop) != skipped:
+            return terms
+        # What the loop starts from: a tile that contributes no column.
+        chunk_lse, picked, chunk_best, chunk_column = terms
+        return (jnp.full_like(chunk_lse, -jnp.inf), jnp.zeros_like(picked),
+                jnp.full_like(chunk_best, -jnp.inf), chunk_column)
+
+    mutating_chunk_terms(monkeypatch, skip)
+
+    losses, _ = chunked_cross_entropy(hidden, head, targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
-
-
-def test_letting_ties_go_to_the_higher_column_fails_the_prediction_check():
-    """The `>=` version of the running comparison, which loses the tie rule."""
-    features, vocab = 8, 24
-    hidden = jnp.ones((1, 3, features), jnp.float32)
-    head = jnp.zeros((features, vocab), jnp.float32)
-    head = head.at[:, 5].set(0.5).at[:, 17].set(0.5).at[:, 21].set(0.5)
-    targets = jnp.asarray([[5, 17, 21]], jnp.int32)
-    expected = reference(hidden, head, targets)[1]
-
-    _, strict = mutated_chunked(hidden, head, targets, 4)
-    _, loose = mutated_chunked(hidden, head, targets, 4, ties_go_high=True)
-
-    assert jnp.array_equal(strict, expected)
-    assert not jnp.array_equal(loose, expected)
 
 
 # --- against the real backbone ---------------------------------------------
