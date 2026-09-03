@@ -4,8 +4,8 @@
 tools/benchmark_data.py answers "is the loader the bottleneck". This answers
 the other half: what a step of ObjectiveTrainer costs for a given
 architecture, batch size and fsdp width. The step measured here is the one the
-trainer compiles for a real run - same objective, same sharding, same donated
-state - so a number from this tool is a number from training, not from a
+trainer compiles for a real run (same objective, same sharding, same donated
+state), so a number from this tool is a number from training, not from a
 hand-written forward pass.
 
 FLOPs are counted off the compiled executable's optimized HLO

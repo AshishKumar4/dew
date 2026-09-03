@@ -198,14 +198,14 @@ framework in it. Two candidates pass that bar: the load-balance bias update
 (`maxtext layers/moe.py:238-261`, plain jax) and the masked reductions in
 `tunix rl/algo_core.py:117-165`. Everything else in the table is either a
 dependency or a pattern, because the source code is bound to NNX modules, to a
-config object with forty fields, or to a loop Dew already owns. That is the
-honest answer to "port code from MaxText": the valuable part of MaxText is its
-configuration surface and its arithmetic, and both transfer as design.
+config object with forty fields, or to a loop Dew already owns. The valuable
+part of MaxText is its configuration surface and its arithmetic, and both
+transfer as design.
 
 ## 3. Telemetry
 
-One design, three parts: a seam to write through, a vocabulary to write, and
-measurement sources that produce numbers.
+The design has three parts: a seam to write through, a vocabulary to write,
+and measurement sources that produce numbers.
 
 ### 3.1 The Tracker seam
 
@@ -218,11 +218,12 @@ class Tracker(Protocol):
     def artifact(self, path: str, name: str, kind: str, aliases: Sequence[str]) -> None: ...
 ```
 
-Five methods, because five things are done with wandb today: metric logging
-(`src/dew/training/trainer.py:505-510`), images and tables from validation
-(`src/dew/objectives/base.py:66`), reading the resume step out of the run summary
-(`src/dew/training/trainer.py:129`), writing run-level bests, and pushing the
-checkpoint artifact to the registry (`src/dew/training/objective_trainer.py:557`).
+The protocol has five methods, because five things are done with wandb today:
+metric logging (`src/dew/training/trainer.py:505-510`), images and tables from
+validation (`src/dew/objectives/base.py:66`), reading the resume step out of
+the run summary (`src/dew/training/trainer.py:129`), writing run-level bests,
+and pushing the checkpoint artifact to the registry
+(`src/dew/training/objective_trainer.py:557`).
 
 Implementations: `WandbTracker` (the default, exactly today's behaviour) and
 `NullTracker` (tests and offline runs). A third backend is a new file and no
@@ -273,7 +274,7 @@ expert utilisation.
 
 ### 3.3 Cadence
 
-Four clocks, each with one owner.
+Each of the four clocks has one owner.
 
 | Clock | Owner | Today |
 | --- | --- | --- |
@@ -282,9 +283,9 @@ Four clocks, each with one owner.
 | Probe cadence | a separate compiled step, run every `ProbeSpec.every` steps | new |
 | Wall-clock cadence | the goodput accumulator and the profiler window | profiler exists (`trainer.py:456-467`) |
 
-The rule that keeps this from becoming a pile of flags: nothing is added to the
-per-step path unless its cost is measured and under a stated fraction of step
-time. Section 4.3's acceptance run states that fraction for gradient norms.
+The rule that keeps this from becoming a pile of flags is that nothing is added
+to the per-step path unless its cost is measured and under a stated fraction of
+step time. Section 4.3's acceptance run states that fraction for gradient norms.
 
 ### 3.4 Measurement sources
 
@@ -304,7 +305,7 @@ The requirement is activation statistics, gradient norms per parameter group,
 and objective-specific collapse telemetry, through one path and without a flag
 per statistic.
 
-Three mechanisms, chosen by cost.
+The three mechanisms are chosen by cost.
 
 1. Anything the objective already computes goes in the aux dict. This covers
    collapse telemetry, KL, entropy, reward statistics, router load.
@@ -398,16 +399,16 @@ of the first run, and the measured cost of `ProbeSpec.norms` written into
 `docs/performance.md`. If gradient norms cost more than 2% of step time, they
 move behind the probe cadence instead.
 
-One prerequisite, because every wave below trains on a real corpus and today's
-path stops short of one. `tools/tokenize_text.py` reads `.txt` files and, with
-`--pack` on `wave/grain-packing`, writes an end-of-sequence id after every
-input file, so a document is a file (`wave/grain-packing:tools/tokenize_text.py`
-docstring). A corpus like FineWeb-Edu arrives as dataset records, not as
-millions of files. The addition is one argument on that tool: read records from
-an `HFDatasetSource` (`wave/hf-interop:src/dew/data/sources/hf.py:50`) and emit
-one document per record. Roughly thirty lines, it belongs to whichever wave
-lands first, and its test is that the token count and the document count match
-the dataset's own.
+One prerequisite comes first, because every wave below trains on a real corpus
+and today's path stops short of one. `tools/tokenize_text.py` reads `.txt`
+files and, with `--pack` on `wave/grain-packing`, writes an end-of-sequence id
+after every input file, so a document is a file
+(`wave/grain-packing:tools/tokenize_text.py` docstring). A corpus like
+FineWeb-Edu arrives as dataset records, not as millions of files. The addition
+is one argument on that tool: read records from an `HFDatasetSource`
+(`wave/hf-interop:src/dew/data/sources/hf.py:50`) and emit one document per
+record. Roughly thirty lines, it belongs to whichever wave lands first, and its
+test is that the token count and the document count match the dataset's own.
 
 ### 4.4 Recipe layer
 
@@ -426,7 +427,7 @@ three commands that reproduce the chain.
 Contents: `build_mesh` grows `sequence` and `tensor` axes; the rules table
 grows the entries that map `sequence` and `heads`, `mlp`, `vocab` onto them;
 `BATCH_SPEC` grows the sequence dimension (`src/dew/training/distributed.py:16`).
-Nothing else. The whole point of the rules table is that an axis is a
+Nothing else changes. The whole point of the rules table is that an axis is a
 configuration change (`docs/research/google-jax-stack.md:71`).
 
 Acceptance run: on the simulated eight-device CPU mesh, the same 50 steps of the
@@ -455,8 +456,8 @@ Parity with single-host: the same 200 steps at the same global batch and the
 same seed on one `v5e-8` host with `fsdp=8`, and on the two-host slice with
 `fsdp=16`. Losses agree to 1e-3 per step and the mean absolute difference over
 the 200 steps is reported. Bitwise equality is not claimed and is not expected:
-the collective order changes. A second check that is exact: a checkpoint saved
-on sixteen chips restores on eight and the parameters compare equal.
+the collective order changes. The second check is exact. A checkpoint saved on
+sixteen chips restores on eight and the parameters compare equal.
 
 Also in this wave: the process-count assumptions stay in the two files that
 have them today, `dew.data.dataloaders` and `dew.training.distributed`
@@ -513,7 +514,7 @@ norms, Muon for matrices), the `weight_dimension_numbers` spec patterned from
 Acceptance run: two runs of the 0.4B decoder on FineWeb-Edu at an equal token
 budget, one AdamW and one Muon with the split, on v5e-16. The comparison is the
 loss at equal tokens, and the numbers go in `docs/performance.md` with the
-commands. A negative result is a result.
+commands. A result that shows no gain is an acceptable outcome.
 
 ### 4.10 Quantized training
 
@@ -612,11 +613,11 @@ groups (`pyproject.toml:42-53`): an `rl` extra holding `mujoco_mjx` and
 `mujoco_playground`, imported lazily inside the adapter, exactly as
 `dew.data` already does for AV readers.
 
-The invariant that makes the decision reversible: nothing under `src/dew`
-outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`. A test
-walks the module tree and asserts it. If `dew.rl` later grows its own process
-model, a distributed sampler and its own deployment story, the split is then a
-directory move and a `pyproject.toml` entry, because the arrow has never
+The invariant that makes the decision reversible is that nothing under
+`src/dew` outside `src/dew/rl` and `src/dew/objectives/rl` may import `dew.rl`.
+A test walks the module tree and asserts it. If `dew.rl` later grows its own
+process model, a distributed sampler and its own deployment story, the split is
+then a directory move and a `pyproject.toml` entry, because the arrow has never
 pointed the other way.
 
 ### 5.2 The primitives
@@ -667,14 +668,14 @@ Identity means the slot is filled by a function that returns its input.
 | Dreamer v3 actor | `env_rollout` against the world model | learned reward head | `lambda_returns` | action log probs in latent space | `reinforce_entropy` | none | critic head with an EMA target | yes, for the world model |
 | DPO family | identity | identity (the preference label is in the data) | not used | chosen and rejected log probs | `preference_logsigmoid` | EMA at 1.0 | none | no |
 
-The last row is the honest one. DPO is not a policy-gradient instance: it has no
+The last row is the exception. DPO is not a policy-gradient instance: it has no
 rollout, no reward and no advantage, so forcing it through
 `PolicyGradientObjective` would mean three identity slots and a surrogate that
-ignores the advantage the fourth slot produced. It is its own small objective in
-`dew/objectives/rl/preference.py` and it shares exactly three things with the
-others: the reference mechanism, the log-probability helper and
+ignores the advantage the fourth slot produced. It is its own small objective
+in `dew/objectives/rl/preference.py` and it shares exactly three things with
+the others: the reference mechanism, the log-probability helper and
 `surrogate.preference_logsigmoid`. Eleven of the twelve rows are instances of
-one object; one is not, and saying so is cheaper than a false unification.
+one object and one is not.
 
 ### 5.4 How it composes with `ObjectiveTrainer`
 
@@ -697,10 +698,10 @@ and sharding all keep working because a rollout happens once per micro-batch and
 produces a fixed-shape batch (`src/dew/training/objective_trainer.py:278-287`).
 
 The critic is a parameter subtree in the objective's own tree, and its loss is
-another term in the same scalar. Three learning rates for three parameter groups,
-which Dreamer needs, is `optax.multi_transform` with a label tree, so it is one
-`GradientTransformation`, one optimizer state and one compiled step. The cost of
-that choice, stated plainly: the three losses are summed, so their relative
+another term in the same scalar. Three learning rates for three parameter
+groups, which Dreamer needs, is `optax.multi_transform` with a label tree, so
+it is one `GradientTransformation`, one optimizer state and one compiled step.
+The cost of that choice is that the three losses are summed, so their relative
 weight is a constant, not a separate step schedule. Dreamer v3's own
 configuration differs between the three only in learning rate, which
 `multi_transform` expresses exactly.
@@ -731,10 +732,11 @@ next section and the reason the loop is not written inside the PPO objective.
 
 ### 5.6 World models
 
-The design claim, and the reason `Env` earns its place: a world model is an
-`Env` whose state is a latent and whose `step` is a learned function. Then
-imagination training is the same `env_rollout` call as environment training,
-with a different `Env`. Dreamer's two loops become one primitive used twice.
+The design claim, and the reason `Env` earns its place, is that a world model
+is an `Env` whose state is a latent and whose `step` is a learned function.
+Then imagination training is the same `env_rollout` call as environment
+training, with a different `Env`. Dreamer's two loops become one primitive used
+twice.
 
 What Dreamer v3 needs from what Dew already has:
 
@@ -798,9 +800,9 @@ named stage's output checkpoint directory becomes the next stage's
 directory or an exported HF-layout directory, dispatched on the directory's
 contents, which is agreed with post-training.md.
 
-Stages run as separate processes. The reason is not isolation for its own sake:
-a stage that changes the model shape needs a fresh JAX process, and a crash in
-stage three must not leave stage two's donated buffers in an unknown state.
+Stages run as separate processes. A stage that changes the model shape needs a
+fresh JAX process, and a crash in stage three must not leave stage two's
+donated buffers in an unknown state.
 
 ### 6.2 Provenance
 
@@ -837,11 +839,11 @@ needs neither (`src/dew/cli/__init__.py`). Each stage's own process imports jax.
 
 ### 6.4 What it does not do
 
-No scheduler, no retries, no DAG (stages are a list), no cluster submission, no
-artifact store, no caching beyond the manifest comparison, and no second
-configuration language. The deletion test is in 1.4: without the manifest chain
-this layer is three shell commands, and if nobody reads manifests it should be
-deleted.
+The layer has no scheduler, no retries, no DAG (stages are a list), no cluster
+submission, no artifact store, no caching beyond the manifest comparison, and
+no second configuration language. The deletion test is in 1.4: without the
+manifest chain this layer is three shell commands, and if nobody reads
+manifests it should be deleted.
 
 ## 7. Post-training as the first consumer
 
@@ -865,7 +867,7 @@ are the first consumers of `dew.rl`, and the fact that a diffusion stage is the
 fifth row using the same primitives is the check that section 5's design is a
 framework rather than an LM-shaped special case.
 
-Where the two documents divide, so that neither repeats the other. This plan
+The two documents divide so that neither repeats the other. This plan
 owns the package layout, the trainer's two changes, the telemetry keys and the
 Recipe layer. `docs/design/post-training.md` owns the six objective
 constructors, the chat and preference data paths, the reward signatures, the
@@ -889,8 +891,8 @@ dominate; `dew/rl/reward.py` then gains one `batched(fn)` wrapper.
 
 ## 8. Tutorials and documentation
 
-One per capability, on real data, added by the wave that adds the capability. A
-wave is not done until its tutorial runs top to bottom.
+There is one per capability, on real data, added by the wave that adds the
+capability. A wave is not done until its tutorial runs top to bottom.
 
 | Wave | Document or notebook | Data |
 | --- | --- | --- |
@@ -935,7 +937,7 @@ starting a second series.
 
 ### 9.2 What can run in parallel
 
-Three groups, no shared files inside a group.
+The waves fall into three groups, with no shared files inside a group.
 
 | Group | Waves | Shared files to watch |
 | --- | --- | --- |

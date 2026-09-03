@@ -48,7 +48,7 @@ SOURCE_KEYS = ("image_tfds", "image_gcs", "image_combined_gcs", "video_tfds", "v
 
 @pytest.mark.parametrize("key", AUGMENTER_KEYS)
 def test_every_augmenter_registry_key_constructs(key):
-    """"video" used to point at a VideoAugmenter class that never existed."""
+    """Every augmenter key resolves to a DataAugmenter that exists."""
     assert isinstance(DataAugmenter.create(key), DataAugmenter)
 
 
@@ -104,8 +104,8 @@ def test_gcs_filter_returns_a_usable_filter_transform():
 # ---------------------------------------------------------------------------------
 
 def test_importing_dew_data_pulls_in_no_heavy_dependencies():
-    """`import dew.data` used to import online_loader, which imports HF
-    `datasets` at module scope and took the whole package down with it.
+    """`import dew.data` must not reach online_loader, which imports HF
+    `datasets` at module scope and would take the whole package down with it.
 
     The hub source has the same duty: naming a hub dataset resolves without
     the streaming extra, only reading one needs it.
@@ -211,7 +211,7 @@ def _indices(loader, num_batches):
 
 
 def test_media_dataset_grain_requires_an_explicit_source(fake_media_dataset):
-    """dataset_source=None used to reach os.path.join(None, ...) in the source."""
+    """dataset_source=None raises instead of reaching os.path.join(None, ...)."""
     with pytest.raises(ValueError, match="dataset_source"):
         get_media_dataset_grain("fake")
     with pytest.raises(ValueError, match="not found in mediaDatasetMap"):
@@ -292,8 +292,8 @@ def fake_legacy_dataset(monkeypatch):
 
 
 def test_legacy_grain_loader_holds_the_validation_records_out_of_training(fake_legacy_dataset):
-    """Validation used to read the whole source, so FID and CLIP were measured
-    on records the model had trained on."""
+    """The validation records are held out of the training set, so FID and CLIP
+    are not measured on records the model trained on."""
     data = dataloaders.get_dataset_grain(
         "fake", dataset_source="/tmp", batch_size=8, val_batch_size=4, val_count=8,
         worker_count=0, val_worker_count=0, num_epochs=1, seed=0)
@@ -358,7 +358,7 @@ def _tone(num_samples=NUM_SAMPLES):
 
 
 def test_wav_decode_excludes_the_riff_header(tmp_path):
-    """np.fromfile(path, np.int16) handed back the 44-byte header as 22 samples."""
+    """A flat int16 read of the file counts the 44-byte header as 22 samples."""
     samples = _tone()
     path = tmp_path / "tone.wav"
     _write_wav(path, samples)
@@ -366,7 +366,7 @@ def test_wav_decode_excludes_the_riff_header(tmp_path):
     audio = _read_wav_mono(str(path))
 
     assert len(audio) == NUM_SAMPLES
-    assert len(np.fromfile(path, np.int16)) == NUM_SAMPLES + 22  # the old behaviour
+    assert len(np.fromfile(path, np.int16)) == NUM_SAMPLES + 22  # what the flat read gives
     assert audio.dtype == np.float32
     np.testing.assert_allclose(audio, samples / 32768.0, atol=1e-7)
 
@@ -421,7 +421,7 @@ def test_read_audio_ffmpeg_honours_start_and_duration(tmp_path):
 # ---------------------------------------------------------------------------------
 
 def test_clip_start_is_reproducible_without_touching_the_global_rng():
-    """The readers used to call np.random.seed() inside data-loading workers."""
+    """Clip starts come from the generator passed in; the global RNG is untouched."""
     np.random.seed(1234)
     global_state = np.random.get_state()[1].copy()
 
@@ -578,7 +578,7 @@ def test_video_local_source_without_a_directory_says_so():
 # ---------------------------------------------------------------------------------
 
 def test_av_benchmark_script_imports_against_the_real_av_utils():
-    """It used to import a read_av_batch that av_utils never defined."""
+    """The script imports only names av_utils defines."""
     script = REPO_ROOT / "tools" / "av_benchmark.py"
     spec = importlib.util.spec_from_file_location("av_benchmark_under_test", script)
     module = importlib.util.module_from_spec(spec)
@@ -632,7 +632,7 @@ def test_image_collate_raises_on_a_malformed_sample(monkeypatch):
 
 
 def test_collate_raises_on_a_sample_without_a_caption(monkeypatch):
-    """A missing caption used to collate as the empty string."""
+    """A sample without a caption raises instead of collating as the empty string."""
     monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
     image_collate = dataloaders.generate_collate_fn("image")
     video_collate = dataloaders.generate_collate_fn("video")

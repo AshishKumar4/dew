@@ -72,7 +72,7 @@ less drop-catch attention than `dew.tools` will.
 
 `dewml.dev` remains the answer if he wants to stop thinking about this today. It costs 8.75 USD for
 the first year and 12.87 USD a year after, `.dev` is HSTS-preloaded so browsers refuse plain HTTP,
-Cloudflare carries it, and it matches the PyPI name. The honest objection to it is unchanged: it
+Cloudflare carries it, and it matches the PyPI name. The objection to it is unchanged: it
 adds no identity that `pip install dew-ml` does not already carry.
 
 The middle path is `dew.science` at 10.79 USD a year flat. It is the cheapest exact-match `dew.`

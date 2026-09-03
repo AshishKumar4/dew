@@ -492,8 +492,8 @@ def test_profiler_warmup_can_cross_an_epoch_boundary(tmp_path, monkeypatch):
 
 
 def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
-    """Reading the cost analysis used to compile the step a second time, which
-    doubled the startup cost of every fit()."""
+    """Reading the cost analysis must not compile the step a second time, which
+    would double the startup cost of every fit()."""
     trainer = make_trainer(tmp_path)
     compiles = []
     real_compile = jax.stages.Lowered.compile

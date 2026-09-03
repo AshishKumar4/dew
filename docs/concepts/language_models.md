@@ -16,13 +16,13 @@ python tools/tokenize_text.py --input data/shakespeare.txt \
 
 `--tokenizer` is either `byte`, which is `dew.data.text.ByteTokenizer` over raw UTF-8 bytes with a vocabulary of 256, or the name of a HuggingFace tokenizer, which `dew.data.text.HFTokenizer` loads through `transformers.AutoTokenizer`. Both expose `encode(str) -> list[int]` and `decode(ids) -> str`, and nothing downstream needs anything else from them.
 
-`dew.data.sources.text.TokenFileSource(path, seq_len)` is a random-access view over a memory-mapped `.bin`: record `i` is `tokens[i * seq_len : i * seq_len + seq_len + 1]`, so the records tile the file and the last token of one is the first of the next. `dew.data.dataloaders.get_token_dataset_grain` wraps that source in the same grain pipeline the image loaders use - an index sampler seeded from the run, `ShardByJaxProcess` so every host reads its own records, and worker processes for the reads - and yields batches of
+`dew.data.sources.text.TokenFileSource(path, seq_len)` is a random-access view over a memory-mapped `.bin`: record `i` is `tokens[i * seq_len : i * seq_len + seq_len + 1]`, so the records tile the file and the last token of one is the first of the next. `dew.data.dataloaders.get_token_dataset_grain` wraps that source in the same grain pipeline the image loaders use (an index sampler seeded from the run, `ShardByJaxProcess` so every host reads its own records, and worker processes for the reads) and yields batches of
 
 ```python
 {"text": int32[B, seq_len + 1]}
 ```
 
-One id longer than the context on purpose: the inputs are `text[:, :-1]` and the targets are `text[:, 1:]`, so a batch carries its own labels and nothing has to be shifted twice.
+The record is one id longer than the context on purpose. The inputs are `text[:, :-1]` and the targets are `text[:, 1:]`, so a batch carries its own labels and nothing has to be shifted twice.
 
 ## Packed documents
 
@@ -32,7 +32,7 @@ A flat stream has no document boundaries, so a fixed window can straddle two unr
 python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --tokenizer byte --pack
 ```
 
-`data.pack_sequences` then selects `dew.data.dataloaders.get_packed_token_dataset_grain`, which is grain's `Dataset` API rather than its `DataLoader` for the reason grain gives for switching: packing. `dew.data.sources.text.TokenDocumentSource` reads a record as one document, documents longer than the window are cut into consecutive pieces first (grain's packer refuses an over-long element), and `grain.experimental.FirstFitPackIterDataset` fills windows of `seq_len + 1` with whole documents. A batch is then
+`data.pack_sequences` then selects `dew.data.dataloaders.get_packed_token_dataset_grain`, which is grain's `Dataset` API rather than its `DataLoader`, because packing is the reason grain gives for switching. `dew.data.sources.text.TokenDocumentSource` reads a record as one document, documents longer than the window are cut into consecutive pieces first (grain's packer refuses an over-long element), and `grain.experimental.FirstFitPackIterDataset` fills windows of `seq_len + 1` with whole documents. A batch is then
 
 ```python
 {"text": int32[B, seq_len + 1],
@@ -40,7 +40,7 @@ python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --token
  "text_positions": int32[B, seq_len + 1]}     # position inside that document
 ```
 
-Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel changes: cuDNN has no mask argument, so jax converts a bool mask into an additive bias of `-2**41` in the compute dtype (`combine_bias_and_mask`) and refuses odd sequence lengths in training once a bias is present, while the xla kernel takes the mask itself on every backend with the same fp32 softmax. A segment-masked batch therefore runs on xla. Passing neither argument leaves every unpacked run bit-identical.
+Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal and block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel changes: cuDNN has no mask argument, so jax converts a bool mask into an additive bias of `-2**41` in the compute dtype (`combine_bias_and_mask`) and refuses odd sequence lengths in training once a bias is present, while the xla kernel takes the mask itself on every backend with the same fp32 softmax. A segment-masked batch therefore runs on xla. Passing neither argument leaves every unpacked run bit-identical.
 
 That kernel costs, one NVIDIA GeForce RTX 4080 (16 GiB, driver 595.84), 3 layers of GPT-2 small's width in bf16, 20 steps, one process per row:
 
@@ -52,7 +52,7 @@ That kernel costs, one NVIDIA GeForce RTX 4080 (16 GiB, driver 595.84), 3 layers
 | 4 x 2048 | fixed window | cuDNN | 78.5 | 5.00 |
 | 4 x 2048 | packed, 4 documents | xla | 108.2 | 8.34 |
 
-The third row is where the cost is: a fixed window on the xla kernel costs what a packed batch costs on it, so the mask is free and the whole difference is the fused kernel. The xla path materializes the fp32 `[B, N, T, S]` logits per layer and keeps them for the backward pass, which is why the gap grows with the sequence: 0.81 GiB at 512, 3.34 GiB at 2048. Keeping cuDNN for a packed batch means training against the bias it builds from the mask, so it needs a parity check against xla on the card in question before it can be the default.
+The third row is where the cost is. A fixed window on the xla kernel costs what a packed batch costs on it, so the mask is free and the whole difference is the fused kernel. The xla path materializes the fp32 `[B, N, T, S]` logits per layer and keeps them for the backward pass, which is why the gap grows with the sequence: 0.81 GiB at 512, 3.34 GiB at 2048. Keeping cuDNN for a packed batch means training against the bias it builds from the mask, so it needs a parity check against xla on the card in question before it can be the default.
 
 ```bash
 python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20

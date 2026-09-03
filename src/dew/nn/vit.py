@@ -87,7 +87,8 @@ class RotaryEmbedding(nn.Module):
 
     def __call__(self, seq_len: int):
         if seq_len > self.max_seq_len:
-            # Dynamically extend frequencies if needed (more robust)
+            # The cached table covers max_seq_len only, so a longer sequence
+            # needs frequencies of its own.
             t = jnp.arange(seq_len, dtype=jnp.float32)
             inv_freq = 1.0 / (
                 self.base ** (jnp.arange(0, self.dim, 2,

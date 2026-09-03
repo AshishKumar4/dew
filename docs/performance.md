@@ -60,7 +60,7 @@ of the twelve architectures in the small preset could not train on this card
 at their default settings. `'auto'` now picks cudnn only for the shapes
 cudnn supports and xla for the rest (`dew.nn.attention.cudnn_supports`),
 per call rather than per run, since one model holds both kinds of shape.
-Explicit `'cudnn'` still raises: a run that names a kernel gets that kernel.
+Explicit `'cudnn'` still raises. A run that names a kernel gets that kernel.
 
 Where 'auto' lands, at the small preset's shapes:
 
@@ -107,7 +107,7 @@ configuration was repeated.
 | `--xla_gpu_enable_while_loop_double_buffering=true` | 6.95 [6.93-7.09] n=5 | 75.73 | 17.30 |
 | the two above with any signal, together | 7.00 [6.99-7.02] n=2 | 75.75 [75.67-75.84] n=2 | 17.09 [16.93-17.26] n=2 |
 
-Nothing was adopted. The noise band decides it: four repeats of the *same*
+Nothing was adopted. The noise band decides it: four repeats of the same
 configuration on simple_dit spread from 6.97 to 7.53 ms, 8%, because a fresh
 process autotunes afresh. Against that, every simple_dit column is one
 distribution. The causal_transformer is the quiet measurement, spread 0.7%,
@@ -124,7 +124,7 @@ Two flags are worth knowing about for a different reason:
 - `--xla_gpu_autotune_level=4` changes nothing anywhere, which is how you
   learn it is already the default in this build.
 - `--xla_gpu_enable_command_buffer=` (command buffers off) is the only
-  configuration that is reliably *slower*: 17.90 against 17.38 on the unet
+  configuration that is reliably slower, 17.90 against 17.38 on the unet
   over four runs, and slower on the other two as well. Command buffers are on
   by default and worth 3% on the launch-heavy architecture. Passing a longer
   type list than the default does not add to that.

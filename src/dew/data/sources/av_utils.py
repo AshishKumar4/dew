@@ -18,9 +18,9 @@ def choose_clip_start(
 ) -> int:
     """Pick a random clip start leaving `padding` frames on either side.
 
-    Takes an explicit Generator: the readers used to call np.random.seed(), which
-    reseeded the process-global RNG from inside data-loading workers and silently
-    perturbed every other consumer of np.random.
+    Takes an explicit Generator, because np.random.seed() inside a data-loading
+    worker reseeds the process-global RNG and silently perturbs every other
+    consumer of np.random.
 
     Args:
         total_frames: Number of frames in the video.

@@ -89,7 +89,7 @@ def read_audio_ffmpeg(
         subprocess.run(cmd, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
         
         # Parse the WAV container instead of reading it as a flat int16 array,
-        # which used to prepend the 44-byte RIFF header as ~22 fake samples.
+        # which would prepend the 44-byte RIFF header as ~22 fake samples.
         audio_data = _read_wav_mono(tmp_path)
         
         return audio_data, target_sr

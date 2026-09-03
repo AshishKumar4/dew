@@ -33,10 +33,10 @@ def serialize_model(model: nn.Module):
 def get_latest_checkpoint(checkpoint_path):
     """Path of the highest-numbered step directory under a checkpoint root.
 
-    Orbax leaves entries that are not steps next to them - lock files, the
+    Orbax leaves entries that are not steps next to them (lock files, the
     manager's own metadata, `<step>.orbax-checkpoint-tmp` directories from a
-    write that was interrupted - and a step directory can exist while still
-    being empty. int()-ing every name blew up on the first of those, so this
+    write that was interrupted), and a step directory can exist while still
+    being empty. int()-ing every name raises on the first of those, so this
     only considers directories whose name is a number and which hold something.
     """
     steps = []
