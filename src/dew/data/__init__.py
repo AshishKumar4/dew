@@ -17,7 +17,6 @@ import importlib
 _EXPORTS = {
     # dataloaders: grain (offline) and streaming (online) dataset factories
     "generate_collate_fn": ".dataloaders",
-    "CaptionDeletionTransform": ".dataloaders",
     "get_dataset_grain": ".dataloaders",
     "get_dataset_online": ".dataloaders",
     "get_media_dataset_grain": ".dataloaders",
@@ -46,7 +45,6 @@ _EXPORTS = {
     "ImageGCSSource": ".sources.images",
     "CombinedImageGCSSource": ".sources.images",
     "ImageGCSAugmenter": ".sources.images",
-    "get_oxford_valset": ".sources.images",
     "labelizer_oxford_flowers102": ".sources.images",
     "labelizer_record_caption": ".sources.images",
     "image_augmenter": ".sources.images",
@@ -74,12 +72,6 @@ _EXPORTS = {
     "TokenDocumentSource": ".sources.text",
     "ByteTokenizer": ".text",
     "HFTokenizer": ".text",
-    "VideoTFDSSource": ".sources.videos",
-    "VideoLocalSource": ".sources.videos",
-    "AudioVideoAugmenter": ".sources.videos",
-    "gather_video_paths": ".sources.videos",
-    "gather_video_paths_iter": ".sources.videos",
-    "VoxCeleb2Source": ".sources.voxceleb2",
 }
 
 __all__ = sorted(_EXPORTS)

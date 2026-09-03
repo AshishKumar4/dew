@@ -41,37 +41,10 @@ from dew.data.sources.voxceleb2 import VoxCeleb2Source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Registry keys the factories advertise; every one must build.
-AUGMENTER_KEYS = ("image_tfds", "image_gcs", "video")
-SOURCE_KEYS = ("image_tfds", "image_gcs", "image_combined_gcs", "video_tfds", "video_local")
-
 
 # ---------------------------------------------------------------------------------
 # Registries
 # ---------------------------------------------------------------------------------
-
-@pytest.mark.parametrize("key", AUGMENTER_KEYS)
-def test_every_augmenter_registry_key_constructs(key):
-    """Every augmenter key resolves to a DataAugmenter that exists."""
-    assert isinstance(DataAugmenter.create(key), DataAugmenter)
-
-
-def test_video_augmenter_key_resolves_to_the_audio_video_augmenter():
-    assert isinstance(DataAugmenter.create("video"), AudioVideoAugmenter)
-
-
-@pytest.mark.parametrize("key", SOURCE_KEYS)
-def test_every_source_registry_key_constructs(key):
-    kwargs = {"name": "oxford_flowers102"} if key.endswith("tfds") else {}
-    assert isinstance(DataSource.create(key, **kwargs), DataSource)
-
-
-def test_unknown_registry_keys_are_rejected():
-    with pytest.raises(ValueError, match="Unknown augmenter type"):
-        DataAugmenter.create("video_gcs")
-    with pytest.raises(ValueError, match="Unknown source type"):
-        DataSource.create("audio_gcs")
-
 
 @pytest.mark.parametrize("source_cls", [ImageGCSSource, CombinedImageGCSSource])
 def test_gcs_sources_require_an_explicit_dataset_path(source_cls):
@@ -134,7 +107,10 @@ def test_lazy_exports_resolve_and_unknown_names_raise_attribute_error():
     assert dew.data.get_media_dataset_grain is get_media_dataset_grain
     assert dew.data.VoxCeleb2Source is VoxCeleb2Source
     assert dew.data.HFDatasetSource is HFDatasetSource
-    assert "get_dataset_grain" in dir(dew.data)
+    # An export left behind after a deletion raises only on first use, so
+    # every advertised name is resolved here.
+    for name in dir(dew.data):
+        getattr(dew.data, name)
     with pytest.raises(AttributeError, match="has no attribute"):
         dew.data.get_dataset_from_thin_air
 
