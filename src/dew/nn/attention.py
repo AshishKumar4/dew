@@ -94,6 +94,28 @@ def open_kv_cache(module: nn.Module, key, max_seq_len):
     return index + jnp.arange(length), append
 
 
+def cudnn_supports(query, key) -> Optional[str]:
+    """Why the fused cudnn kernel cannot take this call, or None if it can.
+
+    One rule: cudnn's flash kernel has no backward pass for an odd query or
+    key length, and jax raises NotImplementedError from inside the gradient.
+    The check sees shapes, not the trace, so every call of an odd length is
+    refused, forward-only ones included: single-token decode has q_len 1 and
+    leaves cudnn for xla, which costs the fused kernel's speed and changes no
+    numbers (both run the softmax in fp32). 77 CLIP text tokens are odd,
+    which is every cross-attention call in this repo.
+
+    The other cudnn limits (head_dim a multiple of 8 and at most 128 before
+    Hopper) fail the forward pass too, so they cannot silently ruin a run and
+    are left to jax's own error.
+    """
+    q_len, kv_len = query.shape[-3], key.shape[-3]
+    if q_len % 2 or kv_len % 2:
+        return ("has no backward pass for odd sequence lengths, got "
+                f"{q_len} and {kv_len}")
+    return None
+
+
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
                                  causal=False, sliding_window=None, mask=None):
@@ -107,8 +129,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
-    - 'auto': 'cudnn' on a gpu backend, 'xla' anywhere else. Resolved per
-      trace, so a config logged as 'auto' still runs on the next machine.
+    - 'auto': on a gpu backend 'cudnn' for the shapes cudnn supports and
+      'xla' for the rest (`cudnn_supports`), 'xla' anywhere else. Resolved per
+      trace, so a config logged as 'auto' still runs on the next machine, and
+      per call, since one model can hold both a shape cudnn takes and a shape
+      it does not.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -124,7 +149,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `mask` instead (built by causal_attention_mask over the cache slots): a
     step's single query sits at the cache index, not at row 0. The fused
     kernels take causality and the window as flags rather than a materialized
-    mask, which is where their memory win comes from; the pallas kernel has no
+    mask, which is where their memory win comes from; the TPU kernel has no
     mask argument, so an explicit mask rides in there as an additive bias.
     """
     if sliding_window is not None and sliding_window < 1:
@@ -144,7 +169,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
     if implementation == 'auto':
-        implementation = 'cudnn' if jax.default_backend() == 'gpu' else 'xla'
+        implementation = ('cudnn' if jax.default_backend() == 'gpu'
+                          and cudnn_supports(query, key) is None else 'xla')
 
     requested = {str(getattr(p, 'name', p)).upper()
                  for p in (precision if isinstance(precision, (tuple, list)) else (precision,))

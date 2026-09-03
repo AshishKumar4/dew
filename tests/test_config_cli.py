@@ -363,6 +363,22 @@ def test_prepare_process_joins_the_pool_when_a_cluster_is_configured(monkeypatch
         prepare_process("flip_only")
 
 
+def test_xla_flags_reach_the_environment_before_the_pool_is_joined(monkeypatch):
+    """XLA reads XLA_FLAGS when it opens a backend, so the flags have to be in
+    the environment before the first JAX call, which is the pool join."""
+    monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
+    seen = []
+    monkeypatch.setattr(jax.distributed, "initialize",
+                        lambda *a, **k: seen.append(os.environ["XLA_FLAGS"]))
+
+    prepare_process("flip_only", xla_flags="--xla_gpu_triton_gemm_any=true")
+    assert seen == ["--xla_force_host_platform_device_count=8 "
+                    "--xla_gpu_triton_gemm_any=true"]
+
+    prepare_process("flip_only")
+    assert seen[-1] == os.environ["XLA_FLAGS"]
+
+
 TOKENIZED = []
 
 

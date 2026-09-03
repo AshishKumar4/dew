@@ -42,8 +42,13 @@ def representation_health(z) -> Dict[str, jax.Array]:
     to zero exactly when the encoder stops distinguishing inputs. repr_cov_offdiag
     is the RMS magnitude of the off-diagonal covariance, which rises when the
     dimensions become redundant (dimensional collapse) even while repr_std holds.
+
+    Both are computed in fp32 so that a run's compute dtype does not set the
+    noise floor of the drift they exist to show, and so bf16 and fp32 runs
+    read off the same curves.
     """
     batch_size, dim = z.shape
+    z = z.astype(jnp.float32)
     centered = z - jnp.mean(z, axis=0, keepdims=True)
     cov = (centered.T @ centered) / max(batch_size - 1, 1)
     off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
@@ -137,7 +142,8 @@ class JepaObjective(Objective):
             train=True, rngs={"dropout": dropout_rng},
         ).reshape(targets.shape)
 
-        loss = jnp.mean((predictions - targets) ** 2)
+        loss = jnp.mean(
+            (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
         return loss, representation_health(pooled)
 

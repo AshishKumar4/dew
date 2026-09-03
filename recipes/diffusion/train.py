@@ -196,7 +196,7 @@ def experiment_name(config: DiffusionRunConfig, summary: dict, latent: bool) -> 
 
 def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
     prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host)
+                    config.trainer.multi_host, config.trainer.xla_flags)
     print(f"Local devices: {jax.local_devices()}")
 
     data = load_data(config.data)

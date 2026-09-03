@@ -36,6 +36,9 @@ dependencies = [
 ]
 license = "MIT"
 
+[project.scripts]
+dew-tpu = "dew.cli.tpu:main"
+
 [project.optional-dependencies]
 test = ["pytest", "safetensors"]
 # AV/video sources and readers (lazy imports in dew.data)

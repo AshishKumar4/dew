@@ -7,8 +7,8 @@ separately by `tools/benchmark_data.py`.
 
 FLOPs come off the compiled executable through
 `dew.telemetry.instrumentation.compiled_flops`, and `util` is the same figure
-the trainer logs as `train/mfu`: measured FLOPs over the device's dense bf16
-peak (97.5 TFLOP/s for this card).
+the trainer logs as `train/mfu`: the step's measured FLOPs divided by the step
+time and by one device's dense bf16 peak (97.5 TFLOP/s for this card).
 
 ## `--preset small` on one RTX 4080
 
@@ -69,6 +69,47 @@ otherwise idle.
 - Compile dominates a short run: 15-114 s per architecture against 10-37 ms
   per step. A sweep is mostly XLA, and a real run should set
   `compilation_cache_dir`.
+
+## `--preset small` on one RTX 4080, 2026-09-02, with the run's own attention kernel
+
+```
+python tools/benchmark_step.py --preset small --architectures <arch> \
+    --warmup 3 --steps 10 --json-out bench.json
+```
+
+The table above was measured before `benchmark_step.py` applied the run's
+precision policy, so every row there ran the reference einsum attention while
+a recipe would have run `attention_impl='auto'`. The tool now applies the
+policy, which is what these rows are: same models, same batches, `auto`
+attention (cudnn where cudnn supports the shape, xla elsewhere, see
+`docs/performance.md`), no XLA flags, one architecture per process so every
+peak is its own. `change` is against the row above.
+
+| architecture       | sample    | batch |      params | ms/step | samples/s | GFLOP/step |  util | peak GiB | compile s | change |
+|--------------------|-----------|-------|-------------|---------|-----------|------------|-------|----------|-----------|--------|
+| unet               | 64x64x3   |    16 |  10,159,299 |    16.8 |     951.9 |       28.6 |  1.7% |     0.78 |      32.3 |   -11% |
+| uvit               | 64x64x3   |    16 |  24,351,024 |    21.3 |     750.3 |      290.3 | 14.0% |     1.29 |       6.1 |   -11% |
+| simple_udit        | 64x64x3   |    16 |  23,381,424 |     8.8 |    1828.0 |      326.0 | 38.2% |     0.80 |       8.1 |   -17% |
+| simple_dit         | 64x64x3   |    16 |  19,835,568 |     7.0 |    2293.9 |      208.4 | 30.6% |     0.69 |       6.4 |   -33% |
+| simple_mmdit       | 64x64x3   |    16 |  36,385,584 |    13.4 |    1189.7 |      355.3 | 27.1% |     1.40 |      14.8 |   -29% |
+| hierarchical_mmdit | 64x64x3   |    16 |  55,498,188 |    34.8 |     459.6 |      672.9 | 19.8% |     3.49 |      35.5 |    -2% |
+| hybrid_dit         | 64x64x3   |    16 |  19,344,048 |     9.6 |    1669.7 |      189.0 | 20.2% |     0.82 |      11.0 |    -6% |
+| video_dit          | 8x64x64x3 |     4 |  25,155,504 |    17.8 |     224.4 |      652.0 | 37.5% |     1.27 |      11.3 |    -8% |
+| unet_3d            | 8x64x64x3 |     4 |  11,045,699 |    34.5 |     116.1 |      145.4 |  4.3% |     1.77 |      46.3 |    -7% |
+| jepa_encoder       | 64x64x3   |    16 |  12,149,568 |     9.4 |    1701.3 |      244.1 | 26.6% |     0.64 |      12.5 |   -22% |
+| jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    21.3 |     187.8 |      693.1 | 33.4% |     1.20 |      17.8 |    -1% |
+| causal_transformer | 512 tokens |    16 |  66,950,784 |    75.7 |     211.4 |     1201.2 | 16.3% |     4.99 |       7.5 |   -10% |
+
+The GFLOP/step figures moved too, because the fused kernels do not
+materialize the logits the reference path did. Six of these architectures
+(unet, unet_3d, simple_mmdit, hierarchical_mmdit and the two jepa encoders)
+could not have produced a row at all under plain cudnn: it has no backward
+pass for their odd sequence lengths, which is what `auto` now routes around.
+
+Compile times fell for the same reason. `benchmark_step.py` passes no
+`compilation_cache_dir`, so both tables compile cold; a fused attention call
+is one custom call where the reference path was a chain of einsums for XLA to
+optimize.
 
 ## `--preset cpu-smoke`
 

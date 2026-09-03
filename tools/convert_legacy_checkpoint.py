@@ -8,7 +8,7 @@ MMDiT checkpoints are NOT convertible - the architecture itself changed
 (dual-stream rewrite), not just the naming.
 
 Usage:
-    python scripts/convert_legacy_checkpoint.py <checkpoint_dir> <output_dir>
+    python tools/convert_legacy_checkpoint.py <checkpoint_dir> <output_dir>
 
 Note on time conditioning: FourierEmbedding frequencies used to come from
 jax's PRNG, whose default implementation changed in jax 0.5.0. Checkpoints

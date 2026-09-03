@@ -36,9 +36,10 @@ DEFAULT_ENCODER_CONFIG = {"precision": "default"}
 
 # What the predictor takes from the encoder unless --predictor overrides it.
 # Its depth and width are its own: a predictor as wide as the encoder makes the
-# objective too easy.
+# objective too easy. The compute dtype and the attention kernel are not here:
+# they belong to the run's precision policy, which writes them into both models.
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
-                     "ssm_state_dim", "dropout_rate", "attention_impl", "dtype", "precision")
+                     "ssm_state_dim", "dropout_rate", "precision")
 
 
 @dataclass(frozen=True)
@@ -82,13 +83,16 @@ def build_encoder(config: JepaRunConfig):
 def build_predictor(config: JepaRunConfig, encoder_config: dict, encoder, grid,
                     is_video: bool):
     """The predictor that reads the encoder's embeddings, and its config."""
-    predictor_config = {
-        **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
-        **config.predictor,
-        "grid": grid,
-        "factorized": is_video,
-        "scan_order": encoder.scan_order,
-    }
+    predictor_config = apply_precision_policy(
+        'jepa_predictor',
+        {
+            **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
+            **config.predictor,
+            "grid": grid,
+            "factorized": is_video,
+            "scan_order": encoder.scan_order,
+        },
+        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     return build_model('jepa_predictor', predictor_config), predictor_config
 
 
@@ -107,7 +111,7 @@ def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
 
 def main(config: JepaRunConfig) -> ObjectiveTrainer:
     prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host)
+                    config.trainer.multi_host, config.trainer.xla_flags)
 
     checkpoint_dir = config.trainer.checkpoint_dir
     if config.trainer.checkpoint_fs == 'gcs':
