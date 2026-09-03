@@ -29,6 +29,13 @@ HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 # (optax/contrib/_muon.py:57-70).
 BATCH_AXES = frozenset({'exp'})
 
+# A parameter that maps into or out of a discrete index is a lookup rather
+# than a matrix, so AdamW keeps the embeddings, the head and the router
+# (docs/research/frontier-training.md:183). An expert dimension is one of
+# these when it is the output, where it counts the experts a router scores,
+# and a batch axis when it leads, where it stacks one matrix per expert.
+SELECTION_AXES = frozenset({'vocab', 'output'})
+
 
 def _matrix_sides(path, axes: distributed.LogicalAxes) -> tuple[tuple[int, ...], ...]:
     """The contracted axes and the output axes of a declared parameter.
@@ -65,9 +72,10 @@ def muon_weight_dimension_numbers(params):
     Which group a parameter lands in is read off the logical axes declared in
     `distributed.DEFAULT_LOGICAL_PARAM_AXES`, the table the sharding
     derivation already reads, so one declaration answers both questions. A
-    parameter of rank below two, a bias, and a parameter whose axes name a
-    token table or the model's output space go to AdamW, which is the split
-    four labs cross-confirmed. Everything else is a matrix and goes to Muon.
+    parameter of rank below two, a bias, and a parameter that maps into or out
+    of a discrete index, the vocabulary, the model's output space or the
+    expert a router picks, go to AdamW, which is the split four labs
+    cross-confirmed. Everything else is a matrix and goes to Muon.
 
     An undeclared matrix of rank two takes Linen's kernel convention,
     contracting axis 0 into axis 1. An undeclared parameter of higher rank
@@ -89,7 +97,7 @@ def muon_weight_dimension_numbers(params):
                     "declared logical axes, so Muon cannot tell which of its axes "
                     "form the matrix. Declare it in DEFAULT_LOGICAL_PARAM_AXES.")
             return optax.contrib.MuonDimensionNumbers()
-        if 'vocab' in axes or 'output' in axes:
+        if SELECTION_AXES & set(axes) or axes[-1] in BATCH_AXES:
             return None
         return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
     return jax.tree_util.tree_map_with_path(leaf, params)

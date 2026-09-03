@@ -288,3 +288,24 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time(monkeypatch):
         expected, _ = reference.update(one, reference.init(one), one)
         np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
                                    np.asarray(expected['kernel']), atol=1e-8)
+
+
+def test_the_router_gate_takes_the_adamw_update(monkeypatch):
+    """A router gate is declared ('embed', 'exp'): one column per expert, so
+    its output side counts choices rather than features, and the labs keep
+    the router on AdamW along with the embeddings and the head. The same axis
+    name leads the expert kernels, where it stacks matrices, so position is
+    what tells the two apart."""
+    monkeypatch.setitem(distributed.DEFAULT_LOGICAL_PARAM_AXES,
+                        ("gate",), ("embed", "exp"))
+    params = {'params': {'layers_0': {'mlp': {'gate': {
+        'kernel': jnp.zeros((8, 4))}}}}}
+    path = ('params', 'layers_0', 'mlp', 'gate', 'kernel')
+    assert at(muon_weight_dimension_numbers(params), path) is None
+
+    updates, grads = group_updates(params)
+    reference = optax.adamw(LR, nesterov=True, weight_decay=0.0)
+    param, grad = at(params, path), at(grads, path)
+    expected, _ = reference.update(grad, reference.init(param), param)
+    np.testing.assert_allclose(np.asarray(at(updates, path)),
+                               np.asarray(expected), atol=1e-8)
