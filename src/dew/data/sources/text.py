@@ -86,9 +86,10 @@ class TokenDocumentSource:
 
     A document is the span from after the previous `eos_id` through its own,
     so the eos tokens are the record separators. The tail after the last eos
-    is a document too: a train/val split cuts the stream wherever the token
-    fraction falls, and dropping the piece past the last boundary would lose
-    those tokens silently.
+    is a document too, and a split with no eos at all is one document: a
+    train/val split cuts the stream wherever the token fraction falls, and
+    --pack closes input files rather than that cut, so the head of the stream
+    can carry no boundary while the tokens are still a document.
 
     The dtype and `eos_id` come from the sibling `meta.json` (the tokenize
     tool records them when run with --pack); `eos_id` is required, since
@@ -117,11 +118,7 @@ class TokenDocumentSource:
 
         self._tokens = np.memmap(self.path, dtype=self.dtype, mode="r")
         ends = (np.flatnonzero(self._tokens == self.eos_id) + 1).astype(np.int64)
-        if len(ends) == 0:
-            raise ValueError(
-                f"{self.path} holds no eos id {self.eos_id}, so it has no "
-                "document boundaries")
-        if ends[-1] < len(self._tokens):
+        if len(ends) == 0 or ends[-1] < len(self._tokens):
             ends = np.append(ends, len(self._tokens))
         # Exclusive span ends; record i is tokens[starts[i] : ends[i]].
         self._ends = ends

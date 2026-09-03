@@ -410,9 +410,15 @@ def test_document_source_needs_an_eos_id(tmp_path):
     _token_dir(tmp_path, train_tokens=32)  # meta.json without eos_id
     with pytest.raises(ValueError, match="no eos_id"):
         TokenDocumentSource(str(tmp_path / "train.bin"))
+
+
+def test_document_source_reads_a_split_without_a_boundary_as_one_document(tmp_path):
     _token_dir(tmp_path, train_tokens=32, body=[1, 2, 3, 4], eos_id=9)
-    with pytest.raises(ValueError, match="holds no eos id 9"):
-        TokenDocumentSource(str(tmp_path / "train.bin"))
+    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+
+    assert len(source) == 1
+    np.testing.assert_array_equal(source[0]["text"],
+                                  np.asarray([1, 2, 3, 4], np.int32))
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
@@ -520,3 +526,35 @@ def test_load_data_selects_packing_only_when_asked(tmp_path):
 
     fixed = next(iter(load_data(DataConfig(**shared))["train"]()))
     assert set(fixed) == {"text"}, "the fixed-window loader grew packing keys"
+
+
+def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
+    """--pack closes each input file with one eos and the val split is cut off
+    the head of the token stream by fraction, so a single-file corpus leaves
+    val.bin with no boundary inside it: that split is one document."""
+    raw = tmp_path / "corpus.txt"
+    raw.write_text("the quick brown fox jumps over the lazy dog\n" * 8,
+                   encoding="utf-8")
+    out = tmp_path / "tokens"
+
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "tools" / "tokenize_text.py"),
+         "--input", str(raw), "--out", str(out), "--tokenizer", "byte",
+         "--val-fraction", "0.1", "--pack"],
+        capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    val_tokens = list((out / "val.bin").read_bytes())
+    assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
+
+    seq_len = 63
+    data = load_data(DataConfig(dataset=str(out), sequence_length=seq_len,
+                                batch_size=1, worker_count=0, pack_sequences=True))
+    row = next(iter(data["val"]()))
+
+    padding = seq_len + 1 - len(val_tokens)
+    np.testing.assert_array_equal(row["text"][0], val_tokens + [0] * padding)
+    np.testing.assert_array_equal(row["text_segment_ids"][0],
+                                  [1] * len(val_tokens) + [0] * padding)
+    np.testing.assert_array_equal(row["text_positions"][0, :len(val_tokens)],
+                                  np.arange(len(val_tokens)))
