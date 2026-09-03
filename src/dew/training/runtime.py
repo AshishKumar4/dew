@@ -1,8 +1,8 @@
 """Process setup every recipe runs before it builds anything.
 
-rlimits, the JAX distributed pool and the augmenter/wandb env vars are the
-same in every recipe: library wiring, not recipe behavior. The recipes call
-this once at the top of main().
+rlimits, the XLA flags, the JAX distributed pool and the augmenter/wandb env
+vars are the same in every recipe: library wiring, not recipe behavior. The
+recipes call this once at the top of main().
 """
 
 import os
@@ -11,9 +11,12 @@ from typing import Optional
 
 import jax
 
+from dew.telemetry.devices import apply_xla_flags
+
 
 def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
-                    multi_host: Optional[bool] = None):
+                    multi_host: Optional[bool] = None,
+                    xla_flags: Optional[str] = None):
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
     jax.distributed.initialize() finds the coordinator from the environment on
@@ -22,11 +25,17 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
     every other failure means a pod run would otherwise continue on one host,
     so it propagates. multi_host=True requires the pool, multi_host=False
     never asks for it.
+
+    xla_flags reaches XLA through the environment, which it reads when it
+    opens a backend, so this call has to come before the first JAX call in the
+    process. That is what makes it a recipe's first line and why a library
+    user, who never runs a recipe, sets XLA_FLAGS themselves.
     """
     # The image augmenters read this at MapTransform construction time
     os.environ['FLAXDIFF_AUGMENT_MODE'] = augmentation_mode
     if wandb_offline:
         os.environ['WANDB_MODE'] = 'offline'
+    apply_xla_flags(xla_flags)
 
     resource.setrlimit(
         resource.RLIMIT_CORE,

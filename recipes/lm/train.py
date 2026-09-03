@@ -134,7 +134,7 @@ def run_summary(config: LmRunConfig, model_config: dict) -> dict:
 
 def main(config: LmRunConfig) -> ObjectiveTrainer:
     prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host)
+                    config.trainer.multi_host, config.trainer.xla_flags)
 
     checkpoint_dir = config.trainer.checkpoint_dir
     if config.trainer.checkpoint_fs == 'gcs':

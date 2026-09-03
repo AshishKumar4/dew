@@ -11,7 +11,7 @@ python tools/tokenize_text.py --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.01
 ```
 
-- `train.bin` and `val.bin` are flat arrays of token ids, `uint16` when the vocabulary fits and `uint32` otherwise, with no separators or padding.
+- `train.bin` and `val.bin` are flat arrays of token ids in the smallest unsigned dtype that holds the vocabulary, `uint8` up to 256 ids, `uint16` up to 65536 and `uint32` beyond, with no separators or padding.
 - `meta.json` records the `tokenizer`, its `vocab_size`, the `dtype` of the id arrays and the `train_tokens` / `val_tokens` counts. The recipe reads the vocabulary from here, so the model is always built for the ids on disk.
 
 `--tokenizer` is either `byte`, which is `dew.data.text.ByteTokenizer` over raw UTF-8 bytes with a vocabulary of 256, or the name of a HuggingFace tokenizer, which `dew.data.text.HFTokenizer` loads through `transformers.AutoTokenizer`. Both expose `encode(str) -> list[int]` and `decode(ids) -> str`, and nothing downstream needs anything else from them.
@@ -59,10 +59,10 @@ python recipes/lm/train.py --data.dataset data/shakespeare-byte \
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--trainer.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
+`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--optim.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
 
 ## What a run reports
 
 Every logging tick writes `train/loss` and, from the objective's auxiliary metrics, `train/ce`, `train/perplexity` and `train/token_accuracy`, alongside the trainer's throughput numbers.
 
-At the end of each epoch the validation loop runs the objective's validation step over `--data.val-steps-per-epoch` batches. It reports the teacher-forced cross entropy, which `dew.eval.get_perplexity_metric()` turns into `val/perplexity` (lower is better, and tracked as `best_val/perplexity`), and the generated ids, which the objective decodes into a `val/samples` table. `--trainer.best-tracker-metric` defaults to `val/perplexity` for this recipe, so the checkpoint published to the registry is the one with the lowest validation perplexity rather than the lowest training loss.
+At the end of each epoch the validation loop runs the objective's validation step over `--data.val-steps-per-epoch` batches. It reports the teacher-forced cross entropy, which `dew.eval.get_perplexity_metric()` turns into `val/perplexity` (lower is better, and tracked as `best_val/perplexity`), and the generated ids, which the objective decodes into a `val/samples` table. `--trainer.best-tracker-metric` defaults to `val/perplexity` for this recipe, and it decides whether the run is published rather than which step is: the trainer compares this run against the project's best five on that metric, and a run among them pushes its newest checkpoint to the registry, with the `best` alias when it leads.
