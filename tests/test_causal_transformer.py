@@ -446,22 +446,21 @@ def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
 
 
 @pytest.mark.parametrize("overrides", [
-    {},
     {"attention_impl": 'xla'},
     {"num_kv_heads": 2, "attention_impl": 'xla'},
 ])
 def test_packed_kernels_agree_with_the_reference(rng, overrides):
-    reference = tiny()
-    other = tiny(**overrides)
+    """The reference kernel applies the segment mask itself and xla applies it
+    inside jax.nn.dot_product_attention, on the same weights."""
+    kernel = tiny(**overrides)
+    reference = tiny(**{**overrides, "attention_impl": None})
     ids, segment_ids, positions = packed_pair(rng)
     params = reference.init(rng, ids)
-    if "num_kv_heads" in overrides:
-        params = other.init(rng, ids)
-        reference = tiny(num_kv_heads=2)
+
     expected = reference.apply(params, ids, positions=positions,
                                segment_ids=segment_ids)
-    actual = other.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    # Largest difference observed on CPU: 1.4e-06.
+    actual = kernel.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    # Largest difference observed on CPU: 1.5e-06.
     assert jnp.max(jnp.abs(expected - actual)) < 1e-4
 
 
