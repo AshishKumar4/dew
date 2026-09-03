@@ -40,7 +40,7 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
     resource.setrlimit(
         resource.RLIMIT_CORE,
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-    resource.setrlimit(resource.RLIMIT_OFILE, (65535, 65535))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
 
     if multi_host is not False:
         try:
