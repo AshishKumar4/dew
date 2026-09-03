@@ -42,7 +42,7 @@ python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --token
 
 Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel choice changes: cuDNN takes causality as a flag and turns any explicit mask into a materialized `[B, N, T, S]` bias, so a segment-masked batch runs on the xla kernel instead, which takes the mask itself. Passing neither argument leaves every unpacked run bit-identical.
 
-Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts documents rather than windows, because how many windows a document set fills depends on which lengths first-fit puts together.
+Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts window-sized chunks, which is the windows a pass yields at most: every window first-fit emits holds at least one chunk, and which chunks share a window depends on the shuffle, so the exact number is not known until the pass has run. A recipe divides it by the batch size for `steps_per_epoch`.
 
 ## The objective
 

@@ -468,6 +468,20 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
 
 
+def test_packed_loader_lengths_count_windows_not_documents(tmp_path):
+    """A run turns train_len into steps_per_epoch, so a split of one document
+    that fills three windows cannot report one."""
+    seq_len = 3  # windows of 4 ids
+    _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=1, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
+        num_packing_bins=1)
+
+    assert data["train_len"] == 3 and data["val_len"] == 3
+    assert len(list(data["val"]())) == 3, "the length is not the pass it counts"
+
+
 def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
     """The trainer saves the iterator's position in the checkpoint, so a
     restored iterator has to carry on where the saved one had got to."""

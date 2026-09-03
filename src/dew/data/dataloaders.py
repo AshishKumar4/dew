@@ -681,6 +681,11 @@ def get_token_dataset_grain(
     }
 
 
+def chunk_counts(lengths, chunk_len: int):
+    """Chunks of at most `chunk_len` tokens each of `lengths` is cut into."""
+    return -(-np.asarray(lengths, np.int64) // chunk_len)
+
+
 class DocumentChunks(pygrain.MapDataset):
     """Documents cut into consecutive chunks of at most `chunk_len` tokens.
 
@@ -697,7 +702,7 @@ class DocumentChunks(pygrain.MapDataset):
         super().__init__(parent)
         self._chunk_len = chunk_len
         lengths = np.asarray(lengths, np.int64)
-        counts = -(-lengths // chunk_len)
+        counts = chunk_counts(lengths, chunk_len)
         self._document = np.repeat(np.arange(len(lengths), dtype=np.int64), counts)
         first_chunk = np.concatenate([[0], np.cumsum(counts)[:-1]])
         self._offset = (np.arange(len(self._document), dtype=np.int64)
@@ -752,8 +757,13 @@ def get_packed_token_dataset_grain(
     Returns:
         The standard loader dict: "train" fn, "train_len", "val" fn,
         "val_len", "local_batch_size", "global_batch_size". The two lengths
-        count documents, not packed windows: how many windows a document set
-        fills depends on the lengths first-fit happens to put together.
+        count window-sized chunks, which is the upper bound on the windows a
+        pass over the split yields, and the count a run has before it packs
+        anything: every emitted window holds at least one chunk, the bound is
+        tight once documents reach the window, and which chunks share a
+        window depends on the shuffle. A recipe divides this by the batch
+        size for steps_per_epoch, so counting documents instead reports zero
+        steps for a corpus of fewer documents than a batch.
     """
     from grain.experimental import FirstFitPackIterDataset
 
@@ -791,12 +801,15 @@ def get_packed_token_dataset_grain(
         )
         return packed.batch(batch, drop_remainder=True)
 
+    def packed_windows(source) -> int:
+        return int(chunk_counts(source.lengths, window).sum())
+
     return {
         "train": lambda: build_loader(train_path, local_batch_size, True),
-        "train_len": len(TokenDocumentSource(train_path)),
+        "train_len": packed_windows(TokenDocumentSource(train_path)),
         "val": lambda: build_loader(
             val_path, val_batch_size or local_batch_size, False),
-        "val_len": len(TokenDocumentSource(val_path)),
+        "val_len": packed_windows(TokenDocumentSource(val_path)),
         "local_batch_size": local_batch_size,
         "global_batch_size": batch_size,
     }
