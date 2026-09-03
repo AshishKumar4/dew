@@ -8,11 +8,11 @@ load_pretrained_decoder returns a (model, variables, hf_config) triple that a
 forward pass takes straight away.
 
 The families covered are the ones CausalTransformer can express: llama, qwen3
-and gemma3_text, including the text_config of a gemma3 multimodal checkpoint.
-qwen2 is refused rather than half-loaded, since its q/k/v biases without an
-o_proj bias have no counterpart in the backbone's one attention_bias flag. A config field that changes what the model computes and has no dew
-counterpart raises a ValueError naming it, rather than loading a model that
-silently computes something else.
+and gemma3_text. qwen2 is refused rather than half-loaded, since its q/k/v
+biases without an o_proj bias have no counterpart in the backbone's one
+attention_bias flag. A config field that changes what the model computes and
+has no dew counterpart raises a ValueError naming it, rather than loading a
+model that silently computes something else.
 """
 
 import json
@@ -50,14 +50,6 @@ _IGNORED_FIELDS = {
 # The fields above have no effect on an eval-time forward pass: metadata,
 # token ids, or runtime knobs of the reference implementation (Gemma 3 ships
 # cache_implementation 'hybrid', which describes transformers' KV cache).
-
-# A gemma3 multimodal config describes a vision tower and a splicer too; only
-# the text decoder maps, and these are the fields that name the rest.
-_IGNORED_MULTIMODAL_FIELDS = {
-    'architectures', 'boi_token_index', 'dtype', 'eoi_token_index',
-    'eos_token_id', 'image_token_index', 'mm_tokens_per_image', 'model_type',
-    'text_config', 'torch_dtype', 'transformers_version', 'vision_config',
-}
 
 
 def _refuse(field: str, detail: str) -> None:
@@ -156,22 +148,10 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
 
     Accepts the text decoder families CausalTransformer can express: llama,
-    qwen3 and gemma3_text, plus a gemma3 multimodal config by reading its
-    text_config. Every field that changes what a forward pass computes and
-    has no dew counterpart raises, naming the field.
+    qwen3 and gemma3_text. Every field that changes what a forward pass
+    computes and has no dew counterpart raises, naming the field.
     """
     hf_config = dict(hf_config)
-
-    if hf_config.get('model_type') == 'gemma3' and 'text_config' in hf_config:
-        unknown = set(hf_config) - _IGNORED_MULTIMODAL_FIELDS
-        if unknown:
-            _refuse(f"gemma3 config fields {sorted(unknown)}",
-                    "only the text_config of a multimodal Gemma maps onto a "
-                    "text decoder")
-        hf_config = dict(hf_config['text_config'])
-        if hf_config.get('model_type') not in (None, 'gemma3_text'):
-            _refuse(f"text_config model_type {hf_config.get('model_type')!r}",
-                    "expected 'gemma3_text'")
 
     model_type = hf_config.get('model_type')
     if model_type == 'qwen2':
