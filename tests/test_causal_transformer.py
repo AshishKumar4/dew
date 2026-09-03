@@ -311,14 +311,16 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     assert gap(tiny()) > 0.1
 
 
-def test_the_embedding_scale_multiplies_in_fp32(rng):
-    """Gemma casts sqrt(hidden) to the embedding's dtype, which is the
-    parameter dtype, so a bf16 run must round the product and not the factor:
-    sqrt(1152) is 33.941 and bf16 holds it as 34.0, 1.7e-3 too high.
+def test_the_embedding_scale_rounds_with_the_activations(rng):
+    """Gemma multiplies the embedding by embed_scale cast to the weight dtype
+    (modeling_gemma3.py:117), and a bf16 checkpoint's weight dtype is bf16, so
+    at hidden 1152 the factor is bf16(33.941) = 34.0 and the multiply runs in
+    bf16.
 
-    Folding the same scale into the embedding table gives the value the module
-    has to produce, and the head is untied so the fold only moves the input
-    side.
+    Folding 34.0 into the embedding table gives the value the module has to
+    produce, and the head is untied so the fold only moves the input side. An
+    fp32 multiply by 33.941 lands on another bf16 value for a third of the
+    table, so it fails this.
     """
     features, ids = 1152, tokens(rng, length=4)
     shared = dict(emb_features=features, num_heads=8, num_layers=1,
@@ -326,13 +328,16 @@ def test_the_embedding_scale_multiplies_in_fp32(rng):
     scaled = tiny(embedding_scale=True, **shared)
     params = scaled.init(rng, ids)
 
-    folded = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: (leaf.astype(jnp.bfloat16).astype(jnp.float32)
-                            * math.sqrt(features)).astype(jnp.bfloat16)
-        if path[-2].key == 'embed_tokens' else leaf, params)
+    def fold(factor):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf.astype(jnp.bfloat16) * factor
+            if path[-2].key == 'embed_tokens' else leaf, params)
 
     assert jnp.array_equal(scaled.apply(params, ids),
-                           tiny(**shared).apply(folded, ids))
+                           tiny(**shared).apply(fold(jnp.bfloat16(34.0)), ids))
+    assert not jnp.array_equal(
+        scaled.apply(params, ids),
+        tiny(**shared).apply(fold(jnp.float32(math.sqrt(features))), ids))
 
 
 def test_attention_scale_defaults_to_the_head_dim_scale(rng):
