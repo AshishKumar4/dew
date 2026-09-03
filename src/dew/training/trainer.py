@@ -475,7 +475,6 @@ class SimpleTrainer:
         else:
             pbar = None
 
-        last_log_time = time.time()
         steps_since_log = 0
         compiled_step = None
         # One profiler window per run; its warmup continues across epochs.
@@ -487,6 +486,9 @@ class SimpleTrainer:
             if compiled_step is None:
                 compiled_step = self._compiled_step(
                     train_step_fn, train_state, rng_state, batch)
+                # The interval clock starts once the executable exists, so the
+                # first tick reports step time rather than compile time.
+                last_log_time = time.time()
             if (not tracing and not self._profile_complete and self.profile_steps
                     and self._profile_seen_steps >= self.profile_warmup_steps):
                 jax.profiler.start_trace(self.profile_path())
