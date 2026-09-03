@@ -57,6 +57,12 @@ class TokenFileSource:
                 f"one window of seq_len {seq_len}"
             )
 
+    def __repr__(self) -> str:
+        # grain writes repr(source) into a DataLoader iterator's checkpoint and
+        # refuses a state whose repr no longer matches, so a resumed run needs
+        # this to describe the file rather than an address in this process.
+        return f"TokenFileSource(path={self.path!r}, seq_len={self.seq_len})"
+
     def __len__(self) -> int:
         return (len(self._tokens) - 1) // self.seq_len
 

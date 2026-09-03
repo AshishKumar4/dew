@@ -13,7 +13,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from dew.config import DataConfig
@@ -22,6 +25,8 @@ from dew.data.dataloaders import (
 )
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.data.text import ByteTokenizer
+from dew.nn.backbones import causal_transformer as backbone
+from dew.objectives.lm import LMObjective
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -618,3 +623,415 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
                                   [1] * len(val_tokens) + [0] * padding)
     np.testing.assert_array_equal(row["text_positions"][0, :len(val_tokens)],
                                   np.arange(len(val_tokens)))
+
+
+# ---------------------------------------------------------------------------------
+# Stream termination on the token paths
+# ---------------------------------------------------------------------------------
+
+# Both token factories hand their validation sampler the num_epochs a run
+# passes, which is None, so today a validation pass never ends and the same
+# windows come round again. wave/fix-val-split owns that; the tests carrying
+# this reason are the contract its fix has to meet and they fail until it lands.
+ENDLESS_VAL = "an endless validation pass; wave/fix-val-split owns the sampler"
+
+
+def _bounded(loader, limit):
+    """At most `limit` batches, and whether the stream ended inside them.
+
+    Bounded on purpose: an endless stream then fails a count instead of
+    hanging the suite.
+    """
+    iterator = iter(loader)
+    taken = list(itertools.islice(iterator, limit))
+    return taken, next(iterator, None) is None
+
+
+def _rows(batches):
+    return [row.tobytes() for batch in batches for row in batch["text"]]
+
+
+def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
+    """Eight windows at batch four are two batches, then the end."""
+    seq_len = 4
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
+               seq_len=seq_len)
+    data = get_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+
+    assert data["val_len"] == 8
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+    assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
+
+
+def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
+    """Ten windows at batch four are two batches, in file order, then the end.
+
+    Validation batches keep drop_remainder: a part-full batch cannot be
+    sharded across the data axis, and it would weigh as much as a full one in
+    the metric reducers. The two windows past the last full batch are simply
+    not scored, which is a reason to hold out a whole number of batches.
+    """
+    seq_len = 4
+    val_tokens = np.arange(900, 900 + 11 * seq_len, dtype=np.int64)
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=len(val_tokens),
+               seq_len=seq_len)
+    (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
+    data = get_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+
+    assert data["val_len"] == 10
+    assert len(batches) == data["val_len"] // 4 and ended, ENDLESS_VAL
+    assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
+    np.testing.assert_array_equal(batches[0]["text"][0], val_tokens[:seq_len + 1])
+
+
+def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
+    """No document twice, every batch full, and the same batches next time.
+
+    Bins come out in packing order for validation, so two passes are the same
+    windows; today the pass never ends and the documents come round again.
+    """
+    documents = [[i, i + 1, i + 2] for i in range(10, 40, 3)]
+    _document_dir(tmp_path, documents)
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+
+    batches, ended = _bounded(data["val"](), 2 + len(documents))
+    heads = [int(t) for batch in batches for row in batch["text"] for t in row
+             if int(t) in {d[0] for d in documents}]
+    again, _ = _bounded(data["val"](), len(batches))
+
+    assert ended, ENDLESS_VAL
+    assert all(batch["text"].shape[0] == 2 for batch in batches)
+    assert sorted(heads) == sorted(set(heads)), "a document was handed over twice"
+    assert _rows(again) == _rows(batches), "two passes read different windows"
+
+
+def test_a_validation_pass_through_load_data_ends(tmp_path):
+    """A run reaches these loaders through load_data, which passes no
+    num_epochs at all."""
+    seq_len = 4
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
+               seq_len=seq_len)
+    data = load_data(DataConfig(dataset=str(tmp_path), sequence_length=seq_len,
+                                batch_size=4, worker_count=0))
+
+    batches, ended = _bounded(data["val"](), 3)
+
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+
+
+def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
+    """The trainer keeps asking long after one pass over the windows, and the
+    fixed-window loader is the one path that has no `repeat` of its own."""
+    seq_len = 4
+    _token_dir(tmp_path, train_tokens=9 * seq_len, val_tokens=5 * seq_len,
+               seq_len=seq_len)
+    data = get_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+
+    epoch = data["train_len"] // 4
+    batches, ended = _bounded(data["train"](), 3 * epoch)
+
+    assert data["train_len"] == 8 and not ended
+    assert len(batches) == 3 * epoch
+    assert len(set(_rows(batches[:epoch]))) == 8, "one pass reads distinct windows"
+
+
+# ---------------------------------------------------------------------------------
+# Packed windows under adversity: the mask the backbone builds, the loss it counts
+# ---------------------------------------------------------------------------------
+
+# Documents are closed by this id and padding is 0, so a row's documents can be
+# read back off the ids alone, without asking the segment ids the test is there
+# to check.
+PACK_EOS = 1
+
+
+def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
+    """One validation pass over `documents` packed into `seq_len + 1` windows."""
+    stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
+    _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
+    (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"), batch_size=batch,
+        seq_len=seq_len, seed=0, worker_count=0, num_epochs=1, num_packing_bins=bins)
+    return data, list(data["val"]())
+
+
+def _tiny_backbone(seq_len):
+    return backbone.CausalTransformer(vocab_size=64, emb_features=16, num_layers=1,
+                                      num_heads=2, mlp_ratio=2,
+                                      max_seq_len=seq_len + 1)
+
+
+def _attention_mask(batch, monkeypatch):
+    """The mask the backbone hands the attention kernel for this batch.
+
+    Recorded at the kernel call, which is the only place the mask has to be
+    right; rebuilding it from the segment ids here would test the test.
+    """
+    seen = []
+    kernel = backbone.scaled_dot_product_attention
+
+    def recording_kernel(query, key, value, **kwargs):
+        seen.append(kwargs.get("mask"))
+        return kernel(query, key, value, **kwargs)
+
+    tokens = jnp.asarray(batch["text"][:, :-1], jnp.int32)
+    model = _tiny_backbone(tokens.shape[1])
+    params = model.init(jax.random.PRNGKey(0), tokens)
+
+    monkeypatch.setattr(backbone, "scaled_dot_product_attention", recording_kernel)
+    model.apply(params, tokens,
+                positions=jnp.asarray(batch["text_positions"][:, :-1]),
+                segment_ids=jnp.asarray(batch["text_segment_ids"][:, :-1]))
+    monkeypatch.undo()
+
+    assert len(seen) == 1 and seen[0] is not None, "the packed batch built no mask"
+    return np.asarray(seen[0])
+
+
+def _documents_in(row):
+    """(start, stop) of each document in a packed row, read off the ids.
+
+    A span closes on the boundary id, or on the padding that follows the last
+    one: a chunk cut out of an over-long document carries no boundary of its
+    own and is still a segment.
+    """
+    spans, start = [], 0
+    for index, token in enumerate(row):
+        if token == 0:
+            break
+        if token == PACK_EOS:
+            spans.append((start, index + 1))
+            start = index + 1
+    else:
+        index = len(row)
+    if start < index:
+        spans.append((start, index))
+    return spans
+
+
+def _assert_mask_blocks_everything_it_should(batch, monkeypatch):
+    mask = _attention_mask(batch, monkeypatch)
+    rows = np.asarray(batch["text"])
+    length = mask.shape[-1]
+
+    for row in range(rows.shape[0]):
+        inside = {}
+        for start, stop in _documents_in(rows[row]):
+            for position in range(start, min(stop, length)):
+                inside[position] = (start, stop)
+        for query in range(length):
+            for key in range(length):
+                allowed = bool(mask[row, 0, query, key])
+                same_document = (query in inside and key in inside
+                                 and inside[query] == inside[key])
+                assert allowed == (same_document and key <= query), (
+                    f"row {row} position {query} attending to {key}")
+
+
+def _counted_cross_entropy(batch, seq_len):
+    """The objective's ce, and the same number computed by hand.
+
+    The hand version averages the per-token losses over the transitions that
+    live inside one document, which is every target a packed row owns.
+    """
+    model = _tiny_backbone(seq_len)
+    objective = LMObjective(model, seq_len, vocab_size=64)
+    params = objective.init_params(jax.random.PRNGKey(0))
+    tokens = jnp.asarray(batch["text"], jnp.int32)
+    segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
+    positions = jnp.asarray(batch["text_positions"], jnp.int32)
+
+    ce, _ = objective.shifted_cross_entropy(params, tokens, segment_ids=segment_ids,
+                                            positions=positions)
+
+    logits = model.apply(params, tokens[:, :-1], positions=positions[:, :-1],
+                         segment_ids=segment_ids[:, :-1])
+    losses = np.asarray(optax.softmax_cross_entropy_with_integer_labels(
+        logits.astype(jnp.float32), tokens[:, 1:]))
+
+    rows = np.asarray(batch["text"])
+    total, counted = 0.0, 0
+    for row in range(rows.shape[0]):
+        for start, stop in _documents_in(rows[row]):
+            total += losses[row, start:stop - 1].sum()
+            counted += stop - 1 - start
+    return float(ce), total / counted, counted
+
+
+def test_a_document_the_size_of_the_window_is_one_segment(tmp_path, monkeypatch):
+    """Exactly the window is the case the chunker must not cut."""
+    data, batches = _packed(tmp_path, [[2, 3, 4, 5]], seq_len=4, bins=1)
+
+    assert data["val_len"] == 1 and len(batches) == 1
+    np.testing.assert_array_equal(batches[0]["text"][0], [2, 3, 4, 5, PACK_EOS])
+    np.testing.assert_array_equal(batches[0]["text_segment_ids"][0], [1] * 5)
+    np.testing.assert_array_equal(batches[0]["text_positions"][0], range(5))
+    _assert_mask_blocks_everything_it_should(batches[0], monkeypatch)
+
+
+def test_three_documents_in_one_window_cannot_read_each_other(tmp_path, monkeypatch):
+    data, batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
+    row = batches[0]
+
+    np.testing.assert_array_equal(row["text"][0], [2, 3, 1, 4, 5, 1, 6, 7, 1])
+    np.testing.assert_array_equal(row["text_segment_ids"][0],
+                                  [1, 1, 1, 2, 2, 2, 3, 3, 3])
+    np.testing.assert_array_equal(row["text_positions"][0], [0, 1, 2, 0, 1, 2, 0, 1, 2])
+    _assert_mask_blocks_everything_it_should(row, monkeypatch)
+
+
+def test_a_document_longer_than_the_window_is_cut_into_separate_segments(
+        tmp_path, monkeypatch):
+    """Each piece is its own segment, so no chunk attends into the one before
+    it and RoPE starts again at zero."""
+    data, batches = _packed(tmp_path, [list(range(2, 14))], seq_len=4, bins=1)
+
+    assert len(batches) == 3
+    np.testing.assert_array_equal(
+        np.concatenate([b["text"][0] for b in batches])[:13],
+        list(range(2, 14)) + [PACK_EOS])
+    for batch in batches:
+        np.testing.assert_array_equal(batch["text_positions"][0][:1], [0])
+        _assert_mask_blocks_everything_it_should(batch, monkeypatch)
+
+
+def test_a_document_of_one_token_is_its_own_segment(tmp_path, monkeypatch):
+    """A split can end on a bare boundary, and a one-token document owns no
+    transition: it must not borrow the previous document's."""
+    data, batches = _packed(tmp_path, [[2, 3, 4], []], seq_len=8, bins=1)
+    row = batches[0]
+
+    np.testing.assert_array_equal(row["text"][0], [2, 3, 4, 1, 1, 0, 0, 0, 0])
+    np.testing.assert_array_equal(row["text_segment_ids"][0],
+                                  [1, 1, 1, 1, 2, 0, 0, 0, 0])
+    _assert_mask_blocks_everything_it_should(row, monkeypatch)
+
+    ce, by_hand, counted = _counted_cross_entropy(row, seq_len=8)
+    assert counted == 3, "four ids of the first document, none from the second"
+    assert ce == pytest.approx(by_hand, rel=1e-5)
+
+
+def test_the_padded_tail_of_a_window_is_attended_by_nothing_and_counts_for_nothing(
+        tmp_path, monkeypatch):
+    data, batches = _packed(tmp_path, [[2, 3]], seq_len=8, bins=8)
+    row = batches[0]
+
+    np.testing.assert_array_equal(row["text"][0], [2, 3, 1, 0, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(row["text_segment_ids"][0], [1, 1, 1, 0, 0, 0, 0, 0, 0])
+    _assert_mask_blocks_everything_it_should(row, monkeypatch)
+
+    ce, by_hand, counted = _counted_cross_entropy(row, seq_len=8)
+    assert counted == 2, "the padding owns no target"
+    assert ce == pytest.approx(by_hand, rel=1e-5)
+
+
+def test_the_loss_counts_one_target_per_transition_inside_a_document(
+        tmp_path, monkeypatch):
+    """Three documents in a row own six targets between them: the two boundary
+    transitions and the padding are not the model's to predict."""
+    data, batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
+
+    ce, by_hand, counted = _counted_cross_entropy(batches[0], seq_len=8)
+
+    assert counted == 6
+    assert ce == pytest.approx(by_hand, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------------
+# Worker counts and restarts on the token paths
+# ---------------------------------------------------------------------------------
+
+@pytest.mark.slow
+@pytest.mark.parametrize("worker_count", [1, 2, 4])
+def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
+                                                                  worker_count):
+    """Real worker processes, one epoch: the windows a pass reads are a
+    function of the seed and the file, not of how many workers read them."""
+    seq_len = 8
+    _token_dir(tmp_path, train_tokens=17 * seq_len, seq_len=seq_len)
+
+    def windows(workers):
+        data = get_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
+            batch_size=4, seq_len=seq_len, seed=7, worker_count=workers,
+            num_epochs=1)
+        return sorted(row.tobytes() for batch in data["train"]()
+                      for row in batch["text"])
+
+    serial = windows(0)
+
+    assert len(serial) == 16
+    assert windows(worker_count) == serial
+
+
+@pytest.mark.slow
+def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
+    """A resumed run builds its loader again, in a new process, and grain
+    checks the saved position against `repr(source)` before it will restore:
+    the description has to name the file, not an address in the process that
+    wrote it."""
+    seq_len = 8
+    _token_dir(tmp_path, train_tokens=33 * seq_len, seq_len=seq_len)
+
+    def loader():
+        return get_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
+            batch_size=4, seq_len=seq_len, seed=7, worker_count=2, num_epochs=1)
+
+    interrupted = iter(loader()["train"]())
+    seen = [row.tobytes() for row in next(interrupted)["text"]]
+    state = interrupted.get_state()
+    rest, ended = _bounded(interrupted, 40)
+    unseen = [row.tobytes() for batch in rest for row in batch["text"]]
+
+    restored = iter(loader()["train"]())
+    restored.set_state(state)
+    after, ended_again = _bounded(restored, 40)
+    resumed = [row.tobytes() for batch in after for row in batch["text"]]
+
+    assert "object at 0x" not in json.loads(state)["data_source"], (
+        "a source described by its address can only be restored in the process "
+        "that saved it")
+    assert ended and ended_again
+    assert resumed == unseen
+    assert len(set(seen + resumed)) == 32, "the epoch reads every window once"
+
+
+@pytest.mark.slow
+def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
+    """The packed loader reads its documents in worker processes and packs
+    behind them, so a restart has to carry the packer's position too."""
+    _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 100, 3)])
+
+    def loader():
+        return get_packed_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"), batch_size=2,
+            seq_len=8, seed=0, worker_count=2, num_epochs=1, num_packing_bins=2)
+
+    interrupted = iter(loader()["val"]())
+    seen = [row.tobytes() for row in next(interrupted)["text"]]
+    state = interrupted.get_state()
+    rest, ended = _bounded(interrupted, 40)
+    unseen = [row.tobytes() for batch in rest for row in batch["text"]]
+
+    restored = iter(loader()["val"]())
+    restored.set_state(state)
+    after, ended_again = _bounded(restored, 40)
+    resumed = [row.tobytes() for batch in after for row in batch["text"]]
+
+    assert unseen and ended and ended_again
+    assert resumed == unseen
+    assert len(set(seen + resumed)) == len(seen) + len(unseen), "a window came twice"

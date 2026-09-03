@@ -69,6 +69,13 @@ class HFDatasetSource(DataSource):
         self._cache_path: Optional[str] = None
         self._lock = threading.Lock()
 
+    def __repr__(self) -> str:
+        # grain writes repr(source) into a DataLoader iterator's checkpoint and
+        # refuses a state whose repr no longer matches, so this names the
+        # dataset rather than an address, and without touching the table.
+        return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
+                f"cache={self._cache_path!r})")
+
     def get_source(self, path_override: Optional[str] = None) -> "HFDatasetSource":
         """The record source itself: a hub dataset resolves by name, not by path."""
         return self
