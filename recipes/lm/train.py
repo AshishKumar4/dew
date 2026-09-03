@@ -134,7 +134,7 @@ def run_summary(config: LmRunConfig, model_config: dict) -> dict:
 
 def main(config: LmRunConfig) -> ObjectiveTrainer:
     prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host)
+                    config.trainer.multi_host, config.trainer.xla_flags)
 
     checkpoint_dir = config.trainer.checkpoint_dir
     if config.trainer.checkpoint_fs == 'gcs':
@@ -152,6 +152,12 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
     data = load_data(token_data_config(config))
     steps_per_epoch = (config.trainer.steps_per_epoch
                        or data['train_len'] // config.data.batch_size)
+    if steps_per_epoch < 1:
+        raise ValueError(
+            f"{data['train_len']} training windows do not fill one batch of "
+            f"{config.data.batch_size}, so an epoch is no steps at all: read "
+            "more data, lower --data.batch-size, or set "
+            "--trainer.steps-per-epoch")
 
     samples = build_samples(config)
     model, model_config = build_lm(config, vocab_size,

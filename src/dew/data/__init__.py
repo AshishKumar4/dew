@@ -66,7 +66,9 @@ _EXPORTS = {
     "VoxCeleb2Source": ".sources.voxceleb2",
     # text / language-model data
     "get_token_dataset_grain": ".dataloaders",
+    "get_packed_token_dataset_grain": ".dataloaders",
     "TokenFileSource": ".sources.text",
+    "TokenDocumentSource": ".sources.text",
     "ByteTokenizer": ".text",
     "HFTokenizer": ".text",
     "VideoTFDSSource": ".sources.videos",

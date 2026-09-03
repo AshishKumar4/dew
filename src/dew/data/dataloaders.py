@@ -681,6 +681,145 @@ def get_token_dataset_grain(
     }
 
 
+def chunk_counts(lengths, chunk_len: int):
+    """Chunks of at most `chunk_len` tokens each of `lengths` is cut into."""
+    return -(-np.asarray(lengths, np.int64) // chunk_len)
+
+
+class DocumentChunks(pygrain.MapDataset):
+    """Documents cut into consecutive chunks of at most `chunk_len` tokens.
+
+    Grain's packer refuses an element longer than the bin it packs into, so a
+    document that outgrows the window is cut first; each chunk becomes its own
+    segment in the packed row, which keeps attention inside the chunk and RoPE
+    running from the chunk's own 0.
+
+    The chunk table is built once from the document lengths, so a record costs
+    one memmap slice rather than a walk over the documents before it.
+    """
+
+    def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
+        super().__init__(parent)
+        self._chunk_len = chunk_len
+        lengths = np.asarray(lengths, np.int64)
+        counts = chunk_counts(lengths, chunk_len)
+        self._document = np.repeat(np.arange(len(lengths), dtype=np.int64), counts)
+        first_chunk = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        self._offset = (np.arange(len(self._document), dtype=np.int64)
+                        - first_chunk[self._document]) * chunk_len
+
+    def __len__(self) -> int:
+        return len(self._document)
+
+    def __getitem__(self, index):
+        # grain's conventions: a slice is the sharding and windowing API
+        # (ds[shard::count]), and an index past the end wraps, which is what
+        # makes `repeat` a length change rather than a copy.
+        if isinstance(index, slice):
+            return self.slice(index)
+        index = index % len(self)
+        text = self._parent[int(self._document[index])]["text"]
+        start = int(self._offset[index])
+        return {"text": text[start:start + self._chunk_len]}
+
+
+def get_packed_token_dataset_grain(
+    train_path: str,
+    val_path: str,
+    batch_size: int,
+    seq_len: int,
+    seed: int = 0,
+    worker_count: int = 32,
+    worker_buffer_size: int = 20,
+    num_epochs: Optional[int] = None,
+    val_batch_size: Optional[int] = None,
+    num_packing_bins: int = 8,
+):
+    """Grain loaders that pack whole documents into `seq_len + 1` windows.
+
+    Documents come from `TokenDocumentSource`, which cuts the token stream at
+    the eos ids the tokenize tool writes between files. Each document (in
+    chunks, when it outgrows the window) is one element the packer adds to the
+    first bin with room, and every emitted window carries `text_segment_ids`
+    (which document each token is from, 0 for padding) and `text_positions`
+    (the token's position inside its document), so the model can stop
+    attention and the loss at document boundaries. This is grain's `Dataset`
+    API rather than `DataLoader` for the reason grain gives for switching:
+    packing.
+
+    Train shuffles the documents from `seed`, reshuffled per epoch, and val
+    reads them in file order, so the two splits stay disjoint files and
+    validation is reproducible. Both shard by JAX process, by slicing the
+    documents before packing: sharding after it would have every process pack
+    the same documents. num_epochs None runs forever, as the fixed-window
+    sampler does.
+
+    Returns:
+        The standard loader dict: "train" fn, "train_len", "val" fn,
+        "val_len", "local_batch_size", "global_batch_size". The two lengths
+        count window-sized chunks, which is the upper bound on the windows a
+        pass over the split yields, and the count a run has before it packs
+        anything: every emitted window holds at least one chunk, the bound is
+        tight once documents reach the window, and which chunks share a
+        window depends on the shuffle. A recipe divides this by the batch
+        size for steps_per_epoch, so counting documents instead reports zero
+        steps for a corpus of fewer documents than a batch.
+    """
+    from grain.experimental import FirstFitPackIterDataset
+
+    from .sources.text import TokenDocumentSource
+
+    local_batch_size = batch_size // jax.process_count()
+    window = seq_len + 1
+
+    # One source per split, reused by its loader: finding the boundaries reads
+    # the whole file, and a run rebuilding it per epoch would read a
+    # multi-gigabyte train.bin again for a table it already has.
+    train_source = TokenDocumentSource(train_path)
+    val_source = TokenDocumentSource(val_path)
+
+    def build_loader(source, batch, shuffle):
+        documents = DocumentChunks(
+            pygrain.MapDataset.source(source), source.lengths, window)
+        documents = documents[jax.process_index()::jax.process_count()]
+        if shuffle:
+            documents = documents.shuffle(seed)
+        documents = documents.repeat(num_epochs)
+        reads = documents.to_iter_dataset()
+        if worker_count:
+            # The workers read documents, and the packer stays behind them in
+            # this process: grain runs a whole pipeline per worker, so packing
+            # inside them would fill bins from one worker's slice of the
+            # documents and make the windows depend on worker_count.
+            reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
+                num_workers=worker_count,
+                per_worker_buffer_size=worker_buffer_size))
+        packed = FirstFitPackIterDataset(
+            reads,
+            length_struct={"text": window},
+            num_packing_bins=num_packing_bins,
+            seed=seed,
+            # Bins come out in packing order for val, so a validation pass is
+            # the same batches every time.
+            shuffle_bins=shuffle,
+            padding_struct={"text": 0},
+        )
+        return packed.batch(batch, drop_remainder=True)
+
+    def packed_windows(source) -> int:
+        return int(chunk_counts(source.lengths, window).sum())
+
+    return {
+        "train": lambda: build_loader(train_source, local_batch_size, True),
+        "train_len": packed_windows(train_source),
+        "val": lambda: build_loader(
+            val_source, val_batch_size or local_batch_size, False),
+        "val_len": packed_windows(val_source),
+        "local_batch_size": local_batch_size,
+        "global_batch_size": batch_size,
+    }
+
+
 def _token_dataset_dir(name: Optional[str]) -> Optional[str]:
     """`name` if it names a tokenized-corpora directory, else None.
 
@@ -706,7 +845,8 @@ def load_data(config: DataConfig) -> dict:
 
     A dataset that is a directory of tokenized text (train.bin [+ val.bin]
     from tools/tokenize_text.py) takes the token loader ahead of all of
-    that, and needs DataConfig.sequence_length.
+    that, and needs DataConfig.sequence_length. With pack_sequences the
+    windows are whole documents packed by grain instead of fixed strides.
     """
     token_dir = _token_dataset_dir(config.dataset)
     if token_dir is not None:
@@ -718,9 +858,21 @@ def load_data(config: DataConfig) -> dict:
             )
         root = Path(token_dir)
         val_bin = root / "val.bin"
+        train_bin = str(root / "train.bin")
+        val_bin = str(val_bin if val_bin.is_file() else root / "train.bin")
+        if config.pack_sequences:
+            # The Dataset API reads its source directly, so the DataLoader's
+            # read threads and buffers have nothing to configure here.
+            return get_packed_token_dataset_grain(
+                train_bin, val_bin,
+                batch_size=config.batch_size,
+                seq_len=config.sequence_length,
+                seed=config.dataset_seed,
+                worker_count=config.worker_count,
+                worker_buffer_size=config.worker_buffer_size,
+            )
         return get_token_dataset_grain(
-            str(root / "train.bin"),
-            str(val_bin if val_bin.is_file() else root / "train.bin"),
+            train_bin, val_bin,
             batch_size=config.batch_size,
             seq_len=config.sequence_length,
             seed=config.dataset_seed,

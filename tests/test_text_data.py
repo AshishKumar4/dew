@@ -15,8 +15,10 @@ import numpy as np
 import pytest
 
 from dew.config import DataConfig
-from dew.data.dataloaders import get_token_dataset_grain, load_data
-from dew.data.sources.text import TokenFileSource
+from dew.data.dataloaders import (
+    get_packed_token_dataset_grain, get_token_dataset_grain, load_data,
+)
+from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.data.text import ByteTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +32,7 @@ if not flags.FLAGS.is_parsed():
 
 
 def _token_dir(tmp_path, train_tokens, val_tokens=None, seq_len=8, dtype=np.uint16,
-               vocab_size=256, body=None):
+               vocab_size=256, body=None, eos_id=None):
     """Write a token directory: train.bin (+ val.bin + meta.json)."""
     rng = np.random.RandomState(0)
     tokens = (rng.randint(0, vocab_size, train_tokens + (val_tokens or 0))
@@ -42,12 +44,23 @@ def _token_dir(tmp_path, train_tokens, val_tokens=None, seq_len=8, dtype=np.uint
     (tmp_path / "train.bin").write_bytes(train.astype(dtype).tobytes())
     if val is not None:
         (tmp_path / "val.bin").write_bytes(val.astype(dtype).tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps({
+    meta = {
         "tokenizer": "byte", "vocab_size": vocab_size,
         "dtype": np.dtype(dtype).name,
         "train_tokens": len(train), "val_tokens": len(val) if val is not None else 0,
-    }))
+    }
+    if eos_id is not None:
+        meta["eos_id"] = eos_id
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
     return tmp_path
+
+
+def _document_dir(tmp_path, documents, eos_id=0, dtype=np.uint16):
+    """A token directory whose stream is `documents`, each closed by eos_id."""
+    stream = np.concatenate([np.asarray(d + [eos_id], np.int64) for d in documents])
+    _token_dir(tmp_path, train_tokens=0, body=stream, dtype=dtype, eos_id=eos_id)
+    (tmp_path / "val.bin").write_bytes(stream.astype(dtype).tobytes())
+    return tmp_path, stream
 
 
 # ---------------------------------------------------------------------------------
@@ -363,3 +376,199 @@ def test_tokenize_tool_writes_the_smallest_dtype_that_fits():
     assert dtype_for(257) == np.dtype("uint16")
     assert dtype_for(50257) == np.dtype("uint16")
     assert dtype_for(70000) == np.dtype("uint32")
+
+
+# ---------------------------------------------------------------------------------
+# TokenDocumentSource and get_packed_token_dataset_grain
+# ---------------------------------------------------------------------------------
+
+def test_document_source_reads_one_document_per_record(tmp_path):
+    documents = [[10, 11, 12], [20, 21], [30, 31, 32, 33]]
+    _document_dir(tmp_path, documents, eos_id=0)
+    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+
+    assert len(source) == 3
+    for index, document in enumerate(documents):
+        # The eos closes the document, so it belongs to the record.
+        np.testing.assert_array_equal(
+            source[index]["text"], np.asarray(document + [0], np.int32))
+    assert list(source.lengths) == [4, 3, 5]
+
+
+def test_document_source_keeps_the_tail_past_the_last_boundary(tmp_path):
+    """A split cuts the stream mid-document; dropping the piece past the last
+    eos would lose those tokens with nothing said about it."""
+    stream = np.asarray([10, 11, 0, 20, 21], np.int64)
+    _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=0)
+    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+
+    assert len(source) == 2
+    np.testing.assert_array_equal(source[1]["text"], np.asarray([20, 21], np.int32))
+
+
+def test_document_source_needs_an_eos_id(tmp_path):
+    _token_dir(tmp_path, train_tokens=32)  # meta.json without eos_id
+    with pytest.raises(ValueError, match="no eos_id"):
+        TokenDocumentSource(str(tmp_path / "train.bin"))
+
+
+def test_document_source_reads_a_split_without_a_boundary_as_one_document(tmp_path):
+    _token_dir(tmp_path, train_tokens=32, body=[1, 2, 3, 4], eos_id=9)
+    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+
+    assert len(source) == 1
+    np.testing.assert_array_equal(source[0]["text"],
+                                  np.asarray([1, 2, 3, 4], np.int32))
+
+
+def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
+    seq_len = 8  # windows of 9 ids
+    # 4, 6 and 5 ids once each eos is counted: first fit puts 4 + 5 in one
+    # window and 6 in the next.
+    _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23, 24], [30, 31, 32, 33]])
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=2, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
+        num_packing_bins=2)
+
+    assert data["train_len"] == 3 and data["val_len"] == 3
+    assert data["local_batch_size"] == 2 and data["global_batch_size"] == 2
+    batch = next(iter(data["val"]()))
+
+    for key in ("text", "text_segment_ids", "text_positions"):
+        assert batch[key].shape == (2, seq_len + 1)
+        assert batch[key].dtype == np.int32
+    np.testing.assert_array_equal(batch["text"], [
+        [10, 11, 12, 0, 30, 31, 32, 33, 0],
+        [20, 21, 22, 23, 24, 0, 0, 0, 0]])
+    np.testing.assert_array_equal(batch["text_segment_ids"], [
+        [1, 1, 1, 1, 2, 2, 2, 2, 2],
+        [1, 1, 1, 1, 1, 1, 0, 0, 0]])
+    # Positions restart at 0 inside every document, which is what RoPE reads.
+    np.testing.assert_array_equal(batch["text_positions"], [
+        [0, 1, 2, 3, 0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4, 5, 0, 0, 0]])
+
+
+def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
+    """Grain's packer refuses an over-long element, so the loader cuts first;
+    each piece is its own segment and its positions start again at 0."""
+    seq_len = 3  # windows of 4 ids
+    _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=1, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
+        num_packing_bins=1)
+
+    rows = [batch["text"][0] for batch in data["val"]()]
+    positions = [batch["text_positions"][0] for batch in data["val"]()]
+    assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
+    np.testing.assert_array_equal(np.concatenate(rows)[:10],
+                                  list(range(10, 19)) + [0])
+    np.testing.assert_array_equal(positions[0], [0, 1, 2, 3])
+
+
+def test_packed_loader_lengths_count_windows_not_documents(tmp_path):
+    """A run turns train_len into steps_per_epoch, so a split of one document
+    that fills three windows cannot report one."""
+    seq_len = 3  # windows of 4 ids
+    _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=1, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
+        num_packing_bins=1)
+
+    assert data["train_len"] == 3 and data["val_len"] == 3
+    assert len(list(data["val"]())) == 3, "the length is not the pass it counts"
+
+
+def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
+    """The trainer saves the iterator's position in the checkpoint, so a
+    restored iterator has to carry on where the saved one had got to."""
+    _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 60, 3)])
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=2, seq_len=8, seed=0, worker_count=0, num_epochs=1,
+        num_packing_bins=2)
+
+    iterator = iter(data["val"]())
+    next(iterator)
+    state = iterator.get_state()
+    expected = [next(iterator)["text"] for _ in range(2)]
+
+    restored = iter(data["val"]())
+    restored.set_state(state)
+    for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)]):
+        np.testing.assert_array_equal(wanted, got)
+
+
+def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
+    _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 70, 3)])
+
+    def windows(worker_count):
+        data = get_packed_token_dataset_grain(
+            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+            batch_size=2, seq_len=8, seed=0, worker_count=worker_count,
+            num_epochs=1, num_packing_bins=2)
+        return sorted(row.tobytes() for batch in data["val"]()
+                      for row in batch["text"])
+
+    serial = windows(0)
+    assert serial, "the loader produced no windows"
+    assert serial == windows(2)
+
+
+def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
+    """num_epochs None is what a run uses, and the trainer keeps asking for
+    batches long after one pass over the documents."""
+    _document_dir(tmp_path, [[i, i + 1] for i in range(10, 30, 2)])
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+
+    iterator = iter(data["train"]())
+    assert len([next(iterator)["text"] for _ in range(20)]) == 20
+
+
+def test_load_data_selects_packing_only_when_asked(tmp_path):
+    _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]])
+    shared = dict(dataset=str(tmp_path), sequence_length=8, batch_size=2,
+                  worker_count=0)
+
+    packed = next(iter(load_data(DataConfig(pack_sequences=True, **shared))["train"]()))
+    assert set(packed) == {"text", "text_segment_ids", "text_positions"}
+
+    fixed = next(iter(load_data(DataConfig(**shared))["train"]()))
+    assert set(fixed) == {"text"}, "the fixed-window loader grew packing keys"
+
+
+def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
+    """--pack closes each input file with one eos and the val split is cut off
+    the head of the token stream by fraction, so a single-file corpus leaves
+    val.bin with no boundary inside it: that split is one document."""
+    raw = tmp_path / "corpus.txt"
+    raw.write_text("the quick brown fox jumps over the lazy dog\n" * 8,
+                   encoding="utf-8")
+    out = tmp_path / "tokens"
+
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "tools" / "tokenize_text.py"),
+         "--input", str(raw), "--out", str(out), "--tokenizer", "byte",
+         "--val-fraction", "0.1", "--pack"],
+        capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    val_tokens = list((out / "val.bin").read_bytes())
+    assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
+
+    seq_len = 63
+    data = load_data(DataConfig(dataset=str(out), sequence_length=seq_len,
+                                batch_size=1, worker_count=0, pack_sequences=True))
+    row = next(iter(data["val"]()))
+
+    padding = seq_len + 1 - len(val_tokens)
+    np.testing.assert_array_equal(row["text"][0], val_tokens + [0] * padding)
+    np.testing.assert_array_equal(row["text_segment_ids"][0],
+                                  [1] * len(val_tokens) + [0] * padding)
+    np.testing.assert_array_equal(row["text_positions"][0, :len(val_tokens)],
+                                  np.arange(len(val_tokens)))

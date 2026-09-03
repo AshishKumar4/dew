@@ -11,7 +11,7 @@ python tools/tokenize_text.py --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.01
 ```
 
-- `train.bin` and `val.bin` are flat arrays of token ids, `uint16` when the vocabulary fits and `uint32` otherwise, with no separators or padding.
+- `train.bin` and `val.bin` are flat arrays of token ids in the smallest unsigned dtype that holds the vocabulary, `uint8` up to 256 ids, `uint16` up to 65536 and `uint32` beyond, with no separators or padding.
 - `meta.json` records the `tokenizer`, its `vocab_size`, the `dtype` of the id arrays and the `train_tokens` / `val_tokens` counts. The recipe reads the vocabulary from here, so the model is always built for the ids on disk.
 
 `--tokenizer` is either `byte`, which is `dew.data.text.ByteTokenizer` over raw UTF-8 bytes with a vocabulary of 256, or the name of a HuggingFace tokenizer, which `dew.data.text.HFTokenizer` loads through `transformers.AutoTokenizer`. Both expose `encode(str) -> list[int]` and `decode(ids) -> str`, and nothing downstream needs anything else from them.
@@ -24,13 +24,57 @@ python tools/tokenize_text.py --input data/shakespeare.txt \
 
 One id longer than the context on purpose: the inputs are `text[:, :-1]` and the targets are `text[:, 1:]`, so a batch carries its own labels and nothing has to be shifted twice.
 
+## Packed documents
+
+A flat stream has no document boundaries, so a fixed window can straddle two unrelated texts: attention runs across the seam and RoPE never restarts. `--pack` closes every document (input file) with the tokenizer's eos id and records that id in `meta.json` as `eos_id`:
+
+```bash
+python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --tokenizer byte --pack
+```
+
+`data.pack_sequences` then selects `dew.data.dataloaders.get_packed_token_dataset_grain`, which is grain's `Dataset` API rather than its `DataLoader` for the reason grain gives for switching: packing. `dew.data.sources.text.TokenDocumentSource` reads a record as one document, documents longer than the window are cut into consecutive pieces first (grain's packer refuses an over-long element), and `grain.experimental.FirstFitPackIterDataset` fills windows of `seq_len + 1` with whole documents. A batch is then
+
+```python
+{"text": int32[B, seq_len + 1],
+ "text_segment_ids": int32[B, seq_len + 1],   # which document, 0 for padding
+ "text_positions": int32[B, seq_len + 1]}     # position inside that document
+```
+
+Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel changes: cuDNN has no mask argument, so jax converts a bool mask into an additive bias of `-2**41` in the compute dtype (`combine_bias_and_mask`) and refuses odd sequence lengths in training once a bias is present, while the xla kernel takes the mask itself on every backend with the same fp32 softmax. A segment-masked batch therefore runs on xla. Passing neither argument leaves every unpacked run bit-identical.
+
+That kernel costs, one NVIDIA GeForce RTX 4080 (16 GiB, driver 595.84), 3 layers of GPT-2 small's width in bf16, 20 steps, one process per row:
+
+| shape | batch | kernel | ms/step | peak GiB |
+|---|---|---|---:|---:|
+| 16 x 512 | fixed window | cuDNN | 75.8 | 4.99 |
+| 16 x 512 | packed, 4 documents | xla | 83.6 | 5.80 |
+| 16 x 512 | fixed window, xla pinned | xla | 83.5 | 5.80 |
+| 4 x 2048 | fixed window | cuDNN | 78.5 | 5.00 |
+| 4 x 2048 | packed, 4 documents | xla | 108.2 | 8.34 |
+
+The third row is where the cost is: a fixed window on the xla kernel costs what a packed batch costs on it, so the mask is free and the whole difference is the fused kernel. The xla path materializes the fp32 `[B, N, T, S]` logits per layer and keeps them for the backward pass, which is why the gap grows with the sequence: 0.81 GiB at 512, 3.34 GiB at 2048. Keeping cuDNN for a packed batch means training against the bias it builds from the mask, so it needs a parity check against xla on the card in question before it can be the default.
+
+```bash
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --packed-documents 4
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --attention-impl xla
+
+LONG='{"architecture": "causal_transformer", "config": {"vocab_size": 50304,
+  "emb_features": 768, "num_layers": 3, "num_heads": 12, "mlp_ratio": 4,
+  "max_seq_len": 2048}, "batch_size": 4, "seq_len": 2048, "dtype": "bfloat16"}'
+python tools/benchmark_step.py --steps 20 --cases "[$LONG]"
+python tools/benchmark_step.py --steps 20 --cases "[$LONG]" --packed-documents 4
+```
+
+Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts window-sized chunks, which is the windows a pass yields at most: every window first-fit emits holds at least one chunk, and which chunks share a window depends on the shuffle, so the exact number is not known until the pass has run. A recipe divides it by the batch size for `steps_per_epoch`.
+
 ## The objective
 
 `dew.objectives.lm.LMObjective(model, seq_len, vocab_size=..., pad_id=None, head_chunks=4, samples=None)` is the whole learning problem:
 
 - `loss` reads the model's final hidden states, multiplies them by its head matrix a vocabulary slice at a time, and returns the mean cross entropy of the targets in float32. Float32 is deliberate: a bfloat16 logsumexp over a large vocabulary loses enough precision to move the loss and the gradient with it. The slicing is why the full `[tokens, vocab]` logits tensor is never built, which at the small benchmark preset is 1.57 GiB read four times over; `head_chunks` is how many slices, and four is the measured best on one RTX 4080 at vocabulary 50,304 ([research](../research/lm-head.md)). The scalar comes with `ce`, `perplexity` and `token_accuracy`, which the trainer logs under `train/`. The accuracy is the same top-1 the whole row would have given, tie for tie, taken as a running best across the slices.
-- The model has to expose the seam the loss reads: `hidden_states(tokens, train=...)` for the states before the head, `head_weight(params)` for the `[width, vocab]` matrix the forward multiplies them by, and `final_logit_softcap` and `precision` so the loss applies what the forward would have. `CausalTransformer` does; a model with a bias on its head does not fit, because then the projection is not a matmul.
-- `pad_id` excludes padded targets from the mean. It defaults to `None` because packed token files have no padding, and masking an id that is really in the data would drop those tokens from the average.
+- The model has to expose the seam the loss reads: `hidden_states(tokens, train=..., positions=..., segment_ids=...)` for the states before the head, `head_weight(params)` for the `[width, vocab]` matrix the forward multiplies them by, and `final_logit_softcap` and `precision` so the loss applies what the forward would have. `CausalTransformer` does; a model with a bias on its head does not fit, because then the projection is not a matmul.
+- `pad_id` excludes padded targets from the mean. It defaults to `None` because a fixed-window token file has no padding, and masking an id that is really in the data would drop those tokens from the average. A packed batch needs no pad id: `text_segment_ids` says which slots are padding, and those targets are excluded whatever the id.
 - `ema` averages the whole parameter tree at `--trainer.ema-decay`, and the EMA copy is what validation reads.
 - `input_shapes` is `{"tokens": ((seq_len,), jnp.int32)}`. This is how a run needs no `DiffusionInputConfig`: `ObjectiveTrainer(..., objective=objective, input_config=None)` takes the init batch from the objective, and the `(shape, dtype)` pair is what keeps token ids from being initialised as floats. An objective that declares neither is rejected at construction.
 
@@ -60,10 +104,10 @@ python recipes/lm/train.py --data.dataset data/shakespeare-byte \
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--trainer.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
+`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--optim.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
 
 ## What a run reports
 
 Every logging tick writes `train/loss` and, from the objective's auxiliary metrics, `train/ce`, `train/perplexity` and `train/token_accuracy`, alongside the trainer's throughput numbers.
 
-At the end of each epoch the validation loop runs the objective's validation step over `--data.val-steps-per-epoch` batches. It reports the teacher-forced cross entropy, which `dew.eval.get_perplexity_metric()` turns into `val/perplexity` (lower is better, and tracked as `best_val/perplexity`), and the generated ids, which the objective decodes into a `val/samples` table. `--trainer.best-tracker-metric` defaults to `val/perplexity` for this recipe, so the checkpoint published to the registry is the one with the lowest validation perplexity rather than the lowest training loss.
+At the end of each epoch the validation loop runs the objective's validation step over `--data.val-steps-per-epoch` batches. It reports the teacher-forced cross entropy, which `dew.eval.get_perplexity_metric()` turns into `val/perplexity` (lower is better, and tracked as `best_val/perplexity`), and the generated ids, which the objective decodes into a `val/samples` table. `--trainer.best-tracker-metric` defaults to `val/perplexity` for this recipe, and it decides whether the run is published rather than which step is: the trainer compares this run against the project's best five on that metric, and a run among them pushes its newest checkpoint to the registry, with the `best` alias when it leads.
