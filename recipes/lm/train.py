@@ -55,6 +55,10 @@ class LmRunConfig(RunConfig):
     """Prompt the validation samples continue; empty continues a newline."""
     sample_tokens: int = 128
     """Tokens generated per validation sample; 0 logs no text."""
+    pretrained: Optional[str] = None
+    """Hugging Face decoder to continue training: a hub repo id or a local
+    directory in that layout. The checkpoint decides the architecture, so
+    --model.config may then carry max_seq_len and nothing else."""
 
 
 def read_meta(dataset: str) -> dict:
@@ -96,6 +100,62 @@ def build_lm(config: LmRunConfig, vocab_size: int, max_seq_len: int):
          "vocab_size": vocab_size},
         dtype=config.model.dtype, attention_impl=config.model.attention_impl)
     return build_model(architecture, model_config), model_config
+
+
+def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
+                    meta: dict):
+    """The decoder a --pretrained run continues, its variables and the config
+    it was built from.
+
+    The checkpoint decides every architecture field, so the only thing
+    --model.config may still say is how far the KV cache reaches. The config
+    that comes back is dew's, not the checkpoint's, so a pretrained run logs
+    the same vocabulary a fresh one does, compute dtype and kernel included.
+    The tokenizer of the token files has to be the one the checkpoint was
+    trained with: continuing pretraining on ids from another vocabulary trains
+    the embedding table against noise.
+    """
+    from dew.interop.hf_decoders import load_pretrained_decoder
+
+    overridden = sorted(set(config.model.config) - {"max_seq_len"})
+    if overridden:
+        raise ValueError(
+            f"--model.config carries {overridden}, which the checkpoint at "
+            f"{config.pretrained} decides. Only max_seq_len is still a choice.")
+
+    model, variables, model_config = load_pretrained_decoder(
+        config.pretrained,
+        dtype=config.model.dtype, attention_impl=config.model.attention_impl,
+        max_seq_len=config.model.config.get("max_seq_len", max_seq_len))
+    expected = checkpoint_tokenizer(config.pretrained)
+    if meta["tokenizer"] != expected:
+        raise ValueError(
+            f"the token files were written with {meta['tokenizer']}, and "
+            f"{config.pretrained} expects {expected}. Retokenize with "
+            f"--tokenizer {expected}.")
+    # A decoder's embedding table is usually padded past the tokenizer's ids
+    # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
+    # requirement, not matching the count.
+    if model.vocab_size < vocab_size:
+        raise ValueError(
+            f"{config.pretrained} has room for {model.vocab_size} ids and the "
+            f"token files use {vocab_size}")
+    return model, variables, model_config
+
+
+def checkpoint_tokenizer(pretrained: str) -> str:
+    """The tokenizer name a checkpoint expects its ids to come from.
+
+    A hub repo is its own tokenizer's name. A directory written by
+    save_pretrained_decoder records the name it was exported with, since the
+    path it happens to sit at says nothing.
+    """
+    generation_config = Path(pretrained) / "generation_config.json"
+    if generation_config.is_file():
+        recorded = json.loads(generation_config.read_text()).get("tokenizer_name")
+        if recorded:
+            return recorded
+    return pretrained
 
 
 def build_tokenizer(name: str):
@@ -160,14 +220,20 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
             "--trainer.steps-per-epoch")
 
     samples = build_samples(config)
-    model, model_config = build_lm(config, vocab_size,
-                                   context_length(config, samples))
+    context = context_length(config, samples)
+    pretrained = None
+    if config.pretrained is None:
+        model, model_config = build_lm(config, vocab_size, context)
+    else:
+        model, pretrained, model_config = load_pretrained(
+            config, vocab_size, context, meta)
     objective = LMObjective(
         model,
         config.sequence_length,
         vocab_size=vocab_size,
         ema_decay=config.trainer.ema_decay,
         samples=samples,
+        pretrained=pretrained,
     )
 
     name = config.trainer.name or (
