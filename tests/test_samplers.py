@@ -18,7 +18,7 @@ from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
 from dew.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
 from dew.sampling.ddim import DDIMSampler
-from dew.sampling.ddpm import DDPMSampler, SimpleDDPMSampler
+from dew.sampling.ddpm import DDPMSampler
 from dew.sampling.euler import EulerSampler, EulerAncestralSampler
 from dew.sampling.heun_sampler import HeunSampler
 from dew.sampling.multistep_dpm import MultiStepDPM
@@ -114,7 +114,7 @@ def generate(model, sampler, **kwargs):
     return sampler.generate_samples(params, **defaults)
 
 
-@pytest.mark.parametrize("sampler_class", [EulerSampler, DDIMSampler, SimpleDDPMSampler])
+@pytest.mark.parametrize("sampler_class", [EulerSampler, DDIMSampler, DDPMSampler])
 def test_vp_sampler_converges(sampler_class):
     model, sampler = make_vp_sampler(sampler_class)
     samples = generate(model, sampler)
