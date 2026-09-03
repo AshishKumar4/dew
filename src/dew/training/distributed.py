@@ -1,5 +1,6 @@
 """Device mesh, parameter sharding and host-to-device prefetch."""
 
+import math
 import queue
 import threading
 from collections.abc import Mapping, Sequence
@@ -164,22 +165,31 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     """The spec these logical axes ask for, reduced to one the shape can take.
 
     A mesh axis of size 1 shards nothing, so it is dropped rather than left in
-    the spec where it would only obscure what is replicated. A dimension the
-    assigned axes do not divide evenly cannot be split at all, and replicating
-    the whole parameter is the honest answer: the tolerance check below is what
-    turns that into an error when it matters.
+    the spec where it would only obscure what is replicated. A dimension its
+    assigned axes do not divide evenly cannot be split at all, so its name is
+    dropped and the rules hand the axis to the next dimension that names it:
+    an odd vocabulary shards the embedding on its width instead of taking the
+    whole table out of the layout. Only a parameter no named dimension can
+    split stays whole, which the tolerance check turns into an error when it
+    matters.
     """
-    entries = []
-    for dimension, assignment in enumerate(nn.logical_to_mesh_axes(axes, rules)):
-        mesh_axes = tuple(
-            axis for axis in
-            ((assignment,) if isinstance(assignment, str)
-             else tuple(assignment) if assignment is not None else ())
-            if mesh.shape[axis] > 1)
-        shards = int(np.prod([mesh.shape[axis] for axis in mesh_axes], dtype=np.int64))
-        if shards > 1 and shape[dimension] % shards:
-            return P()
-        entries.append(mesh_axes[0] if len(mesh_axes) == 1 else mesh_axes or None)
+    names = list(axes)
+    while True:
+        assigned = [
+            tuple(axis for axis in
+                  ((assignment,) if isinstance(assignment, str)
+                   else () if assignment is None else tuple(assignment))
+                  if mesh.shape[axis] > 1)
+            for assignment in nn.logical_to_mesh_axes(tuple(names), rules)]
+        blocked = [
+            dimension for dimension, mesh_axes in enumerate(assigned)
+            if shape[dimension] % math.prod(mesh.shape[axis] for axis in mesh_axes)]
+        if not blocked:
+            break
+        for dimension in blocked:
+            names[dimension] = None
+    entries = [mesh_axes[0] if len(mesh_axes) == 1 else mesh_axes or None
+               for mesh_axes in assigned]
     while entries and entries[-1] is None:
         entries.pop()
     return P(*entries)

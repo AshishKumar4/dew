@@ -77,7 +77,9 @@ Precedence is fixed, so it cannot track the largest axis for every conceivable s
 
 The table is the whole mechanism for future parallelism. Adding a `tensor` axis to the mesh and changing two rows (`"heads": "tensor"`, `"mlp": ["tensor"]`) moves every declared model to hybrid FSDP/tensor parallelism with no model edits, exactly as MaxText's `logical_axis_rules` does (`docs/research/google-jax-stack.md`, MaxText section). An `fsdp_transpose` axis would land in the same place.
 
-`state_sharding_tree(mesh, abstract_state, min_shard_size, logical_axis_rules)` implements the derivation, one pass over the abstract state: `_logical_axes` reads the declared names off each leaf's path, `nn.logical_to_mesh_axes` applies the rules table, and the result drops size-1 mesh axes and replicates a parameter whose assigned dimension the mesh axes do not divide. Below `min_shard_size` elements a declared parameter stays replicated too. Deriving names and values in the same pass is what lets an optimizer state hold leaves that are not arrays at all, `optax.MaskedNode` under a masked transform among them.
+`state_sharding_tree(mesh, abstract_state, min_shard_size, logical_axis_rules)` implements the derivation, one pass over the abstract state: `_logical_axes` reads the declared names off each leaf's path, `nn.logical_to_mesh_axes` applies the rules table, and the result drops mesh axes of size 1. Below `min_shard_size` elements a declared parameter stays replicated. Deriving names and values in the same pass is what lets an optimizer state hold leaves that are not arrays at all, `optax.MaskedNode` under a masked transform among them.
+
+A dimension the assigned mesh axes do not divide evenly cannot be split, so its name is dropped and the rules hand the axis to the next dimension that names it. GPT-2's 50257 rows, Qwen's 151665 and Gemma's 256000 all make the `vocab` rule unusable on any real mesh, and the embedding then shards on `embed`, which is what the shape heuristic picked. Only a parameter where no named dimension divides stays whole, and the tolerance check below is what turns that into an error when it matters.
 
 ## Which parameters shard
 
