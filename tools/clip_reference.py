@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Write the CLIP fixtures tests/test_text_encoders.py checks against.
+"""Write the CLIP fixtures tests/test_text_encoders.py and tests/test_metrics.py
+check against.
 
 Everything here runs under torch and transformers, which dew does not depend
-on, so this is the only place the reference implementation of the text tower is
+on, so this is the only place the reference implementation of the towers is
 executed. The fixtures it writes are what CI compares against.
 
 Set up the venv and run it:
@@ -10,27 +11,35 @@ Set up the venv and run it:
     uv venv /tmp/clipref --python 3.12
     uv pip install --python /tmp/clipref/bin/python torch \
         --index-url https://download.pytorch.org/whl/cpu
-    uv pip install --python /tmp/clipref/bin/python transformers safetensors numpy
+    uv pip install --python /tmp/clipref/bin/python transformers safetensors \
+        numpy pillow
     HF_HOME=/tmp/clipref-hf /tmp/clipref/bin/python tools/clip_reference.py
 
 What lands in tests/fixtures/clip:
 
 - tiny/: a random-weight CLIP checkpoint in the Hugging Face layout
-  (config.json + model.safetensors, both towers), a tokenizer small enough to
-  commit, the four prompts it was run on, and the fp32 last hidden states and
-  pooled outputs of the reference text tower in eval mode with eager
-  attention. Small enough to live in git, so the parity test needs no network.
-  Its eos_token_id is 1, which is not the largest id in its vocabulary, so the
-  pooled row it fixes is the one the eos branch of the reference finds.
+  (config.json + model.safetensors, both towers and the projection heads), a
+  tokenizer small enough to commit, an image processor config at the tower's
+  8 pixel input, the four prompts and four synthetic images it was run on, and
+  the fp32 outputs of the reference in eval mode with eager attention: the
+  text tower's last hidden states and pooled outputs, the projected text
+  embeddings, the processor's pixel values and the projected image
+  embeddings. Small enough to live in git, so the parity tests need no
+  network. Its eos_token_id is 1, which is not the largest id in its
+  vocabulary, so the pooled row it fixes is the one the eos branch of the
+  reference finds. The images are taller than they are wide, so the
+  processor's resize and centre crop both do work.
 - large-patch14/: no weights, 340 MB of them would not fit. prompts.json holds
-  the three prompts, config.json is the repo's own, and reference.npz the fp32
-  outputs of the real openai/clip-vit-large-patch14 text tower, which the
-  network test compares against. That config carries eos_token_id 2, so it
-  fixes the argmax branch of the pooled row.
+  the three prompts and the recipe for three synthetic images, config.json is
+  the repo's own, and reference.npz the fp32 outputs of the real
+  openai/clip-vit-large-patch14: the text tower's hidden states and pooled
+  outputs and both projected embeddings, which the network tests compare
+  against. That config carries eos_token_id 2, so it fixes the argmax branch
+  of the pooled row.
 
 --skip-real leaves large-patch14 alone, for a run without the 1.7 GB download.
---fp64 PATH also writes the real tower's fp64 outputs to PATH, outside the
-fixtures, which is the evidence behind the fp32 tolerance the test states.
+--fp64 PATH also writes the real text tower's fp64 outputs to PATH, outside
+the fixtures, which is the evidence behind the fp32 tolerance the test states.
 """
 
 import argparse
@@ -43,8 +52,8 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from transformers import (
-    AutoTokenizer, CLIPConfig, CLIPModel, CLIPTextConfig, CLIPTokenizer,
-    CLIPVisionConfig,
+    AutoTokenizer, CLIPConfig, CLIPImageProcessorPil, CLIPModel, CLIPTextConfig,
+    CLIPTokenizer, CLIPVisionConfig,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "clip"
@@ -59,6 +68,16 @@ REAL_PROMPTS = [
     "pier, gulls over the water, the town behind it still asleep, warm light "
     "on the rooftops and a cold blue shadow in the alleys",
 ]
+# Synthetic images: seed and (count, height, width, channels). Noise is as good
+# as a photograph for parity, and a recipe is smaller than pixels.
+TINY_IMAGES = {"seed": 0, "shape": [4, 16, 12, 3]}
+REAL_IMAGES = {"seed": 0, "shape": [3, 64, 48, 3]}
+
+
+def synthetic_images(recipe) -> np.ndarray:
+    """uint8 RGB images from a recipe, reproduced the same way by the tests."""
+    return np.random.RandomState(recipe["seed"]).randint(
+        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
 def tiny_tokenizer() -> CLIPTokenizer:
@@ -98,7 +117,8 @@ def tiny_model(vocab_size: int) -> CLIPModel:
 
 
 def encode(model: CLIPModel, tokenizer, prompts):
-    """The reference text tower on `prompts`, fp32, eval mode, eager attention."""
+    """The reference text tower and its projection head on `prompts`, fp32,
+    eval mode, eager attention."""
     model.eval()
     model.set_attn_implementation("eager")
     tokens = tokenizer(prompts, padding="max_length", max_length=MAX_LENGTH,
@@ -106,11 +126,29 @@ def encode(model: CLIPModel, tokenizer, prompts):
     with torch.no_grad():
         outputs = model.text_model(input_ids=tokens["input_ids"],
                                    attention_mask=tokens["attention_mask"])
+        text_embeds = model.text_projection(outputs.pooler_output)
     return {
         "input_ids": tokens["input_ids"].to(torch.int32).numpy(),
         "attention_mask": tokens["attention_mask"].to(torch.int32).numpy(),
         "last_hidden_state": outputs.last_hidden_state.to(torch.float32).numpy(),
         "pooler_output": outputs.pooler_output.to(torch.float32).numpy(),
+        "text_embeds": text_embeds.to(torch.float32).numpy(),
+    }
+
+
+def encode_images(model: CLIPModel, processor: CLIPImageProcessorPil, images):
+    """The reference image processor, vision tower and projection head on
+    uint8 images, fp32, eval mode, eager attention."""
+    model.eval()
+    model.set_attn_implementation("eager")
+    pixel_values = processor(images=images, return_tensors="pt")["pixel_values"]
+    with torch.no_grad():
+        outputs = model.vision_model(pixel_values=pixel_values)
+        image_embeds = model.visual_projection(outputs.pooler_output)
+    return {
+        "images": images,
+        "pixel_values": pixel_values.to(torch.float32).numpy(),
+        "image_embeds": image_embeds.to(torch.float32).numpy(),
     }
 
 
@@ -162,6 +200,10 @@ def write_tiny(directory: Path) -> None:
     tokenizer.save_pretrained(directory)
     model = tiny_model(len(tokenizer.get_vocab()))
     model.save_pretrained(directory, safe_serialization=True)
+    side = model.config.vision_config.image_size
+    processor = CLIPImageProcessorPil(size={"shortest_edge": side},
+                                      crop_size={"height": side, "width": side})
+    processor.save_pretrained(directory)
 
     reference = encode(model, tokenizer, TINY_PROMPTS)
     ids = reference["input_ids"]
@@ -170,21 +212,29 @@ def write_tiny(directory: Path) -> None:
     assert (ids.argmax(axis=-1) != (ids == 1).argmax(axis=-1)).any(), (
         "the argmax and eos branches of the pooled row agree on every prompt, "
         "so this fixture would not tell them apart")
+    reference.update(encode_images(model, processor, synthetic_images(TINY_IMAGES)))
 
     np.savez(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(
-        {"prompts": TINY_PROMPTS, "max_length": MAX_LENGTH}, indent=2) + "\n")
+        {"prompts": TINY_PROMPTS, "max_length": MAX_LENGTH, "images": TINY_IMAGES},
+        indent=2) + "\n")
 
 
 def write_real(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL)
+    processor = CLIPImageProcessorPil.from_pretrained(REAL_MODEL)
     model = CLIPModel.from_pretrained(REAL_MODEL, dtype=torch.float32)
 
     reference = encode(model, tokenizer, REAL_PROMPTS)
+    # The pixel values are 1.8 MB of upsampled noise; the test recomputes them
+    # with the same processor.
+    images = encode_images(model, processor, synthetic_images(REAL_IMAGES))
+    reference["image_embeds"] = images["image_embeds"]
     np.savez_compressed(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(
-        {"repo": REAL_MODEL, "prompts": REAL_PROMPTS, "max_length": MAX_LENGTH},
+        {"repo": REAL_MODEL, "prompts": REAL_PROMPTS, "max_length": MAX_LENGTH,
+         "images": REAL_IMAGES},
         indent=2) + "\n")
 
     # The repo's own config.json, byte for byte, so the translation test reads

@@ -106,6 +106,9 @@ class Case:
     """Compute dtype, written into the model config by the precision policy."""
     batch_size: int = 8
     fsdp_size: int = 1
+    expert_size: int = 1
+    """Devices the expert dimension of an MoE layer is split over, as
+    --trainer.expert-size; 1 replicates every expert."""
     image_size: int = 32
     frames: int = 0
     """Video models take (frames, H, W, C) samples; 0 means images."""
@@ -134,7 +137,8 @@ class Case:
 
     @property
     def label(self) -> str:
-        return f"{self.architecture} b{self.batch_size} fsdp{self.fsdp_size}"
+        return (f"{self.architecture} b{self.batch_size} fsdp{self.fsdp_size} "
+                f"expert{self.expert_size}")
 
 
 def cpu_smoke_cases() -> list[Case]:
@@ -320,6 +324,7 @@ def build_trainer(case: Case, checkpoint_dir: str,
         wandb_config=None,
         distributed_training=True,
         fsdp_size=case.fsdp_size,
+        expert_size=case.expert_size,
         fsdp_min_param_size=case.fsdp_min_param_size,
         checkpoint_base_path=checkpoint_dir,
     )
@@ -448,6 +453,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "architecture": case.architecture,
         "batch_size": case.batch_size,
         "fsdp_size": case.fsdp_size,
+        "expert_size": case.expert_size,
         "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
         "packed_documents": case.packed_documents,
         "dtype": case.dtype,
@@ -481,6 +487,7 @@ TABLE_COLUMNS = (
     ("architecture", "architecture", 20, "{}"),
     ("batch_size", "batch", 6, "{}"),
     ("fsdp_size", "fsdp", 5, "{}"),
+    ("expert_size", "expert", 7, "{}"),
     ("params", "params", 12, "{:,}"),
     ("ms_per_step", "ms/step", 9, "{:.1f}"),
     ("p10_ms", "p10", 7, "{:.1f}"),

@@ -355,11 +355,14 @@ def _validation_pass(source, batch_size, transformations=(), *, seed,
     and it leaves the batches independent of worker_count.
 
     Sharding is grain's slice convention, so process p of n reads records
-    p, p + n, ... of the split.
+    p, p + n, ... of the split. The transforms are applied before that slice
+    because grain keys a record's rng by its index in the dataset the random
+    map sits on: applied after, record k was keyed by its position in the
+    slice, and the same seed augmented and captioned it differently on one
+    host than on a pod.
     """
-    records = pygrain.MapDataset.source(source)[
-        jax.process_index()::jax.process_count()]
-    reads = records.seed(seed).apply(transformations).to_iter_dataset(read_options)
+    records = pygrain.MapDataset.source(source).seed(seed).apply(transformations)
+    reads = records[jax.process_index()::jax.process_count()].to_iter_dataset(read_options)
     if worker_count:
         reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=worker_count, per_worker_buffer_size=worker_buffer_size))

@@ -250,6 +250,24 @@ def test_benchmark_step_tool_measures_a_real_step(tmp_path):
     assert tool.format_table(rows).count("\n") == 2
 
 
+def test_benchmark_case_expert_size_reaches_the_mesh(tmp_path):
+    """A --cases entry can ask for an expert axis; the trainer the tool builds
+    has to be sharded that way, or the row measures a replicated run under an
+    expert-parallel label. The dense parameters shard over fsdp beside it,
+    since replicated across the expert axis they would trip the sharding
+    tolerance."""
+    tool = benchmark_tool()
+    moe = next(case for case in CASES if case.architecture == "moe")
+    (case,) = tool.build_cases(tool.BenchmarkConfig(cases=[{
+        "architecture": "moe", "config": moe.config, "seq_len": SEQ_LEN,
+        "expert_size": 2, "fsdp_size": 2, "fsdp_min_param_size": 256}]))
+    assert case.expert_size == 2 and case.label.endswith("fsdp2 expert2")
+
+    trainer = tool.build_trainer(case, str(tmp_path))
+
+    assert dict(trainer.mesh.shape) == {"data": 2, "expert": 2, "fsdp": 2}
+
+
 def test_benchmark_small_preset_profiles_every_architecture():
     """--preset small is the GPU sweep, so an architecture missing from it is
     an architecture nobody has ever profiled."""
