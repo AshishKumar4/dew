@@ -11,6 +11,8 @@ test_every_exported_scheduler_is_covered fails if a scheduler is exported
 without being added to it, so new schedulers inherit the invariants.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -44,15 +46,15 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 # 'vp' is variance preserving, 've' keeps alpha=1 and scales the input,
 # 'flow' is the rectified-flow linear path.
 SCHEDULES = [
-    (CosineNoiseScheduler, lambda: CosineNoiseScheduler(1000), DISCRETE_STEPS, 'vp'),
-    (LinearNoiseScheduler, lambda: LinearNoiseScheduler(1000), DISCRETE_STEPS, 'vp'),
-    (ExpNoiseScheduler, lambda: ExpNoiseScheduler(1000), DISCRETE_STEPS, 'vp'),
-    (CosineContinuousNoiseScheduler, lambda: CosineContinuousNoiseScheduler(), CONTINUOUS_STEPS, 'vp'),
-    (SqrtContinuousNoiseScheduler, lambda: SqrtContinuousNoiseScheduler(), CONTINUOUS_STEPS, 'vp'),
-    (CosineGeneralNoiseScheduler, lambda: CosineGeneralNoiseScheduler(), CONTINUOUS_STEPS, 've'),
-    (KarrasVENoiseScheduler, lambda: KarrasVENoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (EDMNoiseScheduler, lambda: EDMNoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
-    (FlowMatchingScheduler, lambda: FlowMatchingScheduler(), CONTINUOUS_STEPS, 'flow'),
+    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (CosineContinuousNoiseScheduler, partial(CosineContinuousNoiseScheduler), CONTINUOUS_STEPS, 'vp'),
+    (SqrtContinuousNoiseScheduler, partial(SqrtContinuousNoiseScheduler), CONTINUOUS_STEPS, 'vp'),
+    (CosineGeneralNoiseScheduler, partial(CosineGeneralNoiseScheduler), CONTINUOUS_STEPS, 've'),
+    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, 1, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
+    (EDMNoiseScheduler, partial(EDMNoiseScheduler, 1, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
+    (FlowMatchingScheduler, partial(FlowMatchingScheduler), CONTINUOUS_STEPS, 'flow'),
 ]
 
 # Base classes: no rates of their own, so nothing to assert invariants against
@@ -89,6 +91,14 @@ def test_every_exported_scheduler_is_covered():
 def test_abstract_schedulers_stay_exported():
     """They are the documented subclassing surface."""
     assert ABSTRACT_SCHEDULERS <= set(schedulers.__all__)
+
+
+@pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
+def test_misspelled_keyword_is_rejected(cls, make, steps, family):
+    """A typo in a keyword must raise at construction. Swallowing it means the
+    run silently trains with the default, here without min-SNR weighting."""
+    with pytest.raises(TypeError, match="min_snr_gama"):
+        make(min_snr_gama=5.0)
 
 
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
