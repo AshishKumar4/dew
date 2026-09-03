@@ -130,12 +130,6 @@ def generate_collate_fn(media_type="image"):
     else:  # Default to image
         return image_collate
 
-class CaptionDeletionTransform(pygrain.MapTransform):
-    def map(self, element):
-        """Delete the caption from the element."""
-        if "caption" in element:
-            del element["caption"]
-        return element
 
 def get_dataset_grain(
     data_name="cc12m",
@@ -256,15 +250,11 @@ def get_dataset_online(
         data_name="combined_online",
         batch_size=64,
         image_scale=256,
-        count=None,
-        num_epochs=None,
         method=jax.image.ResizeMethod.LANCZOS3,
         worker_count=32,
         read_thread_count=64,
         read_buffer_size=50,
         worker_buffer_size=20,
-        seed=0,
-        dataset_source="/mnt/gcs_mount/arrayrecord2/cc12m/",
     ):
     """Legacy function for getting online streaming dataloader for images.
     
@@ -272,15 +262,11 @@ def get_dataset_online(
         data_name: Name of the dataset in onlineDatasetMap.
         batch_size: Batch size for the dataset.
         image_scale: Size to scale images to.
-        count: Optional count limit for the dataset.
-        num_epochs: Number of epochs to iterate.
         method: Interpolation method for resizing.
         worker_count: Number of worker processes.
         read_thread_count: Number of read threads.
         read_buffer_size: Size of the read buffer.
         worker_buffer_size: Size of the worker buffer.
-        seed: Random seed.
-        dataset_source: Source path for the dataset.
         
     Returns:
         Dictionary with train dataset function and metadata.
@@ -989,7 +975,6 @@ def load_data(config: DataConfig) -> dict:
             worker_count=config.worker_count, read_thread_count=read_thread_count,
             read_buffer_size=config.read_buffer_size,
             worker_buffer_size=worker_buffer_size,
-            seed=config.dataset_seed, dataset_source=config.dataset_path,
         )
 
     if name in datasetMap:
