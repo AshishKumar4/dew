@@ -7,6 +7,7 @@ from typing import Callable, List, Dict, Tuple, Union, Any, Sequence, Optional
 from dataclasses import field, dataclass
 import jax.numpy as jnp
 import optax
+import itertools
 import functools
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
@@ -313,17 +314,19 @@ class ObjectiveTrainer(SimpleTrainer):
         """
         process_index = jax.process_index()
 
-        val_ds = iter(val_ds()) if val_ds else None
+        # val_steps_per_epoch bounds the pass, and a held-out split that runs
+        # out first ends it. What it scored before that is the epoch's score,
+        # so the reduction below has to be reached either way.
+        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
+                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
         print(f"Validation loop started for process index {process_index} "
               f"with {jax.device_count()} devices.")
         # Evaluation step
         try:
             metrics = {metric.name: [] for metric in self.eval_metrics} if self.eval_metrics else {}
-            for i in range(val_steps_per_epoch):
-                if val_ds is None:
-                    batch = None
-                else:
-                    batch = shard_batch(self.batch_sharding, next(val_ds))
+            for i, batch in enumerate(batches):
+                if batch is not None:
+                    batch = shard_batch(self.batch_sharding, batch)
                 artifacts = val_step_fn(val_state, batch)
 
                 if self.eval_metrics is not None:
@@ -348,6 +351,7 @@ class ObjectiveTrainer(SimpleTrainer):
                 metrics = {
                     metric.name: metric.reducer(metrics[metric.name])
                     for metric in self.eval_metrics
+                    if metrics[metric.name]
                 }
                 # Update the best validation metrics (min or max per metric direction)
                 for key, value in metrics.items():
@@ -375,11 +379,6 @@ class ObjectiveTrainer(SimpleTrainer):
                             f"best_{key}": value,
                         }, step=current_step)
                 print(f"Validation metrics for process index {process_index}: {metrics}")
-            
-            # Close validation dataset iterator
-            del val_ds
-        except StopIteration:
-            print(f"Validation dataset exhausted for process index {process_index}")
         except Exception as e:
             print(f"Error during validation for process index {process_index}: {e}")
             import traceback

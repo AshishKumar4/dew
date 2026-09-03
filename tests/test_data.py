@@ -244,6 +244,25 @@ def test_media_dataset_validation_split_is_ordered_and_disjoint_from_train(fake_
     assert train_indices != sorted(train_indices)  # the train sampler still shuffles
 
 
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_media_validation_pass_reads_every_held_out_record_once(fake_media_dataset, workers):
+    """A pass is the split, once, in record order, and then it ends.
+
+    grain's DataLoader applies its operations inside the worker processes, so
+    each worker had to fill a whole batch out of its own slice of the split,
+    and the unbounded num_epochs a run leaves at None let it read that slice
+    again to do so.
+    """
+    data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                   val_count=24, val_batch_size=8,
+                                   worker_count=workers, seed=0)
+
+    assert _indices(data["val"](), 12) == [
+        list(range(8)), list(range(8, 16)), list(range(16, 24))]
+    train = [index for batch in _indices(data["train"](), 2) for index in batch]
+    assert set(train).isdisjoint(range(24))
+
+
 def test_media_dataset_validation_split_rejects_impossible_sizes(fake_media_dataset):
     with pytest.raises(ValueError, match="val_count"):
         get_media_dataset_grain("fake", dataset_source="/tmp", val_count=32)
@@ -304,9 +323,52 @@ def test_legacy_grain_loader_holds_the_validation_records_out_of_training(fake_l
     val_indices = [i for batch in _indices(data["val"](), 2) for i in batch]
     train_indices = [i for batch in _indices(data["train"](), 3) for i in batch]
 
-    assert val_indices == list(range(8))  # canonical order, its own sampler
+    assert val_indices == list(range(8))  # canonical order, its own pass
     assert set(train_indices).isdisjoint(val_indices)
     assert len(train_indices) == 24 and train_indices != sorted(train_indices)
+
+
+@pytest.mark.parametrize("val_workers", [0, 2])
+def test_a_validation_pass_reads_every_held_out_record_once(fake_legacy_dataset, val_workers):
+    """A pass is the split, once, in record order, and then it ends.
+
+    The legacy loader defaults to eight validation workers, and grain's
+    DataLoader batches inside them, so each worker filled a batch out of its
+    own eighth of the split by reading that eighth again. On 512 held-out
+    flowers the first batch held 64 records four times over, 44 distinct
+    labels where the records carry 96, and the pass never ended.
+    """
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_batch_size=8,
+        val_count=24, worker_count=0, val_worker_count=val_workers, seed=0)
+
+    assert _indices(data["val"](), 12) == [
+        list(range(8)), list(range(8, 16)), list(range(16, 24))]
+    train = [index for batch in _indices(data["train"](), 2) for index in batch]
+    assert set(train).isdisjoint(range(24))
+
+
+def test_a_bounded_validation_pass_at_the_default_worker_count_still_yields_batches(
+        fake_legacy_dataset):
+    """The run's own numbers, with the epochs bounded.
+
+    load_data holds out whole batches and leaves val_worker_count where it
+    is, so a worker owns a slice smaller than one batch. grain's DataLoader
+    batched inside the workers and dropped what it could not fill, which at
+    these numbers is every batch, while val_len went on reporting the
+    records. Nothing raised, so the epoch scored nothing.
+    """
+    workers = inspect.signature(
+        dataloaders.get_dataset_grain).parameters["val_worker_count"].default
+    assert workers == 8, "the default this test is about"
+
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_batch_size=8,
+        val_count=16, worker_count=0, val_worker_count=workers, num_epochs=1,
+        seed=0)
+
+    assert data["val_len"] == 16
+    assert _indices(data["val"](), 6) == [list(range(8)), list(range(8, 16))]
 
 
 def test_legacy_grain_loader_without_val_count_keeps_validating_on_every_record(fake_legacy_dataset):
