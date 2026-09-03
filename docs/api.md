@@ -39,7 +39,8 @@ The public modules, and what each one is for.
 | `dew.nn.backbones.causal_transformer` | `CausalTransformer` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
 | `dew.nn.moe` | `Router`, `ExpertMLP`, `SparseMLP`, `calculate_load_balance_updates` |
-| `dew.nn` | `attention`, `blocks`, `dit`, `vit`, `ssm`, `scan_orders`, `moe` |
+| `dew.nn.text_encoders` | `CLIPTextModel`, `CLIPTextTransformer`, `translate_config`, `translate_weights` |
+| `dew.nn` | `attention`, `blocks`, `dit`, `vit`, `ssm`, `scan_orders`, `moe`, `text_encoders` |
 
 ## Sampling and inference
 
