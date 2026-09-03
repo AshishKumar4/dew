@@ -47,7 +47,7 @@ from dew.nn.moe import calculate_load_balance_updates
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
-It is `+rate` for every expert below the average load, `-rate` for every expert above it. A training step that applies it owns the write; nothing in the trainer does that yet, so a run today trains with the bias at whatever a checkpoint carried.
+It is `+rate` for every expert below the average load, `-rate` for every expert above it. A training step that applies it owns the write, and no Dew trainer does that yet. `SparseMLP` and `CausalTransformer` build routers without the bias, so a sparse decoder today routes on the scores alone; the bias is reachable by building a `Router` with `expert_bias=True`, which is what the parity test against DeepSeek does and what a DeepSeek checkpoint will need.
 
 ## The grouped matmul
 
@@ -90,5 +90,8 @@ Everything below ran on CPU at fp32 with `JAX_PLATFORMS=cpu .venv/bin/python -m 
 | The whole sparse layer's output | `MixtralSparseMoeBlock` | 7.63e-06 on outputs reaching 24.7 |
 | Grouped matmul against a per-expert loop | written out one expert at a time | 1.19e-07 |
 | 50 training steps, `expert_size` 1 against 4 | the same run at the same seed | equal on every step |
+| `tokamax` against `xla` in `ExpertMLP` | `jax.lax.ragged_dot` | bitwise equal, tokamax 0.0.13 on CPU |
+
+The tokamax row needs the package, which Dew does not depend on, so its test skips without it. It was run once with tokamax 0.0.13 and its dependencies staged on `PYTHONPATH`.
 
 The 2000-step acceptance run of the 8-expert decoder on FineWeb-Edu, its load-balance band and its loss curve against a dense model of the same active parameter count are not run yet; they need the v5e-16 slice in `docs/design/plan.md` section 4.7.
