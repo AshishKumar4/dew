@@ -40,7 +40,31 @@ python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --token
  "text_positions": int32[B, seq_len + 1]}     # position inside that document
 ```
 
-Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel choice changes: cuDNN takes causality as a flag and turns any explicit mask into a materialized `[B, N, T, S]` bias, so a segment-masked batch runs on the xla kernel instead, which takes the mask itself. Passing neither argument leaves every unpacked run bit-identical.
+Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal *and* block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel changes: cuDNN has no mask argument, so jax converts a bool mask into an additive bias of `-2**41` in the compute dtype (`combine_bias_and_mask`) and refuses odd sequence lengths in training once a bias is present, while the xla kernel takes the mask itself on every backend with the same fp32 softmax. A segment-masked batch therefore runs on xla. Passing neither argument leaves every unpacked run bit-identical.
+
+That kernel costs, one NVIDIA GeForce RTX 4080 (16 GiB, driver 595.84), 3 layers of GPT-2 small's width in bf16, 20 steps, one process per row:
+
+| shape | batch | kernel | ms/step | peak GiB |
+|---|---|---|---:|---:|
+| 16 x 512 | fixed window | cuDNN | 75.8 | 4.99 |
+| 16 x 512 | packed, 4 documents | xla | 83.6 | 5.80 |
+| 16 x 512 | fixed window, xla pinned | xla | 83.5 | 5.80 |
+| 4 x 2048 | fixed window | cuDNN | 78.5 | 5.00 |
+| 4 x 2048 | packed, 4 documents | xla | 108.2 | 8.34 |
+
+The third row is where the cost is: a fixed window on the xla kernel costs what a packed batch costs on it, so the mask is free and the whole difference is the fused kernel. The xla path materializes the fp32 `[B, N, T, S]` logits per layer and keeps them for the backward pass, which is why the gap grows with the sequence: 0.81 GiB at 512, 3.34 GiB at 2048. Keeping cuDNN for a packed batch means training against the bias it builds from the mask, so it needs a parity check against xla on the card in question before it can be the default.
+
+```bash
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --packed-documents 4
+python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --attention-impl xla
+
+LONG='{"architecture": "causal_transformer", "config": {"vocab_size": 50304,
+  "emb_features": 768, "num_layers": 3, "num_heads": 12, "mlp_ratio": 4,
+  "max_seq_len": 2048}, "batch_size": 4, "seq_len": 2048, "dtype": "bfloat16"}'
+python tools/benchmark_step.py --steps 20 --cases "[$LONG]"
+python tools/benchmark_step.py --steps 20 --cases "[$LONG]" --packed-documents 4
+```
 
 Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts window-sized chunks, which is the windows a pass yields at most: every window first-fit emits holds at least one chunk, and which chunks share a window depends on the shuffle, so the exact number is not known until the pass has run. A recipe divides it by the batch size for `steps_per_epoch`.
 

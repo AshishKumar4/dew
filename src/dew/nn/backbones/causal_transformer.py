@@ -179,14 +179,17 @@ class CausalSelfAttention(nn.Module):
                 inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
             causal, window = False, None
             if implementation in ('auto', 'cudnn'):
-                # cuDNN takes causality and windows as flags, not masks: jax
-                # turns any mask on that path into a materialized [B, N, T, S]
-                # additive bias (combine_bias_and_mask in
-                # jax/_src/cudnn/fused_attention_stablehlo.py), which needs
-                # even sequence lengths while training and reads grouped-query
-                # heads as MLA, supported only from Hopper on. The xla kernel
-                # takes the mask itself and runs the same fp32 softmax, so a
-                # packed batch goes there instead of degrading silently.
+                # cuDNN has no mask argument: causality and the window are
+                # flags, and jax hands the kernel a bool mask as an additive
+                # bias of -2**41 in the compute dtype instead
+                # (combine_bias_and_mask in
+                # jax/_src/cudnn/fused_attention_stablehlo.py), which also
+                # makes check_is_flash_attention refuse an odd length while
+                # training. The xla kernel masks by exclusion, on every
+                # backend and with the same fp32 softmax. It costs 83.6 ms
+                # and 5.80 GiB a step where the fixed window on cuDNN costs
+                # 75.8 ms and 4.99 GiB, measured in
+                # docs/concepts/language_models.md.
                 implementation = 'xla'
 
         attention = scaled_dot_product_attention(
