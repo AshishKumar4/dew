@@ -83,14 +83,19 @@ def test_gemma3_config_carries_the_gemma_switches():
     assert (config['rope_theta'], config['rope_local_theta']) == (1e6, 1e4)
 
 
-def test_a_multimodal_gemma3_config_translates_its_text_config():
-    text_config = fixture_config("gemma3-tiny")
-    wrapped = {'model_type': 'gemma3', 'text_config': text_config,
+def test_a_multimodal_gemma3_config_is_refused():
+    """Only a text decoder maps, and no published multimodal Gemma 3 has a
+    text_config that would: gemma-3-4b, 12b and 27b all carry rope_scaling
+    {'rope_type': 'linear', 'factor': 8}, which the field map refuses. So the
+    refusal names the model_type instead of loading the text half of a
+    checkpoint whose vision tower nothing here runs."""
+    wrapped = {'model_type': 'gemma3', 'text_config': fixture_config("gemma3-tiny"),
                'vision_config': {'hidden_size': 8}, 'mm_tokens_per_image': 256,
                'boi_token_index': 255999, 'eoi_token_index': 256000,
                'image_token_index': 262144}
 
-    assert translate_config(wrapped) == translate_config(text_config)
+    with pytest.raises(ValueError, match="model_type 'gemma3'"):
+        translate_config(wrapped)
 
 
 def test_the_real_gemma3_1b_config_translates():
