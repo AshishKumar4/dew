@@ -772,8 +772,13 @@ def get_packed_token_dataset_grain(
     local_batch_size = batch_size // jax.process_count()
     window = seq_len + 1
 
-    def build_loader(path, batch, shuffle):
-        source = TokenDocumentSource(path)
+    # One source per split, reused by its loader: finding the boundaries reads
+    # the whole file, and a run rebuilding it per epoch would read a
+    # multi-gigabyte train.bin again for a table it already has.
+    train_source = TokenDocumentSource(train_path)
+    val_source = TokenDocumentSource(val_path)
+
+    def build_loader(source, batch, shuffle):
         documents = DocumentChunks(
             pygrain.MapDataset.source(source), source.lengths, window)
         documents = documents[jax.process_index()::jax.process_count()]
@@ -805,11 +810,11 @@ def get_packed_token_dataset_grain(
         return int(chunk_counts(source.lengths, window).sum())
 
     return {
-        "train": lambda: build_loader(train_path, local_batch_size, True),
-        "train_len": packed_windows(TokenDocumentSource(train_path)),
+        "train": lambda: build_loader(train_source, local_batch_size, True),
+        "train_len": packed_windows(train_source),
         "val": lambda: build_loader(
-            val_path, val_batch_size or local_batch_size, False),
-        "val_len": packed_windows(TokenDocumentSource(val_path)),
+            val_source, val_batch_size or local_batch_size, False),
+        "val_len": packed_windows(val_source),
         "local_batch_size": local_batch_size,
         "global_batch_size": batch_size,
     }
