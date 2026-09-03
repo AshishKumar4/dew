@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import json
 import os
-import warnings
 from typing import Literal
 
 import wandb
@@ -52,8 +51,6 @@ def parse_config(config, overrides=None):
         Dictionary containing model, sampler, scheduler, and other required components
         including DiffusionInputConfig for the general diffusion framework
     """
-    warnings.filterwarnings("ignore")
-    
     # Merge config with overrides if provided
     if overrides is not None:
         # Create a deep copy of config to avoid modifying the original
@@ -128,9 +125,16 @@ def parse_config(config, overrides=None):
     model = build_model(architecture, model_config)
     model_kwargs = map_config_strings(model_config)
     
-    # Same preset as training, so the sampling convention always matches
+    # Same preset as training, so the sampling convention always matches. The
+    # recipe logs its whole run config; a run from before a knob was logged
+    # trained at the preset default.
     noise_schedule_type = conf.get('noise_schedule', conf.get('arguments', {}).get('noise_schedule', 'edm'))
-    _, noise_schedule, prediction_transform = get_diffusion_preset(noise_schedule_type)
+    run_config = conf.get('run_config', {})
+    _, noise_schedule, prediction_transform = get_diffusion_preset(
+        noise_schedule_type,
+        shift=run_config.get('flow_shift', 1.0),
+        min_snr_gamma=run_config.get('min_snr_gamma'),
+    )
     
     # Prepare return dictionary with all components
     result = {

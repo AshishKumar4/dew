@@ -27,7 +27,6 @@ from .distributed import (
     build_mesh, shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
-from dataclasses import dataclass
 
 PROCESS_COLOR_MAP = {
     0: "green",
@@ -53,13 +52,7 @@ class SimpleTrainState(train_state.TrainState):
 def _epoch_loss(metrics):
     return metrics['loss']
 
-@dataclass
 class SimpleTrainer:
-    state: SimpleTrainState
-    best_loss: float
-    model: nn.Module
-    ema_decay: float = 0.999
-
     def __init__(self,
                  model: nn.Module,
                  input_shapes: Dict[str, Tuple[int]],
@@ -421,25 +414,21 @@ class SimpleTrainer:
         # out first ends it, which is not an error to report.
         batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
                    if val_ds else itertools.repeat(None, val_steps_per_epoch))
-        # Evaluation step
-        try:
-            for i, batch in enumerate(batches):
-                if batch is not None:
-                    batch = shard_batch(self.batch_sharding, batch)
-                if i == 0:
-                    print(f"Evaluation started for process index {process_index}")
-                metrics = val_step_fn(val_state, batch)
-                if self.wandb is not None:
-                    # metrics is a dict of metrics
-                    if metrics and type(metrics) == dict:
-                        for key, value in metrics.items():
-                            if isinstance(value, jnp.ndarray):
-                                value = np.array(value)
-                            self.wandb.log({
-                                f"val/{key}": value,
-                            }, step=current_step)
-        except Exception as e:
-            print("Error logging images to wandb", e)
+        for i, batch in enumerate(batches):
+            if batch is not None:
+                batch = shard_batch(self.batch_sharding, batch)
+            if i == 0:
+                print(f"Evaluation started for process index {process_index}")
+            metrics = val_step_fn(val_state, batch)
+            if self.wandb is not None:
+                # metrics is a dict of metrics
+                if metrics and type(metrics) == dict:
+                    for key, value in metrics.items():
+                        if isinstance(value, jnp.ndarray):
+                            value = np.array(value)
+                        self.wandb.log({
+                            f"val/{key}": value,
+                        }, step=current_step)
 
     def _compiled_step(self, train_step_fn: Callable, *args):
         """The training step's executable, compiled at most once per run.
@@ -489,7 +478,6 @@ class SimpleTrainer:
         else:
             pbar = None
 
-        last_log_time = time.time()
         steps_since_log = 0
         compiled_step = None
         # One profiler window per run; its warmup continues across epochs.
@@ -501,6 +489,9 @@ class SimpleTrainer:
             if compiled_step is None:
                 compiled_step = self._compiled_step(
                     train_step_fn, train_state, rng_state, batch)
+                # The interval clock starts once the executable exists, so the
+                # first tick reports step time rather than compile time.
+                last_log_time = time.time()
             if (not tracing and not self._profile_complete and self.profile_steps
                     and self._profile_seen_steps >= self.profile_warmup_steps):
                 jax.profiler.start_trace(self.profile_path())
