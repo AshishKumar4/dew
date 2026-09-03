@@ -22,6 +22,7 @@ three of the seven agree bit for bit. The two references disagree with each
 other by 2.4e-07 on these inputs, which is the floor any port can reach.
 """
 
+import importlib.util
 import math
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from dew.rl.advantage import (
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "advantage.npz"
+GENERATOR = Path(__file__).resolve().parents[1] / "tools" / "parity_rl.py"
 ADVANTAGE_TOLERANCE = 2e-7
 GAE_TOLERANCE = 5e-7
 
@@ -42,6 +44,16 @@ GAE_TOLERANCE = 5e-7
 @pytest.fixture(scope="module")
 def reference():
     return dict(np.load(FIXTURE))
+
+
+@pytest.fixture(scope="module")
+def generator():
+    """tools/ holds scripts, not an importable package, and the module scope
+    of the generator is constants and stubs, so loading it runs no reference."""
+    spec = importlib.util.spec_from_file_location("parity_rl", GENERATOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def largest(computed, expected):
@@ -259,3 +271,21 @@ def test_the_estimators_are_jittable():
 
     assert grouped(jnp.array([1.0, 0.0, 0.0, 0.0])).shape == (4,)
     assert discounted(jnp.zeros((2, 3)), jnp.zeros((2, 3)), jnp.ones((2, 3)))[0].shape == (2, 3)
+
+
+def test_the_fixture_holds_the_inputs_the_generator_names(generator):
+    """A fixture regenerates only if the inputs beside it are the inputs it was
+    made from. Editing a reward in tools/parity_rl.py and forgetting to run it
+    leaves this file comparing Dew against the reference's answer to a
+    different question."""
+    fixture = dict(np.load(FIXTURE))
+
+    assert int(fixture["group"]) == generator.GROUP
+    for name, expected in (("rewards", generator.REWARDS),
+                           ("uids", generator.UIDS),
+                           ("token_rewards", generator.TOKEN_REWARDS),
+                           ("values", generator.VALUES),
+                           ("response_mask", generator.RESPONSE_MASK)):
+        assert np.array_equal(fixture[name], expected), name
+    assert fixture["gamma"] == np.float32(generator.GAMMA)
+    assert fixture["lam"] == np.float32(generator.LAM)

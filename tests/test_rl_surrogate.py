@@ -29,6 +29,7 @@ differ in the last fp32 digit because torch sums the token matrix in a
 different order.
 """
 
+import importlib.util
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ import pytest
 from dew.rl import surrogate
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "surrogate.npz"
+GENERATOR = Path(__file__).resolve().parents[1] / "tools" / "parity_rl.py"
 REFERENCE = dict(np.load(FIXTURE))
 TOLERANCE = 1e-7
 
@@ -277,3 +279,25 @@ def test_flipping_the_stop_gradient_fails_only_the_gradient_check():
         np.asarray(surrogate.sequence_log_ratio(LOG_PROBS, OLD_LOG_PROBS, MASK)))
 
     assert_only_this_check_fails(mutant, "stop_gradient")
+
+
+def test_the_fixture_holds_the_inputs_the_generator_names():
+    """A fixture regenerates only if the inputs beside it are the inputs it was
+    made from. Editing a log-probability in tools/parity_rl.py and forgetting
+    to run it leaves this file comparing Dew against the reference's answer to
+    a different question."""
+    spec = importlib.util.spec_from_file_location("parity_rl", GENERATOR)
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+
+    for name, expected in (("log_probs", generator.LOG_PROBS),
+                           ("old_log_probs", generator.OLD_LOG_PROBS),
+                           ("ref_log_probs", generator.REF_LOG_PROBS),
+                           ("response_mask", generator.SURROGATE_MASK),
+                           ("advantages", generator.ADVANTAGES),
+                           ("extreme_log_probs", generator.EXTREME_LOG_PROBS),
+                           ("extreme_ref_log_probs", generator.EXTREME_REF_LOG_PROBS)):
+        assert np.array_equal(REFERENCE[name], expected), name
+    assert REFERENCE["epsilon_low"] == np.float32(generator.EPSILON_LOW)
+    assert REFERENCE["epsilon_high"] == np.float32(generator.EPSILON_HIGH)
+    assert REFERENCE["dual_clip"] == np.float32(generator.DUAL_CLIP)
