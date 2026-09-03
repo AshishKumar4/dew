@@ -1,16 +1,19 @@
 """Streaming loader tests: what reaches the model when fetching goes wrong.
 
-The shared environment has no HF `datasets`, which is the point of one of
-these: importing the streaming stack must not need the `streaming` extra. Most
-of the rest replace the fetcher pool with a stub producer; the two that do run
-the real worker pool stub the fetch instead. Nothing here touches the network,
-and every url is under .invalid so a stray fetch could not reach a host.
+Most of these replace the fetcher pool with a stub producer. One simulates a
+missing HF `datasets` to check that importing the streaming stack does not
+need the `streaming` extra. The test that runs the real pool cannot stub the
+fetch, because a worker that was not forked holds no copy of this process's
+memory, so it asserts on what its workers report. Nothing here touches the
+network. Every url is under .invalid, apart from the file:// url the fetch
+test reads out of tmp_path.
 """
 
-import multiprocessing
+import os
 import queue
 import sys
 import threading
+import time
 
 import numpy as np
 import PIL.Image
@@ -25,9 +28,8 @@ BATCH = 4
 # Comfortably longer than the iterator's timeout below, so the slow producer
 # really does make it wait.
 SLOW = 0.15
-# The pool tests: 12 rows over 2 workers, one batch per pass.
+# The pool test spreads 12 rows over 2 workers.
 POOL_ROWS = 12
-POOL_BATCH = 8
 
 
 @pytest.fixture
@@ -88,34 +90,17 @@ class _StubDataset:
                 "caption": [f"caption {i}" for i in indices]}
 
 
-def _url_index(url):
-    return int(url.rsplit("/", 1)[1].split(".")[0])
+def _image_file(root, index):
+    """A file the real fetch can read. Over the minimum size, square, and not
+    a solid colour, so the default processor keeps it."""
+    pixels = np.random.RandomState(index).randint(0, 256, (48, 48, 3), np.uint8)
+    path = root / f"{index}.png"
+    PIL.Image.fromarray(pixels).save(path)
+    return path
 
 
-def _fetch_stub(url, timeout=None, retries=0):
-    """A synthetic image the default processor accepts: over the minimum size,
-    square, and not a solid colour."""
-    pixels = np.random.RandomState(_url_index(url)).randint(0, 256, (48, 48, 3), np.uint8)
-    return PIL.Image.fromarray(pixels)
-
-
-def _fetch_stub_every_third_fails(url, timeout=None, retries=0):
-    return None if _url_index(url) % 3 == 2 else _fetch_stub(url)
-
-
-def _pool_iterator(passes):
-    """A MediaBatchIterator on the real fetcher pool."""
-    return MediaBatchIterator(_StubDataset(POOL_ROWS, passes=passes),
-                              batch_size=POOL_BATCH, num_workers=2, num_threads=2,
-                              image_shape=(64, 64), min_image_shape=(32, 32),
-                              queue_timeout=10)
-
-
-def _require_fork():
-    """The stub fetch reaches the pool workers by fork inheritance; a spawned
-    worker would re-import the real module and go looking for a network."""
-    if multiprocessing.get_context().get_start_method() != "fork":
-        pytest.skip("the fetch stub only reaches forked workers")
+def _refuse_to_fork(*args, **kwargs):
+    raise AssertionError("the fetch pool forked a process that runs JAX")
 
 
 # ---------------------------------------------------------------------------------
@@ -244,39 +229,61 @@ def test_batches_keep_flowing_until_the_collate_error(monkeypatch, stop):
 
 
 # ---------------------------------------------------------------------------------
-# The real worker pool, with the fetch stubbed
+# The real worker pool
 # ---------------------------------------------------------------------------------
 
-def test_the_worker_pool_delivers_real_samples(monkeypatch):
-    """parallel_media_loader passed its multiprocessing.Queue to pool.map as an
-    argument, which multiprocessing refuses to pickle, so the pool died before
-    its first fetch and every batch was fabricated zeros."""
-    _require_fork()
-    monkeypatch.setattr(online_loader, "fetch_single_image", _fetch_stub)
+def test_the_fetch_pool_starts_its_workers_without_forking(monkeypatch):
+    """os.fork carries over only the calling thread, so a worker forked out of
+    a training process inherits mutexes that JAX's other threads were holding,
+    and hangs the first time it allocates. With os.fork refused the pool still
+    has to start its workers and hear back from them."""
+    monkeypatch.setattr(os, "fork", _refuse_to_fork)
+    data_queue = online_loader.ResourceManager(max_queue_size=64).get_data_queue()
+    producer_failure = []
 
-    batch = next(_pool_iterator(passes=2))
+    def produce():
+        try:
+            online_loader.parallel_media_loader(
+                _StubDataset(POOL_ROWS), data_queue=data_queue, num_workers=2,
+                num_threads=2, timeout=1, retries=0, image_shape=(64, 64),
+                min_image_shape=(32, 32))
+        except BaseException as error:
+            producer_failure.append(error)
 
-    assert len(batch) == POOL_BATCH
-    assert all(sample["image"].shape == (64, 64, 3) for sample in batch)
-    assert all(int(sample["image"].max()) > 0 for sample in batch)
-    assert {sample["caption"] for sample in batch} <= {
-        f"caption {index}" for index in range(POOL_ROWS)}
+    threading.Thread(target=produce, daemon=True).start()
+
+    reported = []
+    deadline = time.monotonic() + 60
+    while len(reported) < POOL_ROWS and time.monotonic() < deadline:
+        try:
+            reported.append(data_queue.get(timeout=0.5))
+        except queue.Empty:
+            # Nothing queued and the producer gone means no worker ever ran.
+            assert not producer_failure, producer_failure[0]
+
+    # Each url is under .invalid, so every fetch fails, and the marker a worker
+    # queues for it proves the worker ran and its inherited queue crossed over.
+    assert len(reported) == POOL_ROWS
+    assert all(DROPPED_SAMPLE in entry for entry in reported)
 
 
-def test_drops_in_the_worker_processes_reach_the_iterators_counter(monkeypatch):
-    _require_fork()
-    monkeypatch.setattr(online_loader, "fetch_single_image",
-                        _fetch_stub_every_third_fails)
+def test_a_fetched_image_reaches_the_queue_as_a_sample(tmp_path, monkeypatch):
+    """What a worker does with one url, run here rather than in a worker, which
+    holds no copy of a patched fetch. Of that path only the request header
+    comes from HF datasets, which the streaming extra owns."""
+    monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
+    path = _image_file(tmp_path, 3)
+    data_queue = queue.Queue()
 
-    iterator = _pool_iterator(passes=6)
-    batches = [next(iterator) for _ in range(3)]
+    online_loader.map_image_sample(path.as_uri(), "caption 3", data_queue,
+                                   image_shape=(64, 64), min_image_shape=(32, 32))
 
-    assert all(len(batch) == POOL_BATCH for batch in batches)
-    assert all("image" in sample for batch in batches for sample in batch)
-    # A pass over the 12 rows queues 8 samples and 4 markers, and pool.map
-    # finishes a pass before the next starts, so three batches of real samples
-    # come with 12 markers, give or take one pass of cross-process flush order.
-    assert 8 <= iterator.dropped <= 16
+    sample = data_queue.get_nowait()
+    assert sample["caption"] == "caption 3"
+    assert sample["image"].shape == (64, 64, 3)
+    assert int(sample["image"].max()) > 0
+    assert (sample["original_height"], sample["original_width"]) == (48, 48)
+
 
 # ---------------------------------------------------------------------------------
 # The streaming extra
