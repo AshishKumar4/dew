@@ -195,7 +195,7 @@ def run_steps(solver, steps=9):
 
 
 def old_inline_schedule(config: OptimConfig, steps_per_epoch: int):
-    """The warmup-cosine schedule the recipes used to build inline."""
+    """The warmup-cosine schedule the config layer has to reproduce."""
     return optax.warmup_cosine_decay_schedule(
         init_value=config.learning_rate, peak_value=config.learning_rate_peak,
         warmup_steps=config.learning_rate_warmup_steps,
@@ -319,8 +319,8 @@ def test_compilation_cache_dir_defaults_into_the_cache_home(tmp_path, monkeypatc
 
 
 def test_defaults_name_no_person_and_no_course_project(monkeypatch):
-    """The library's defaults used to be one laptop's bucket mount and one
-    course project's wandb team, so a fresh clone trained on neither."""
+    """No default carries a personal path or a course project's wandb team, so a
+    fresh clone trains on neither."""
     # The cache dir is the one default read from the environment, and every
     # path this machine offers has the username in it; pin it to a neutral one
     # so the check is about the config rather than about who is logged in.
@@ -341,8 +341,8 @@ def test_defaults_name_no_person_and_no_course_project(monkeypatch):
 
 
 def test_resume_last_run_without_a_project_is_an_error():
-    """It is a wandb run id: with no project there is nothing to resume, and
-    the run used to start over from step 0 instead of saying so."""
+    """It is a wandb run id, and with no project there is nothing to resume, so
+    the run stops instead of starting over from step 0."""
     with pytest.raises(ValueError, match="wandb_project"):
         TrainerConfig(resume_last_run="9xk2p1")
 
@@ -351,9 +351,9 @@ def test_resume_last_run_without_a_project_is_an_error():
 
 
 def test_prepare_process_joins_the_pool_when_a_cluster_is_configured(monkeypatch):
-    """A pod run whose initialize() failed used to keep going on one process, and a
-    pod run that forgot a flag would have done the same. The default asks the
-    environment; only the single-host signature is allowed to continue."""
+    """A pod run whose initialize() fails stops, and so does a pod run that forgot
+    a flag. The default asks the environment; only the single-host signature is
+    allowed to continue."""
     monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "unset")
     joins = []
     monkeypatch.setattr(jax.distributed, "initialize", lambda *a, **k: joins.append(a))

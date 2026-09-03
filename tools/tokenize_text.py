@@ -54,7 +54,7 @@ def iter_text_chunks(paths, chunk_chars=CHUNK_CHARS):
     """Yield the corpus as chunks of at most a few chunk_chars, line-bounded.
 
     Every chunk ends at a newline (except a file's final partial line), so a
-    tokenizer that merges across its input - BPE pretokenizers do - produces
+    tokenizer that merges across its input (BPE pretokenizers do) produces
     the same ids it would on the unbroken text.
     """
     for path in paths:

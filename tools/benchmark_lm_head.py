@@ -46,7 +46,7 @@ targets = jax.random.randint(jax.random.PRNGKey(2), (B, S), 0, V)
 
 
 def baseline(states, table):
-    """shifted_cross_entropy's head path as it read before this branch."""
+    """The unchunked head: one full-vocabulary logits tensor, then the loss."""
     logits = jnp.einsum('...d,vd->...v', states.astype(jnp.float32),
                         table.astype(jnp.float32))
     losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)

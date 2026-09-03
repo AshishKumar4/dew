@@ -40,7 +40,7 @@ from dew.diffusion.schedules.common import get_coeff_shapes_tuple
 DISCRETE_STEPS = jnp.array([10, 300, 600, 900])
 CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 
-# (class, factory, probe steps, family) — family picks the extra rate identity:
+# (class, factory, probe steps, family); family picks the extra rate identity:
 # 'vp' is variance preserving, 've' keeps alpha=1 and scales the input,
 # 'flow' is the rectified-flow linear path.
 SCHEDULES = [
@@ -229,7 +229,7 @@ def test_min_snr_v_weights_match_the_paper():
 
 
 def test_min_snr_weights_are_capped_and_non_increasing_in_snr():
-    """The whole point: high-SNR (low noise) steps stop dominating the gradient."""
+    """High-SNR (low noise) steps stop dominating the gradient."""
     schedule = make_min_snr_schedule(EpsilonPredictionTransform(), 5.0)
     # ascending timesteps are descending SNR, so weights must be non-decreasing
     weights = schedule.get_weights(jnp.arange(1, 1000, 10), shape=(-1,))

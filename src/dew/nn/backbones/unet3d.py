@@ -1,8 +1,8 @@
 """
 UNet3D: the 2D UNet inflated for video, AnimateDiff-style.
 
-The forward mirrors Unet exactly - same blocks, same explicit module names,
-same auto-name ordering - processing every frame through the spatial path,
+The forward mirrors Unet exactly (same blocks, same explicit module names,
+same auto-name ordering), processing every frame through the spatial path,
 with zero-initialized temporal attention blocks interleaved at each
 resolution level. Zero init means a freshly inflated model reproduces the 2D
 UNet frame by frame, so a pretrained image checkpoint (inflate_unet_params)

@@ -133,7 +133,7 @@ def test_fit_checkpoints_the_final_step(tmp_path):
 
     The in-loop save only fires on an epoch that improved the best loss, so
     pinning the best loss out of reach leaves the end-of-run save as the only
-    one - which is the case where it used to write the final weights under
+    one, which is the case where the final weights would otherwise land under
     step 0, behind whatever older checkpoint a resume would then pick.
     """
     trainer = make_trainer(tmp_path)
@@ -228,9 +228,9 @@ def test_best_step_is_the_lowest_epoch_loss(tmp_path):
 
 
 def test_a_populated_checkpoint_directory_is_not_written_over(tmp_path):
-    """A second run into the same directory used to train a whole epoch and
-    then die in the save, because orbax refuses to overwrite a step. Resuming
-    and starting fresh are both fine; neither is guessed."""
+    """A second run into the same directory stops before it trains, because orbax
+    refuses to overwrite a step. Resuming and starting fresh are both fine;
+    neither is guessed."""
     trainer = make_trainer(tmp_path, name="taken")
     trainer.save(epoch=0, step=2)
     trainer.wait_for_checkpoints()

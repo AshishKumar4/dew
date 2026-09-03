@@ -195,7 +195,7 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_single_and_multi_device_losses_agree(tmp_path):
-    """The whole point of the migration: partitioning must not change the maths."""
+    """Partitioning must not change the maths."""
     steps = 20
     single = run_losses(make_trainer(tmp_path / "one", "one", distributed_training=False), steps)
     multi = run_losses(make_trainer(tmp_path / "many", "many", distributed_training=True), steps)
@@ -525,8 +525,8 @@ def peak_to_peak_metric(seen):
     """A real EvaluationMetric over the sampler's artifacts.
 
     Deliberately not CLIP or FID: those download pretrained weights. What is
-    under test is the metric plumbing - artifacts in, score out, best tracked,
-    logged - which is identical whatever the score means.
+    under test is the metric plumbing (artifacts in, score out, best tracked,
+    logged), which is identical whatever the score means.
     """
     def peak_to_peak(generated, batch):
         seen.append((np.asarray(generated).shape,
