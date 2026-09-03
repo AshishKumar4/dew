@@ -348,6 +348,29 @@ def test_a_validation_pass_reads_every_held_out_record_once(fake_legacy_dataset,
     assert set(train).isdisjoint(range(24))
 
 
+def test_a_bounded_validation_pass_at_the_default_worker_count_still_yields_batches(
+        fake_legacy_dataset):
+    """The run's own numbers, with the epochs bounded.
+
+    load_data holds out whole batches and leaves val_worker_count where it
+    is, so a worker owns a slice smaller than one batch. grain's DataLoader
+    batched inside the workers and dropped what it could not fill, which at
+    these numbers is every batch, while val_len went on reporting the
+    records. Nothing raised, so the epoch scored nothing.
+    """
+    workers = inspect.signature(
+        dataloaders.get_dataset_grain).parameters["val_worker_count"].default
+    assert workers == 8, "the default this test is about"
+
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_batch_size=8,
+        val_count=16, worker_count=0, val_worker_count=workers, num_epochs=1,
+        seed=0)
+
+    assert data["val_len"] == 16
+    assert _indices(data["val"](), 6) == [list(range(8)), list(range(8, 16))]
+
+
 def test_legacy_grain_loader_without_val_count_keeps_validating_on_every_record(fake_legacy_dataset):
     data = dataloaders.get_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
                                          worker_count=0, val_worker_count=0, num_epochs=1)
