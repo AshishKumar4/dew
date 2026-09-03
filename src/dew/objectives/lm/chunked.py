@@ -16,17 +16,20 @@ comparison keeps the lowest index among equals, which is what `jnp.argmax`
 returns for the whole row. The tile matmuls accumulate in float32 and the
 reductions run in float32, so the numbers are the ones the full pass produced.
 
-The backward pass recomputes a tile from the hidden states and the head slice
-rather than reading a stored one: `jax.checkpoint` around the per-chunk term.
-Without it autodiff keeps every tile alive to compute the softmax gradient,
-which is the 1.57 GiB this exists to avoid. MaxText's vocabulary tiling makes
-the same trade with a hand-written `custom_vjp` over a `lax.scan`, because its
-tiles carry sharding constraints a remat boundary would drop; a single-device
-head needs no such rule
+The tiles are kept for the backward pass rather than recomputed there. That is
+measured, not assumed: on one RTX 4080 at this shape, keeping them costs 0.32
+GiB and runs the head forward and backward in 49.71 ms, while `jax.checkpoint`
+around the tile saves the 0.32 GiB and costs 67.19 ms, because recomputing
+every tile is a fourth pass of the head matmul. Storing four tiles is still
+1.08 GiB below the full-vocabulary path, which had to hold the logits and
+their softmax gradient at once. MaxText's vocabulary tiling recomputes instead,
+behind a hand-written `custom_vjp` over a `lax.scan`, because its tiles carry
+sharding constraints across a much larger vocabulary and many devices
 (https://github.com/AI-Hypercomputer/maxtext, maxtext/utils/vocabulary_tiling.py).
+The numbers above are what a single 16 GiB card says instead; the reproduction
+is in docs/research/lm-head.md.
 """
 
-import functools
 from typing import Optional, Tuple
 
 import jax
@@ -109,12 +112,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     best = jnp.full(flat_targets.shape, -jnp.inf, jnp.float32)
     predicted = jnp.zeros(flat_targets.shape, jnp.int32)
 
-    terms = jax.checkpoint(
-        functools.partial(_chunk_terms, softcap=softcap, precision=precision),
-        static_argnums=(3, 4))
     for start, stop in bounds:
-        chunk_lse, picked, chunk_best, chunk_column = terms(
-            flat, head_weight[:, start:stop], flat_targets, start, stop)
+        chunk_lse, picked, chunk_best, chunk_column = _chunk_terms(
+            flat, head_weight[:, start:stop], flat_targets, start, stop,
+            softcap, precision)
         total = jnp.logaddexp(total, chunk_lse)
         target_logit = target_logit + picked
         # Strictly greater, and the chunks run in vocabulary order, so among
