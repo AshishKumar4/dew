@@ -90,6 +90,15 @@ filterwarnings = [
     # where an error raised by a filter is swallowed, so making it an error
     # would delete the message instead of failing the run. It has to stay
     # visible, and a test that starts a pool has to assert it never appears.
+    # grain tears its worker pool down inside a multiprocessing finalizer, so
+    # CPython's resource tracker reports reentrant cleanup of the pool's own
+    # semaphores and shared memory. Those objects go with the worker process,
+    # and dew cannot close the pool earlier because a DataLoaderIterator has
+    # no close(). Ignored rather than shown, because nothing stays in the tail
+    # of a green run, and scoped to the tracker so a leak of ours still
+    # speaks. Counted 44 of them in the grain worker tests.
+    'ignore:ResourceTracker called reentrantly:UserWarning:multiprocessing\.resource_tracker',
+    'ignore:resource_tracker:UserWarning:multiprocessing\.resource_tracker',
 ]
 
 [tool.setuptools.dynamic]
