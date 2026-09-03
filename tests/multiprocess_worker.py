@@ -305,8 +305,17 @@ def mode_steps(args) -> dict:
     }
 
 
+def scored_batches():
+    """An EvaluationMetric whose epoch score is how many batches the pass scored."""
+    from dew.eval.common import EvaluationMetric
+
+    return EvaluationMetric(function=lambda artifacts, batch: 1.0, name="batches",
+                            reducer=np.sum)
+
+
 def mode_fit(args) -> dict:
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load,
+                            eval_metrics=[scored_batches()])
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored, restored_step = trainer.dataset_state, trainer.latest_step
     rows = BATCH // args.processes
@@ -315,8 +324,24 @@ def mode_fit(args) -> dict:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
     data = {"train": lambda: loader, "train_len": args.records,
             "local_batch_size": rows, "global_batch_size": BATCH}
+    available = None
+    if args.tokens:
+        # The packed token split, whose documents are strided over the
+        # processes before packing. The sampler that validation runs ignores
+        # an unconditional batch's contents, so the split only has to shard.
+        from dew.data.dataloaders import get_packed_token_dataset_grain
+
+        tokens = Path(args.tokens)
+        data["val"] = get_packed_token_dataset_grain(
+            str(tokens / "train.bin"), str(tokens / "val.bin"), batch_size=BATCH,
+            seq_len=args.seq_len, num_epochs=1, worker_count=args.workers)["val"]
+        available = sum(1 for _ in data["val"]())
+        # 200 sampler steps per validation batch is the production default and
+        # pure overhead here.
+        trainer.objective.diffusion_steps = 4
     state = trainer.fit(data, training_steps_per_epoch=args.steps, epochs=1,
-                        val_steps_per_epoch=0, checkpoint_every_steps=args.save_every)
+                        val_steps_per_epoch=args.val_steps,
+                        checkpoint_every_steps=args.save_every)
     trainer.wait_for_checkpoints()
     dump_params(args.out.with_suffix(".npz"), state.params)
     return {
@@ -326,6 +351,9 @@ def mode_fit(args) -> dict:
         "checkpoint_path": trainer.checkpoint_path(),
         "written_steps": sorted(int(step) for step in trainer.checkpointer.all_steps()),
         "dataset_state": trainer.dataset_state.decode(),
+        "val_available": available,
+        "val_batches": (None if available is None
+                        else int(trainer.best_val_metrics["val/batches"])),
     }
 
 
@@ -348,6 +376,8 @@ def parse_args(argv=None):
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
+    parser.add_argument("--val-steps", type=int, default=0,
+                        help="validation batches per pass, over the packed split of --tokens")
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
     parser.add_argument("--marker", help="file written once the source blocks")

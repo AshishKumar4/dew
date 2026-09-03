@@ -391,6 +391,11 @@ def broadcast_from_process_zero(value):
     return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
 
 
+def minimum_across_processes(count: int) -> int:
+    """The smallest `count` any process holds."""
+    return int(multihost_utils.process_allgather(np.asarray(count, np.int64)).min())
+
+
 def gather_positions(position: bytes) -> dict:
     """Every process's iterator position as one table, the checkpoint's `position`.
 

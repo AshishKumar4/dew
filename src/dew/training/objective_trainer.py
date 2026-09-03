@@ -7,7 +7,6 @@ from typing import Callable, List, Dict, Tuple, Union, Any, Sequence, Optional
 from dataclasses import field, dataclass
 import jax.numpy as jnp
 import optax
-import itertools
 import functools
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
@@ -321,12 +320,9 @@ class ObjectiveTrainer(SimpleTrainer):
         Score the objective's validation artifacts and let it visualize them.
         """
         process_index = jax.process_index()
-
-        # val_steps_per_epoch bounds the pass, and a held-out split that runs
-        # out first ends it. What it scored before that is the epoch's score,
-        # so the reduction below has to be reached either way.
-        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
-                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
+        # What the pass scored is the epoch's score however it ended, so the
+        # reduction below has to be reached either way.
+        batches = self._validation_batches(val_ds, val_steps_per_epoch)
         print(f"Validation loop started for process index {process_index} "
               f"with {jax.device_count()} devices.")
         metrics = {metric.name: [] for metric in self.eval_metrics} if self.eval_metrics else {}
