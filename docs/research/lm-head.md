@@ -4,11 +4,15 @@
 
 Scoring the vocabulary in four chunks instead of one takes the small causal
 transformer's step from 82.977 ms to 82.017 ms and its peak allocation from
-5.803 GiB to 4.721 GiB: 1.2% faster, 18.6% leaner. The loss is unchanged and
-`train/token_accuracy` keeps both its value and its key, computed from a
-running argmax across the chunks rather than a pass over the whole logits
-tensor. The accuracy now costs nothing measurable: 49.71 ms of head work with
-it and 49.71 ms without.
+5.803 GiB to 4.721 GiB: 1.2% faster, 18.6% leaner. Both rows were measured at
+`d19b242`, whose `chunked.py` recomputed each tile under `jax.checkpoint`, so
+they do not describe the kernel that ships; the isolation table below prices
+that difference at 17.48 ms of head work, which the step row does not show,
+and the step has not been re-measured at the shipped commit. The loss is
+unchanged and `train/token_accuracy` keeps both its value and its key,
+computed from a running argmax across the chunks rather than a pass over the
+whole logits tensor. The accuracy costs nothing measurable: 49.71 ms of head
+work with it and 49.71 ms without.
 
 The time saving is small because the head's three matmuls are the floor and
 chunking does not remove them. What chunking removes is the traffic around
@@ -18,9 +22,17 @@ four 0.39 GiB tiles and one gradient tile.
 
 ## Fixed point
 
-Measured at commit `d19b242` of `wave/lm-head-perf`, against `main` at
-`124a347`. One NVIDIA GeForce RTX 4080, 16 GiB, driver 595.84. Python 3.12.13,
-JAX and jaxlib 0.11.1, Flax 0.12.9, Optax 0.2.8. Every run started with
+The step table and the head table were measured at commit `d19b242` of
+`wave/lm-head-perf`, against `main` at `124a347`. `d19b242` wrapped each
+vocabulary tile in `jax.checkpoint`; the kernel that ships keeps the tiles
+(`3d184ef`), which is the "tiles kept" row of the isolation table, so the
+step row above is the remat kernel's and the one for the shipped kernel is
+missing. Re-measuring it is the two `tools/benchmark_step.py` commands under
+Reproduction, run at the merge commit of this branch; the card was held by
+another run for the whole of this pass.
+
+One NVIDIA GeForce RTX 4080, 16 GiB, driver 595.84. Python 3.12.13, JAX and
+jaxlib 0.11.1, Flax 0.12.9, Optax 0.2.8. Every run started with
 `nvidia-smi --query-compute-apps=pid --format=csv,noheader` showing only
 `gnome-remote-desktop-daemon`. Both sides of every comparison ran through the
 same harness, `tools/benchmark_step.py` from this branch, with `PYTHONPATH`
@@ -119,27 +131,26 @@ PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/benchmark_step
 PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/benchmark_step.py \
   --preset small --architectures causal_transformer --steps 50 \
   --json-out /tmp/lm-head/after.json
-
 # The head in isolation, one process per variant.
 for v in baseline stored4 stored8 remat4 stored4-noacc; do
-  PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python /tmp/lm-head/head_loss.py $v
+  PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/benchmark_lm_head.py $v
 done
 
 # Twenty steps from one seed, each side and each precision.
-PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python /tmp/lm-head/loss_parity.py \
+PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --out /tmp/lm-head/losses-main.json
-PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python /tmp/lm-head/loss_parity.py \
+PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --out /tmp/lm-head/losses-branch.json
-PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python /tmp/lm-head/loss_parity.py \
+PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --precision highest --out /tmp/lm-head/losses-main-fp32.json
-PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python /tmp/lm-head/loss_parity.py \
+PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --precision highest --out /tmp/lm-head/losses-branch-fp32.json
 ```
 
-The two harness scripts live in `/tmp/lm-head`. `head_loss.py` times one
-variant per process and prints a JSON row; `loss_parity.py` runs the small
-preset's language model for a fixed number of steps from seed 0 on the
-benchmark's fixed batch and writes every step's loss and token accuracy.
+`tools/benchmark_lm_head.py` times one variant of the head per process and
+prints a JSON row; `tools/lm_step_parity.py` runs the small preset's language
+model for a fixed number of steps from seed 0 on the benchmark's fixed batch
+and writes every step's loss and token accuracy.
 
 ## What is left
 
