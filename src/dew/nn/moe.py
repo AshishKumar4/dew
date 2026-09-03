@@ -44,7 +44,7 @@ GROUPED_MATMULS = ('xla', 'tokamax')
 # whose sigmoid scores are all zero stays finite
 # (modeling_deepseek_v3.py:166, maxtext layers/moe.py:839). A softmax over the
 # experts sums to one, which cannot reach it, and in fp32 the term changes no
-# bit of a denominator above 1e-13.
+# bit of a denominator above 1e-12.
 WEIGHT_SUM_EPSILON = 1e-20
 
 
