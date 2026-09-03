@@ -145,7 +145,8 @@ def get_dataset_grain(
         batch_size: Batch size for the dataset.
         image_scale: Size to scale images to.
         count: Optional count limit for the dataset.
-        num_epochs: Number of epochs to iterate.
+        num_epochs: Epochs the training stream repeats for, None for
+            forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
         worker_count: Number of worker processes.
         read_thread_count: Number of read threads.
@@ -192,16 +193,6 @@ def get_dataset_grain(
         shard_options=pygrain.ShardByJaxProcess(),
     )
 
-    # Validation reads its records in canonical order: sharing the shuffled
-    # train sampler made "validation" a random slice of training data.
-    val_sampler = pygrain.IndexSampler(
-        num_records=val_length,
-        shuffle=False,
-        seed=seed,
-        num_epochs=num_epochs,
-        shard_options=pygrain.ShardByJaxProcess(),
-    )
-    
     def get_trainset():
         transformations = [
             augmenter(),
@@ -221,22 +212,10 @@ def get_dataset_grain(
         return loader
     
     def get_valset():
-        transformations = [
-            augmenter(),
-            pygrain.Batch(val_batch_size or local_batch_size, drop_remainder=True),
-        ]
-
-        loader = pygrain.DataLoader(
-            data_source=val_source,
-            sampler=val_sampler,
-            operations=transformations,
-            worker_count=val_worker_count,
-            read_options=pygrain.ReadOptions(
-                32, 128
-            ),
-            worker_buffer_size=32,
-        )
-        return loader
+        return _validation_pass(
+            val_source, val_batch_size or local_batch_size, [augmenter()],
+            seed=seed, worker_count=val_worker_count,
+            read_options=pygrain.ReadOptions(32, 128), worker_buffer_size=32)
 
     return {
         "train": get_trainset,
@@ -321,9 +300,10 @@ def get_dataset_online(
 class _SourceSlice:
     """Random-access view over `source[start:stop]`.
 
-    Gives the train and validation loaders disjoint index ranges while each
-    keeps a stock grain IndexSampler, so sharding and epoch handling stay
-    grain's. Plain attributes only: grain pickles the source to its workers.
+    Gives the train and validation loaders disjoint index ranges while
+    sharding and epoch handling stay grain's, the sampler's on the train side
+    and the Dataset API's on the validation side. Plain attributes only:
+    grain pickles the source to its workers.
     """
 
     def __init__(self, source: Any, start: int, stop: int):
@@ -338,6 +318,30 @@ class _SourceSlice:
         if not 0 <= index < self.length:
             raise IndexError(index)
         return self.source[self.start + index]
+
+
+def _validation_pass(source, batch_size, transformations=(), *, seed,
+                     worker_count, read_options, worker_buffer_size):
+    """One pass over `source` in record order, batched in this process.
+
+    grain's DataLoader applies its operations inside the worker processes, so
+    each worker had to fill a whole batch out of its own slice of the split.
+    At the default eight workers a 512-record split gave batches of 64
+    records read four times over, and with the sampler unbounded the pass
+    never ended. Here the workers read and transform records and the batch is
+    formed behind them, which is what the packed loader does with its packer,
+    and it leaves the batches independent of worker_count.
+
+    Sharding is grain's slice convention, so process p of n reads records
+    p, p + n, ... of the split.
+    """
+    records = pygrain.MapDataset.source(source)[
+        jax.process_index()::jax.process_count()]
+    reads = records.seed(seed).apply(transformations).to_iter_dataset(read_options)
+    if worker_count:
+        reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
+            num_workers=worker_count, per_worker_buffer_size=worker_buffer_size))
+    return reads.batch(batch_size, drop_remainder=True)
 
 
 _HF_PREFIX = "hf:"
@@ -407,7 +411,8 @@ def get_media_dataset_grain(
         media_scale: Size to scale media (image or video frames) to.
         sequence_length: Length of the sequence for video data.
         count: Optional count limit for the dataset.
-        num_epochs: Number of epochs to iterate.
+        num_epochs: Epochs the training stream repeats for, None for
+            forever. A validation pass is one pass over its records.
         method: Interpolation method for resizing.
         worker_count: Number of worker processes.
         read_thread_count: Number of read threads.
@@ -532,34 +537,13 @@ def get_media_dataset_grain(
     if val_source is None:
         return dataset
 
-    # Its own unshuffled sampler: sharing the train sampler turned validation
-    # into a random slice of the training stream.
-    val_sampler = pygrain.IndexSampler(
-        num_records=len(val_source),
-        shuffle=False,
-        seed=seed,
-        num_epochs=num_epochs,
-        shard_options=pygrain.ShardByJaxProcess(),
-    )
-
     def get_valset():
         """Get a validation dataset iterator."""
-        transformations = [
-            augmenter(),
-            pygrain.Batch(val_batch_size or local_batch_size, drop_remainder=True),
-        ]
-
-        loader = pygrain.DataLoader(
-            data_source=val_source,
-            sampler=val_sampler,
-            operations=transformations,
-            worker_count=worker_count,
-            read_options=pygrain.ReadOptions(
-                read_thread_count, read_buffer_size
-            ),
-            worker_buffer_size=worker_buffer_size,
-        )
-        return loader
+        return _validation_pass(
+            val_source, val_batch_size or local_batch_size, [augmenter()],
+            seed=seed, worker_count=worker_count,
+            read_options=pygrain.ReadOptions(read_thread_count, read_buffer_size),
+            worker_buffer_size=worker_buffer_size)
 
     dataset["val"] = get_valset
     dataset["val_len"] = len(val_source)
@@ -666,9 +650,9 @@ def get_token_dataset_grain(
     """Grain loaders over a tokenized corpus (see `dew.data.sources.text`).
 
     Train shuffles a seeded IndexSampler over the windows of train.bin; val
-    reads val.bin in file order through its own unshuffled sampler, so the
-    two splits are disjoint files and validation is reproducible. Both
-    shard by JAX process like every other grain path.
+    reads val.bin once, in file order, so the two splits are disjoint files
+    and every validation pass scores the same windows. Both shard by JAX
+    process like every other grain path.
 
     Returns:
         The standard loader dict: "train" fn, "train_len", "val" fn,
@@ -683,13 +667,6 @@ def get_token_dataset_grain(
     train_sampler = pygrain.IndexSampler(
         num_records=len(train_source),
         shuffle=True,
-        seed=seed,
-        num_epochs=num_epochs,
-        shard_options=pygrain.ShardByJaxProcess(),
-    )
-    val_sampler = pygrain.IndexSampler(
-        num_records=len(val_source),
-        shuffle=False,
         seed=seed,
         num_epochs=num_epochs,
         shard_options=pygrain.ShardByJaxProcess(),
@@ -709,17 +686,11 @@ def get_token_dataset_grain(
         return loader
 
     def get_valset():
-        loader = pygrain.DataLoader(
-            data_source=val_source,
-            sampler=val_sampler,
-            operations=[pygrain.Batch(val_batch_size or local_batch_size, drop_remainder=True)],
+        return _validation_pass(
+            val_source, val_batch_size or local_batch_size, seed=seed,
             worker_count=worker_count,
-            read_options=pygrain.ReadOptions(
-                read_thread_count, read_buffer_size
-            ),
-            worker_buffer_size=worker_buffer_size,
-        )
-        return loader
+            read_options=pygrain.ReadOptions(read_thread_count, read_buffer_size),
+            worker_buffer_size=worker_buffer_size)
 
     return {
         "train": get_trainset,
@@ -797,12 +768,12 @@ def get_packed_token_dataset_grain(
     API rather than `DataLoader` for the reason grain gives for switching:
     packing.
 
-    Train shuffles the documents from `seed`, reshuffled per epoch, and val
-    reads them in file order, so the two splits stay disjoint files and
-    validation is reproducible. Both shard by JAX process, by slicing the
-    documents before packing: sharding after it would have every process pack
-    the same documents. num_epochs None runs forever, as the fixed-window
-    sampler does.
+    Train shuffles the documents from `seed`, reshuffled per epoch, and runs
+    for num_epochs, where None runs forever as the fixed-window sampler does.
+    Val reads its documents once, in file order, so a validation pass covers
+    the split exactly once and scores the same windows every time. Both
+    shard by JAX process, by slicing the documents before packing, since
+    sharding after it would have every process pack the same documents.
 
     Returns:
         The standard loader dict: "train" fn, "train_len", "val" fn,
@@ -828,13 +799,13 @@ def get_packed_token_dataset_grain(
     train_source = TokenDocumentSource(train_path)
     val_source = TokenDocumentSource(val_path)
 
-    def build_loader(source, batch, shuffle):
+    def build_loader(source, batch, shuffle, epochs):
         documents = DocumentChunks(
             pygrain.MapDataset.source(source), source.lengths, window)
         documents = documents[jax.process_index()::jax.process_count()]
         if shuffle:
             documents = documents.shuffle(seed)
-        documents = documents.repeat(num_epochs)
+        documents = documents.repeat(epochs)
         reads = documents.to_iter_dataset()
         if worker_count:
             # The workers read documents, and the packer stays behind them in
@@ -860,10 +831,11 @@ def get_packed_token_dataset_grain(
         return int(chunk_counts(source.lengths, window).sum())
 
     return {
-        "train": lambda: build_loader(train_source, local_batch_size, True),
+        "train": lambda: build_loader(
+            train_source, local_batch_size, True, num_epochs),
         "train_len": packed_windows(train_source),
         "val": lambda: build_loader(
-            val_source, val_batch_size or local_batch_size, False),
+            val_source, val_batch_size or local_batch_size, False, 1),
         "val_len": packed_windows(val_source),
         "local_batch_size": local_batch_size,
         "global_batch_size": batch_size,
