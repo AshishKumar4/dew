@@ -88,8 +88,9 @@ def test_nothing_outside_the_rl_packages_imports_dew_rl():
 
 def test_importing_dew_rl_loads_nothing_else_from_dew():
     """What the source says and what the interpreter does are different claims.
-    This one is the transitive closure. After `import dew.rl` the only `dew`
-    modules in `sys.modules` are `dew` itself and the package's own two."""
+    This one is the transitive closure. After `import dew.rl`, every `dew`
+    module in `sys.modules` is `dew` itself or one of the package's own, so an
+    import two files deep cannot smuggle the trainer in."""
     program = ("import dew.rl, sys; "
                "print(sorted(name for name in sys.modules if name.startswith('dew')))")
     result = subprocess.run([sys.executable, "-c", program], text=True,
@@ -98,8 +99,10 @@ def test_importing_dew_rl_loads_nothing_else_from_dew():
                                  "PATH": "/usr/bin:/bin"})
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(
-        ["dew", "dew.rl", "dew.rl.advantage", "dew.rl.surrogate"])
+    loaded = ast.literal_eval(result.stdout.strip())
+    assert {"dew", "dew.rl", "dew.rl.advantage", "dew.rl.surrogate"} <= set(loaded)
+    assert [name for name in loaded
+            if name != "dew" and not name.startswith("dew.rl")] == []
 
 
 @pytest.mark.parametrize("module", ["advantage", "surrogate"])
