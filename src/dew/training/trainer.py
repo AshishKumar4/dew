@@ -324,8 +324,22 @@ class SimpleTrainer:
         template, restore_args = self._checkpoint_template(manager.item_metadata(target).keys())
         # partial_restore: a key the checkpoint holds and the template does not
         # is skipped instead of refused.
-        ckpt = manager.restore(target, args=ocp.args.PyTreeRestore(
-            item=template, restore_args=restore_args, partial_restore=True))
+        try:
+            ckpt = manager.restore(target, args=ocp.args.PyTreeRestore(
+                item=template, restore_args=restore_args, partial_restore=True))
+        except (TypeError, ValueError) as mismatch:
+            # A structural mismatch surfaces from inside orbax's tree walk as a
+            # key path and a pair of container types, which says nothing about
+            # what to do. opt_state is shaped by the optimizer and by the
+            # MultiSteps wrapper gradient accumulation puts around it, so
+            # changing either between runs is what usually lands here.
+            raise ValueError(
+                f"The checkpoint at {self.loaded_checkpoint_path} does not fit this "
+                f"run's train state ({mismatch}). A checkpoint carries the optimizer "
+                f"state, so a resume needs the model, the optimizer and the gradient "
+                f"accumulation it was written with. Resume it with those, or start a "
+                f"fresh run with --trainer.name and no --trainer.load-from-checkpoint."
+            ) from mismatch
 
         self.state = ckpt['state']
         self.rngstate = ckpt['rngs']

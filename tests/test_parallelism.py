@@ -285,16 +285,19 @@ def test_sharding_tolerance_outside_zero_to_one_is_rejected(tmp_path):
         make_indivisible_trainer(tmp_path, tolerance=1.5)
 
 
-def test_odd_vocabulary_shards_the_embedding_on_its_other_axis():
+@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
+def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
     """GPT-2's 50257 rows divide by nothing, so the rule that wins the
     embedding cannot be taken: the width has to carry the shard, or a real run
-    stops on the tolerance check with 98% of the model replicated."""
+    stops on the tolerance check with 98% of the model replicated. Nothing
+    about that changes as the fsdp axis widens, which is where a fallback that
+    only ever divided by two would show up."""
     model = CausalTransformer(
         vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
         num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(fsdp_size=2)
+    mesh = build_mesh(fsdp_size=fsdp_size)
     shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
 
     assert shardings["params"]["embed_tokens"]["embedding"].spec == P(None, "fsdp")
@@ -655,7 +658,7 @@ class DeterministicObjective(Objective):
         return lambda val_state, batch: None
 
 
-def make_deterministic_trainer(tmp_path, name, grad_accum_steps):
+def make_deterministic_trainer(tmp_path, name, grad_accum_steps, load=None):
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
     input_config = DiffusionInputConfig(
         sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[])
@@ -679,6 +682,7 @@ def make_deterministic_trainer(tmp_path, name, grad_accum_steps):
         fsdp_min_param_size=TINY,
         checkpoint_base_path=str(tmp_path),
         grad_accum_steps=grad_accum_steps,
+        load_from_checkpoint=load,
     )
 
 
@@ -966,3 +970,246 @@ def test_muon_group_moments_take_the_spec_their_parameter_declared():
     kernel = moments[("params", "layers_0", "mlp", "down_proj", "kernel")]
     assert len(embedding[1]) == 2 and embedding[0] == P()
     assert len(kernel[1]) == 1 and kernel[0] == P("fsdp")
+
+# Sharding invariants at every fsdp width
+# --------------------------------------------------------------------------
+
+def assert_specs_can_split(variables, shardings, fsdp_size):
+    """Every dimension a spec names has to be splittable that many ways.
+
+    A spec that names a dimension the mesh axis does not divide, or one of
+    size 1, is a layout jit rejects or a collective that moves nothing. The
+    rules are supposed to drop those names and hand the axis to another
+    dimension.
+    """
+    leaves = jax.tree_util.tree_flatten_with_path(variables)[0]
+    for (path, value), sharding in zip(leaves, jax.tree.leaves(shardings), strict=True):
+        for dimension, entry in enumerate(sharding.spec):
+            if not entry:
+                continue
+            size = value.shape[dimension]
+            where = f"{jax.tree_util.keystr(path)} {value.shape} -> {sharding.spec}"
+            assert size % fsdp_size == 0, f"{where} cannot split {fsdp_size} ways"
+            assert size > 1, f"{where} shards a dimension of one"
+
+
+def single_head_variables(num_heads=1):
+    """A DiT whose attention kernels carry a heads dimension of one."""
+    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1,
+                      num_heads=num_heads, mlp_ratio=1)
+    return jax.eval_shape(model.init, jax.random.key(0),
+                          jnp.ones((1, RES, RES, 3)), jnp.ones((1,)))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
+def test_a_single_head_model_shards_a_dimension_it_can_split(fsdp_size):
+    """One head makes the heads dimension 1, which shards nothing.
+
+    The DiT's attention kernels are (embed, heads, head_dim) and the table
+    names all three, so the rules have to leave the single head alone and
+    shard a dimension that exists. Every model in the suite has two heads,
+    where a spec naming the heads axis happens to work.
+    """
+    variables = single_head_variables()
+    mesh = build_mesh(fsdp_size=fsdp_size)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+    attention = shardings["params"]["dit_block_0"]["attention"]
+
+    assert attention["to_q"]["kernel"].spec == P("fsdp")
+    assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
+    assert_params_sufficiently_sharded(
+        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+
+
+class OneLongVector(nn.Module):
+    """A model whose only parameter worth sharding has a single dimension."""
+    length: int = 4096
+
+    @nn.compact
+    def __call__(self, x):
+        scale = self.param('scale', nn.initializers.ones, (self.length,))
+        return nn.Dense(4)(x) * jnp.sum(scale)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fsdp_size", [2, 4, 8])
+def test_a_one_dimensional_parameter_shards_on_its_only_axis(fsdp_size):
+    """A vector has one axis to give, and giving it is not optional.
+
+    Every declared parameter in the table is a matrix or a stack of them, so
+    a 1-D parameter falls to the shape heuristic. Leaving it replicated
+    because it has no second dimension would put the whole model on every
+    device and pass every other sharding test here.
+    """
+    variables = jax.eval_shape(
+        OneLongVector().init, jax.random.key(0), jnp.ones((1, 4)))
+    mesh = build_mesh(fsdp_size=fsdp_size)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+
+    assert shardings["params"]["scale"].spec == P("fsdp")
+    assert_params_sufficiently_sharded(
+        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fsdp_size,replicated_fraction", [(2, 0.0), (4, 0.36), (8, 0.90)])
+def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it(
+        fsdp_size, replicated_fraction):
+    """62 features divide by two and by nothing else the mesh offers.
+
+    The rules drop a name they cannot use, so the wider the fsdp axis the more
+    of this model stays whole: nothing at two, a third at four, nine tenths at
+    eight. What must not happen is a run that trains anyway with the model
+    replicated on every device, which is what the tolerance check is for.
+    """
+    model = CausalTransformer(
+        vocab_size=64, emb_features=62, num_layers=1, num_heads=1, num_kv_heads=1,
+        mlp_ratio=2, max_seq_len=8)
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    mesh = build_mesh(fsdp_size=fsdp_size)
+    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+
+    # Whatever the rules could not place, they left alone rather than named.
+    assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
+
+    if not replicated_fraction:
+        assert_params_sufficiently_sharded(
+            variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+        return
+    with pytest.raises(ValueError) as error:
+        assert_params_sufficiently_sharded(
+            variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+    reported = float(str(error.value).split("%")[0]) / 100
+    assert abs(reported - replicated_fraction) < 0.01, str(error.value)
+
+
+# --------------------------------------------------------------------------
+# Restoring into a differently shaped run
+# --------------------------------------------------------------------------
+
+def optimizer_for(optimizer="adam", grad_accum_steps=1):
+    """The optimizer a run's config builds, which is what it resumes into."""
+    return build_optimizer(
+        OptimConfig(optimizer=optimizer, learning_rate=1e-3,
+                    grad_accum_steps=grad_accum_steps),
+        steps_per_epoch=1)
+
+
+@pytest.mark.parametrize("written,restored", [(1, 8), (8, 1)])
+def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, restored):
+    """A run resumes on the hardware it gets, not the hardware it left.
+
+    Both directions of the widest change the simulated mesh allows: every
+    parameter replicated, and every parameter split eight ways. A checkpoint
+    is bytes rather than arithmetic, so the values have to come back equal.
+    """
+    trainer = make_trainer(tmp_path, "range", distributed_training=True,
+                           fsdp_size=written, fsdp_min_param_size=TINY)
+    grads = jax.tree.map(jnp.ones_like, trainer.state.params)
+    trainer.state = trainer.state.apply_gradients(grads=grads)
+    trainer.save(epoch=0, step=1)
+    trainer.wait_for_checkpoints()
+    before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(trainer.state.params)]
+
+    reopened = make_trainer(tmp_path, "range", distributed_training=True,
+                            fsdp_size=restored, fsdp_min_param_size=TINY,
+                            load_from_checkpoint=trainer.checkpoint_path())
+    assert int(reopened.state.step) == 1
+    leaves = jax.tree.leaves(reopened.state.params)
+    for saved, leaf in zip(before, leaves, strict=True):
+        np.testing.assert_array_equal(saved, np.asarray(leaf))
+
+    sharded = [leaf for leaf in leaves if 'fsdp' in str(leaf.sharding.spec)]
+    assert bool(sharded) == (restored > 1), "the restored layout is not this run's"
+    for leaf in sharded:
+        assert leaf.addressable_shards[0].data.size == leaf.size // restored
+
+
+@pytest.mark.parametrize("written,resumed", [
+    (dict(optimizer="adam"), dict(optimizer="muon")),
+    (dict(optimizer="adam", grad_accum_steps=2), dict(optimizer="adam")),
+], ids=["optimizer", "accumulation"])
+def test_a_checkpoint_the_run_cannot_hold_is_refused_with_what_to_do(
+        tmp_path, written, resumed):
+    """Swapping the solver or the accumulation has to be a message, not a crash.
+
+    The optimizer state is part of what a checkpoint carries, and MultiSteps
+    adds counters and an accumulator around it, so neither swap can be
+    restored. Orbax says so from inside its own tree walk, as a key path and a
+    pair of container types; the run has to say which part of the state does
+    not fit and what to do instead.
+    """
+    trainer = make_trainer(
+        tmp_path, "swap", distributed_training=True,
+        optimizer=optimizer_for(**written),
+        grad_accum_steps=written.get("grad_accum_steps", 1))
+    trainer.save(epoch=0, step=1)
+    trainer.wait_for_checkpoints()
+
+    with pytest.raises(ValueError) as error:
+        make_trainer(tmp_path, "swap", distributed_training=True,
+                     optimizer=optimizer_for(**resumed),
+                     grad_accum_steps=resumed.get("grad_accum_steps", 1),
+                     load_from_checkpoint=trainer.checkpoint_path())
+
+    message = str(error.value)
+    assert "does not fit this run's train state" in message
+    assert "opt_state" in message, "the message does not say which part"
+    assert "optimizer" in message and "gradient accumulation" in message
+    assert trainer.checkpoint_path() in message
+
+
+def run_micro_steps(trainer, micro_steps):
+    """`micro_steps` real steps, whatever the accumulation window is."""
+    train_step = trainer._define_train_step(batch_size=BATCH)
+    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
+    state, rng = trainer.state, trainer.rngstate
+    for _ in range(micro_steps):
+        state, _, _, rng, _ = train_step(state, rng, next(source))
+    return state, rng
+
+
+def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
+    """An accumulated run killed mid-window has to average like one run whole.
+
+    The checkpoint is taken one micro-batch into a window, so it carries the
+    half-filled accumulator, the MultiSteps counters and a step count that is
+    not a multiple of the window. The EMA decay is a ramp indexed by completed
+    updates, so a resume that took the micro-batch counter for the update
+    counter, or started either counter over, moves the average a different
+    distance from where the uninterrupted run put it.
+    """
+    accum, updates = 2, 3
+    total = accum * updates * 2
+    cut = accum * updates + 1
+
+    whole, _ = run_micro_steps(
+        make_deterministic_trainer(tmp_path / "whole", "whole", accum), total)
+
+    interrupted = make_deterministic_trainer(tmp_path / "split", "split", accum)
+    state, rng = run_micro_steps(interrupted, cut)
+    assert int(np.asarray(state.opt_state.mini_step)) == 1, "the cut is not mid-window"
+    interrupted.state, interrupted.rngstate = state, rng
+    interrupted.save(epoch=0, step=cut)
+    interrupted.wait_for_checkpoints()
+
+    resumed, _ = run_micro_steps(
+        make_deterministic_trainer(tmp_path / "split", "split", accum,
+                                   load=interrupted.checkpoint_path()),
+        total - cut)
+
+    assert int(resumed.step) == int(whole.step) == total
+    # The comparison only means something if the average left its start
+    assert any(not np.allclose(np.asarray(param), np.asarray(ema))
+               for param, ema in zip(jax.tree.leaves(whole.params),
+                                     jax.tree.leaves(whole.ema_params)))
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
+                                   rtol=1e-6, atol=1e-7)
+    for expected, actual in zip(jax.tree.leaves(whole.ema_params),
+                                jax.tree.leaves(resumed.ema_params), strict=True):
+        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
+                                   rtol=1e-6, atol=1e-7)
