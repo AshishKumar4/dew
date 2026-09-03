@@ -7,6 +7,8 @@ guards the config surface the HF decoders need (grouped-query heads, sliding
 layers, the Gemma flags) and the param tree the interop map renames.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -268,6 +270,112 @@ def test_local_rope_only_moves_the_sliding_layers(rng):
     assert jnp.allclose(model.apply(params, ids), same_theta.apply(params, ids))
     other_theta = tiny(**shared, rope_local_theta=1e6)
     assert not jnp.allclose(model.apply(params, ids), other_theta.apply(params, ids))
+
+
+def param_paths(params):
+    return {'.'.join(str(entry.key) for entry in path)
+            for path, _ in jax.tree_util.tree_flatten_with_path(params)[0]}
+
+
+def test_sandwich_norms_add_exactly_the_two_output_norms(rng):
+    """Gemma's second pair of norms is additive: the pre-norms keep their names
+    and their roles, so a checkpoint without them loads into the same tree."""
+    ids = tokens(rng)
+    plain = tiny().init(rng, ids)['params']
+    sandwiched = tiny(sandwich_norms=True).init(rng, ids)['params']
+
+    assert param_paths(sandwiched) - param_paths(plain) == {
+        f'layers_{index}.{norm}.scale' for index in (0, 1)
+        for norm in ('attention_output_norm', 'mlp_output_norm')}
+    assert not param_paths(plain) - param_paths(sandwiched)
+    assert sandwiched['layers_0']['attention_output_norm']['scale'].shape == (32,)
+
+
+def test_sandwich_norms_normalize_what_the_residual_adds(rng):
+    """The two norms sit on the sublayer outputs, which makes each residual
+    contribution scale-free: a ten times larger o_proj and down_proj leave the
+    logits where they were, and without the norms they move them."""
+    ids = tokens(rng)
+    model = tiny(sandwich_norms=True)
+    params = model.init(rng, ids)
+
+    amplified = ('o_proj', 'down_proj')
+    louder = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf * 10.0 if path[-2].key in amplified else leaf, params)
+
+    def gap(model):
+        return float(jnp.max(jnp.abs(model.apply(params, ids) - model.apply(louder, ids))))
+
+    # exact in real arithmetic, fp32 rounding through the norm is the residue
+    assert gap(model) < 1e-3
+    assert gap(tiny()) > 0.1
+
+
+def test_the_embedding_scale_rounds_with_the_activations(rng):
+    """Gemma multiplies the embedding by embed_scale cast to the weight dtype
+    (modeling_gemma3.py:117), and a bf16 checkpoint's weight dtype is bf16, so
+    at hidden 1152 the factor is bf16(33.941) = 34.0 and the multiply runs in
+    bf16.
+
+    Folding 34.0 into the embedding table gives the value the module has to
+    produce, and the head is untied so the fold only moves the input side. An
+    fp32 multiply by 33.941 lands on another bf16 value for a third of the
+    table, so it fails this.
+    """
+    features, ids = 1152, tokens(rng, length=4)
+    shared = dict(emb_features=features, num_heads=8, num_layers=1,
+                  tie_embeddings=False, dtype=jnp.bfloat16)
+    scaled = tiny(embedding_scale=True, **shared)
+    params = scaled.init(rng, ids)
+
+    def fold(factor):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf.astype(jnp.bfloat16) * factor
+            if path[-2].key == 'embed_tokens' else leaf, params)
+
+    assert jnp.array_equal(scaled.apply(params, ids),
+                           tiny(**shared).apply(fold(jnp.bfloat16(34.0)), ids))
+    assert not jnp.array_equal(
+        scaled.apply(params, ids),
+        tiny(**shared).apply(fold(jnp.float32(math.sqrt(features))), ids))
+
+
+def test_attention_scale_defaults_to_the_head_dim_scale(rng):
+    """None is 1/sqrt(head_dim), the scale every kernel applies itself: asking
+    for that number explicitly must not move a bit, and Gemma's
+    query_pre_attn_scalar must move the logits."""
+    ids = tokens(rng)
+    model = tiny(head_dim=16)
+    params = model.init(rng, ids)
+
+    explicit = tiny(head_dim=16, attention_scale=16 ** -0.5)
+    assert jnp.array_equal(model.apply(params, ids), explicit.apply(params, ids))
+
+    # query_pre_attn_scalar 16 on head_dim 16 heads, as Gemma3 sets it
+    gemma = tiny(head_dim=16, attention_scale=16 ** -0.5 * 2)
+    assert not jnp.allclose(model.apply(params, ids), gemma.apply(params, ids))
+
+
+def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
+    """transformers hands query_pre_attn_scalar ** -0.5 to the attention call
+    as a float (modeling_gemma3.py:318, 376), so the scale itself never rounds.
+
+    Gemma 3 27B asks for scalar 168 on head_dim 128, where the ratio to the
+    kernel's own 1/sqrt(head_dim) is 0.872872 and bf16 holds it as 0.871094.
+    A bf16 run that rounds the ratio first cannot tell that scale from the one
+    whose ratio is exactly 0.871094, and scales every logit 0.2% low.
+    """
+    ids = tokens(rng)
+    shared = dict(head_dim=128, num_layers=1, dtype=jnp.bfloat16)
+    exact = tiny(attention_scale=168 ** -0.5, **shared)
+    params = exact.init(rng, ids)
+    rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
+                   / math.sqrt(128), **shared)
+
+    assert not jnp.array_equal(exact.apply(params, ids), rounded.apply(params, ids))
+    # None asks for the kernel's own scale, so no factor touches the query
+    assert jnp.array_equal(tiny(**shared).apply(params, ids),
+                           tiny(attention_scale=128 ** -0.5, **shared).apply(params, ids))
 
 
 def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
