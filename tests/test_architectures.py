@@ -148,6 +148,13 @@ CASES = [
     Case("causal_transformer", {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2,
                                 "num_heads": 2, "num_kv_heads": 1, "mlp_ratio": 2,
                                 "max_seq_len": SEQ_LEN}, seq_len=SEQ_LEN),
+    # Eight experts so the expert dimension divides every mesh this file
+    # builds, on the second layer only, so one dense and one sparse
+    # feed-forward go through the same run.
+    Case("moe", {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2,
+                 "num_heads": 2, "num_kv_heads": 1, "mlp_ratio": 2,
+                 "max_seq_len": SEQ_LEN, "num_experts": 8, "top_k": 2,
+                 "moe_layers": (1,)}, seq_len=SEQ_LEN),
 ]
 
 # jepa_predictor has no training step of its own: it is built through the

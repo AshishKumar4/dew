@@ -33,6 +33,7 @@ from flax.typing import Dtype, PrecisionLike
 from ..attention import (
     causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
 )
+from ..moe import SparseMLP
 
 
 LAYER_TYPES = ('full_attention', 'sliding_attention')
@@ -245,11 +246,13 @@ class GatedMLP(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Pre-norm decoder block: token mixer, then gated MLP, both residual.
+    """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
-    `mixer` is a factory taking only a name; whatever it builds lands in the
-    tree as self_attn and has to accept (x, decode=..., positions=...,
-    segment_ids=...). The last two are None outside a packed batch.
+    `mixer` and `feedforward` are factories taking only a name. What `mixer`
+    builds lands in the tree as self_attn and has to accept (x, decode=...,
+    positions=..., segment_ids=...), the last two None outside a packed batch.
+    What `feedforward` builds lands there as mlp and takes the normalized
+    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share.
 
     sandwich_norms adds Gemma's second pair of norms, on the output of each
     sublayer rather than on its input; the pre-norms keep their names and their
@@ -257,9 +260,8 @@ class DecoderBlock(nn.Module):
     leaves per layer.
     """
     mixer: Callable[..., nn.Module]
+    feedforward: Callable[..., nn.Module]
     emb_features: int
-    mlp_features: int
-    mlp_activation: str = 'swiglu'
     norm_eps: float = 1e-5
     scale_offset: bool = False
     sandwich_norms: bool = False
@@ -276,13 +278,7 @@ class DecoderBlock(nn.Module):
         if self.sandwich_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
-        self.mlp = GatedMLP(
-            hidden_features=self.mlp_features,
-            out_features=self.emb_features,
-            activation=self.mlp_activation,
-            dtype=self.dtype,
-            precision=self.precision,
-            name='mlp')
+        self.mlp = self.feedforward(name='mlp')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, train: bool = False, decode: bool = False,
@@ -314,6 +310,13 @@ class CausalTransformer(nn.Module):
     checkpoint's config derives layer_types (Qwen3 makes every layer past
     max_window_layers sliding) belongs to that translation, not here: this
     takes the tuple.
+
+    num_experts turns the feed-forward of some layers into `moe.SparseMLP`,
+    routing each token to top_k of num_experts gated MLPs of the same width a
+    dense layer would use. Which layers is moe_layers, or every moe_every-th
+    layer counting from the end of the first group, which is the rule
+    Qwen3-MoE's decoder_sparse_step means, or every layer when neither is set,
+    which is Mixtral. A dense layer keeps the leaves it always had.
     """
     vocab_size: int
     emb_features: int = 512
@@ -343,10 +346,16 @@ class CausalTransformer(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     attention_impl: Optional[str] = None
+    num_experts: int = 0                     # 0: every layer is dense
+    top_k: int = 2                           # experts each token routes to
+    moe_every: Optional[int] = None          # sparse layer cadence
+    moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
 
     def __post_init__(self):
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        if self.moe_layers is not None:
+            object.__setattr__(self, "moe_layers", tuple(self.moe_layers))
         super().__post_init__()
 
 
@@ -370,6 +379,18 @@ class CausalTransformer(nn.Module):
             return ('full_attention',) * self.num_layers
         return tuple(self.layer_types)
 
+    @property
+    def sparse_layers(self) -> Tuple[int, ...]:
+        """The layers whose feed-forward routes to experts."""
+        if self.num_experts == 0:
+            return ()
+        if self.moe_layers is not None:
+            return tuple(self.moe_layers)
+        if self.moe_every is not None:
+            return tuple(index for index in range(self.num_layers)
+                         if (index + 1) % self.moe_every == 0)
+        return tuple(range(self.num_layers))
+
     def setup(self):
         head_dim = self.features_per_head
         if head_dim % 2:
@@ -389,6 +410,25 @@ class CausalTransformer(nn.Module):
                 f"unknown layer types {unknown}, expected one of {list(LAYER_TYPES)}")
         if 'sliding_attention' in types and self.sliding_window is None:
             raise ValueError("sliding attention layers need sliding_window set")
+        if self.num_experts == 0 and (self.moe_every is not None
+                                      or self.moe_layers is not None):
+            raise ValueError(
+                "moe_every and moe_layers name the sparse layers of a model "
+                "that has experts, so num_experts has to be set")
+        if self.moe_every is not None and self.moe_layers is not None:
+            raise ValueError(
+                f"moe_every ({self.moe_every}) and moe_layers "
+                f"({self.moe_layers}) both choose the sparse layers, so only "
+                "one of them can be set")
+        if self.moe_every is not None and self.moe_every < 1:
+            raise ValueError(f"moe_every must be positive, got {self.moe_every}")
+        sparse = self.sparse_layers
+        outside = sorted(index for index in sparse
+                         if not 0 <= index < self.num_layers)
+        if outside:
+            raise ValueError(
+                f"moe_layers {outside} are outside the {self.num_layers} layers "
+                "of this model")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -418,8 +458,24 @@ class CausalTransformer(nn.Module):
                     attention_impl=self.attention_impl,
                     force_fp32_for_softmax=self.force_fp32_for_softmax),
                 emb_features=self.emb_features,
-                mlp_features=self.hidden_features,
-                mlp_activation=self.mlp,
+                feedforward=(
+                    functools.partial(
+                        SparseMLP,
+                        num_experts=self.num_experts,
+                        top_k=self.top_k,
+                        hidden_features=self.hidden_features,
+                        out_features=self.emb_features,
+                        activation=self.mlp,
+                        dtype=self.dtype,
+                        precision=self.precision)
+                    if index in sparse else
+                    functools.partial(
+                        GatedMLP,
+                        hidden_features=self.hidden_features,
+                        out_features=self.emb_features,
+                        activation=self.mlp,
+                        dtype=self.dtype,
+                        precision=self.precision)),
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 sandwich_norms=self.sandwich_norms,
