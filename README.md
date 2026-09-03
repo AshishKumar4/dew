@@ -375,7 +375,7 @@ Checkpoints from FlaxDiff load as they are, and `tools/convert_legacy_checkpoint
 
 With `--trainer.wandb-project` set, a run logs to Weights & Biases; without it, to the terminal. Every `log_every` steps: `train/loss`, `train/step_time_ms`, `train/samples_per_sec`, `train/mfu`, and every metric the objective returned as `train/<name>`. Every epoch: `train/avg_loss`, `train/best_loss`, `train/epoch_time`, each evaluation metric as `val/<name>`, and the objective's artifacts (`sample_i` and `video_sample_i` for diffusion, a `val/samples` table of generated text for language models). The config that ran is stored with the run, and when the run ranks among the project's best by `--trainer.best-tracker-metric` its newest checkpoint is pushed to the wandb model registry, which is what `DiffusionInferencePipeline.from_wandb_registry` loads.
 
-`train/mfu` is the step's FLOPs, read from the compiled executable, over the device's dense peak; the table of peaks in `dew.telemetry.instrumentation` covers TPU v4 to v6e, A100, H100, H200 and the RTX 4080, and the metric is left out on hardware it does not know. `profile_steps=N` writes a profiler trace of `N` steps after a warmup to `<checkpoint dir>/profile`, for TensorBoard or Perfetto. The XLA compilation cache is on by default under `~/.cache/dew/xla`, so a restarted run compiles in seconds instead of minutes. A sustained non-finite loss stops the run.
+`train/mfu` is the step's FLOPs, counted off the compiled executable's optimized HLO, divided by the step time and by one device's dense peak; the table of peaks in `dew.telemetry.instrumentation` covers TPU v4 to v6e, A100, H100, H200 and the RTX 4080, and the metric is left out on hardware it does not know. `profile_steps=N` writes a profiler trace of `N` steps after a warmup to `<checkpoint dir>/profile`, for TensorBoard or Perfetto. The XLA compilation cache is on by default under `~/.cache/dew/xla`, so a restarted run compiles in seconds instead of minutes. A sustained non-finite loss stops the run.
 
 ## Extending Dew
 
@@ -465,12 +465,12 @@ pytest tests/test_models.py tests/test_trainer.py -q  # any file on the local GP
 
 | architecture | sample | batch | params | ms/step | samples/s | util |
 |---|---|---|---|---|---|---|
-| `simple_dit` | 64x64x3 | 16 | 19.8M | 10.4 | 1537 | 29% |
-| `hierarchical_mmdit` | 64x64x3 | 16 | 55.5M | 35.4 | 451 | 20% |
-| `video_dit` | 8x64x64x3 | 4 | 25.2M | 19.3 | 207 | 33% |
-| `causal_transformer` | 512 tokens | 16 | 67.0M | 83.8 | 191 | 16% |
+| `simple_dit` | 64x64x3 | 16 | 19.8M | 7.9 | 2036 | 38% |
+| `hierarchical_mmdit` | 64x64x3 | 16 | 55.5M | 32.7 | 489 | 23% |
+| `video_dit` | 8x64x64x3 | 4 | 25.2M | 17.3 | 232 | 45% |
+| `causal_transformer` | 512 tokens | 16 | 67.0M | 83.0 | 193 | 42% |
 
-RTX 4080, bf16, excerpt; the full table with FLOPs, memory and compile times is in [docs/benchmarks.md](docs/benchmarks.md). `tools/benchmark_data.py` measures the data pipeline alone.
+RTX 4080, bf16, excerpt; the full table with FLOPs, spread, memory and compile times is in [docs/benchmarks.md](docs/benchmarks.md). `tools/benchmark_data.py` measures the data pipeline alone.
 
 ## Installation
 
