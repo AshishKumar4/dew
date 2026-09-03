@@ -111,7 +111,7 @@ inputs = DiffusionInputConfig(
 )
 ```
 
-The trainer drops the conditions on 12% of each batch (`unconditional_prob`), so the model also learns the unconditional distribution that classifier-free guidance needs. `dew.inputs.encoders` ships a CLIP text encoder and a Hugging Face audio encoder; a new one implements `tokenize` and `encode_from_tokens`. Pass `autoencoder=StableDiffusionVAE()` to the trainer to train in the latent space of the Stable Diffusion VAE instead of pixels, or `SimpleAutoEncoder` to train your own.
+The trainer drops the conditions on 12% of each batch (`unconditional_prob`), so the model also learns the unconditional distribution that classifier-free guidance needs. `dew.inputs.encoders` ships a CLIP text encoder and a Hugging Face audio encoder; a new one implements `tokenize` and `encode_from_tokens`. The CLIP encoder is dew's own port of the text tower, in [`dew/nn/text_encoders.py`](src/dew/nn/text_encoders.py), and it reads the checkpoint's safetensors itself, since transformers 5 removed the Flax classes it used to load. Pass `autoencoder=StableDiffusionVAE()` to the trainer to train in the latent space of the Stable Diffusion VAE instead of pixels, or `SimpleAutoEncoder` to train your own.
 
 ### Sampling
 
