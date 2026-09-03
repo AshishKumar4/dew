@@ -77,7 +77,7 @@ class SimpleTrainer:
                  fsdp_size: int = 1,
                  fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
                  logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
-                 sharding_tolerance: float = DEFAULT_SHARDING_TOLERANCE,
+                 sharding_tolerance: Optional[float] = None,
                  compilation_cache_dir: str = None,
                  profile_steps: int = 0,
                  profile_warmup_steps: int = 2,
@@ -99,7 +99,8 @@ class SimpleTrainer:
         self.replicated = NamedSharding(self.mesh, P())
         self.fsdp_min_param_size = fsdp_min_param_size
         self.logical_axis_rules = logical_axis_rules
-        self.sharding_tolerance = sharding_tolerance
+        self.sharding_tolerance = (DEFAULT_SHARDING_TOLERANCE
+                                   if sharding_tolerance is None else sharding_tolerance)
 
         self.model = model
         self.name = name

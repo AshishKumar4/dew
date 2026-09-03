@@ -258,6 +258,20 @@ def test_sharding_tolerance_can_allow_intentional_replication(tmp_path):
     assert kernel.sharding.spec == P()
 
 
+def test_unset_sharding_tolerance_takes_the_library_default(tmp_path):
+    """A config that names no tolerance has to reach the same 2% the library
+    declares, without the config repeating the number."""
+    with pytest.raises(ValueError) as error:
+        make_indivisible_trainer(tmp_path, tolerance=None)
+
+    assert "2.00%" in str(error.value)
+
+
+def test_sharding_tolerance_outside_zero_to_one_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        make_indivisible_trainer(tmp_path, tolerance=1.5)
+
+
 def test_odd_vocabulary_shards_the_embedding_on_its_other_axis():
     """GPT-2's 50257 rows divide by nothing, so the rule that wins the
     embedding cannot be taken: the width has to carry the shard, or a real run
