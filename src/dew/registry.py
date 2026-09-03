@@ -155,8 +155,8 @@ def apply_precision_policy(architecture: str, config: dict, *,
 def build_model(architecture: str, config: dict):
     """Construct a model from an architecture name and a plain config dict.
 
-    Config keys the model has no field for are dropped with a notice (older
-    runs logged since-removed flags), so old configs keep reconstructing.
+    A key the model has no field for is an error, since dropping it would
+    build a model other than the one the config describes.
     """
     canonical, flags = canonicalize_architecture(architecture)
 
@@ -173,10 +173,11 @@ def build_model(architecture: str, config: dict):
             f"Supported: {', '.join(MODEL_REGISTRY.keys())}")
 
     kwargs = {**map_config_strings(config), **flags}
-    valid_fields = {f.name for f in dataclasses.fields(model_class)}
-    dropped = sorted(set(kwargs) - valid_fields)
-    if dropped:
-        print(f"Dropping config keys not accepted by {model_class.__name__}: {dropped}")
-    kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+    valid_fields = sorted(f.name for f in dataclasses.fields(model_class))
+    unknown = sorted(set(kwargs) - set(valid_fields))
+    if unknown:
+        raise ValueError(
+            f"{model_class.__name__} has no field for {unknown}. "
+            f"Accepted fields: {valid_fields}")
 
     return model_class(**kwargs)
