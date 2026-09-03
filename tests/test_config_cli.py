@@ -11,6 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
 import tyro
 
 from dew.config import DataConfig, ModelConfig, OptimConfig, RunConfig, TrainerConfig
