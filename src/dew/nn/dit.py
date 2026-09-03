@@ -145,7 +145,6 @@ class PatchSequenceOutput(nn.Module):
     any (non-square included) patch grid."""
     patch_size: int
     output_channels: int
-    learn_sigma: bool = False
     modulated: bool = False  # adaLN shift/scale on the final norm (DiT FinalLayer)
     norm_epsilon: float = 1e-5
     dtype: Optional[Dtype] = None
@@ -170,19 +169,14 @@ class PatchSequenceOutput(nn.Module):
             )(nn.silu(conditioning)), 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
-        output_dim = self.patch_size * self.patch_size * self.output_channels
-        if self.learn_sigma:
-            output_dim *= 2
         x_out = nn.Dense(
-            features=output_dim,
+            features=self.patch_size * self.patch_size * self.output_channels,
             dtype=jnp.float32,  # fp32 output head - the loss is computed in fp32
             precision=self.precision,
             kernel_init=nn.initializers.zeros,
             name="final_proj",
         )(x_out)
 
-        if self.learn_sigma:
-            x_out, _x_logvar = jnp.split(x_out, 2, axis=-1)
         if inv_idx is not None:
             return hilbert_unpatchify(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
         return unpatchify(x_out, channels=self.output_channels,
