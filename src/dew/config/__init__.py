@@ -115,6 +115,8 @@ class TrainerConfig:
     multi_host: Optional[bool] = None
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     fsdp_size: int = 1
+    expert_size: int = 1
+    """Devices the expert dimension of an MoE layer is split over. 1 replicates every expert."""
     fsdp_min_param_size: Optional[int] = None
     logical_axis_rules: Optional[JsonDict] = None
     """Replaces the logical-axis-to-mesh-axis table, e.g. {"mlp": "fsdp"}. Unset uses DEFAULT_LOGICAL_AXIS_RULES, which reproduces the shape heuristic."""
