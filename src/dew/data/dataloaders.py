@@ -331,6 +331,17 @@ class _SourceSlice:
         self.start = start
         self.length = stop - start
 
+    def __repr__(self) -> str:
+        # grain writes repr(source) into a DataLoader iterator's checkpoint and
+        # refuses to restore a state whose repr no longer matches, so a resumed
+        # run needs a description that survives the process that wrote it. The
+        # wrapped source is named by type: an arrayrecord source's own repr is
+        # its address, and asking a hub source for its length would download
+        # the table. Which half of the split this is, and how long, is what the
+        # index stream depends on.
+        return (f"_SourceSlice({type(self.source).__name__}, "
+                f"start={self.start}, length={self.length})")
+
     def __len__(self) -> int:
         return self.length
 

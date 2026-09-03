@@ -10,6 +10,7 @@ import os
 import importlib.util
 import inspect
 import itertools
+import json
 import shutil
 import subprocess
 import sys
@@ -850,23 +851,41 @@ def test_augmentation_really_moves_the_pixels(augmenting_media_dataset):
 
 @pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
 def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
-        augmenting_media_dataset, worker_count):
+        augmenting_media_dataset, monkeypatch, worker_count, tmp_path):
     """The trainer saves the iterator's position in its checkpoint, so a
-    restored run owes the epoch its unseen records, no more and no fewer."""
-    data = get_media_dataset_grain("augmenting", dataset_source="/tmp", batch_size=4,
-                                   worker_count=worker_count, num_epochs=1, seed=3)
+    restored run owes the epoch its unseen records, no more and no fewer.
 
-    interrupted = iter(data["train"]())
+    The loader is built again from a source object of its own, which is what a
+    resumed process has: grain validates a saved position against
+    `repr(source)` and will not restore one it cannot match.
+
+    Eight training records over two workers is two whole batches, since each
+    worker batches its own slice and drops what is left over.
+    """
+    def loader():
+        labels = tmp_path / "label.labels.txt"
+        dataset = MediaDataset(source=_ImageSource(16),
+                               augmenter=_AugmentingAugmenter(str(labels)),
+                               media_type="image")
+        monkeypatch.setitem(mediaDatasetMap, "augmenting", dataset)
+        return get_media_dataset_grain("augmenting", dataset_source="/tmp",
+                                       batch_size=4, worker_count=worker_count,
+                                       num_epochs=1, seed=3, val_count=8)
+
+    interrupted = iter(loader()["train"]())
     seen = _rows(next(interrupted))
     state = interrupted.get_state()
     unseen = [row for b in interrupted for row in _rows(b)]
 
-    restored = iter(data["train"]())
+    restored = iter(loader()["train"]())
     restored.set_state(state)
     resumed = [row for b in restored for row in _rows(b)]
 
+    assert "object at 0x" not in json.loads(state)["data_source"], (
+        "a source described by its address can only be restored in the process "
+        "that saved it")
     assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
-    assert sorted(index for index, _, _ in seen + resumed) == list(range(16))
+    assert sorted(index for index, _, _ in seen + resumed) == list(range(8, 16))
 
 
 # ---------------------------------------------------------------------------------
