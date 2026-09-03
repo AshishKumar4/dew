@@ -497,12 +497,13 @@ NAMED_LEAF = {
 def test_a_built_trainer_carries_the_layout_the_rules_derive(case, tmp_path, fsdp_size):
     """The derivation through the path a run takes, not called on its own.
 
-    Every other sharding test calls state_sharding_tree directly, so a body
-    that cannot run at all leaves them green: replacing `size` in its
-    threshold branch with an undefined name keeps the declared-axis tests
-    passing and raises NameError as soon as a trainer is built at fsdp_size 8.
-    Building the state is what these assertions go through, and the build
-    carries the tolerance check at the library default with it.
+    Every other sharding test calls state_sharding_tree and reads its return
+    value, so a layout that is derived correctly and never reaches the state
+    leaves all of them green. Dropping out_shardings from the jit in
+    _build_state is that mutation, and it passes the declared-axis tests and
+    the tolerance tests while every parameter here lands on one device.
+    Building the state is what these assertions read, and the build carries
+    the tolerance check at the library default with it.
     """
     trainer = make_trainer(case, tmp_path, fsdp_size, [])
     leaves = jax.tree_util.tree_flatten_with_path(trainer.state.params)[0]
@@ -514,15 +515,17 @@ def test_a_built_trainer_carries_the_layout_the_rules_derive(case, tmp_path, fsd
         leaf = trainer.state.params["params"]
         for key in path:
             leaf = leaf[key]
-        assert leaf.sharding.spec == expected, f"{path} {leaf.shape}"
+        assert getattr(leaf.sharding, "spec", None) == expected, f"{path} {leaf.shape}"
 
     # The default table reproduces the shape heuristic, so every leaf of a
     # built state has to match what the heuristic asks for on this width, and
     # the arrays have to be split that way rather than merely labelled.
     for path, leaf in leaves:
         expected = parameter_spec(leaf.shape, fsdp_size, TINY_SHARD)
-        where = f"{jax.tree_util.keystr(path)} {leaf.shape}"
-        assert leaf.sharding.spec == expected, where
+        where = f"{jax.tree_util.keystr(path)} {leaf.shape} on {leaf.sharding}"
+        # A state materialised without the derived layout carries a single
+        # device sharding, which has no spec at all.
+        assert getattr(leaf.sharding, "spec", None) == expected, where
         if any(expected):
             assert leaf.addressable_shards[0].data.size == leaf.size // fsdp_size, where
 
