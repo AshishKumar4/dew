@@ -18,7 +18,7 @@ from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
 from dew.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
 from dew.sampling.ddim import DDIMSampler
-from dew.sampling.ddpm import DDPMSampler, SimpleDDPMSampler
+from dew.sampling.ddpm import DDPMSampler
 from dew.sampling.euler import EulerSampler, EulerAncestralSampler
 from dew.sampling.heun_sampler import HeunSampler
 from dew.sampling.multistep_dpm import MultiStepDPM
@@ -114,14 +114,14 @@ def generate(model, sampler, **kwargs):
     return sampler.generate_samples(params, **defaults)
 
 
-@pytest.mark.parametrize("sampler_class", [EulerSampler, DDIMSampler, SimpleDDPMSampler])
+@pytest.mark.parametrize("sampler_class", [EulerSampler, DDIMSampler, DDPMSampler])
 def test_vp_sampler_converges(sampler_class):
     model, sampler = make_vp_sampler(sampler_class)
     samples = generate(model, sampler)
     assert_gaussian_stats(samples)
 
 
-@pytest.mark.parametrize("sampler_class", [EulerSampler, EulerAncestralSampler, DDIMSampler, HeunSampler, MultiStepDPM])
+@pytest.mark.parametrize("sampler_class", [EulerSampler, EulerAncestralSampler, DDIMSampler, HeunSampler, MultiStepDPM, DDPMSampler])
 def test_karras_sampler_converges(sampler_class):
     model, sampler = make_karras_sampler(sampler_class)
     samples = generate(model, sampler)
@@ -170,6 +170,41 @@ def test_ddpm_sampler_converges():
     assert_gaussian_stats(samples)
 
 
+@pytest.mark.parametrize("t,s", [(700, 500), (300, 200), (100, 99)])
+def test_ddpm_step_is_the_vp_posterior(t, s):
+    """One step from t to s is the DDPM posterior q(x_s | x_t, x_0) written in
+    signal and noise rates, which under alpha^2 + sigma^2 = 1 has std
+    sqrt(sigma_s^2 / sigma_t^2 * (1 - alpha_t^2 / alpha_s^2)).
+    """
+    schedule = CosineNoiseScheduler(1000)
+    _, sampler = make_vp_sampler(DDPMSampler)
+    key = jax.random.PRNGKey(3)
+    x0 = jax.random.normal(jax.random.fold_in(key, 1), (4, 8, 8, 3))
+    eps = jax.random.normal(jax.random.fold_in(key, 2), (4, 8, 8, 3))
+    ones = jnp.ones((4,), jnp.float32)
+    shape = get_coeff_shapes_tuple(x0)
+    alpha_t, sigma_t = schedule.get_rates(ones * t, shape)
+    alpha_s, sigma_s = schedule.get_rates(ones * s, shape)
+
+    state = RandomMarkovState(key)
+    _, noise_key = state.get_random_key()
+    noise = jax.random.normal(noise_key, x0.shape)
+    std = jnp.sqrt(sigma_s**2 / sigma_t**2 * (1 - alpha_t**2 / alpha_s**2))
+    expected = alpha_s * x0 + alpha_t * sigma_s**2 / (alpha_s * sigma_t) * eps + std * noise
+
+    actual, _ = sampler.take_next_step(
+        current_samples=alpha_t * x0 + sigma_t * eps,
+        reconstructed_samples=x0,
+        model_conditioning_inputs=(),
+        pred_noise=eps,
+        current_step=ones * t,
+        state=state,
+        sample_model_fn=None,
+        next_step=ones * s,
+    )
+    assert jnp.allclose(actual, expected, atol=1e-6)
+
+
 def test_ddim_eta_converges():
     model, sampler = make_vp_sampler(DDIMSampler, eta=0.5)
     samples = generate(model, sampler)
@@ -187,6 +222,13 @@ def test_multistep_dpm_reentrant():
     first = generate(model, sampler)
     second = generate(model, sampler)
     assert jnp.allclose(first, second, atol=1e-5)
+
+
+@pytest.mark.parametrize("sampler_class", [MultiStepDPM, RK4Sampler])
+def test_sigma_integrators_reject_a_vp_schedule(sampler_class):
+    """Both integrate dx/dsigma = eps, which only holds when alpha is 1."""
+    with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
+        make_vp_sampler(sampler_class)
 
 
 ############################################################################################################
