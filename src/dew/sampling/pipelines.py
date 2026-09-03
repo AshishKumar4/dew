@@ -22,7 +22,7 @@ from dew.inputs import DiffusionInputConfig
 from dew.inputs.processors import defaultTextEncodeModel
 from dew.random_state import RandomMarkovState
 from dew.sampling.euler import EulerAncestralSampler
-from dew.sampling.loading import parse_config, load_from_wandb_run, load_from_wandb_registry
+from dew.sampling.loading import RestoredState, parse_config, load_from_wandb_run, load_from_wandb_registry
 
 @dataclass
 class InferencePipeline:
@@ -33,17 +33,17 @@ class InferencePipeline:
     """
     name: str = None
     model: nn.Module = None
-    state: SimpleTrainState = None
+    state: Union["SimpleTrainState", RestoredState] = None
 
 @dataclass
 class DiffusionInferencePipeline(InferencePipeline):
     """Inference pipeline for diffusion models.
-    
+
     This pipeline handles loading models from wandb and generating samples using the
     DiffusionSampler.
     """
     artifact: Any = None
-    state: TrainState = None
+    state: Union["TrainState", RestoredState] = None
     rngstate: Optional[RandomMarkovState] = None
     noise_schedule: NoiseScheduler = None
     model_output_transform: DiffusionPredictionTransform = None
@@ -142,7 +142,7 @@ class DiffusionInferencePipeline(InferencePipeline):
     def create(
         cls,
         config: Dict[str, Any],
-        state: Dict[str, Any],
+        state: Union["TrainState", RestoredState],
         rngstate: Optional[RandomMarkovState] = None,
         run=None,
         artifact=None,
@@ -232,9 +232,9 @@ class DiffusionInferencePipeline(InferencePipeline):
         print(f"Generating samples: steps={diffusion_steps}, num_samples={num_samples}, guidance={guidance_scale}")
         
         if use_ema:
-            params = self.state['ema_params']
+            params = self.state.ema_params
         else:
-            params = self.state['params']
+            params = self.state.params
 
         return sampler.generate_samples(
             params=params,

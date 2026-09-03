@@ -38,7 +38,7 @@ RES = 8
 MODEL_KWARGS = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-def make_trainer(tmp_path, name="inference"):
+def make_trainer(tmp_path, name="inference", **kwargs):
     """The tiny unconditional DiT of tests/test_trainer.py, on one device."""
     train_schedule, _, transform = get_diffusion_preset("edm")
     return ObjectiveTrainer(
@@ -56,6 +56,7 @@ def make_trainer(tmp_path, name="inference"):
         wandb_config=None,
         distributed_training=False,
         checkpoint_base_path=str(tmp_path),
+        **kwargs,
     )
 
 
@@ -157,7 +158,7 @@ def test_pipeline_generates_from_a_local_checkpoint(tmp_path):
     trainer.wait_for_checkpoints()
 
     state = load_from_checkpoint(get_latest_checkpoint(trainer.checkpoint_path()))
-    assert state is not None and {"params", "ema_params"} <= set(state)
+    assert state.params is not None and state.ema_params is not None
 
     pipeline = DiffusionInferencePipeline.create(
         config=parse_config(current_config()), state=state)
@@ -213,9 +214,9 @@ def test_load_from_checkpoint_picks_the_best_step(tmp_path):
 
     best = load_from_checkpoint(trainer.checkpoint_path(), step="best")
     latest = load_from_checkpoint(trainer.checkpoint_path())
-    assert int(best["step"]) == 0, "step 2 came back as the best"
-    assert int(latest["step"]) == 1
-    assert int(load_from_checkpoint(trainer.checkpoint_path(), step=1)["step"]) == 0
+    assert int(best.step) == 0, "step 2 came back as the best"
+    assert int(latest.step) == 1
+    assert int(load_from_checkpoint(trainer.checkpoint_path(), step=1).step) == 0
 
 
 def test_a_single_step_directory_is_its_own_best_checkpoint(tmp_path):
@@ -225,7 +226,7 @@ def test_a_single_step_directory_is_its_own_best_checkpoint(tmp_path):
     step_dir = get_latest_checkpoint(trainer.checkpoint_path())
 
     state = load_from_checkpoint(step_dir, step="best")
-    assert int(state["step"]) == 0
+    assert int(state.step) == 0
 def test_legacy_converter_preserves_the_best_state(tmp_path):
     source = tmp_path / "legacy"
     output = tmp_path / "converted"
@@ -252,9 +253,59 @@ def test_legacy_converter_preserves_the_best_state(tmp_path):
 
     latest = load_from_checkpoint(str(output), step="latest")
     best = load_from_checkpoint(str(output), step="best")
-    assert float(latest["params"]["params"]["embed"]["patch_embed"]["kernel"][0]) == 3.0
-    assert float(best["params"]["params"]["embed"]["patch_embed"]["kernel"][0]) == 1.0
+    assert float(latest.params["params"]["embed"]["patch_embed"]["kernel"][0]) == 3.0
+    assert float(best.params["params"]["embed"]["patch_embed"]["kernel"][0]) == 1.0
 
+
+def test_load_from_checkpoint_returns_the_saved_train_state(tmp_path):
+    """The restored object carries the saved state's fields under the
+    TrainState's own attribute names, with the saved values."""
+    trainer = make_trainer(tmp_path, name="restored-fields")
+    # One real update, so params, the EMA copy, the adam moments and the
+    # step counter are all non-trivial and the fields can be told apart.
+    trainer.state = trainer.state.apply_gradients(
+        grads=jax.tree.map(jnp.ones_like, trainer.state.params)).apply_ema(0.99)
+    trainer.save(epoch=0, step=1, metrics={"loss": 0.2})
+    trainer.wait_for_checkpoints()
+
+    restored = load_from_checkpoint(trainer.checkpoint_path())
+    assert int(restored.step) == int(trainer.state.step)
+    for field in ("params", "ema_params", "opt_state", "rngs", "metrics"):
+        saved = jax.tree.leaves(getattr(trainer.state, field))
+        loaded = jax.tree.leaves(getattr(restored, field))
+        assert len(loaded) == len(saved) != 0, field
+        for before, after in zip(saved, loaded, strict=True):
+            np.testing.assert_allclose(np.asarray(before), np.asarray(after))
+    assert restored.dynamic_scale == trainer.state.dynamic_scale is None
+
+
+def test_a_resume_from_the_restored_state_trains(tmp_path):
+    """The restored state goes back into a trainer as `train_state` and the
+    run continues from the restored step, keeping the restored optimizer."""
+    trainer = make_trainer(tmp_path, name="resume-source")
+    trainer.state = trainer.state.apply_gradients(
+        grads=jax.tree.map(jnp.ones_like, trainer.state.params)).apply_ema(0.99)
+    trainer.save(epoch=0, step=1, metrics={"loss": 0.2})
+    trainer.wait_for_checkpoints()
+    restored = load_from_checkpoint(trainer.checkpoint_path())
+    resumed = make_trainer(tmp_path, name="resumed", train_state=restored)
+    resumed_step = int(restored.step)
+    assert int(resumed.state.step) == resumed_step
+    images = np.tile(
+        np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
+        (8, 1, RES, 3))
+
+    def batches():
+        while True:
+            yield {"image": jnp.asarray(images)}
+
+    # The resume lands mid-epoch, so one step completes epoch 0.
+    data = {"train": batches, "train_len": 32, "local_batch_size": 8}
+    state = resumed.fit(data, training_steps_per_epoch=2, epochs=1,
+                        val_steps_per_epoch=0)
+    assert int(state.step) == resumed_step + 1, "the resumed run trained nothing"
+    assert all(np.all(np.isfinite(np.asarray(leaf)))
+               for leaf in jax.tree.leaves(state.params)), "the resumed run diverged"
 
 # --------------------------------------------------------------------------
 # parse_config across config generations
@@ -337,7 +388,7 @@ def test_parse_config_overrides_reach_both_levels():
 def test_package_exports_the_public_names():
     for name in ("InferencePipeline", "DiffusionInferencePipeline", "parse_config",
                  "load_from_checkpoint", "load_from_wandb_run",
-                 "load_from_wandb_registry", "get_wandb_run"):
+                 "load_from_wandb_registry", "get_wandb_run", "RestoredState"):
         assert hasattr(inference, name), name
 
 
