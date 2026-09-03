@@ -19,33 +19,6 @@ class DataSource(ABC):
             A data source object compatible with grain or other loaders.
         """
         pass
-    
-    @staticmethod
-    def create(source_type: str, **kwargs) -> 'DataSource':
-        """Factory method to create a data source of the specified type.
-        
-        Args:
-            source_type: Registry key: "image_tfds", "image_gcs",
-                "image_combined_gcs", "video_tfds" or "video_local".
-            **kwargs: Additional arguments for the specific data source.
-            
-        Returns:
-            An instance of a DataSource subclass.
-        """
-        from .images import ImageTFDSSource, ImageGCSSource, CombinedImageGCSSource
-        from .videos import VideoTFDSSource, VideoLocalSource
-        
-        source_map = {
-            "image_tfds": ImageTFDSSource,
-            "image_gcs": ImageGCSSource,
-            "image_combined_gcs": CombinedImageGCSSource,
-            "video_tfds": VideoTFDSSource,
-            "video_local": VideoLocalSource
-        }
-        
-        if source_type not in source_map:
-            raise ValueError(f"Unknown source type: {source_type}")
-        return source_map[source_type](**kwargs)
 
 
 class DataAugmenter(ABC):
@@ -68,31 +41,6 @@ class DataAugmenter(ABC):
             A callable that returns a pygrain.Transformation instance.
         """
         pass
-    
-    @staticmethod
-    def create(augmenter_type: str, **kwargs) -> 'DataAugmenter':
-        """Factory method to create a data augmenter of the specified type.
-        
-        Args:
-            augmenter_type: Registry key: "image_tfds", "image_gcs" or "video".
-            **kwargs: Additional arguments for the specific augmenter.
-            
-        Returns:
-            An instance of a DataAugmenter subclass.
-        """
-        from .images import ImageTFDSAugmenter, ImageGCSAugmenter
-        from .videos import AudioVideoAugmenter
-
-        augmenter_map = {
-            "image_tfds": ImageTFDSAugmenter,
-            "image_gcs": ImageGCSAugmenter,
-            "video": AudioVideoAugmenter,
-        }
-        
-        if augmenter_type not in augmenter_map:
-            raise ValueError(f"Unknown augmenter type: {augmenter_type}")
-        
-        return augmenter_map[augmenter_type](**kwargs)
 
 
 class MediaDataset:
