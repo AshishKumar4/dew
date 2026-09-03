@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """One optimizer's loss curve at a fixed token budget, on a token dataset.
 
-Both optimizers under comparison see the same model, the same seed and the
-same batches in the same order, so the curves differ only by the solver. The
-step is the trainer's own compiled step and the model and data come from
+Every arm of a comparison sees the same model, the same seed and the same
+batches in the same order, so the curves differ only by the solver. The step
+is the trainer's own compiled step and the model and the data come from
 `recipes/lm/train.py`, so nothing here is a second wiring of a run. What is
 local is the loop, which records every step's loss instead of logging one per
 interval.
+
+`--optimizer` takes an `OPTIMIZER_MAP` name, or `muon-unsplit` for
+`optax.contrib.muon` with its own ndim == 2 rule, which is what the 'muon'
+entry did before the parameter groups landed.
 
 Usage:
     PYTHONPATH=src python tools/optimizer_curve.py \
@@ -21,6 +25,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import optax
 import tyro
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recipes" / "lm"))
@@ -34,6 +39,17 @@ from dew.training.optim import build_optimizer  # noqa: E402
 
 import train as lm_recipe  # noqa: E402
 
+UNSPLIT = "muon-unsplit"
+
+
+def build_solver(config: "Comparison", optim: OptimConfig):
+    """The solver this arm runs, from the library or from optax directly."""
+    if config.optimizer != UNSPLIT:
+        return build_optimizer(optim, steps_per_epoch=config.steps)
+    return optax.contrib.muon(config.learning_rate,
+                              weight_decay=config.weight_decay,
+                              adam_weight_decay=config.weight_decay)
+
 
 @dataclass(frozen=True)
 class Comparison:
@@ -44,6 +60,7 @@ class Comparison:
     out: str
     """Where the per-step losses are written, as JSON."""
     optimizer: str = "muon"
+    """An OPTIMIZER_MAP name, or muon-unsplit."""
     learning_rate: float = 3e-3
     weight_decay: float = 0.1
     steps: int = 2000
@@ -67,9 +84,10 @@ def run(config: Comparison) -> dict:
                         # worker pool costs more than it saves.
                         worker_count=0, read_thread_count=1, read_buffer_size=1,
                         worker_buffer_size=1),
-        optim=OptimConfig(optimizer=config.optimizer,
-                          learning_rate=config.learning_rate,
-                          weight_decay=config.weight_decay),
+        optim=OptimConfig(
+            optimizer='adamw' if config.optimizer == UNSPLIT else config.optimizer,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay),
         trainer=TrainerConfig(distributed_training=False, multi_host=False,
                               compilation_cache_dir=None, wandb_project=None),
         sequence_length=config.sequence_length,
@@ -83,7 +101,7 @@ def run(config: Comparison) -> dict:
 
     trainer = ObjectiveTrainer(
         model=model,
-        optimizer=build_optimizer(run_config.optim, steps_per_epoch=config.steps),
+        optimizer=build_solver(config, run_config.optim),
         rngs=jax.random.PRNGKey(config.seed),
         input_config=None,
         objective=objective,
