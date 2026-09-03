@@ -287,9 +287,8 @@ def batches(case: Case):
 def shape_metric(seen):
     """A real EvaluationMetric over the objective's validation artifacts.
 
-    The validation loop reports exceptions rather than raising them, so an
-    assertion inside a metric would be swallowed. Recording here and asserting
-    afterwards is what makes a validation step that never ran a failure.
+    Recording the shapes here and asserting afterwards makes a validation
+    step that never ran a failure.
     """
     def record(artifacts, batch):
         # The language model objective returns a dict; its cross entropy is the artifact.
