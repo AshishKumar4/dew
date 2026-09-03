@@ -62,16 +62,23 @@ class LMObjective(Objective):
         ema_decay: float = 0.999,
         pad_id: Optional[int] = None,
         samples: Optional[Dict[str, Any]] = None,
+        pretrained: Optional[Dict[str, Any]] = None,
     ):
         """`samples` configures the text logged at validation: a `prompt` of
         int32 ids (one, or several of equal length), `max_new_tokens`, a
         `temperature` (0 is greedy), an optional `top_k`, and the `decode`
-        that turns ids back into a string. Unset logs no text."""
+        that turns ids back into a string. Unset logs no text.
+
+        `pretrained` is a variables dict to start from instead of a fresh
+        init, as dew.interop.hf_decoders.load_pretrained_decoder returns for a
+        Hugging Face checkpoint. The trainer takes its whole initial state
+        from init_params, so this is where continued pretraining begins."""
         self.model = model
         self.seq_len = seq_len
         self.vocab_size = vocab_size
         self.pad_id = pad_id
         self.samples = samples
+        self.pretrained = pretrained
         self.ema = EMASpec(decay=lambda step: ema_decay)
 
     @property
@@ -80,6 +87,12 @@ class LMObjective(Objective):
         return {"tokens": ((self.seq_len,), jnp.int32)}
 
     def init_params(self, rng):
+        if self.pretrained is not None:
+            if "params" not in self.pretrained:
+                raise ValueError(
+                    "pretrained is the variables dict ({'params': ...}) that "
+                    "load_pretrained_decoder and model.init return")
+            return self.pretrained
         shape, dtype = shape_and_dtype(self.input_shapes["tokens"])
         return self.model.init(rng, jnp.zeros((1, *shape), dtype))
 
