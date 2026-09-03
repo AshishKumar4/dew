@@ -450,6 +450,8 @@ save_hf_layout(state.ema_params, config=model_config, directory="export/flowers"
 # export/flowers/model.safetensors and export/flowers/config.json
 ```
 
+`push_to_hub(directory, repo_id)` uploads that directory to a Hub repo, creating the repo if it does not exist yet. `pull_from_hub(repo_id)` downloads a repo snapshot and returns the local directory it landed in.
+
 See [docs/api.md](docs/api.md#evaluation-and-interop) for more.
 
 ## Testing and benchmarks
