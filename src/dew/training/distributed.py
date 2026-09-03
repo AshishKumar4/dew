@@ -78,6 +78,13 @@ DEFAULT_LOGICAL_PARAM_AXES: Mapping[tuple[str, ...], LogicalAxes] = {
 }
 
 
+def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
+    """One entry of a spec or a rule as the mesh axes it names."""
+    if assignment is None:
+        return ()
+    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
+
+
 def _parameter_path(path) -> tuple[str, ...]:
     """The parameter's own path: the trailing run of dict keys under a leaf.
 
@@ -119,9 +126,7 @@ def _normalize_logical_axis_rules(
              else rules.items() if isinstance(rules, Mapping) else rules)
     normalized = []
     for logical_axis, mesh_axes in items:
-        axes = ((mesh_axes,) if isinstance(mesh_axes, str)
-                else () if mesh_axes is None else tuple(mesh_axes))
-        axes = tuple(axis for axis in axes if axis in mesh.axis_names)
+        axes = tuple(axis for axis in _mesh_axes(mesh_axes) if axis in mesh.axis_names)
         normalized.append(
             (logical_axis, axes[0] if len(axes) == 1 else axes or None))
     return tuple(normalized)
@@ -176,10 +181,7 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     names = list(axes)
     while True:
         assigned = [
-            tuple(axis for axis in
-                  ((assignment,) if isinstance(assignment, str)
-                   else () if assignment is None else tuple(assignment))
-                  if mesh.shape[axis] > 1)
+            tuple(axis for axis in _mesh_axes(assignment) if mesh.shape[axis] > 1)
             for assignment in nn.logical_to_mesh_axes(tuple(names), rules)]
         blocked = [
             dimension for dimension, mesh_axes in enumerate(assigned)
@@ -256,9 +258,7 @@ def assert_params_sufficiently_sharded(
         if elements < min_shard_size:
             continue
         shardable_elements += elements
-        if any(assignment == FSDP_AXIS
-               or isinstance(assignment, tuple) and FSDP_AXIS in assignment
-               for assignment in sharding.spec):
+        if any(FSDP_AXIS in _mesh_axes(assignment) for assignment in sharding.spec):
             continue
         replicated.append((elements, jax.tree_util.keystr(path), param.shape))
 

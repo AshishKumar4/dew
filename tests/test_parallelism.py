@@ -176,6 +176,16 @@ def test_dit_axes_land_on_the_dimensions_they_name():
     assert mlp["conditioning"]["time_embed"]["layers_2"]["kernel"] == P("fsdp")
 
 
+def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
+    """A module that keeps its name while its parameter gains a dimension has
+    to stop the derivation, not shard whichever dimensions the short name
+    happens to reach."""
+    variables = {"params": {"q_proj": {
+        "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
+    with pytest.raises(ValueError, match="q_proj"):
+        state_sharding_tree(build_mesh(fsdp_size=2), variables, min_shard_size=1)
+
+
 def test_rule_override_changes_only_declared_axes():
     model = SimpleDiT(
         patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
@@ -433,8 +443,8 @@ def test_muon_masked_optimizer_state_shards_with_its_parameters(tmp_path):
 
     kernel = trainer.state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
     assert kernel.sharding.spec == P(None, "fsdp")
-    moment_specs = {str(leaf.sharding.spec) for leaf in jax.tree.leaves(trainer.state.opt_state)}
-    assert str(kernel.sharding.spec) in moment_specs
+    moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.opt_state)}
+    assert kernel.sharding.spec in moment_specs
 
 
 def test_replicated_run_shards_nothing(tmp_path):
