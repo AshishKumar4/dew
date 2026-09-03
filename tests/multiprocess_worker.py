@@ -328,10 +328,18 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     if args.coordinator:
         import jax
+        from jax.experimental import multihost_utils
 
         jax.distributed.initialize(
             coordinator_address=args.coordinator, num_processes=args.processes,
             process_id=args.process_id)
+        # One collective while the processes are still in lockstep. CPU
+        # collectives rendezvous through the coordinator with a 30 second
+        # deadline, and the first one otherwise falls inside a checkpoint
+        # barrier, by which time the processes are as far apart as their model
+        # init and compile times. On a machine under load that is more than 30
+        # seconds and the run dies in gloo rather than in anything under test.
+        multihost_utils.sync_global_devices("worker ready")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 
