@@ -7,9 +7,11 @@ from dew.random_state import MarkovState, RandomMarkovState
 class DDPMSampler(DiffusionSampler):
     """Exact ancestral sampler for the reverse diffusion SDE.
 
-    This is the simplified (but algebraically exact) form of the DDPM
-    posterior, phrased purely in terms of signal/noise rates so it works for
-    any schedule and any step stride, not just t -> t-1.
+    One step draws from the forward posterior q(x_s | x_t, x_0) for
+    x_t = alpha_t x_0 + sigma_t eps, written in signal and noise rates so it
+    holds for any schedule and any step stride, not just t -> t-1. The
+    posterior mean is alpha_s x_0 + alpha_t sigma_s^2 / (alpha_s sigma_t) eps
+    and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
     """
     def take_next_step(self, current_samples, reconstructed_samples, model_conditioning_inputs,
                  pred_noise, current_step, state:RandomMarkovState, sample_model_fn, next_step=1) -> tuple[jnp.ndarray, RandomMarkovState]:
@@ -24,7 +26,7 @@ class DDPMSampler(DiffusionSampler):
 
         noise_ratio_squared = (next_noise_rate ** 2) / (current_noise_rate ** 2)
         signal_ratio_squared = (current_signal_rate ** 2) / (next_signal_rate ** 2)
-        gamma = jnp.sqrt(noise_ratio_squared * (1 - signal_ratio_squared))
+        gamma = next_noise_rate * jnp.sqrt(1 - signal_ratio_squared * noise_ratio_squared)
 
         next_samples = next_signal_rate * reconstructed_samples + pred_noise_coeff * pred_noise + noise * gamma
         return next_samples, state
