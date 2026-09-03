@@ -405,3 +405,24 @@ def test_the_streaming_factory_stops_when_its_fetcher_is_gone(monkeypatch):
     assert len(next(loader)["image"]) == 4
     with pytest.raises(StopIteration):
         next(loader)
+
+
+def test_load_data_routes_a_streaming_only_dataset_to_the_streamer(monkeypatch, stop):
+    """'auto' reads the registries, and what comes back has no validation
+    loader at all: a streaming run holds nothing out, so nothing downstream
+    may report a validation pass over a held-out split."""
+    from dew.config import DataConfig
+    from dew.data import dataloaders
+    from dew.data.registry import onlineDatasetMap
+
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "parallel_media_loader",
+                        _producer_of(12, 1, stop))
+    monkeypatch.setitem(onlineDatasetMap, "fake_online", {"source": _StubDataset(12)})
+
+    data = dataloaders.load_data(DataConfig(dataset="fake_online", batch_size=4,
+                                            image_size=4, worker_count=1))
+
+    assert data["train_len"] == 12 and data["local_batch_size"] == 4
+    assert "val" not in data and "test" not in data
+    assert len(next(data["train"]())["image"]) == 4
