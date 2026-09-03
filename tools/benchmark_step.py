@@ -193,6 +193,12 @@ def small_cases(dtype: str) -> list[Case]:
         Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
                                     "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512},
              batch_size=16, seq_len=512),
+        # The same decoder with an 8-expert, top-2 feed-forward on every second
+        # layer, which is the sparse shape the 4.7 acceptance run trains
+        Case("moe", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
+                     "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512,
+                     "num_experts": 8, "top_k": 2, "moe_every": 2},
+             batch_size=16, seq_len=512),
     ]
     cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
     # jepa_predictor has no step of its own: it is built through the registry

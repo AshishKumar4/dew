@@ -76,6 +76,7 @@ class SimpleTrainer:
                  max_checkpoints_to_keep: int = 2,
                  train_start_step_override: int = None,
                  fsdp_size: int = 1,
+                 expert_size: int = 1,
                  fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
                  logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
                  sharding_tolerance: Optional[float] = None,
@@ -95,7 +96,7 @@ class SimpleTrainer:
             distributed_training = jax.device_count() > 1
         self.distributed_training = distributed_training
         devices = jax.devices() if distributed_training else jax.devices()[:1]
-        self.mesh = build_mesh(fsdp_size, devices=devices)
+        self.mesh = build_mesh(fsdp_size, expert_size, devices=devices)
         self.batch_sharding = batch_sharding(self.mesh)
         self.replicated = NamedSharding(self.mesh, P())
         self.fsdp_min_param_size = fsdp_min_param_size

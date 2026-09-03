@@ -35,6 +35,9 @@ MODEL_REGISTRY = {
     'jepa_video_encoder': JepaVideoEncoder,
     'jepa_predictor': JepaPredictor,
     'causal_transformer': CausalTransformer,
+    # The same decoder with experts: num_experts and top_k, and moe_every or
+    # moe_layers for which layers route (dew/nn/moe.py).
+    'moe': CausalTransformer,
 }
 
 ARCHITECTURE_SUFFIX_FLAGS = {
