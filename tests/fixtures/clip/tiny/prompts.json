@@ -1,0 +1,9 @@
+{
+  "prompts": [
+    "a red bird",
+    "",
+    "two cats on a mat, painted",
+    "x"
+  ],
+  "max_length": 77
+}
