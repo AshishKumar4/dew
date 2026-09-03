@@ -32,6 +32,10 @@ Both build a `pygrain.IndexSampler` with `ShardByJaxProcess`, so each process re
 
 Validation reads the same records in canonical order with a separate unshuffled sampler. For the media loader, `val_count` holds out the first N records as a disjoint slice, and the train loader covers the rest.
 
+## Hub datasets
+
+A dataset named `hf:<dataset>:<split>`, as in `hf:acme/pets:train`, is a Hugging Face `datasets.Dataset`. An Arrow-backed dataset answers `len()` and integer indexing, so `HFDatasetSource` hands it to grain as a random-access source and the records go through the same image transform as a TFDS dataset, with the caption read from the record's `caption` or `text` column. The split defaults to `train`, no `dataset_path` is involved, and reading needs the `streaming` extra; naming one does not. The table stays out of the pickle grain sends to its workers: they reload it by name and split.
+
 ## Streaming
 
 `get_dataset_online` builds an `OnlineStreamingDataLoader` over Hugging Face `datasets` URLs, fetching and decoding images or videos in worker threads. It needs the `streaming` extra. `dew.data` imports lazily through a module `__getattr__`, so a training run that only uses grain never pays for that stack, and a host without opencv or PyAV can still `import dew.data`.

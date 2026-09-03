@@ -40,7 +40,14 @@ license = "MIT"
 dew-tpu = "dew.cli.tpu:main"
 
 [project.optional-dependencies]
-test = ["pytest", "safetensors"]
+test = [
+    "pytest",
+    "safetensors",
+    # test_hf_data.py; 3.6.0 is the last release whose dependency set works
+    # with the pyarrow it pulls (datasets 5.x + pyarrow 25 break inside
+    # datasets' own fingerprinting before any dew code runs).
+    "datasets==3.6.0",
+]
 # AV/video sources and readers (lazy imports in dew.data)
 av = ["opencv-python", "decord", "moviepy", "av", "pillow"]
 # FID (scipy sqrtm) and Inception weight download

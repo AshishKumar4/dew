@@ -60,6 +60,7 @@ The public modules, and what each one is for.
 | `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_token_dataset_grain`, `get_packed_token_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
 | `dew.data.text` | `ByteTokenizer`, `HFTokenizer` |
 | `dew.data.sources.text` | `TokenFileSource`, `TokenDocumentSource` |
+| `dew.data.sources.hf` | `HFDatasetSource`, the `hf:<dataset>:<split>` route into the media loader |
 | `dew.data.registry` | `datasetMap`, `onlineDatasetMap`, `mediaDatasetMap` |
 | `dew.data.sources.base` | `DataSource`, `DataAugmenter`, `MediaDataset` |
 | `dew.data.sources.images`, `.videos`, `.voxceleb2` | the TFDS, GCS, local video and VoxCeleb2 implementations |
@@ -69,7 +70,8 @@ The public modules, and what each one is for.
 | Module | Contents |
 | --- | --- |
 | `dew.eval` | `EvaluationMetric`, `get_fid_metric`, `get_clip_metric`, `get_clip_score_metric`, `get_psnr_metric`, `get_ssim_metric`, `get_perplexity_metric`, `psnr`, `ssim`, `frechet_distance` |
-| `dew.interop` | `save_params`, `load_params`, `save_hf_layout`, `load_pretrained_decoder`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
+| `dew.interop` | `save_params`, `load_params`, `save_hf_layout`, `push_to_hub`, `pull_from_hub`, `load_pretrained_decoder`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
 | `dew.interop.hf_decoders` | `load_pretrained_decoder`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
+| `dew.interop.hub` | `push_to_hub`, `pull_from_hub` |
 | `dew.random_state` | `MarkovState`, `RandomMarkovState` |
 | `dew.image_ops` | `clip_images`, `denormalize_images` |

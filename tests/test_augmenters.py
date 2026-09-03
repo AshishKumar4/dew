@@ -293,6 +293,40 @@ def test_the_caption_template_comes_from_the_record_rng(tmp_path):
     assert labelizer(element, _record_rng(3)) == captions[3]
 
 
+@pytest.mark.parametrize("column", ["caption", "text"])
+def test_a_record_caption_is_taken_as_it_is(column):
+    """Hub datasets carry their own text, under either of two column names."""
+    labelizer = images.labelizer_record_caption
+
+    assert labelizer({column: "a yellow tulip"}, _record_rng(0)) == "a yellow tulip"
+
+
+def test_a_record_with_no_caption_column_says_what_it_has():
+    with pytest.raises(KeyError, match="'caption' or a 'text' column"):
+        images.labelizer_record_caption({"image": None, "url": "x"}, _record_rng(0))
+
+
+def test_the_tfds_transform_captions_from_the_record_and_reads_no_label_file(monkeypatch):
+    """The same image transform serves a hub dataset: what changes is where the
+    caption comes from, and that a caption dataset has no class index."""
+    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "none")
+    # The default label path points at a TFDS install that is not here; a
+    # record-caption augmenter must never open it.
+    transform = ImageTFDSAugmenter(
+        labelizer=images.labelizer_record_caption).create_transform(image_scale=SCALE)()
+
+    element = {"image": _synthetic_image(0), "caption": "a yellow tulip"}
+    out = transform.random_map(element, _record_rng(0))
+
+    np.testing.assert_array_equal(
+        out["image"], cv2.resize(element["image"], (SCALE, SCALE),
+                                 interpolation=cv2.INTER_AREA))
+    np.testing.assert_array_equal(
+        out["text"]["input_ids"], _StubTokenizer()("a yellow tulip")["input_ids"][0])
+    assert "label" not in out
+
+
 # ---------------------------------------------------------------------------------
 # Loader level: a record does not depend on how many workers produced it
 # ---------------------------------------------------------------------------------

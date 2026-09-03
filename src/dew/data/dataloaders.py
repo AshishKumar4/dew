@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import grain.python as pygrain
-from typing import Dict, Any, Optional, Union, List, Callable, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, Union, List, Callable, TYPE_CHECKING
 from pathlib import Path
 import numpy as np
 import jax
 import cv2
 from dew.inputs.processors import AutoTextTokenizer
 from .registry import datasetMap, onlineDatasetMap, mediaDatasetMap
+from .sources.base import MediaDataset
 # NOTE: .online_loader is imported lazily inside the two `*_online` factories.
 # It needs HF `datasets`, which the grain paths must not require.
 from functools import partial
@@ -339,6 +340,44 @@ class _SourceSlice:
         return self.source[self.start + index]
 
 
+_HF_PREFIX = "hf:"
+
+
+def _hf_dataset_spec(data_name: str) -> Optional[Tuple[str, str]]:
+    """`(dataset, split)` when `data_name` is an `hf:<dataset>[:<split>]` name.
+
+    A hub dataset is named, not registered: one repo id per dataset and no
+    path to resolve against, so the dataset string carries both halves. Repo
+    ids are `namespace/name` and hold no colon, so the split parses off the
+    tail unambiguously; it defaults to train.
+    """
+    if not data_name or not data_name.startswith(_HF_PREFIX):
+        return None
+    dataset, _, split = data_name[len(_HF_PREFIX):].partition(":")
+    if not dataset:
+        raise ValueError(
+            f"'{data_name}' names no hub dataset; write it as hf:<dataset>:<split>")
+    return dataset, split or "train"
+
+
+def _hf_media_dataset(dataset: str, split: str) -> MediaDataset:
+    """The image pipeline for a hub dataset: its Arrow table, the TFDS transform.
+
+    Records go through the same augmenter as a TFDS image dataset. The caption
+    comes from the record instead of a class-label file, which is the one
+    thing a hub dataset does differently.
+    """
+    from .sources.hf import HFDatasetSource
+    from .sources.images import ImageTFDSAugmenter, labelizer_record_caption
+
+    return MediaDataset(
+        source=HFDatasetSource(name=dataset, split=split),
+        augmenter=ImageTFDSAugmenter(labelizer=labelizer_record_caption),
+        media_type="image",
+    )
+
+
+
 def get_media_dataset_grain(
     data_name: str,
     batch_size: int = 64,
@@ -361,7 +400,9 @@ def get_media_dataset_grain(
     """Get a grain dataset loader for any media type (image or video).
     
     Args:
-        data_name: Name of the dataset in mediaDatasetMap.
+        data_name: Name of the dataset in mediaDatasetMap, or an
+            `hf:<dataset>:<split>` reference to a Hugging Face hub dataset,
+            which builds its own image pipeline.
         batch_size: Batch size for the dataset.
         media_scale: Size to scale media (image or video frames) to.
         sequence_length: Length of the sequence for video data.
@@ -375,7 +416,8 @@ def get_media_dataset_grain(
         seed: Random seed.
         dataset_source: Root path the dataset's source resolves its files
             against. Required - there is no sane default for a bucket mount
-            or a local media tree.
+            or a local media tree. An `hf:` dataset needs none, it resolves
+            by name.
         media_type: Type of media ("image" or "video"). Auto-detected if None.
         additional_transform_kwargs: Additional arguments for the transform.
         val_count: Records held out, in canonical source order, as a
@@ -388,16 +430,19 @@ def get_media_dataset_grain(
         Dictionary with train dataset function and metadata; with val_count set
         it also carries "val" and "val_len" for the held-out split.
     """
-    if data_name not in mediaDatasetMap:
-        raise ValueError(f"Dataset {data_name} not found in mediaDatasetMap")
-    if not dataset_source:
-        raise ValueError(
-            f"get_media_dataset_grain('{data_name}') needs an explicit dataset_source: "
-            "media sources resolve their files against it, and an unset one used to "
-            "reach os.path.join(None, ...) inside the source itself."
-        )
-
-    media_dataset = mediaDatasetMap[data_name]
+    hf_spec = _hf_dataset_spec(data_name)
+    if hf_spec is not None:
+        media_dataset = _hf_media_dataset(*hf_spec)
+    else:
+        if data_name not in mediaDatasetMap:
+            raise ValueError(f"Dataset {data_name} not found in mediaDatasetMap")
+        if not dataset_source:
+            raise ValueError(
+                f"get_media_dataset_grain('{data_name}') needs an explicit dataset_source: "
+                "media sources resolve their files against it, and an unset one used to "
+                "reach os.path.join(None, ...) inside the source itself."
+            )
+        media_dataset = mediaDatasetMap[data_name]
 
     # Auto-detect media_type if not provided
     if media_type is None:
@@ -406,12 +451,17 @@ def get_media_dataset_grain(
     # Get the data source and augmenter
     data_source = media_dataset.get_source(dataset_source)
 
-    # Prepare transform kwargs
-    transform_kwargs = {
-        "image_scale" if media_type == "image" else "frame_size": media_scale,
-        "method": method,
-        "sequence_length": sequence_length,
-    }
+    # Prepare transform kwargs. A frame size and a clip length are the video
+    # transforms' arguments; the image transforms take neither, and handing
+    # them one raised TypeError on every image dataset that came through here.
+    if media_type == "image":
+        transform_kwargs = {"image_scale": media_scale, "method": method}
+    else:
+        transform_kwargs = {
+            "frame_size": media_scale,
+            "method": method,
+            "sequence_length": sequence_length,
+        }
     if additional_transform_kwargs:
         transform_kwargs.update(additional_transform_kwargs)
 
@@ -847,6 +897,9 @@ def load_data(config: DataConfig) -> dict:
     from tools/tokenize_text.py) takes the token loader ahead of all of
     that, and needs DataConfig.sequence_length. With pack_sequences the
     windows are whole documents packed by grain instead of fixed strides.
+
+    A dataset named `hf:<dataset>:<split>` is a Hugging Face hub dataset,
+    which the media loader reads through grain's random access.
     """
     token_dir = _token_dataset_dir(config.dataset)
     if token_dir is not None:
