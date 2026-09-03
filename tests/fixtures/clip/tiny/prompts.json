@@ -5,5 +5,14 @@
     "two cats on a mat, painted",
     "x"
   ],
-  "max_length": 77
+  "max_length": 77,
+  "images": {
+    "seed": 0,
+    "shape": [
+      4,
+      16,
+      12,
+      3
+    ]
+  }
 }

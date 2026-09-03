@@ -4,8 +4,13 @@ PSNR and SSIM are checked against their closed forms and against the
 properties they exist to report (degradation ordering, shape handling).
 The Frechet distance itself is checked against closed forms that need no
 weights; the end-to-end InceptionV3 path downloads the FID checkpoint and is
-network-marked.
+network-marked. The CLIP metrics build on the tiny checkpoint under
+tests/fixtures/clip and score against the cosines of the reference's own
+embeddings.
 """
+
+import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -15,12 +20,16 @@ import pytest
 import dew.eval as metrics
 from dew.eval import (
     EvaluationMetric,
+    get_clip_metric,
+    get_clip_score_metric,
     get_psnr_metric,
     get_ssim_metric,
     psnr,
     ssim,
 )
 from dew.eval.fid import frechet_distance, get_fid_metric
+
+CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
 
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
@@ -214,3 +223,74 @@ def test_metrics_package_exports_resolve():
     }
     for name in metrics.__all__:
         assert getattr(metrics, name) is not None
+
+
+############################################################################################################
+# CLIP
+############################################################################################################
+
+
+def clip_fixture():
+    """The reference's inputs and embeddings, and the sampler-shaped batch
+    that carries them: images in [-1, 1] and the tokenized captions."""
+    reference = np.load(CLIP_TINY / "reference.npz")
+    recipe = json.loads((CLIP_TINY / "prompts.json").read_text())["images"]
+    images = np.random.RandomState(recipe["seed"]).randint(
+        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
+    generated = jnp.asarray(images, jnp.float32) / 127.5 - 1.0
+    batch = {"text": {"input_ids": reference["input_ids"],
+                      "attention_mask": reference["attention_mask"]}}
+    image = reference["image_embeds"].astype(np.float64)
+    text = reference["text_embeds"].astype(np.float64)
+    cosine = ((image * text).sum(-1)
+              / np.linalg.norm(image, axis=-1) / np.linalg.norm(text, axis=-1))
+    return generated, batch, cosine
+
+
+CLIP_TOLERANCE = 1e-5
+
+
+def test_clip_metric_scores_the_reference_cosine():
+    """The factory builds on the vendored towers, the images go through the
+    checkpoint's own processor, and the score is the reference's
+    mean(1 - cos): observed 3.2e-08 off it against a tolerance of 1e-5. Before
+    the towers were vendored, the factory raised ImportError on
+    `FlaxCLIPModel`, which transformers 5 removed."""
+    metric = get_clip_metric(modelname=str(CLIP_TINY))
+    assert isinstance(metric, EvaluationMetric)
+    assert metric.name == 'clip_similarity' and metric.higher_is_better is False
+    generated, batch, cosine = clip_fixture()
+
+    score = float(metric.function(generated, batch))
+
+    expected = np.mean(1.0 - cosine)
+    assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
+
+
+def test_clip_score_metric_clamps_the_reference_cosine():
+    """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
+    cosine (-0.072) among three positive ones, so the clamp does work here.
+    Observed 6.1e-06 off the reference against a tolerance of 1e-5."""
+    metric = get_clip_score_metric(modelname=str(CLIP_TINY))
+    assert metric.name == 'clip_score' and metric.higher_is_better is True
+    generated, batch, cosine = clip_fixture()
+    assert (cosine < 0).any() and (cosine > 0).any()
+
+    score = float(metric.function(generated, batch))
+
+    expected = np.mean(100.0 * np.maximum(cosine, 0.0))
+    assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
+    assert score != pytest.approx(np.mean(100.0 * cosine), abs=1e-3)
+
+
+def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
+    """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
+    it to a dark pixel, which the old metric did; the score of an overshooting
+    white image has to be the score of a white one."""
+    metric = get_clip_score_metric(modelname=str(CLIP_TINY))
+    _, batch, _ = clip_fixture()
+    white = jnp.ones((4, 16, 12, 3), jnp.float32)
+
+    assert float(metric.function(1.2 * white, batch)) == float(metric.function(white, batch))
+    assert float(metric.function(-1.2 * white, batch)) == float(metric.function(-white, batch))
+    assert float(metric.function(white, batch)) != float(metric.function(-white, batch))
