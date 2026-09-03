@@ -19,12 +19,14 @@ import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.config import OptimConfig
 from dew.inputs import DiffusionInputConfig
 from dew.eval.common import EvaluationMetric
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.diffusion.transforms import get_diffusion_preset
 from dew.training import ObjectiveTrainer, SimpleTrainer
+from dew.training.optim import build_optimizer
 from dew.objectives.base import EMASpec, Objective
 from dew.training.distributed import (
     DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator,
@@ -896,3 +898,45 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
 
     trainer.wait_for_checkpoints()
     assert trainer.checkpointer.latest_step() == 2
+
+
+def optimizer_for(optimizer="adam", grad_accum_steps=1):
+    """The optimizer a run's config builds, which is what it resumes into."""
+    return build_optimizer(
+        OptimConfig(optimizer=optimizer, learning_rate=1e-3,
+                    grad_accum_steps=grad_accum_steps),
+        steps_per_epoch=1)
+
+
+@pytest.mark.parametrize("written,resumed", [
+    (dict(optimizer="adam"), dict(optimizer="muon")),
+    (dict(optimizer="adam", grad_accum_steps=2), dict(optimizer="adam")),
+], ids=["optimizer", "accumulation"])
+def test_a_checkpoint_the_run_cannot_hold_is_refused_with_what_to_do(
+        tmp_path, written, resumed):
+    """Swapping the solver or the accumulation has to be a message, not a crash.
+
+    The optimizer state is part of what a checkpoint carries, and MultiSteps
+    adds counters and an accumulator around it, so neither swap can be
+    restored. Orbax says so from inside its own tree walk, as a key path and a
+    pair of container types; the run has to say which part of the state does
+    not fit and what to do instead.
+    """
+    trainer = make_trainer(
+        tmp_path, "swap", distributed_training=True,
+        optimizer=optimizer_for(**written),
+        grad_accum_steps=written.get("grad_accum_steps", 1))
+    trainer.save(epoch=0, step=1)
+    trainer.wait_for_checkpoints()
+
+    with pytest.raises(ValueError) as error:
+        make_trainer(tmp_path, "swap", distributed_training=True,
+                     optimizer=optimizer_for(**resumed),
+                     grad_accum_steps=resumed.get("grad_accum_steps", 1),
+                     load_from_checkpoint=trainer.checkpoint_path())
+
+    message = str(error.value)
+    assert "does not fit this run's train state" in message
+    assert "opt_state" in message, "the message does not say which part"
+    assert "optimizer" in message and "gradient accumulation" in message
+    assert trainer.checkpoint_path() in message
