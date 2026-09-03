@@ -24,7 +24,6 @@ import numpy as np
 from dew.registry import apply_precision_policy, build_model
 
 CONFIG_FILE = "config.json"
-WEIGHTS_FILE = "model.safetensors"
 GENERATION_CONFIG_FILE = "generation_config.json"
 
 # The KV cache is allocated at the full decode length, so a 128k-context
