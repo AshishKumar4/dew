@@ -5,6 +5,8 @@ is silently dropped or remapped means the inference pipeline runs a
 different model than the one in the checkpoint.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -59,6 +61,15 @@ def test_parse_config_rebuilds_model():
     assert model.num_layers == 2
     assert model.dtype == jnp.bfloat16
     assert model.precision == jax.lax.Precision.HIGH
+
+
+def test_parse_config_leaves_warning_filters_untouched():
+    """Silencing every warning in the process hides the failures the rest of
+    the run would otherwise report."""
+    before = list(warnings.filters)
+    parse_config(make_config())
+
+    assert warnings.filters == before
 
 
 def test_parse_config_drops_removed_fields():
