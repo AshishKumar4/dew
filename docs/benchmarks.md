@@ -15,11 +15,11 @@ the step time and by one device's dense bf16 peak (97.5 TFLOP/s for this card).
 ## `--preset small` on one RTX 4080
 
 ```
-python tools/benchmark_step.py --preset small --json-out bench.json
+python tools/benchmark_step.py --preset small --architectures unet --json-out bench.json
 ```
 
 Run 2026-09-02, jax 0.11.1 / jaxlib 0.11.1 (CUDA), flax 0.12.9, optax 0.2.8,
-driver 595.84, RTX 4080 16 GiB, dew at `9be3e61`. Every model in bf16
+driver 595.84, RTX 4080 16 GiB, dew at `6b0f119`. Every model in bf16
 (`dtype=bfloat16`), single device, `fsdp_size=1`, adam, 2 warmup steps, 100
 steps per architecture. One invocation per architecture (`--architectures
 unet` and so on), so each row's peak memory is its own; `ms/step` times the
