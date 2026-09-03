@@ -279,6 +279,7 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
         grad_accum_steps=config.optim.grad_accum_steps,
         use_dynamic_scale=config.optim.use_dynamic_scale,
         fsdp_size=config.trainer.fsdp_size,
+        expert_size=config.trainer.expert_size,
         fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
         logical_axis_rules=config.trainer.logical_axis_rules,
         sharding_tolerance=config.trainer.sharding_tolerance,
