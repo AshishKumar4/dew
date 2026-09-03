@@ -14,6 +14,11 @@ nav:
       - Distributed training: concepts/distributed.md
       - The data pipeline: concepts/data.md
       - Language models: concepts/language_models.md
+  - Design:
+      - The API: design/api.md
+      - Review of main at 102baa4: design/review-2026-09-03.md
+      - Dew at scale: design/plan.md
+      - Post-training: design/post-training.md
   - Recipes: recipes.md
   - TPUs: tpu.md
   - Benchmarks: benchmarks.md
