@@ -1,3 +1,4 @@
+import copy
 import cv2
 import jax.numpy as jnp
 import grain.python as pygrain
@@ -6,6 +7,8 @@ from typing import Dict, Any, Callable, List, Optional
 import jax
 import os
 import struct as st
+import threading
+import weakref
 from functools import partial
 import numpy as np
 from .base import DataSource, DataAugmenter
@@ -65,17 +68,30 @@ def image_augmentations():
     ])
 
 
+# Each thread's copies of the pipelines it has augmented with, keyed by the
+# shared pipeline they were copied from.
+_thread_pipelines = threading.local()
+
+
 def augment_image(augments, image, rng: np.random.Generator):
     """Apply a pipeline from image_augmentations to one image.
 
     The seed is drawn from grain's per-record rng (Philox keyed by the record
     index), so every record gets the same augmentation regardless of how many
-    workers or processes produced the batch. albumentations keeps its
-    randomness in instance-local generators, so numpy's global RNG is never
-    touched from inside data-loading workers.
+    workers, threads or processes produced the batch. albumentations keeps the
+    generators a call draws from on the pipeline itself, so a pipeline shared
+    between grain's prefetch threads had one record's seed applied to another
+    record's pixels; each thread seeds and runs a copy of its own. numpy's
+    global RNG is never touched from inside data-loading workers.
     """
-    augments.set_random_seed(int(rng.integers(0, 2**32 - 1)))
-    return augments(image=image)['image']
+    copies = getattr(_thread_pipelines, "copies", None)
+    if copies is None:
+        copies = _thread_pipelines.copies = weakref.WeakKeyDictionary()
+    pipeline = copies.get(augments)
+    if pipeline is None:
+        pipeline = copies[augments] = copy.deepcopy(augments)
+    pipeline.set_random_seed(int(rng.integers(0, 2**32 - 1)))
+    return pipeline(image=image)['image']
 
 
 PROMPT_TEMPLATES = [
