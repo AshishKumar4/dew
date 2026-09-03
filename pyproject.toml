@@ -82,9 +82,14 @@ filterwarnings = [
     'error::DeprecationWarning:(test_|conftest)',
     'error::FutureWarning:(test_|conftest)',
     # os.fork in a process that already runs JAX threads is the deadlock this
-    # suite exists to catch, whichever library calls it, so it fails wherever
-    # it comes from rather than being scoped to dew.
+    # suite exists to catch, so jax's own warning about it is an error
+    # wherever it comes from rather than scoped to dew.
     'error:os\.fork\(\) was called:RuntimeWarning',
+    # CPython warns about the same fork from multiprocessing's start method,
+    # and that one is deliberately not listed. A pool forks on its own thread,
+    # where an error raised by a filter is swallowed, so making it an error
+    # would delete the message instead of failing the run. It has to stay
+    # visible, and a test that starts a pool has to assert it never appears.
 ]
 
 [tool.setuptools.dynamic]
