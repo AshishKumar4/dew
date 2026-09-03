@@ -1,0 +1,9 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "<|startoftext|>",
+  "eos_token": "<|endoftext|>",
+  "model_max_length": 77,
+  "pad_token": "<|endoftext|>",
+  "tokenizer_class": "CLIPTokenizer",
+  "unk_token": "<|endoftext|>"
+}
