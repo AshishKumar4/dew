@@ -58,7 +58,7 @@ Three axes beyond the usual list are worth naming:
 
 The mesh is built by `create_device_mesh` (`utils/maxtext_utils.py:2169-2248`): fill the `-1`s with `fill_unspecified_mesh_axes`, then `mesh_utils.create_hybrid_device_mesh(ici_parallelism, dcn_parallelism, devices)` for multiple slices, or `mesh_utils.create_device_mesh(ici_parallelism, devices)` for one. Around that sit sub-slice selection, split physical axes, ring-reshaped custom meshes, a v6e-specific optimisation, and an elastic device list from `elastic_utils.live_devices`.
 
-**The part worth copying is not the axis list, it is the indirection.** Arrays carry logical names, and the config maps each logical name to an ordered list of physical axes; the first axis that exists in the mesh wins. The table is 109 lines, `base.yml:550-658`. Five of them show the shape:
+**The part worth copying is the indirection.** Arrays carry logical names, and the config maps each logical name to an ordered list of physical axes; the first axis that exists in the mesh wins. The table is 109 lines, `base.yml:550-658`. Five of them show the shape:
 
 ```
 ['activation_batch_attn', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
@@ -259,7 +259,7 @@ Tunix also ships its own model zoo with `safetensors_loader.py`, `safetensors_sa
 
 ### What Dew should do about it
 
-The honest position is that Dew's post-training story is safetensors. Dew can already export to and import from Hugging Face format, and that is the interchange both ecosystems accept. Post-training in Tunix means exporting weights, training there, importing back, which is a real workflow and needs no coupling.
+Dew's post-training story is safetensors. Dew can already export to and import from Hugging Face format, and that is the interchange both ecosystems accept. Post-training in Tunix means exporting weights, training there, importing back, which is a real workflow and needs no coupling.
 
 If Dew wants deeper integration later, the cheapest path is a `dew.interop` function that converts a Dew Linen param tree into the NNX structure Tunix expects, modelled on `module_from_linen_variables`. That is an adapter in Dew, not a dependency on Tunix internals.
 
@@ -335,7 +335,7 @@ Dew already uses more of Orbax than most projects do: a `CheckpointManager` with
 
 `orbax/checkpoint/experimental/v1/` is a full parallel API. Its training entry point is `Checkpointer`, a context manager with `should_save(step)`, `save_checkpointables`, `save_checkpointables_async`, `load_checkpointables`, `save_pytree` and `load_pytree` (`checkpoint/orbax/checkpoint/experimental/v1/_src/training/checkpointer.py:81,277,383,524,687,954-966`), exported alongside `save_decision_policies`, `preservation_policies`, `errors`, `CheckpointMetadata` and `RootMetadata` (`experimental/v1/training.py:19-30`).
 
-The naming is the design: a checkpoint is a set of named *checkpointables*, not one pytree. Model state, optimizer state and a data iterator are siblings, each with its own handler. Dew packs everything into one pytree and then works around the consequences, including a variable-length leaf for the data iterator position (`trainer.py:285-288`).
+A checkpoint is a set of named *checkpointables*, not one pytree. Model state, optimizer state and a data iterator are siblings, each with its own handler. Dew packs everything into one pytree and then works around the consequences, including a variable-length leaf for the data iterator position (`trainer.py:285-288`).
 
 Two policies are separated where Dew's options conflate them: `SaveDecisionPolicy` decides whether to write at this step (`save_decision_policies.py:50`, with `SaveEveryNSteps` at `:81`), and `PreservationPolicy` decides what to keep afterwards (`preservation_policies.py:40`). Dew uses preservation policies already but expresses "when to save" as an if-statement in the loop.
 
@@ -426,7 +426,7 @@ Dew's `build_optimizer` offers `adam`, `adamw` and `lamb`, a warmup-cosine sched
 
 `optax/contrib/_muon.py`. Momentum with `beta=0.95` and Nesterov on by default, then a Newton-Schulz quintic iteration orthogonalises the 2D update: `ns_steps=5`, coefficients `(3.4445, -4.7750, 2.0315)`, a Frobenius rescale before the iteration, and a transpose for efficiency. The update is then scaled by `sqrt(max(1, fan_out/fan_in))`, or with `consistent_rms=0.2` by `sqrt(max(fan_in, fan_out))`, which makes the update RMS shape-independent so Muon and AdamW can share one parameter tree.
 
-The practical detail: the top-level `muon()` partitions parameters by `ndim == 2`. Matrices go through `scale_by_muon`, everything else goes through `optax.adamw`. Adopting Muon needs no restructuring of Dew's parameter tree, only a `weight_dimension_numbers` spec for arrays whose matrix axes are not `(0, 1)`.
+The practical detail is that the top-level `muon()` partitions parameters by `ndim == 2`. Matrices go through `scale_by_muon`, everything else goes through `optax.adamw`. Adopting Muon needs no restructuring of Dew's parameter tree, only a `weight_dimension_numbers` spec for arrays whose matrix axes are not `(0, 1)`.
 
 **MuonClip is not in Optax.** A repository-wide search for `muon_clip` or `MuonClip` returns nothing. The mechanism exists elsewhere and belongs elsewhere: it is QK-Clip, a per-head rescale of the query and key projections when the observed maximum attention logit exceeds a threshold. MaxText implements it at the attention seam as `use_qk_clip` with `qk_clip_threshold: 100.0` (section 1).
 
@@ -515,7 +515,7 @@ So sm_89, which includes this workstation's RTX 4080, is the first architecture 
 
 ### What Dew should do about it
 
-Qwix fits Dew's model code without touching it, which is the whole argument. Dew's parameters are Linen pytrees, and Qwix's entry point is one call on the module plus one on the params. Nothing in `dew.nn` needs a quantization branch, and nothing in the checkpoint format changes except that leaves become `QArray`.
+Qwix fits Dew's model code without touching it. Dew's parameters are Linen pytrees, and Qwix's entry point is one call on the module plus one on the params. Nothing in `dew.nn` needs a quantization branch, and nothing in the checkpoint format changes except that leaves become `QArray`.
 
 The sensible order: int8 PTQ first, because it is cheap to validate (quantize, evaluate, compare) and it gives Dew a serving story. Then `QtProvider` for fp8 training, which is where the throughput is, on TPU v5e and above and on Ada or newer GPUs. Note that fp8 training and Dew's fp32 master weights are compatible: the weights stay fp32 while the gemms run in fp8.
 
