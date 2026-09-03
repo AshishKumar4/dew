@@ -326,6 +326,10 @@ class SimpleTrainer:
         return template, restore_args
 
     def load(self, checkpoint_path, checkpoint_step=None, load_directly_from_dir=False):
+        if not _is_uri(checkpoint_path):
+            # orbax takes local paths absolute only, and a recipe's is
+            # ./checkpoints/<run>.
+            checkpoint_path = os.path.abspath(checkpoint_path)
         # The handler has to be registered for item_metadata to report the
         # checkpoint's structure, which is what the template is built against.
         manager = ocp.CheckpointManager(
