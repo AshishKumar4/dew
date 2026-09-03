@@ -75,12 +75,6 @@ class NoiseScheduler():
     def transform_inputs(self, x, steps):
         return x, steps
     
-    def get_posterior_mean(self, x_0, x_t, steps):
-        raise NotImplementedError
-    
-    def get_posterior_variance(self, steps, shape=(-1, 1, 1, 1)):
-        raise NotImplementedError
-
     def get_max_variance(self, shape=(-1, 1, 1, 1)):
         alpha_n, sigma_n = self.get_rates(self.max_timesteps, shape=shape)
         variance = jnp.sqrt(alpha_n ** 2 + sigma_n ** 2) 
