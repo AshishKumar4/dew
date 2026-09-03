@@ -443,7 +443,8 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp_size):
     to leave a checkpoint behind.
     """
     trainer = make_trainer(tmp_path, fsdp_size=fsdp_size)
-    assert trainer.mesh.devices.shape == (jax.device_count() // fsdp_size, fsdp_size)
+    assert trainer.mesh.shape['fsdp'] == fsdp_size
+    assert trainer.mesh.shape['data'] == jax.device_count() // fsdp_size
     specs = [p.sharding.spec for p in jax.tree.leaves(trainer.state.params)]
     if fsdp_size > 1:
         sharded = [p for p in jax.tree.leaves(trainer.state.params)
