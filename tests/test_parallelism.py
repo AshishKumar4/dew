@@ -5,6 +5,8 @@ migration: a partitioned run has to produce the same numbers as a single-device
 one, otherwise the collectives GSPMD derived are not the ones we meant.
 """
 
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -157,6 +159,35 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
     resumed = DevicePrefetchIterator(iter(loader), batch_sharding(mesh), depth=2,
                                      source_state=state)
     assert np.array_equal(np.asarray(next(resumed)), expected)
+
+
+def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
+    """The packed loader is grain's Dataset API, whose iterator reports its
+    position as a dict where the DataLoader reports JSON bytes. A checkpoint
+    holds bytes, so the position has to arrive as bytes and go back as a
+    dict."""
+    from dew.data.dataloaders import get_packed_token_dataset_grain
+
+    documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
+    (tmp_path / "train.bin").write_bytes(documents.tobytes())
+    (tmp_path / "val.bin").write_bytes(documents.tobytes())
+    (tmp_path / "meta.json").write_text(json.dumps(
+        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
+    data = get_packed_token_dataset_grain(
+        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
+        batch_size=jax.device_count(), seq_len=8, seed=0, worker_count=0,
+        num_epochs=1, num_packing_bins=2)
+
+    mesh = build_mesh()
+    it = DevicePrefetchIterator(data["val"](), batch_sharding(mesh), depth=2)
+    next(it)
+    state = it.source_state
+    expected = np.asarray(next(it)["text"])
+    assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
+
+    resumed = DevicePrefetchIterator(data["val"](), batch_sharding(mesh), depth=2,
+                                     source_state=state)
+    assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
 
 
 # --------------------------------------------------------------------------
