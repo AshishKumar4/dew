@@ -30,6 +30,3 @@ class DDPMSampler(DiffusionSampler):
 
         next_samples = next_signal_rate * reconstructed_samples + pred_noise_coeff * pred_noise + noise * gamma
         return next_samples, state
-
-# Back-compat alias; older configs and notebooks import SimpleDDPMSampler.
-SimpleDDPMSampler = DDPMSampler
