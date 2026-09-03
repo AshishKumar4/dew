@@ -1,5 +1,3 @@
-import jax.numpy as jnp
-import flax.linen as nn
 from typing import Any, Callable
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -123,41 +121,33 @@ class AudioEncoder(ConditioningEncoder):
 
 @dataclass
 class HFAudioEncoder(AudioEncoder):
-    """Any HuggingFace audio model, resolved through the Auto* classes.
+    """Audio conditioning through a Hugging Face feature extractor and a model
+    that takes its features.
 
-    Works with wav2vec2/HuBERT (`input_values`), Whisper/AST
-    (`input_features`) and anything else whose processor and model are
-    registered with transformers - whatever keys the processor emits are
-    forwarded to the model unchanged, so swapping the audio model is a config
-    change and nothing more. Audio *file* formats are handled upstream by
-    `dew.data.sources.audio_utils.read_audio`, which decodes via ffmpeg
-    and resamples to `sampling_rate`.
+    Whatever keys the extractor emits (`input_values` for wav2vec2/HuBERT,
+    `input_features` for Whisper/AST) are forwarded to the model unchanged.
+    Audio file formats are handled upstream by
+    `dew.data.sources.audio_utils.read_audio`, which decodes via ffmpeg and
+    resamples to `sampling_rate`.
+
+    No loader builds the model: transformers 5 ships no Flax audio models, and
+    a torch one cannot take the numpy arrays `tokenize` produces.
+    `from_modelname` says so. Until an audio tower is vendored the way
+    `dew.nn.text_encoders` vendors CLIP, an encoder is constructed with a
+    model of the caller's own.
     """
     modelname: str
     backend: str
     sampling_rate: int
 
     @staticmethod
-    def from_modelname(modelname: str = "facebook/wav2vec2-base-960h",
-                       backend: str = "jax", sampling_rate: int = None):
-        from transformers import AutoFeatureExtractor
-        processor = AutoFeatureExtractor.from_pretrained(modelname)
-        if backend == "jax":
-            from transformers import FlaxAutoModel
-            model = FlaxAutoModel.from_pretrained(modelname, dtype=jnp.bfloat16)
-        else:
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(modelname)
-        if sampling_rate is None:
-            # The processor knows the rate its model was trained at
-            sampling_rate = getattr(processor, "sampling_rate", 16000)
-        return HFAudioEncoder(
-            model=model,
-            tokenizer=processor,
-            modelname=modelname,
-            backend=backend,
-            sampling_rate=sampling_rate,
-        )
+    def from_modelname(modelname: str = "facebook/wav2vec2-base-960h", backend: str = "jax"):
+        raise NotImplementedError(
+            f"no loader can build {modelname!r} on backend {backend!r}: transformers 5 "
+            "ships no Flax audio models, and a torch model cannot take the numpy "
+            "arrays tokenize produces. Vendor the audio tower the way "
+            "dew.nn.text_encoders vendors CLIP, then construct HFAudioEncoder with it "
+            "and AutoFeatureExtractor.from_pretrained(modelname) as the tokenizer")
 
     def tokenize(self, data):
         return dict(self.tokenizer(
@@ -180,7 +170,6 @@ class HFAudioEncoder(AudioEncoder):
         return HFAudioEncoder.from_modelname(
             modelname=serialized_config["modelname"],
             backend=serialized_config["backend"],
-            sampling_rate=serialized_config.get("sampling_rate"),
         )
 
 CONDITIONAL_ENCODERS_REGISTRY = {
