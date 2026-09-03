@@ -14,10 +14,15 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 DATA_AXIS = 'data'
 FSDP_AXIS = 'fsdp'
+EXPERT_AXIS = 'expert'
+
+# The two axes a parameter can be split over. A dimension named 'exp' takes
+# the expert axis, everything else takes fsdp.
+PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS)
 
 # Batches are split across every device, whichever axis it sits on; only
-# parameters distinguish the two axes.
-BATCH_SPEC = P((DATA_AXIS, FSDP_AXIS))
+# parameters distinguish the axes.
+BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS))
 
 # Below this many elements a parameter costs more in collectives than it saves
 # in memory, so it stays replicated.
@@ -43,7 +48,7 @@ DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
     ("heads", FSDP_AXIS),
     ("kv", FSDP_AXIS),
     ("output", FSDP_AXIS),
-    ("expert", FSDP_AXIS),
+    ("exp", EXPERT_AXIS),
     ("batch", None),
     ("sequence", None),
     ("stage", None),
@@ -65,6 +70,13 @@ DEFAULT_LOGICAL_PARAM_AXES: Mapping[tuple[str, ...], LogicalAxes] = {
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
     ("down_proj",): ("mlp", "embed"),
+    # A sparse layer's experts are stacked on one leaf, so the expert
+    # dimension is named here and the longer path wins over the dense
+    # projection above it.
+    ("experts", "gate_proj"): ("exp", "embed", "mlp"),
+    ("experts", "up_proj"): ("exp", "embed", "mlp"),
+    ("experts", "down_proj"): ("exp", "mlp", "embed"),
+    ("gate",): ("embed", "exp"),
     ("patch_embed", "Conv_0"): (None, None, None, "embed"),
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -120,8 +132,8 @@ def _normalize_logical_axis_rules(
 ) -> LogicalAxisRules:
     """Rules as flax wants them, minus mesh axes this mesh does not have.
 
-    Dropping absent axes is what lets one table name a future 'tensor' or
-    'expert' mesh axis and still apply on today's (data, fsdp) mesh.
+    Dropping absent axes is what lets one table name a future 'tensor' axis
+    and still apply on today's (data, expert, fsdp) mesh.
     """
     items = (DEFAULT_LOGICAL_AXIS_RULES if rules is None
              else rules.items() if isinstance(rules, Mapping) else rules)
@@ -133,22 +145,29 @@ def _normalize_logical_axis_rules(
     return tuple(normalized)
 
 
-def build_mesh(fsdp_size: int = 1, devices: Optional[list] = None) -> Mesh:
-    """Two-axis device mesh: parameters shard over 'fsdp', replicate over 'data'.
+def build_mesh(fsdp_size: int = 1, expert_size: int = 1,
+               devices: Optional[list] = None) -> Mesh:
+    """Three-axis device mesh: parameters shard over 'fsdp' and 'expert',
+    batches over all three.
 
-    fsdp_size=1 degenerates to plain data parallelism, so the same code path
-    serves both without a flag. Axes are Auto so GSPMD infers the collectives
+    An MoE layer's expert dimension is the one dimension no dense model has,
+    and splitting it is what expert parallelism is, so it gets its own axis
+    rather than competing with the model's widths for 'fsdp'. Sizes of 1
+    degenerate to plain data parallelism, so the same code path serves every
+    topology without a flag. Axes are Auto so GSPMD infers the collectives
     rather than us writing them by hand.
     """
     devices = list(devices) if devices is not None else jax.devices()
-    if fsdp_size < 1 or len(devices) % fsdp_size:
+    sharded = fsdp_size * expert_size
+    if fsdp_size < 1 or expert_size < 1 or len(devices) % sharded:
         raise ValueError(
-            f"fsdp_size {fsdp_size} must be a positive divisor of device count {len(devices)}")
+            f"fsdp_size {fsdp_size} times expert_size {expert_size} must be a "
+            f"positive divisor of device count {len(devices)}")
     return jax.make_mesh(
-        (len(devices) // fsdp_size, fsdp_size),
-        (DATA_AXIS, FSDP_AXIS),
+        (len(devices) // sharded, expert_size, fsdp_size),
+        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS),
         devices=devices,
-        axis_types=(AxisType.Auto, AxisType.Auto),
+        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto),
     )
 
 
@@ -213,13 +232,14 @@ def state_sharding_tree(
     """
     rules = _normalize_logical_axis_rules(logical_axis_rules, mesh)
     fsdp_size = mesh.shape[FSDP_AXIS]
+    sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
 
     def leaf_sharding(path, value):
         axes = _logical_axes(path, value.ndim)
         size = int(np.prod(value.shape, dtype=np.int64))
         if axes is None:
             spec = parameter_spec(value.shape, fsdp_size, min_shard_size)
-        elif fsdp_size == 1 or size < min_shard_size:
+        elif sharded_devices == 1 or size < min_shard_size:
             spec = P()
         else:
             spec = _mesh_spec(value.shape, axes, rules, mesh)
@@ -233,10 +253,10 @@ def assert_params_sufficiently_sharded(
     tolerance: float = DEFAULT_SHARDING_TOLERANCE,
     min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
 ) -> None:
-    """Reject an FSDP layout that left too much of the model replicated.
+    """Reject a layout that left too much of the model replicated.
 
     MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
-    fsdp axis divides none of the model's dimensions, which the shape
+    parameter axes divide none of the model's dimensions, which the shape
     heuristic otherwise absorbs in silence.
 
     MaxText measures excess per-chip memory over perfect sharding across every
@@ -247,7 +267,7 @@ def assert_params_sufficiently_sharded(
     if not 0.0 <= tolerance <= 1.0:
         raise ValueError(
             f"sharding_tolerance must be between 0 and 1, got {tolerance}")
-    if mesh.shape[FSDP_AXIS] == 1:
+    if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
         return
 
     path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
@@ -259,7 +279,8 @@ def assert_params_sufficiently_sharded(
         if elements < min_shard_size:
             continue
         shardable_elements += elements
-        if any(FSDP_AXIS in _mesh_axes(assignment) for assignment in sharding.spec):
+        if any(axis in _mesh_axes(assignment)
+               for assignment in sharding.spec for axis in PARAMETER_AXES):
             continue
         replicated.append((elements, jax.tree_util.keystr(path), param.shape))
 
