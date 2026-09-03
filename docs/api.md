@@ -38,7 +38,8 @@ The public modules, and what each one is for.
 | `dew.nn.backbones.jepa` | `JepaEncoder`, `JepaVideoEncoder`, `JepaPredictor` |
 | `dew.nn.backbones.causal_transformer` | `CausalTransformer` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
-| `dew.nn` | `attention`, `blocks`, `dit`, `vit`, `ssm`, `scan_orders` |
+| `dew.nn.moe` | `Router`, `ExpertMLP`, `SparseMLP`, `calculate_load_balance_updates` |
+| `dew.nn` | `attention`, `blocks`, `dit`, `vit`, `ssm`, `scan_orders`, `moe` |
 
 ## Sampling and inference
 

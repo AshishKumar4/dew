@@ -1,14 +1,16 @@
 # Distributed training
 
-Every run is sharded, and a single device is the degenerate case. There is one code path: the trainer builds a two-axis mesh over the devices it was given, derives a sharding for every leaf of the train state, and hands both to `jax.jit`. GSPMD infers the collectives.
+Every run is sharded, and a single device is the degenerate case. There is one code path: the trainer builds a three-axis mesh over the devices it was given, derives a sharding for every leaf of the train state, and hands both to `jax.jit`. GSPMD infers the collectives.
 
 The pieces live in `dew.training.distributed`.
 
 ## The mesh
 
-`build_mesh(fsdp_size, devices=None)` returns a `(data, fsdp)` mesh of shape `(device_count // fsdp_size, fsdp_size)`. Parameters shard over `fsdp` and replicate over `data`, so `fsdp_size=1` is plain data parallelism and needs no separate branch. A `fsdp_size` that does not divide the device count is an error rather than a silent reshape.
+`build_mesh(fsdp_size, expert_size, devices=None)` returns a `(data, expert, fsdp)` mesh of shape `(device_count // (fsdp_size * expert_size), expert_size, fsdp_size)`. Parameters shard over `fsdp`, an MoE layer's expert dimension shards over `expert`, and both replicate over `data`, so `fsdp_size=1, expert_size=1` is plain data parallelism and needs no separate branch. A product that does not divide the device count is an error rather than a silent reshape.
 
-Batches split across every device on both axes at once: `BATCH_SPEC = P(('data', 'fsdp'))`. Only parameters distinguish the two axes.
+The expert dimension gets an axis of its own rather than competing for `fsdp` because it is the one dimension no dense model has. Splitting eight experts four ways leaves every expert whole, where splitting a width costs a collective on every matmul.
+
+Batches split across every device on all three axes at once: `BATCH_SPEC = P(('data', 'expert', 'fsdp'))`. Only parameters distinguish the axes.
 
 ## Logical axes
 
@@ -18,7 +20,7 @@ A logical axis name says what a parameter's dimension is, never where it goes. A
 
 The names are declared here rather than on the initializers because `nn.with_partitioning` hands a parameter back inside a `Partitioned` box and `model.init` then gives that box to the caller. Parameter trees are frozen and a caller reads plain arrays under the documented names, `save_params` among them. Declaring the names here also keeps sharding vocabulary on the trainer's side of the seam, where the mesh already lives. What it costs: a module rename does not carry its entry along, so `test_every_declared_parameter_axis_names_a_module_some_model_has` fails as soon as an entry stops naming a parameter of a registry model, and a caller's own module gets the shape heuristic unless its parameters sit under a declared name.
 
-Declared today: `CausalTransformer`'s token embedding, its attention and MLP projections and its untied head, and the DiT stack's patch embedding, attention, adaLN projections, MLP and output head. Through the shared modules that reaches `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit`, the MMDiT ada and output projections, UViT, the JEPA encoders and the attention blocks inside the U-Nets. The MMDiT and UViT blocks' own MLPs, the S5 layers and the rest of `blocks.py` fall back on shape.
+Declared today: `CausalTransformer`'s token embedding, its attention and MLP projections, its untied head and the router and stacked expert kernels of a sparse layer, and the DiT stack's patch embedding, attention, adaLN projections, MLP and output head. Through the shared modules that reaches `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit`, the MMDiT ada and output projections, UViT, the JEPA encoders and the attention blocks inside the U-Nets. The MMDiT and UViT blocks' own MLPs, the S5 layers and the rest of `blocks.py` fall back on shape.
 
 The vocabulary:
 
@@ -33,7 +35,7 @@ The vocabulary:
 | `modulation` | adaLN shift/scale/gate outputs | the per-block and final ada projections |
 | `output` | patch output channels | the zero-init output head |
 | `attention` | flattened attention input | the out projection's contract axis |
-| `expert` | mixture-of-experts rows | reserved, no model uses it yet |
+| `exp` | mixture-of-experts rows | the stacked expert kernels and the router |
 | `batch` | sample rows | activations only, never parameters |
 | `sequence` | token positions | activations only, never parameters |
 | `stage` | pipeline stage index | reserved, no model uses it yet |
@@ -55,7 +57,7 @@ A parameter no entry names keeps the shape heuristic below, so a family can be d
 | `heads` | `fsdp` |
 | `kv` | `fsdp` |
 | `output` | `fsdp` |
-| `expert` | `fsdp` |
+| `exp` | `expert` |
 | `batch` | none |
 | `sequence` | none |
 | `stage` | none |
@@ -91,9 +93,9 @@ The state is then built straight into that layout: the trainer runs `jax.jit(lam
 
 ## Sharding tolerance
 
-`assert_params_sufficiently_sharded` is a startup assertion, run by the trainer whenever `fsdp_size > 1`: if more than `sharding_tolerance` of the shardable parameter elements ended up replicated, the run stops before step one, naming the fraction and the five largest replicated parameters by path, shape and element count. This is the guardrail against a mesh whose `fsdp` axis divides none of the model's dimensions, which the shape heuristic used to absorb in silence. `--trainer.sharding-tolerance 1.0` disables it.
+`assert_params_sufficiently_sharded` is a startup assertion, run by the trainer whenever a parameter axis of the mesh is above one: if more than `sharding_tolerance` of the shardable parameter elements ended up replicated, the run stops before step one, naming the fraction and the five largest replicated parameters by path, shape and element count. This is the guardrail against a mesh whose parameter axes divide none of the model's dimensions, which the shape heuristic used to absorb in silence. `--trainer.sharding-tolerance 1.0` disables it.
 
-"Shardable" means at or above `min_shard_size`. The reference (`utils/sharding.py:605` `assert_params_sufficiently_sharded`, tolerance from `configs/base.yml:672-673`) is the same ratio (replicated elements over total, raise above the tolerance, name the five largest by `jax.tree_util.keystr` path) taken over every parameter, which it can do because it has no size threshold. Here a small parameter is replicated on purpose, so counting it would make the check fire on models that are merely small rather than badly laid out. MaxText also restricts the check to mesh axes that exist and are larger than one (`_get_nontrival_mesh_axes`); on a `(data, fsdp)` mesh that is `fsdp` alone, so the check is skipped entirely when `fsdp_size == 1`. The default tolerance is MaxText's 0.02.
+"Shardable" means at or above `min_shard_size`. The reference (`utils/sharding.py:605` `assert_params_sufficiently_sharded`, tolerance from `configs/base.yml:672-673`) is the same ratio (replicated elements over total, raise above the tolerance, name the five largest by `jax.tree_util.keystr` path) taken over every parameter, which it can do because it has no size threshold. Here a small parameter is replicated on purpose, so counting it would make the check fire on models that are merely small rather than badly laid out. MaxText also restricts the check to mesh axes that exist and are larger than one (`_get_nontrival_mesh_axes`); on a `(data, expert, fsdp)` mesh those are `expert` and `fsdp`, and a parameter split over either one counts as sharded, so the check is skipped only when both are one. The default tolerance is MaxText's 0.02.
 
 ## The step
 
