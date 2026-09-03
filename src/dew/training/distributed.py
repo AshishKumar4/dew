@@ -23,12 +23,13 @@ DEFAULT_MIN_SHARD_SIZE = 2 ** 16
 DEFAULT_SHARDING_TOLERANCE = 0.02
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
+LogicalAxes: TypeAlias = tuple[Optional[str], ...]
 LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
 LogicalAxisRuleConfig: TypeAlias = (
     Mapping[str, str | Sequence[str] | None] | LogicalAxisRules)
 
 # Rule order is precedence when two logical dimensions target the one fsdp axis.
-# It reproduces the largest-axis choice for the annotated model shapes while
+# It reproduces the largest-axis choice for the declared model shapes while
 # giving a config one place to redirect model semantics onto a future mesh.
 DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
     ("vocab", FSDP_AXIS),
@@ -45,6 +46,64 @@ DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
     ("sequence", None),
     ("stage", None),
 )
+
+# What a parameter's dimensions are, keyed by the module path that ends in
+# these names, outermost dimension first. A parameter takes the trailing names
+# its rank can hold, so a kernel takes all of them and its bias the output
+# ones. Declaring them here rather than on the initializers keeps the models
+# plain flax modules whose init returns arrays, and reaches optimizer moments
+# and EMA copies for free: their paths end in their parameter's.
+DEFAULT_LOGICAL_PARAM_AXES: Mapping[tuple[str, ...], LogicalAxes] = {
+    ("embed_tokens",): ("vocab", "embed"),
+    ("lm_head",): ("embed", "vocab"),
+    ("q_proj",): ("embed", "heads"),
+    ("k_proj",): ("embed", "kv"),
+    ("v_proj",): ("embed", "kv"),
+    ("o_proj",): ("attention", "embed"),
+    ("gate_proj",): ("embed", "mlp"),
+    ("up_proj",): ("embed", "mlp"),
+    ("down_proj",): ("mlp", "embed"),
+    ("patch_embed", "Conv_0"): (None, None, None, "embed"),
+    ("to_q",): ("embed", "heads", "head_dim"),
+    ("to_k",): ("embed", "heads", "head_dim"),
+    ("to_v",): ("embed", "heads", "head_dim"),
+    ("to_out_0",): ("heads", "head_dim", "embed"),
+    ("ada_proj",): ("embed", "modulation"),
+    ("final_ada_proj",): ("embed", "modulation"),
+    ("final_proj",): ("embed", "output"),
+    ("mlp", "layers_0"): ("embed", "mlp"),
+    ("mlp", "layers_2"): ("mlp", "embed"),
+    ("time_embed", "layers_2"): ("mlp", "embed"),
+}
+
+
+def _parameter_path(path) -> tuple[str, ...]:
+    """The parameter's own path: the trailing run of dict keys under a leaf.
+
+    An optimizer state nests a copy of the parameter tree inside its own
+    structure, so what identifies a parameter is where its path ends.
+    """
+    names = []
+    for entry in reversed(path):
+        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
+            break
+        names.append(entry.key)
+    return tuple(reversed(names))
+
+
+def _logical_axes(path, ndim: int) -> Optional[LogicalAxes]:
+    """The declared axes of the parameter at `path`, or None for an unnamed one."""
+    module = _parameter_path(path)[:-1]
+    for length in range(len(module), 0, -1):
+        axes = DEFAULT_LOGICAL_PARAM_AXES.get(module[-length:])
+        if axes is None:
+            continue
+        if ndim > len(axes):
+            raise ValueError(
+                f"{'/'.join(module[-length:])} is declared {axes}, which cannot "
+                f"name the {ndim} dimensions of {'/'.join(_parameter_path(path))}")
+        return axes[len(axes) - ndim:]
+    return None
 
 
 def _normalize_logical_axis_rules(
@@ -101,8 +160,8 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     return P()
 
 
-def _canonical_mesh_spec(shape: tuple, spec: P, mesh: Mesh) -> P:
-    """Reduce a rules-derived spec to one this parameter can actually take.
+def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: Mesh) -> P:
+    """The spec these logical axes ask for, reduced to one the shape can take.
 
     A mesh axis of size 1 shards nothing, so it is dropped rather than left in
     the spec where it would only obscure what is replicated. A dimension the
@@ -111,14 +170,16 @@ def _canonical_mesh_spec(shape: tuple, spec: P, mesh: Mesh) -> P:
     turns that into an error when it matters.
     """
     entries = []
-    for dimension, assignment in enumerate(spec):
-        axes = ((assignment,) if isinstance(assignment, str)
-                else tuple(assignment) if assignment is not None else ())
-        axes = tuple(axis for axis in axes if mesh.shape[axis] > 1)
-        shards = int(np.prod([mesh.shape[axis] for axis in axes], dtype=np.int64))
+    for dimension, assignment in enumerate(nn.logical_to_mesh_axes(axes, rules)):
+        mesh_axes = tuple(
+            axis for axis in
+            ((assignment,) if isinstance(assignment, str)
+             else tuple(assignment) if assignment is not None else ())
+            if mesh.shape[axis] > 1)
+        shards = int(np.prod([mesh.shape[axis] for axis in mesh_axes], dtype=np.int64))
         if shards > 1 and shape[dimension] % shards:
             return P()
-        entries.append(axes[0] if len(axes) == 1 else axes or None)
+        entries.append(mesh_axes[0] if len(mesh_axes) == 1 else mesh_axes or None)
     while entries and entries[-1] is None:
         entries.pop()
     return P(*entries)
@@ -130,30 +191,28 @@ def state_sharding_tree(
     min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
     logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
 ):
-    """Derive physical shardings from logical metadata, with shape fallback.
+    """Derive physical shardings from the declared parameter axes.
 
-    Flax metadata is removed from the returned tree. Unannotated leaves retain
-    the previous largest-divisible-axis heuristic so models can be annotated a
-    family at a time.
+    A leaf whose path no entry names retains the largest-divisible-axis
+    heuristic, so a model family can be declared at a time. Flax metadata, if a
+    caller's own module attached any, is removed here, because the state the
+    trainer materialises against this tree carries plain arrays.
     """
-    unboxed_state = nn.unbox(abstract_state)
-    logical_specs = nn.get_partition_spec(abstract_state)
-    logical_shardings = nn.logical_to_mesh_sharding(
-        logical_specs, mesh, _normalize_logical_axis_rules(logical_axis_rules, mesh))
+    rules = _normalize_logical_axis_rules(logical_axis_rules, mesh)
     fsdp_size = mesh.shape[FSDP_AXIS]
 
-    def leaf_sharding(value, logical_spec, logical_sharding):
+    def leaf_sharding(path, value):
+        axes = _logical_axes(path, value.ndim)
         size = int(np.prod(value.shape, dtype=np.int64))
-        if logical_spec == P():
+        if axes is None:
             spec = parameter_spec(value.shape, fsdp_size, min_shard_size)
         elif fsdp_size == 1 or size < min_shard_size:
             spec = P()
         else:
-            spec = _canonical_mesh_spec(value.shape, logical_sharding.spec, mesh)
+            spec = _mesh_spec(value.shape, axes, rules, mesh)
         return NamedSharding(mesh, spec)
 
-    return jax.tree.map(
-        leaf_sharding, unboxed_state, logical_specs, logical_shardings)
+    return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(abstract_state))
 
 
 def assert_params_sufficiently_sharded(

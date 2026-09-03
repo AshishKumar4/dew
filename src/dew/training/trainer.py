@@ -221,10 +221,11 @@ class SimpleTrainer:
         return ones
 
     def _build_state(self, init_fn) -> SimpleTrainState:
-        """Materialise an unboxed train state directly into its sharded layout.
+        """Materialise the train state directly into its sharded layout.
 
-        Logical metadata is read from the abstract state before it is removed.
-        Optimizer moments and EMA copies retain the axes of their parameters.
+        The layout comes from the abstract state, so optimizer moments and EMA
+        copies inherit the axes of the parameters they track. Unboxing is what
+        keeps a caller's own flax metadata out of the state the run carries.
         """
         abstract_state = jax.eval_shape(init_fn)
         self.state_sharding = state_sharding_tree(

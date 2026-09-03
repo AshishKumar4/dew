@@ -12,9 +12,13 @@ Batches split across every device on both axes at once: `BATCH_SPEC = P(('data',
 
 ## Logical axes
 
-A parameter can carry logical axis names alongside its values, written with `nn.with_partitioning` at the initializer. A DiT attention query kernel, shape `[embed, heads, head_dim]`, is annotated `("embed", "heads", "head_dim")`. The names say what a dimension is; nothing about the mesh.
+A logical axis name says what a parameter's dimension is, never where it goes. A DiT attention query kernel, shape `[embed, heads, head_dim]`, carries `("embed", "heads", "head_dim")`.
 
-Two families carry them today: the DiT stack (`dew/nn/dit.py`'s patch embedding, modulated block, conditioning embedding and output head, plus `NormalAttention` and `PatchEmbedding` under their `logical_axes` flag) and `CausalTransformer`. Everything a DiT backbone reuses from those modules is annotated with it, so `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit` and the JEPA encoders inherit the names without their own files changing. The MMDiT blocks, UViT's own transformer block, the U-Nets, the S5 layers and `blocks.py` still fall back on shape.
+`DEFAULT_LOGICAL_PARAM_AXES` declares them, keyed by the module path a parameter sits under and read outermost dimension first. A parameter takes the trailing names its rank can hold, so `("to_q",): ("embed", "heads", "head_dim")` names the query kernel's three dimensions and, from the same entry, its bias's two. A key matches the end of a path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's.
+
+The names are declared here rather than on the initializers because `nn.with_partitioning` hands a parameter back inside a `Partitioned` box and `model.init` then gives that box to the caller. Parameter trees are frozen and a caller reads plain arrays under the documented names, `save_params` among them. Declaring the names here also keeps sharding vocabulary on the trainer's side of the seam, where the mesh already lives. What it costs: a module rename does not carry its entry along, so `test_every_declared_parameter_axis_names_a_module_some_model_has` fails as soon as an entry stops naming a parameter of a registry model, and a caller's own module gets the shape heuristic unless its parameters sit under a declared name.
+
+Declared today: `CausalTransformer`'s token embedding, its attention and MLP projections and its untied head, and the DiT stack's patch embedding, attention, adaLN projections, MLP and output head. Through the shared modules that reaches `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit`, the MMDiT ada and output projections, UViT, the JEPA encoders and the attention blocks inside the U-Nets. The MMDiT and UViT blocks' own MLPs, the S5 layers and the rest of `blocks.py` fall back on shape.
 
 The vocabulary:
 
@@ -34,7 +38,7 @@ The vocabulary:
 | `sequence` | token positions | activations only, never parameters |
 | `stage` | pipeline stage index | reserved, no model uses it yet |
 
-Parameters that carry no names keep the shape heuristic below, so a model can be annotated one family at a time without breaking the rest. Norms and other 1-D parameters are deliberately left alone: they are replicated either way. So is any dimension whose width the model does not choose — the raw patch content of the Hilbert projection, the conditioning encoder's feature width — because there is no honest name for it and the heuristic already picks the larger side, which for CLIP-L into a 384-wide DiT is the encoder's 768.
+A parameter no entry names keeps the shape heuristic below, so a family can be declared at a time. Norms and other 1-D parameters are left alone: they are replicated either way. So is any dimension whose width the model does not choose, the raw patch content of the Hilbert projection and the conditioning encoder's feature width, because there is no honest name for it and the heuristic already picks the larger side, which for CLIP-L into a 384-wide DiT is the encoder's 768.
 
 ## The rules table
 
@@ -67,21 +71,21 @@ Rule order is precedence: when two logical dimensions of one parameter both clai
 | q/k/v | `[embed, heads]`, `[embed, kv]` | `embed` | grouped-query `kv` is narrower; a tie goes left |
 | output head | `[embed, output]` | `embed` | `patch^2 * channels` is far below the model width |
 
-Precedence is fixed, so it cannot track the largest axis for every conceivable shape: a model narrower than its own output head, or an `mlp_ratio` of exactly 1, would land on the other dimension. That is a different split of the same parameter over the same axis — identical memory, identical collectives, identical numbers — not a different model, and no shipped configuration reaches it. `test_default_logical_rules_match_previous_specs_for_every_registry_model` pins spec-for-spec equality with the old heuristic across every registry architecture at the sizes the suite builds, and the FSDP/DP parity tests pin the numbers.
+Precedence is fixed, so it cannot track the largest axis for every conceivable shape: a model narrower than its own output head, or an `mlp_ratio` of exactly 1, would land on the other dimension. That is a different split of the same parameter over the same axis, with identical memory, identical collectives and identical numbers, not a different model, and no shipped configuration reaches it. `test_default_logical_rules_match_previous_specs_for_every_registry_model` pins spec-for-spec equality with the old heuristic across every registry architecture at the sizes the suite builds, and the FSDP/DP parity tests pin the numbers.
 
 `--trainer.logical-axis-rules` takes a JSON object and replaces the table, e.g. `{"mlp": "fsdp"}`. A name set to `null`, or absent from the table, leaves that dimension whole. Mesh axes the current mesh does not have are dropped, so one table can name `tensor` today and mean it later.
 
-The table is the whole mechanism for future parallelism. Adding a `tensor` axis to the mesh and changing two rows (`"heads": "tensor"`, `"mlp": ["tensor"]`) moves every annotated model to hybrid FSDP/tensor parallelism with no model edits, exactly as MaxText's `logical_axis_rules` does (`docs/research/google-jax-stack.md`, MaxText section). An `fsdp_transpose` axis would land in the same place.
+The table is the whole mechanism for future parallelism. Adding a `tensor` axis to the mesh and changing two rows (`"heads": "tensor"`, `"mlp": ["tensor"]`) moves every declared model to hybrid FSDP/tensor parallelism with no model edits, exactly as MaxText's `logical_axis_rules` does (`docs/research/google-jax-stack.md`, MaxText section). An `fsdp_transpose` axis would land in the same place.
 
-`state_sharding_tree(mesh, abstract_state, min_shard_size, logical_axis_rules)` implements the derivation: `nn.get_partition_spec` reads the annotations, `nn.logical_to_mesh_sharding` applies the table, then `_canonical_mesh_spec` drops size-1 mesh axes, drops axes assigned to a dimension whose size does not divide, and replicates a parameter whose sharded axis would not divide evenly. Below `min_shard_size` elements an annotated parameter stays replicated too. Checkpoint layout is untouched: the flax metadata is unboxed before anything is written, so orbax still sees plain arrays under the same leaf names.
+`state_sharding_tree(mesh, abstract_state, min_shard_size, logical_axis_rules)` implements the derivation, one pass over the abstract state: `_logical_axes` reads the declared names off each leaf's path, `nn.logical_to_mesh_axes` applies the rules table, and the result drops size-1 mesh axes and replicates a parameter whose assigned dimension the mesh axes do not divide. Below `min_shard_size` elements a declared parameter stays replicated too. Deriving names and values in the same pass is what lets an optimizer state hold leaves that are not arrays at all, `optax.MaskedNode` under a masked transform among them.
 
 ## Which parameters shard
 
 `parameter_spec(shape, fsdp_size, min_shard_size)` picks the largest axis that divides evenly by `fsdp_size` and shards it. Anything smaller than `min_shard_size` elements (`DEFAULT_MIN_SHARD_SIZE`, 65536) stays replicated: below that a parameter costs more in collectives than it saves in memory.
 
-`state_sharding_tree` maps sharding over the whole train state, not just the params, annotated and unannotated alike. Optimizer moments and the EMA copy carry the same axes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
+`state_sharding_tree` maps sharding over the whole train state, not just the params, declared and undeclared alike. Optimizer moments and the EMA copy carry the same axes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
 
-The state is then built straight into that layout: the trainer runs `jax.jit(lambda: nn.unbox(init_fn()), out_shardings=state_sharding)()`, so a model too large for one device is never materialized on one device, and the metadata is gone before anything downstream — optimizer, EMA, checkpointer — can see it.
+The state is then built straight into that layout: the trainer runs `jax.jit(lambda: nn.unbox(init_fn()), out_shardings=state_sharding)()`, so a model too large for one device is never materialized on one device, and any flax metadata a caller's own module attached is gone before the optimizer, the EMA or the checkpointer can see it.
 
 ## Sharding tolerance
 

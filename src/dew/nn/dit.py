@@ -80,14 +80,10 @@ class PatchSequenceEmbed(nn.Module):
                 embedding_dim=self.emb_features,
                 dtype=self.dtype,
                 precision=self.precision,
-                logical_axes=True,
                 name="patch_embed",
             )
         else:
             # Raw patch extraction + Dense instead of the Conv-based embedding
-            # The input width here is patch content, a size the model does not
-            # choose, so it carries no logical name and keeps the shape
-            # fallback. See docs/concepts/distributed.md.
             self.scan_proj = nn.Dense(
                 features=self.emb_features,
                 dtype=self.dtype,
@@ -130,16 +126,8 @@ class ConditioningEmbed(nn.Module):
         self.time_embed = nn.Sequential([
             FourierEmbedding(features=self.emb_features),
             TimeProjection(features=self.emb_features * self.mlp_ratio),
-            nn.Dense(
-                features=self.emb_features, dtype=self.dtype,
-                precision=self.precision,
-                kernel_init=nn.with_partitioning(
-                    nn.linear.default_kernel_init, ("mlp", "embed")),
-                bias_init=nn.with_partitioning(nn.initializers.zeros, ("embed",))),
+            nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
         ], name="time_embed")
-        # The conditioning encoder's feature width is not the model's to name
-        # (CLIP-L is 768 wide into a 384-wide DiT), so this projection keeps
-        # the shape fallback rather than an invented logical axis.
         self.text_proj = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")
@@ -177,10 +165,7 @@ class PatchSequenceOutput(nn.Module):
                 features=2 * features,
                 dtype=self.dtype,
                 precision=self.precision,
-                kernel_init=nn.with_partitioning(
-                    nn.initializers.zeros, ("embed", "modulation")),
-                bias_init=nn.with_partitioning(
-                    nn.initializers.zeros, ("modulation",)),
+                kernel_init=nn.initializers.zeros,
                 name="final_ada_proj",
             )(nn.silu(conditioning)), 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
@@ -192,9 +177,7 @@ class PatchSequenceOutput(nn.Module):
             features=output_dim,
             dtype=jnp.float32,  # fp32 output head - the loss is computed in fp32
             precision=self.precision,
-            kernel_init=nn.with_partitioning(
-                nn.initializers.zeros, ("embed", "output")),
-            bias_init=nn.with_partitioning(nn.initializers.zeros, ("output",)),
+            kernel_init=nn.initializers.zeros,
             name="final_proj",
         )(x_out)
 
@@ -291,7 +274,6 @@ class ModulatedBlock(nn.Module):
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 rope_emb=self.rope_emb,
-                logical_axes=True,
             )
         else:
             ssm_cls = BidirectionalS5Layer if self.bidirectional_ssm else S5Layer
@@ -314,17 +296,9 @@ class ModulatedBlock(nn.Module):
                 )
 
         self.mlp = nn.Sequential([
-            nn.Dense(
-                features=hidden_features, dtype=self.dtype, precision=self.precision,
-                kernel_init=nn.with_partitioning(
-                    nn.linear.default_kernel_init, ("embed", "mlp")),
-                bias_init=nn.with_partitioning(nn.initializers.zeros, ("mlp",))),
+            nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
             nn.gelu,
-            nn.Dense(
-                features=self.features, dtype=self.dtype, precision=self.precision,
-                kernel_init=nn.with_partitioning(
-                    nn.linear.default_kernel_init, ("mlp", "embed")),
-                bias_init=nn.with_partitioning(nn.initializers.zeros, ("embed",))),
+            nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
         ])
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
