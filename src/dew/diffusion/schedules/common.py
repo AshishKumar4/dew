@@ -19,8 +19,7 @@ class NoiseScheduler():
                     clip_min=-1.0,
                     clip_max=1.0,
                     min_snr_gamma: float = None,
-                    prediction_transform=None,
-                    *args, **kwargs):
+                    prediction_transform=None):
         self.max_timesteps = timesteps
         self.dtype = dtype
         self.clip_min = clip_min
@@ -95,8 +94,10 @@ class GeneralizedNoiseScheduler(NoiseScheduler):
     Basically the signal rate shall always be 1, and the model
     input itself shall be scaled to match the noise rate
     """
-    def __init__(self, timesteps, sigma_min=0.002, sigma_max=80.0, sigma_data=1, *args, **kwargs):
-        super().__init__(timesteps, *args, **kwargs)
+    def __init__(self, timesteps, sigma_min=0.002, sigma_max=80.0, sigma_data=1,
+                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
+        super().__init__(timesteps, dtype=dtype, clip_min=clip_min, clip_max=clip_max,
+                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data

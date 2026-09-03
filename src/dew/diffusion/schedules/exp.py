@@ -1,4 +1,5 @@
 import numpy as np
+import jax.numpy as jnp
 from .discrete import DiscreteNoiseScheduler
 
 def exp_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
@@ -9,5 +10,9 @@ def exp_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
     return np.clip(betas, 0, end_angle)
 
 class ExpNoiseScheduler(DiscreteNoiseScheduler):
-    def __init__(self, timesteps, beta_start=0.008, beta_end=0.999, *args, **kwargs):
-        super().__init__(timesteps, beta_start, beta_end, schedule_fn=exp_beta_schedule, *args, **kwargs)
+    def __init__(self, timesteps, beta_start=0.008, beta_end=0.999, p2_loss_weight_k=1, p2_loss_weight_gamma=1,
+                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
+        super().__init__(timesteps, beta_start, beta_end, schedule_fn=exp_beta_schedule,
+                         p2_loss_weight_k=p2_loss_weight_k, p2_loss_weight_gamma=p2_loss_weight_gamma,
+                         dtype=dtype, clip_min=clip_min, clip_max=clip_max,
+                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
