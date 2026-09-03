@@ -7,7 +7,10 @@ from dew.diffusion.schedules import GeneralizedNoiseScheduler, get_coeff_shapes_
 class RK4Sampler(DiffusionSampler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert issubclass(type(self.noise_schedule), GeneralizedNoiseScheduler), "Noise schedule must be a GeneralizedNoiseScheduler"
+        if not isinstance(self.noise_schedule, GeneralizedNoiseScheduler):
+            raise ValueError(
+                f"RK4Sampler integrates dx/dsigma = eps, which holds only when alpha is 1, "
+                f"so it needs a GeneralizedNoiseScheduler and not {type(self.noise_schedule).__name__}")
         # Not jitted here: sample_model_fn is a python callable, the model call
         # inside it is already jitted
         def get_derivative(sample_model_fn, x_t, sigma, state:RandomMarkovState, model_conditioning_inputs) -> tuple[jnp.ndarray, RandomMarkovState]:
