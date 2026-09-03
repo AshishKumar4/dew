@@ -4,7 +4,7 @@ What was measured on one RTX 4080, what was adopted, and what was rejected
 with the number that rejected it. `docs/benchmarks.md` is the step table per
 architecture; this file is the evidence behind the kernel and flag defaults.
 
-Every number here comes from one of three harnesses:
+Every number here comes from one of four harnesses:
 
 ```
 python tools/benchmark_attention.py --json-out attention.json
@@ -12,6 +12,8 @@ python tools/benchmark_step.py --preset small --architectures <arch> \
     --attention-impl <kernel> --warmup 3 --steps 10
 XLA_FLAGS=<flags> python tools/benchmark_step.py --preset small \
     --architectures <arch> --warmup 3 --steps 10
+python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
+    --learning-rate <lr> --out <json>
 ```
 
 Conditions: jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
@@ -165,3 +167,60 @@ and that number was the counter rather than the card: XLA's `cost_analysis()`
 cannot see inside the cuDNN convolution calls the backend emits, and it
 undercounted this model 22.5 times. Counted off the optimized HLO the unet
 runs at 40.5% of peak, which `docs/benchmarks.md` reports.
+
+## Muon against AdamW at equal tokens
+
+The rows below are the only CPU rows in this file. A loss curve at equal
+tokens asks nothing of the card's kernels, and the run is small enough that
+one workstation CPU does nine of them in under an hour.
+
+```
+python tools/tokenize_text.py --input data/shakespeare.txt \
+    --out data/shakespeare-byte --tokenizer byte --val-fraction 0.02
+JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
+    --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \
+    --steps 2000 --emb-features 128 --num-layers 2 --num-heads 2 --seed 0 \
+    --out /tmp/muon-3e-3.json
+```
+
+once per arm, learning rate and seed. Conditions: `causal_transformer`, 128
+wide, 2 layers, 2 heads, tied head, byte vocabulary of 256, sequence length
+128, batch 16, 557,952 parameters, bf16 compute, weight decay 0.1 on both
+groups, no schedule, no clipping. 2000 steps is 4,096,000 tokens, which is
+3.75 passes over the 1,093,086 training tokens of the Shakespeare corpus.
+12th Gen i9-12900K, jax 0.11.1, `JAX_PLATFORMS=cpu`, six cores pinned per
+run, three runs at a time on disjoint cores. Every arm sees the same batches
+in the same order at the same seed, so a difference between two arms is the
+solver.
+
+Three arms: `adamw`, `muon` as this branch builds it, and `muon-unsplit`,
+which is `optax.contrib.muon` with its own ndim == 2 rule, the shape the
+'muon' entry had before the parameter groups. Final loss is the mean over
+the last 50 steps.
+
+| arm | lr 1e-3 | lr 3e-3 | lr 1e-2 |
+|---|---|---|---|
+| adamw | 1.4723 | 1.4842 | 1.5885 |
+| muon | 1.5229 | 1.4438 | 1.4713 |
+| muon-unsplit | 1.5762 | 1.4598 | 1.4916 |
+
+Each arm at its own best learning rate, averaged over seeds 0, 1 and 2, as
+the loss at five token counts:
+
+| arm | 0.51M | 1.02M | 2.05M | 3.07M | 4.10M |
+|---|---|---|---|---|---|
+| adamw, lr 1e-3 | 2.0136 | 1.7376 | 1.5737 | 1.5015 | 1.4764 |
+| muon, lr 3e-3 | 1.9885 | 1.6744 | 1.5179 | 1.4572 | 1.4386 |
+| muon-unsplit, lr 3e-3 | 2.2454 | 1.7646 | 1.5559 | 1.4812 | 1.4561 |
+
+Muon with the groups reaches 1.4386 where AdamW reaches 1.4764, 0.038 nats
+lower at the same tokens. The three seeds of an arm spread 0.007 to 0.013,
+so the gap to AdamW is three times that noise. The gap to unsplit Muon is
+0.018, one and a half times it, and the split is ahead on each of the three
+seeds by 0.016, 0.020 and 0.017. Muon also holds its loss at a learning
+rate ten times its best, losing 0.028 against AdamW's 0.116, which is the
+tolerance the labs report (`docs/research/frontier-training.md:183`).
+
+These numbers say nothing about 0.4B parameters, which is the run section
+4.9 of `docs/design/plan.md` asks for and which needs a v5e-16. Wall-clock
+is not comparable either, because the runs shared a machine.
