@@ -328,7 +328,6 @@ def test_an_expert_no_token_reached_cannot_change_the_output():
     used = set(np.asarray(indices).ravel().tolist())
 
     for expert in range(8):
-        zeroed = jax.tree.map(lambda leaf: leaf, variables)
         zeroed = {"params": {name: {"kernel": value["kernel"].at[expert].set(0.0)}
                              for name, value in variables["params"].items()}}
         output = experts.apply(zeroed, x, weights, indices)
@@ -456,6 +455,27 @@ def test_an_expert_layer_and_a_dense_layer_agree_at_one_expert():
 
     assert np.max(np.abs(np.asarray(sparse.apply(variables, tokens))
                          - np.asarray(gated.apply(dense_variables, tokens)))) < 1e-6
+
+
+def test_the_router_runs_in_fp32_under_a_bfloat16_model():
+    """Routing decides which experts a token trains, so a bf16 run must not
+    decide it on bf16 scores. The experts stay in the compute dtype."""
+    tokens = jnp.asarray(jax.random.normal(jax.random.key(0), (2, 3, 8)), jnp.bfloat16)
+    sparse = SparseMLP(num_experts=4, top_k=2, hidden_features=16, out_features=8,
+                       dtype=jnp.bfloat16)
+    variables = sparse.init(jax.random.key(1), tokens)
+    weights, _ = sparse.apply(variables, tokens, method=lambda module, x: module.gate(x))
+
+    assert variables["params"]["gate"]["kernel"].dtype == jnp.float32
+    assert weights.dtype == jnp.float32
+    assert sparse.apply(variables, tokens).dtype == jnp.bfloat16
+
+    # The same tokens at fp32 choose the same experts and weight them the
+    # same, which is what running the gate in fp32 is for.
+    exact = SparseMLP(num_experts=4, top_k=2, hidden_features=16, out_features=8)
+    wide = exact.apply(variables, jnp.asarray(tokens, jnp.float32),
+                       method=lambda module, x: module.gate(x))
+    assert np.array_equal(np.asarray(weights), np.asarray(wide[0]))
 
 
 @pytest.mark.parametrize("settings,message", [
