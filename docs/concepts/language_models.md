@@ -57,13 +57,13 @@ The prompt in `samples` is one sequence of ids or several of the same length, wh
 ```python
 from dew.interop import load_pretrained_decoder, save_pretrained_decoder
 
-model, variables, hf_config = load_pretrained_decoder("Qwen/Qwen3-0.6B")
+model, variables, config = load_pretrained_decoder("Qwen/Qwen3-0.6B")
 logits = model.apply(variables, tokens)              # [B, S, 151936] fp32
 save_pretrained_decoder(model, variables, "out/qwen3-tuned",
                         tokenizer_name="Qwen/Qwen3-0.6B")
 ```
 
-- `load_pretrained_decoder(name_or_dir, *, dtype='bfloat16', attention_impl='auto', max_seq_len=None, revision=None)` takes a hub repo id or a local directory in the HF layout. It downloads only `*.safetensors` and `*.json`, reads the shards as float32 without torch (`safetensors.numpy` cannot read bfloat16, so those leaves are widened here), and builds the model through the same `apply_precision_policy` a recipe uses, so `dtype` is the compute dtype and the parameters stay float32. `max_seq_len` defaults to the config's context clamped to 8192, since the KV cache is allocated at that length whether decoding uses it or not.
+- `load_pretrained_decoder(name_or_dir, *, dtype='bfloat16', attention_impl='auto', max_seq_len=None, revision=None)` takes a hub repo id or a local directory in the HF layout. It downloads only `*.safetensors` and `*.json`, reads the shards as float32 without torch (`safetensors.numpy` cannot read bfloat16, so those leaves are widened here), and builds the model through the same `apply_precision_policy` a recipe uses, so `dtype` is the compute dtype and the parameters stay float32. `max_seq_len` defaults to the config's context clamped to 8192, since the KV cache is allocated at that length whether decoding uses it or not. The third return is the dew config the model was built from, which is what a run logs.
 - `translate_config(hf_config)` is the field map on its own, and `translate_weights(tensors, config)` the key map: `.weight` of a Linear becomes a transposed `.kernel`, a norm's `.weight` becomes `.scale`, `embed_tokens.weight` becomes `embed_tokens.embedding`, and a tied `lm_head.weight` is dropped after checking it really is the copy of the embedding it claims to be.
 - `save_pretrained_decoder(model, variables, directory, *, tokenizer_name=None)` writes `config.json`, `model.safetensors` and `generation_config.json` back in HF vocabulary: `gemma3_text` when the sandwich norms are on, `qwen3` when the q/k norms are, `llama` otherwise. transformers loads the result, and `load_pretrained_decoder` on it returns bitwise-equal parameters.
 

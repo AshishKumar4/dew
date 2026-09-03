@@ -104,13 +104,16 @@ def build_lm(config: LmRunConfig, vocab_size: int, max_seq_len: int):
 
 def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
                     meta: dict):
-    """The decoder a --pretrained run continues, and its variables.
+    """The decoder a --pretrained run continues, its variables and the config
+    it was built from.
 
     The checkpoint decides every architecture field, so the only thing
-    --model.config may still say is how far the KV cache reaches. The
-    tokenizer of the token files has to be the one the checkpoint was trained
-    with: continuing pretraining on ids from another vocabulary trains the
-    embedding table against noise.
+    --model.config may still say is how far the KV cache reaches. The config
+    that comes back is dew's, not the checkpoint's, so a pretrained run logs
+    the same vocabulary a fresh one does, compute dtype and kernel included.
+    The tokenizer of the token files has to be the one the checkpoint was
+    trained with: continuing pretraining on ids from another vocabulary trains
+    the embedding table against noise.
     """
     from dew.interop.hf_decoders import load_pretrained_decoder
 
@@ -120,7 +123,7 @@ def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
             f"--model.config carries {overridden}, which the checkpoint at "
             f"{config.pretrained} decides. Only max_seq_len is still a choice.")
 
-    model, variables, hf_config = load_pretrained_decoder(
+    model, variables, model_config = load_pretrained_decoder(
         config.pretrained,
         dtype=config.model.dtype, attention_impl=config.model.attention_impl,
         max_seq_len=config.model.config.get("max_seq_len", max_seq_len))
@@ -137,7 +140,7 @@ def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
         raise ValueError(
             f"{config.pretrained} has room for {model.vocab_size} ids and the "
             f"token files use {vocab_size}")
-    return model, variables, hf_config
+    return model, variables, model_config
 
 
 def checkpoint_tokenizer(pretrained: str) -> str:
@@ -216,9 +219,8 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
     if config.pretrained is None:
         model, model_config = build_lm(config, vocab_size, context)
     else:
-        model, pretrained, hf_config = load_pretrained(
+        model, pretrained, model_config = load_pretrained(
             config, vocab_size, context, meta)
-        model_config = {**hf_config, "max_seq_len": model.max_seq_len}
     objective = LMObjective(
         model,
         config.sequence_length,
