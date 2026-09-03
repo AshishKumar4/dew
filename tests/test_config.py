@@ -5,6 +5,8 @@ is silently dropped or remapped means the inference pipeline runs a
 different model than the one in the checkpoint.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -61,12 +63,28 @@ def test_parse_config_rebuilds_model():
     assert model.precision == jax.lax.Precision.HIGH
 
 
-def test_parse_config_drops_removed_fields():
-    """Configs from older runs carry since-removed flags; reconstruction must
-    drop them instead of crashing."""
-    result = parse_config(make_config(model_overrides={
-        "use_flash_attention": False, "norm_groups": 8, "activation": "swish"}))
-    assert type(result["model"]).__name__ == "SimpleDiT"
+def test_parse_config_leaves_warning_filters_untouched():
+    """Silencing every warning in the process hides the failures the rest of
+    the run would otherwise report."""
+    before = list(warnings.filters)
+    parse_config(make_config())
+
+    assert warnings.filters == before
+
+
+def test_build_model_rejects_config_keys_the_model_has_no_field_for():
+    """A key the model cannot take is a typo or a since-removed flag; dropping
+    it would build a model other than the one the run trained."""
+    from dew.registry import build_model
+
+    config = {**make_config()["model"], "num_layerss": 99, "emb_feature": 4096}
+    with pytest.raises(ValueError) as error:
+        build_model("simple_dit", config)
+
+    message = str(error.value)
+    assert "SimpleDiT" in message
+    assert "['emb_feature', 'num_layerss']" in message
+    assert "'emb_features'" in message
 
 
 def test_parse_config_noise_schedule_selection():
@@ -77,17 +95,35 @@ def test_parse_config_noise_schedule_selection():
     assert type(cosine["noise_schedule"]).__name__ == "CosineNoiseScheduler"
 
 
+def test_parse_config_samples_with_the_trained_flow_shift():
+    """The recipe logs its whole run config; a flow run trained at shift 3.0
+    has to sample at shift 3.0, since the shift moves every timestep."""
+    config = make_config(arguments_overrides={"noise_schedule": "flow"})
+    config["run_config"] = {"noise_schedule": "flow", "flow_shift": 3.0, "min_snr_gamma": 5.0}
+
+    assert parse_config(config)["noise_schedule"].shift == 3.0
+
+
+def test_parse_config_flow_shift_defaults_for_configs_before_the_knob():
+    """A run logged before flow_shift existed trained at the preset default."""
+    config = make_config(arguments_overrides={"noise_schedule": "flow"})
+
+    assert parse_config(config)["noise_schedule"].shift == 1.0
+
+
 def test_parse_config_resolves_dotted_values():
     """Function paths like 'jax.nn.mish' (and the 'jax._src.nn.functions.silu'
     that old configs contain from the aliasing bug) must resolve to the actual
     function, not silently vanish into class defaults."""
+    uvit = {"emb_features": 64, "patch_size": 4, "num_layers": 2, "num_heads": 2}
+
     config = make_config(arguments_overrides={"architecture": "uvit"})
-    config["model"]["activation"] = "jax.nn.mish"
+    config["model"] = {**uvit, "activation": "jax.nn.mish"}
     result = parse_config(config)
     assert result["model"].activation is jax.nn.mish
 
     config = make_config(arguments_overrides={"architecture": "uvit"})
-    config["model"]["activation"] = "jax._src.nn.functions.silu"
+    config["model"] = {**uvit, "activation": "jax._src.nn.functions.silu"}
     result = parse_config(config)
     assert result["model"].activation is jax.nn.silu
 
@@ -120,25 +156,31 @@ def test_registry_builds_every_architecture():
     the same call path training and inference share."""
     from dew.registry import MODEL_REGISTRY, build_model
 
-    base = {"emb_features": 64, "dtype": "float32", "precision": "default",
-            "output_channels": 3, "patch_size": 4, "num_layers": 2, "num_heads": 2}
+    base = {"emb_features": 64, "dtype": "float32", "precision": "default"}
+    dit = {"output_channels": 3, "patch_size": 4, "num_layers": 2, "num_heads": 2}
+    unet = {"output_channels": 3, "feature_depths": [16, 32], "attention_configs": [None, None],
+            "num_res_blocks": 1, "num_middle_res_blocks": 1,
+            "activation": "swish", "norm_groups": 4}
+    lm = {"num_layers": 2, "num_heads": 2, "vocab_size": 32, "max_seq_len": 16}
     per_arch = {
-        "unet": {"feature_depths": [16, 32], "attention_configs": [None, None],
-                 "num_res_blocks": 1, "num_middle_res_blocks": 1,
-                 "activation": "swish", "norm_groups": 4},
-        "uvit": {"num_layers": 4},
-        "simple_udit": {"num_layers": 4},
-        "hierarchical_mmdit": {"emb_features": (32, 64, 96), "num_layers": (1, 1, 1),
-                               "num_heads": (2, 2, 2), "base_patch_size": 2},
-        "unet_3d": {"feature_depths": [16, 32], "attention_configs": [None, None],
-                    "num_res_blocks": 1, "num_middle_res_blocks": 1,
-                    "activation": "swish", "norm_groups": 4, "temporal_heads": 2},
-        "causal_transformer": {"vocab_size": 32, "max_seq_len": 16},
-        "moe": {"vocab_size": 32, "max_seq_len": 16, "num_experts": 4, "top_k": 2},
+        "unet": unet,
+        "unet_3d": {**unet, "temporal_heads": 2},
+        "uvit": {**dit, "num_layers": 4},
+        "simple_udit": {**dit, "num_layers": 4},
+        "simple_dit": dit,
+        "simple_mmdit": dit,
+        "hybrid_dit": dit,
+        "video_dit": dit,
+        "hierarchical_mmdit": {"output_channels": 3, "emb_features": (32, 64, 96),
+                               "num_layers": (1, 1, 1), "num_heads": (2, 2, 2), "base_patch_size": 2},
+        "jepa_encoder": {"patch_size": 4, "num_layers": 2, "num_heads": 2},
+        "jepa_video_encoder": {"patch_size": 4, "num_layers": 2, "num_heads": 2},
+        "jepa_predictor": {"num_layers": 2, "num_heads": 2},
+        "causal_transformer": lm,
+        "moe": {**lm, "num_experts": 4, "top_k": 2},
     }
     for name in MODEL_REGISTRY:
-        config = {**base, **per_arch.get(name, {})}
-        model = build_model(name, config)
+        model = build_model(name, {**base, **per_arch[name]})
         assert type(model).__name__ == MODEL_REGISTRY[name].__name__
 
 
