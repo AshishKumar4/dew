@@ -155,7 +155,10 @@ def get_dataset_grain(
         seed: Random seed.
         dataset_source: Source path for the dataset.
         val_batch_size: Batch size for the validation loader. Defaults to the
-            process-local training batch size.
+            process-local training batch size. A pass is whole batches only,
+            val_len // this many of them, because a part-full batch cannot be
+            sharded over a device mesh. load_data holds out a whole number of
+            batches, so a run leaves no record unscored.
         val_worker_count: Number of worker processes for the validation loader.
         val_count: Records held out from the head of the source, in canonical
             order, as the validation split; the train loader then covers the
@@ -429,7 +432,9 @@ def get_media_dataset_grain(
             validation split; the train loader then covers the rest. None
             (default) means no validation loader.
         val_batch_size: Batch size of the validation loader. Defaults to the
-            train loader's local batch size.
+            train loader's local batch size. A pass is whole batches only,
+            val_len // this many of them, because a part-full batch cannot be
+            sharded over a device mesh.
 
     Returns:
         Dictionary with train dataset function and metadata; with val_count set
@@ -651,8 +656,9 @@ def get_token_dataset_grain(
 
     Train shuffles a seeded IndexSampler over the windows of train.bin; val
     reads val.bin once, in file order, so the two splits are disjoint files
-    and every validation pass scores the same windows. Both shard by JAX
-    process like every other grain path.
+    and every validation pass scores the same windows. A pass is whole
+    batches only, because a part-full batch cannot be sharded over a device
+    mesh. Both shard by JAX process like every other grain path.
 
     Returns:
         The standard loader dict: "train" fn, "train_len", "val" fn,
@@ -770,10 +776,10 @@ def get_packed_token_dataset_grain(
 
     Train shuffles the documents from `seed`, reshuffled per epoch, and runs
     for num_epochs, where None runs forever as the fixed-window sampler does.
-    Val reads its documents once, in file order, so a validation pass covers
-    the split exactly once and scores the same windows every time. Both
-    shard by JAX process, by slicing the documents before packing, since
-    sharding after it would have every process pack the same documents.
+    Val reads its documents once, in file order, so a validation pass scores
+    the same windows every time, in whole batches of them. Both shard by JAX
+    process, by slicing the documents before packing, since sharding after it
+    would have every process pack the same documents.
 
     Returns:
         The standard loader dict: "train" fn, "train_len", "val" fn,
