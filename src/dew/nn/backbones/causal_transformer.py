@@ -12,8 +12,9 @@ mlp.{gate,up,down}_proj}, norm, lm_head. A model family is supported only
 after its translator and same-weight reference parity test land.
 
 The block holds its token mixer in a slot: any module with the
-(x, decode=...) -> x signature of CausalSelfAttention becomes self_attn
-without the block changing, which is where a linear-attention mixer goes.
+(x, decode=..., positions=..., segment_ids=...) -> x signature of
+CausalSelfAttention becomes self_attn without the block changing, which is
+where a linear-attention mixer goes.
 """
 
 import functools
@@ -59,18 +60,34 @@ class RMSNorm(nn.Module):
 def rotary_freqs(positions, head_dim: int, theta: float):
     """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
 
-    Computed in fp32 so a token gets the same rotation whether it arrives in a
-    prefill or comes back as a single decode step.
+    `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
+    documents each restart at 0); the angle axes line up with the trailing
+    [B, S] either way. Computed in fp32 so a token gets the same rotation
+    whether it arrives in a prefill or comes back as a single decode step.
     """
     inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-    angles = jnp.asarray(positions, jnp.float32)[:, None] * inv_freq[None, :]
+    positions = jnp.asarray(positions, jnp.float32)
+    if positions.ndim == 1:
+        angles = positions[:, None] * inv_freq[None, :]
+    else:
+        angles = positions[:, :, None] * inv_freq[None, None, :]
     return jnp.cos(angles), jnp.sin(angles)
 
 
 def apply_rotary(x, freqs_cos, freqs_sin):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders."""
-    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)[None, :, None, :]
-    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)[None, :, None, :]
+    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
+
+    The freqs are [S, D] for one sequence, or [B, S, D] when a packed batch
+    restarts positions per document.
+    """
+    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
+    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
+    if cos.ndim == 3:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+    else:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
     fp32 = x.astype(jnp.float32)
     x1, x2 = jnp.split(fp32, 2, axis=-1)
     rotated = jnp.concatenate([-x2, x1], axis=-1)
@@ -119,7 +136,8 @@ class CausalSelfAttention(nn.Module):
                 dtype=self.dtype, name='k_norm')
 
     @nn.compact
-    def __call__(self, x, decode: bool = False):
+    def __call__(self, x, decode: bool = False,
+                 positions=None, segment_ids=None):
         B, S, _ = x.shape
         query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
         key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
@@ -129,27 +147,57 @@ class CausalSelfAttention(nn.Module):
             key = self.k_norm(key)
 
         # The cache slot carries position while decoding, so the rotation and
-        # the mask both read it instead of the row index of the token.
+        # the mask both read it instead of the row index of the token. A
+        # packed batch supplies the position inside its document instead of
+        # the row index, which is what restarts RoPE at every boundary.
         append = None
         if decode:
             positions, append = open_kv_cache(self, key, self.max_seq_len)
-        else:
+        elif positions is None:
             positions = jnp.arange(S)
+        else:
+            positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
         query = apply_rotary(query, freqs_cos, freqs_sin)
         key = apply_rotary(key, freqs_cos, freqs_sin)
 
         causal, mask = True, None
+        implementation = self.attention_impl
+        window = None if decode else self.sliding_window
         if append is not None:
             key, value = append(key, value)
             mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
             causal = False
+        elif segment_ids is not None:
+            # Attention stays inside each packed document: the segment ids
+            # make the mask block-diagonal, padding (segment 0) sees nothing,
+            # and causality (with the layer's window) travels in the same mask
+            # rather than as the kernels' flag.
+            segment_ids = jnp.asarray(segment_ids)
+            inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
+                      & (segment_ids[:, :, None] != 0))[:, None]
+            mask = jnp.logical_and(
+                inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
+            causal, window = False, None
+            if implementation in ('auto', 'cudnn'):
+                # cuDNN has no mask argument: causality and the window are
+                # flags, and jax hands the kernel a bool mask as an additive
+                # bias of -2**41 in the compute dtype instead
+                # (combine_bias_and_mask in
+                # jax/_src/cudnn/fused_attention_stablehlo.py), which also
+                # makes check_is_flash_attention refuse an odd length while
+                # training. The xla kernel masks by exclusion, on every
+                # backend and with the same fp32 softmax. It costs 83.6 ms
+                # and 5.80 GiB a step where the fixed window on cuDNN costs
+                # 75.8 ms and 4.99 GiB, measured in
+                # docs/concepts/language_models.md.
+                implementation = 'xla'
 
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl, causal=causal,
-            sliding_window=None if decode else self.sliding_window, mask=mask)
+            implementation=implementation, causal=causal,
+            sliding_window=window, mask=mask)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 
@@ -184,7 +232,8 @@ class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then gated MLP, both residual.
 
     `mixer` is a factory taking only a name; whatever it builds lands in the
-    tree as self_attn and only has to accept (x, decode=...).
+    tree as self_attn and has to accept (x, decode=..., positions=...,
+    segment_ids=...). The last two are None outside a packed batch.
     """
     mixer: Callable[..., nn.Module]
     emb_features: int
@@ -211,8 +260,10 @@ class DecoderBlock(nn.Module):
             name='mlp')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x, train: bool = False, decode: bool = False):
-        mixed = self.self_attn(self.input_layernorm(x), decode=decode)
+    def __call__(self, x, train: bool = False, decode: bool = False,
+                 positions=None, segment_ids=None):
+        mixed = self.self_attn(self.input_layernorm(x), decode=decode,
+                               positions=positions, segment_ids=segment_ids)
         x = x + self.dropout(mixed, deterministic=not train)
         hidden = self.mlp(self.post_attention_layernorm(x))
         return x + self.dropout(hidden, deterministic=not train)
@@ -350,8 +401,10 @@ class CausalTransformer(nn.Module):
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
                 precision=self.precision, name='lm_head')
 
-    def __call__(self, tokens, train: bool = False, decode: bool = False):
-        x = self.hidden_states(tokens, train=train, decode=decode)
+    def __call__(self, tokens, train: bool = False, decode: bool = False,
+                 positions=None, segment_ids=None):
+        x = self.hidden_states(tokens, train=train, decode=decode,
+                               positions=positions, segment_ids=segment_ids)
 
         # fp32 head, as in the DiT output projection: the loss is computed in fp32
         if self.tie_embeddings:
@@ -367,18 +420,22 @@ class CausalTransformer(nn.Module):
             logits = cap * jnp.tanh(logits / cap)
         return logits
 
-    def hidden_states(self, tokens, train: bool = False, decode: bool = False):
+    def hidden_states(self, tokens, train: bool = False, decode: bool = False,
+                      positions=None, segment_ids=None):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
         A loss that pairs this with `head_weight` scores tokens without ever
-        holding the full `[B, S, vocab]` logits tensor.
+        holding the full `[B, S, vocab]` logits tensor. A packed batch passes
+        its per-document `positions` and `segment_ids` through to the layers,
+        which is where RoPE and the mask read them.
         """
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             x = x * jnp.asarray(math.sqrt(self.emb_features), x.dtype)
         for layer in self.layers:
-            x = layer(x, train=train, decode=decode)
+            x = layer(x, train=train, decode=decode,
+                      positions=positions, segment_ids=segment_ids)
         return self.norm(x)
 
     def head_weight(self, params):

@@ -44,7 +44,8 @@ class ModelConfig:
     dtype: Literal["float32", "bfloat16"] = "bfloat16"
     """Compute dtype; params stay float32."""
     attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
-    """Attention kernel; 'auto' is cudnn on gpu, xla elsewhere."""
+    """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
+    supports and xla for the rest, xla on any other backend."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,8 +72,11 @@ class DataConfig:
     """Tokens per training window, when the dataset is a tokenized text
     directory from tools/tokenize_text.py."""
     tokenizer: Optional[str] = None
-    """Tokenizer behind that directory: 'byte' or an HF tokenizer name."""
-
+    pack_sequences: bool = False
+    """Pack whole documents into the training windows instead of reading
+    fixed strides. The token files must then hold eos ids between documents
+    (tools/tokenize_text.py --pack), and every batch row carries
+    `text_segment_ids` / `text_positions` for the backbone's mask."""
 
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
@@ -124,6 +128,10 @@ class TrainerConfig:
     """Unset runs without wandb: nothing is logged and nothing is published."""
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
+    xla_flags: Optional[str] = None
+    """Extra XLA_FLAGS for this run, appended to the environment by
+    `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
+    themselves; see docs/performance.md for what was measured."""
 
     def __post_init__(self):
         if self.resume_last_run is not None and self.wandb_project is None:

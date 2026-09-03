@@ -30,9 +30,14 @@ Anything that implements a published architecture, schedule, sampler or loss is 
 
 ## Tests
 
-- Every behaviour has a test that can fail, at the seam where the behaviour lives: a scheduler against its paper's invariants, a sampler against an analytic denoiser, a model through `fit` on the simulated 8-device mesh, a parity check against the reference for anything that ports a published design.
-- A bug fix comes with the test that fails before and passes after.
-- Tests are deterministic and run on CPU. The GPU lane exists for kernels and dtypes, not for logic.
+A test is worth keeping only if it would fail on a plausible bug in the thing it names. Before committing one, ask what change to the code would make it go red; if the answer is "none" or "only deleting the function", it is not a test.
+
+- Test the output, not the plumbing. Assert values: a scheduler against its paper's equations, a sampler against an analytic denoiser, a loss against a hand computation on a small case, a model through `fit` on the simulated 8-device mesh, a port against the reference at fp32 with the tolerance and the largest observed difference written in the test. Do not assert that a function was called, that a shape came back, or that a constant equals itself.
+- Test at the seam where the behaviour lives, through the public interface, with real inputs. Mock only at real external boundaries (network, disk, a service). A stub that returns the value the test then checks proves nothing.
+- Prove the test can fail. A bug fix ships with the test that failed before the fix and passes after, both runs shown in the commit or review. A new invariant ships with a mutation that breaks it (drop a term, flip a comparison, skip a chunk) and the assertion that the mutated code fails.
+- One behaviour per test, named for the behaviour. A test that would need its name changed when the implementation changes is testing the implementation.
+- Deterministic and on CPU. Fixed seeds, no wall-clock timing, no network unless marked. The GPU lane exists for kernels and dtypes, not for logic.
+- No silent skips. `importorskip` only for an optional dependency, never for the code under test; a test that skips because a module broke is a broken test.
 - `tests/test_architectures.py` fails when a registry entry has no training case. Keep it that way.
 
 ## Writing
