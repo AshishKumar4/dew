@@ -75,7 +75,7 @@ class DataConfig:
     pack_sequences: bool = False
     """Pack whole documents into the training windows instead of reading
     fixed strides. The token files must then hold eos ids between documents
-    (tools/tokenize_text.py --pack-seq-len), and every batch row carries
+    (tools/tokenize_text.py --pack), and every batch row carries
     `text_segment_ids` / `text_positions` for the backbone's mask."""
 
 @dataclasses.dataclass(frozen=True)
