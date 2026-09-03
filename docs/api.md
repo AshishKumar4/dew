@@ -60,6 +60,7 @@ The public modules, and what each one is for.
 | `dew.data.dataloaders` | `load_data`, `get_dataset_grain`, `get_media_dataset_grain`, `get_token_dataset_grain`, `get_dataset_online`, `generate_collate_fn` |
 | `dew.data.text` | `ByteTokenizer`, `HFTokenizer` |
 | `dew.data.sources.text` | `TokenFileSource` |
+| `dew.data.sources.hf` | `HFDatasetSource`, the `hf:<dataset>:<split>` route into the media loader |
 | `dew.data.registry` | `datasetMap`, `onlineDatasetMap`, `mediaDatasetMap` |
 | `dew.data.sources.base` | `DataSource`, `DataAugmenter`, `MediaDataset` |
 | `dew.data.sources.images`, `.videos`, `.voxceleb2` | the TFDS, GCS, local video and VoxCeleb2 implementations |

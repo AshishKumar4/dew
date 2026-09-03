@@ -104,6 +104,20 @@ def labelizer_oxford_flowers102(path):
     return load_labels
 
 
+def labelizer_record_caption(sample, rng: np.random.Generator) -> str:
+    """The caption a record already carries, for datasets that ship their text.
+
+    Hub image datasets keep it in a 'caption' or a 'text' column. The rng is
+    the labelizer contract's; reading a stored caption needs no randomness.
+    """
+    for key in ("caption", "text"):
+        if key in sample:
+            return sample[key]
+    raise KeyError(
+        "an image record needs a 'caption' or a 'text' column, this one has "
+        f"{sorted(sample)}")
+
+
 # ----------------------------------------------------------------------------------
 # TFDS Image Source
 # ----------------------------------------------------------------------------------
@@ -160,15 +174,20 @@ class ImageTFDSSource(DataSource):
 class ImageTFDSAugmenter(DataAugmenter):
     """Augmenter for TFDS image datasets."""
     
-    def __init__(self, label_path: str = None):
+    def __init__(self, label_path: str = None, labelizer: Callable = None):
         """Initialize a TFDS image augmenter.
-        
+
         Args:
             label_path: Path to the labels file for datasets like Oxford Flowers.
+            labelizer: Function mapping a sample and its record rng to a caption.
+                Defaults to reading the class index out of `label_path`, which
+                is what a dataset labelled by class needs; one that carries its
+                own text passes labelizer_record_caption instead.
         """
         if label_path is None:
             label_path = os.path.join(os.path.expanduser("~"), "tensorflow_datasets/oxford_flowers102/2.1.1/label.labels.txt")
         self.label_path = label_path
+        self.labelizer = labelizer
     
     def create_transform(self, image_scale: int = 256, method: Any = None) -> Callable[[], pygrain.Transformation]:
         """Create a transform for TFDS image datasets.
@@ -180,7 +199,8 @@ class ImageTFDSAugmenter(DataAugmenter):
         Returns:
             A callable that returns a pygrain.RandomMapTransform.
         """
-        labelizer = labelizer_oxford_flowers102(self.label_path)
+        # The label file is only read when it is the caption source.
+        labelizer = self.labelizer or labelizer_oxford_flowers102(self.label_path)
         
         if image_scale > 256:
             interpolation = cv2.INTER_CUBIC
@@ -202,15 +222,17 @@ class ImageTFDSAugmenter(DataAugmenter):
                 
                 caption = labelizer(element, rng)
                 results = self.tokenize(caption)
-                return {
+                record = {
                     "image": image,
-                    # the class index, which the JEPA linear/kNN probes score against
-                    "label": np.int32(element['label']),
                     "text": {
                         "input_ids": results['input_ids'][0],
                         "attention_mask": results['attention_mask'][0],
                     }
                 }
+                if 'label' in element:
+                    # the class index, which the JEPA linear/kNN probes score against
+                    record["label"] = np.int32(element['label'])
+                return record
         
         return TFDSTransform
     
