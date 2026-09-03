@@ -13,7 +13,10 @@ import numpy as np
 
 from concurrent.futures import ThreadPoolExecutor
 import io
-import urllib
+# `import urllib` leaves urllib.request undefined, so the fetch below reached
+# it only when something else in the process had imported it. A worker that
+# was not forked imports neither.
+import urllib.request
 import os
 
 import PIL.Image
@@ -43,6 +46,16 @@ def _user_agent() -> str:
 DROPPED_SAMPLE = "__dropped__"
 
 
+# The fetcher's worker processes are started without forking this one. This
+# loader runs inside a training process, and os.fork carries over only the
+# calling thread, so a child inherits mutexes that JAX's and CUDA's other
+# threads were holding and hangs the first time it allocates or logs. The
+# sample queue comes from the same context, because a semaphore created for
+# the fork context is unlinked as soon as it exists and a spawned worker
+# cannot reopen it.
+_WORKER_CONTEXT = multiprocessing.get_context("spawn")
+
+
 class ResourceManager:
     """A manager for shared resources across data loading processes."""
     
@@ -52,7 +65,7 @@ class ResourceManager:
         Args:
             max_queue_size: Maximum size of the data queue.
         """
-        self.data_queue = Queue(max_queue_size)
+        self.data_queue = _WORKER_CONTEXT.Queue(max_queue_size)
     
     def get_data_queue(self) -> Queue:
         """Get the data queue."""
@@ -618,8 +631,7 @@ def parallel_media_loader(
     shard_len = len(dataset) // num_workers
     print(f"Local Shard length: {shard_len}")
     
-    # Process dataset in parallel
-    with multiprocessing.Pool(num_workers, initializer=_init_media_worker,
+    with _WORKER_CONTEXT.Pool(num_workers, initializer=_init_media_worker,
                               initargs=(data_queue,)) as pool:
         iteration = 0
         while True:
