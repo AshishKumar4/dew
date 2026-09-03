@@ -9,6 +9,8 @@ network. Every url is under .invalid, apart from the file:// url the fetch
 test reads out of tmp_path.
 """
 
+import functools
+import multiprocessing
 import os
 import queue
 import sys
@@ -315,3 +317,120 @@ def test_batch_mapping_propagates_feature_extractor_errors():
     with pytest.raises(RuntimeError, match="bad shard schema"):
         online_loader.map_batch({}, queue.Queue(), num_threads=1,
                                feature_extractor=broken)
+
+
+# ---------------------------------------------------------------------------------
+# The streaming factory: what a run gets from get_dataset_online
+# ---------------------------------------------------------------------------------
+
+class _StubTokenizer:
+    """The collate's tokenizer; the real one downloads CLIP."""
+
+    def __init__(self, tensor_type="np"):
+        pass
+
+    def __call__(self, captions):
+        n = len(captions)
+        return {"input_ids": np.zeros((n, 4), np.int32),
+                "attention_mask": np.ones((n, 4), np.int32)}
+
+
+def _producer_of(rows, passes, stop):
+    """A fetcher that walks `rows` records `passes` times, then stays alive."""
+
+    def produce(dataset, *, data_queue, **kwargs):
+        for _ in range(passes):
+            for index in range(rows):
+                data_queue.put({**_sample(index), "image": np.full((4, 4, 3),
+                                                                   index + 1, np.uint8)})
+        stop.wait(5)
+
+    return produce
+
+
+def _online_factory(monkeypatch, rows, passes, stop, batch=4):
+    from dew.data import dataloaders
+    from dew.data.registry import onlineDatasetMap
+
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "parallel_media_loader",
+                        _producer_of(rows, passes, stop))
+    monkeypatch.setitem(onlineDatasetMap, "fake_online",
+                        {"source": _StubDataset(rows)})
+    return dataloaders.get_dataset_online("fake_online", batch_size=batch,
+                                          worker_count=1, image_scale=4)
+
+
+def test_the_streaming_factory_repeats_its_records_instead_of_ending(monkeypatch, stop):
+    """The streamer is documented as endless: the pool walks its shards in a
+    loop and a run bounds training by steps, so `for batch in loader` must not
+    stop at the end of the dataset."""
+    rows, batch, passes = 12, 4, 3
+    data = _online_factory(monkeypatch, rows, passes, stop, batch=batch)
+    loader = data["train"]()
+
+    seen = [[int(v) for v in next(loader)["image"][:, 0, 0, 0]]
+            for _ in range(rows // batch * passes)]
+    records = [value for row in seen for value in row]
+
+    assert len(records) == rows * passes
+    assert sorted(records[:rows]) == list(range(1, rows + 1)), "a pass repeats a record"
+    assert set(records[rows:]) == set(records[:rows]), "the stream reads them again"
+
+
+def test_the_streaming_factory_reports_its_length_in_records(monkeypatch, stop):
+    """train_len is records, like every grain factory's, and a recipe divides
+    it by the batch size for steps per epoch."""
+    data = _online_factory(monkeypatch, 12, 1, stop, batch=4)
+
+    assert data["train_len"] == 12
+    assert data["local_batch_size"] == 4 and data["global_batch_size"] == 4
+    assert len(data["train"]()) == 12
+
+
+def test_the_streaming_factory_stops_when_its_fetcher_is_gone(monkeypatch):
+    """The one thing that does end the stream: nothing left to wait for.
+
+    The factory leaves the iterator's queue timeout at a minute, so the wait
+    before it looks at the fetcher is shortened here. What is under test is
+    that the wait ends in StopIteration rather than in a batch of zeros.
+    """
+    def exhausted(dataset, *, data_queue, **kwargs):
+        for index in range(4):
+            data_queue.put({**_sample(index), "image": np.full((4, 4, 3), 1, np.uint8)})
+
+    from dew.data import dataloaders
+    from dew.data.registry import onlineDatasetMap
+
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "parallel_media_loader", exhausted)
+    monkeypatch.setattr(online_loader, "MediaBatchIterator",
+                        functools.partial(MediaBatchIterator, queue_timeout=0.05))
+    monkeypatch.setitem(onlineDatasetMap, "fake_online", {"source": _StubDataset(4)})
+    loader = dataloaders.get_dataset_online("fake_online", batch_size=4,
+                                            worker_count=1, image_scale=4)["train"]()
+
+    assert len(next(loader)["image"]) == 4
+    with pytest.raises(StopIteration):
+        next(loader)
+
+
+def test_load_data_routes_a_streaming_only_dataset_to_the_streamer(monkeypatch, stop):
+    """'auto' reads the registries, and what comes back has no validation
+    loader at all: a streaming run holds nothing out, so nothing downstream
+    may report a validation pass over a held-out split."""
+    from dew.config import DataConfig
+    from dew.data import dataloaders
+    from dew.data.registry import onlineDatasetMap
+
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "parallel_media_loader",
+                        _producer_of(12, 1, stop))
+    monkeypatch.setitem(onlineDatasetMap, "fake_online", {"source": _StubDataset(12)})
+
+    data = dataloaders.load_data(DataConfig(dataset="fake_online", batch_size=4,
+                                            image_size=4, worker_count=1))
+
+    assert data["train_len"] == 12 and data["local_batch_size"] == 4
+    assert "val" not in data and "test" not in data
+    assert len(next(data["train"]())["image"]) == 4

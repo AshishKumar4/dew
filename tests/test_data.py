@@ -10,12 +10,14 @@ import os
 import importlib.util
 import inspect
 import itertools
+import json
 import shutil
 import subprocess
 import sys
 import wave
 from pathlib import Path
 
+import cv2
 import grain.python as pygrain
 import numpy as np
 import pytest
@@ -29,7 +31,8 @@ from dew.data.sources.av_utils import choose_clip_start
 from dew.data.sources.base import DataAugmenter, DataSource, MediaDataset
 from dew.data.sources.hf import HFDatasetSource
 from dew.data.sources.images import (
-    CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, gcs_filters,
+    CombinedImageGCSSource, ImageGCSSource, ImageTFDSAugmenter, augment_image,
+    gcs_filters, image_augmentations, image_augmenter, labelizer_oxford_flowers102,
 )
 from dew.data.sources import videos as videos_module
 from dew.data.sources.videos import AudioVideoAugmenter, VideoLocalSource
@@ -715,3 +718,397 @@ def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
 
     with pytest.raises(AttributeError):
         collate(batch)
+
+
+# ---------------------------------------------------------------------------------
+# Stream termination: a validation pass ends, a training stream does not
+# ---------------------------------------------------------------------------------
+
+# Both grain factories build their validation sampler with the num_epochs a run
+# passes, which is None, so today a pass never ends and its records come round
+# again. wave/fix-val-split owns that sampler; the tests carrying this reason
+# state the contract its fix has to meet, and they fail until it lands.
+ENDLESS_VAL = "an endless validation pass; wave/fix-val-split owns the sampler"
+
+
+def _bounded(loader, limit):
+    """At most `limit` batches, and whether the stream ended inside them.
+
+    Bounded on purpose: an endless stream then fails a count instead of
+    hanging the suite.
+    """
+    iterator = iter(loader)
+    taken = list(itertools.islice(iterator, limit))
+    return taken, next(iterator, None) is None
+
+
+def test_a_media_validation_pass_ends_when_the_split_runs_out(fake_media_dataset):
+    """Sixteen held-out records at batch eight are two batches, then the end."""
+    data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                   val_count=16, worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+    assert indices == list(range(16))
+
+
+def test_a_legacy_validation_pass_ends_when_the_split_runs_out(fake_legacy_dataset):
+    data = dataloaders.get_dataset_grain(
+        "fake", dataset_source="/tmp", batch_size=8, val_count=16,
+        worker_count=0, val_worker_count=0)
+
+    batches, ended = _bounded(data["val"](), 3)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+
+    assert len(batches) == 2 and ended, ENDLESS_VAL
+    assert indices == list(range(16))
+
+
+@pytest.mark.parametrize("worker_count", [0, 1, pytest.param(2, marks=pytest.mark.slow)])
+def test_a_validation_pass_covers_the_held_out_split_once_at_any_worker_count(
+        fake_media_dataset, worker_count):
+    """Every held-out record reaches the metrics once, and no record the model
+    trains on does.
+
+    Which batch a record lands in is worker_count's business, since each worker
+    batches its own slice of the sampler's indices. The set is not.
+    """
+    data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                   val_count=16, worker_count=worker_count)
+
+    batches, _ = _bounded(data["val"](), 2)
+    indices = [int(i) for batch in batches for i in batch["index"]]
+    train, _ = _bounded(data["train"](), 2)
+
+    assert sorted(indices) == list(range(16))
+    assert {int(i) for batch in train for i in batch["index"]}.isdisjoint(indices)
+
+
+@pytest.mark.parametrize("factory", ["media", "legacy"])
+def test_the_training_stream_repeats_instead_of_ending(
+        factory, fake_media_dataset, fake_legacy_dataset):
+    """num_epochs is None in a run, and the trainer keeps asking for batches
+    long after one pass over the records."""
+    if factory == "media":
+        data = get_media_dataset_grain("fake", dataset_source="/tmp", batch_size=8,
+                                       val_count=16, worker_count=0)
+    else:
+        data = dataloaders.get_dataset_grain(
+            "fake", dataset_source="/tmp", batch_size=8, val_count=16,
+            worker_count=0, val_worker_count=0)
+
+    epoch = data["train_len"] // 8  # the sixteen training records, in two batches
+    batches, ended = _bounded(data["train"](), 3 * epoch)
+    first_epoch = [int(i) for batch in batches[:epoch] for i in batch["index"]]
+    later = [int(i) for batch in batches[epoch:] for i in batch["index"]]
+
+    assert not ended and len(batches) == 3 * epoch
+    assert sorted(first_epoch) == list(range(16, 32))
+    assert set(later) == set(first_epoch), "the stream reads the same records again"
+
+
+# ---------------------------------------------------------------------------------
+# Determinism across worker counts, and a restart mid-epoch
+# ---------------------------------------------------------------------------------
+
+class _ImageSource(DataSource):
+    """Deterministic images and class labels, addressed by index."""
+
+    def __init__(self, length):
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        rng = np.random.RandomState(index)
+        return {"index": index,
+                "image": rng.randint(0, 256, (12, 12, 3), np.uint8),
+                "label": index % 5}
+
+    def get_source(self, path_override):
+        return self
+
+
+class _AugmentingAugmenter(DataAugmenter):
+    """The real augmentation pipeline and the real labelizer, no tokenizer.
+
+    Those two are what a worker count could move: both draw from grain's
+    per-record rng. Tokenizing a caption is deterministic and needs the hub.
+    """
+
+    def __init__(self, label_path):
+        self.label_path = label_path
+
+    def create_transform(self, image_scale=8, method=None):
+        augments = image_augmentations()
+        labelizer = labelizer_oxford_flowers102(self.label_path)
+
+        class Augmenting(pygrain.RandomMapTransform):
+            def random_map(self, element, rng):
+                return {"index": element["index"],
+                        "image": augment_image(augments, element["image"], rng),
+                        "caption": labelizer(element, rng)}
+
+        return Augmenting
+
+
+@pytest.fixture
+def augmenting_media_dataset(monkeypatch, tmp_path):
+    """A media dataset whose records really are augmented and captioned."""
+    labels = tmp_path / "label.labels.txt"
+    labels.write_text("\n".join(["rose", "tulip", "lotus", "orchid", "marigold"]))
+    dataset = MediaDataset(source=_ImageSource(16),
+                           augmenter=_AugmentingAugmenter(str(labels)),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "augmenting", dataset)
+    return dataset
+
+
+def _rows(batch):
+    """(index, pixels, caption) per record, so a comparison covers all three."""
+    return [(int(batch["index"][row]), batch["image"][row].tobytes(),
+             str(batch["caption"][row]))
+            for row in range(len(batch["index"]))]
+
+
+def _augmented(worker_count, batch=4, seed=3):
+    """{record index: (pixels, caption)} for one epoch at this worker count."""
+    data = get_media_dataset_grain("augmenting", dataset_source="/tmp",
+                                   batch_size=batch, worker_count=worker_count,
+                                   num_epochs=1, seed=seed)
+    records = {}
+    for b in data["train"]():
+        for row in range(len(b["index"])):
+            records[int(b["index"][row])] = (b["image"][row].tobytes(),
+                                             str(b["caption"][row]))
+    return records
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("worker_count", [1, 2, 4])
+def test_a_records_pixels_and_caption_do_not_depend_on_worker_count(
+        augmenting_media_dataset, worker_count):
+    """The flip, the colour jitter and the prompt template all come from the
+    per-record rng, which grain keys by record index, so the number of workers
+    that produced a batch cannot change what is in it."""
+    serial = _augmented(0)
+    parallel = _augmented(worker_count)
+
+    assert sorted(serial) == list(range(16))
+    assert serial == parallel
+
+
+def test_augmentation_really_moves_the_pixels(augmenting_media_dataset):
+    """Guards the test above: identical records at every worker count would
+    also be true of a pipeline that augmented nothing."""
+    records = _augmented(0)
+    source = _ImageSource(16)
+
+    assert any(records[i][0] != source[i]["image"].tobytes() for i in records)
+    assert len({caption for _, caption in records.values()}) > 1
+
+
+@pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
+        augmenting_media_dataset, monkeypatch, worker_count, tmp_path):
+    """The trainer saves the iterator's position in its checkpoint, so a
+    restored run owes the epoch its unseen records, no more and no fewer.
+
+    The loader is built again from a source object of its own, which is what a
+    resumed process has: grain validates a saved position against
+    `repr(source)` and will not restore one it cannot match.
+
+    Eight training records over two workers is two whole batches, since each
+    worker batches its own slice and drops what is left over.
+    """
+    def loader():
+        labels = tmp_path / "label.labels.txt"
+        dataset = MediaDataset(source=_ImageSource(16),
+                               augmenter=_AugmentingAugmenter(str(labels)),
+                               media_type="image")
+        monkeypatch.setitem(mediaDatasetMap, "augmenting", dataset)
+        return get_media_dataset_grain("augmenting", dataset_source="/tmp",
+                                       batch_size=4, worker_count=worker_count,
+                                       num_epochs=1, seed=3, val_count=8)
+
+    interrupted = iter(loader()["train"]())
+    seen = _rows(next(interrupted))
+    state = interrupted.get_state()
+    rest, ended = _bounded(interrupted, 20)
+    unseen = [row for batch in rest for row in _rows(batch)]
+
+    restored = iter(loader()["train"]())
+    restored.set_state(state)
+    after, ended_again = _bounded(restored, 20)
+    resumed = [row for batch in after for row in _rows(batch)]
+
+    assert "object at 0x" not in json.loads(state)["data_source"], (
+        "a source described by its address can only be restored in the process "
+        "that saved it")
+    assert ended and ended_again
+    assert resumed == unseen, "a resumed epoch owes the same records, augmented alike"
+    assert sorted(index for index, _, _ in seen + resumed) == list(range(8, 16))
+
+
+# ---------------------------------------------------------------------------------
+# Failure paths: a record that cannot be read stops the run
+# ---------------------------------------------------------------------------------
+
+class _RaisingSource(DataSource):
+    """Raises on record `bad`, or on every record when `bad` is None."""
+
+    def __init__(self, length, bad):
+        self.length = length
+        self.bad = bad
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if self.bad is None or index == self.bad:
+            raise RuntimeError(f"record {index} is unreadable")
+        return {"index": index}
+
+    def get_source(self, path_override):
+        return self
+
+
+def _raising_loader(monkeypatch, bad, worker_count, length=8, batch=2):
+    dataset = MediaDataset(source=_RaisingSource(length, bad),
+                           augmenter=_PassthroughAugmenter(), media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "raising", dataset)
+    return get_media_dataset_grain("raising", dataset_source="/tmp", batch_size=batch,
+                                   worker_count=worker_count, num_epochs=1)
+
+
+@pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_a_record_that_cannot_be_read_stops_the_stream(monkeypatch, worker_count):
+    """The source's own error has to reach the trainer. A pipeline that caught
+    it would train on whatever it substituted, and a worker's exception is the
+    easiest one to lose."""
+    data = _raising_loader(monkeypatch, bad=3, worker_count=worker_count)
+
+    delivered = []
+    with pytest.raises(RuntimeError, match="record 3 is unreadable"):
+        for batch in data["train"]():
+            delivered.extend(int(i) for i in batch["index"])
+
+    assert 3 not in delivered
+    assert all(index in range(8) for index in delivered), "no fabricated records"
+
+
+def test_a_source_that_fails_on_every_record_raises_instead_of_an_empty_batch(
+        monkeypatch):
+    data = _raising_loader(monkeypatch, bad=None, worker_count=0)
+
+    iterator = iter(data["train"]())
+    with pytest.raises(RuntimeError, match="is unreadable"):
+        next(iterator)
+
+
+# ---------------------------------------------------------------------------------
+# Adversarial shapes
+# ---------------------------------------------------------------------------------
+
+def test_a_dataset_of_one_record_yields_one_batch(monkeypatch):
+    dataset = MediaDataset(source=_ListSource(1), augmenter=_PassthroughAugmenter(),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "single", dataset)
+    data = get_media_dataset_grain("single", dataset_source="/tmp", batch_size=1,
+                                   worker_count=0, num_epochs=1)
+
+    batches, ended = _bounded(data["train"](), 2)
+
+    assert [[int(i) for i in b["index"]] for b in batches] == [[0]] and ended
+
+
+def test_a_validation_split_cannot_swallow_the_only_record(monkeypatch):
+    """One record and a held-out one would leave nothing to train on."""
+    dataset = MediaDataset(source=_ListSource(1), augmenter=_PassthroughAugmenter(),
+                           media_type="image")
+    monkeypatch.setitem(mediaDatasetMap, "single", dataset)
+
+    with pytest.raises(ValueError, match="val_count"):
+        get_media_dataset_grain("single", dataset_source="/tmp", batch_size=1,
+                                worker_count=0, val_count=1)
+
+
+def test_the_image_augmenter_gives_a_grayscale_record_three_channels():
+    """A single-channel record has to come out the same shape as every other
+    one, or the batch it lands in cannot be stacked."""
+    gray = np.tile(np.arange(0, 128, 8, dtype=np.uint8), (16, 1))
+
+    out = image_augmenter(gray, 16, cv2.INTER_NEAREST)
+
+    assert out.shape == (16, 16, 3)
+    np.testing.assert_array_equal(out[..., 0], gray)
+    np.testing.assert_array_equal(out[..., 0], out[..., 2])
+
+
+def test_the_image_augmenter_drops_alpha_and_hands_back_rgb():
+    """Records arrive as BGR(A) from cv2; the model is trained on RGB."""
+    bgra = np.dstack([np.full((16, 16), 10, np.uint8), np.full((16, 16), 20, np.uint8),
+                      np.full((16, 16), 30, np.uint8), np.full((16, 16), 40, np.uint8)])
+
+    out = image_augmenter(bgra, 16, cv2.INTER_NEAREST)
+
+    assert out.shape == (16, 16, 3)
+    np.testing.assert_array_equal(out[0, 0], [30, 20, 10])
+
+
+def test_a_truncated_image_raises_rather_than_becoming_an_array():
+    """cv2.imdecode hands back None for a half-written jpeg, and None resized
+    to the training size would be a black record."""
+    whole = np.random.RandomState(0).randint(0, 256, (16, 16, 3), np.uint8)
+    encoded, buffer = cv2.imencode(".jpg", whole)
+    assert encoded
+    truncated = buffer.tobytes()[:len(buffer) // 2]
+
+    decoded = cv2.imdecode(np.frombuffer(truncated, np.uint8), cv2.IMREAD_UNCHANGED)
+
+    assert decoded is None
+    with pytest.raises(cv2.error):
+        image_augmenter(decoded, 16)
+
+
+def test_image_collate_stacks_a_batch_of_one(monkeypatch):
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+
+    out = collate([{"image": np.full((8, 8, 3), 7, np.uint8), "caption": "alone"}])
+
+    assert out["image"].shape == (1, 8, 8, 3)
+    assert out["text"]["input_ids"].shape == (1, 4)
+
+
+def test_image_collate_raises_when_a_grayscale_record_meets_colour_ones(monkeypatch):
+    """Resizing to the largest shape cannot rescue a record with no channels,
+    and a batch that quietly dropped it would train on the wrong captions."""
+    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    collate = dataloaders.generate_collate_fn("image")
+    batch = [
+        {"image": np.full((8, 8, 3), 7, np.uint8), "caption": "colour"},
+        {"image": np.full((8, 8), 7, np.uint8), "caption": "gray"},
+    ]
+
+    with pytest.raises(ValueError, match="same shape"):
+        collate(batch)
+
+
+@pytest.mark.network
+def test_an_overlong_caption_is_truncated_to_the_text_context():
+    """The tokenizer pads and truncates to CLIP's context, so one enormous
+    caption cannot widen a batch or make it ragged."""
+    from dew.inputs.processors import AutoTextTokenizer
+
+    tokenizer = AutoTextTokenizer(tensor_type="np")
+    context = tokenizer.tokenizer.model_max_length
+
+    out = tokenizer(["x" * 10000, "short"])
+
+    assert out["input_ids"].shape == (2, context)
+    assert int(out["attention_mask"][0].sum()) == context
+    assert int(out["attention_mask"][1].sum()) < context
