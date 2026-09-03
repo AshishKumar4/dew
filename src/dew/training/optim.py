@@ -24,6 +24,11 @@ from dew.training import distributed
 # side of the matrix and both layouts get the same orthogonalized update.
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
+# An expert dimension stacks whole matrices, one per expert, so it is a batch
+# axis: optax names neither side and orthogonalizes each expert on its own
+# (optax/contrib/_muon.py:57-70).
+BATCH_AXES = frozenset({'exp'})
+
 
 def _matrix_sides(path, axes: distributed.LogicalAxes) -> tuple[tuple[int, ...], ...]:
     """The contracted axes and the output axes of a declared parameter.
@@ -36,8 +41,10 @@ def _matrix_sides(path, axes: distributed.LogicalAxes) -> tuple[tuple[int, ...],
     """
     sides: list[list[int]] = []
     for dimension, name in enumerate(axes):
+        if name in BATCH_AXES:
+            continue
         previous = axes[dimension - 1] if dimension else None
-        continues = dimension and (
+        continues = bool(sides) and (
             name is None or (name in HEAD_AXES and previous in HEAD_AXES))
         if continues:
             sides[-1].append(dimension)
@@ -47,8 +54,8 @@ def _matrix_sides(path, axes: distributed.LogicalAxes) -> tuple[tuple[int, ...],
         raise ValueError(
             f"{jax.tree_util.keystr(path)} is declared {axes}, which is not one "
             f"contracted side and one output side, so Muon cannot tell what its "
-            f"matrix is. An axis that is a stack of matrices rather than part of "
-            f"one, an expert axis for instance, needs its own rule here.")
+            f"matrix is. An axis that stacks matrices rather than being part of "
+            f"one belongs in BATCH_AXES.")
     return tuple(sides[0]), tuple(sides[1])
 
 

@@ -15,6 +15,7 @@ import pytest
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
+from dew.training import distributed
 from dew.training.optim import build_optimizer, muon_weight_dimension_numbers
 
 LR = 1e-3
@@ -260,3 +261,30 @@ def test_both_groups_step_with_the_one_schedule():
                 np.asarray(at(scheduled_updates, path)),
                 float(rate(step)) * np.asarray(at(unscaled_updates, path)),
                 rtol=2e-4, atol=1e-12, err_msg=f"step {step} {path}")
+
+
+def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time(monkeypatch):
+    """A routed expert kernel is [experts, embed, mlp], one matrix per expert
+    stacked on the leading dimension (wave/moe's declaration). Muon has to
+    treat that dimension as a batch and orthogonalize each expert on its own,
+    so the update equals the updates of the single matrices stacked back up.
+    Contracting the expert dimension instead would mix the experts, and the
+    loss curve is the only place it would show.
+    """
+    monkeypatch.setitem(distributed.DEFAULT_LOGICAL_PARAM_AXES,
+                        ("experts", "gate_proj"), ("exp", "embed", "mlp"))
+    experts, embed, mlp = 3, 8, 16
+    params = {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
+        'kernel': jnp.zeros((experts, embed, mlp))}}}}}}
+    path = ('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel')
+    spec = at(muon_weight_dimension_numbers(params), path)
+    assert spec.reduction_axis == (1,) and spec.output_axis == (2,)
+
+    updates, grads = group_updates(params)
+    grad = at(grads, path)
+    reference = optax.contrib.muon(LR)
+    for expert in range(experts):
+        one = {'kernel': grad[expert]}
+        expected, _ = reference.update(one, reference.init(one), one)
+        np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
+                                   np.asarray(expected['kernel']), atol=1e-8)
