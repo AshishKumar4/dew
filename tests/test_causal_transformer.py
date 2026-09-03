@@ -7,6 +7,8 @@ guards the config surface the HF decoders need (grouped-query heads, sliding
 layers, the Gemma flags) and the param tree the interop map renames.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -307,6 +309,30 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     # exact in real arithmetic, fp32 rounding through the norm is the residue
     assert gap(model) < 1e-3
     assert gap(tiny()) > 0.1
+
+
+def test_the_embedding_scale_multiplies_in_fp32(rng):
+    """Gemma casts sqrt(hidden) to the embedding's dtype, which is the
+    parameter dtype, so a bf16 run must round the product and not the factor:
+    sqrt(1152) is 33.941 and bf16 holds it as 34.0, 1.7e-3 too high.
+
+    Folding the same scale into the embedding table gives the value the module
+    has to produce, and the head is untied so the fold only moves the input
+    side.
+    """
+    features, ids = 1152, tokens(rng, length=4)
+    shared = dict(emb_features=features, num_heads=8, num_layers=1,
+                  tie_embeddings=False, dtype=jnp.bfloat16)
+    scaled = tiny(embedding_scale=True, **shared)
+    params = scaled.init(rng, ids)
+
+    folded = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: (leaf.astype(jnp.bfloat16).astype(jnp.float32)
+                            * math.sqrt(features)).astype(jnp.bfloat16)
+        if path[-2].key == 'embed_tokens' else leaf, params)
+
+    assert jnp.array_equal(scaled.apply(params, ids),
+                           tiny(**shared).apply(folded, ids))
 
 
 def test_attention_scale_defaults_to_the_head_dim_scale(rng):

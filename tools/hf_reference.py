@@ -25,6 +25,9 @@ What lands in tests/fixtures/hf:
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
   prompt and reference.npz the top 32 logits per position of the real
   weights in fp32, which the network test compares against.
+- gemma3-1b/: config.json only. google/gemma-3-1b-pt is gated and returns 401
+  without a token, so the config comes from a mirror of it, which is the same
+  file minus the mirror's own marker key.
 """
 
 import argparse
@@ -42,6 +45,8 @@ from transformers import (
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"
+# google/gemma-3-1b-pt is gated; this mirror carries the identical config
+GEMMA_MIRROR = "unsloth/gemma-3-1b-pt"
 PROMPT = (
     "The Cascade Range runs from northern California through Oregon and "
     "Washington into British Columbia, and its volcanoes include Mount Rainier, "
@@ -158,6 +163,22 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
+def write_gemma3_config(directory: Path) -> None:
+    """The real Gemma 3 1B text config, from a mirror of the gated repo.
+
+    google/gemma-3-1b-pt answers 401 without an accepted licence, and the
+    translation still has to be tested against a real Gemma config rather
+    than only the tiny fixture, so this takes the mirror's copy and drops the
+    marker key the mirror adds.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    config = json.loads(Path(hf_hub_download(GEMMA_MIRROR, "config.json")).read_text())
+    config.pop("unsloth_fixed", None)
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    print(f"{directory / 'config.json'}: {GEMMA_MIRROR}, "
+          f"{config['num_hidden_layers']} layers, {len(config)} fields")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-real", action="store_true",
@@ -173,6 +194,8 @@ def main() -> None:
     write_tensor_table(real)
     if not args.skip_real:
         write_real_reference(real)
+
+    write_gemma3_config(FIXTURES / "gemma3-1b")
 
 
 if __name__ == "__main__":
