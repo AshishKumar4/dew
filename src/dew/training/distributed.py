@@ -1,5 +1,6 @@
 """Device mesh, parameter sharding and host-to-device prefetch."""
 
+import json
 import queue
 import threading
 from typing import Iterator, Optional
@@ -93,7 +94,7 @@ class DevicePrefetchIterator:
             if not self._checkpointable:
                 raise TypeError(
                     f"{type(self._iterator).__name__} cannot resume from a saved position")
-            self._iterator.set_state(source_state)
+            self._iterator.set_state(self._position_for(source_state))
         # Position of the source iterator as of the batch most recently handed
         # out, so a checkpoint resumes at the next unseen batch rather than at
         # whatever the prefetch thread has already raced ahead to.
@@ -101,11 +102,22 @@ class DevicePrefetchIterator:
         self._thread = threading.Thread(target=self._prefetch, daemon=True)
         self._thread.start()
 
+    def _position_as_bytes(self, state):
+        """A position a checkpoint can carry: grain's DataLoader iterator
+        reports JSON bytes, its Dataset iterator (the packed loader) a dict,
+        and the checkpoint holds one uint8 array either way."""
+        return state if isinstance(state, bytes) else json.dumps(state).encode()
+
+    def _position_for(self, saved: bytes):
+        """`saved` back in the shape this iterator's set_state reads."""
+        return saved if isinstance(self._iterator.get_state(), bytes) else json.loads(saved)
+
     def _prefetch(self):
         try:
             while True:
                 batch = next(self._iterator)
-                state = self._iterator.get_state() if self._checkpointable else None
+                state = (self._position_as_bytes(self._iterator.get_state())
+                         if self._checkpointable else None)
                 self._queue.put((shard_batch(self._sharding, batch), state))
         except StopIteration:
             self._queue.put(StopIteration())
