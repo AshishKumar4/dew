@@ -7,6 +7,7 @@ from clu import metrics
 from flax.training import train_state  # Useful dataclass to keep train state
 import optax
 from flax import struct                # Flax dataclasses
+import itertools
 import time
 import os
 import orbax.checkpoint as ocp
@@ -379,14 +380,15 @@ class SimpleTrainer:
     ):
         process_index = jax.process_index()
         
-        val_ds = iter(val_ds()) if val_ds else None
+        # val_steps_per_epoch bounds the pass, and a held-out split that runs
+        # out first ends it, which is not an error to report.
+        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
+                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
         # Evaluation step
         try:
-            for i in range(val_steps_per_epoch):
-                if val_ds is None:
-                    batch = None
-                else:
-                    batch = shard_batch(self.batch_sharding, next(val_ds))
+            for i, batch in enumerate(batches):
+                if batch is not None:
+                    batch = shard_batch(self.batch_sharding, batch)
                 if i == 0:
                     print(f"Evaluation started for process index {process_index}")
                 metrics = val_step_fn(val_state, batch)
