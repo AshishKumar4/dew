@@ -342,6 +342,21 @@ def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
     assert not (tmp_path / "gs:").exists(), "a local directory named gs: was created"
 
 
+def test_a_relative_checkpoint_path_resumes(tmp_path, monkeypatch):
+    """`--trainer.load-from-checkpoint ./checkpoints/<run>` is what the README
+    shows. checkpoint_path resolves its own directory; load handed the path
+    straight to orbax, which refuses a relative one."""
+    trainer = make_trainer(tmp_path, name="relative")
+    trainer.save(epoch=0, step=2)
+    trainer.wait_for_checkpoints()
+
+    monkeypatch.chdir(tmp_path)
+    resumed = make_trainer(tmp_path, name="relative-resumed", load_from_checkpoint="./relative")
+    assert resumed.latest_step == 2
+    assert resumed.loaded_checkpoint_path == str(tmp_path / "relative" / "2")
+
+
+
 class ExplodingCheckpointer:
     """Orbax when the filesystem refuses the write.
 
