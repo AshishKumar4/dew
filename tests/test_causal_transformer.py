@@ -356,6 +356,28 @@ def test_attention_scale_defaults_to_the_head_dim_scale(rng):
     assert not jnp.allclose(model.apply(params, ids), gemma.apply(params, ids))
 
 
+def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
+    """transformers hands query_pre_attn_scalar ** -0.5 to the attention call
+    as a float (modeling_gemma3.py:318, 376), so the scale itself never rounds.
+
+    Gemma 3 27B asks for scalar 168 on head_dim 128, where the ratio to the
+    kernel's own 1/sqrt(head_dim) is 0.872872 and bf16 holds it as 0.871094.
+    A bf16 run that rounds the ratio first cannot tell that scale from the one
+    whose ratio is exactly 0.871094, and scales every logit 0.2% low.
+    """
+    ids = tokens(rng)
+    shared = dict(head_dim=128, num_layers=1, dtype=jnp.bfloat16)
+    exact = tiny(attention_scale=168 ** -0.5, **shared)
+    params = exact.init(rng, ids)
+    rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
+                   / math.sqrt(128), **shared)
+
+    assert not jnp.array_equal(exact.apply(params, ids), rounded.apply(params, ids))
+    # None asks for the kernel's own scale, so no factor touches the query
+    assert jnp.array_equal(tiny(**shared).apply(params, ids),
+                           tiny(attention_scale=128 ** -0.5, **shared).apply(params, ids))
+
+
 def test_dropout_trains_with_an_rng_and_is_off_by_default(rng):
     model = tiny(dropout_rate=0.5)
     ids = tokens(rng)

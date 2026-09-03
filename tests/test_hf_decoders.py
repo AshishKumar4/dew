@@ -187,6 +187,25 @@ def test_fp32_logits_match_the_reference_implementation(name):
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
+def test_the_bf16_gemma_forward_still_tracks_the_reference():
+    """gemma3-tiny is the fixture with an attention scale (query_pre_attn_scalar
+    16 on head_dim 32), and bf16 is the recipe's default compute dtype. Against
+    the fp32 reference logits the observed difference is 5.7e-02 on the
+    reference kernel, tolerance 1e-01; dropping the scale moves them by 1.06."""
+    directory = FIXTURES / "gemma3-tiny"
+    model, variables, _ = load_pretrained_decoder(
+        str(directory), dtype='bfloat16', attention_impl='reference')
+    reference = np.load(directory / "logits.npy")
+
+    logits = np.asarray(model.apply(
+        variables, jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)),
+        np.float32)
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-1, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
 def test_the_tied_head_is_the_embedding_and_untied_heads_load():
     """A tied checkpoint carries lm_head as a copy; the tree keeps one leaf."""
     config = translate_config(fixture_config("qwen3-tiny"))

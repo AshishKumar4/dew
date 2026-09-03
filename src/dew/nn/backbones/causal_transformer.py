@@ -71,14 +71,19 @@ def rotary_freqs(positions, head_dim: int, theta: float):
     return jnp.cos(angles), jnp.sin(angles)
 
 
-def apply_rotary(x, freqs_cos, freqs_sin):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders."""
+def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
+    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
+
+    `scale` multiplies the rotated heads inside the fp32 arithmetic, so a
+    query's attention scale narrows once, with the product.
+    """
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)[None, :, None, :]
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)[None, :, None, :]
     fp32 = x.astype(jnp.float32)
     x1, x2 = jnp.split(fp32, 2, axis=-1)
     rotated = jnp.concatenate([-x2, x1], axis=-1)
-    return (fp32 * cos + rotated * sin).astype(x.dtype)
+    out = fp32 * cos + rotated * sin
+    return (out if scale is None else out * scale).astype(x.dtype)
 
 
 class CausalSelfAttention(nn.Module):
@@ -141,13 +146,16 @@ class CausalSelfAttention(nn.Module):
         else:
             positions = jnp.arange(S)
         freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
-        query = apply_rotary(query, freqs_cos, freqs_sin)
+        # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
+        # query carries the ratio to the scale the checkpoint asks for. The
+        # reference hands its scaling to the attention call as a float
+        # (modeling_gemma3.py:318, 376), so the ratio rides the rotary's fp32
+        # arithmetic rather than being rounded to the activation dtype first.
+        query = apply_rotary(
+            query, freqs_cos, freqs_sin,
+            scale=(None if self.attention_scale is None
+                   else self.attention_scale * math.sqrt(self.head_dim)))
         key = apply_rotary(key, freqs_cos, freqs_sin)
-        if self.attention_scale is not None:
-            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so
-            # the query carries the ratio to the scale the checkpoint asks for.
-            query = query * jnp.asarray(
-                self.attention_scale * math.sqrt(self.head_dim), query.dtype)
 
         causal, mask = True, None
         if append is not None:
