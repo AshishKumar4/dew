@@ -882,7 +882,7 @@ def load_data(config: DataConfig) -> dict:
     for datasets registered solely there - the name alone once decided this
     ('online' in the dataset name), which chose a loader from spelling.
 
-    A dataset that is a directory of tokenized text (train.bin [+ val.bin]
+    A dataset that is a directory of tokenized text (train.bin and val.bin
     from tools/tokenize_text.py) takes the token loader ahead of all of
     that, and needs DataConfig.sequence_length. With pack_sequences the
     windows are whole documents packed by grain instead of fixed strides.
@@ -900,8 +900,14 @@ def load_data(config: DataConfig) -> dict:
             )
         root = Path(token_dir)
         val_bin = root / "val.bin"
-        train_bin = str(root / "train.bin")
-        val_bin = str(val_bin if val_bin.is_file() else root / "train.bin")
+        if not val_bin.is_file():
+            # Reading train.bin in its place scored the validation pass on the
+            # windows the model trains on.
+            raise ValueError(
+                f"dataset '{config.dataset}' has a train.bin but no val.bin; "
+                "tools/tokenize_text.py --val-fraction writes the held-out split"
+            )
+        train_bin, val_bin = str(root / "train.bin"), str(val_bin)
         if config.pack_sequences:
             # The Dataset API reads its source directly, so the DataLoader's
             # read threads and buffers have nothing to configure here.
