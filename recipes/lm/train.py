@@ -16,7 +16,6 @@ import json
 import os
 import time
 from dataclasses import dataclass, field, replace
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,6 +29,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
 from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
+from dew.training.runtime import run_timestamp
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
@@ -240,7 +240,7 @@ def main(config: LmRunConfig) -> ObjectiveTrainer:
         f"lm-{Path(config.data.dataset).name}/seq-{config.sequence_length}/"
         f"emb-{model.emb_features}/layers-{model.num_layers}/"
         f"lr-{config.optim.learning_rate}/"
-        f"date-{datetime.now().strftime('%Y-%m-%d_%H:%M:%S')}")
+        f"date-{run_timestamp()}")
     print("Experiment_Name:", name)
 
     wandb_config: Optional[dict[str, Any]] = None

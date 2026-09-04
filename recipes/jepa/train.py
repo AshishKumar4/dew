@@ -14,7 +14,6 @@ them. The Objective seam is what makes the same trainer serve both.
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Optional
 
 import jax
@@ -29,6 +28,7 @@ from dew.objectives.jepa import (
 from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
 from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
+from dew.training.runtime import run_timestamp
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
@@ -172,7 +172,7 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
     name = config.trainer.name or (
         f"jepa-{config.data.dataset}/res-{config.data.image_size}/patch-{encoder.patch_size}/"
         f"mixer-{encoder.ssm_attention_ratio}/emb-{encoder.emb_features}/"
-        f"lr-{config.optim.learning_rate}/date-{datetime.now().strftime('%Y-%m-%d_%H:%M:%S')}")
+        f"lr-{config.optim.learning_rate}/date-{run_timestamp()}")
     print("Experiment_Name:", name)
 
     wandb_config: Optional[dict[str, Any]] = None

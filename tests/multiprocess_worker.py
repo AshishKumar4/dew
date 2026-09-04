@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -253,10 +254,26 @@ def dump_params(path: Path, params) -> None:
     np.savez(path, **params_dict(params))
 
 
+class YearAhead(datetime):
+    """A clock a year off, for every process but the first in topology mode.
+
+    Two processes on one machine read the same second nearly always, so a
+    run name that came from each process's own clock would agree in a test
+    and split on a pod. Skewing one clock a year makes the source visible.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(days=400)
+
+
 def mode_topology(args) -> dict:
     import jax
+    from dew.training import runtime
     from dew.training.distributed import batch_sharding, build_mesh, shard_batch
 
+    if args.process_id > 0:
+        runtime.datetime = YearAhead
     mesh = build_mesh(args.fsdp_size)
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
@@ -275,6 +292,8 @@ def mode_topology(args) -> dict:
         "local_rows": sorted(
             {int(value) for shard in sharded.addressable_shards
              for value in np.asarray(shard.data)[:, 0, 0, 0]}),
+        "run_timestamp": runtime.run_timestamp(),
+        "own_year": runtime.datetime.now().year,
     }
 
 
