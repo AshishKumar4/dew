@@ -24,8 +24,8 @@ from dew.telemetry.instrumentation import (
 from .distributed import (
     DEFAULT_MIN_SHARD_SIZE, DEFAULT_SHARDING_TOLERANCE, DevicePrefetchIterator,
     LogicalAxisRuleConfig, assert_params_sufficiently_sharded, batch_sharding,
-    build_mesh, gather_positions, minimum_across_processes, own_position, shard_batch,
-    state_sharding_tree,
+    broadcast_from_process_zero, build_mesh, gather_positions,
+    minimum_across_processes, own_position, shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
 
@@ -139,7 +139,7 @@ class SimpleTrainer:
                 # If resuming from a previous run, and train_start_step_override is not set, 
                 # set the start step to the last step of the previous run
                 if train_start_step_override is None:
-                    train_start_step_override = run.summary['train/step'] + 1
+                    train_start_step_override = int(run.summary['train/step']) + 1
                 print(f"Resuming from previous run {wandb_config['id']} with start step {train_start_step_override}")
                 
                 # If load_from_checkpoint is not set, and an artifact is found, load the artifact
@@ -170,6 +170,14 @@ class SimpleTrainer:
                 self.wandb_sweep = api.sweep(f"{self.wandb.entity}/{self.wandb.project}/{self.wandb.sweep_id}")
                 print(f"Running sweep {self.wandb_sweep.id} with id {self.wandb.sweep_id}")
             
+        if wandb_config is not None and 'id' in wandb_config:
+            # Process 0 resolved the run id into a start step and a checkpoint.
+            # A process that kept its own values would resume from another
+            # step and other weights than the rest of the pool.
+            train_start_step_override, load_from_checkpoint, load_directly_from_dir = (
+                broadcast_from_process_zero((
+                    train_start_step_override, load_from_checkpoint, load_directly_from_dir)))
+
         # The latest few steps so a resume has something recent, plus the one
         # step with the lowest epoch loss. BestN reads `reverse=True` as
         # "smallest metric wins"; best_fn is what writes the metric into the
