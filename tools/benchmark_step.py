@@ -43,13 +43,13 @@ import numpy as np
 import optax
 import tyro
 
-import dew  # registers the models
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew.registry import models, with_precision
+from dew import models  # naming a registry fills it
+from dew.registry import with_precision
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer
