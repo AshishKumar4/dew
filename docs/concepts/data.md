@@ -1,55 +1,59 @@
 # The data pipeline
 
-`dew.data` turns a dataset name into a dict the trainer can consume:
+A dataset is a frozen dataclass in the `datasets` registry, and `load(batch=)` turns it into a `Dataset`, the value a run trains on:
 
 ```python
-{
-  "train": callable_returning_an_iterator,
-  "train_len": 8189,
-  "val": callable_returning_an_iterator,   # when the loader has one
-  "val_len": 8189,
-  "local_batch_size": 32,
-  "global_batch_size": 32,
-}
+import dew
+from dew.data import Dataset, OxfordFlowers, TokenWindows
+
+spec = OxfordFlowers(image_size=128, val_batches=4)     # a DatasetSpec: what the data is and how it is read
+assert dew.datasets["oxford_flowers102"] is OxfordFlowers
+# data = spec.load(batch=32)                            # a Dataset: train, val, records, batch
 ```
 
-`ObjectiveTrainer.fit` calls `data["train"]()`, wraps it in a `DevicePrefetchIterator`, and reads `local_batch_size` and `global_batch_size` for the throughput numbers.
+`Dataset.train()` opens an endless shuffled stream of global batches. `Dataset.val()` opens one pass over the held-out records in a fixed order that ends by itself, and is `None` when nothing is held out. `records` is the count behind the training stream, so `steps_per_epoch` is one pass over them, and `batch` is the global batch. Image and video fields are uint8 in `[0, 255]`; tokenized text is the `{"input_ids", "attention_mask"}` dict an encoder's `tokenize` produces, under `"text"`; a token window is int32 ids under `"text"`. An objective converts pixels to `[-1, 1]` itself through `dew.inputs.unit_range`, so the dataset stays what the reader decoded.
 
-## Source and augmenter
+The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.worker-count 16`. A new dataset is a dataclass behind `@datasets(name)`; it appears on the command line with nothing else written.
 
-Two abstractions, in `dew.data.sources.base`:
+## What every spec shares
 
-- `DataSource.get_source(path_override)` returns something with `__len__` and `__getitem__`, which is all grain's `IndexSampler` needs. TFDS datasets, ArrayRecord shards on a GCS mount, local video trees and VoxCeleb2 are all sources.
-- `DataAugmenter.create_transform(**kwargs)` returns a callable that builds a `pygrain.MapTransform`: decode, resize, augment, and produce the keys the model reads.
+`dew.data.dataset` holds the plumbing the image, video and token specs have in common:
 
-`MediaDataset` pairs one of each and records whether it is image or video. `dew.data.registry` holds the names: `datasetMap` for the image loader, `onlineDatasetMap` for the streaming one, `mediaDatasetMap` for the unified media loader.
+- `local_batch(batch)` is the one place the per-process batch is computed, and it refuses a global batch the processes cannot split evenly, since a remainder would train on fewer records a step than the run says.
+- `hold_out(source, records, held_out)` slices the head of a source off as the validation split and gives training the rest, so the two are disjoint by construction and FID and CLIP are never measured on records the model trained on.
+- `train_stream` builds grain's shuffled, sharded, repeated stream over the training slice, with the transformations applied after `to_iter_dataset` so they run in the workers.
+- `validation_pass` reads the held-out slice once in canonical order, sharded by process, and applies the random map before the per-process slice, so a record's augmentation is keyed by its global index and is the same on one host or eight.
 
-## Grain loaders
+Every process holds the same number of validation batches; the trainer confirms that before a pass and scores the minimum, so an uneven split cannot leave one host waiting in a collective.
 
-`get_dataset_grain(data_name, batch_size, image_scale, ...)` is the image path, `get_media_dataset_grain(data_name, ..., sequence_length=N)` handles images or video with one source and one augmenter per dataset.
+## Determinism
 
-Both build a `pygrain.IndexSampler` with `ShardByJaxProcess`, so each process reads its own shard, and batch to `batch_size // jax.process_count()` with `drop_remainder=True`. Worker processes, read threads and buffer sizes are all arguments; the defaults suit a machine with a fast disk and many cores.
+Decoding, resizing and augmentation draw their randomness from the record's own generator, seeded from the spec's `seed` and the record's index. Each grain read thread runs its own copy of the augmentation pipeline, so a record gets the same pixels and the same caption at any `worker_count`, any `read_threads`, and any number of hosts. A failed record is dropped and counted; nothing is ever replaced with zeros.
 
-Validation reads the same records in canonical order with a separate unshuffled sampler. For the media loader, `val_count` holds out the first N records as a disjoint slice, and the train loader covers the rest.
+## The specs
 
-## Hub datasets
+| Spec | Records | Notes |
+| --- | --- | --- |
+| `OxfordFlowers` | TFDS images, captioned from the class name through a prompt template | needs the `tfds` extra |
+| `HFImages` | a Hugging Face hub dataset with a `caption` or `text` column | `name`, `split`; needs the `streaming` extra |
+| `Laion12mCoco`, `CC12M`, `LaionaCoco`, `Combined30M` and the other named sets | captioned images from ArrayRecord shards on a GCS mount, one `dew.data.images.ArrayRecordImages` each | `path` is the mount |
+| `LocalVideos`, `VoxCeleb2` | video clips with audio, `frames` per record | need the `av` extra |
+| `TokenWindows` | `seq_len + 1` ids per record from `train.bin` and `val.bin` | written by `tools/tokenize_text.py` |
+| `PackedTokens` | documents packed into rows with segment ids and positions | the language model's packed path |
+| `OnlineImages`, `CombinedOnline` | images fetched from URL tables while training | no validation split; needs the `streaming` extra |
 
-A dataset named `hf:<dataset>:<split>`, as in `hf:acme/pets:train`, is a Hugging Face `datasets.Dataset`. An Arrow-backed dataset answers `len()` and integer indexing, so `HFDatasetSource` hands it to grain as a random-access source and the records go through the same image transform as a TFDS dataset, with the caption read from the record's `caption` or `text` column. The split defaults to `train`, no `dataset_path` is involved, and reading needs the `streaming` extra; naming one does not. The table stays out of the pickle grain sends to its workers: they reload it by name and split.
-
-## Streaming
-
-`get_dataset_online` builds an `OnlineStreamingDataLoader` over Hugging Face `datasets` URLs, fetching and decoding images or videos in worker threads. It needs the `streaming` extra. `dew.data` imports lazily through a module `__getattr__`, so a training run that only uses grain never pays for that stack, and a host without opencv or PyAV can still `import dew.data`.
+`import dew.data` registers all of them and imports none of opencv, albumentations, TFDS, `datasets` or transformers; a spec imports what it needs when it is loaded.
 
 ## Resuming mid-epoch
 
-Grain iterators report their position through `get_state()`, and the prefetch iterator carries the position of the batch it last handed out. The trainer writes that into the checkpoint and passes it back as `source_state` on the next run, so a resumed job continues where it stopped rather than replaying the epoch from the top. An iterator that cannot report a position simply has no `dataset_state` in the checkpoint.
+Grain iterators report their position through `get_state()`, and the prefetch iterator carries the position of the batch it last handed out. The trainer writes every process's position into the checkpoint's `position` entry and hands each process its own back on resume, so a resumed job continues where it stopped on every host rather than replaying the epoch from the top. A checkpoint written by two processes refuses to resume on one, with the reason, since a position is where one process's shard stopped and cannot be translated. A stream without `get_state` cannot record a position, and the trainer refuses to checkpoint one.
 
 ## Measuring it
 
-`tools/benchmark_data.py` iterates a loader with no model attached and prints samples per second and p50/p95 step latency, with the first steps dropped so worker startup is not counted:
+`tools/benchmark_data.py` iterates a spec's training stream with no model attached and prints samples per second and p50/p95 step latency, with the first steps dropped so worker startup is not counted:
 
 ```bash
-python tools/benchmark_data.py --dataset oxford_flowers102 --batch-size 32 --steps 100
+python tools/benchmark_data.py --steps 100 data:oxford-flowers --data.image-size 128
 ```
 
 If that number is above what training reaches, the loader is not the bottleneck.

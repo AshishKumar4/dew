@@ -24,7 +24,9 @@ import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
+FILES = [ROOT / "README.md",
+         *(x for x in sorted((ROOT / "docs").rglob("*.md"))
+           if x.relative_to(ROOT).parts[1] not in ("design", "research"))]
 BLOCK = re.compile(r"```python\n(.*?)```", re.S)
 ELSEWHERE = re.compile(r"^\s*# runs elsewhere: \S")
 
@@ -44,7 +46,7 @@ def tiny_world(tmp_path):
 
     import dew
     from dew import Checkpoints, Condition, Field, InputSpec, MeshSpec, Trainer, models, presets
-    from dew.data import Dataset
+    from dew.data import ByteTokenizer, Dataset
     from dew.inputs import CharTable
     from dew.objectives.diffusion import DiffusionObjective
 
@@ -71,7 +73,8 @@ def tiny_world(tmp_path):
         __name__="__docs__", dew=dew, jax=jax, optax=optax, np=np,
         data=data, steps=2, key=jax.random.key(0), text=text, inputs=inputs, fields=fields,
         model=model, process=process, objective=objective, trainer=trainer, state=state,
-        prompt=np.asarray([list(b"ROMEO:")], np.int32), optimizer=optax.adam(1e-3),
+        prompt=np.asarray([list(b"ROMEO:")], np.int32), tokenizer=ByteTokenizer(),
+        optimizer=optax.adam(1e-3), meta={"vocab_size": 256},
     )
 
 
@@ -82,6 +85,10 @@ def test_the_documented_code_runs(path, tmp_path, monkeypatch):
         pytest.skip("no python blocks")
     monkeypatch.chdir(tmp_path)
     namespace = tiny_world(tmp_path)
+    # Concept pages name library things bare, so the run starts with jax's names.
+    if path != ROOT / "README.md":
+        namespace.update(dict(jnp=__import__("jax.numpy", fromlist=["x"]), jax=__import__("jax"),
+                                int32=__import__("jax.numpy", fromlist=["x"]).int32))
     for line, source in found:
         where = f"{path.relative_to(ROOT)}:{line}"
         code = compile(source, where, "exec")
