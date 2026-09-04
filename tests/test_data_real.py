@@ -1,4 +1,4 @@
-"""One real dataset, pulled through load_data exactly as a recipe does.
+"""One real dataset, loaded from its spec exactly as a recipe does.
 
 Every other data test stubs the source: they check the registries, the
 transforms and the split logic, but nothing has ever taken a real TFDS
@@ -21,8 +21,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.config import DataConfig
-from dew.data.dataloaders import load_data
+from dew.data import OxfordFlowers
 
 pytestmark = pytest.mark.network
 
@@ -40,9 +39,8 @@ VAL_RECORDS = 4 * BATCH
 
 @pytest.fixture(scope="module")
 def flowers():
-    """The loader a recipe builds from a DataConfig, in-process."""
-    return load_data(DataConfig(
-        dataset="oxford_flowers102", batch_size=BATCH, image_size=SIZE, worker_count=0))
+    """The Dataset a recipe loads from the registered spec, in-process."""
+    return OxfordFlowers(image_size=SIZE, worker_count=0).load(batch=BATCH)
 
 
 def labels_of(batch):
@@ -50,11 +48,10 @@ def labels_of(batch):
 
 
 def test_train_batches_carry_resized_images_and_tokenized_captions(flowers):
-    assert flowers["train_len"] == RECORDS - VAL_RECORDS
-    assert flowers["val_len"] == VAL_RECORDS
-    assert flowers["local_batch_size"] == BATCH
+    assert flowers.records == RECORDS - VAL_RECORDS
+    assert flowers.batch == BATCH
 
-    train = iter(flowers["train"]())
+    train = flowers.train()
     first, second = next(train), next(train)
 
     for batch in (first, second):
@@ -75,9 +72,9 @@ def test_train_batches_carry_resized_images_and_tokenized_captions(flowers):
 
 def test_validation_reads_different_records_in_a_stable_order(flowers):
     """The val loader must not be a random slice of the training stream."""
-    train_labels = labels_of(next(iter(flowers["train"]())))
-    val = next(iter(flowers["val"]()))
-    again = next(iter(flowers["val"]()))
+    train_labels = labels_of(next(flowers.train()))
+    val = next(flowers.val())
+    again = next(flowers.val())
 
     assert val["image"].shape == (VAL_BATCH, SIZE, SIZE, 3)
     assert val["image"].dtype == np.uint8
@@ -97,7 +94,7 @@ def test_the_validation_pass_reads_the_split_once_and_stops(flowers):
     twice and the pass ran on for good. Two records of Flowers are never the
     same image, so counting distinct rows counts records.
     """
-    rows = [image.tobytes() for batch in itertools.islice(flowers["val"](), 8)
+    rows = [image.tobytes() for batch in itertools.islice(flowers.val(), 8)
             for image in batch["image"]]
 
     assert len(rows) == VAL_RECORDS

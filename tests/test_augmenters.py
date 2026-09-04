@@ -1,4 +1,4 @@
-"""Image augmenter tests: the albumentations migration, mode by mode.
+"""Image transform tests: the augmentation field, mode by mode.
 
 Ground truth, measured against torchvision 0.28 in a throwaway venv: the
 previous torchvision v2 pipelines returned plain numpy arrays UNCHANGED
@@ -11,7 +11,9 @@ These tests run in the bare venv: torchvision is blocked in sys.modules to
 prove nothing in the module's import or construction path reaches it.
 """
 
+import dataclasses
 import hashlib
+import itertools
 import os
 import random
 import struct
@@ -34,8 +36,8 @@ if not flags.FLAGS.is_parsed():
 # test must import, construct and augment regardless.
 sys.modules["torchvision"] = None
 
-from dew.data.sources import images  # noqa: E402
-from dew.data.sources.images import ImageGCSAugmenter, ImageTFDSAugmenter  # noqa: E402
+from dew.data import CC12M, OxfordFlowers, images  # noqa: E402
+from dew.data.images import ImageTransform  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,8 +80,8 @@ def _pack_records(records):
     packed = bytearray()
     for key, value in records.items():
         key_bytes = key.encode("utf-8")
-        packed += struct.pack("=I", len(key_bytes)) + key_bytes
-        packed += struct.pack("=I", len(value)) + value
+        packed += struct.pack("I", len(key_bytes)) + key_bytes
+        packed += struct.pack("I", len(value)) + value
     return bytes(packed)
 
 
@@ -91,18 +93,21 @@ def _element_for(kind, seed=0):
     return _pack_records({"jpg": encoded, "txt": b"a yellow tulip"})
 
 
-def _make_transform(kind, labels_file, monkeypatch):
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+def _spec(kind, labels_file, augmentation="flip_jitter"):
+    """The TFDS flowers spec, or an arrayrecord one: `record` is what differs."""
     if kind == "tfds":
-        augmenter = ImageTFDSAugmenter(label_path=str(labels_file))
-    else:
-        augmenter = ImageGCSAugmenter()
-    return augmenter.create_transform(image_scale=SCALE)()
+        return OxfordFlowers(image_size=SCALE, augmentation=augmentation, labels=str(labels_file))
+    return CC12M(image_size=SCALE, augmentation=augmentation)
+
+
+def _make_transform(kind, labels_file, monkeypatch, augmentation="flip_jitter"):
+    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+    return ImageTransform(_spec(kind, labels_file, augmentation))
 
 
 def _resized(kind, element):
     """The deterministic prefix of random_map: decode, convert, resize.
-    For GCS, `element` is still the packed byte blob the transform unpacks."""
+    For arrayrecord, `element` is still the packed byte blob the transform unpacks."""
     if kind == "tfds":
         image = element["image"]
     else:
@@ -130,60 +135,47 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
     script = "\n".join([
         "import sys",
         "sys.modules['torchvision'] = None",
+        "sys.modules['transformers'] = None",
         "",
         "import numpy as np",
         "import grain.python as pygrain",
-        "from dew.data.sources.images import (",
-        "    ImageGCSAugmenter, ImageTFDSAugmenter, augment_image, image_augmentations,",
-        ")",
+        "from dew.data import CC12M, OxfordFlowers",
+        "from dew.data.images import ImageTransform, augment_image, image_augmentations",
         "",
         "labels = sys.argv[1]",
         "image = np.zeros((9, 11, 3), dtype=np.uint8)",
         "for mode in ('none', 'flip_only', 'flip_jitter'):",
-        "    import os",
-        "    os.environ['FLAXDIFF_AUGMENT_MODE'] = mode",
-        "    classes = (",
-        "        ImageTFDSAugmenter(label_path=labels).create_transform(image_scale=32),",
-        "        ImageGCSAugmenter().create_transform(image_scale=32),",
-        "    )",
-        "    assert all(issubclass(c, pygrain.RandomMapTransform) for c in classes)",
-        "    out = augment_image(image_augmentations(), image, np.random.default_rng(0))",
+        "    for spec in (OxfordFlowers(labels=labels, augmentation=mode), CC12M(augmentation=mode)):",
+        "        assert image_augmentations(spec.augmentation) is not None",
+        "    assert issubclass(ImageTransform, pygrain.RandomMapTransform)",
+        "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
         "    assert out.dtype == np.uint8 and out.shape == image.shape",
         "print('ok')",
     ])
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"))
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
     result = subprocess.run(
         [sys.executable, "-c", script, str(labels_file)],
         capture_output=True, text=True, env=env, cwd=REPO_ROOT,
     )
-    # the GCS augmenter prints its interpolation method; only the final
-    # verdict line matters here
-    assert result.stdout.strip().splitlines()[-1] == "ok"
+    assert result.stdout.strip().splitlines()[-1:] == ["ok"], result.stderr
     assert "torchvision" not in result.stderr
 
 
-def test_created_transforms_receive_grains_record_rng(tmp_path, monkeypatch):
+def test_the_transform_receives_grains_record_rng():
     """grain only hands a per-record rng to RandomMapTransform subclasses; the
     per-record seeding contract depends on that dispatch."""
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
-    labels_file = _write_labels(tmp_path)
-    for cls in (
-        ImageTFDSAugmenter(label_path=str(labels_file)).create_transform(image_scale=SCALE),
-        ImageGCSAugmenter().create_transform(image_scale=SCALE),
-    ):
-        assert issubclass(cls, pygrain.RandomMapTransform)
+    assert issubclass(ImageTransform, pygrain.RandomMapTransform)
 
 
 # ---------------------------------------------------------------------------------
-# FLAXDIFF_AUGMENT_MODE contract
+# The augmentation field
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
 def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path, monkeypatch):
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "none")
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch)
+    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="none")
 
     out = transform.random_map(element, _record_rng(0))
 
@@ -195,10 +187,9 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path, monke
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
 def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path, monkeypatch):
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_only")
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch)
+    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="flip_only")
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -215,10 +206,9 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path, mon
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
 def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path, monkeypatch):
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch)
+    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="flip_jitter")
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -239,11 +229,12 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_unset_mode_defaults_to_flip_jitter(kind, tmp_path, monkeypatch):
-    monkeypatch.delenv("FLAXDIFF_AUGMENT_MODE", raising=False)
+def test_the_default_augmentation_is_flip_jitter(kind, tmp_path, monkeypatch):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch)
+    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+    spec = dataclasses.replace(_spec(kind, labels_file), augmentation=OxfordFlowers().augmentation)
+    transform = ImageTransform(spec)
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -261,7 +252,6 @@ def test_unset_mode_defaults_to_flip_jitter(kind, tmp_path, monkeypatch):
 def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path, monkeypatch):
     """The same record must get the same augmentation and the same caption
     whatever the worker or process count, and neither global RNG may move."""
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
     first = _make_transform(kind, labels_file, monkeypatch)
@@ -283,38 +273,34 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
 def test_the_caption_template_comes_from_the_record_rng(tmp_path):
     """A module-global random.choice picked the template, so a record's caption
     moved with the worker and process count while its image did not."""
-    labelizer = images.labelizer_oxford_flowers102(str(_write_labels(tmp_path)))
-    element = {"label": 1}
+    spec = OxfordFlowers(labels=str(_write_labels(tmp_path)))
+    element = {"image": _synthetic_image(), "label": 1}
 
-    captions = [labelizer(element, _record_rng(draw)) for draw in range(DRAWS)]
+    captions = [spec.record(element, _record_rng(draw))[1] for draw in range(DRAWS)]
 
     assert len(set(captions)) > 1  # the rng really does pick the template
     assert set(captions) <= {t.format(LABELS[1]) for t in images.PROMPT_TEMPLATES}
-    assert labelizer(element, _record_rng(3)) == captions[3]
+    assert spec.record(element, _record_rng(3))[1] == captions[3]
+    assert spec.record(element, _record_rng(3))[2] == 1
 
 
 @pytest.mark.parametrize("column", ["caption", "text"])
 def test_a_record_caption_is_taken_as_it_is(column):
     """Hub datasets carry their own text, under either of two column names."""
-    labelizer = images.labelizer_record_caption
-
-    assert labelizer({column: "a yellow tulip"}, _record_rng(0)) == "a yellow tulip"
+    assert images.record_caption({column: "a yellow tulip"}) == "a yellow tulip"
 
 
 def test_a_record_with_no_caption_column_says_what_it_has():
     with pytest.raises(KeyError, match="'caption' or a 'text' column"):
-        images.labelizer_record_caption({"image": None, "url": "x"}, _record_rng(0))
+        images.record_caption({"image": None, "url": "x"})
 
 
-def test_the_tfds_transform_captions_from_the_record_and_reads_no_label_file(monkeypatch):
+def test_a_hub_record_captions_from_the_record_and_reads_no_label_file(monkeypatch):
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
     monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "none")
-    # The default label path points at a TFDS install that is not here; a
-    # record-caption augmenter must never open it.
-    transform = ImageTFDSAugmenter(
-        labelizer=images.labelizer_record_caption).create_transform(image_scale=SCALE)()
+    transform = ImageTransform(images.HFImages(name="acme/pets", image_size=SCALE,
+                                               augmentation="none"))
 
     element = {"image": _synthetic_image(0), "caption": "a yellow tulip"}
     out = transform.random_map(element, _record_rng(0))
@@ -331,23 +317,25 @@ def test_the_tfds_transform_captions_from_the_record_and_reads_no_label_file(mon
 # Loader level: a record does not depend on how many workers produced it
 # ---------------------------------------------------------------------------------
 
-def _by_record(transform_cls, source, worker_count):
+@dataclasses.dataclass(frozen=True)
+class Flowers(OxfordFlowers):
+    """The flowers spec over synthetic records, one label per record so a
+    batch says which records it carries."""
+
+    def source(self):
+        return [{"image": _synthetic_image(i), "label": i} for i in range(RECORDS)]
+
+
+def _by_record(spec, worker_count):
     """label -> (image, caption ids) for every record of one epoch.
 
     Keyed by label rather than compared batch for batch: grain gives each
     worker its own slice of the index stream, so batch composition follows
     worker_count while record content must not.
     """
-    sampler = pygrain.IndexSampler(num_records=len(source), shuffle=True, seed=7,
-                                   num_epochs=1, shard_options=pygrain.NoSharding())
-    loader = pygrain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=[transform_cls(), pygrain.Batch(4, drop_remainder=True)],
-        worker_count=worker_count,
-    )
+    data = dataclasses.replace(spec, worker_count=worker_count).load(batch=4)
     records = {}
-    for batch in loader:
+    for batch in itertools.islice(data.train(), data.steps_per_epoch):
         for position, label in enumerate(batch["label"]):
             records[int(label)] = (batch["image"][position].tobytes(),
                                    batch["text"]["input_ids"][position].tobytes())
@@ -355,17 +343,14 @@ def _by_record(transform_cls, source, worker_count):
 
 
 def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path, monkeypatch):
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "flip_jitter")
     monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
-    # One label per record, so a batch says which records it carries.
     labels_file = tmp_path / "indexed_labels.txt"
     labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
-    source = [{"image": _synthetic_image(i), "label": i} for i in range(RECORDS)]
-    transform_cls = ImageTFDSAugmenter(
-        label_path=str(labels_file)).create_transform(image_scale=SCALE)
+    spec = Flowers(image_size=SCALE, labels=str(labels_file), val_batches=None, seed=7,
+                   read_threads=1, read_buffer=1, worker_buffer=1)
 
-    serial = _by_record(transform_cls, source, worker_count=0)
-    parallel = _by_record(transform_cls, source, worker_count=2)
+    serial = _by_record(spec, worker_count=0)
+    parallel = _by_record(spec, worker_count=2)
 
     assert sorted(serial) == list(range(RECORDS))
     assert serial == parallel

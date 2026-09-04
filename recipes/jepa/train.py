@@ -1,35 +1,33 @@
 """Train a JEPA encoder (I-JEPA over images, V-JEPA over video).
 
-A sibling of the diffusion recipe rather than a flag on it: the two share the
-data pipeline, the registry and the trainer, but nothing else. A JEPA run has
-no noise schedule, no sampler, no text conditioning and no VAE, and folding an
---objective switch into one recipe would mean threading None through all of
-them. The Objective seam is what makes the same trainer serve both.
+    python recipes/jepa/train.py --data.image-size 224 --trainer.batch-size 64 \
+        --trainer.epochs 300 --model.config '{"patch_size": 16, "emb_features": 384, \
+        "num_layers": 12, "num_heads": 6}' --probe-classes 102
 
-    python recipes/jepa/train.py --data.dataset oxford_flowers102 \
-        --data.image-size 128 --trainer.epochs 100 --probe-classes 102 \
-        --model.config '{"patch_size": 16, "emb_features": 384, "num_layers": 12}'
+The encoder is --model, the predictor takes the encoder's width and heads plus
+--predictor, and the probes score the frozen encoder at every validation.
 """
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 import jax
 import tyro
 
-from dew.config import DataConfig, JsonDict, ModelConfig, OptimConfig, RunConfig
-from dew.data.dataloaders import load_data
-from dew.inputs import DiffusionInputConfig
-from dew.objectives.jepa import (
-    JepaObjective, multi_block_mask, get_linear_probe_metric, get_knn_probe_metric,
-)
-from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
-from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
-from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
-from dew.training.runtime import run_timestamp
+import dew.io
+from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
+from dew.data import ImageDataset, VideoDataset
+from dew.inputs import Field
+from dew.interop.manifest import Manifest
+from dew.objectives.jepa import JepaObjective, multi_block_mask
+from dew.registry import datasets, metrics, models
+from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
+                          build_optimizer, prepare_process, run_timestamp)
 
+# HF tokenizers fork a thread pool; grain's workers fork the process.
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 DEFAULT_ENCODER_CONFIG = {"precision": "default"}
@@ -48,14 +46,11 @@ class JepaRunConfig(RunConfig):
 
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
-    data: DataConfig = field(default_factory=lambda: DataConfig(batch_size=64))
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             learning_rate=1e-3, learning_rate_peak=1.5e-3, learning_rate_end=1e-6))
     predictor: JsonDict = field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
-    frames_per_sample: Optional[int] = None
-    """Set for video (V-JEPA), leave unset for images (I-JEPA)."""
     num_target_blocks: int = 4
     target_scale: list[float] = field(default_factory=lambda: [0.15, 0.2])
     target_aspect: list[float] = field(default_factory=lambda: [0.75, 1.5])
@@ -69,69 +64,67 @@ class JepaRunConfig(RunConfig):
     knn_k: int = 20
 
 
+def sample_field(config: JepaRunConfig) -> Field:
+    """The batch field the encoder reads, at the resolution the data comes in."""
+    spec = config.data
+    if isinstance(spec, ImageDataset):
+        return Field("image", (spec.image_size, spec.image_size, 3))
+    if isinstance(spec, VideoDataset):
+        return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
+    raise ValueError(
+        f"the JEPA recipe trains on image or video datasets, not {datasets.name_of(type(spec))}")
+
+
 def build_encoder(config: JepaRunConfig):
-    """The encoder, and the config the registry built it from."""
-    architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
-    encoder_config = apply_precision_policy(
-        architecture, {**config.model.config, **suffix_flags},
-        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
-    if encoder_config.get('use_hilbert') and encoder_config.get('use_zigzag'):
-        raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
-    return build_model(architecture, encoder_config), encoder_config
+    """The encoder, and the fields the registry built it from."""
+    fields = config.model.fields()
+    return models.build(config.model.architecture, **fields), fields
 
 
-def build_predictor(config: JepaRunConfig, encoder_config: dict, encoder, grid,
+def build_predictor(config: JepaRunConfig, encoder_fields: dict, encoder, grid,
                     is_video: bool):
-    """The predictor that reads the encoder's embeddings, and its config."""
-    predictor_config = apply_precision_policy(
-        'jepa_predictor',
-        {
-            **{k: v for k, v in encoder_config.items() if k in SHARED_MODEL_KEYS},
-            **config.predictor,
-            "grid": grid,
-            "factorized": is_video,
-            "scan_order": encoder.scan_order,
-        },
-        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
-    return build_model('jepa_predictor', predictor_config), predictor_config
+    """The predictor that reads the encoder's embeddings, and its fields."""
+    fields = {
+        **{k: v for k, v in encoder_fields.items() if k in SHARED_MODEL_KEYS},
+        **config.predictor,
+        "grid": grid,
+        "factorized": is_video,
+        "scan_order": encoder.scan_order,
+    }
+    fields = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
+                         attention_impl=config.model.attention_impl).fields()
+    return models.build('jepa_predictor', **fields), fields
 
 
-def run_summary(config: JepaRunConfig, encoder_config: dict) -> dict:
-    """Flat view of the run, for the wandb config."""
+def run_summary(config: JepaRunConfig, encoder_fields: dict) -> dict:
+    """Flat view of the run, for the tracker."""
     return {
-        **encoder_config,
+        **encoder_fields,
         "architecture": config.model.architecture,
-        "dataset": config.data.dataset,
-        "image_size": config.data.image_size,
-        "batch_size": config.data.batch_size,
+        "dataset": datasets.name_of(type(config.data)),
+        "image_size": sample_field(config).shape[-2],
+        "batch_size": config.trainer.batch_size,
         "learning_rate": config.optim.learning_rate,
-        "epochs": config.trainer.epochs,
     }
 
 
-def main(config: JepaRunConfig) -> ObjectiveTrainer:
-    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host, config.trainer.xla_flags)
+def main(config: JepaRunConfig) -> TrainState:
+    prepare_process(config.trainer.wandb_offline, config.trainer.multi_host,
+                    config.trainer.xla_flags, config.trainer.compilation_cache_dir)
 
-    checkpoint_dir = config.trainer.checkpoint_dir
-    if config.trainer.checkpoint_fs == 'gcs':
-        checkpoint_dir = f"gs://{checkpoint_dir}"
+    data = config.data.load(batch=config.trainer.batch_size)
+    steps = config.trainer.total_steps(data)
 
-    data = load_data(config.data)
-    steps_per_epoch = (config.trainer.steps_per_epoch
-                       or data['train_len'] // config.data.batch_size)
-    total_steps = steps_per_epoch * config.trainer.epochs
-
-    is_video = config.frames_per_sample is not None
-    architecture, _ = canonicalize_architecture(config.model.architecture)
-    if is_video != (architecture == 'jepa_video_encoder'):
+    sample = sample_field(config)
+    is_video = sample.key == "video"
+    if is_video != (config.model.architecture == 'jepa_video_encoder'):
         raise ValueError(
-            "--frames-per-sample and --model.architecture jepa_video_encoder go together")
+            "a video dataset and --model.architecture jepa_video_encoder go together")
 
-    encoder, encoder_config = build_encoder(config)
-    grid = (config.data.image_size // encoder.patch_size,) * 2
-    predictor, predictor_config = build_predictor(
-        config, encoder_config, encoder, grid, is_video)
+    encoder, encoder_fields = build_encoder(config)
+    grid = (sample.shape[-2] // encoder.patch_size,) * 2
+    predictor, predictor_fields = build_predictor(
+        config, encoder_fields, encoder, grid, is_video)
 
     mask = multi_block_mask(
         grid,
@@ -142,96 +135,74 @@ def main(config: JepaRunConfig) -> ObjectiveTrainer:
     print(f"Mask geometry: {mask.block_area} tokens per target block "
           f"({mask.block_shapes}), {mask.num_context} context tokens of {mask.num_patches}")
 
-    sample_data_shape = ((config.frames_per_sample, config.data.image_size,
-                          config.data.image_size, 3)
-                         if is_video else
-                         (config.data.image_size, config.data.image_size, 3))
-    input_config = DiffusionInputConfig(
-        sample_data_key='video' if is_video else 'image',
-        sample_data_shape=sample_data_shape,
-        conditions=[],
-    )
     objective = JepaObjective(
         encoder=encoder,
         predictor=predictor,
         mask=mask,
-        sample_data_key=input_config.sample_data_key,
-        sample_data_shape=sample_data_shape,
+        sample=sample,
         momentum=tuple(config.momentum),
-        momentum_steps=config.momentum_steps or total_steps,
+        momentum_steps=config.momentum_steps or steps,
+        label_key=config.probe_label_key,
     )
 
-    eval_metrics = []
+    probes = ()
     if config.probe_classes:
-        eval_metrics = [
-            get_linear_probe_metric(config.probe_classes, label_key=config.probe_label_key),
-            get_knn_probe_metric(config.probe_classes, label_key=config.probe_label_key,
-                                 k=config.knn_k),
-        ]
+        probes = (metrics.linear_probe(config.probe_classes),
+                  metrics.knn_probe(config.probe_classes, k=config.knn_k))
 
     name = config.trainer.name or (
-        f"jepa-{config.data.dataset}/res-{config.data.image_size}/patch-{encoder.patch_size}/"
-        f"mixer-{encoder.ssm_attention_ratio}/emb-{encoder.emb_features}/"
-        f"lr-{config.optim.learning_rate}/date-{run_timestamp()}")
+        f"jepa-{datasets.name_of(type(config.data))}/res-{sample.shape[-2]}/"
+        f"patch-{encoder.patch_size}/mixer-{encoder.ssm_attention_ratio}/"
+        f"emb-{encoder.emb_features}/lr-{config.optim.learning_rate}/date-{run_timestamp()}")
     print("Experiment_Name:", name)
+    directory = os.path.join(config.trainer.checkpoint_dir, name)
 
-    wandb_config: Optional[dict[str, Any]] = None
+    run_config = config.to_dict()
+    tracker = None
     if config.trainer.wandb_project is not None:
-        wandb_config = {
-            "project": config.trainer.wandb_project,
-            "entity": config.trainer.wandb_entity,
-            "name": name,
-            "config": {
-                "encoder": encoder_config,
-                "predictor": predictor_config,
-                "architecture": architecture,
-                "mask": {"grid": grid, "block_shapes": mask.block_shapes,
-                         "block_area": mask.block_area, "num_context": mask.num_context},
-                "dataset": {"name": config.data.dataset, "length": data['train_len']},
-                "arguments": run_summary(config, encoder_config),
-                "run_config": config.to_dict(),
-            },
-        }
-        if config.trainer.resume_last_run is not None:
-            wandb_config['id'] = config.trainer.resume_last_run
+        tracker = WandbTracker(
+            config.trainer.wandb_project, name, entity=config.trainer.wandb_entity,
+            offline=config.trainer.wandb_offline,
+            config={"run_config": run_config, "encoder": encoder_fields,
+                    "predictor": predictor_fields,
+                    "mask": {"grid": grid, "block_shapes": mask.block_shapes,
+                             "block_area": mask.block_area, "num_context": mask.num_context},
+                    "arguments": run_summary(config, encoder_fields),
+                    "dataset": {"name": datasets.name_of(type(config.data)),
+                                "records": data.records},
+                    "steps": steps})
 
-    trainer = ObjectiveTrainer(
-        model=encoder,
-        optimizer=build_optimizer(config.optim, steps_per_epoch),
-        input_config=input_config,
-        rngs=jax.random.PRNGKey(4),
-        objective=objective,
-        name=name,
-        wandb_config=wandb_config,
-        distributed_training=config.trainer.distributed_training,
-        checkpoint_base_path=checkpoint_dir,
-        checkpoint_step=config.trainer.checkpoint_step,
-        load_from_checkpoint=config.trainer.load_from_checkpoint,
-        max_checkpoints_to_keep=config.trainer.max_checkpoints_to_keep,
-        eval_metrics=eval_metrics,
-        best_tracker_metric=(
-            config.trainer.best_tracker_metric
-            or ("val/knn_probe_accuracy" if eval_metrics else "train/best_loss")),
-        grad_accum_steps=config.optim.grad_accum_steps,
-        use_dynamic_scale=config.optim.use_dynamic_scale,
-        fsdp_size=config.trainer.fsdp_size,
-        expert_size=config.trainer.expert_size,
-        fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
-        logical_axis_rules=config.trainer.logical_axis_rules,
-        sharding_tolerance=config.trainer.sharding_tolerance,
-        compilation_cache_dir=config.trainer.compilation_cache_dir,
-        profile_steps=config.trainer.profile_steps,
-        log_every=config.trainer.log_every,
+    Manifest(config=run_config,
+             model={"name": config.model.architecture, "fields": encoder_fields}).write(directory)
+
+    checkpoints = Checkpoints(directory, keep=config.trainer.keep)
+    trainer = Trainer(
+        objective, build_optimizer(config.optim, steps),
+        key=jax.random.key(config.trainer.seed),
+        mesh=config.trainer.mesh,
+        layout=config.trainer.layout,
+        accumulation=config.trainer.accumulation,
+        dynamic_scale=config.trainer.dynamic_scale,
+        checkpoints=checkpoints,
+        tracker=tracker,
+        profile=(Profile(os.path.join(directory, "profile"), config.trainer.profile_steps)
+                 if config.trainer.profile_steps else None),
     )
 
     start = time.time()
-    trainer.fit(data, training_steps_per_epoch=steps_per_epoch,
-                epochs=config.trainer.epochs,
-                val_steps_per_epoch=config.data.val_steps_per_epoch,
-                checkpoint_every_steps=config.trainer.checkpoint_every_steps)
+    state = trainer.fit(
+        data, steps=steps,
+        log_every=config.trainer.log_every,
+        eval_every=config.trainer.eval_every or data.steps_per_epoch,
+        checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
+        metrics=probes,
+    )
     print(f"Training finished in {time.time() - start:.0f}s")
-    return trainer
+    if tracker is not None:
+        dew.io.publish(checkpoints.path(checkpoints.latest), re.sub(r"[^\w.-]", "-", name),
+                       tracker=tracker)
+    return state
 
 
 if __name__ == '__main__':
-    main(tyro.cli(JepaRunConfig))
+    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[JepaRunConfig]))

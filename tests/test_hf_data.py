@@ -25,9 +25,7 @@ import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.config import DataConfig  # noqa: E402
-from dew.data.dataloaders import get_media_dataset_grain, load_data  # noqa: E402
-from dew.data.sources import images  # noqa: E402
+from dew.data import HFImages, images  # noqa: E402
 from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
@@ -78,7 +76,7 @@ def _caption_ids(*records):
 
 @pytest.fixture
 def hub(monkeypatch):
-    """`hf:` names resolve to a local table, and record the load arguments."""
+    """Hub names resolve to a local table, and record the load arguments."""
     calls = []
 
     def load_dataset(name, split=None, **kwargs):
@@ -87,8 +85,12 @@ def hub(monkeypatch):
 
     monkeypatch.setattr(datasets, "load_dataset", load_dataset)
     monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
-    monkeypatch.setenv("FLAXDIFF_AUGMENT_MODE", "none")
     return calls
+
+
+def _hub_images(**fields):
+    return HFImages(name="acme/pets", image_size=SCALE, augmentation="none", worker_count=0,
+                    read_threads=1, read_buffer=1, worker_buffer=1, **fields)
 
 
 # ---------------------------------------------------------------------------------
@@ -191,52 +193,47 @@ def test_records_do_not_depend_on_worker_count():
 
 
 # ---------------------------------------------------------------------------------
-# hf:<dataset>:<split> through the media pipeline
+# HFImages through the image pipeline
 # ---------------------------------------------------------------------------------
 
-def test_a_hub_dataset_string_builds_the_image_pipeline(hub):
-    """No registry entry and no dataset path: the name carries both halves."""
-    data = get_media_dataset_grain("hf:acme/pets:train", batch_size=4,
-                                   media_scale=SCALE, worker_count=0, num_epochs=1)
+def test_a_hub_dataset_spec_builds_the_image_pipeline(hub):
+    """No registry entry per dataset and no path: the name carries the table."""
+    data = _hub_images(val_batches=None).load(batch=4)
 
     assert hub == [{"name": "acme/pets", "split": "train"}]
-    assert data["media_type"] == "image" and data["train_len"] == RECORDS
+    assert data.records == RECORDS and data.val is None
 
-    batch = next(iter(data["train"]()))
+    batch = next(data.train())
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     assert batch["text"]["input_ids"].shape == (4, 2)
     # A caption dataset carries no class index, and the transform invents none.
     assert "label" not in batch
 
 
-def test_the_split_defaults_to_train(hub):
-    get_media_dataset_grain("hf:acme/pets", batch_size=4, media_scale=SCALE,
-                            worker_count=0, num_epochs=1)
+def test_the_split_is_a_field(hub):
+    _hub_images(split="validation", val_batches=None).load(batch=4)
 
-    assert hub == [{"name": "acme/pets", "split": "train"}]
+    assert hub == [{"name": "acme/pets", "split": "validation"}]
 
 
 def test_the_caption_comes_from_the_record(hub):
-    """The image augmenter is the TFDS one; only the caption source differs.
+    """The image transform is the one every image dataset uses; only where
+    the caption comes from differs.
 
     The validation loader reads the held-out records in table order, so which
     caption belongs in which row is known here.
     """
-    data = get_media_dataset_grain("hf:acme/pets:train", batch_size=2,
-                                   media_scale=SCALE, worker_count=0,
-                                   num_epochs=1, val_count=2)
-    batch = next(iter(data["val"]()))
+    data = _hub_images(val_batches=1).load(batch=2)
+    batch = next(data.val())
 
     assert np.array_equal(batch["text"]["input_ids"], _caption_ids(0, 1))
 
 
-def test_load_data_reads_a_hub_dataset(hub):
-    data = load_data(DataConfig(dataset="hf:acme/pets:train", batch_size=4,
-                                image_size=SCALE, val_steps_per_epoch=1,
-                                worker_count=0))
+def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
+    data = _hub_images(val_batches=1).load(batch=4)
 
-    assert data["val_len"] == 4 and data["train_len"] == RECORDS - 4
-    batch = next(iter(data["val"]()))
+    assert data.records == RECORDS - 4 and data.steps_per_epoch == 3
+    batch = next(data.val())
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     # The held-out records, in table order.
     assert np.array_equal(batch["text"]["input_ids"], _caption_ids(0, 1, 2, 3))

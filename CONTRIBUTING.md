@@ -8,7 +8,7 @@ Dew is small on purpose. Every line has to earn its place. These rules apply to 
 - One path. A capability has one implementation, one config field, one registry entry. No fallbacks, flags or compatibility layers without a demonstrated need.
 - The seams are the contract. Models are plain Flax modules that know nothing about training. Objectives own parameters, loss and validation. The trainer owns the mesh, the compiled step, EMA, checkpoints and logging. Data sources produce records; transforms are Grain transforms. A new architecture is a module and a registry entry; a new modality is an objective. If a change needs to cross these lines, the design is wrong, not the lines.
 - Prefer deep modules: a small interface over real complexity. Delete an abstraction if inlining it makes the code clearer.
-- Frozen: parameter tree names, the checkpoint layout, wandb metric keys, the Objective methods, and the Hugging Face parameter layout of `CausalTransformer`. A change to any of these is a migration, with a converter and a test that loads the old form.
+- Frozen at 1.0: parameter tree names, the checkpoint layout, wandb metric keys, the Objective methods, and the Hugging Face parameter layout of `CausalTransformer`. Dew is unpublished, so until 1.0 these change outright, with no converter and no compatibility path; from 1.0 on, a change to any of them is a migration, with a converter and a test that loads the old form.
 
 ## Reference parity
 
