@@ -7,17 +7,17 @@ The trainer owns the mechanics: sharding, gradients, EMA bookkeeping, checkpoint
 `dew.objectives.Objective` is three methods and three attributes.
 
 ```python
-from typing import Any
 import jax
 from dew import Aux, EMASpec, InputSpec
 from dew.artifacts import Artifacts
+from dew.objectives.base import Variables
 
 class Objective:
     inputs: InputSpec              # per-example shapes the tree is initialised from
     ema: EMASpec | None = None     # which leaves get an exponential moving average, and how fast
     artifact: type | None = None   # what evaluate returns
 
-    def init(self, key) -> Any: ...
+    def init(self, key) -> Variables: ...
     def loss(self, params, batch, step) -> tuple[jax.Array, Aux]: ...
     def evaluate(self, params, batch, step) -> Artifacts | None: ...
 ```
