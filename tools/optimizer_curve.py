@@ -30,11 +30,11 @@ import tyro
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recipes" / "lm"))
 
-import dew  # noqa: E402,F401  registers the models and datasets
 from dew.config import OptimConfig  # noqa: E402
 from dew.data import TokenWindows  # noqa: E402
 from dew.objectives.lm import LMObjective  # noqa: E402
-from dew.registry import models, with_precision  # noqa: E402
+from dew import models  # noqa: E402  naming a registry fills it
+from dew.registry import with_precision  # noqa: E402
 from dew.training import MeshSpec, Trainer  # noqa: E402
 from dew.training.distributed import DevicePrefetchIterator  # noqa: E402
 from dew.training.optim import build_optimizer  # noqa: E402

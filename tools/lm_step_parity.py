@@ -18,9 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-import dew  # registers the models
 from dew.objectives.lm import LMObjective, TEXT_KEY
-from dew.registry import models, with_precision
+from dew import models  # naming a registry fills it
+from dew.registry import with_precision
 from dew.training import MeshSpec, Trainer
 
 # tools/benchmark_step.py's small causal_transformer preset.

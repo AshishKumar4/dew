@@ -27,9 +27,8 @@ from absl import flags  # noqa: E402
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-import dew  # noqa: E402,F401  registers the datasets
 from dew.data import OxfordFlowers  # noqa: E402
-from dew.registry import datasets  # noqa: E402
+from dew import datasets  # noqa: E402  naming a registry fills it
 
 
 @dataclass(frozen=True)
