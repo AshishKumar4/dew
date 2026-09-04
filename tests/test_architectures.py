@@ -147,7 +147,7 @@ PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
 VOCAB = 64
 SEQ_LEN = 16
 LM = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
-      "num_kv_heads": 1, "mlp_ratio": 2, "max_seq_len": SEQ_LEN}
+      "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
 
 CASES = [
     Case("unet", UNET),

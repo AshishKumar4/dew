@@ -25,7 +25,7 @@ from dew.training import MeshSpec, Trainer
 
 # tools/benchmark_step.py's small causal_transformer preset.
 CONFIG = dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
-              mlp_ratio=4, max_seq_len=512)
+              mlp_features=4 * 768, max_seq_len=512)
 BATCH, SEQ = 16, 512
 
 

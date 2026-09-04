@@ -321,6 +321,10 @@ class SparseMLP(nn.Module):
     out_features: int
     activation: str = 'swiglu'
     implementation: str = 'xla'
+    score_function: str = 'softmax'
+    routed_scaling_factor: float = 1.0
+    expert_groups: int = 1
+    groups_per_token: int = 1
     expert_bias: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -328,6 +332,10 @@ class SparseMLP(nn.Module):
     def setup(self):
         self.gate = Router(num_experts=self.num_experts,
                            in_features=self.out_features, top_k=self.top_k,
+                           score_function=self.score_function,
+                           routed_scaling_factor=self.routed_scaling_factor,
+                           expert_groups=self.expert_groups,
+                           groups_per_token=self.groups_per_token,
                            expert_bias=self.expert_bias,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(

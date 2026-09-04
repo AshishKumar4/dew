@@ -26,7 +26,7 @@ pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP
+from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
 from dew.nn.moe import (
     ExpertMLP, Router, SparseMLP, calculate_load_balance_updates,
 )
@@ -405,11 +405,15 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 # The decoder that grows experts
 # --------------------------------------------------------------------------
 
-def decoder(**overrides) -> CausalTransformer:
+def decoder_fields(**overrides) -> dict:
     settings = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=2,
-                    num_kv_heads=1, mlp_ratio=2, max_seq_len=SEQ_LEN)
+                    num_kv_heads=1, mlp_features=64, max_seq_len=SEQ_LEN)
     settings.update(overrides)
-    return CausalTransformer(**settings)
+    return settings
+
+
+def decoder(**overrides) -> CausalTransformer:
+    return CausalTransformer(**decoder_fields(**overrides))
 
 
 def leaf_names(variables):
@@ -418,21 +422,21 @@ def leaf_names(variables):
 
 
 @pytest.mark.parametrize("settings,expected", [
-    ({"num_experts": 4}, (0, 1, 2, 3)),
-    ({"num_experts": 4, "moe_every": 2}, (1, 3)),
-    ({"num_experts": 4, "moe_every": 4}, (3,)),
-    ({"num_experts": 4, "moe_layers": (0, 2)}, (0, 2)),
+    ({"mixture": {"experts": 4}}, (0, 1, 2, 3)),
+    ({"mixture": {"experts": 4, "every": 2}}, (1, 3)),
+    ({"mixture": {"experts": 4, "every": 4}}, (3,)),
+    ({"mixture": {"experts": 4, "layers": (0, 2)}}, (0, 2)),
     ({}, ()),
 ])
-def test_the_sparse_layers_are_the_ones_the_configuration_names(settings, expected):
-    assert decoder(**settings).sparse_layers == expected
+def test_the_sparse_layers_are_the_ones_the_mixture_names(settings, expected):
+    assert models.build("causal_transformer", **decoder_fields(**settings)).sparse_layers == expected
 
 
 def test_a_sparse_layer_replaces_only_its_own_feed_forward():
     """The frozen leaf names: a model with experts on one layer keeps every
     other leaf of the dense model, including the dense layers' mlp."""
     dense = decoder()
-    sparse = decoder(num_experts=4, top_k=2, moe_layers=(1,))
+    sparse = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1,)))
     tokens = jnp.zeros((2, SEQ_LEN), jnp.int32)
     dense_names = leaf_names(dense.init(jax.random.key(0), tokens))
     sparse_names = leaf_names(sparse.init(jax.random.key(0), tokens))
@@ -450,7 +454,7 @@ def test_a_sparse_layer_replaces_only_its_own_feed_forward():
 def test_the_expert_leaves_hold_every_expert_of_the_reference_layout():
     """One leaf per projection, stacked over the experts, which is what a
     checkpoint's `mlp.experts.N.gate_proj.weight` tensors translate into."""
-    model = decoder(emb_features=32, num_experts=8, top_k=2, moe_layers=(0,))
+    model = decoder(emb_features=32, mixture=Mixture(experts=8, top_k=2, layers=(0,)))
     variables = model.init(jax.random.key(0), jnp.zeros((2, SEQ_LEN), jnp.int32))
     experts = variables["params"]["layers_0"]["mlp"]["experts"]
 
@@ -500,17 +504,20 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     assert np.array_equal(np.asarray(weights), np.asarray(wide[0]))
 
 
-@pytest.mark.parametrize("settings,message", [
-    ({"moe_every": 2}, "num_experts"),
-    ({"moe_layers": (1,)}, "num_experts"),
-    ({"num_experts": 4, "moe_every": 2, "moe_layers": (1,)}, "only"),
-    ({"num_experts": 4, "moe_layers": (4,)}, "outside"),
-    ({"num_experts": 4, "moe_every": 0}, "positive"),
-    ({"num_experts": 4, "top_k": 5}, "top_k"),
+@pytest.mark.parametrize("mixture,message", [
+    ({"experts": 0}, "dense model has no mixture"),
+    ({"experts": 4, "every": 2, "layers": (1,)}, "only"),
+    ({"experts": 4, "layers": (4,)}, "outside"),
+    ({"experts": 4, "every": 0}, "positive"),
+    ({"experts": 4, "top_k": 5}, "top_k"),
 ])
-def test_a_misconfigured_sparse_stack_is_rejected(settings, message):
+def test_a_misconfigured_mixture_is_rejected(mixture, message):
+    """A mixture's own dials are checked where they are set, and the ones
+    that read the model are checked when it builds; either way the message
+    names the dial."""
     with pytest.raises(ValueError, match=message):
-        decoder(**settings).init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
+        models.build("causal_transformer", **decoder_fields(mixture=mixture)).init(
+            jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
 
 
 # --------------------------------------------------------------------------
@@ -618,9 +625,9 @@ def test_the_batch_is_split_over_the_expert_axis_too():
 def moe_config() -> dict:
     """Eight experts, so the expert dimension divides every mesh below."""
     return {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2,
-            "num_heads": 2, "num_kv_heads": 1, "mlp_ratio": 2,
-            "max_seq_len": SEQ_LEN, "num_experts": 8, "top_k": 2,
-            "moe_layers": (1,)}
+            "num_heads": 2, "num_kv_heads": 1, "mlp_features": 64,
+            "max_seq_len": SEQ_LEN,
+            "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}}
 
 
 def token_batches():
@@ -651,10 +658,12 @@ class RecordingTracker:
         pass
 
 
-def moe_trainer(expert_size, fsdp_size, tracker=None, **model_overrides):
-    model = models.build("causal_transformer", **{**moe_config(), **model_overrides})
+def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
+    config = moe_config()
+    model = models.build("causal_transformer",
+                         **{**config, "mixture": {**config["mixture"], "bias": bias}})
     return Trainer(
-        LMObjective(model, SEQ_LEN, balance_rate=0.01 if model_overrides.get("expert_bias") else None),
+        LMObjective(model, SEQ_LEN, balance_rate=0.01 if bias else None),
         optax.adam(1e-3), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp_size, expert=expert_size),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
@@ -710,7 +719,7 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     """
     steps = 30
     tracker = RecordingTracker()
-    trainer = moe_trainer(1, 2, tracker=tracker, expert_bias=True)
+    trainer = moe_trainer(1, 2, tracker=tracker, bias=True)
     fresh = trainer.initial_state()
     assert set(fresh.params) == {"params", "moe"}
     np.testing.assert_array_equal(
@@ -734,6 +743,6 @@ def test_balancing_needs_a_router_with_a_bias():
     trainer = moe_trainer(1, 2)
     trainer.objective.balance_rate = 0.01
     params = trainer.initial_state().params
-    with pytest.raises(ValueError, match="expert_bias"):
+    with pytest.raises(ValueError, match="bias=True"):
         trainer.objective.loss(params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))

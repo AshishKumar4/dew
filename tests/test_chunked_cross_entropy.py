@@ -172,7 +172,7 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 
 def small_model(**overrides):
     config = dict(vocab_size=97, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_ratio=2, max_seq_len=16, dtype=jnp.bfloat16)
+                  mlp_features=64, max_seq_len=16, dtype=jnp.bfloat16)
     return CausalTransformer(**{**config, **overrides})
 
 
