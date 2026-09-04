@@ -12,11 +12,12 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
 import optax
+from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid, host
 from dew.diffusion.process import Process
@@ -28,7 +29,7 @@ from dew.objectives.base import Aux, EMASpec, Objective, Step, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
-from dew.sampling.solvers import DDIM
+from dew.sampling.solvers import DDIM, Solver
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -53,14 +54,14 @@ class DiffusionObjective(Objective):
 
     def __init__(
         self,
-        model,
+        model: nn.Module,
         process: Process,
         inputs: InputSpec,
         *,
         autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
         ema_decay: float = 0.999,
-        sampler=DDIM(),
+        sampler: Solver[Any] = DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
         steps: int = 200,
     ):

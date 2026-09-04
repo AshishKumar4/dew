@@ -217,6 +217,18 @@ def test_joint_stream_models_refuse_an_unconditional_run():
             config.build()
 
 
+def test_a_discrete_preset_is_refused_by_the_gaussian_objective():
+    """`preset:mdlm` is one subcommand away on the diffusion recipe, and its
+    process has no schedule the Gaussian objective can corrupt with, so the
+    config names the preset and the objective that trains it instead of
+    failing inside the loss."""
+    from dew.diffusion.discrete import MDLM
+
+    config = dataclasses.replace(DiffusionRunConfig(text=None), preset=MDLM(mask_id=0))
+    with pytest.raises(ValueError, match="mdlm.*MaskedDiffusionObjective"):
+        config.build()
+
+
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: the
     factories read that grid there, and the image-only metrics are refused

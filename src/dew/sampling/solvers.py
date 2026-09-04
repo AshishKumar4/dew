@@ -37,8 +37,11 @@ class Solver(Protocol[StateT]):
     def init(self, x) -> StateT: ...
 
     def step(self, x, t, t_next, denoised, eps, state, key, process,
-             denoise) -> tuple[jax.Array, StateT]:
-        """`x` at `t_next` from `x` at `t` and the model's `(denoised, eps)` at `t`."""
+             denoise, /) -> tuple[jax.Array, StateT]:
+        """`x` at `t_next` from `x` at `t` and the model's `(denoised, eps)` at
+        `t`. `sample` passes every argument by position, so a solver over
+        another algebra names the pair for what it reads (the discrete one
+        takes log-probabilities where a Gaussian one takes eps)."""
         ...
 
 

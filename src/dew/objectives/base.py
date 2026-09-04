@@ -143,12 +143,18 @@ class Objective(ABC):
 class Metric(Protocol):
     """A per-batch measurement of one artifact type, and its reduction over a pass."""
 
-    name: str
-    reads: type
-    """The artifact type this metric scores; the trainer hands it that one."""
+    @property
+    def name(self) -> str: ...
 
-    def __call__(self, artifact: Any, batch: Batch) -> Any:
-        """One batch's measurement, whatever `reduce` needs of it."""
+    @property
+    def reads(self) -> type:
+        """The artifact type this metric scores; the trainer hands it that one."""
+        ...
+
+    def __call__(self, artifact: Any, batch: Batch, /) -> Any:
+        """One batch's measurement, whatever `reduce` needs of it. The trainer
+        passes both by position, so a metric names the artifact for what it
+        reads (`representations`, `scores`)."""
         ...
 
     def reduce(self, values: Sequence[Any]) -> float:
