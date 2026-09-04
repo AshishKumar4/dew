@@ -64,7 +64,8 @@ class TextToImage:
         autoencoder = load_autoencoder(manifest.autoencoder)
         objective = DiffusionObjective(model, process, inputs, autoencoder=autoencoder)
 
-        abstract = jax.eval_shape(objective.init, jax.random.key(0))
+        # Only shapes are traced, so the key is abstract too.
+        abstract = jax.eval_shape(objective.init, jax.ShapeDtypeStruct((2,), jnp.uint32))
         template = {"params": abstract}
         if ema:
             template["ema"] = select(abstract, objective.ema.select)
