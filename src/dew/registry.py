@@ -17,11 +17,21 @@ import dataclasses
 import types
 import typing
 from collections.abc import Iterator, Mapping
-from typing import Any, Callable, Generic, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, Union
 
 import jax.numpy as jnp
 
+if TYPE_CHECKING:
+    from flax import linen as nn
+
+    from dew.data.dataset import DatasetSpec
+    from dew.diffusion.presets import Preset
+    from dew.inputs.encoders import ConditionEncoder
+    from dew.objectives.base import Metric, Objective
+    from dew.sampling.solvers import Solver
+
 T = TypeVar("T", bound=Callable[..., Any])
+M = TypeVar("M", bound=Callable[..., Any])
 
 
 class Registry(Mapping[str, T], Generic[T]):
@@ -29,14 +39,19 @@ class Registry(Mapping[str, T], Generic[T]):
 
     def __init__(self, kind: str):
         self.kind = kind
-        self._members: dict[str, T] = {}
+        # Registration is where a member's kind is promised, not checked: a
+        # decorator has no base class to test against, and it has to hand back
+        # the class it decorated (`DiffusionObjective`, not `Objective`) so a
+        # caller's checker keeps the concrete type. The table is untyped here
+        # and typed on the way out, which is the one place `T` is asserted.
+        self._members: dict[str, Any] = {}
 
-    def __call__(self, name: str, /) -> Callable[[T], T]:
+    def __call__(self, name: str, /) -> Callable[[M], M]:
         """`@models("simple_dit")` on the class it names."""
         if not isinstance(name, str) or not name:
             raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
 
-        def register(member: T) -> T:
+        def register(member: M) -> M:
             held = self._members.get(name)
             if held is not None and held is not member:
                 raise ValueError(
@@ -250,13 +265,13 @@ def with_precision(name: str, config: Mapping[str, Any], *,
     return fields
 
 
-models: Registry[type] = Registry("model")
-presets: Registry[type] = Registry("preset")
-samplers: Registry[type] = Registry("sampler")
-datasets: Registry[type] = Registry("dataset")
-encoders: Registry[type] = Registry("encoder")
-metrics: Registry[Callable[..., Any]] = Registry("metric")
-objectives: Registry[type] = Registry("objective")
+models: Registry[type[nn.Module]] = Registry("model")
+presets: Registry[type[Preset]] = Registry("preset")
+samplers: Registry[type[Solver[Any]]] = Registry("sampler")
+datasets: Registry[type[DatasetSpec]] = Registry("dataset")
+encoders: Registry[type[ConditionEncoder[Any]]] = Registry("encoder")
+metrics: Registry[Callable[..., Metric]] = Registry("metric")
+objectives: Registry[type[Objective]] = Registry("objective")
 
 __all__ = [
     "Registry", "models", "presets", "samplers", "datasets", "encoders", "metrics", "objectives",

@@ -32,7 +32,7 @@ import dew.data  # noqa: F401  registers the datasets a config names
 from dew.data import DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
-from dew.registry import datasets, models, with_precision
+from dew.registry import Registry, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.trainer import Profile
@@ -59,7 +59,7 @@ else:
 
 RUN_FILE = "run.json"
 
-REGISTRIES = (registry.models, registry.presets, registry.samplers, registry.datasets,
+REGISTRIES: tuple[Registry[Any], ...] = (registry.models, registry.presets, registry.samplers, registry.datasets,
               registry.encoders, registry.metrics, registry.objectives)
 
 

@@ -72,8 +72,7 @@ def rebuild(name: str, fields: Mapping[str, Any]) -> ConditionEncoder[Any]:
     wrote. This is the one place those fields are unpacked dynamically, so
     each encoder's `from_pretrained` keeps its own concrete signature.
     """
-    make: Callable[..., ConditionEncoder[Any]] = getattr(encoders[name], "from_pretrained")
-    return make(**fields)
+    return encoders[name].from_pretrained(**fields)
 
 
 @encoders("clip_text")
