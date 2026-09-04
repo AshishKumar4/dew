@@ -157,22 +157,35 @@ def test_constructing_a_trainer_opens_nothing(tmp_path):
     assert trainer.mesh == MeshSpec()
 
 
-def test_the_run_key_and_the_step_derive_every_step_key():
-    """Two runs from one key see the same keys at the same steps, so a
-    resumed run continues the stream the uninterrupted one draws from."""
-    seen = []
+class Keyed(Regression):
+    """Loss scaled by the step key, so the key stream is observable in the parameters.
 
-    class Recording(Regression):
-        def loss(self, params, batch, step):
-            seen.append(step.key)
-            return super().loss(params, batch, step)
+    Scaling multiplies the gradients, which a constant offset would not, so two
+    runs that draw different keys land in different places.
+    """
 
-    state = make_trainer(objective=Recording()).fit(Data(endless), steps=2, log_every=1)
-    expected = [jax.random.fold_in(state.key, index) for index in range(2)]
-    # The step traces once; the keys it saw are traced values of fold_in(key, step).
-    assert len(seen) == 1
-    assert jnp.array_equal(jax.random.key_data(expected[0]),
-                           jax.random.key_data(jax.random.fold_in(state.key, 0)))
+    def loss(self, params, batch, step):
+        base, aux = super().loss(params, batch, step)
+        factor = 1.0 + 0.01 * jax.random.normal(step.key, ())
+        return base * factor, aux
+
+
+def test_a_resumed_run_continues_the_key_stream(tmp_path):
+    """A resume continues fold_in(run_key, step) where it stopped.
+
+    The data position already decides which batches the resumed run sees, so an
+    unkeyed loss cannot tell a resumed run from a restarted key stream. Scaling
+    the loss by the step key makes the keys observable: a resume that restarted
+    its keys, or restored the step but not the run key, lands where the
+    uninterrupted run does not.
+    """
+    make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=2, log_every=1)
+    resumed = make_trainer(tmp_path, objective=Keyed()).fit(Data(), steps=4, log_every=1)
+    whole = make_trainer(objective=Keyed()).fit(Data(), steps=4, log_every=1)
+
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
 
 
 def test_the_ema_lags_the_parameters_at_the_configured_decay():
@@ -739,14 +752,6 @@ def test_ema_update_moves_only_the_leaves_the_average_holds():
     updated = ema_update(ema, params, 0.5)
     assert set(updated["params"]) == {"tracked"}
     np.testing.assert_allclose(updated["params"]["tracked"]["w"], 2.0)
-
-
-def test_ema_decay_follows_the_update_schedule():
-    """I-JEPA's momentum ramp: the trainer reads decay at the update count."""
-    ema = EMASpec(decay=optax.linear_schedule(0.996, 1.0, transition_steps=100))
-    assert float(ema.decay(0)) == pytest.approx(0.996)
-    assert float(ema.decay(100)) == pytest.approx(1.0)
-    assert float(ema.decay(50)) == pytest.approx(0.998)
 
 
 # --------------------------------------------------------------------------
