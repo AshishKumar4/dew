@@ -11,6 +11,7 @@ import pytest
 
 from dew.nn.backbones.unet import Unet
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.dit import TextContext
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.uvit import UViT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
@@ -23,11 +24,15 @@ def run_forward(model, rng, x, temb, textcontext):
     return model.apply(params, x, temb, textcontext)
 
 
+def text(batch=2, tokens=77, features=768):
+    """A fully real text context, the shape CLIP-L/14 gives."""
+    return TextContext(jnp.ones((batch, tokens, features), jnp.float32), jnp.ones((batch, tokens)))
+
+
 def small_inputs(rng, res=RES, channels=3):
     x = jax.random.normal(rng, (2, res, res, channels))
     temb = jnp.ones((2,))
-    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
-    return x, temb, textcontext
+    return x, temb, text()
 
 
 def test_unet_forward(rng):
@@ -65,7 +70,7 @@ def test_simple_dit_non_square(rng):
     model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x = jax.random.normal(rng, (2, 16, 64, 3))
     temb = jnp.ones((2,))
-    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
+    textcontext = text()
     out = run_forward(model, rng, x, temb, textcontext)
     assert out.shape == x.shape
 
@@ -86,10 +91,10 @@ def test_uvit_forward(rng):
 
 @pytest.mark.parametrize("kwargs", [
     {},
-    {"use_hilbert": True},
-    {"use_zigzag": True},
-    {"use_zigzag": True, "use_2d_fusion": True},
-    {"use_hilbert": True, "use_2d_fusion": True},
+    {"scan_order": "hilbert"},
+    {"scan_order": "zigzag"},
+    {"scan_order": "zigzag", "use_2d_fusion": True},
+    {"scan_order": "hilbert", "use_2d_fusion": True},
 ])
 def test_hybrid_dit_forward(rng, kwargs):
     model = HybridSSMAttentionDiT(patch_size=4, emb_features=64, num_layers=4,
@@ -101,7 +106,7 @@ def test_hybrid_dit_forward(rng, kwargs):
 
 def test_uvit_hilbert_forward(rng):
     """UViT takes the hilbert order and returns the shape it was given."""
-    model = UViT(patch_size=4, emb_features=64, num_layers=4, num_heads=2, use_hilbert=True)
+    model = UViT(patch_size=4, emb_features=64, num_layers=4, num_heads=2, scan_order="hilbert")
     x, temb, textcontext = small_inputs(rng)
     out = run_forward(model, rng, x, temb, textcontext)
     assert out.shape == x.shape
@@ -158,8 +163,10 @@ def test_mmdit_is_dual_stream(rng):
     params = model.init(rng, x, temb, textcontext)
     params = jax.tree.map(lambda p: p + 0.02, params)
 
-    text_a = jnp.ones_like(textcontext)
-    text_b = jnp.concatenate([jnp.ones_like(textcontext[:, :38]) * 2.0, text_a[:, 38:]], axis=1)
+    text_a = textcontext
+    text_b = TextContext(
+        jnp.concatenate([jnp.ones_like(textcontext.hidden[:, :38]) * 2.0, text_a.hidden[:, 38:]], axis=1),
+        textcontext.mask)
     out_a = model.apply(params, x, temb, text_a)
     out_b = model.apply(params, x, temb, text_b)
     assert not jnp.allclose(out_a, out_b), "text tokens do not reach the image stream"
@@ -186,7 +193,7 @@ def test_video_dit_forward(rng):
     model = VideoDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x = jax.random.normal(rng, (2, 3, 16, 16, 3))
     temb = jnp.ones((2,))
-    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
+    textcontext = text()
     out = run_forward(model, rng, x, temb, textcontext)
     assert out.shape == x.shape
     assert jnp.all(jnp.isfinite(out))
@@ -246,7 +253,7 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
 
     x = jax.random.normal(rng, (2, 3, 16, 16, 3))
     temb = jnp.ones((2,))
-    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
+    textcontext = text()
 
     params_2d = model_2d.init(rng, x[:, 0], temb, textcontext)
     params_3d = model_3d.init(jax.random.PRNGKey(7), x, temb, textcontext)
@@ -268,7 +275,7 @@ def test_unet3d_temporal_mixing_after_training_signal(rng):
                    num_middle_res_blocks=1, temporal_heads=2)
     x = jax.random.normal(rng, (1, 3, 16, 16, 3))
     temb = jnp.ones((1,))
-    textcontext = jnp.ones((1, 77, 768), dtype=jnp.float32)
+    textcontext = text(batch=1)
     params = model.init(rng, x, temb, textcontext)
     params = jax.tree.map(lambda p: p + 0.02, params)
 
@@ -293,7 +300,7 @@ def test_non_symmetric_attention_configs_init(rng):
         num_middle_res_blocks=1,
     )
     temb = jnp.ones((2,))
-    textcontext = jnp.ones((2, 77, 768), dtype=jnp.float32)
+    textcontext = text()
 
     image = jax.random.normal(rng, (2, 16, 16, 3))
     Unet(**config).init(rng, image, temb, textcontext)
