@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Mapping, Optional
 import dataclasses
 
 import jax.numpy as jnp
@@ -12,7 +13,7 @@ import tyro
 
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.registry import datasets, models
+from dew.registry import Registry, datasets, models
 from dew.training import Layout, MeshSpec
 
 
@@ -137,3 +138,52 @@ def test_a_fresh_process_resolves_models_and_datasets_through_the_config():
              "PATH": os.environ.get("PATH", "")})
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip() == "True True bfloat16"
+
+
+# --------------------------------------------------------------------------
+# A record builds a value
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Kind:
+    window: Optional[int] = None
+    rope_theta: float = 10_000.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Shape:
+    width: int = 8
+    mix: Optional[Kind] = None
+    kinds: Mapping[str, Kind] = dataclasses.field(default_factory=dict)
+    stages: tuple = ()
+    dtype: Any = None
+
+
+def shapes() -> Registry:
+    registry = Registry("shape")
+    registry("shape")(Shape)
+    return registry
+
+
+def test_a_record_builds_the_value_its_field_declares():
+    """A model config is a dict on the command line and in run.json, so a
+    field whose type is a value takes that dict, and code that already holds
+    the value passes it through."""
+    built = shapes().build("shape", mix={"rope_theta": 1e6},
+                           kinds={"sliding": {"window": 512}})
+    assert built.mix == Kind(rope_theta=1e6)
+    assert built.kinds == {"sliding": Kind(window=512)}
+    assert shapes().build("shape", mix=Kind(window=1)).mix == Kind(window=1)
+
+
+def test_a_dtype_is_a_dtype_wherever_it_is_named():
+    """The rule is the field's name, at the top level and inside a record the
+    unets keep their per-stage attention settings in."""
+    built = shapes().build("shape", dtype="bfloat16", stages=({"dtype": "float32"},))
+    assert built.dtype is jnp.bfloat16
+    assert built.stages[0]["dtype"] is jnp.float32
+
+
+def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
+    with pytest.raises(ValueError, match=r"Kind has no field for \['theta'\]"):
+        shapes().build("shape", mix={"theta": 1e6})
