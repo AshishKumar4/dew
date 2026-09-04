@@ -30,7 +30,7 @@ from dew.checkpoints import Checkpoints
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.training.distributed import (
-    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding, build_mesh,
+    Checkpointable, DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding, build_mesh,
     minimum_across_processes, shard_batch,
 )
 from dew.training.state import TrainState
@@ -352,12 +352,13 @@ class Trainer:
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
         source = data.train()
-        if checkpoint_every and not hasattr(source, "get_state"):
+        if checkpoint_every and not isinstance(source, Checkpointable):
             raise ValueError(
-                f"checkpoint_every needs a training stream with get_state, and "
-                f"{type(source).__name__} has none; a checkpoint written without "
-                f"the data position would replay the data on resume. Train it "
-                f"with checkpoint_every=None (--trainer.checkpoint-every None)")
+                f"checkpoint_every needs a training stream with get_state and "
+                f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+                f"written without the data position would replay the data on "
+                f"resume. Train it with checkpoint_every=None "
+                f"(--trainer.checkpoint-every None)")
         train = DevicePrefetchIterator(source, sharding, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
         compiled = None
