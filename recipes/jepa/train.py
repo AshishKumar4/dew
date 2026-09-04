@@ -21,7 +21,6 @@ import dew.io
 from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
-from dew.interop.manifest import Manifest
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import datasets, metrics, models
 from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
@@ -172,10 +171,8 @@ def main(config: JepaRunConfig) -> TrainState:
                                 "records": data.records},
                     "steps": steps})
 
-    Manifest(config=run_config,
-             model={"name": config.model.architecture, "fields": encoder_fields}).write(directory)
-
     checkpoints = Checkpoints(directory, keep=config.trainer.keep)
+    config.save(checkpoints.directory)
     trainer = Trainer(
         objective, build_optimizer(config.optim, steps),
         key=jax.random.key(config.trainer.seed),
