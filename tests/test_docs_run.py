@@ -209,12 +209,11 @@ def keyword_errors(tree, bound: dict) -> list[str]:
     return problems
 
 
-def notebook_cases():
+def notebook_cases() -> list:
     """One case per tutorial; the parked ones as a strict xfail."""
-    for path in NOTEBOOKS:
-        marks = [pytest.mark.xfail(strict=True, reason="parked for a rewrite")] \
-            if path.name in PENDING else []
-        yield pytest.param(path, marks=marks, id=path.name)
+    parked = [pytest.mark.xfail(strict=True, reason="parked for a rewrite")]
+    return [pytest.param(path, marks=parked if path.name in PENDING else [], id=path.name)
+            for path in NOTEBOOKS]
 
 
 def test_the_parked_list_names_tutorials_that_exist():
