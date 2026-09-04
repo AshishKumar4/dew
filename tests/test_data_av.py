@@ -6,6 +6,7 @@ plumbing is checked against a stubbed reader so it runs everywhere; the tests
 that decode real media skip when the libraries are missing.
 """
 
+import importlib
 import shutil
 import subprocess
 import sys
@@ -84,7 +85,12 @@ def test_read_av_improved_without_an_end_reads_to_the_clip_end(stub_reader):
 
 @pytest.fixture(scope="module")
 def synthesized_clip(tmp_path_factory):
-    pytest.importorskip("video_reader", reason="PyVideoReader is not installed")
+    try:
+        # A missing reader and a reader whose native library will not load are
+        # the same thing to a test: pytest.importorskip re-raises the second.
+        importlib.import_module("video_reader")
+    except ImportError as error:
+        pytest.skip(f"PyVideoReader is unusable here: {error}")
     if shutil.which("ffmpeg") is None:
         pytest.skip("needs the ffmpeg binary")
 

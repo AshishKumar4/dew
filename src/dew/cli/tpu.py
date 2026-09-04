@@ -408,7 +408,7 @@ class List(Base):
         for zone in zones:
             payload = gcloud.json("compute", "tpus", "tpu-vm", "list",
                                   f"--zone={zone}", default=[])
-            for item in payload:
+            for item in payload if isinstance(payload, list) else ():
                 node = Node.parse(item)
                 rows.append((node.name, node.accelerator_type, node.state,
                              node.health or "-", str(node.workers), zone,

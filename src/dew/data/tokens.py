@@ -14,7 +14,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, overload
 
 import grain.python as pygrain
 import jax
@@ -72,10 +72,10 @@ class TokenWindows(DatasetSpec):
         train_bin, val_bin = token_files(self.path, "TokenWindows")
         train = TokenFileSource(train_bin, self.seq_len)
         val = TokenFileSource(val_bin, self.seq_len)
-        knobs = dict(batch=local_batch(batch), seed=self.seed, loading=self.loading)
         return Dataset(
-            train=train_stream(train, [], **knobs),
-            val=bounded(validation_pass(val, [], **knobs), self.val_batches),
+            train=train_stream(train, [], batch=local_batch(batch),
+                               seed=self.seed, loading=self.loading),
+            val=bounded(validation_pass(val, [], batch=local_batch(batch), seed=self.seed, loading=self.loading), self.val_batches),
             records=len(train),
             batch=batch,
         )
@@ -86,7 +86,7 @@ def chunk_counts(lengths, chunk_len: int):
     return -(-np.asarray(lengths, np.int64) // chunk_len)
 
 
-class DocumentChunks(pygrain.MapDataset):
+class DocumentChunks(pygrain.MapDataset[Batch]):
     """Documents cut into consecutive chunks of at most `chunk_len` tokens.
 
     Grain's packer refuses an element longer than the bin it packs into, so a
@@ -111,6 +111,12 @@ class DocumentChunks(pygrain.MapDataset):
     def __len__(self) -> int:
         return len(self._document)
 
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
     def __getitem__(self, index):
         # grain's conventions: a slice is the sharding and windowing API
         # (ds[shard::count]), and an index past the end wraps, which is what
@@ -118,9 +124,11 @@ class DocumentChunks(pygrain.MapDataset):
         if isinstance(index, slice):
             return self.slice(index)
         index = index % len(self)
-        text = self._parent[int(self._document[index])]["text"]
+        document = self._parent[int(self._document[index])]
+        if document is None:
+            raise ValueError(f"document {index} of the packed corpus is missing")
         start = int(self._offset[index])
-        return {"text": text[start:start + self._chunk_len]}
+        return {"text": document["text"][start:start + self._chunk_len]}
 
 
 @datasets("packed_tokens")
@@ -173,13 +181,12 @@ class PackedTokens(DatasetSpec):
         val_source = TokenDocumentSource(val_bin)
 
         def stream(source, shuffle, epochs):
-            documents = DocumentChunks(
+            chunks: pygrain.MapDataset[Batch] = DocumentChunks(
                 pygrain.MapDataset.source(source), source.lengths, window)
-            documents = documents[jax.process_index()::jax.process_count()]
+            chunks = chunks[jax.process_index()::jax.process_count()]  # a slice is a dataset
             if shuffle:
-                documents = documents.shuffle(self.seed)
-            documents = documents.repeat(epochs)
-            reads = documents.to_iter_dataset()
+                chunks = chunks.shuffle(self.seed)
+            reads = chunks.repeat(epochs).to_iter_dataset()
             if self.loading.workers:
                 # The workers read documents, and the packer stays behind them
                 # in this process: grain runs a whole pipeline per worker, so

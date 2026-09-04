@@ -104,11 +104,10 @@ def read_video_rsreader(video_path, fast=False):
 def read_audio_decord(audio_path:str):
     from decord import AudioReader
     ar = AudioReader(audio_path)
-    audio_frames = ar[:].asnumpy()
-    ar.seek(0)
-    return audio_frames
+    # The whole track in one read; decord's AudioReader has no seek to rewind.
+    return ar[:].asnumpy()
 
-def read_av_decord(path: str, start: int=0, end: int = None, ctx=None):
+def read_av_decord(path: str, start: int = 0, end: int | None = None, ctx=None):
     from decord import AVReader, cpu
     if ctx is None:
         ctx = cpu(0)
@@ -242,7 +241,9 @@ def read_av_random_clip_moviepy(
     # Load the video
     video = VideoFileClip(video_path).with_fps(target_fps)
     original_duration = video.duration
-    total_frames = video.n_frames#int(original_duration * target_fps)
+    if original_duration is None:
+        raise ValueError(f"{video_path} reports no duration, so no clip can be cut from it")
+    total_frames = int(original_duration * target_fps)
     
     # Calculate effective padding needed based on audio segmentation
     effective_padding = max(audio_frame_padding, (audio_frames_per_video_frame) // 2)
@@ -283,10 +284,10 @@ def read_av_random_clip_moviepy(
         raise ValueError(f"Audio start time {audio_start_time} or end time {audio_end_time} is out of bounds for video duration {original_duration}")
     
     # Extract the subclip
-    clip : VideoFileClip = video.subclipped(audio_start_time, audio_end_time)
-    # Extract audio
-    audio = clip.audio.with_fps(target_sr)
-    audio_data = audio.to_soundarray()
+    clip = video.subclipped(audio_start_time, audio_end_time)
+    if clip.audio is None:
+        raise ValueError(f"{video_path} has no audio track")
+    audio_data = clip.audio.to_soundarray(fps=target_sr)
     # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
     num_audio_samples_required = int(round(audio_duration * target_sr))
     if len(audio_data) < num_audio_samples_required:
@@ -382,8 +383,11 @@ def read_av_random_clip_alt(
     assert audio_start_time >= 0, f"Audio start time {audio_start_time} is negative"
     
     # Extract the subclip
-    audio_clip : AudioFileClip = VideoFileClip(video_path).audio.with_fps(target_sr).subclipped(audio_start_time, audio_end_time)
-    audio_data = audio_clip.to_soundarray()
+    track = VideoFileClip(video_path).audio
+    if track is None:
+        raise ValueError(f"{video_path} has no audio track")
+    audio_clip = track.subclipped(audio_start_time, audio_end_time)
+    audio_data = audio_clip.to_soundarray(fps=target_sr)
     # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
     num_audio_samples_required = int(round(audio_duration * target_sr))
     
@@ -464,17 +468,18 @@ def read_av_random_clip_pyav(
     audio_start_time = max(0.0, (start_idx - eff_pad) / target_fps)
     audio_end_time = (end_idx + eff_pad) / target_fps
     with av.open(video_path) as container:
-        audio_stream = next((s for s in container.streams if s.type == "audio"), None)
-        if audio_stream is None:
+        if not container.streams.audio:
             raise ValueError("No audio stream found in the file.")
+        audio_stream = container.streams.audio[0]
 
         # --- 4) Decode all audio, resample to s16 mono @ target_sr ---
         resampler = av.AudioResampler(format="s16", layout="mono", rate=target_sr)
         audio_segments = []
         segment_times = []
+        sample_rate = audio_stream.codec_context.sample_rate
         for packet in container.demux(audio_stream):
             for frame in packet.decode():
-                if frame.pts is None:
+                if not isinstance(frame, av.AudioFrame) or frame.pts is None:
                     continue
                 out = resampler.resample(frame)
                 out = [out] if not isinstance(out, list) else out
@@ -482,7 +487,7 @@ def read_av_random_clip_pyav(
                     # Extract samples from the PyAV audio frame
                     arr = oframe.to_ndarray()   # shape: (1, samples) for mono
                     samples = arr.flatten().astype(np.int16)
-                    start_t = float(oframe.pts * audio_stream.time_base)
+                    start_t = float((oframe.pts or 0) * (oframe.time_base or 0))
                     end_t = start_t + oframe.samples / oframe.sample_rate
                     audio_segments.append(samples)
                     segment_times.append((start_t, end_t))
@@ -504,7 +509,7 @@ def read_av_random_clip_pyav(
             return len(full_audio)
         for i, (st, ed) in enumerate(segment_times):
             if st <= t < ed:
-                seg_offset = int(round((t - st) * audio_stream.rate))
+                seg_offset = int(round((t - st) * (sample_rate or target_sr)))
                 return offsets[i] + min(seg_offset, seg_lens[i] - 1)
         return len(full_audio)
 

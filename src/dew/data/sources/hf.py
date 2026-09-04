@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -87,7 +88,14 @@ class HFDatasetSource:
                 if self._dataset is None:
                     datasets = _hf_datasets()
                     if self._cache_path is not None:
-                        self._dataset = datasets.load_from_disk(self._cache_path)
+                        # A directory of splits comes back as a DatasetDict;
+                        # a row source is one split's table.
+                        held = datasets.load_from_disk(self._cache_path)
+                        self._dataset = (held[self.split]
+                                         if isinstance(held, datasets.DatasetDict) else held)
+                    elif self.name is None:
+                        raise ValueError(
+                            "an HF source needs a dataset name or a cache path")
                     else:
                         self._dataset = datasets.load_dataset(
                             self.name, split=self.split)
@@ -97,8 +105,9 @@ class HFDatasetSource:
         return len(self._table())
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        return {key: _plain_value(value)
-                for key, value in self._table()[index].items()}
+        row: Mapping[str, Any] = self._table()[index]
+        return {key: _plain_value(value) for key, value in row.items()}
+
 
     def __getstate__(self) -> Dict[str, Any]:
         # grain pickles the source into every worker process, so the table

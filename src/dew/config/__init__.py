@@ -21,13 +21,15 @@ import json
 import os
 import types
 import typing
-from typing import Annotated, Any, Literal, Mapping, Optional, Self, Union
+from typing import (TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self,
+                    TypeAlias, Union)
 
 import tyro
 
 from etils import epath
 
 import dew.data  # noqa: F401  registers the datasets a config names
+from dew.data import DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.registry import datasets, models, with_precision
@@ -46,6 +48,14 @@ JsonDict = Annotated[
     ),
 ]
 """A dict, written as a single JSON string on the command line."""
+
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, a Union of the registered specs, and a
+    # type checker cannot read a variable in a type expression. Both get what
+    # they need: the base class statically, the union at runtime.
+    DataSpec: TypeAlias = DatasetSpec
+else:
+    DataSpec = datasets.union
 
 RUN_FILE = "run.json"
 
@@ -191,7 +201,8 @@ def _registry_for(annotation):
     return None
 
 
-def _to_json(value):
+def _to_json(value) -> Any:
+    """`value` as JSON: a dict, a list, or a scalar json.dump can write."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name))
@@ -216,12 +227,14 @@ def _fields(cls, values):
     return {name: _rebuild(hints[name], values[name]) for name in declared}
 
 
-def _rebuild(annotation, value):
+def _rebuild(annotation, value) -> Any:
+    """The value `annotation` asks for, built out of a record. Any is the
+    truth here: what comes back is whatever type the field declares."""
     held = _registry_for(annotation)
     if held is not None:
         member = held[value["name"]]
         return member(**_fields(member, value["fields"]))
-    if dataclasses.is_dataclass(annotation):
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return annotation(**_fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
         inner = [m for m in typing.get_args(annotation) if m is not type(None)]
@@ -236,7 +249,7 @@ class RunConfig:
     """A whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: datasets.union = dataclasses.field(
+    data: DataSpec = dataclasses.field(
         default_factory=lambda: datasets["oxford_flowers102"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
@@ -244,7 +257,8 @@ class RunConfig:
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe record of the run; a registered member is written as its
         name and fields."""
-        return _to_json(self)
+        return {field.name: _to_json(getattr(self, field.name))
+                for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> Self:
