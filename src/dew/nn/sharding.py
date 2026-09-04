@@ -14,16 +14,20 @@ the models plain Flax modules whose init returns arrays. The optimizer's
 moments and the EMA copy have paths ending in their parameter's, so one
 declaration reaches them as well.
 
-`heuristic` lists the modules a class leaves to the shape heuristic on
-purpose (a convolution, a state matrix): their parameters are placed on their
-largest divisible axis. A declared or heuristic name that no parameter
-carries any more is what the coverage test in tests/test_architectures.py
-reports, so a renamed submodule fails there rather than silently stopping to
-match.
+`heuristic` lists what a class leaves to the shape heuristic on purpose (a
+convolution, a state matrix, a projection with no side worth naming): their
+parameters are placed on their largest divisible axis. Each entry is a run
+of `fnmatch` patterns matched against consecutive names of the parameter
+path, so `("time_embed",)` covers every parameter under that module and
+`("up_dense_*",)` a numbered family. A declared or heuristic name that no
+parameter carries any more is what the coverage test in
+tests/test_architectures.py reports, so a renamed submodule fails there
+rather than silently stopping to match.
 """
 
 from __future__ import annotations
 
+import fnmatch
 from collections.abc import Iterable, Mapping
 from typing import TypeAlias
 
@@ -36,7 +40,7 @@ DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
 
 HEURISTIC: set[Suffix] = set()
-"""Module suffixes whose parameters take the shape heuristic on purpose."""
+"""Runs of name patterns whose parameters take the shape heuristic on purpose."""
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
@@ -97,5 +101,11 @@ def declared_axes(path, ndim: int) -> LogicalAxes | None:
 
 
 def is_heuristic(path) -> bool:
-    """Whether the parameter at `path` sits under a module listed as heuristic."""
-    return _matching(HEURISTIC, parameter_path(path)[:-1]) is not None
+    """Whether the parameter at `path` is one a module left to the shape heuristic."""
+    names = parameter_path(path)
+    for pattern in HEURISTIC:
+        for start in range(len(names) - len(pattern) + 1):
+            if all(fnmatch.fnmatchcase(name, glob)
+                   for name, glob in zip(names[start:], pattern)):
+                return True
+    return False

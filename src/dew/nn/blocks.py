@@ -10,6 +10,8 @@ from functools import partial
 import math
 from einops import rearrange
 
+from .sharding import logical_axes
+
 # Kernel initializer to use
 def kernel_init(scale=1.0, dtype=jnp.float32):
     scale = max(scale, 1e-10)
@@ -82,6 +84,7 @@ class FourierEmbedding(nn.Module):
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
         return emb
 
+@logical_axes({}, heuristic=(("DenseGeneral_*",),))
 class TimeProjection(nn.Module):
     features:int
     activation:Callable=jax.nn.gelu
@@ -127,6 +130,7 @@ class SeparableConv(nn.Module):
         )(depthwise)
         return pointwise
 
+@logical_axes({}, heuristic=(("conv",),))
 class ConvLayer(nn.Module):
     conv_type:str
     features:int
@@ -229,6 +233,7 @@ def l2norm(t, axis=1, eps=1e-6): # Increased epsilon from 1e-12
     return (out)
 
 
+@logical_axes({}, heuristic=(("temb_projection",),))
 class ResidualBlock(nn.Module):
     conv_type:str
     features:int

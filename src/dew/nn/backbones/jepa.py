@@ -23,6 +23,7 @@ from ..dit import (
 )
 from ..vit import RotaryEmbedding
 from dew.registry import models
+from ..sharding import logical_axes
 
 
 def gather_tokens(tokens, idx):
@@ -240,6 +241,7 @@ class JepaVideoEncoder(nn.Module):
 
 
 @models("jepa_predictor")
+@logical_axes({}, heuristic=(("proj_in",), ("proj_out",), ("mask_token",)))
 class JepaPredictor(nn.Module):
     """Narrow transformer from context embeddings to target embeddings.
 

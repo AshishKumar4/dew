@@ -76,7 +76,7 @@ def select(tree: Variables, keep: PathFilter) -> Variables:
     def prune(node, path):
         if isinstance(node, Mapping):
             kept = {name: prune(child, path + (name,)) for name, child in node.items()}
-            return {name: child for name, child in kept.items() if child is not None}
+            return {name: child for name, child in kept.items() if child is not None} or None
         return node if keep(path) else None
 
     selected = prune(tree, ())
