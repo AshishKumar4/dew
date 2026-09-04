@@ -9,7 +9,7 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import Any, Iterator, Optional, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Iterator, Optional, TypeAlias
 
 import jax
 import numpy as np
@@ -18,6 +18,7 @@ from flax.linen import spmd
 from jax.experimental import multihost_utils
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
+from dew.data.dataset import Checkpointable
 from dew.nn.sharding import LogicalAxes, declared_axes
 from dew.objectives.base import Batch, Variables
 
@@ -265,19 +266,6 @@ def shard_batch(sharding: NamedSharding, batch: Batch) -> Batch:
     """Assemble this process's slice of each array into a globally sharded one."""
     return jax.tree.map(
         lambda x: jax.make_array_from_process_local_data(sharding, np.asarray(x)), batch)
-
-
-@runtime_checkable
-class Checkpointable(Protocol):
-    """A data stream that can say where it stopped and be put back there.
-
-    grain's iterators satisfy this; a plain iterator does not, which is what
-    `fit` refuses when a run asks for checkpoints.
-    """
-
-    def get_state(self) -> Any: ...
-
-    def set_state(self, state: Any) -> None: ...
 
 
 class DevicePrefetchIterator:
