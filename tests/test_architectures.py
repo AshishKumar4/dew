@@ -34,6 +34,7 @@ from dew.diffusion.transforms import get_diffusion_preset
 from dew.eval.common import EvaluationMetric
 from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
 from dew.inputs.encoders import ConditioningEncoder
+from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.objectives.lm import LMObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import MODEL_REGISTRY, build_model
@@ -418,13 +419,15 @@ def assert_run_landed(trainer, state, case, seen, losses):
     assert len(losses) == 2 and all(np.isfinite(loss) for loss in losses), losses
 
     # fit() validates once as a pre-training sanity check and once after the
-    # epoch, both from the EMA parameters as they sit on the mesh.
+    # epoch, both from the EMA parameters as they sit on the mesh. A diffusion
+    # objective samples VALIDATION_SAMPLES images whatever the batch holds,
+    # since each is a full sampler pass.
     if case.is_lm:
         expected = ()
     elif case.is_jepa:
         expected = (BATCH, case.config["emb_features"])
     else:
-        expected = (BATCH, *case.sample_shape)
+        expected = (VALIDATION_SAMPLES, *case.sample_shape)
     assert seen == [expected] * 2, seen
     assert np.isfinite(trainer.best_val_metrics["val/artifact_spread"])
 
