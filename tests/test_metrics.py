@@ -398,3 +398,65 @@ def test_a_metric_refuses_a_batch_with_fewer_records_than_samples():
     with pytest.raises(ValueError, match="at least as many"):
         registry["psnr"]()(ImageGrid(jnp.zeros((8, 32, 32, 3))),
                            {"image": jnp.zeros((4, 32, 32, 3), jnp.uint8)})
+
+############################################################################################################
+# The FID weights
+############################################################################################################
+
+
+def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
+    """T28: the FID weights are a pickle written under numpy 1, whose array
+    reconstructor now lives behind a shim that warns on every attribute read,
+    so `pickle.load` could not read them under numpy 2 with the suite's
+    filters. The loader resolves the numpy names at their current home, which
+    also means it can allow exactly those names and refuse the rest, so a
+    downloaded pickle cannot run code."""
+    import pickle
+
+    from dew.eval.utils import load_arrays
+
+    tree = {"conv": {"kernel": np.arange(6, dtype=np.float32).reshape(2, 3),
+                     "bias": np.zeros(3, np.float32)}}
+    path = tmp_path / "weights.pickle"
+    path.write_bytes(pickle.dumps(tree))
+    loaded = load_arrays(path)
+    assert set(loaded) == {"conv"} and set(loaded["conv"]) == {"kernel", "bias"}
+    assert np.array_equal(loaded["conv"]["kernel"], tree["conv"]["kernel"])
+
+    hostile = tmp_path / "hostile.pickle"
+    hostile.write_bytes(pickle.dumps(print))
+    with pytest.raises(pickle.UnpicklingError, match="builtins.print"):
+        load_arrays(hostile)
+
+
+@pytest.mark.network
+def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
+    """The calibration the metric exists for: two disjoint halves of the same
+    photographs score close, unrelated noise scores far.
+
+    Measured on Oxford Flowers at 64px with the released weights, 64 images a
+    side: 123 between halves against 505 for noise. The absolute number is
+    finite-sample bias, not the distance between the halves, and it falls with
+    the sample count on the same photographs: 176 at 16 a side, 89 at 128, 63
+    at 256, 41 at 512, while noise stays near 500 throughout. That is why the
+    metric's own docstring calls a per-batch value a trend rather than a
+    headline.
+    """
+    tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+    from dew.inputs import unit_range
+
+    source = tfds.data_source("oxford_flowers102", split="all", try_gcs=False)
+    photos = np.stack([
+        np.asarray(jax.image.resize(jnp.asarray(source[index]["image"], jnp.float32),
+                                    (64, 64, 3), method="bilinear"))
+        for index in range(128)]).astype(np.uint8)
+    metric = fid()
+    first, second = photos[:64], photos[64:]
+    noise = jax.random.normal(jax.random.PRNGKey(1), (64, 64, 64, 3)).clip(-1.0, 1.0)
+
+    halves = metric(ImageGrid(unit_range(first)), {"image": second})
+    unrelated = metric(ImageGrid(noise), {"image": second})
+    itself = metric(ImageGrid(unit_range(second)), {"image": second})
+
+    assert abs(itself) < 1.0, f"the same images do not score zero: {itself:.3f}"
+    assert halves < 0.5 * unrelated, f"halves {halves:.1f} against noise {unrelated:.1f}"
