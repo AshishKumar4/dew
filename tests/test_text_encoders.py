@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.inputs.encoders import CLIPTextEncoder
+from dew.inputs import CLIPText, Condition, InputSpec, Field
 from dew.nn.text_encoders import (
     CLIPModel, CLIPTextModel, CLIPTextTransformer, translate_clip_config,
     translate_clip_weights, translate_config, translate_vision_config, translate_weights,
@@ -99,42 +99,42 @@ def test_tiny_checkpoint_matches_the_reference():
     assert pooled < TOLERANCE, f"max |pooled difference| {pooled:.3e}"
 
 
-def test_from_modelname_loads_and_encodes():
-    """The path that was dead: from_modelname on the jax backend built its model
-    with FlaxCLIPTextModel, which transformers 5 removed, so every call raised
-    ImportError. It loads the vendored tower now, tokenizes with AutoTokenizer,
-    and the embeddings it returns are the reference's."""
+def test_the_encoder_loads_and_encodes():
+    """`CLIPText.from_pretrained` loads the vendored tower and the checkpoint's
+    tokenizer; `encode` under the encoder's own params returns the
+    reference's hidden states with the tokenizer's mask."""
     expected = reference(TINY)
-    encoder = CLIPTextEncoder.from_modelname(modelname=str(TINY), backend="jax")
+    encoder = CLIPText.from_pretrained(str(TINY))
 
     tokens = encoder.tokenize(prompts(TINY))
-    embeddings = np.asarray(encoder.encode_from_tokens(tokens), np.float32)
+    context = encoder.encode(encoder.params, tokens)
 
-    assert np.array_equal(np.asarray(tokens["input_ids"], np.int32),
-                          expected["input_ids"])
-    difference = float(np.max(np.abs(embeddings - expected["last_hidden_state"])))
+    assert np.array_equal(tokens["input_ids"], expected["input_ids"])
+    assert np.array_equal(np.asarray(context.mask), expected["attention_mask"])
+    difference = float(np.max(np.abs(np.asarray(context.hidden, np.float32)
+                                     - expected["last_hidden_state"])))
     assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
+    assert encoder.captions(tokens)[0] == "a red bird"
 
 
-def test_serialized_config_rebuilds_an_encoder_that_agrees():
-    """Sampling restores an encoder from the run's config, so a round-trip has
-    to come back as the same encoder, not just the same fields."""
-    encoder = CLIPTextEncoder.from_modelname(modelname=str(TINY), backend="jax")
-    config = encoder.serialize()
-    assert config == {"modelname": str(TINY), "backend": "jax"}
+def test_the_manifest_fields_rebuild_an_encoder_that_agrees():
+    """A run manifest stores the spec as JSON, and inference rebuilds the
+    encoder from it, so the round-trip has to come back as the same encoder
+    and not just the same fields."""
+    spec = InputSpec(Field("image", (8, 8, 3)),
+                     {"textcontext": Condition(CLIPText.from_pretrained(str(TINY)))})
+    data = spec.to_json()
+    assert data["conditions"]["textcontext"] == {
+        "encoder": {"name": "clip_text", "fields": {"checkpoint": str(TINY), "dtype": None}},
+        "field": "text", "unconditional": ""}
+    assert data["sample"] == {"key": "image", "shape": [8, 8, 3]}
 
-    restored = CLIPTextEncoder.deserialize(config)
-    texts = prompts(TINY)
-    assert np.array_equal(np.asarray(restored(texts)), np.asarray(encoder(texts)))
-
-
-def test_a_backend_that_cannot_run_is_refused():
-    """The torch branch this replaced loaded a model that then raised on the
-    first call: `tokenize` returns numpy arrays and transformers'
-    `CLIPTextModel.forward` calls `input_ids.size()` on them. Refusing at
-    construction says so, instead of failing a batch later."""
-    with pytest.raises(ValueError, match="'jax' is the only one"):
-        CLIPTextEncoder.from_modelname(modelname=str(TINY), backend="torch")
+    restored = InputSpec.from_json(data)
+    assert restored.sample == spec.sample
+    encoder, rebuilt = spec.conditions["textcontext"].encoder, restored.conditions["textcontext"].encoder
+    tokens = encoder.tokenize(prompts(TINY))
+    assert np.array_equal(np.asarray(rebuilt.encode(rebuilt.params, tokens).hidden),
+                          np.asarray(encoder.encode(encoder.params, tokens).hidden))
 
 
 def test_padding_is_masked_where_the_reference_masks_it():
@@ -402,12 +402,13 @@ def test_the_real_checkpoint_matches_the_reference():
     same prompts."""
     expected = reference(REAL)
     repo = json.loads((REAL / "prompts.json").read_text())["repo"]
-    encoder = CLIPTextEncoder.from_modelname(modelname=repo, backend="jax")
+    encoder = CLIPText.from_pretrained(repo)
 
     tokens = encoder.tokenize(prompts(REAL))
     assert np.array_equal(np.asarray(tokens["input_ids"], np.int32),
                           expected["input_ids"])
-    outputs = encoder.model(tokens["input_ids"], tokens["attention_mask"])
+    outputs = encoder.transformer.apply(encoder.params, tokens["input_ids"],
+                                        tokens["attention_mask"])
 
     hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
                                  - expected["last_hidden_state"])))

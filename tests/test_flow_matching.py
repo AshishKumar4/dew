@@ -1,7 +1,7 @@
 """Flow matching on the linear (rectified flow) path.
 
 Covers the schedule invariants, the exact velocity round-trip, the claim that
-the existing DDIM/Euler samplers already integrate the flow ODE, and a toy
+the DDIM and Euler solvers already integrate the flow ODE, and a toy
 end-to-end run proving the objective actually learns a distribution.
 """
 
@@ -12,21 +12,17 @@ import optax
 import pytest
 from flax import linen as nn
 
-from dew.inputs import DiffusionInputConfig
-from dew.diffusion.transforms import FlowMatchPredictionTransform, get_diffusion_preset
-from dew.sampling.ddim import DDIMSampler
-from dew.sampling.euler import EulerSampler
+from dew.diffusion import FlowMatchPredictionTransform, Process, broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.flow import compute_resolution_shift
-from dew.diffusion.schedules.common import get_coeff_shapes_tuple
-from dew.random_state import RandomMarkovState
+from dew.sampling import DDIM, Euler, sample
 
 STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 
 
 def test_linear_path_rates():
     schedule = FlowMatchingScheduler()
-    alpha, sigma = schedule.get_rates(STEPS, shape=(-1,))
+    alpha, sigma = schedule.rates(STEPS)
     assert jnp.allclose(alpha + sigma, 1.0, atol=1e-6)
     assert jnp.allclose(sigma, STEPS, atol=1e-6)
     # No input preconditioning on the linear path
@@ -38,13 +34,16 @@ def test_endpoints_are_data_and_noise(rng):
     key0, key1 = jax.random.split(rng)
     x0 = jax.random.normal(key0, (4, 8, 8, 3))
     noise = jax.random.normal(key1, (4, 8, 8, 3))
-    assert jnp.allclose(schedule.add_noise(x0, noise, jnp.zeros((4,))), x0, atol=1e-6)
-    assert jnp.allclose(schedule.add_noise(x0, noise, jnp.ones((4,))), noise, atol=1e-6)
+    transform = FlowMatchPredictionTransform()
+    at_zero = transform.forward_diffusion(x0, noise, broadcast_rates(schedule, jnp.zeros((4,)), x0))[0]
+    at_one = transform.forward_diffusion(x0, noise, broadcast_rates(schedule, jnp.ones((4,)), x0))[0]
+    assert jnp.allclose(at_zero, x0, atol=1e-6)
+    assert jnp.allclose(at_one, noise, atol=1e-6)
 
 
 def test_timesteps_are_logit_normal(rng):
     schedule = FlowMatchingScheduler(logit_mean=-0.3, logit_std=1.4)
-    steps, _ = schedule.generate_timesteps(50000, RandomMarkovState(rng))
+    steps = schedule.sample_t(rng, 50000)
     assert jnp.all((steps > 0) & (steps < 1))
     logits = jnp.log(steps) - jnp.log1p(-steps)
     assert abs(float(jnp.mean(logits)) - (-0.3)) < 0.05
@@ -80,9 +79,7 @@ def test_resolution_shift_grows_with_sequence_length():
 
 def test_timestep_conditioning_is_scaled_to_the_embedding_range():
     schedule = FlowMatchingScheduler(shift=2.0)
-    x = jnp.zeros((4, 8, 8, 3))
-    _, temb = schedule.transform_inputs(x, STEPS)
-    assert jnp.allclose(temb, schedule.shift_timesteps(STEPS) * 1000)
+    assert jnp.allclose(schedule.model_time(STEPS), schedule.shift_timesteps(STEPS) * 1000)
 
 
 def test_velocity_roundtrip_is_exact(rng):
@@ -91,7 +88,7 @@ def test_velocity_roundtrip_is_exact(rng):
     key0, key1 = jax.random.split(rng)
     x0 = jax.random.normal(key0, (4, 8, 8, 3))
     noise = jax.random.normal(key1, (4, 8, 8, 3))
-    rates = schedule.get_rates(STEPS, get_coeff_shapes_tuple(x0))
+    rates = broadcast_rates(schedule, STEPS, x0)
 
     xt, _, target = transform.forward_diffusion(x0, noise, rates)
     assert jnp.allclose(target, noise - x0, atol=1e-6)
@@ -102,62 +99,30 @@ def test_velocity_roundtrip_is_exact(rng):
 
 
 def test_preset_wires_flow_matching():
-    for name in ('flow', 'flow_matching'):
-        train, sample, transform = get_diffusion_preset(name, shift=2.0)
-        assert isinstance(train, FlowMatchingScheduler)
-        assert isinstance(sample, FlowMatchingScheduler)
-        assert isinstance(transform, FlowMatchPredictionTransform)
-        assert train.shift == 2.0 and sample.shift == 2.0
+    process = presets.Flow(shift=2.0)()
+    assert isinstance(process.schedule, FlowMatchingScheduler)
+    assert process.sampling is None
+    assert isinstance(process.prediction, FlowMatchPredictionTransform)
+    assert process.schedule.shift == 2.0
 
 
 ############################################################################################################
-# The existing samplers already integrate the flow ODE
+# The existing solvers already integrate the flow ODE
 ############################################################################################################
 
-class ConstantVelocity(nn.Module):
-    """Stands in for a trained model; take_next_step never calls it."""
-    @nn.compact
-    def __call__(self, x, temb):
-        return x
-
-
-def _flow_sampler(sampler_class):
-    schedule = FlowMatchingScheduler()
-    return sampler_class(
-        model=ConstantVelocity(),
-        noise_schedule=schedule,
-        model_output_transform=FlowMatchPredictionTransform(),
-        input_config=DiffusionInputConfig(sample_data_key="image", sample_data_shape=(8, 8, 3), conditions=[]),
-        guidance_scale=0.0,
-    )
-
-
-@pytest.mark.parametrize("sampler_class", [EulerSampler, DDIMSampler])
-def test_sampler_step_is_the_flow_euler_step(sampler_class, rng):
-    """x_{t+dt} = x_t + u * dt exactly, for the unmodified samplers."""
-    sampler = _flow_sampler(sampler_class)
-    transform = FlowMatchPredictionTransform()
-    schedule = sampler.noise_schedule
-
+@pytest.mark.parametrize("solver", [Euler(), DDIM()], ids=lambda s: type(s).__name__)
+def test_solver_step_is_the_flow_euler_step(solver, rng):
+    """x_{t+dt} = x_t + u * dt exactly, for the unmodified solvers."""
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     key0, key1 = jax.random.split(rng)
     x_t = jax.random.normal(key0, (4, 8, 8, 3))
     velocity = jax.random.normal(key1, (4, 8, 8, 3))
-    current_step = jnp.full((4,), 0.8)
-    next_step = jnp.full((4,), 0.6)
+    t = jnp.full((4,), 0.8)
+    t_next = jnp.full((4,), 0.6)
 
-    rates = schedule.get_rates(current_step, get_coeff_shapes_tuple(x_t))
-    x0, eps = transform.backward_diffusion(x_t, velocity, rates)
-
-    stepped, _ = sampler.take_next_step(
-        current_samples=x_t,
-        reconstructed_samples=x0,
-        model_conditioning_inputs=(),
-        pred_noise=eps,
-        current_step=current_step,
-        state=RandomMarkovState(rng),
-        sample_model_fn=None,
-        next_step=next_step,
-    )
+    rates = broadcast_rates(process.schedule, t, x_t)
+    x0, eps = process.prediction.backward_diffusion(x_t, velocity, rates)
+    stepped, _ = solver.step(x_t, t, t_next, x0, eps, (), rng, process, None)
     expected = x_t + velocity * (0.6 - 0.8)
     assert jnp.max(jnp.abs(stepped - expected)) < 1e-5
 
@@ -194,7 +159,8 @@ class ToyVelocityMLP(nn.Module):
 
 
 def test_flow_matching_learns_a_two_mode_mixture():
-    schedule, sampling_schedule, transform = get_diffusion_preset('flow')
+    process = presets.Flow()()
+    schedule, transform = process.schedule, process.prediction
     model = ToyVelocityMLP()
     key = jax.random.PRNGKey(0)
     params = model.init(key, jnp.zeros((1, 1, 1, 3)), jnp.zeros((1,)))
@@ -202,39 +168,30 @@ def test_flow_matching_learns_a_two_mode_mixture():
     opt_state = optimizer.init(params)
 
     def loss_fn(params, x0, noise, steps):
-        rates = schedule.get_rates(steps, get_coeff_shapes_tuple(x0))
+        rates = broadcast_rates(schedule, steps, x0)
         x_t, c_in, target = transform.forward_diffusion(x0, noise, rates)
-        preds = model.apply(params, *schedule.transform_inputs(x_t * c_in, steps))
-        weights = schedule.get_weights(steps, get_coeff_shapes_tuple(x0))
+        preds = model.apply(params, x_t * c_in, schedule.model_time(steps))
+        weights = expand(process.weight(steps), x0)
         return jnp.mean(weights * (preds - target) ** 2)
 
     @jax.jit
-    def train_step(params, opt_state, rng_state):
-        rng_state, data_key = rng_state.get_random_key()
-        rng_state, noise_key = rng_state.get_random_key()
+    def train_step(params, opt_state, key):
+        data_key, noise_key, time_key = jax.random.split(key, 3)
         x0 = sample_mixture(data_key, 512)
         noise = jax.random.normal(noise_key, x0.shape)
-        steps, rng_state = schedule.generate_timesteps(512, rng_state)
+        steps = schedule.sample_t(time_key, 512)
         loss, grads = jax.value_and_grad(loss_fn)(params, x0, noise, steps)
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, rng_state, loss
+        return optax.apply_updates(params, updates), opt_state, loss
 
-    rng_state = RandomMarkovState(jax.random.PRNGKey(1))
-    for _ in range(1500):
-        params, opt_state, rng_state, loss = train_step(params, opt_state, rng_state)
+    run_key = jax.random.PRNGKey(1)
+    for step in range(1500):
+        params, opt_state, loss = train_step(params, opt_state, jax.random.fold_in(run_key, step))
     assert float(loss) < 1.0, "flow matching loss did not come down"
 
-    sampler = EulerSampler(
-        model=model,
-        noise_schedule=sampling_schedule,
-        model_output_transform=transform,
-        input_config=DiffusionInputConfig(sample_data_key="image", sample_data_shape=(1, 1, 3), conditions=[]),
-        guidance_scale=0.0,
-    )
-    samples = sampler.generate_samples(
-        params, num_samples=2048, resolution=1, diffusion_steps=64,
-        rngstate=RandomMarkovState(jax.random.PRNGKey(2)),
-    ).reshape(-1, 3)
+    denoise = process.denoiser(model, params, {})
+    x_T = process.noise(jax.random.PRNGKey(2), (2048, 1, 1, 3))
+    samples = sample(denoise, x_T, 64, solver=Euler(), key=jax.random.PRNGKey(3)).reshape(-1, 3)
 
     assignment = samples[:, 0] > 0
     fraction = float(jnp.mean(assignment))
