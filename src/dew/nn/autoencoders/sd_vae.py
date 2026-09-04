@@ -76,7 +76,7 @@ class StableDiffusionVAE(AutoEncoder):
         self.latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
         print(f"Latent shift: {self.latent_shift}, latent scale: {self.latent_scale}")
 
-        def encode_single_frame(images, rngkey: jax.random.PRNGKey = None):
+        def encode_single_frame(params, images, rngkey=None):
             latents = enc.apply({"params": params['encoder']}, images, deterministic=True)
             if quant_conv is not None:
                 latents = quant_conv.apply({"params": params['quant_conv']}, latents)
@@ -89,30 +89,26 @@ class StableDiffusionVAE(AutoEncoder):
                 latents, _ = jnp.split(latents, 2, axis=-1)
             return latents
 
-        def decode_single_frame(latents):
+        def decode_single_frame(params, latents):
             if post_quant_conv is not None:
                 latents = post_quant_conv.apply({"params": params['post_quant_conv']}, latents)
             return dec.apply({"params": params['decoder']}, latents)
-        
+
         self.encode_single_frame = jax.jit(encode_single_frame)
         self.decode_single_frame = jax.jit(decode_single_frame)
-        
-        # Calculate downscale factor by passing a dummy input through the encoder
-        print("Calculating downscale factor...")
+
+        # The latent geometry, from one frame through the encoder. It is the
+        # weights' own shape, so it is read here and not on every call.
         dummy_input = jnp.ones((1, 128, 128, config["in_channels"]), dtype=dtype)
-        dummy_latents = self.encode_single_frame(dummy_input)
-        _, h, w, c = dummy_latents.shape
-        _, H, W, C = dummy_input.shape
-        self.__downscale_factor__ = H // h
-        self.__latent_channels__ = c
-        print(f"Downscale factor: {self.__downscale_factor__}")
-        print(f"Latent channels: {self.__latent_channels__}")
+        dummy_latents = self.encode_single_frame(params, dummy_input)
+        self.__downscale_factor__ = dummy_input.shape[1] // dummy_latents.shape[1]
+        self.__latent_channels__ = dummy_latents.shape[-1]
 
-    def encode_batch(self, images, key=None):
-        return self.encode_single_frame(images, key)
+    def encode_batch(self, params, images, key=None):
+        return self.encode_single_frame(params, images, key)
 
-    def decode_batch(self, latents):
-        return self.decode_single_frame(latents)
+    def decode_batch(self, params, latents):
+        return self.decode_single_frame(params, latents)
 
     @property
     def downscale_factor(self) -> int:

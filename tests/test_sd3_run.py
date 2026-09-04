@@ -110,7 +110,7 @@ def test_one_trainer_step_and_a_sample(tmp_path):
     objective = config.build()
 
     variables = objective.init(jax.random.PRNGKey(0))
-    assert set(variables) == {"params", "encoders"}
+    assert set(variables) == {"params", "encoders", "autoencoder"}
     assert set(variables["encoders"]) == {"textcontext"}
 
     data = Dataset(train=batches(objective), val=None, records=None, batch=BATCH)
@@ -151,3 +151,33 @@ def test_the_frozen_text_tower_is_not_optimized(tmp_path):
     for before, after in zip(jax.tree.leaves(loaded), jax.tree.leaves(trained), strict=True):
         np.testing.assert_array_equal(np.asarray(after), np.asarray(before))
     assert objective.ema.select(("params",)) and not objective.ema.select(("encoders",))
+
+def test_the_compiled_step_carries_no_frozen_weights_as_constants(tmp_path):
+    """The T5 tower and the VAE reach the step as arguments the layout places,
+    not as constants baked into it.
+
+    A frozen tower that a closure read off the objective became a
+    compile-time constant: replicated on every device, absent from the
+    checkpoint, and invisible to the layout. The whole VAE encoder used to sit
+    in this jaxpr as 52 constants shaped like its kernels.
+    """
+    config = run_config(tmp_path)
+    objective = config.build()
+    variables = jax.eval_shape(objective.init, jax.random.PRNGKey(0))
+    encoder = objective.inputs.conditions["textcontext"].encoder
+    batch = {"image": jax.ShapeDtypeStruct((BATCH, RES, RES, 3), jnp.uint8),
+             "text": jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                  encoder.tokenize(PROMPTS))}
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+
+    closed = jax.make_jaxpr(lambda params, data: objective.loss(params, data, step)[0])(
+        variables, batch)
+    constants = {np.shape(const) for const in closed.consts}
+    # Kernels, not biases: a one-dimensional shape collides with the
+    # incidental constants a step carries, while a kernel's shape is the
+    # weight itself.
+    frozen = {np.shape(leaf) for leaf in
+              jax.tree.leaves(variables["autoencoder"]) + jax.tree.leaves(variables["encoders"])
+              if np.ndim(leaf) >= 2}
+    assert len(frozen) > 5, "the run has no frozen weights, so this proves nothing"
+    assert not (constants & frozen), sorted(constants & frozen)

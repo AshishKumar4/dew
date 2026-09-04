@@ -100,9 +100,10 @@ class SimpleAutoEncoder(AutoEncoder):
     bottleneck width, the two properties the samplers and input config read off
     an autoencoder (same contract as StableDiffusionVAE).
 
-    Like StableDiffusionVAE this owns its parameters, so `encode`/`decode` work
-    on a bare instance; unlike it, the weights start random. Train them (or pass
-    a trained tree as `params`) before the reconstructions mean anything. The
+    Like StableDiffusionVAE it loads a tree into `params` and takes the tree
+    to use on every call; unlike it, the weights start random. Train them (or
+    pass a trained tree as `params`) before the reconstructions mean
+    anything. The
     latent is deterministic: there is no KL bottleneck, so the encode `key` is
     accepted and ignored. Video comes free from the AutoEncoder base class,
     which flattens [B, T, H, W, C] to frames.
@@ -153,11 +154,11 @@ class SimpleAutoEncoder(AutoEncoder):
             params = self.init_params(key if key is not None else jax.random.PRNGKey(0))
         self.params = params
 
-        def encode_single_frame(images):
-            return self.encoder.apply({"params": self.params["encoder"]}, images)
+        def encode_single_frame(params, images):
+            return self.encoder.apply({"params": params["encoder"]}, images)
 
-        def decode_single_frame(latents):
-            return self.decoder.apply({"params": self.params["decoder"]}, latents)
+        def decode_single_frame(params, latents):
+            return self.decoder.apply({"params": params["decoder"]}, latents)
 
         self.encode_single_frame = jax.jit(encode_single_frame)
         self.decode_single_frame = jax.jit(decode_single_frame)
@@ -176,13 +177,13 @@ class SimpleAutoEncoder(AutoEncoder):
         decoder_params = self.decoder.init(decode_key, latent)["params"]
         return {"encoder": encoder_params, "decoder": decoder_params}
 
-    def encode_batch(self, images: jnp.ndarray, key=None) -> jnp.ndarray:
+    def encode_batch(self, params, images: jnp.ndarray, key=None) -> jnp.ndarray:
         """`key` is part of the AutoEncoder contract but unused: this encoder
         is deterministic."""
-        return self.encode_single_frame(images)
+        return self.encode_single_frame(params, images)
 
-    def decode_batch(self, latents: jnp.ndarray) -> jnp.ndarray:
-        return self.decode_single_frame(latents)
+    def decode_batch(self, params, latents: jnp.ndarray) -> jnp.ndarray:
+        return self.decode_single_frame(params, latents)
 
     @property
     def downscale_factor(self) -> int:
