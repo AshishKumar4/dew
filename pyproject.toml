@@ -74,6 +74,9 @@ typeCheckingMode = "standard"
 # Name the environment, or two people get two counts for the same tree.
 venvPath = "."
 venv = ".venv"
+# grain ships no py.typed, so its stubs live in stubs/: RandomMap.random_map
+# and MapDataset.__getitem__ as they really are, plus the used surface.
+stubPath = "stubs"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
