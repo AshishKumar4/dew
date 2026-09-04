@@ -25,6 +25,7 @@ DeepSeek points `config.head_dim`.
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from typing import Optional
 
 import jax
@@ -33,11 +34,11 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
-from dew.nn.backbones.causal_transformer import (
-    RMSNorm,
-    apply_rotary,
-    rotary_freqs,
-)
+# The norm and the rotary primitives live on the backbone, which imports the
+# mixers package, whose hub imports this module: a module reference, read at
+# build time, is what completes in either import order.
+from dew.nn.backbones import causal_transformer as backbone
+from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import logical_axes
 
 
@@ -141,7 +142,7 @@ def mla_rope_freqs(positions, head_dim: int, theta: float,
     embedding returns.
     """
     if yarn is None:
-        return rotary_freqs(positions, head_dim, theta)
+        return backbone.rotary_freqs(positions, head_dim, theta)
     inv_freq = yarn_inv_freq(head_dim, theta, yarn)
     positions = jnp.asarray(positions, jnp.float32)
     if positions.ndim == 1:
@@ -345,7 +346,7 @@ class SparseIndexer(nn.Module):
         what the reference's `update_indexer` ordering does.
         """
         k_rot, k_pass = jnp.split(keys, [self.rope_head_dim], axis=-1)
-        k_rot = apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
+        k_rot = backbone.apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
         return jnp.concatenate([k_rot[:, :, 0, :], k_pass], axis=-1)
 
     def select(self, hidden, q_resid, keys, freqs_cos, freqs_sin, mask):
@@ -364,7 +365,7 @@ class SparseIndexer(nn.Module):
             batch, length, self.n_heads, self.head_dim)
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
-            [apply_rotary(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+            [backbone.apply_rotary(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
         scores = jnp.matmul(
             query.astype(jnp.float32),
             jnp.expand_dims(keys.astype(jnp.float32).transpose(0, 2, 1), -3))
@@ -403,7 +404,10 @@ class MultiHeadLatentAttention(nn.Module):
     the mixer's `rope_theta` has to equal the record's, so the scaling is
     configured once, and the mscale reaches the logits as a query
     pre-scale. causal=False is full attention with no cache, the mode a
-    non-causal reader would take; decode=True raises there.
+    non-causal reader would take; decode=True raises there. The two latent
+    norms are the model's RMSNorm under the model's `scale_offset` and
+    `scale_after_cast`, since the reference builds them from the same class
+    as every other norm of the layer.
     """
 
     emb_features: int
@@ -419,6 +423,8 @@ class MultiHeadLatentAttention(nn.Module):
     rope_interleave: bool = True
     yarn: Optional[YarnScaling] = None
     norm_eps: float = 1e-6
+    scale_offset: bool = False
+    scale_after_cast: bool = False
     attention_bias: bool = False
     index_topk: Optional[int] = None
     index_n_heads: Optional[int] = None
@@ -451,6 +457,10 @@ class MultiHeadLatentAttention(nn.Module):
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
             precision=self.precision)
+        norm = functools.partial(
+            backbone.RMSNorm, epsilon=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
         if self.q_lora_rank is None:
             # The reference's plain q_proj takes no bias, whatever
             # attention_bias says; only the low-rank projections do.
@@ -459,15 +469,13 @@ class MultiHeadLatentAttention(nn.Module):
                 precision=self.precision, name='q_proj')
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
-            self.q_a_layernorm = RMSNorm(
-                epsilon=self.norm_eps, dtype=self.dtype, name='q_a_layernorm')
+            self.q_a_layernorm = norm(name='q_a_layernorm')
             self.q_b_proj = nn.Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
                 precision=self.precision, name='q_b_proj')
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
-        self.kv_a_layernorm = RMSNorm(
-            epsilon=self.norm_eps, dtype=self.dtype, name='kv_a_layernorm')
+        self.kv_a_layernorm = norm(name='kv_a_layernorm')
         self.kv_b_proj = nn.Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -518,7 +526,7 @@ class MultiHeadLatentAttention(nn.Module):
     def _rotate(self, part, freqs_cos, freqs_sin):
         if self.rope_interleave:
             return apply_rotary_interleave(part, freqs_cos, freqs_sin)
-        return apply_rotary(part, freqs_cos, freqs_sin)
+        return backbone.apply_rotary(part, freqs_cos, freqs_sin)
 
     def _expand(self, latent, rot):
         """Latent and rope head into per-head keys and values."""
@@ -648,3 +656,82 @@ class MultiHeadLatentAttention(nn.Module):
             jnp.arange(batch)[:, None, None],
             queries[None, :, None], chosen].set(True)
         return jnp.logical_and(keep, selected[:, None])
+
+
+@mixers("mla")
+@dataclasses.dataclass(frozen=True)
+class MLAMixer(MixerBase):
+    """The `mla` kind: DeepSeek's latent attention under the reference's names.
+
+    A config names it as `mixer={"kind": "mla", ...}` with the fields of a
+    DeepSeek config.json, so translation renames nothing; `yarn` is the
+    rope-scaling record (or None for plain rope), and the three index fields
+    together turn on the V3.2 sparse indexer (None is dense MLA). The rope
+    base is the model's `rope_theta`, transformed by the yarn ramp rather
+    than replaced, so scaling is configured once; the mscale lives in the
+    attention as a query pre-scale, not in the rope.
+
+    The context's grouped-query geometry (`num_kv_heads`, `head_dim`) has
+    no meaning here and is not read, as the backbone documents; `qk_norm` is
+    not read either, since the latent norms are the design's own and always
+    present. The dials a standard attention would honour and this cannot
+    (a values norm, KV sharing, a window, an attention scale, a partial
+    rotary) refuse rather than drop silently.
+    """
+
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    rope_interleave: bool = True
+    yarn: Optional[YarnScaling] = None
+    index_topk: Optional[int] = None
+    index_n_heads: Optional[int] = None
+    index_head_dim: Optional[int] = None
+
+    def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
+        unsupported = {
+            "v_norm": ctx.v_norm,
+            "kv_shared": ctx.kv_shared,
+            "sliding_window": ctx.sliding_window,
+            "attention_scale": ctx.attention_scale,
+            "partial_rotary_factor": ctx.partial_rotary_factor,
+        }
+        asked = sorted(name for name, value in unsupported.items() if value)
+        if asked:
+            raise ValueError(
+                f"the mla mixer has no {', '.join(asked)}: the latent "
+                "attention scales by its head dims and the yarn mscale, "
+                "rotates its rope head whole, attends the whole sequence "
+                "and norms its latents, not its values")
+        if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
+            raise ValueError(
+                f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
+                f"the layer's ({ctx.rope_theta}) disagree; the rope base is "
+                "configured once, on the model")
+        return functools.partial(
+            MultiHeadLatentAttention,
+            emb_features=ctx.emb_features,
+            num_heads=ctx.num_heads,
+            max_seq_len=ctx.max_seq_len,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            causal=ctx.causal,
+            rope_theta=ctx.rope_theta,
+            rope_interleave=self.rope_interleave,
+            yarn=self.yarn,
+            norm_eps=ctx.norm_eps,
+            scale_offset=ctx.scale_offset,
+            scale_after_cast=ctx.scale_after_cast,
+            attention_bias=ctx.attention_bias,
+            index_topk=self.index_topk,
+            index_n_heads=self.index_n_heads,
+            index_head_dim=self.index_head_dim,
+            dtype=ctx.dtype,
+            precision=ctx.precision,
+            attention_impl=ctx.attention_impl,
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax)

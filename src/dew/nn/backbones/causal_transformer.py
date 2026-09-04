@@ -87,9 +87,18 @@ class Mixture:
     is what Qwen3-MoE's decoder_sparse_step means; neither makes every layer
     sparse, which is Mixtral.
 
-    The routing options are `Router`'s: `score_function` softmax or sigmoid,
-    `scaling` on the routed output, `groups` with `groups_per_token` for
-    DeepSeek's node limit, and `bias` for its aux-loss-free balancing bias.
+    The routing options are `Router`'s: `score_function` softmax, sigmoid or
+    sqrtsoftplus, `scaling` on the routed output, `groups` with
+    `groups_per_token` for DeepSeek's node limit, and `bias` for its
+    aux-loss-free balancing bias.
+
+    `expert_features` is the routed experts' width, None for the model's
+    `mlp_features`; DeepSeek sizes its experts apart from its dense layers
+    (`moe_intermediate_size` beside `intermediate_size`). `shared_features`
+    is the width of the one dense gated MLP every token takes beside the
+    routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
+    as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
+    product is the whole record of them.
     """
 
     experts: int
@@ -101,6 +110,8 @@ class Mixture:
     groups: int = 1
     groups_per_token: int = 1
     bias: bool = False
+    expert_features: Optional[int] = None
+    shared_features: int = 0
 
     def __post_init__(self):
         if self.layers is not None:
@@ -115,6 +126,14 @@ class Mixture:
                 "sparse layers, so only one of them can be set")
         if self.every is not None and self.every < 1:
             raise ValueError(f"every must be positive, got {self.every}")
+        if self.expert_features is not None and self.expert_features < 1:
+            raise ValueError(
+                f"expert_features is the routed experts' width, got "
+                f"{self.expert_features}; None takes the model's mlp_features")
+        if self.shared_features < 0:
+            raise ValueError(
+                f"shared_features is the shared branch's width, got "
+                f"{self.shared_features}; 0 is a layer without one")
 
 
 class RMSNorm(nn.Module):
@@ -800,11 +819,24 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
         mixture = self.mixture
+        # The shared branch is the dense feed-forward at the mixture's shared
+        # width, handed to the sparse layer as a factory the way the block
+        # takes its own slots.
+        shared = None if mixture is None or not mixture.shared_features else (
+            functools.partial(
+                GatedMLP,
+                hidden_features=mixture.shared_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                dtype=self.dtype,
+                precision=self.precision))
         routed = None if mixture is None else functools.partial(
             SparseMLP,
             num_experts=mixture.experts,
             top_k=mixture.top_k,
-            hidden_features=self.hidden_features,
+            hidden_features=(self.hidden_features
+                             if mixture.expert_features is None
+                             else mixture.expert_features),
             out_features=self.emb_features,
             activation=self.mlp,
             score_function=mixture.score_function,
@@ -812,6 +844,7 @@ class CausalTransformer(nn.Module):
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
             expert_bias=mixture.bias,
+            shared=shared,
             dtype=self.dtype,
             precision=self.precision)
         # None is today's attention; a kind value builds every layer's mixer

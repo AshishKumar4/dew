@@ -155,3 +155,8 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
             f"mixer {kind!r} built {type(built).__name__}, which is not a "
             "mixer value")
     return built
+
+
+# The kind modules register where they are defined; this hub imports them,
+# one line per kind module, alphabetical.
+from .. import mla
