@@ -19,7 +19,7 @@ names has to match its signature. That is what a markdown block gets for free
 by being run, and without it a notebook keeps naming a symbol the library
 deleted until a reader finds out.
 
-The eight tutorials on the pre-registry API are named in `PENDING` and their
+The seven tutorials on the pre-registry API are named in `PENDING` and their
 check is a strict xfail, so the marker erases itself: the first notebook
 ported to the built API fails as an unexpected pass until its name comes off
 the list, and a new notebook is checked from the day it is added.
@@ -45,8 +45,8 @@ FILES = [ROOT / "README.md",
 BLOCK = re.compile(r"```python\n(.*?)```", re.S)
 NOTEBOOKS = sorted((ROOT / "tutorials").glob("*.ipynb"))
 PENDING = (
-    # Written against the pre-registry API (ObjectiveTrainer, build_model, the
-    # sampler classes, the input configs) and parked for a rewrite, not a port.
+    # Written against the pre-registry API, down to the trainer, the model
+    # builder and the sampler classes, and parked for a rewrite, not a port.
     # 01 is not here: it builds diffusion from scratch and names no dew symbol,
     # so it is checked like any other notebook.
     "02-train-a-diffusion-model.ipynb",
