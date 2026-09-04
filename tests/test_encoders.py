@@ -140,3 +140,17 @@ def test_the_text_encoder_hands_the_model_its_mask():
     # BOS, four word pieces, EOS for the prompt; BOS and EOS for the empty one
     assert int(context.mask[1].sum()) == 2
     assert int(context.mask[0].sum()) > 2
+
+
+def test_two_conditions_cannot_share_one_batch_field():
+    """The objective reads batch[condition.field] under each keyword, so two
+    conditions on one field would tokenize twice into one key and the second
+    writing would win. A run with two text towers names a field per tower."""
+    from dew.inputs import CharTable
+
+    conditions = {
+        "clip": Condition(CharTable.from_pretrained(seed=0), field="text"),
+        "t5": Condition(CharTable.from_pretrained(seed=1), field="text"),
+    }
+    with pytest.raises(ValueError, match="field"):
+        InputSpec(sample=Field("image", (8, 8, 3)), conditions=conditions)
