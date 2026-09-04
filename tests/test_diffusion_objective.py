@@ -37,8 +37,8 @@ VOCAB = 11
 @dataclass(frozen=True, eq=False)
 class StubText(ConditionEncoder):
     """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
-    ids by character, encode looks them up. Small, and shaped like CLIP's
-    output, so the models' text keyword takes it."""
+    ids by character behind a start token, encode looks them up. Small, and
+    shaped like CLIP's output, so the models' text keyword takes it."""
 
     params: dict
 
@@ -51,7 +51,7 @@ class StubText(ConditionEncoder):
         ids = np.zeros((len(texts), TOKENS), np.int32)
         mask = np.zeros((len(texts), TOKENS), np.int32)
         for row, text in enumerate(texts):
-            codes = [1 + (ord(char) % (VOCAB - 1)) for char in text[:TOKENS]]
+            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1
         return {"input_ids": ids, "attention_mask": mask}
@@ -61,7 +61,7 @@ class StubText(ConditionEncoder):
                            mask=jnp.asarray(tokens["attention_mask"]))
 
     def captions(self, tokens):
-        return tuple("".join(chr(97 + int(i)) for i in row[row > 0])
+        return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
     def to_json(self):
@@ -179,9 +179,10 @@ def test_evaluate_samples_from_the_batch_conditions():
     assert isinstance(artifact, ImageGrid)
     assert artifact.images.shape == (VALIDATION_SAMPLES, RES, RES, 3)
     assert float(artifact.images.min()) >= -1.0 and float(artifact.images.max()) <= 1.0
-    assert artifact.captions == ("abird"[:TOKENS] if False else objective.inputs.conditions["textcontext"].encoder.captions(
-        {"input_ids": batch["text"]["input_ids"][:VALIDATION_SAMPLES]}))
-    assert len(artifact.captions) == VALIDATION_SAMPLES
+    encoder = objective.inputs.conditions["textcontext"].encoder
+    assert artifact.captions == encoder.captions(
+        {"input_ids": batch["text"]["input_ids"][:VALIDATION_SAMPLES]})
+    assert len(artifact.captions) == VALIDATION_SAMPLES and artifact.captions[2] == ""
 
 
 def test_validation_samples_follow_the_step_key():
@@ -198,7 +199,7 @@ def test_validation_samples_follow_the_step_key():
     assert jnp.array_equal(objective.evaluate(params, batch, again).images, images)
     assert not jnp.allclose(objective.evaluate(params, batch, later).images, images)
 
-    averaged = jax.tree.map(lambda leaf: leaf * 0.5, params)
+    averaged = jax.tree.map(lambda leaf: leaf + 0.1, params)
     with_ema = Step(step=jnp.asarray(5), key=jax.random.PRNGKey(2), ema=averaged)
     assert not jnp.allclose(objective.evaluate(params, batch, with_ema).images, images)
     assert jnp.array_equal(objective.evaluate(params, batch, with_ema).images,
@@ -254,4 +255,7 @@ def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
                            objective.inputs.conditions["textcontext"].encoder.params["table"])
 
 
-GOLDEN = {"params": None, "ema": None, "opt_state": None}
+# Captured on one CPU at c0f4156 (JAX_PLATFORMS=cpu, the eight simulated
+# devices of conftest move the third figure after the decimal point by 2e-9).
+GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
+          "opt_state": 2.391809580367163}
