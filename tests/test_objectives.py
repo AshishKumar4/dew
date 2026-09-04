@@ -26,7 +26,8 @@ def test_under_selects_a_prefix_and_everything_selects_all():
 
 def test_select_keeps_the_nesting_of_what_it_keeps():
     selected = select(tree(), under("params", "encoder"))
-    assert selected == {"params": {"encoder": {"w": tree()["params"]["encoder"]["w"]}}}
+    assert jax.tree.structure(selected) == jax.tree.structure({"params": {"encoder": {"w": 0}}})
+    np.testing.assert_array_equal(selected["params"]["encoder"]["w"], 1.0)
     assert set(select(tree(), everything)) == {"params", "stats"}
 
 
