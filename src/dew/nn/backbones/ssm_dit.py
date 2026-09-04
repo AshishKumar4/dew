@@ -17,10 +17,18 @@ from ..vit import RotaryEmbedding
 from dew.registry import models
 
 
+DEFAULT_SSM_RATIO = "3:1"
+
+
 @models("hybrid_dit")
 class HybridSSMAttentionDiT(nn.Module):
-    """DiT that interleaves SSM blocks with attention blocks in a configurable ratio.
-    block_pattern (e.g. ['ssm','ssm','ssm','attn']) overrides ssm_attention_ratio ('3:1').
+    """DiT that interleaves SSM blocks with attention blocks.
+
+    The mixer of every layer comes from `ssm_attention_ratio`, a shorthand
+    that reads the same at any depth ("3:1", "all-ssm"), or from
+    `block_pattern`, which names each layer. Setting both is refused: the
+    pattern used to win in silence, so a run that set the ratio too was
+    training something other than what it said.
     """
     output_channels: int = 3
     patch_size: int = 16
@@ -39,12 +47,16 @@ class HybridSSMAttentionDiT(nn.Module):
     remat: bool = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     block_pattern: Optional[Sequence[str]] = None  # e.g., ['ssm','ssm','ssm','attn']
-    ssm_attention_ratio: str = "3:1"  # e.g., "3:1", "1:1", "all-ssm", "all-attn"
+    ssm_attention_ratio: str = DEFAULT_SSM_RATIO  # "3:1", "1:1", "all-ssm", "all-attn"
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
 
     def setup(self):
+        if self.block_pattern is not None and self.ssm_attention_ratio != DEFAULT_SSM_RATIO:
+            raise ValueError(
+                f"block_pattern names every layer's mixer and ssm_attention_ratio "
+                f"{self.ssm_attention_ratio!r} names them by ratio; set one, not both")
         self.embed = PatchSequenceEmbed(
             patch_size=self.patch_size,
             emb_features=self.emb_features,

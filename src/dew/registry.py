@@ -230,9 +230,11 @@ def with_precision(name: str, config: Mapping[str, Any], *,
               "attention_impl": None if attention_impl == "reference" else attention_impl}
     stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
+        precise = {"dtype": dtype, "force_fp32_for_softmax": True}
         fields["attention_configs"] = [
             None if stage is None
-            else {**stage, "dtype": dtype, "force_fp32_for_softmax": True}
+            else {**stage, **precise} if isinstance(stage, Mapping)
+            else dataclasses.replace(stage, **precise)
             for stage in config.get("attention_configs", stages.default)]
     return fields
 
