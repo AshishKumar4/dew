@@ -16,10 +16,9 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 
-from dew.artifacts import ImageGrid, VideoGrid
+from dew.artifacts import ImageGrid, VideoGrid, host
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -163,14 +162,19 @@ class DiffusionObjective(Objective):
 
     def evaluate(self, params, batch, step: Step):
         """`VALIDATION_SAMPLES` samples from the batch's conditions, with the
-        averaged weights when the run keeps them, seeded by the step's key."""
+        averaged weights when the run keeps them, seeded by the step's key.
+
+        The captions are decoded on the host, so the tokens come home first:
+        on a pool the batch is a global array this process holds one shard of,
+        and the gather is a collective every process makes here.
+        """
         params = params if step.ema is None else step.ema
         count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
         tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
                   for keyword, condition in self.inputs.conditions.items()}
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
-            captions = condition.encoder.captions(jax.tree.map(np.asarray, tokens[keyword]))
+            captions = condition.encoder.captions(host(tokens[keyword]))
             if captions:
                 break
         samples = self._sample(params, tokens, step.key, count=count)

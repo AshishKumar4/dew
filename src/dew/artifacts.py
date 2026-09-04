@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from flax import struct
 import jax
+import numpy as np
 
 
 @struct.dataclass
@@ -58,3 +59,27 @@ class TokenScores:
 # every pass and TextSamples when samples are configured.
 Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
 Artifacts = Artifact | tuple[Artifact, ...]
+
+
+def _addressable(leaf):
+    """`leaf` as numpy, gathering it across the pool when it is a global
+    array this process holds only a shard of."""
+    if getattr(leaf, "is_fully_addressable", True):
+        return np.asarray(leaf)
+    from jax.experimental import multihost_utils
+
+    return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
+
+
+def host(value):
+    """An artifact whose arrays are host-local numpy.
+
+    Scoring and drawing happen on the host: a metric reads the arrays with
+    numpy, a tracker draws them. On one process that is a device transfer. On
+    a pool the arrays are shards of a global array, which numpy cannot read at
+    all, and the gather that completes them is a collective, so every process
+    has to make the same call. That is why the trainer brings an artifact home
+    once for the whole pool instead of leaving it to a metric or a tracker,
+    which run on one process.
+    """
+    return jax.tree.map(_addressable, value)
