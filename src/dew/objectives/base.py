@@ -149,6 +149,8 @@ class Metric(Protocol):
 
     def __call__(self, artifact: Any, batch: Batch) -> Any:
         """One batch's measurement, whatever `reduce` needs of it."""
+        ...
 
     def reduce(self, values: Sequence[Any]) -> float:
         """The pass's value from every batch's measurement."""
+        ...
