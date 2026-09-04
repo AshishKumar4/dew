@@ -437,7 +437,7 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
         sampler=pygrain.IndexSampler(num_records=64, shuffle=False, seed=0, num_epochs=1,
                                      shard_options=pygrain.NoSharding()),
         operations=[pygrain.Batch(jax.device_count(), drop_remainder=True)],
-        loading=Loading(workers=0),
+        worker_count=0,
     )
     mesh = build_mesh()
     it = DevicePrefetchIterator(iter(loader), batch_sharding(mesh), depth=2)
@@ -742,7 +742,7 @@ def grain_image_loader(num_records=256):
         sampler=pygrain.IndexSampler(num_records=num_records, shuffle=False, seed=0,
                                      num_epochs=4, shard_options=pygrain.NoSharding()),
         operations=[ToImage(), pygrain.Batch(BATCH, drop_remainder=True)],
-        loading=Loading(workers=0),
+        worker_count=0,
     ))
 
 
