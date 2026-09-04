@@ -139,7 +139,9 @@ def test_ddpm_step_is_the_vp_posterior(t, s):
 
     actual, _ = DDPM().step(alpha_t * x0 + sigma_t * eps, ones * t, ones * s, x0, eps, (),
                             key, process, None)
-    assert jnp.allclose(actual, expected, atol=1e-6)
+    # The closed form and the step group the same products differently; an
+    # RTX 4080 puts them 2.6e-6 apart at the adjacent step, a CPU 1e-7.
+    assert jnp.allclose(actual, expected, atol=1e-5)
 
 
 def test_ddim_eta_converges():

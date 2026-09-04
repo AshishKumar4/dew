@@ -14,9 +14,9 @@ from dew.diffusion.transforms import (
     DirectPredictionTransform,
     VPredictionTransform,
     KarrasPredictionTransform,
+    broadcast_rates,
 )
 from dew.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
-from dew.diffusion.schedules.common import get_coeff_shapes_tuple
 
 TRANSFORMS = [
     ("epsilon", EpsilonPredictionTransform()),
@@ -26,7 +26,7 @@ TRANSFORMS = [
 ]
 SCHEDULES = [
     ("cosine", CosineNoiseScheduler(1000), jnp.array([10, 300, 600, 900])),
-    ("karras_ve", KarrasVENoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5), jnp.array([0.2, 0.4, 0.6, 0.8])),
+    ("karras_ve", KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5), jnp.array([0.2, 0.4, 0.6, 0.8])),
 ]
 
 
@@ -37,7 +37,7 @@ def test_forward_backward_roundtrip(tname, transform, sname, schedule, steps, rn
     # one timestep per batch element
     x0 = jax.random.normal(key0, (4, 8, 8, 3))
     noise = jax.random.normal(key1, (4, 8, 8, 3))
-    rates = schedule.get_rates(steps, get_coeff_shapes_tuple(x0))
+    rates = broadcast_rates(schedule, steps, x0)
 
     xt, c_in, target = transform.forward_diffusion(x0, noise, rates)
     # A model that outputs the exact target must recover x0 and noise
@@ -50,9 +50,9 @@ def test_forward_backward_roundtrip(tname, transform, sname, schedule, steps, rn
 def test_karras_preconditioning_matches_paper(rng):
     """c_in, c_skip and c_out must match Karras et al. 2022 Table 1."""
     transform = KarrasPredictionTransform(sigma_data=0.5)
-    schedule = KarrasVENoiseScheduler(1, sigma_max=80, rho=7, sigma_data=0.5)
+    schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
     steps = jnp.array([0.3])
-    rates = schedule.get_rates(steps, (-1, 1, 1, 1))
+    rates = broadcast_rates(schedule, steps, jnp.zeros((1, 8, 8, 3)))
     _, sigma = rates
     sd = 0.5
 
