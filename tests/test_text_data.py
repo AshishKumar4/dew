@@ -818,7 +818,7 @@ def _counted_cross_entropy(batch, seq_len):
     live inside one document, which is every target a packed row owns.
     """
     model = _tiny_backbone(seq_len)
-    objective = LMObjective(model, seq_len, vocab_size=64)
+    objective = LMObjective(model, seq_len)
     params = objective.init_params(jax.random.PRNGKey(0))
     tokens = jnp.asarray(batch["text"], jnp.int32)
     segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
