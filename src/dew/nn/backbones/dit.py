@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional
+from typing import Optional, Literal
 from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
@@ -8,8 +8,10 @@ from ..dit import (
     ModulatedBlock, remat_block, neutralized_rope_freqs,
 )
 from ..vit import RotaryEmbedding
+from dew.registry import models
 
 
+@models("simple_dit")
 class SimpleDiT(nn.Module):
     """Standard DiT: a plain stack of adaLN-Zero attention blocks."""
     output_channels: int = 3
@@ -26,14 +28,8 @@ class SimpleDiT(nn.Module):
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
-    use_hilbert: bool = False
-    use_zigzag: bool = False
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
-    @property
-    def scan_order(self):
-        assert not (self.use_hilbert and self.use_zigzag), \
-            "use_hilbert and use_zigzag are mutually exclusive"
-        return 'hilbert' if self.use_hilbert else 'zigzag' if self.use_zigzag else 'raster'
 
     def setup(self):
         self.embed = PatchSequenceEmbed(

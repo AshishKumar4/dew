@@ -1,183 +1,173 @@
-"""Single source of truth for architecture names and model construction.
+"""Names for the things a run is made of.
 
-Both training.py and the inference pipeline build models through here, so a
-config logged at training time always reconstructs the same model at
-inference time. Architecture names may carry +2d/+hilbert/+zigzag suffixes;
-they canonicalize to the base architecture plus the matching config flags.
+One `Registry` per kind: `models`, `presets`, `samplers`, `datasets`,
+`encoders`, `metrics`, `objectives`. A registry is a decorator, a mapping and
+an attribute view over the same table, so `models["simple_dit"]`,
+`models.SimpleDiT` and the class are one object. A name or a field the table
+does not know raises; nothing is dropped or guessed.
+
+The registries are empty at import. Each member registers itself where it is
+defined, so importing a package fills its table and the registry module
+imports none of them.
 """
 
-import dataclasses
+from __future__ import annotations
 
-import jax
+import dataclasses
+from collections.abc import Iterator, Mapping
+from typing import Any, Callable, Generic, TypeVar, Union
+
 import jax.numpy as jnp
 
-from dew.nn.backbones.unet import Unet
-from dew.nn.backbones.uvit import UViT, SimpleUDiT
-from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.backbones.mmdit import SimpleMMDiT, HierarchicalMMDiT
-from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
-from dew.nn.backbones.video_dit import VideoDiT
-from dew.nn.backbones.unet3d import UNet3D
-from dew.nn.backbones.jepa import JepaEncoder, JepaVideoEncoder, JepaPredictor
-from dew.nn.backbones.causal_transformer import CausalTransformer
-
-MODEL_REGISTRY = {
-    'unet': Unet,
-    'uvit': UViT,
-    'simple_udit': SimpleUDiT,
-    'simple_dit': SimpleDiT,
-    'simple_mmdit': SimpleMMDiT,
-    'hierarchical_mmdit': HierarchicalMMDiT,
-    'hybrid_dit': HybridSSMAttentionDiT,
-    'video_dit': VideoDiT,
-    'unet_3d': UNet3D,
-    'jepa_encoder': JepaEncoder,
-    'jepa_video_encoder': JepaVideoEncoder,
-    'jepa_predictor': JepaPredictor,
-    'causal_transformer': CausalTransformer,
-    # The same decoder with experts: num_experts and top_k, and moe_every or
-    # moe_layers for which layers route (dew/nn/moe.py).
-    'moe': CausalTransformer,
-}
-
-ARCHITECTURE_SUFFIX_FLAGS = {
-    '+2d': 'use_2d_fusion',
-    '+hilbert': 'use_hilbert',
-    '+zigzag': 'use_zigzag',
-}
-
-DTYPE_MAP = {
-    'bfloat16': jnp.bfloat16,
-    'float32': jnp.float32,
-    'jax.numpy.float32': jnp.float32,
-    'jax.numpy.bfloat16': jnp.bfloat16,
-    'None': None,
-    None: None,
-}
-
-PRECISION_MAP = {
-    'high': jax.lax.Precision.HIGH,
-    'HIGH': jax.lax.Precision.HIGH,
-    'default': jax.lax.Precision.DEFAULT,
-    'DEFAULT': jax.lax.Precision.DEFAULT,
-    'highest': jax.lax.Precision.HIGHEST,
-    'HIGHEST': jax.lax.Precision.HIGHEST,
-    'None': None,
-    None: None,
-}
-
-ACTIVATION_MAP = {
-    'swish': jax.nn.swish,
-    'silu': jax.nn.silu,
-    'mish': jax.nn.mish,
-    'gelu': jax.nn.gelu,
-    'relu': jax.nn.relu,
-}
+T = TypeVar("T")
 
 
-def canonicalize_architecture(architecture: str) -> tuple[str, dict]:
-    """Strip +2d/+hilbert/+zigzag suffixes into their matching config flags."""
-    flags = {}
-    canonical = architecture
-    for suffix, flag in ARCHITECTURE_SUFFIX_FLAGS.items():
-        if suffix in canonical:
-            canonical = canonical.replace(suffix, '')
-            flags[flag] = True
-    return canonical, flags
+class Registry(Mapping[str, T], Generic[T]):
+    """Names for one kind of thing: a decorator, a mapping and an attribute view."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self._members: dict[str, T] = {}
+
+    def __call__(self, name: str, /) -> Callable[[T], T]:
+        """`@models("simple_dit")` on the class it names."""
+        if not isinstance(name, str) or not name:
+            raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
+
+        def register(member: T) -> T:
+            held = self._members.get(name)
+            if held is not None and held is not member:
+                raise ValueError(
+                    f"{self.kind} {name!r} is already {_describe(held)}; "
+                    f"a name maps to one {self.kind}")
+            self._members[name] = member
+            return member
+
+        return register
+
+    def __getitem__(self, name: str) -> T:
+        try:
+            return self._members[name]
+        except KeyError:
+            raise KeyError(
+                f"no {self.kind} named {name!r}; known: {', '.join(sorted(self._members))}"
+            ) from None
+
+    def __getattr__(self, attr: str) -> T:
+        """`models.SimpleDiT`: the member whose class name is `attr`."""
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        for member in self._members.values():
+            if getattr(member, "__name__", None) == attr:
+                return member
+        raise AttributeError(
+            f"no {self.kind} is called {attr!r}; known: "
+            f"{', '.join(sorted(_describe(m) for m in self._members.values()))}")
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._members)
+
+    def __len__(self) -> int:
+        return len(self._members)
+
+    def __repr__(self) -> str:
+        return f"Registry({self.kind!r}, {sorted(self._members)})"
+
+    def name_of(self, member: T) -> str:
+        """The name a member was registered under."""
+        for name, held in self._members.items():
+            if held is member:
+                return name
+        raise KeyError(f"{_describe(member)} is not a registered {self.kind}")
+
+    def build(self, name: str, /, **fields: Any) -> Any:
+        """Construct the member called `name` from keyword fields.
+
+        A field the member has no declaration for is an error, since dropping
+        it would build something other than what was asked for. Fields arrive
+        from JSON as often as from code, so a `dtype` given as a string is
+        resolved here, at the one boundary where a logged config becomes an
+        object.
+        """
+        member = self[name]
+        if dataclasses.is_dataclass(member):
+            declared = {f.name for f in dataclasses.fields(member) if f.init}
+            unknown = sorted(set(fields) - declared)
+            if unknown:
+                raise ValueError(
+                    f"{self.kind} {name!r} ({_describe(member)}) has no field for "
+                    f"{unknown}; its fields are {sorted(declared)}")
+            if "dtype" in fields:
+                fields["dtype"] = resolve_dtype(fields["dtype"])
+        return member(**fields)
+
+    @property
+    def union(self) -> Any:
+        """`Union[...]` of the members, for a tyro subcommand over the table."""
+        members = tuple(self._members.values())
+        if not members:
+            raise ValueError(f"the {self.kind} registry is empty")
+        return Union[members] if len(members) > 1 else members[0]
 
 
-def map_config_strings(config: dict):
-    """Convert the string leaves of a logged config back to objects.
+def _describe(member: Any) -> str:
+    return getattr(member, "__name__", repr(member))
 
-    dtypes, precisions and activations are stored as strings in the wandb
-    config; function paths like 'jax.nn.mish' (or the 'jax._src.nn.functions.*'
-    that older configs contain) resolve by attribute walk.
+
+_DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
+
+
+def resolve_dtype(value: Any) -> Any:
+    """A dtype as a module field: a jnp dtype, one of its names, or None."""
+    if value is None or not isinstance(value, str):
+        return value
+    try:
+        return _DTYPES[value]
+    except KeyError:
+        raise ValueError(
+            f"dtype {value!r} is not one of {sorted(_DTYPES)}") from None
+
+
+def dtype_name(value: Any) -> str | None:
+    """The name `resolve_dtype` accepts for a dtype, for a logged config."""
+    if value is None:
+        return None
+    for name, dtype in _DTYPES.items():
+        if jnp.dtype(value) == jnp.dtype(dtype):
+            return name
+    raise ValueError(f"{value!r} is not a dtype a config can name")
+
+
+def with_precision(name: str, config: Mapping[str, Any], *,
+                   dtype: str, attention_impl: str) -> dict[str, Any]:
+    """A model config with the run's compute dtype and attention kernel in it.
+
+    Params stay float32 whatever `dtype` says; it is the compute dtype. The
+    UNets keep per-stage attention settings in nested `attention_configs`,
+    which do not inherit the model dtype and default `force_fp32_for_softmax`
+    off, which no fused kernel can honour, so the knobs reach into them.
     """
-    if isinstance(config, dict):
-        return {k: map_config_strings(v) for k, v in config.items()}
-    if isinstance(config, list):
-        return [map_config_strings(v) for v in config]
-    if isinstance(config, str):
-        if config in DTYPE_MAP:
-            return DTYPE_MAP[config]
-        if config in PRECISION_MAP:
-            return PRECISION_MAP[config]
-        if config in ACTIVATION_MAP:
-            return ACTIVATION_MAP[config]
-        if config == 'None':
-            return None
-        if config.startswith('jax.') or config.startswith('jax._src.'):
-            attr_path = config.replace('jax._src.nn.functions', 'jax.nn')
-            obj = jax
-            for part in attr_path.split('.')[1:]:
-                obj = getattr(obj, part)
-            return obj
-    return config
-
-
-def apply_precision_policy(architecture: str, config: dict, *,
-                           dtype: str, attention_impl: str) -> dict:
-    """Write a run's compute dtype and attention kernel into a model config.
-
-    The two knobs live on --model.dtype and --model.attention-impl and land
-    here, so the config a run logs is the config it ran. Values stay strings
-    for map_config_strings to resolve; 'reference' is the reference kernel,
-    which the modules spell as None. Params are unaffected: they stay float32.
-
-    The UNets keep per-stage attention settings in nested attention_configs
-    dicts, which do not inherit the model dtype (a missing or None dtype there
-    computes attention in fp32) and whose force_fp32_for_softmax defaults to
-    False, which no fused kernel can honor. So the policy reaches into them.
-    """
-    duplicate = sorted(set(config) & {'dtype', 'attention_impl'})
+    duplicate = sorted(set(config) & {"dtype", "attention_impl"})
     if duplicate:
         raise ValueError(
-            f"--model.config carries {duplicate}, which the precision policy "
-            "owns. Set --model.dtype and --model.attention-impl instead.")
-
-    canonical, _ = canonicalize_architecture(architecture)
-    model_class = MODEL_REGISTRY.get(canonical)
-    if model_class is None:
-        # third-party wrappers take a compute dtype and expose no attention seam
-        return {**config, 'dtype': dtype}
-
-    kwargs = {**config, 'dtype': dtype,
-              'attention_impl': None if attention_impl == 'reference' else attention_impl}
-    stages = {f.name: f for f in dataclasses.fields(model_class)}.get('attention_configs')
+            f"the model config carries {duplicate}, which the run's precision "
+            "settings own; set --model.dtype and --model.attention-impl instead")
+    member = models[name]
+    fields = {**config, "dtype": dtype,
+              "attention_impl": None if attention_impl == "reference" else attention_impl}
+    stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
-        kwargs['attention_configs'] = [
+        fields["attention_configs"] = [
             None if stage is None
-            else {**stage, 'dtype': dtype, 'force_fp32_for_softmax': True}
-            for stage in config.get('attention_configs', stages.default)]
-    return kwargs
+            else {**stage, "dtype": dtype, "force_fp32_for_softmax": True}
+            for stage in config.get("attention_configs", stages.default)]
+    return fields
 
 
-def build_model(architecture: str, config: dict):
-    """Construct a model from an architecture name and a plain config dict.
-
-    A key the model has no field for is an error, since dropping it would
-    build a model other than the one the config describes.
-    """
-    canonical, flags = canonicalize_architecture(architecture)
-
-    if canonical == 'diffusers_unet_simple':
-        # Third-party linen model, kept behind a lazy import and the BCHW seam
-        from diffusers import FlaxUNet2DConditionModel
-        from dew.nn.backbones.wrappers import BCHWModelWrapper
-        return BCHWModelWrapper(FlaxUNet2DConditionModel(**map_config_strings(config)))
-
-    model_class = MODEL_REGISTRY.get(canonical)
-    if model_class is None:
-        raise ValueError(
-            f"Unknown architecture: {architecture}. "
-            f"Supported: {', '.join(MODEL_REGISTRY.keys())}")
-
-    kwargs = {**map_config_strings(config), **flags}
-    valid_fields = sorted(f.name for f in dataclasses.fields(model_class))
-    unknown = sorted(set(kwargs) - set(valid_fields))
-    if unknown:
-        raise ValueError(
-            f"{model_class.__name__} has no field for {unknown}. "
-            f"Accepted fields: {valid_fields}")
-
-    return model_class(**kwargs)
+models: Registry[type] = Registry("model")
+presets: Registry[type] = Registry("preset")
+samplers: Registry[type] = Registry("sampler")
+datasets: Registry[type] = Registry("dataset")
+encoders: Registry[type] = Registry("encoder")
+metrics: Registry[Callable[..., Any]] = Registry("metric")
+objectives: Registry[type] = Registry("objective")

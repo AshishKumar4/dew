@@ -6,7 +6,7 @@ block and the patchify/conditioning/output machinery live in dit_common.py.
 
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Literal
 from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
@@ -14,8 +14,10 @@ from ..dit import (
     ModulatedBlock, remat_block, neutralized_rope_freqs, build_block_pattern,
 )
 from ..vit import RotaryEmbedding
+from dew.registry import models
 
 
+@models("hybrid_dit")
 class HybridSSMAttentionDiT(nn.Module):
     """DiT that interleaves SSM blocks with attention blocks in a configurable ratio.
     block_pattern (e.g. ['ssm','ssm','ssm','attn']) overrides ssm_attention_ratio ('3:1').
@@ -35,18 +37,12 @@ class HybridSSMAttentionDiT(nn.Module):
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
-    use_hilbert: bool = False
-    use_zigzag: bool = False  # ZigMa-style serpentine scan
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     block_pattern: Optional[Sequence[str]] = None  # e.g., ['ssm','ssm','ssm','attn']
     ssm_attention_ratio: str = "3:1"  # e.g., "3:1", "1:1", "all-ssm", "all-attn"
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
-    @property
-    def scan_order(self):
-        assert not (self.use_hilbert and self.use_zigzag), \
-            "use_hilbert and use_zigzag are mutually exclusive"
-        return 'hilbert' if self.use_hilbert else 'zigzag' if self.use_zigzag else 'raster'
 
     def setup(self):
         self.embed = PatchSequenceEmbed(
