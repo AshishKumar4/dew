@@ -58,9 +58,12 @@ class YarnScaling:
     original_max_position_embeddings: int = 4096
     beta_fast: float = 32.0
     beta_slow: float = 1.0
-    mscale: float = 1.0
-    mscale_all_dim: float = 1.0
+    mscale: Optional[float] = None
+    mscale_all_dim: Optional[float] = None
     truncate: bool = True
+    # An explicit cos/sin amplitude, which the reference applies instead of
+    # deriving one; None derives it from factor and the mscales above.
+    attention_factor: Optional[float] = None
 
 
 def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
@@ -96,7 +99,6 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
     ramp = jnp.clip((jnp.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
     return inv_interpolation * ramp + inv_extrapolation * (1 - ramp)
 
-
 def yarn_attention_factor(yarn: YarnScaling) -> float:
     """The cos/sin multiplier of `_compute_yarn_parameters`.
 
@@ -104,6 +106,8 @@ def yarn_attention_factor(yarn: YarnScaling) -> float:
     1.0 for them; the general form stays, because a config that sets them
     apart rotates at a different amplitude and must not silently lose it.
     """
+    if yarn.attention_factor is not None:
+        return float(yarn.attention_factor)
     def mscale(scale: float, weight: float) -> float:
         return 1.0 if scale <= 1 else 0.1 * weight * math.log(scale) + 1.0
 
@@ -522,6 +526,7 @@ class MultiHeadLatentAttention(nn.Module):
             rot[:, :, None, :], (batch, length, self.num_heads, self.qk_rope_head_dim))
         return jnp.concatenate([nope, rot], axis=-1), values
 
+    @nn.compact
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None):
         causal, mask = self.causal, None
