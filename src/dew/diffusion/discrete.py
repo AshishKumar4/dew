@@ -77,8 +77,10 @@ class DiscreteProcess:
 
     def weight(self, t) -> jax.Array:
         """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross
-        entropy."""
-        return -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t))
+        entropy, and exactly zero at t = 0: nothing is masked there, so no
+        token contributes, and the quotient itself is undefined."""
+        t = jnp.asarray(t, jnp.float32)
+        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
     def times(self, steps: int) -> jax.Array:
         return jnp.linspace(self.T, 0.0, steps, dtype=jnp.float32)
