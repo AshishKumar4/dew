@@ -8,6 +8,7 @@ comes back is a second path, which is what the design exists to prevent.
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -74,7 +75,7 @@ def test_training_imports_no_modality():
         "loaded = sorted(m for m in sys.modules if m.startswith(('dew.diffusion', 'dew.inputs', 'dew.sampling', 'wandb')))\n"
         "print(loaded)\n")
     out = subprocess.run(
-        ["python", "-c", code], cwd=ROOT, capture_output=True, text=True,
-        env={"PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu", "PATH": "/usr/bin:/bin"})
+        [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
+        env={"PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu"})
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip() == "[]", out.stdout
