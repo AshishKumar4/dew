@@ -401,3 +401,267 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
 
     difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+# --------------------------------------------------------------------------
+# Gemma 4 gaps: per-layer input embeddings and cross-layer KV sharing
+# --------------------------------------------------------------------------
+
+GEMMA4 = Path(__file__).resolve().parent / "fixtures" / "gemma4"
+
+# The Dew fields for a fixture. The translator does not cover gemma4 (no
+# v-norm, no partial rotary), so the map is written out here, next to the
+# assertion it serves.
+GEMMA4_FIELDS = dict(
+    vocab_size=64, emb_features=32, num_layers=4, num_heads=4, num_kv_heads=2,
+    mlp_features=64, max_seq_len=64, rope_theta=10000.0, sliding_window=32,
+    norm_eps=1e-6, qk_norm=True, attention_bias=False, attention_scale=1.0,
+    embedding_scale=True, tie_embeddings=True, sandwich_norms=True)
+
+# Reference norm names to the Dew names that sit in the same place: Dew's
+# post_attention_layernorm is the pre-feedforward norm, applied after the
+# residual, and attention_output_norm is the reference's post-attention norm.
+GEMMA4_NORMS = {"input_layernorm": "input_layernorm",
+                "attention_output_norm": "post_attention_layernorm",
+                "post_attention_layernorm": "pre_feedforward_layernorm",
+                "mlp_output_norm": "post_feedforward_layernorm"}
+
+
+def gemma4_tensors(name):
+    """Fixture weights, input ids and reference logits.
+
+    The fixtures were generated under torch with transformers 5.16.1 (see the
+    meta json beside each npz for the seed, the versions and the config):
+    a tiny Gemma4TextConfig, random init, the v_proj of every owning layer
+    zeroed. Zeroing the values isolates the new feature paths from the
+    values norm, which Dew does not implement; the queries, the shared keys
+    and the scores stay live. The attention scale is 1.0, the head dim is
+    uniform, full layers run standard rope by config override.
+    """
+    data = np.load(GEMMA4 / f"{name}.npz")
+    tensors = {key: data[key] for key in data.files if key not in ("ids", "expected")}
+    return data["ids"], data["expected"], tensors
+
+
+def gemma4_variables(tensors, per_layer_input_dim, zero_values=True):
+    """Reference tensors into a CausalTransformer variables dict.
+
+    zero_values repeats the fixture's own isolation: the committed expected
+    logits were generated with the values zeroed, so the comparison zeroes
+    the translated v_proj kernels too."""
+    tensors = dict(tensors)
+    if zero_values:
+        for key in [key for key in tensors if key.endswith("self_attn.v_proj.weight")]:
+            tensors[key] = np.zeros_like(tensors[key])
+    params = {"embed_tokens": {"embedding": tensors["model.embed_tokens.weight"]}}
+    for index in range(4):
+        prefix = f"model.layers.{index}."
+        layer = {dew: {"scale": tensors[prefix + hf + ".weight"]}
+                 for dew, hf in GEMMA4_NORMS.items()}
+        attention = {
+            "q_proj": {"kernel": tensors[prefix + "self_attn.q_proj.weight"].T},
+            "o_proj": {"kernel": tensors[prefix + "self_attn.o_proj.weight"].T},
+            "q_norm": {"scale": tensors[prefix + "self_attn.q_norm.weight"]}}
+        for projection in ("k_proj", "v_proj"):
+            key = prefix + f"self_attn.{projection}.weight"
+            if key in tensors:
+                attention[projection] = {"kernel": tensors[key].T}
+        key = prefix + "self_attn.k_norm.weight"
+        if key in tensors:
+            attention["k_norm"] = {"scale": tensors[key]}
+        layer["self_attn"] = attention
+        layer["mlp"] = {
+            projection: {"kernel": tensors[prefix + f"mlp.{projection}.weight"].T}
+            for projection in ("gate_proj", "up_proj", "down_proj")}
+        if per_layer_input_dim:
+            layer["per_layer_input_gate"] = {
+                "kernel": tensors[prefix + "per_layer_input_gate.weight"].T}
+            layer["per_layer_projection"] = {
+                "kernel": tensors[prefix + "per_layer_projection.weight"].T}
+            layer["post_per_layer_input_norm"] = {
+                "scale": tensors[prefix + "post_per_layer_input_norm.weight"]}
+        params[f"layers_{index}"] = layer
+    params["norm"] = {"scale": tensors["model.norm.weight"]}
+    if per_layer_input_dim:
+        params["embed_tokens_per_layer"] = {
+            "embedding": tensors["model.embed_tokens_per_layer.weight"]}
+        params["per_layer_model_projection"] = {
+            "kernel": tensors["model.per_layer_model_projection.weight"].T}
+        params["per_layer_projection_norm"] = {
+            "scale": tensors["model.per_layer_projection_norm.weight"]}
+    return {"params": params}
+
+
+def gemma4_model(name, **overrides):
+    fields = dict(GEMMA4_FIELDS, **overrides)
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", fields, dtype="float32", attention_impl="xla"))
+    ids, expected, tensors = gemma4_tensors(name)
+    variables = gemma4_variables(tensors, fields.get("per_layer_input_dim", 0))
+    return model, variables, jnp.asarray(ids, jnp.int32), expected
+
+
+def test_per_layer_input_embeddings_match_gemma4():
+    """PLE parity: the packed table, its projection and norm, the per-layer
+    gate, product, projection, norm and residual, against Gemma4TextModel
+    with per-layer inputs on and KV sharing off. Largest observed max |logit
+    difference| on CPU: 2.5e-07."""
+    model, variables, ids, expected = gemma4_model(
+        "ple", layer_types=("sliding_attention",) * 3 + ("full_attention",),
+        per_layer_input_dim=8, per_layer_input_vocab=64)
+
+    logits = np.asarray(model.apply(variables, ids))
+
+    difference = float(np.max(np.abs(logits - expected)))
+    assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(expected, axis=-1))
+
+
+def test_kv_sharing_matches_gemma4():
+    """Sharing parity: layers 2 and 3 read the K/V of the last earlier layer
+    of their own type, against Gemma4TextModel with two shared layers and no
+    per-layer inputs. Largest observed max |logit difference| on CPU:
+    2.3e-07."""
+    model, variables, ids, expected = gemma4_model(
+        "kvshare", layer_types=("sliding_attention", "full_attention") * 2,
+        num_kv_shared_layers=2)
+
+    logits = np.asarray(model.apply(variables, ids))
+
+    difference = float(np.max(np.abs(logits - expected)))
+    assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(expected, axis=-1))
+
+
+def test_sharing_layers_own_no_kv_and_name_their_provider():
+    """The tree shape of sharing: layers past the cutoff keep q_proj, o_proj
+    and q_norm but lose k_proj, v_proj and k_norm; the provider map follows
+    the layer type, not the position."""
+    model, variables, _, _ = gemma4_model(
+        "kvshare", layer_types=("sliding_attention", "full_attention") * 2,
+        num_kv_shared_layers=2)
+    params = variables["params"]
+
+    assert set(model.kv_sharing) == {2, 3}
+    assert model.kv_sharing[2] == 0 and model.kv_sharing[3] == 1
+    for index in (2, 3):
+        attention = params[f"layers_{index}"]["self_attn"]
+        assert set(attention) == {"q_proj", "o_proj", "q_norm"}, set(attention)
+    for index in (0, 1):
+        attention = params[f"layers_{index}"]["self_attn"]
+        assert {"k_proj", "v_proj", "k_norm"} <= set(attention)
+
+
+def test_sharing_without_a_provider_and_sharing_everything_are_refused():
+    base = dict(GEMMA4_FIELDS, layer_types=("sliding_attention", "full_attention") * 2)
+    with pytest.raises(ValueError, match="no earlier full_attention layer"):
+        models.build("causal_transformer", **base, num_kv_shared_layers=3).kv_sharing
+    with pytest.raises(ValueError, match="leave a provider"):
+        models.build("causal_transformer", **base, num_kv_shared_layers=4).kv_sharing
+
+
+def test_the_features_leave_a_plain_tree_unchanged():
+    """Off by default: no PLE leaves, no missing K/V, same leaves as before."""
+    model, variables, _, _ = gemma4_model("ple", per_layer_input_dim=0)
+    assert model.kv_sharing == {}
+    flat = flat_tree(variables["params"])
+    assert not [name for name in flat if "per_layer" in name]
+    assert "layers_0.self_attn.k_proj.kernel" in flat
+
+
+def test_new_leaves_are_declared_or_heuristic():
+    """The coverage sweep builds default configs only, so the new leaves are
+    asserted here: the packed table and the projections are declared, the
+    scalar norms fall under rank one."""
+    from dew.nn.sharding import declared_axes, is_heuristic
+
+    model = models.build("causal_transformer", **dict(
+        GEMMA4_FIELDS, per_layer_input_dim=8, num_kv_shared_layers=2,
+        layer_types=("sliding_attention", "full_attention") * 2))
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    uncovered = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]:
+        if leaf.ndim < 2:
+            continue
+        if declared_axes(path, leaf.ndim) is None and not is_heuristic(path):
+            uncovered.append(jax.tree_util.keystr(path))
+    assert uncovered == []
+
+
+def test_a_sharing_model_decodes_like_it_prefills(rng):
+    """The decode path of sharing: prefill writes the provider's cache, each
+    single-token step reads it, and the tokens match a full forward."""
+    model = models.build("causal_transformer", **dict(
+        GEMMA4_FIELDS, layer_types=("sliding_attention", "full_attention") * 2,
+        num_kv_shared_layers=2, max_seq_len=16))
+    params = model.init(rng, jnp.ones((1, 4), jnp.int32))
+    prompt = jax.random.randint(rng, (1, 3), 0, 64)
+
+    cache = model.apply(params, 1, method=type(model).init_cache, mutable=["cache"])[1]["cache"]
+    variables = {**params, "cache": cache}
+    logits, mutated = model.apply(variables, prompt, decode=True, mutable=["cache"])
+    first = jnp.argmax(logits[:, -1], axis=-1)
+    token, variables = first[:, None], {**params, "cache": mutated["cache"]}
+    generated = [first]
+    for _ in range(3):
+        logits, mutated = model.apply(variables, token, decode=True, mutable=["cache"])
+        token = jnp.argmax(logits[:, -1], axis=-1)[:, None]
+        variables = {**params, "cache": mutated["cache"]}
+        generated.append(token[:, 0])
+    decoded = jnp.concatenate([prompt, jnp.stack(generated, axis=1)], axis=1)
+
+    assert jnp.array_equal(
+        model.apply(params, decoded)[:, -1].argmax(axis=-1),
+        jnp.asarray(generated[-1]))
+
+
+def test_export_refuses_the_new_features(tmp_path, rng):
+    """The three exported families have neither, so a model with either set
+    is refused instead of silently dropping its leaves."""
+    model = models.build("causal_transformer", **dict(
+        GEMMA4_FIELDS, per_layer_input_dim=8, num_kv_shared_layers=2,
+        layer_types=("sliding_attention", "full_attention") * 2))
+    variables = model.init(rng, jnp.ones((1, 4), jnp.int32))
+    with pytest.raises(ValueError, match="per_layer_input_dim"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+def test_kv_sharing_scores_live_values_like_gemma4():
+    """Sharing with live values: the committed fixture zeroes the values, so
+    this runs the transformers model live with its values norms replaced by
+    the identity (the one Gemma 4 norm Dew does not implement) and the same
+    live weights on both sides. What is under test is the shared-K scores
+    with nonzero values behind them. Largest observed max |logit difference|
+    on CPU: 3.5e-07."""
+    torch = pytest.importorskip("torch")
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+
+    meta = json.loads((GEMMA4 / "kvshare.json").read_text())
+    config = Gemma4TextConfig(**meta["config"])
+    reference = Gemma4ForCausalLM(config).eval()
+    _, _, tensors = gemma4_tensors("kvshare")
+    # npz arrays are read-only; torch takes ownership on conversion.
+    tensors = {name: array.copy() for name, array in tensors.items()}
+    # Buffers (layer_scalar) and the tied head carry no weights in the
+    # fixture; both are ones and copies at init, so a non-strict load keeps
+    # them and every other leaf comes from the fixture.
+    reference.load_state_dict({name: torch.from_numpy(tensors[name])
+                               for name, _ in reference.named_parameters()
+                               if name in tensors}, strict=False)
+    for layer in reference.model.layers:
+        layer.self_attn.v_norm = torch.nn.Identity()
+
+    model, _, dew_ids, _ = gemma4_model(
+        "kvshare", layer_types=("sliding_attention", "full_attention") * 2,
+        num_kv_shared_layers=2)
+    live = gemma4_variables(tensors, 0, zero_values=False)
+    with torch.no_grad():
+        expected = reference(torch.tensor(np.asarray(dew_ids), dtype=torch.long)
+                             ).logits.detach().cpu().numpy()
+    logits = np.asarray(model.apply(live, dew_ids))
+
+    difference = float(np.max(np.abs(logits - expected)))
+    assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(expected, axis=-1))

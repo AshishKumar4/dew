@@ -455,6 +455,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     if not isinstance(model, CausalTransformer):
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
+    if model.per_layer_input_dim or model.num_kv_shared_layers:
+        raise ValueError(
+            "per-layer input embeddings and KV sharing have no counterpart in "
+            "the llama, qwen3 and gemma3_text families this exports, so a model "
+            "with per_layer_input_dim or num_kv_shared_layers set cannot be "
+            "written back to the HF layout")
     params = variables.get('params', variables)
     config = _export_config(model)
 
