@@ -12,7 +12,7 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -60,7 +60,6 @@ class DiffusionObjective(Objective):
         *,
         autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
-        loss_fn: Callable = optax.l2_loss,
         ema_decay: float = 0.999,
         sampler=DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
@@ -73,7 +72,6 @@ class DiffusionObjective(Objective):
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.unconditional_prob = unconditional_prob
-        self.loss_fn = loss_fn
         self.sampler = sampler
         self.guidance = guidance
         self.steps = steps
@@ -145,7 +143,7 @@ class DiffusionObjective(Objective):
             variables, noisy * c_in, schedule.model_time(t), **conditions,
             train=True, rngs={"dropout": dropout_key})
         preds = self.process.prediction.pred_transform(noisy, preds, rates)
-        losses = self.loss_fn(preds, target)
+        losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
         return jnp.mean(losses * weights), Aux(metrics={})
 
