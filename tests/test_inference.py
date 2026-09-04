@@ -170,14 +170,20 @@ def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatc
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
+    """Two steps of training leave the zero-initialised head near zero, so
+    the weights are nudged off it for the conditional and unconditional
+    branches to differ; then guidance is visible in the sample."""
     make_run(tmp_path)
-    pipe = TextToImage.from_run(str(tmp_path))
+    loaded = TextToImage.from_run(str(tmp_path))
+    pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
     key = jax.random.PRNGKey(1)
-    plain = pipe(["x"], steps=3, guidance=None, sampler=Heun(), key=key)
-    guided = pipe(["x"], steps=3, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key)
+    plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key)
+    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key)
     assert plain.shape == guided.shape == (1, RES, RES, 3)
     assert not np.allclose(plain, guided)
-    assert np.array_equal(pipe(["x"], steps=3, guidance=None, sampler=Heun(), key=key), plain)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key), plain)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, sampler=Heun(), key=key),
+                          pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key))
 
 
 def test_an_autoencoder_without_a_loader_is_refused():
