@@ -50,7 +50,7 @@ test = [
     "datasets",
 ]
 # AV/video sources and readers (lazy imports in dew.data)
-av = ["opencv-python", "decord", "moviepy", "av", "pillow", "video-reader-rs"]
+av = ["opencv-python", "decord", "moviepy", "av", "pillow"]
 # FID (scipy sqrtm) and Inception weight download
 metrics = ["scipy", "requests"]
 # Online URL-streaming loader (HF datasets-backed)
