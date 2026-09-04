@@ -44,6 +44,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.sharding import logical_axes
 
 CONFIG_FILE = "config.json"
 WEIGHTS_FILE = "model.safetensors"
@@ -66,6 +67,7 @@ def quick_gelu(x):
     return x * jax.nn.sigmoid(1.702 * x)
 
 
+@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed")})
 class CLIPAttention(nn.Module):
     """Self-attention with a bias on all four projections.
 
@@ -98,6 +100,7 @@ class CLIPAttention(nn.Module):
         return self.out_proj(attended.reshape(batch, length, self.hidden_size))
 
 
+@logical_axes({("fc1",): ("embed", "mlp"), ("fc2",): ("mlp", "embed")})
 class CLIPMLP(nn.Module):
     """The feed-forward of a CLIP layer: one hidden layer, quick-GELU."""
     hidden_size: int
@@ -141,6 +144,7 @@ class CLIPEncoderLayer(nn.Module):
         return hidden_states + self.mlp(self.layer_norm2(hidden_states))
 
 
+@logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
 class CLIPTextTransformer(nn.Module):
     """The text tower of CLIP, param layout and defaults of `CLIPTextConfig`.
 
@@ -204,6 +208,7 @@ class CLIPTextTransformer(nn.Module):
                                hidden_states[jnp.arange(batch), index])
 
 
+@logical_axes({("patch_embedding",): (None, None, None, "embed"), ("position_embedding",): (None, "embed")})
 class CLIPVisionTransformer(nn.Module):
     """The vision tower of CLIP, param layout and defaults of `CLIPVisionConfig`.
 
@@ -270,6 +275,7 @@ class CLIPVisionTransformer(nn.Module):
         return CLIPTowerOutput(hidden_states, self.post_layernorm(hidden_states[:, 0]))
 
 
+@logical_axes({("text_projection",): ("embed", "output"), ("visual_projection",): ("embed", "output")})
 class CLIP(nn.Module):
     """Both towers and their projection heads, `CLIPModel` in the reference.
 
@@ -692,6 +698,7 @@ class T5LayerNorm(nn.Module):
             self.dtype if self.dtype is not None else hidden_states.dtype)
 
 
+@logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed"), ("rel_bias",): (None, "heads")})
 class T5SelfAttention(nn.Module):
     """Multi-head self-attention with the relative position bias, no causal
     mask and no 1/sqrt(d) scale, modeling_t5.py `T5Attention` as the encoder
@@ -752,6 +759,7 @@ class T5SelfAttention(nn.Module):
         attended = self.out_proj(attended.reshape(batch, length, -1))
         return self.dropout(attended, deterministic=not train), position_bias
 
+@logical_axes({("wi",): ("embed", "mlp"), ("wo",): ("mlp", "embed")})
 class T5DenseReluDense(nn.Module):
     """wi, relu, wo, modeling_t5.py `T5DenseReluDense`."""
     d_ff: int
@@ -783,6 +791,7 @@ def _gelu_new(x):
     return jax.nn.gelu(x, approximate=True)
 
 
+@logical_axes({("wi_0",): ("embed", "mlp"), ("wi_1",): ("embed", "mlp"), ("wo",): ("mlp", "embed")})
 class T5DenseGatedGeluDense(nn.Module):
     """wi_0 through gelu times wi_1, then wo, modeling_t5.py
     `T5DenseGatedGeluDense`, the T5 v1.1 feed-forward SD3.5 and Flux run."""
@@ -854,6 +863,7 @@ class T5Block(nn.Module):
                 position_bias)
 
 
+@logical_axes({("embed_tokens",): ("vocab", "embed")})
 class T5EncoderTransformer(nn.Module):
     """The T5 encoder stack: token embedding, pre-norm blocks of
     bidirectional relative-bias attention and feed-forward, a final RMS norm,

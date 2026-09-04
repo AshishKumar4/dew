@@ -128,11 +128,35 @@ def _batches(batch):
     return lambda: _Batches(batch)
 
 
+class _Checkpointable:
+    """Explicit position methods over a tokenized stream."""
+    # tokenized forwards get_state and set_state through __getattr__. A
+    # runtime_checkable isinstance does not see that forwarding, so fit
+    # refuses the stream when checkpoints are asked for. This class states
+    # the pair where the checker looks. The real caption stage stays underneath.
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._inner)
+
+    def get_state(self):
+        return self._inner.get_state()
+
+    def set_state(self, state):
+        return self._inner.set_state(state)
+
+
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
     recipe = load_recipe("diffusion")
     batch = 8
     def load(self, *, batch, tokenize=None):
-        return Dataset(train=tokenized(_batches(batch), tokenize),
+        train = tokenized(_batches(batch), tokenize)
+        return Dataset(train=lambda: _Checkpointable(train()),
                        val=tokenized(lambda: itertools.islice(_batches(batch)(), 1), tokenize),
                        records=4 * batch, batch=batch)
 
@@ -155,4 +179,50 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "P_mean": -0.4, "P_std": 1.0, "min_snr_gamma": None}}
     assert config.model_fields(None)["output_channels"] == 3
+    assert (tmp_path / "run" / "2").is_dir()
+
+def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
+    recipe = load_recipe("jepa")
+    batch = 8
+    size = 32
+
+    class _Images:
+        def __init__(self, count=None):
+            self.count = 0
+            self.remaining = count
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.remaining is not None and self.remaining <= 0:
+                raise StopIteration
+            self.count += 1
+            if self.remaining is not None:
+                self.remaining -= 1
+            rng = np.random.RandomState(self.count)
+            return {"image": rng.randint(0, 256, (batch, size, size, 3)).astype(np.uint8), "label": np.zeros((batch,), np.int32)}
+
+        def get_state(self):
+            return json.dumps({"count": self.count}).encode()
+
+        def set_state(self, state):
+            self.count = json.loads(state)["count"]
+
+    def load(self, *, batch, tokenize=None):
+        return Dataset(train=lambda: _Images(), val=lambda: _Images(count=1),
+                       records=4 * batch, batch=batch)
+
+    monkeypatch.setattr(OxfordFlowers, "load", load)
+    config = parse(recipe.JepaRunConfig, [
+        "--data.image-size", str(size), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
+        "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--trainer.log-every", "1", "--model.architecture", "jepa_encoder", "--model.dtype", "float32",
+        "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}'])
+
+    state = recipe.main(config)
+
+    assert int(state.step) == 2
+    assert recipe.JepaRunConfig.load(str(tmp_path / "run")) == config
     assert (tmp_path / "run" / "2").is_dir()
