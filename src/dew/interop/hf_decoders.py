@@ -1003,6 +1003,13 @@ def save_pretrained_decoder(model, variables, directory, *,
             "no counterpart in the llama, qwen3 and gemma3_text families this "
             "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
             "or v_norm set cannot be written back to the HF layout")
+    if getattr(model, 'mixer', None) is not None or model.mixture is not None:
+        raise ValueError(
+            "a mixer other than standard attention and routed experts have "
+            "no writer here yet: the config half round-trips through "
+            "_export_config, but the MLA, indexer and per-expert tensors "
+            "have no _hf_name, so a model with mixer or mixture set cannot "
+            "be written back to the HF layout")
     params = variables.get('params', variables)
     config = _export_config(model)
 

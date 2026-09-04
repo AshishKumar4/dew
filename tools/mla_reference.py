@@ -69,7 +69,6 @@ YARN = {
     "mscale_all_dim": 1.0,
     "original_max_position_embeddings": 4096,
 }
-
 V3 = dict(
     hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=HEADS,
     q_lora_rank=Q_LORA, kv_lora_rank=KV_LORA, qk_nope_head_dim=NOPE,
@@ -87,6 +86,9 @@ V32 = dict(
     rope_scaling=dict(YARN), attention_bias=True, rms_norm_eps=1e-6,
     max_position_embeddings=256, index_topk=4, index_n_heads=2,
     index_head_dim=16)
+
+
+V3N = dict(V3, q_lora_rank=None)
 
 
 def hidden_states() -> torch.Tensor:
@@ -123,12 +125,11 @@ def block_weights(module: torch.nn.Module) -> dict:
     """Every parameter of the attention block as fp32 numpy, by torch name."""
     return {name: tensor.detach().to(torch.float32).numpy()
             for name, tensor in module.named_parameters()}
-
-
-def run_v3(directory: Path) -> None:
-    config = DeepseekV3Config(**V3)
+def run_v3(directory: Path, settings: dict, seed: int, name: str) -> None:
+    config = DeepseekV3Config(**settings)
     block = DeepseekV3Attention(config, layer_idx=0).to(torch.float32)
-    scatter_weights(block, seed=12)
+    scatter_weights(block, seed=seed)
+    block.eval()
     states = hidden_states()
     rotary = DeepseekV3RotaryEmbedding(config)
     positions = torch.arange(LENGTH).unsqueeze(0).expand(BATCH, LENGTH)
@@ -137,14 +138,18 @@ def run_v3(directory: Path) -> None:
         output, _ = block(states, embeddings, causal_mask(BATCH, LENGTH))
     arrays = {"hidden": states.numpy(), "output": output.numpy(),
               **block_weights(block)}
-    np.savez(directory / "mla_v3.npz", **arrays)
-    print(f"mla_v3.npz: {len(arrays)} arrays")
+    np.savez(directory / f"{name}.npz", **arrays)
+    print(f"{name}.npz: {len(arrays)} arrays")
 
 
 def run_v32(directory: Path) -> None:
+    # Seed 19, not the family's 13: most seeds tie exact-zero relu scores
+    # at the top-4 boundary of some row, which torch.topk and jax.lax.top_k
+    # break differently. Seed 19 holds a 0.11 minimum gap there, so the
+    # output parity below is deterministic, not tie luck.
     config = DeepseekV32Config(**V32)
     block = DeepseekV32Attention(config, layer_idx=0).to(torch.float32)
-    scatter_weights(block, seed=13)
+    scatter_weights(block, seed=19)
     block.eval()
     states = hidden_states()
     positions = torch.arange(LENGTH).unsqueeze(0).expand(BATCH, LENGTH)
@@ -182,9 +187,10 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     (out / "config.json").write_text(
-        json.dumps({"v3": V3, "v32": V32, "yarn": YARN,
+        json.dumps({"v3": V3, "v3n": V3N, "v32": V32, "yarn": YARN,
                     "batch": BATCH, "length": LENGTH}, indent=2) + "\n")
-    run_v3(out)
+    run_v3(out, V3, seed=12, name="mla_v3")
+    run_v3(out, V3N, seed=14, name="mla_v3n")
     run_v32(out)
     run_yarn(out)
     size = sum(path.stat().st_size for path in out.iterdir())
