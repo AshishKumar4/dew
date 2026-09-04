@@ -17,9 +17,12 @@ from dew.data import ImageDataset, OnlineImages, VideoDataset
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.registry import datasets, encoders, models, presets, samplers
+from dew.registry import datasets, encoders, metrics, models, presets, samplers
 from dew.sampling.guidance import CFG
 from .objective import DiffusionObjective
+
+import dew.eval  # noqa: F401  registers the image metrics
+import dew.nn.backbones  # noqa: F401  registers the models
 
 ATTENTION = {
     "heads": 8, "use_projection": False,
@@ -58,6 +61,7 @@ class StableDiffusionAutoencoder:
     """Latent diffusion behind the vendored Stable Diffusion VAE."""
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
+    revision: str = "bf16"
     dtype: Literal["float32", "bfloat16"] = "bfloat16"
     latent_shift: Optional[float] = None
     latent_scale: Optional[float] = None
@@ -67,7 +71,8 @@ class StableDiffusionAutoencoder:
         from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
         from dew.registry import resolve_dtype
 
-        return StableDiffusionVAE(self.modelname, dtype=resolve_dtype(self.dtype),
+        return StableDiffusionVAE(self.modelname, revision=self.revision,
+                                  dtype=resolve_dtype(self.dtype),
                                   latent_shift=self.latent_shift, latent_scale=self.latent_scale)
 
 
@@ -140,3 +145,25 @@ class DiffusionRunConfig(RunConfig):
             guidance=CFG(self.guidance) if self.guidance else None,
             steps=self.sampling_steps,
         )
+
+    def build_eval_metrics(self) -> list:
+        """Validation metrics for `val_metrics`, each pulling its own weights
+        on construction. A video run scores `VideoGrid` against its `video`
+        field, so `psnr` and `ssim` read that grid there and the image-only
+        metrics are refused by name instead of failing in the trainer."""
+        from dew.artifacts import ImageGrid, VideoGrid
+
+        video = len(self.sample_field().shape) == 4
+        built = []
+        for name in self.val_metrics:
+            if video and name in ("fid", "clip", "clip_score"):
+                raise ValueError(
+                    f"metric {name!r} reads an ImageGrid and this run samples video; "
+                    "validate a video run with psnr or ssim")
+            if name in ("psnr", "ssim"):
+                factory = metrics[name]
+                built.append(factory(field="video" if video else "image",
+                                     reads=VideoGrid if video else ImageGrid))
+            else:
+                built.append(metrics[name]())
+        return built

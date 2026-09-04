@@ -8,7 +8,11 @@ trainer has just written.
 """
 
 import dataclasses
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -16,13 +20,15 @@ import optax
 import pytest
 
 import dew.nn.backbones  # registers the models
+from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers
+from dew.data.video import VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.inputs import Field
+from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
 from dew.registry import presets, samplers
 from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 from dew.sampling import CFG, Heun, TextToImage
@@ -171,3 +177,43 @@ def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
     objective = DiffusionRunConfig.from_dict(config.to_dict()).build()
     assert objective.inputs.conditions == {}
     assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
+
+
+def test_build_eval_metrics_follows_the_sample_field(tmp_path):
+    """A video run scores its `VideoGrid` against its `video` field: the
+    factories read that grid there, and the image-only metrics are refused
+    by name instead of failing in the trainer."""
+    video = dataclasses.replace(run_config(tmp_path),
+                                data=VideoDataset(frame_size=8, frames=2),
+                                val_metrics=["psnr"])
+    (metric,) = video.build_eval_metrics()
+    assert metric.reads is VideoGrid
+    images = np.zeros((2, 2, 8, 8, 3), np.uint8)
+    assert np.isinf(metric(VideoGrid(unit_range(images)), {"video": images}))
+    with pytest.raises(ValueError, match="clip"):
+        dataclasses.replace(video, val_metrics=["clip"]).build_eval_metrics()
+
+
+def test_the_autoencoder_record_carries_its_revision(tmp_path):
+    """A run trained with a non-default VAE revision rebuilds from its
+    record; the revision used to fall out of the dataclass entirely."""
+    config = dataclasses.replace(
+        run_config(tmp_path),
+        autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
+    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
+
+
+def test_a_fresh_process_resolves_metrics_and_models_through_the_config():
+    """The recipe runs in a process that imports nothing else first: the
+    registries the config builds from fill on its import alone. `psnr` is
+    pure, so resolving it proves the point without downloading weights."""
+    root = Path(__file__).resolve().parents[1]
+    code = ("from dew.objectives.diffusion.config import DiffusionRunConfig;"
+            "from dew.registry import metrics, models;"
+            "print(metrics['psnr']().name, 'simple_dit' in models)")
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        env={"PYTHONPATH": str(root / "src"), "JAX_PLATFORMS": "cpu",
+             "PATH": os.environ.get("PATH", "")})
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == "psnr True"
