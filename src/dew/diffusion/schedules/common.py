@@ -1,121 +1,88 @@
+"""Noise schedules as values.
+
+A schedule is the forward process x_t = alpha(t) x_0 + sigma(t) eps over a
+time domain [0, T]: how training draws t, how the loss weights a draw and what
+the model is told about t. It holds no random state and knows nothing about
+the parameterization the model predicts in; `Process` pairs the two.
+"""
+
+from abc import ABC, abstractmethod
+
 import jax
 import jax.numpy as jnp
-from typing import Union
-from dew.random_state import RandomMarkovState  
 
-def get_coeff_shapes_tuple(array):
-    shape_tuple = (-1,) + (1,) * (array.ndim - 1)
-    return shape_tuple
 
-def reshape_rates(rates:tuple[jnp.ndarray, jnp.ndarray], shape=(-1, 1, 1, 1)) -> tuple[jnp.ndarray, jnp.ndarray]:
-    signal_rates, noise_rates = rates
-    signal_rates = jnp.reshape(signal_rates, shape)
-    noise_rates = jnp.reshape(noise_rates, shape)
-    return signal_rates, noise_rates
+def expand(coefficient, x):
+    """A per-example coefficient `[B]` shaped to broadcast against `x` `[B, ...]`."""
+    return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
-class NoiseScheduler():
-    def __init__(self, timesteps,
-                    dtype=jnp.float32,
-                    clip_min=-1.0,
-                    clip_max=1.0,
-                    min_snr_gamma: float = None,
-                    prediction_transform=None):
-        self.max_timesteps = timesteps
-        self.dtype = dtype
-        self.clip_min = clip_min
-        self.clip_max = clip_max
-        if min_snr_gamma is not None and prediction_transform is None:
-            raise ValueError("min_snr_gamma needs the prediction transform it will be trained against")
-        self.min_snr_gamma = min_snr_gamma
-        self.prediction_transform = prediction_transform
-        if type(timesteps) == int and timesteps > 1:
-            timestep_generator = lambda rng, batch_size, max_timesteps = timesteps: jax.random.randint(rng, (batch_size,), 0, max_timesteps)
-        else:
-            timestep_generator = lambda rng, batch_size, max_timesteps = timesteps: jax.random.uniform(rng, (batch_size,), minval=0, maxval=max_timesteps)
-        self.timestep_generator = timestep_generator
 
-    def generate_timesteps(self, batch_size, state:RandomMarkovState) -> tuple[jnp.ndarray, RandomMarkovState]:
-        state, rng = state.get_random_key()
-        timesteps = self.timestep_generator(rng, batch_size, self.max_timesteps)
-        return timesteps, state
+class NoiseScheduler(ABC):
+    """The forward process on [0, T], with t = T the fully noised end."""
 
-    def get_snr(self, steps) -> jnp.ndarray:
-        signal_rates, noise_rates = self.get_rates(steps, shape=(-1,))
-        return (signal_rates / noise_rates) ** 2
+    T: float
 
-    def get_weights(self, steps, shape=(-1, 1, 1, 1)):
-        """Per-sample loss weight, in the target space of the paired parameterization.
+    @abstractmethod
+    def rates(self, t) -> tuple[jax.Array, jax.Array]:
+        """`(alpha, sigma)` at `t`, shaped like `t`."""
 
-        min-SNR-gamma (Hang et al. 2023) is defined as min(SNR, gamma) on the
-        x_0 loss; the transform converts that into whichever space the trainer
-        actually computes the loss in. It replaces the schedule's own weighting
-        rather than stacking on top of it.
-        """
-        if self.min_snr_gamma is None:
-            return self.get_schedule_weights(steps, shape)
-        snr = self.get_snr(steps)
-        weights = jnp.minimum(snr, self.min_snr_gamma) / self.prediction_transform.target_error_scale(snr)
-        return weights.reshape(shape)
+    @abstractmethod
+    def sample_t(self, key, n: int) -> jax.Array:
+        """`n` training times drawn the way this schedule trains."""
 
-    def get_schedule_weights(self, steps, shape=(-1, 1, 1, 1)):
-        raise NotImplementedError
+    @abstractmethod
+    def weight(self, t) -> jax.Array:
+        """The schedule's own loss weight at `t`, in the space its paired
+        parameterization computes the loss in."""
 
-    def get_rates(self, steps, shape=(-1, 1, 1, 1)) -> tuple[jnp.ndarray, jnp.ndarray]:
-        raise NotImplementedError
-    
-    def add_noise(self, images, noise, steps) -> jnp.ndarray:
-        signal_rates, noise_rates = self.get_rates(steps, shape=get_coeff_shapes_tuple(images))
-        return signal_rates * images + noise_rates * noise
-    
-    def remove_all_noise(self, noisy_images, noise, steps, clip_denoised=True, rates=None):
-        signal_rates, noise_rates = self.get_rates(steps, shape=get_coeff_shapes_tuple(noisy_images))
-        x_0 = (noisy_images - noise * noise_rates) / signal_rates
-        return x_0
-    
-    def transform_inputs(self, x, steps):
-        return x, steps
-    
-    def get_max_variance(self, shape=(-1, 1, 1, 1)):
-        alpha_n, sigma_n = self.get_rates(self.max_timesteps, shape=shape)
-        variance = jnp.sqrt(alpha_n ** 2 + sigma_n ** 2) 
-        return variance
+    def model_time(self, t) -> jax.Array:
+        """What the model is conditioned on at `t`; the time itself unless the
+        schedule says otherwise."""
+        return jnp.asarray(t, jnp.float32)
+
+    def snr(self, t) -> jax.Array:
+        alpha, sigma = self.rates(t)
+        return (alpha / sigma) ** 2
+
 
 class GeneralizedNoiseScheduler(NoiseScheduler):
+    """The variance exploding family of Karras et al. 2022 ("Elucidating the
+    Design Space of Diffusion-Based Generative Models").
+
+    alpha is 1 and the model input is scaled by the paired preconditioning
+    instead. Every member conditions the model on c_noise = log(sigma) / 4
+    and weights the loss with lambda(sigma) = (sigma^2 + sigma_data^2) /
+    (sigma sigma_data)^2 (Eq. 8 of the paper), written in a form that needs
+    no epsilon guard; a subclass places the sigmas along t and inverts that
+    placement for the solvers that step in sigma.
     """
-    As per the generalization presented in the paper
-    "Elucidating the Design Space of Diffusion-Based
-    Generative Models" by Tero Karras et al.
-    Basically the signal rate shall always be 1, and the model
-    input itself shall be scaled to match the noise rate
-    """
-    def __init__(self, timesteps, sigma_min=0.002, sigma_max=80.0, sigma_data=1,
-                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
-        super().__init__(timesteps, dtype=dtype, clip_min=clip_min, clip_max=clip_max,
-                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
+
+    T = 1.0
+
+    def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0,
+                 sigma_data: float = 0.5):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
-    
-    def get_schedule_weights(self, steps, shape=(-1, 1, 1, 1)):
-        sigma = self.get_sigmas(steps)
-        return (1 + (1 / (1 + ((1 - sigma ** 2)/(sigma ** 2)))) / (self.sigma_max ** 2)).reshape(shape)
-    
-    def get_sigmas(self, steps) -> jnp.ndarray:
-        raise NotImplementedError("This method should be implemented in the subclass")
-    
-    def get_rates(self, steps, shape=(-1, 1, 1, 1)) -> tuple[jnp.ndarray, jnp.ndarray]:
-        sigmas = self.get_sigmas(steps)
-        signal_rates = jnp.ones_like(sigmas)
-        noise_rates = sigmas
-        return reshape_rates((signal_rates, noise_rates), shape=shape)
-    
-    def transform_inputs(self, x, steps, num_discrete_chunks=1000):
-        sigmas_discrete = (steps / self.max_timesteps) * num_discrete_chunks
-        sigmas_discrete = sigmas_discrete.astype(jnp.int32)
-        return x, sigmas_discrete
-    
-    def get_timesteps(self, sigmas):
-        """
-        Inverse of the get_sigmas method
-        """
-        raise NotImplementedError("This method should be implemented in the subclass")
+
+    @abstractmethod
+    def sigmas(self, t) -> jax.Array:
+        """The noise level at `t`."""
+
+    @abstractmethod
+    def t_of_sigma(self, sigma) -> jax.Array:
+        """The inverse of `sigmas`."""
+
+    def rates(self, t):
+        sigma = self.sigmas(jnp.asarray(t, jnp.float32))
+        return jnp.ones_like(sigma), sigma
+
+    def sample_t(self, key, n):
+        return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
+
+    def weight(self, t):
+        sigma = self.sigmas(jnp.asarray(t, jnp.float32))
+        return 1 / self.sigma_data ** 2 + 1 / sigma ** 2
+
+    def model_time(self, t):
+        return jnp.log(self.sigmas(jnp.asarray(t, jnp.float32))) / 4

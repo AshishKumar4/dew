@@ -10,6 +10,8 @@ from flax import linen as nn
 from typing import Optional, Tuple
 from flax.typing import Dtype, PrecisionLike
 
+from .sharding import logical_axes
+
 # --- S5 SSM Layer ---
 
 def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
@@ -147,6 +149,7 @@ class S5Layer(nn.Module):
 
 # --- Bidirectional S5 ---
 
+@logical_axes({}, heuristic=(("s5_*",), ("out_proj",)))
 class BidirectionalS5Layer(nn.Module):
     """Runs forward and backward S5 scans, concats and projects back to features.
     Patches have no inherent direction, so scan both ways.

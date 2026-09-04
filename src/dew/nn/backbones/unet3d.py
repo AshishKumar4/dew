@@ -20,8 +20,10 @@ from ..blocks import ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProj
 from ..attention import TransformerBlock
 from ..vit import RotaryEmbedding, RoPEAttention
 from dew.registry import models
+from ..sharding import logical_axes
 
 
+@logical_axes({}, heuristic=(("temporal_out",),))
 class TemporalBlock(nn.Module):
     """Temporal self-attention over the frame axis at every spatial position.
 
@@ -97,7 +99,7 @@ class UNet3D(nn.Module):
         x = x.reshape(B * T, H, W, C)
         temb = jnp.repeat(temb, T, axis=0)
         if textcontext is not None:
-            textcontext = jnp.repeat(textcontext, T, axis=0)
+            textcontext = jnp.repeat(textcontext.hidden, T, axis=0)
 
         temb = FourierEmbedding(features=self.emb_features)(temb)
         temb = TimeProjection(features=self.emb_features)(temb)

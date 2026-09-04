@@ -14,10 +14,12 @@ import inspect
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax import struct
 from typing import Optional, Sequence
 from flax.typing import Dtype, PrecisionLike
 
 from .blocks import FourierEmbedding, TimeProjection
+from .sharding import logical_axes
 from .vit import PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams, unpatchify
 from .ssm import S5Layer, BidirectionalS5Layer, SpatialFusionConv
 from .scan_orders import (
@@ -27,6 +29,22 @@ from .scan_orders import (
 )
 
 SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
+
+
+@struct.dataclass
+class TextContext:
+    """Encoded text a model conditions on: `hidden` `[B, L, D]` from the text
+    tower and `mask` `[B, L]`, ones on the real tokens and zeros on the padding,
+    which is what any pooling over L weights by."""
+    hidden: jax.Array
+    mask: jax.Array
+
+
+def masked_mean(x, mask):
+    """The mean of `x` `[B, L, D]` over L, counting only the rows `mask`
+    `[B, L]` marks; a padded row moves nothing."""
+    weights = jnp.asarray(mask, x.dtype)[:, :, None]
+    return jnp.sum(x * weights, axis=1) / jnp.sum(weights, axis=1)
 
 
 def scan_indices(scan_order: str, H_P: int, W_P: int):
@@ -60,6 +78,8 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
     return (unit * (num_layers // len(unit) + 1))[:num_layers]
 
 
+@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")},
+              heuristic=(("hilbert_projection",),))
 class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
@@ -114,9 +134,12 @@ class PatchSequenceEmbed(nn.Module):
         return tokens, inv_idx
 
 
+@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")},
+              heuristic=(("time_embed", "layers_1"), ("text_context_proj",)))
 class ConditioningEmbed(nn.Module):
-    """Fourier time embedding + mean-pooled text projection, summed into the
-    single conditioning vector the adaLN modulation consumes."""
+    """Fourier time embedding + the text projection mean-pooled over the real
+    tokens, summed into the single conditioning vector the adaLN modulation
+    consumes."""
     emb_features: int
     mlp_ratio: int = 4
     dtype: Optional[Dtype] = None
@@ -132,14 +155,16 @@ class ConditioningEmbed(nn.Module):
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")
 
-    def __call__(self, temb, textcontext=None):
+    def __call__(self, temb, textcontext: Optional[TextContext] = None):
         cond_emb = self.time_embed(temb)
         if textcontext is not None:
-            text_emb = self.text_proj(textcontext)
-            cond_emb = cond_emb + jnp.mean(text_emb, axis=1)
+            text_emb = self.text_proj(textcontext.hidden)
+            cond_emb = cond_emb + masked_mean(text_emb, textcontext.mask)
         return cond_emb
 
 
+@logical_axes({("final_ada_proj",): ("embed", "modulation"),
+               ("final_proj",): ("embed", "output")})
 class PatchSequenceOutput(nn.Module):
     """Final norm + zero-init fp32 head + unpatchify for any scan order and
     any (non-square included) patch grid."""
@@ -207,6 +232,8 @@ def remat_block(block_cls, enabled: bool, policy='dots'):
     )
 
 
+@logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")},
+              heuristic=(("ssm",), ("spatial_fusion",)))
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 

@@ -13,7 +13,7 @@ class BCHWModelWrapper(nn.Module):
         out = self.model(
             sample=x,
             timesteps=temb,
-            encoder_hidden_states=textcontext,
+            encoder_hidden_states=textcontext.hidden,
         )
         # Reshape the output back to BHWC format
         out = jnp.transpose(out.sample, (0, 2, 3, 1))

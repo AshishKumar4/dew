@@ -7,7 +7,9 @@ channels after per-channel SSIM. No scipy/skimage dependency.
 import jax
 import jax.numpy as jnp
 
-from .common import EvaluationMetric
+from dew.inputs import unit_range
+from dew.registry import metrics
+from .common import ImageMetric, frames
 from .psnr import _as_frame_batch
 
 # Standard SSIM constants for the 11x11/sigma-1.5 gaussian window
@@ -60,7 +62,7 @@ def _ssim_single_channel(
     return jnp.mean(numerator / denominator)
 
 
-def ssim(
+def structural_similarity(
     predictions: jnp.ndarray,
     targets: jnp.ndarray,
     data_range: float,
@@ -93,22 +95,11 @@ def ssim(
     return scores if per_example else jnp.mean(scores)
 
 
-def get_ssim_metric(
-    data_range: float = 2.0,
-    per_example: bool = False,
-) -> EvaluationMetric:
-    """Mean SSIM between generated and reference frames, higher is better.
+@metrics("ssim")
+def ssim(data_range: float = 2.0, field: str = "image") -> ImageMetric:
+    """Mean SSIM between the sampled frames and the batch's, higher is
+    better, on the same [-1, 1] scale as `psnr`."""
+    def measure(artifact, batch):
+        return structural_similarity(frames(artifact), unit_range(batch[field]), data_range)
 
-    The trainer passes the sampler's [-1, 1] samples and the loader's uint8
-    batch. The batch is scaled the way the objective scales it, so both sides
-    span the [-1, 1] range that the default data_range of 2.0 describes.
-    """
-    def ssim_metric(generated: jnp.ndarray, batch):
-        reference = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
-        return ssim(generated, reference, data_range, per_example)
-
-    return EvaluationMetric(
-        function=ssim_metric,
-        name="ssim",
-        higher_is_better=True,
-    )
+    return ImageMetric(name="ssim", measure=measure)
