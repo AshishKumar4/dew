@@ -77,8 +77,10 @@ class DiscreteProcess:
 
     def weight(self, t) -> jax.Array:
         """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross
-        entropy."""
-        return -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t))
+        entropy, and exactly zero at t = 0: nothing is masked there, so no
+        token contributes, and the quotient itself is undefined."""
+        t = jnp.asarray(t, jnp.float32)
+        return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
     def times(self, steps: int) -> jax.Array:
         return jnp.linspace(self.T, 0.0, steps, dtype=jnp.float32)
@@ -101,6 +103,9 @@ class DiscreteDenoiser:
 
     The model's own logits at an unmasked position are irrelevant: the
     position keeps its token, which is MDLM's carry-over parameterization.
+    The mask token itself carries no mass: it marks corruption, so the
+    categorical a reveal draws from never offers it, however the model
+    scores it.
     """
 
     process: DiscreteProcess
@@ -109,6 +114,7 @@ class DiscreteDenoiser:
 
     def __call__(self, x_t, t):
         logits = self.model.apply(self.params, x_t)
+        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = x_t == self.process.mask_id
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)

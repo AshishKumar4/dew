@@ -95,6 +95,19 @@ def test_masked_mean_ignores_padded_rows():
     assert jnp.allclose(pooled[1], jnp.mean(hidden[1], axis=0))
 
 
+def test_an_empty_mask_row_contributes_nothing(rng):
+    """A row with no real tokens pools to exactly zero, the same vector the
+    model gets with no text at all, rather than 0/0 = NaN."""
+    embed = ConditioningEmbed(emb_features=16, mlp_ratio=1)
+    hidden = jax.random.normal(rng, (2, 6, 8))
+    mask = jnp.array([[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]])
+    temb = jnp.array([10.0, 20.0])
+    params = embed.init(rng, temb, TextContext(hidden, mask))
+    pooled = embed.apply(params, temb, TextContext(hidden, mask))
+    assert jnp.all(jnp.isfinite(pooled))
+    assert jnp.allclose(pooled[0], embed.apply(params, temb, None)[0], atol=1e-6)
+
+
 def test_padded_rows_do_not_move_the_conditioning_vector():
     """The tokenizer pads every prompt to 77 slots; what the padded rows hold
     must not reach the adaLN vector. Before the mask, they were averaged in

@@ -36,6 +36,24 @@ def test_log_linear_schedule_and_its_nelbo_weight():
     assert jnp.allclose(process.weight(TIMES), 1 / TIMES, rtol=1e-5)
 
 
+def test_a_zero_time_row_contributes_nothing_to_the_loss(rng, monkeypatch):
+    """t = 0 masks nothing, so its NELBO contribution is exactly zero: the
+    loss stays finite and equals the batch with that row removed. The weight
+    1/t used to make it NaN on a ~1/2^24 draw of the stratified offset, which
+    the trainer counts as non-finite and aborts the run over."""
+    process = MDLM(mask_id=MASK)()
+    objective = MaskedDiffusionObjective(transformer(causal=False), process, 8)
+    params = objective.init(rng)
+    rows = jnp.array([[1, 2, 3, 4, 5, 1, 2, 3], [3, 2, 1, 0, 4, 5, 1, 2]])
+    monkeypatch.setattr(DiscreteProcess, "sample_t",
+                        lambda self, key, n: jnp.zeros((n,)))
+    full, _ = objective.loss(params, {"text": rows}, Step(jnp.asarray(0), rng, None))
+    rest, _ = objective.loss(params, {"text": rows[1:]}, Step(jnp.asarray(0), rng, None))
+    assert jnp.all(jnp.isfinite(full))
+    assert float(full) == pytest.approx(0.0, abs=1e-12)
+    assert float(full) == pytest.approx(float(rest), abs=1e-12)
+
+
 def test_corrupt_masks_the_schedules_fraction_and_keeps_the_rest(rng):
     process = DiscreteProcess(LogLinear(), mask_id=MASK)
     tokens = jax.random.randint(rng, (3, 4000), 0, MASK)
@@ -97,6 +115,24 @@ def test_sample_walks_the_grid_to_a_fully_revealed_row(rng):
     assert jnp.all(x_T == MASK)
     out = sample(denoise, x_T, 6, solver=Unmask(), key=rng)
     assert jnp.array_equal(out, jnp.broadcast_to(jnp.arange(8) % (VOCAB - 1), (5, 8)))
+
+
+def test_unmasking_never_emits_the_mask_id(rng):
+    """The mask token marks corruption; it is not a token a sample can end
+    with, however the model scores it. A model that puts all its mass there
+    must still unmask to real tokens."""
+    class MaskLoving(nn.Module):
+        @nn.compact
+        def __call__(self, tokens):
+            scale = self.param("scale", nn.initializers.constant(20.0), ())
+            return scale * jnp.broadcast_to(jax.nn.one_hot(MASK, VOCAB),
+                                            (*tokens.shape, VOCAB))
+
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    model = MaskLoving()
+    denoise = process.denoiser(model, model.init(rng, jnp.zeros((1, 8), jnp.int32)))
+    out = sample(denoise, process.noise(rng, (5, 8)), 6, solver=Unmask(), key=rng)
+    assert not jnp.any(out == MASK)
 
 
 def test_unmask_refuses_a_gaussian_process(rng):

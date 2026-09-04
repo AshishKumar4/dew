@@ -33,15 +33,17 @@ class Unet(nn.Module):
             self.conv_out_norm = norm()
         
     @nn.compact
-    def __call__(self, x, temb, textcontext, train: bool = False):
+    def __call__(self, x, temb, textcontext=None, train: bool = False):
         # print("embedding features", self.emb_features)
         temb = FourierEmbedding(features=self.emb_features)(temb)
         temb = TimeProjection(features=self.emb_features)(temb)
 
-        # Cross-attention reads the whole sequence; the mask weights the
-        # pooling the DiT family does and has no place in it here.
-        textcontext = textcontext.hidden
-        _, TS, TC = textcontext.shape
+        # Without text the attention blocks fall back to self-attention
+        # (TransformerBlock's context defaults to its input), so there is
+        # nothing to unpack. Cross-attention reads the whole sequence; the
+        # mask weights the pooling the DiT family does and has no place in
+        # it here.
+        text = None if textcontext is None else textcontext.hidden
         
         # print("time embedding", temb.shape)
         feature_depths = self.feature_depths
@@ -87,7 +89,7 @@ class Unet(nn.Module):
                                         force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
                                         norm_inputs=attention_config.get("norm_inputs", True),
                                         explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
-                                        name=f"down_{i}_attention_{j}")(x, textcontext)
+                                        name=f"down_{i}_attention_{j}")(x, text)
                 # print("down residual for feature level", i, "is of shape", x.shape, "features", dim_in)
                 downs.append(x)
             if i != len(feature_depths) - 1:
@@ -128,7 +130,7 @@ class Unet(nn.Module):
                                     force_fp32_for_softmax=middle_attention.get("force_fp32_for_softmax", False),
                                     norm_inputs=middle_attention.get("norm_inputs", True),
                                     explicitly_add_residual=middle_attention.get("explicitly_add_residual", True),
-                                    name=f"middle_attention_{j}")(x, textcontext)
+                                    name=f"middle_attention_{j}")(x, text)
             x = ResidualBlock(
                 middle_conv_type,
                 name=f"middle_res2_{j}",
@@ -172,7 +174,7 @@ class Unet(nn.Module):
                                         force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
                                         norm_inputs=attention_config.get("norm_inputs", True),
                                         explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
-                                        name=f"up_{i}_attention_{j}")(x, textcontext)
+                                        name=f"up_{i}_attention_{j}")(x, text)
             # print("Upscaling ", i, x.shape)
             if i != len(feature_depths) - 1:
                 x = Upsample(
