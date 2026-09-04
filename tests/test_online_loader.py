@@ -291,7 +291,7 @@ def test_a_fetched_image_reaches_the_queue_as_a_sample(tmp_path, monkeypatch):
 # The streaming extra
 # ---------------------------------------------------------------------------------
 
-def test_loading_a_dataset_by_path_asks_for_the_streaming_extra(monkeypatch):
+def test_loading_rows_asks_for_the_streaming_extra(monkeypatch):
     """Importing this module must work without HF datasets; only actually
     loading a dataset needs it, and it has to say so.
 
@@ -300,7 +300,7 @@ def test_loading_a_dataset_by_path_asks_for_the_streaming_extra(monkeypatch):
     """
     monkeypatch.setitem(sys.modules, "datasets", None)
     with pytest.raises(ImportError, match=r"dew-ml\[streaming\]"):
-        OnlineStreamingDataLoader("some/hf/dataset")
+        online_loader.load_rows(["some/hf/dataset"])
 
 
 def test_feature_extractor_rejects_missing_required_columns():
@@ -320,7 +320,7 @@ def test_batch_mapping_propagates_feature_extractor_errors():
 
 
 # ---------------------------------------------------------------------------------
-# The streaming factory: what a run gets from get_dataset_online
+# The streaming spec: what a run gets from OnlineImages
 # ---------------------------------------------------------------------------------
 
 class _StubTokenizer:
@@ -348,26 +348,23 @@ def _producer_of(rows, passes, stop):
     return produce
 
 
-def _online_factory(monkeypatch, rows, passes, stop, batch=4):
-    from dew.data import dataloaders
-    from dew.data.registry import onlineDatasetMap
+def _online_spec(monkeypatch, rows, passes, stop):
+    """OnlineImages over a stub table, with the fetcher pool replaced."""
+    from dew.data import OnlineImages
 
-    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader",
                         _producer_of(rows, passes, stop))
-    monkeypatch.setitem(onlineDatasetMap, "fake_online",
-                        {"source": _StubDataset(rows)})
-    return dataloaders.get_dataset_online("fake_online", batch_size=batch,
-                                          worker_count=1, image_scale=4)
+    monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubDataset(rows))
+    return OnlineImages(sources=("fake_online",), image_size=4, worker_count=1)
 
 
-def test_the_streaming_factory_repeats_its_records_instead_of_ending(monkeypatch, stop):
+def test_the_streaming_spec_repeats_its_records_instead_of_ending(monkeypatch, stop):
     """The streamer is documented as endless: the pool walks its shards in a
     loop and a run bounds training by steps, so `for batch in loader` must not
     stop at the end of the dataset."""
     rows, batch, passes = 12, 4, 3
-    data = _online_factory(monkeypatch, rows, passes, stop, batch=batch)
-    loader = data["train"]()
+    loader = _online_spec(monkeypatch, rows, passes, stop).load(batch=batch).train()
 
     seen = [[int(v) for v in next(loader)["image"][:, 0, 0, 0]]
             for _ in range(rows // batch * passes)]
@@ -378,20 +375,41 @@ def test_the_streaming_factory_repeats_its_records_instead_of_ending(monkeypatch
     assert set(records[rows:]) == set(records[:rows]), "the stream reads them again"
 
 
-def test_the_streaming_factory_reports_its_length_in_records(monkeypatch, stop):
-    """train_len is records, like every grain factory's, and a recipe divides
-    it by the batch size for steps per epoch."""
-    data = _online_factory(monkeypatch, 12, 1, stop, batch=4)
+def test_the_streaming_spec_reports_its_records_and_holds_nothing_out(monkeypatch, stop):
+    """`records` counts rows, like every grain spec's, so a recipe divides it
+    by the batch for steps per epoch; a streaming run holds nothing out, so
+    nothing downstream may report a validation pass over a held-out split."""
+    data = _online_spec(monkeypatch, 12, 1, stop).load(batch=4)
 
-    assert data["train_len"] == 12
-    assert data["local_batch_size"] == 4 and data["global_batch_size"] == 4
-    assert len(data["train"]()) == 12
+    assert data.records == 12 and data.batch == 4 and data.steps_per_epoch == 3
+    assert data.val is None
+    assert len(next(data.train())["image"]) == 4
 
 
-def test_the_streaming_factory_stops_when_its_fetcher_is_gone(monkeypatch):
+def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeypatch, stop):
+    """Loading resolves the rows; the fetcher pool and its thread start with
+    `train()`, and the stream cannot record a position."""
+    started = []
+    producer = _producer_of(4, 1, stop)
+
+    def produce(dataset, **kwargs):
+        started.append(dataset)
+        producer(dataset, **kwargs)
+
+    data = _online_spec(monkeypatch, 4, 1, stop).load(batch=4)
+    monkeypatch.setattr(online_loader, "parallel_media_loader", produce)
+    assert started == []
+
+    stream = data.train()
+    assert len(next(stream)["image"]) == 4
+    assert len(started) == 1
+    assert not hasattr(stream, "get_state")
+
+
+def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
     """The one thing that does end the stream: nothing left to wait for.
 
-    The factory leaves the iterator's queue timeout at a minute, so the wait
+    The spec leaves the iterator's queue timeout at a minute, so the wait
     before it looks at the fetcher is shortened here. What is under test is
     that the wait ends in StopIteration rather than in a batch of zeros.
     """
@@ -399,38 +417,16 @@ def test_the_streaming_factory_stops_when_its_fetcher_is_gone(monkeypatch):
         for index in range(4):
             data_queue.put({**_sample(index), "image": np.full((4, 4, 3), 1, np.uint8)})
 
-    from dew.data import dataloaders
-    from dew.data.registry import onlineDatasetMap
+    from dew.data import OnlineImages
 
-    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
+    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader", exhausted)
     monkeypatch.setattr(online_loader, "MediaBatchIterator",
                         functools.partial(MediaBatchIterator, queue_timeout=0.05))
-    monkeypatch.setitem(onlineDatasetMap, "fake_online", {"source": _StubDataset(4)})
-    loader = dataloaders.get_dataset_online("fake_online", batch_size=4,
-                                            worker_count=1, image_scale=4)["train"]()
+    monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubDataset(4))
+    loader = OnlineImages(sources=("fake_online",), image_size=4,
+                          worker_count=1).load(batch=4).train()
 
     assert len(next(loader)["image"]) == 4
     with pytest.raises(StopIteration):
         next(loader)
-
-
-def test_load_data_routes_a_streaming_only_dataset_to_the_streamer(monkeypatch, stop):
-    """'auto' reads the registries, and what comes back has no validation
-    loader at all: a streaming run holds nothing out, so nothing downstream
-    may report a validation pass over a held-out split."""
-    from dew.config import DataConfig
-    from dew.data import dataloaders
-    from dew.data.registry import onlineDatasetMap
-
-    monkeypatch.setattr(dataloaders, "AutoTextTokenizer", _StubTokenizer)
-    monkeypatch.setattr(online_loader, "parallel_media_loader",
-                        _producer_of(12, 1, stop))
-    monkeypatch.setitem(onlineDatasetMap, "fake_online", {"source": _StubDataset(12)})
-
-    data = dataloaders.load_data(DataConfig(dataset="fake_online", batch_size=4,
-                                            image_size=4, worker_count=1))
-
-    assert data["train_len"] == 12 and data["local_batch_size"] == 4
-    assert "val" not in data and "test" not in data
-    assert len(next(data["train"]())["image"]) == 4
