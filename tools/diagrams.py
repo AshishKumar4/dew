@@ -174,7 +174,7 @@ def architecture(theme: str) -> None:
     d.cell(X0 + (W - GAP) * 0.62 + GAP, y, (W - GAP) * 0.38, H, "dew.interop", "safetensors, Hugging Face layout")
     y += ROW
     d.layer_label(y, H, "training")
-    d.cell(X0, y, W, H, "dew.training", "ObjectiveTrainer: mesh, jit, EMA, accumulation, checkpoints, logging")
+    d.cell(X0, y, W, H, "dew.training", "Trainer: mesh, compiled step, EMA, accumulation, checkpoints, tracker")
     y += ROW
     d.layer_label(y, H, "objectives")
     d.cell(X0, y, third, H, "dew.objectives", "Diffusion, JEPA, language models; the plug-in", accent=True)
@@ -263,7 +263,7 @@ def mesh(theme: str) -> None:
 
 def seam(theme: str) -> None:
     d = Diagram(1200, 330, theme)
-    d.cell(24, 24, 460, 68, "ObjectiveTrainer", "mesh, compiled step, optimizer, EMA, checkpoints, logging")
+    d.cell(24, 24, 460, 68, "Trainer", "mesh, compiled step, optimizer, EMA, checkpoints, tracker")
     d.cell(716, 24, 460, 68, "Objective", "init_params, loss, make_validation_step, log_validation_artifacts", accent=True)
     calls = [("at start", "init_params(rng)", "parameter tree, any number of modules"),
              ("every step", "loss(params, ema_params, batch, rng, step)", "scalar loss and a dict of metrics"),

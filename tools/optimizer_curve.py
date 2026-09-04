@@ -30,10 +30,12 @@ import tyro
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recipes" / "lm"))
 
-from dew.config import DataConfig, ModelConfig, OptimConfig, TrainerConfig  # noqa: E402
-from dew.data.dataloaders import load_data  # noqa: E402
+import dew  # noqa: E402,F401  registers the models and datasets
+from dew.config import OptimConfig  # noqa: E402
+from dew.data import TokenWindows  # noqa: E402
 from dew.objectives.lm import LMObjective  # noqa: E402
-from dew.training import ObjectiveTrainer  # noqa: E402
+from dew.registry import models, with_precision  # noqa: E402
+from dew.training import MeshSpec, Trainer  # noqa: E402
 from dew.training.distributed import DevicePrefetchIterator  # noqa: E402
 from dew.training.optim import build_optimizer  # noqa: E402
 
@@ -74,51 +76,39 @@ class Comparison:
 
 def run(config: Comparison) -> dict:
     meta = lm_recipe.read_meta(config.dataset)
-    vocab_size = int(meta["vocab_size"])
-    run_config = lm_recipe.LmRunConfig(
-        model=ModelConfig("causal_transformer", {
-            "emb_features": config.emb_features, "num_layers": config.num_layers,
-            "num_heads": config.num_heads}),
-        data=DataConfig(dataset=config.dataset, batch_size=config.batch_size,
-                        # A corpus this size is read from page cache, so a
-                        # worker pool costs more than it saves.
-                        worker_count=0, read_thread_count=1, read_buffer_size=1,
-                        worker_buffer_size=1),
-        optim=OptimConfig(
-            optimizer='adamw' if config.optimizer == UNSPLIT else config.optimizer,
-            learning_rate=config.learning_rate,
-            weight_decay=config.weight_decay),
-        trainer=TrainerConfig(distributed_training=False, multi_host=False,
-                              compilation_cache_dir=None, wandb_project=None),
-        sequence_length=config.sequence_length,
-        tokenizer=meta["tokenizer"],
-    )
-    data = load_data(lm_recipe.token_data_config(run_config))
-    model, model_config = lm_recipe.build_lm(
-        run_config, vocab_size, config.sequence_length)
-    objective = LMObjective(model, config.sequence_length, vocab_size=vocab_size,
-                            ema_decay=1.0)
+    vocab_size = meta["vocab_size"]
+    optim = OptimConfig(
+        optimizer='adamw' if config.optimizer == UNSPLIT else config.optimizer,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay)
+    # One worker and one read thread: the arms must see identical batches, and
+    # a curve is not a throughput measurement.
+    data = TokenWindows(path=config.dataset, seq_len=config.sequence_length, seed=config.seed,
+                        worker_count=0, read_threads=1, read_buffer=1,
+                        worker_buffer=1).load(batch=config.batch_size)
+    fields = with_precision(
+        "causal_transformer",
+        dict(vocab_size=vocab_size, emb_features=config.emb_features,
+             num_layers=config.num_layers, num_heads=config.num_heads,
+             max_seq_len=config.sequence_length),
+        dtype="bfloat16", attention_impl="auto")
+    model = models.build("causal_transformer", **fields)
+    objective = LMObjective(model, config.sequence_length, ema_decay=1.0)
 
-    trainer = ObjectiveTrainer(
-        model=model,
-        optimizer=build_solver(config, run_config.optim),
-        rngs=jax.random.PRNGKey(config.seed),
-        input_config=None,
-        objective=objective,
-        name=f"curve-{config.optimizer}-{config.learning_rate}",
-        wandb_config=None,
-        distributed_training=False,
-        checkpoint_base_path="/tmp/dew-optimizer-curve",
-    )
-    parameters = sum(x.size for x in jax.tree.leaves(trainer.state.params))
+    trainer = Trainer(objective, build_solver(config, optim),
+                      key=jax.random.key(config.seed), mesh=MeshSpec(fsdp=1),
+                      checkpoints=None, tracker=None)
+    abstract = jax.eval_shape(trainer.initial_state)
+    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+    parameters = sum(x.size for x in jax.tree.leaves(state.params))
 
-    train_step = trainer._define_train_step(batch_size=config.batch_size)
-    source = DevicePrefetchIterator(data["train"](), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
+    source = DevicePrefetchIterator(data.train(), trainer.batch_sharding)
+    train_step = trainer.compile(state, next(source))
+    scale = None
     losses = []
     start = time.time()
     for step in range(config.steps):
-        state, loss, _, rng, is_finite = train_step(state, rng, next(source))
+        state, scale, loss, _, is_finite = train_step(state, scale, next(source))
         losses.append(float(loss))
         if not bool(is_finite):
             raise RuntimeError(f"loss went non-finite at step {step}")
@@ -133,7 +123,7 @@ def run(config: Comparison) -> dict:
         "tokens": config.steps * config.batch_size * config.sequence_length,
         "corpus_tokens": meta.get("train_tokens"),
         "parameters": parameters,
-        "model": model_config,
+        "model": fields,
         "seed": config.seed,
         "seconds": seconds,
         "device": jax.devices()[0].device_kind,

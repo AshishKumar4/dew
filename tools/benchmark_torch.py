@@ -11,7 +11,7 @@ EMA copy of every parameter updated each step, and the finiteness check on the
 loss. Diffusion cases use fixed NumPy image, CFG-mask, timestep, and noise
 tensors. The paired JAX harness uses the same byte values. This avoids
 comparing JAX threefry with PyTorch Philox. The measured step is otherwise the
-whole of ObjectiveTrainer's train step, not a bare forward pass.
+whole of the Trainer's train step, not a bare forward pass.
 
 Environment: a uv venv at /tmp/torchbench with torch CUDA 12 wheels
 (see the report for the exact versions used). Compiler scratch and caches
