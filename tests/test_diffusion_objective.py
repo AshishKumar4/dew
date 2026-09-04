@@ -116,6 +116,16 @@ class Zero(nn.Module):
         return jnp.zeros_like(x) * self.param("w", nn.initializers.ones, ())
 
 
+def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
+    """The two sigma integrators hold only when alpha is 1; the cosine
+    preset is VP, and the mismatch surfaces when the objective is built."""
+    from dew.sampling import RK4
+    unconditional = InputSpec(Field("image", (RES, RES, 3)))
+    with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
+        DiffusionObjective(Zero(), presets.Cosine()(), unconditional, sampler=RK4())
+    DiffusionObjective(Zero(), presets.Karras()(), unconditional, sampler=RK4())
+
+
 def test_loss_is_the_weighted_error_of_the_prediction():
     """With a zero output, the Karras parameterization predicts x_0 as
     c_skip x_t, the target is x_0, and the loss is the EDM lambda weighted

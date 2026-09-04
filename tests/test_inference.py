@@ -1,10 +1,10 @@
 """Inference: a run directory through to a sample.
 
-A run writes its manifest next to its checkpoints; `TextToImage.from_run`
-rebuilds the model, the process, the inputs and the weights from those two
-things alone, and `from_pretrained` is the same on a pulled hub snapshot.
-Everything here drives the real pipeline from a checkpoint the trainer has
-just written.
+A run writes its resolved config as `run.json` next to its checkpoints;
+`TextToImage.from_run` builds the objective from it the way the recipe did
+and restores the weights, and `from_pretrained` is the same on a pulled hub
+snapshot. Everything here drives the real pipeline from a checkpoint the
+trainer has just written.
 """
 
 import dataclasses
@@ -17,17 +17,16 @@ import optax
 import pytest
 
 import dew.nn.backbones  # registers the models
-from dew.data import Dataset
+from dew.config import ModelConfig, TrainerConfig
+from dew.data import Dataset, OxfordFlowers
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.interop.manifest import Manifest
+from dew.inputs import ConditionEncoder, Field
 from dew.nn.dit import TextContext
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import encoders, models, presets
+from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.registry import encoders, presets, samplers
 from dew.sampling import CFG, Heun, TextToImage
-from dew.sampling import pipelines
 from dew.training import Checkpoints, Trainer
 
 RES = 8
@@ -40,8 +39,8 @@ MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio
 @encoders("stub_text")
 @dataclass(frozen=True, eq=False)
 class StubText(ConditionEncoder):
-    """A table lookup standing in for CLIP, rebuilt from its manifest fields
-    the way the real encoder is."""
+    """A table lookup standing in for CLIP, rebuilt from the run's text
+    condition the way the real encoder is."""
 
     checkpoint: str
     params: dict
@@ -69,13 +68,23 @@ class StubText(ConditionEncoder):
         return {"checkpoint": self.checkpoint}
 
 
+def run_config(directory, preset=presets.EDM(), seed=3):
+    """The resolved config of a tiny conditional DiT run in `directory`."""
+    return DiffusionRunConfig(
+        model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
+        data=OxfordFlowers(image_size=RES),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
+        preset=preset, sampler=samplers.Euler(), sampling_steps=3,
+        text=TextCondition(encoder="stub_text", checkpoint=f"stub-{seed}"))
+
+
 def make_run(directory, preset=presets.EDM(), seed=3):
-    """One training step of the tiny conditional DiT, its checkpoint and its
-    manifest in `directory`, as a recipe leaves them."""
-    inputs = InputSpec(Field("image", (RES, RES, 3)),
-                       {"textcontext": Condition(StubText.from_pretrained(f"stub-{seed}"))})
-    objective = DiffusionObjective(models.SimpleDiT(**MODEL), preset(), inputs)
-    encoder = inputs.conditions["textcontext"].encoder
+    """Two training steps of the tiny conditional DiT, its checkpoint and its
+    `run.json` in `directory`, as the recipe leaves them: the objective is
+    the config's own build."""
+    config = run_config(directory, preset, seed)
+    objective = config.build()
+    encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
                      (8, 1, RES, 3)).astype(np.uint8)
     batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
@@ -103,22 +112,17 @@ def make_run(directory, preset=presets.EDM(), seed=3):
     state = trainer.fit(Dataset(train=Stream, val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
-    Manifest(
-        config={"run": "test"},
-        model={"name": "simple_dit", "fields": MODEL},
-        inputs=inputs.to_json(),
-        preset={"name": presets.name_of(type(preset)), "fields": dataclasses.asdict(preset)},
-        autoencoder=None,
-    ).write(str(directory))
+    config.save(str(directory))
     return objective, state
 
 
 def test_pipeline_generates_from_a_run_directory(tmp_path):
-    """The whole offline path: the manifest and checkpoint a run wrote, the
+    """The whole offline path: the run.json and checkpoint a run wrote, the
     model, process, inputs and weights rebuilt from them, and a sample out."""
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     assert type(pipe.model).__name__ == "SimpleDiT" and pipe.model.emb_features == 16
+    assert pipe.model.output_channels == 3
     assert pipe.inputs.sample == Field("image", (RES, RES, 3))
     assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-3"
 
@@ -151,7 +155,7 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
 
 
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
-    """The manifest holds the preset's fields, so inference samples with the
+    """run.json holds the preset's fields, so inference samples with the
     shift the run trained with and not the preset default."""
     make_run(tmp_path, preset=presets.Flow(shift=3.0, logit_mean=0.5))
     pipe = TextToImage.from_run(str(tmp_path))
@@ -186,7 +190,19 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
                           pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key))
 
 
-def test_an_autoencoder_without_a_loader_is_refused():
-    with pytest.raises(ValueError, match="simple_autoencoder"):
-        pipelines.load_autoencoder({"name": "simple_autoencoder", "fields": {}})
-    assert pipelines.load_autoencoder(None) is None
+def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
+    """A run.json from another objective, or with a knob this class lacks,
+    raises instead of building something other than what was trained."""
+    config = run_config(tmp_path)
+    record = config.to_dict()
+    record["sampler_steps"] = 3
+    with pytest.raises(ValueError, match="sampler_steps"):
+        DiffusionRunConfig.from_dict(record)
+    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
+
+
+def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
+    config = dataclasses.replace(run_config(tmp_path), text=None)
+    objective = DiffusionRunConfig.from_dict(config.to_dict()).build()
+    assert objective.inputs.conditions == {}
+    assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
