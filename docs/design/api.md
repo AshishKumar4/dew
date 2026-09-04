@@ -1,6 +1,6 @@
 # The API: one registry, one objective, one trainer
 
-Design, 2026-09-03. Not built, except where a ticket in section 9 says otherwise. Every file and line cites `main` at `102baa4`, the commit the review in `docs/design/review-api-2026-09-03.md` read. The seven fix branches merged on top of it (`3d30a35` through `b39c62a`) moved some of those lines; the review names the fix commit for each.
+Design, 2026-09-03, **built and merged**. Sections 0 to 4 describe the surface that ships on `main`; section 11 lists where the built surface differs from what was drafted here, and section 10 was added afterwards. Section 1's "what is wrong today" and the seam table are the state of `102baa4`, which the review in `docs/design/review-api-2026-09-03.md` read, and are kept as the record of what was replaced rather than as a description of the code. The line citations in those two sections point at commits that no longer exist on `main`; every citation in sections 3, 10 and 11 points at the tree as it is.
 
 ## 0. The decisions
 
@@ -447,3 +447,20 @@ What stays flat, and this is most of it: every independent dial. `qk_norm`, `v_n
 Deleted rather than grouped: `mlp_ratio` beside `mlp_features`, because the intermediate size is the primitive and the ratio restates it; `profile_steps`, which restates one field of the `Profile` value the trainer already takes, so the config carries the value; `per_layer_input_dim: int = 0`, whose zero becomes None; and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values, so it is refused by name in that combination.
 
 Not condensed, on the second reading: `norm_eps` with the three norm-placement switches, and the attention dials with the head geometry. Each is an independent dial, so each stays a field.
+
+
+## 11. Where the built surface differs from this design
+
+Verified against the tree, not remembered. Nothing here is a compromise of a decision in section 0; each is a name or a shape that moved while being built.
+
+| Drafted | Built | Why |
+| --- | --- | --- |
+|`Manifest` written next to the checkpoints (3.9)|`RunConfig.save` writes `run.json`, and `RunConfig.load` reads it back into the same class|The resolved config already was the record. A second type holding the same fields would have been the drift section 10 forbids.|
+|`Solver.step(x, t, t_next, denoised, eps, state, key, process)` (3.5)|the same, with the denoiser as the last argument|Heun's corrector and RK4's stages evaluate the model again inside one step. Noted in 3.5 when it was found.|
+|`metrics = Registry[Callable[..., Metric]]` (3.1)|`Registry[Callable[..., Any]]`|A metric is a structural `Protocol`, so the factory's return cannot be spelled as the protocol without making every metric declare it nominally.|
+|`Condition.unconditional: Any` (3.6)|`str | float`|Those are the two things an unconditional branch substitutes today, and `Any` at a public field hides which.|
+|`pipelines.TextToImage.from_run` / `.from_pretrained` (3.10)|both built, plus `dew.io.publish(directory, name, tracker=)` as the one publishing path|Publishing left the trainer, as decision 5 asks; a recipe calls it after `fit`.|
+|`objectives` registry (3.1)|built, with `diffusion`, `masked_diffusion`, `jepa` and `lm` registered|As drafted. Recorded here because the design's example code predates the registry existing.|
+|`Trainer(step=...)` escape hatch (decision 11, T34)|built as `step: Callable[[Objective, GradientTransformation], StepFn] | None`|As drafted. It replaces the compiled body only; a rollout is host-side and effectful, so it is not this seam. `docs/design/post-training.md` section 4 states that boundary.|
+
+What section 10 added later, and what the second reading of it narrowed, is in section 10 itself. The ticket table in section 9 records the state at the time of the review and is not maintained against `main`; the suite and `tests/test_api_surface.py` are.

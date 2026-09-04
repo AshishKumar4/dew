@@ -9,11 +9,12 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import Iterator, Optional, TypeAlias
+from typing import Any, Iterator, Optional, Protocol, TypeAlias, runtime_checkable
 
 import jax
 import numpy as np
 from flax import linen as nn
+from flax.linen import spmd
 from jax.experimental import multihost_utils
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
@@ -121,11 +122,16 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     split stays whole, which the tolerance check turns into an error when it
     matters.
     """
-    names = list(axes)
+    names: list[str | None] = list(axes)
     while True:
+        mapped = spmd.logical_to_mesh_axes(tuple(names), rules)
+        if mapped is None:
+            raise ValueError(
+                f"the rules {rules} give the logical axes {tuple(names)} no mesh "
+                "assignment, so the parameter they name cannot be placed")
         assigned = [
             tuple(axis for axis in _mesh_axes(assignment) if mesh.shape[axis] > 1)
-            for assignment in nn.logical_to_mesh_axes(tuple(names), rules)]
+            for assignment in mapped]
         blocked = [
             dimension for dimension, mesh_axes in enumerate(assigned)
             if shape[dimension] % math.prod(mesh.shape[axis] for axis in mesh_axes)]
@@ -255,6 +261,19 @@ def shard_batch(sharding: NamedSharding, batch):
         lambda x: jax.make_array_from_process_local_data(sharding, np.asarray(x)), batch)
 
 
+@runtime_checkable
+class Checkpointable(Protocol):
+    """A data stream that can say where it stopped and be put back there.
+
+    grain's iterators satisfy this; a plain iterator does not, which is what
+    `fit` refuses when a run asks for checkpoints.
+    """
+
+    def get_state(self) -> Any: ...
+
+    def set_state(self, state: Any) -> None: ...
+
+
 class DevicePrefetchIterator:
     """Runs the host-to-device batch transfer a few batches ahead of the loop.
 
@@ -263,17 +282,18 @@ class DevicePrefetchIterator:
     """
 
     def __init__(self, iterator: Iterator, sharding: NamedSharding, depth: int = 2,
-                 source_state=None):
+                 source_state: Optional[bytes] = None):
         self._iterator = iter(iterator)
         self._sharding = sharding
-        self._queue = queue.Queue(maxsize=depth)
+        self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._terminal: Optional[BaseException] = None
-        self.checkpointable = hasattr(self._iterator, 'get_state')
+        self._source = self._iterator if isinstance(self._iterator, Checkpointable) else None
+        self.checkpointable = self._source is not None
         if source_state is not None:
-            if not self.checkpointable:
+            if self._source is None:
                 raise TypeError(
                     f"{type(self._iterator).__name__} cannot resume from a saved position")
-            self._iterator.set_state(self._position_for(source_state))
+            self._source.set_state(self._position_for(self._source, source_state))
         # Position of the source iterator as of the batch most recently handed
         # out, so a checkpoint resumes at the next unseen batch rather than at
         # whatever the prefetch thread has already raced ahead to.
@@ -281,22 +301,22 @@ class DevicePrefetchIterator:
         self._thread = threading.Thread(target=self._prefetch, daemon=True)
         self._thread.start()
 
-    def _position_as_bytes(self, state):
+    def _position_as_bytes(self, state) -> bytes:
         """A position a checkpoint can carry: grain's DataLoader iterator
         reports JSON bytes, its Dataset iterator (the packed loader) a dict,
         and the checkpoint holds one uint8 array either way."""
         return state if isinstance(state, bytes) else json.dumps(state).encode()
 
-    def _position_for(self, saved: bytes):
+    def _position_for(self, source: Checkpointable, saved: bytes):
         """`saved` back in the shape this iterator's set_state reads."""
-        return saved if isinstance(self._iterator.get_state(), bytes) else json.loads(saved)
+        return saved if isinstance(source.get_state(), bytes) else json.loads(saved)
 
     def _prefetch(self):
         try:
             while True:
                 batch = next(self._iterator)
-                state = (self._position_as_bytes(self._iterator.get_state())
-                         if self.checkpointable else None)
+                state = (self._position_as_bytes(self._source.get_state())
+                         if self._source is not None else None)
                 self._queue.put((shard_batch(self._sharding, batch), state))
         except StopIteration:
             self._queue.put(StopIteration())

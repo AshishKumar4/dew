@@ -128,8 +128,9 @@ class Trainer:
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
         self.objective = objective
-        self.optimizer = (optax.MultiSteps(optimizer, every_k_schedule=accumulation)
-                          if accumulation > 1 else optimizer)
+        self.optimizer: optax.GradientTransformation = (
+            optax.MultiSteps(optimizer, every_k_schedule=accumulation).gradient_transformation()
+            if accumulation > 1 else optimizer)
         self.key = key
         self.mesh = mesh
         self.layout = layout
@@ -185,15 +186,16 @@ class Trainer:
         abstract = jax.eval_shape(self.initial_state)
         shardings = self.shardings(abstract)
         self.layout.check(abstract.params, shardings.params, self.device_mesh)
-        resume = None if self.checkpoints is None else self.checkpoints.latest
-        if resume is None:
+        checkpoints = self.checkpoints
+        resume = None if checkpoints is None else checkpoints.latest
+        if checkpoints is None or resume is None:
             state = jax.jit(self.initial_state, out_shardings=shardings)()
             return state, shardings, None
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
-        state, position = self.checkpoints.restore(template, resume)
-        print(f"Resumed from step {resume} in {self.checkpoints.directory}")
+        state, position = checkpoints.restore(template, resume)
+        print(f"Resumed from step {resume} in {checkpoints.directory}")
         return state, shardings, position
 
     # ------------------------------------------------------------------
@@ -232,14 +234,16 @@ class Trainer:
             params = write_back(
                 {**state.params, "params": optax.apply_updates(state.params["params"], updates)},
                 aux.variables)
-            new_state = state.replace(step=state.step + 1, params=params, opt_state=opt_state)
+            new_state = dataclasses.replace(
+                state, step=state.step + 1, params=params, opt_state=opt_state)
 
             if finite is not None:
                 # Overflowed gradients mean the update did not happen, so the
                 # step counter, which every schedule reads, stays with the
                 # params and the optimizer state.
                 keep = functools.partial(jnp.where, finite)
-                new_state = new_state.replace(
+                new_state = dataclasses.replace(
+                    new_state,
                     step=keep(new_state.step, state.step),
                     params=jax.tree.map(keep, new_state.params, state.params),
                     opt_state=jax.tree.map(keep, new_state.opt_state, state.opt_state))
@@ -255,11 +259,15 @@ class Trainer:
                 due = True if finite is None else finite
                 if accumulation > 1:
                     due = due & ((state.step + 1) % accumulation == 0)
+                if state.ema is None:
+                    raise ValueError(
+                        "the objective declares an EMA and the state carries none; "
+                        "a state built by this trainer always holds one")
                 averaged = ema_update(state.ema, new_state.params, decay)
                 if due is not True:
                     averaged = jax.tree.map(functools.partial(jnp.where, due),
                                             averaged, state.ema)
-                new_state = new_state.replace(ema=averaged)
+                new_state = dataclasses.replace(new_state, ema=averaged)
             return new_state, scale, loss, aux
 
         return step
@@ -336,6 +344,11 @@ class Trainer:
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
+        profile, checkpoints = self.profile, self.checkpoints
+        if checkpoint_every and checkpoints is None:
+            raise ValueError(
+                "checkpoint_every asks for checkpoints and this trainer has no "
+                "checkpointer; pass Checkpoints(directory) to write any")
         source = data.train()
         if checkpoint_every and not hasattr(source, "get_state"):
             raise ValueError(
@@ -345,6 +358,9 @@ class Trainer:
         train = DevicePrefetchIterator(source, sharding, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
         compiled = None
+        # Rebound the moment the executable exists, so the first tick measures
+        # steps rather than the compile.
+        last_log_time = time.time()
         last_saved = current if self.checkpoints is not None and current else None
         interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
         steps_since_log = 0
@@ -381,11 +397,11 @@ class Trainer:
             bad_run = jnp.where(finite, 0, bad_run + 1)
             worst_bad_run = jnp.maximum(worst_bad_run, bad_run)
 
-            if tracing:
+            if tracing and profile is not None:
                 traced += 1
-                if traced == self.profile.steps:
+                if traced == profile.steps:
                     tracing = False
-                    self._stop_trace(traced, loss)
+                    self._stop_trace(traced, loss, profile)
 
             if current % log_every == 0:
                 self._check_finite(worst_bad_run, current)
@@ -409,30 +425,30 @@ class Trainer:
 
             # On its own clock, not the logging one: nested inside the log
             # tick, a cadence that did not divide log_every never fired at all.
-            if (checkpoint_every and current % checkpoint_every == 0
-                    and current < steps):
-                self.checkpoints.save(current, state, position,
-                                      {"loss": float(interval_loss / interval_steps)})
+            if (checkpoint_every and checkpoints is not None
+                    and current % checkpoint_every == 0 and current < steps):
+                checkpoints.save(current, state, position,
+                                 {"loss": float(interval_loss / interval_steps)})
                 last_saved = current
                 interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
 
-        if tracing:
+        if tracing and profile is not None:
             # The window outlived the run, and a trace left running takes the
             # next one down with it.
-            self._stop_trace(traced, loss)
+            self._stop_trace(traced, loss, profile)
         self._check_finite(worst_bad_run, current)
         if eval_every:
             self._evaluate(state, data, metrics, mesh, current)
-        if self.checkpoints is not None and last_saved != current:
+        if checkpoints is not None and last_saved != current:
             # The in-loop saves are conditional, so the state the run ends on
             # may never have been written. It goes out under its real step,
             # because a step-0 checkpoint holding the final weights would make
             # a resume restart the schedule from the beginning.
-            self.checkpoints.save(
+            checkpoints.save(
                 current, state, position,
                 {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
-        if self.checkpoints is not None:
-            self.checkpoints.wait()
+        if checkpoints is not None:
+            checkpoints.wait()
         return state
 
     # ------------------------------------------------------------------
@@ -498,11 +514,11 @@ class Trainer:
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss):
+    def _stop_trace(self, traced: int, loss, profile: Profile) -> None:
         """Close the profiler window once its last step has actually landed."""
         loss.block_until_ready()
         jax.profiler.stop_trace()
-        print(f"Wrote profile for {traced} steps to {self.profile.directory}")
+        print(f"Wrote profile for {traced} steps to {profile.directory}")
 
     def _check_finite(self, worst_bad_run, step: int):
         """Fail a diverged run loudly rather than papering over it.
