@@ -15,7 +15,7 @@ import pytest
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.training import distributed
+import dew.nn.moe  # declares the expert and gate axes the two MoE cases read
 from dew.training.optim import build_optimizer, muon_weight_dimension_numbers
 
 LR = 1e-3
@@ -36,7 +36,7 @@ def dit_params():
 
 def muon_solver(**kwargs):
     return build_optimizer(OptimConfig(optimizer='muon', learning_rate=LR, **kwargs),
-                           steps_per_epoch=10)
+                           steps=10)
 
 
 def fixed_gradients(params):
@@ -239,11 +239,11 @@ def test_both_groups_step_with_the_one_schedule():
     grads = fixed_gradients(params)
     schedule = dict(learning_rate=1e-4, learning_rate_peak=4e-3,
                     learning_rate_end=1e-3, learning_rate_schedule='cosine',
-                    learning_rate_warmup_steps=1, learning_rate_decay_epochs=1)
+                    learning_rate_warmup_steps=1, learning_rate_decay_steps=4)
     scheduled = build_optimizer(OptimConfig(optimizer='muon', **schedule),
-                                steps_per_epoch=4)
+                                steps=4)
     unscaled = build_optimizer(OptimConfig(optimizer='muon', learning_rate=1.0),
-                               steps_per_epoch=4)
+                               steps=4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=schedule['learning_rate'], peak_value=schedule['learning_rate_peak'],
         warmup_steps=schedule['learning_rate_warmup_steps'], decay_steps=4,
@@ -263,16 +263,14 @@ def test_both_groups_step_with_the_one_schedule():
                 rtol=2e-4, atol=1e-12, err_msg=f"step {step} {path}")
 
 
-def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time(monkeypatch):
+def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
     """A routed expert kernel is [experts, embed, mlp], one matrix per expert
-    stacked on the leading dimension (wave/moe's declaration). Muon has to
+    stacked on the leading dimension (SparseMLP's declaration). Muon has to
     treat that dimension as a batch and orthogonalize each expert on its own,
     so the update equals the updates of the single matrices stacked back up.
     Contracting the expert dimension instead would mix the experts, and the
     loss curve is the only place it would show.
     """
-    monkeypatch.setitem(distributed.DEFAULT_LOGICAL_PARAM_AXES,
-                        ("experts", "gate_proj"), ("exp", "embed", "mlp"))
     experts, embed, mlp = 3, 8, 16
     params = {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
         'kernel': jnp.zeros((experts, embed, mlp))}}}}}}
@@ -290,14 +288,12 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time(monkeypatch):
                                    np.asarray(expected['kernel']), atol=1e-8)
 
 
-def test_the_router_gate_takes_the_adamw_update(monkeypatch):
+def test_the_router_gate_takes_the_adamw_update():
     """A router gate is declared ('embed', 'exp'): one column per expert, so
     its output side counts choices rather than features, and the labs keep
     the router on AdamW along with the embeddings and the head. The same axis
     name leads the expert kernels, where it stacks matrices, so position is
     what tells the two apart."""
-    monkeypatch.setitem(distributed.DEFAULT_LOGICAL_PARAM_AXES,
-                        ("gate",), ("embed", "exp"))
     params = {'params': {'layers_0': {'mlp': {'gate': {
         'kernel': jnp.zeros((8, 4))}}}}}
     path = ('params', 'layers_0', 'mlp', 'gate', 'kernel')

@@ -11,11 +11,12 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import MODEL_REGISTRY, apply_precision_policy, build_model
+from dew.registry import models, with_precision
 
 VOCAB = 37
 SEQ = 12
@@ -124,12 +125,12 @@ def test_sliding_window_agrees_across_kernels(rng):
 
 
 def test_registry_builds_the_backbone_and_takes_the_precision_policy():
-    assert MODEL_REGISTRY['causal_transformer'] is CausalTransformer
-    config = apply_precision_policy(
+    assert models['causal_transformer'] is CausalTransformer
+    config = with_precision(
         'causal_transformer', {'vocab_size': VOCAB, 'emb_features': 32,
                                'num_layers': 2, 'num_heads': 4, 'max_seq_len': 16},
         dtype='bfloat16', attention_impl='reference')
-    model = build_model('causal_transformer', config)
+    model = models.build('causal_transformer', **config)
     assert isinstance(model, CausalTransformer)
     assert model.dtype is jnp.bfloat16
     assert model.attention_impl is None
@@ -670,3 +671,66 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
     # at 1 moves 1..5 and stops there rather than running into 6.
     assert [int(index) for index in jnp.where(moved)[0]] == list(
         range(flipped, flipped + 5))
+
+
+def test_the_qk_norm_reads_the_model_norm_eps(rng):
+    """Qwen3 and Gemma3 build the head norms with config.rms_norm_eps
+    (modeling_qwen3.py:237-238, modeling_gemma3.py:338-339), so the epsilon
+    the q/k norms use is the model's, not a hardcoded 1e-5. At a large
+    epsilon the two are far apart on small activations."""
+    ids = tokens(rng)
+    small = tiny(norm_eps=1e-6)
+    large = tiny(norm_eps=10.0)
+    params = small.init(rng, ids)
+    layer = params["params"]["layers_0"]["self_attn"]
+    x = jax.random.normal(rng, (2, 4, 4, 8)) * 0.01
+    q_small = small.bind(params).layers[0].self_attn.q_norm(x)
+    q_large = large.bind(params).layers[0].self_attn.q_norm(x)
+    assert not jnp.allclose(q_small, q_large, rtol=1e-2)
+    del layer
+
+
+def test_the_tied_head_multiplies_in_fp32_under_bf16_compute(rng):
+    """The head reads the fp32 embedding table and the fp32 states: casting
+    both to bf16 before the einsum, then up, is a different number, and the
+    loss the optimizer sees is the fp32 one."""
+    model = tiny(dtype=jnp.bfloat16)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    logits = model.apply(params, ids)
+    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
+    table = params["params"]["embed_tokens"]["embedding"]
+    fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table.astype(jnp.float32))
+    bf16 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.bfloat16),
+                      table.astype(jnp.bfloat16)).astype(jnp.float32)
+    np.testing.assert_allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
+    assert not np.allclose(np.asarray(logits), np.asarray(bf16), atol=1e-6)
+
+
+def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
+    """Gemma scales in fp32 and casts the product; Llama and Qwen3 cast the
+    normalized activations and scale in bf16 (modeling_qwen3.py:61-64). The
+    two agree at fp32 and differ under bf16, and the HF translation picks per
+    family."""
+    from dew.nn.backbones.causal_transformer import RMSNorm
+    from dew.interop.hf_decoders import translate_config
+
+    x = jax.random.normal(rng, (2, 4, 32), jnp.bfloat16) * 3
+    variables = {"params": {"scale": jax.random.uniform(rng, (32,), minval=0.5, maxval=1.5)}}
+    gemma = RMSNorm(scale_after_cast=False).apply(variables, x)
+    llama = RMSNorm(scale_after_cast=True).apply(variables, x)
+    assert gemma.dtype == llama.dtype == jnp.bfloat16
+    assert not jnp.array_equal(gemma, llama), "bf16 cannot tell the two orders apart"
+    fp32 = x.astype(jnp.float32)
+    np.testing.assert_allclose(np.asarray(RMSNorm(scale_after_cast=False).apply(variables, fp32)),
+                               np.asarray(RMSNorm(scale_after_cast=True).apply(variables, fp32)),
+                               rtol=1e-6)
+
+    base = {"model_type": "llama", "hidden_size": 32, "num_hidden_layers": 1,
+            "num_attention_heads": 4, "intermediate_size": 64, "vocab_size": 64,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "hidden_act": "silu"}
+    assert translate_config(base)["scale_after_cast"] is True
+    assert translate_config({**base, "model_type": "qwen3", "head_dim": 8})["scale_after_cast"] is True
+    gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
+                    "query_pre_attn_scalar": 8, "sliding_window": 4}
+    assert translate_config(gemma_config)["scale_after_cast"] is False
