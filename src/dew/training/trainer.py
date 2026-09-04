@@ -178,7 +178,7 @@ class Trainer:
         """The layout's placement of `state`, leaf for leaf."""
         return self.layout.shardings(self.device_mesh, state)
 
-    def _place(self):
+    def place(self):
         """The state itself, fresh or restored, on the mesh, with its shardings
         and the data position a resume continues from."""
         abstract = jax.eval_shape(self.initial_state)
@@ -330,7 +330,7 @@ class Trainer:
         mesh = self.device_mesh
         sharding = self.batch_sharding
         process_zero = jax.process_index() == 0
-        state, shardings, position = self._place()
+        state, shardings, position = self.place()
         current = int(state.step)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
