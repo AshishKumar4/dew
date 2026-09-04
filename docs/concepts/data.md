@@ -13,7 +13,7 @@ assert dew.datasets["oxford_flowers102"] is OxfordFlowers
 
 `Dataset.train()` opens an endless shuffled stream of global batches. `Dataset.val()` opens one pass over the held-out records in a fixed order that ends by itself, and is `None` when nothing is held out. `records` is the count behind the training stream, so `steps_per_epoch` is one pass over them, and `batch` is the global batch. Image and video fields are uint8 in `[0, 255]`; tokenized text is the `{"input_ids", "attention_mask"}` dict an encoder's `tokenize` produces, under `"text"`; a token window is int32 ids under `"text"`. An objective converts pixels to `[-1, 1]` itself through `dew.inputs.unit_range`, so the dataset stays what the reader decoded.
 
-The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.worker-count 16`. A new dataset is a dataclass behind `@datasets(name)`; it appears on the command line with nothing else written.
+The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.loading.workers 16`. A new dataset is a dataclass behind `@datasets(name)`; it appears on the command line with nothing else written.
 
 ## What every spec shares
 

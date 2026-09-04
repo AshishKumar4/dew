@@ -157,7 +157,7 @@ def indexed_loader(records: int, batch: int = BATCH):
                                      num_epochs=1,
                                      shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
-        loading=Loading(workers=0),
+        worker_count=0,
     )
 
 
