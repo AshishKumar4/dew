@@ -83,14 +83,19 @@ def test_read_av_improved_without_an_end_reads_to_the_clip_end(stub_reader):
 # Real decoding: needs the native readers and ffmpeg
 # ---------------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def synthesized_clip(tmp_path_factory):
+def needs_rsreader():
+    """`video-reader-rs` is not in the `av` extra and its wheel needs libwebp
+    present, so a test that decodes through it skips rather than fails. A
+    missing module and a module whose native library will not load are the
+    same thing here; pytest.importorskip re-raises the second."""
     try:
-        # A missing reader and a reader whose native library will not load are
-        # the same thing to a test: pytest.importorskip re-raises the second.
         importlib.import_module("video_reader")
     except ImportError as error:
         pytest.skip(f"PyVideoReader is unusable here: {error}")
+
+
+@pytest.fixture(scope="module")
+def synthesized_clip(tmp_path_factory):
     if shutil.which("ffmpeg") is None:
         pytest.skip("needs the ffmpeg binary")
 
@@ -110,6 +115,7 @@ def synthesized_clip(tmp_path_factory):
 
 
 def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
+    needs_rsreader()
     audio, video = read_av_improved(str(synthesized_clip), start=5, end=15, fps=FPS)
 
     assert len(video) == 10
@@ -119,14 +125,18 @@ def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
     assert len(full_video) > len(video)
 
 
-# Each random-clip reader's own decoder; all of them also need PyVideoReader.
+# Each random-clip reader's own decoder. 'moviepy' is the default and reads
+# from wheels alone; the other two decode their frames with PyVideoReader.
 _CLIP_READER_DEPS = {"pyav": "av", "alt": "moviepy", "moviepy": "moviepy"}
+_CLIP_READERS_NEEDING_RSREADER = ("pyav", "alt")
 
 
 @pytest.mark.parametrize("method", sorted(_CLIP_READER_DEPS))
 def test_random_clip_readers_are_seeded_locally(synthesized_clip, method):
     """Same seed, same clip; and no reader may reseed the process-global RNG."""
     pytest.importorskip(_CLIP_READER_DEPS[method])
+    if method in _CLIP_READERS_NEEDING_RSREADER:
+        needs_rsreader()
 
     np.random.seed(99)
     global_state = np.random.get_state()[1].copy()

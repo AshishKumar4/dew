@@ -43,7 +43,13 @@ def get_video_fps(video_path: str):
     cam.release()
     return fps
 
-def read_video(video_path: str, change_fps=False, reader="rsreader"):
+def read_video(video_path: str, change_fps=False, reader="opencv"):
+    """Every frame of `video_path` as RGB uint8.
+
+    `reader` defaults to opencv because it works from the wheels the `av`
+    extra installs. `decord` and `rsreader` are faster on long files and stay
+    reachable by name; each needs more than a wheel, and says so.
+    """
     temp_dir = None
     try:
         if change_fps:
@@ -78,6 +84,8 @@ def read_video(video_path: str, change_fps=False, reader="rsreader"):
             shutil.rmtree(temp_dir)
 
 def read_video_decord(video_path: str):
+    """`decord`, whose wheel is x86-64 Linux only; opencv is the default for
+    that reason."""
     from decord import VideoReader
     vr = VideoReader(video_path)
     video_frames = vr[:].asnumpy()
@@ -99,6 +107,10 @@ def read_video_opencv(video_path):
         cap.release()
 
 def read_video_rsreader(video_path, fast=False):
+    """`video-reader-rs`, which is not in the `av` extra: its wheel links
+    libwebp's libsharpyuv and does not carry it, so it imports only where
+    that library is installed system-wide. Install it yourself if you want
+    it, and pass `reader="rsreader"`."""
     from video_reader import PyVideoReader
     vr = PyVideoReader(video_path)
     return vr.decode_fast() if fast else vr.decode()
@@ -571,7 +583,7 @@ def read_av_random_clip(
     target_sr: int = 16000,
     target_fps: float = 25.0,
     random_seed: Optional[int] = None,
-    method: str = 'alt'
+    method: str = 'moviepy'
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Read a random clip of audio and video frames using specified method.
@@ -584,7 +596,10 @@ def read_av_random_clip(
         target_fps (float): Target frames per second for video.
         random_seed (Optional[int]): Seed for random number generator.
         method (str): Method to use for reading the clip.
-            Options: 'moviepy', 'alt', 'pyav'.
+            Options: 'moviepy', 'alt', 'pyav'. 'moviepy' is the default
+            because it reads from the wheels the `av` extra installs; 'alt'
+            and 'pyav' decode their frames with `video-reader-rs`, which the
+            extra does not install (see `read_video_rsreader`).
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray]: Tuple of (frame_wise_audio, full_padded_audio, video_frames).
             - frame_wise_audio: Shape (1, num_frames, 1, audio_data_per_frame)
