@@ -124,17 +124,20 @@ def _rope(hf_config: Mapping[str, Any], used: set) -> Tuple[float, Optional[floa
 def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
     """Per-layer attention windows, derived the way the family's config does.
 
-    A config that carries layer_types is taken at its word. Without it, qwen3
-    makes every layer from max_window_layers on sliding, and only when
-    use_sliding_window says so; gemma3_text repeats its sliding_window_pattern,
-    five sliding layers to one full; llama has no sliding layers at all.
+    A config that carries layer_types is taken at its word, except that
+    gemma4_text forces its last layer full whatever the config says, which is
+    what its own config class does (configuration_gemma4.py:197-201). Without
+    layer_types, qwen3 makes every layer from max_window_layers on sliding,
+    and only when use_sliding_window says so; gemma3_text repeats its
+    sliding_window_pattern and gemma4_text a fixed period of six, five
+    sliding layers to one full; llama has no sliding layers at all.
     """
     layers = int(hf_config['num_hidden_layers'])
     model_type = hf_config.get('model_type')
     layer_types = hf_config.get('layer_types')
     if layer_types is not None:
         used.add('layer_types')
-        return tuple(layer_types)
+        return _last_layer_full(tuple(layer_types), model_type)
 
     if model_type == 'qwen3':
         used.update(('use_sliding_window', 'sliding_window'))
@@ -145,13 +148,35 @@ def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
         return tuple('sliding_attention' if index >= first_sliding else 'full_attention'
                      for index in range(layers))
 
-    if model_type == _GEMMA:
-        pattern = int(hf_config.get('sliding_window_pattern', 6))
-        used.add('sliding_window_pattern')
-        return tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
-                     for index in range(layers))
+    if model_type in (_GEMMA, 'gemma4_text'):
+        # Gemma 3 reads its period from the config; Gemma 4 fixes it at six
+        # (configuration_gemma4.py:190-195), so a gemma4 config that omits
+        # the pattern is a 5:1 stack and not the all-full model this read as
+        # one before.
+        if model_type == _GEMMA:
+            pattern = int(hf_config.get('sliding_window_pattern', 6))
+            used.add('sliding_window_pattern')
+        else:
+            pattern = 6
+        return _last_layer_full(
+            tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
+                  for index in range(layers)), model_type)
 
     return ('full_attention',) * layers
+
+
+def _last_layer_full(layer_types: Tuple[str, ...], model_type: Optional[str]
+                     ) -> Tuple[str, ...]:
+    """Gemma 4's rule that the last layer attends the whole sequence.
+
+    Gemma4TextConfig rewrites a trailing sliding layer to full and warns
+    (configuration_gemma4.py:197-201), so the weights of a checkpoint whose
+    config ends in a sliding layer were trained with a full one, and reading
+    that config at its word would build a different model.
+    """
+    if model_type != 'gemma4_text' or not layer_types:
+        return layer_types
+    return layer_types[:-1] + ('full_attention',)
 
 
 def _kinds(layer_types: Tuple[str, ...], window: Optional[int],
