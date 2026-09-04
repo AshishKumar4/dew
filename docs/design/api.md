@@ -424,27 +424,26 @@ Status: `open`, `done` with the commit, or `held` with the reason. Type: `fix`, 
 | T34 | design | wave 2 | `Trainer(step=...)` escape hatch | a GAN-style alternating step runs on the same checkpoints and tracker |
 | T35 | docs | open, workhorse | `tests/test_architectures.py:290` docstring (done in the docs commit) and `tests/test_parallelism.py:855` pattern note | docstrings describe the raising loop |
 
-## 10. Values, not field bags
+## 10. What may be condensed
 
-Measured on the tree that landed: 53 constructors take more than eight fields, `CausalTransformer` takes 42, `CausalSelfAttention` 22, and five of `Router`'s routing options, each already pinned against transformers, could not be named from a config at all. Wide flat constructors are how that happens: a family's convention arrives as three or four booleans, an off switch arrives as a zero, and the same knob is declared again at every level it passes through.
+Measured on the tree that landed: 53 constructors take more than eight fields, `CausalTransformer` takes 42, and five of `Router`'s routing options, each already pinned against transformers, could not be named from a config at all. Both of those are worth fixing, and only one of them is fixed by grouping.
 
-The rule, and it applies to every module and every config in the tree:
+The rule, and it is narrow on purpose:
 
-1. Fields become one value when they are set together, mean nothing apart, and name one thing that model families vary. Four booleans that all come from one family's choice are one value; two unrelated switches are two fields.
-2. A feature that is off by default is `Value | None`. That replaces a `0`, an empty tuple or an empty string standing in for "off", and it makes a dependent knob impossible to set without the thing it depends on.
-3. Nothing says one thing twice. Where one field derives from another, keep the primitive one and delete the convenience.
-4. Every value stays a dict. `dew.registry.from_record` builds a declared value from a record at the build boundary, so `attention={"heads": 8}` from the command line and `attention=Attention(heads=8)` from code agree, mappings and tuples of values are walked, and a run record round-trips without a second serialiser.
+1. Condense what is redundant. That is a field another field derives, the same dial declared a second time under a second name, the same dials declared again on a second base, and a sentinel value standing in for a feature being off when the rest of that feature's fields mean nothing without it.
+2. Cohesion is not a reason. Dials that one model family happens to set together stay separate dials, because the next run wants three of them and not the fourth. A family's convention is not a type.
+3. A feature that is off by default becomes `Value | None` only in the sentinel case above, where its other fields depend on it. Then nothing is taken away: every dial is still set by name, inside the value.
+4. Every value stays a dict. `dew.registry.from_record` builds a declared value from a record at the build boundary, so `mixture={"experts": 8}` from the command line and `mixture=Mixture(experts=8)` from code agree, mappings and tuples of values are walked, and a run record round-trips without a second serialiser.
 
-What stays flat: a model's identity (`vocab_size`, `emb_features`, `num_layers`, `num_heads`, `num_kv_heads`), the precision policy the run writes (`dtype`, `precision`, `attention_impl`, `force_fp32_for_softmax`), and any switch that answers to nothing else.
+What stays flat, and this is most of it: every independent dial. `qk_norm`, `v_norm`, `attention_bias`, `attention_scale`, `sandwich_norms`, `scale_offset`, `scale_after_cast`, `norm_eps`, `embedding_scale`, `final_logit_softcap` and `tie_embeddings` are each settable on their own and each mean something on their own, so they are each a field. Grouping them would read tidier and would cost a user the ability to vary one.
 
-| value | replaces | where |
-|---|---|---|
-|`Attention`: heads, kv_heads, head_dim, bias, scale, qk_norm, v_norm, partial_rotary|the same eight fields on every backbone that attends, and their forwarding into the attention modules|`dew.nn.attention`, adopted by every backbone|
-|`Norms`: eps, scale_offset, after_cast, sandwich|`norm_eps`, `scale_offset`, `scale_after_cast`, `sandwich_norms`|`dew.nn`, adopted by the decoders|
-|`LayerKind`: window, rope_theta, head_dim|`sliding_window`, `rope_local_theta`, `global_head_dim`, whose names carry the local and global convention instead of the pattern doing it|`CausalTransformer`, keyed by the names in its layer pattern|
-|`Mixture`: experts, top_k, layers, every, score_function, scaling, groups, groups_per_token, bias|`num_experts` (with its `0` for dense), `top_k`, `moe_every`, `moe_layers`, `expert_bias`, and reaches the routing options nothing could name|`CausalTransformer`|
-|`Loading`: workers, threads, read_buffer, worker_buffer|the same four grain knobs declared on three unrelated dataset bases|`dew.data`, shared by every spec|
-|`Wandb`: project, entity, offline|`wandb_project`, `wandb_entity`, `wandb_offline`, and the rule that an unset project means no tracker|`TrainerConfig`|
-|`Checkpointing`: directory, every, keep|`checkpoint_dir`, `checkpoint_every`, `keep`|`TrainerConfig`|
+| condensed | why it is redundant |
+|---|---|
+|`Mixture`: experts, top_k, layers, every, score_function, scaling, groups, groups_per_token, bias|`num_experts: int = 0` is a sentinel for dense, and `top_k`, `moe_every`, `moe_layers` and `expert_bias` mean nothing with no experts. The five routing options nothing can name today come with it, at no width.|
+|`LayerKind`: window, rope_theta, head_dim, keyed by the names in the layer pattern|`rope_local_theta` beside `rope_theta` and `global_head_dim` beside `head_dim` are one dial named twice, with the local and global convention carried in the names instead of by the pattern that already names each layer's kind. `sliding_window` is that kind's window.|
+|`Loading`: workers, threads, read_buffer, worker_buffer|The same four grain knobs are declared on three unrelated dataset bases.|
+|`Wandb`: project, entity, offline|`wandb_entity` and `wandb_offline` mean nothing with no project, and an unset project is today's sentinel for running without a tracker.|
 
-Derived fields deleted with them: `mlp_ratio` beside `mlp_features` (families state the intermediate size, and the ratio only restates it), `per_layer_input_dim`'s zero, and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values.
+Deleted rather than grouped: `mlp_ratio` beside `mlp_features`, because the intermediate size is the primitive and the ratio restates it; `profile_steps`, which restates one field of the `Profile` value the trainer already takes, so the config carries the value; `per_layer_input_dim: int = 0`, whose zero becomes None; and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values, so it is refused by name in that combination.
+
+Not condensed, on the second reading: `norm_eps` with the three norm-placement switches, and the attention dials with the head geometry. Each is an independent dial, so each stays a field.
