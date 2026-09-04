@@ -21,11 +21,15 @@ import json
 import os
 import types
 import typing
-from typing import Annotated, Any, Literal, Mapping, Optional, Self
+from typing import (TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self,
+                    TypeAlias, Union)
 
 import tyro
 
+from etils import epath
+
 import dew.data  # noqa: F401  registers the datasets a config names
+from dew.data import DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.registry import datasets, models, with_precision
@@ -44,6 +48,14 @@ JsonDict = Annotated[
     ),
 ]
 """A dict, written as a single JSON string on the command line."""
+
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, a Union of the registered specs, and a
+    # type checker cannot read a variable in a type expression. Both get what
+    # they need: the base class statically, the union at runtime.
+    DataSpec: TypeAlias = DatasetSpec
+else:
+    DataSpec = datasets.union
 
 RUN_FILE = "run.json"
 
@@ -116,8 +128,14 @@ class TrainerConfig:
     epochs: Optional[int] = None
     """Run length as passes over the data; `steps` names it directly instead."""
     log_every: int = 100
-    eval_every: Optional[int] = None
-    checkpoint_every: Optional[int] = None
+    eval_every: Union[int, Literal["epoch"], None] = "epoch"
+    """Steps between validation passes: a number of steps, "epoch" for one
+    pass over the data, None to never validate. "epoch" over a stream that
+    reports no record count is refused by name, since it has no pass."""
+    checkpoint_every: Union[int, Literal["epoch"], None] = "epoch"
+    """Steps between checkpoints, the same three answers. None is what a
+    stream whose iterator cannot report a read position trains with; the
+    trainer refuses any other answer for one."""
     accumulation: int = 1
     """Micro-batches per optimizer update."""
     dynamic_scale: bool = False
@@ -155,6 +173,24 @@ class TrainerConfig:
                 "one, so give the run length as --trainer.steps")
         return self.epochs * data.steps_per_epoch
 
+    def eval_interval(self, data) -> Optional[int]:
+        """Steps between validation passes over `data`, or None for never."""
+        return self._interval(self.eval_every, data, "eval-every")
+
+    def checkpoint_interval(self, data) -> Optional[int]:
+        """Steps between checkpoints over `data`, or None for never."""
+        return self._interval(self.checkpoint_every, data, "checkpoint-every")
+
+    @staticmethod
+    def _interval(value, data, flag: str) -> Optional[int]:
+        if value is None or isinstance(value, int):
+            return value
+        if data.steps_per_epoch is None:
+            raise ValueError(
+                f"--trainer.{flag} epoch needs a dataset with a record count; this "
+                f"one streams without one, so give the interval in steps or None")
+        return data.steps_per_epoch
+
 
 def _registry_for(annotation):
     """The registry whose members the annotation names, or None."""
@@ -165,7 +201,8 @@ def _registry_for(annotation):
     return None
 
 
-def _to_json(value):
+def _to_json(value) -> Any:
+    """`value` as JSON: a dict, a list, or a scalar json.dump can write."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name))
@@ -190,12 +227,14 @@ def _fields(cls, values):
     return {name: _rebuild(hints[name], values[name]) for name in declared}
 
 
-def _rebuild(annotation, value):
+def _rebuild(annotation, value) -> Any:
+    """The value `annotation` asks for, built out of a record. Any is the
+    truth here: what comes back is whatever type the field declares."""
     held = _registry_for(annotation)
     if held is not None:
         member = held[value["name"]]
         return member(**_fields(member, value["fields"]))
-    if dataclasses.is_dataclass(annotation):
+    if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return annotation(**_fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
         inner = [m for m in typing.get_args(annotation) if m is not type(None)]
@@ -210,7 +249,7 @@ class RunConfig:
     """A whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: datasets.union = dataclasses.field(
+    data: DataSpec = dataclasses.field(
         default_factory=lambda: datasets["oxford_flowers102"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
@@ -218,7 +257,8 @@ class RunConfig:
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe record of the run; a registered member is written as its
         name and fields."""
-        return _to_json(self)
+        return {field.name: _to_json(getattr(self, field.name))
+                for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> Self:
@@ -227,15 +267,19 @@ class RunConfig:
         return _rebuild(cls, values)
 
     def save(self, directory: str) -> str:
-        """Write this config as `run.json` in `directory` and return the path."""
-        os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, RUN_FILE)
-        with open(path, "w") as handle:
-            json.dump(self.to_dict(), handle, indent=2, sort_keys=True)
-        return path
+        """Write this config as `run.json` in `directory` and return the path.
+
+        The path goes through `epath`, the same filesystem layer orbax writes
+        the checkpoints with, so a `gs://` run directory takes the record too
+        instead of failing a pod run after the training succeeded.
+        """
+        path = epath.Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        target = path / RUN_FILE
+        target.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
+        return str(target)
 
     @classmethod
     def load(cls, directory: str) -> Self:
         """The config a run in `directory` was built from, as this class."""
-        with open(os.path.join(directory, RUN_FILE)) as handle:
-            return cls.from_dict(json.load(handle))
+        return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))

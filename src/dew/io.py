@@ -7,9 +7,12 @@ on disk is never the copy that gets removed.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 
+from etils import epath
+import jax
+
+from dew.checkpoints import is_uri
 from dew.config import RUN_FILE
 from dew.training.tracker import WandbTracker
 
@@ -26,14 +29,31 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     spec is read from its parent, the run directory, so what is published is
     exactly what `Pipeline.from_run` needs. The artifact carries 'latest'
     and `aliases`; the registry link carries `aliases`.
+
+    Only process zero publishes, and it returns None everywhere else: every
+    process holds the same checkpoint, so a second upload is a duplicate of
+    the first rather than another part of the run.
+
+    A directory on a filesystem is uploaded. A URI is referenced instead: a
+    pod writes its checkpoints to the bucket, and the bytes are already
+    somewhere the registry can point at.
     """
+    if jax.process_index() != 0:
+        return None
+
     import wandb
 
     artifact = wandb.Artifact(name=name, type="model")
-    artifact.add_dir(directory)
-    spec = os.path.join(os.path.dirname(directory.rstrip(os.sep)), RUN_FILE)
-    if os.path.exists(spec):
-        artifact.add_file(spec)
+    path = epath.Path(directory)
+    spec = path.parent / RUN_FILE
+    if is_uri(directory):
+        artifact.add_reference(str(path))
+        if spec.exists():
+            artifact.add_reference(str(spec))
+    else:
+        artifact.add_dir(directory)
+        if spec.exists():
+            artifact.add_file(str(spec))
     logged = tracker.run.log_artifact(artifact, aliases=["latest", *aliases])
     tracker.run.link_artifact(
         artifact=logged, target_path=f"{registry}/{name}", aliases=list(aliases))

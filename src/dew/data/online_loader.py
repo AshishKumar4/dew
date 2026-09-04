@@ -37,8 +37,13 @@ def load_rows(sources: List[str], split: str = "train"):
     a hub dataset name read at `split`.
     """
     hf = _hf_datasets()
-    loaded = [hf.load_from_disk(source) if "gs://" in source
-              else hf.load_dataset(source, split=split) for source in sources]
+    loaded: List[Dataset] = []
+    for source in sources:
+        # load_from_disk hands back a DatasetDict for a directory of splits,
+        # and concatenate takes tables; a split is what a row source is.
+        table = (hf.load_from_disk(source) if "gs://" in source
+                 else hf.load_dataset(source, split=split))
+        loaded.append(table[split] if isinstance(table, hf.DatasetDict) else table)
     if len(loaded) == 1:
         return loaded[0]
     return hf.concatenate_datasets(loaded).shuffle(seed=0)
@@ -194,7 +199,8 @@ def fetch_single_video(video_url: str, timeout: Optional[int] = None, retries: i
     """
     # Create a temporary file to download the video
     import tempfile
-    
+
+    tmp_path = None
     for attempt in range(retries + 1):
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
@@ -238,11 +244,11 @@ def fetch_single_video(video_url: str, timeout: Optional[int] = None, retries: i
             print(f"Error fetching video {video_url}: {e}")
             
             # Clean up the temporary file
-            try:
-                if 'tmp_path' in locals():
+            if tmp_path is not None:
+                try:
                     os.remove(tmp_path)
-            except:
-                pass
+                except OSError:
+                    pass
                 
             return None
 
@@ -268,25 +274,24 @@ def default_image_processor(
         Processed image may be None if the image couldn't be processed.
     """
     try:
-        # Convert to numpy
-        image = np.array(image)
-        
+        pixels = np.asarray(image)
+
         # Check if image has 3 channels
-        if len(image.shape) != 3 or image.shape[2] != 3:
+        if len(pixels.shape) != 3 or pixels.shape[2] != 3:
             return None, 0, 0
-            
-        original_height, original_width = image.shape[:2]
-        
+
+        original_height, original_width = pixels.shape[:2]
+
         # Check if the image is too small
         if min(original_height, original_width) < min(min_image_shape):
             return None, original_height, original_width
-            
+
         # Check if wrong aspect ratio
         if max(original_height, original_width) / min(original_height, original_width) > 2.4:
             return None, original_height, original_width
-            
+
         # Check if the variance is too low (likely a blank/solid color image)
-        if np.std(image) < 1e-5:
+        if np.std(pixels) < 1e-5:
             return None, original_height, original_width
             
         # Choose interpolation method based on whether we're upscaling or downscaling
@@ -299,19 +304,19 @@ def default_image_processor(
         scale = max(image_shape) / max(original_height, original_width)
         resized = (max(1, round(original_width * scale)),
                    max(1, round(original_height * scale)))
-        image = cv2.resize(image, resized, interpolation=interpolation)
+        pixels = cv2.resize(pixels, resized, interpolation=interpolation)
 
         # Pad to the target shape, centred, on white
-        pad_height = max(0, image_shape[0] - image.shape[0])
-        pad_width = max(0, image_shape[1] - image.shape[1])
+        pad_height = max(0, image_shape[0] - pixels.shape[0])
+        pad_width = max(0, image_shape[1] - pixels.shape[1])
         if pad_height or pad_width:
             top, left = pad_height // 2, pad_width // 2
-            image = cv2.copyMakeBorder(
-                image, top, pad_height - top, left, pad_width - left,
+            pixels = cv2.copyMakeBorder(
+                pixels, top, pad_height - top, left, pad_width - left,
                 cv2.BORDER_CONSTANT, value=(255, 255, 255),
             )
-        
-        return image, original_height, original_width
+
+        return pixels, original_height, original_width
         
     except Exception as e:
         # Log the error
@@ -641,6 +646,8 @@ def _init_media_worker(data_queue: Queue):
 
 def _map_shard(batch: Dict[str, Any], **kwargs):
     """Pool entry point: map one shard onto this process's queue."""
+    if _worker_queue is None:
+        raise RuntimeError("the fetch pool's worker was started without a queue")
     map_batch(batch, data_queue=_worker_queue, **kwargs)
 
 

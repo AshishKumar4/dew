@@ -17,11 +17,16 @@ import sys
 import threading
 import time
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import optax
 import PIL.Image
 import pytest
 
 from dew.data import Loading, online_loader
+from dew.objectives.base import Aux, Objective
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.data.online_loader import (
     DROPPED_SAMPLE, MediaBatchIterator, OnlineStreamingDataLoader,
 )
@@ -417,3 +422,53 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
     assert len(next(loader)["image"]) == 4
     with pytest.raises(StopIteration):
         next(loader)
+
+
+class Mean(Objective):
+    """One scalar fitted to the batch mean: the smallest objective that reads a
+    batch, so what is under test is the streaming data path and nothing else."""
+
+    ema = None
+
+    def init(self, key):
+        return {"params": {"level": jnp.zeros(())}}
+
+    def loss(self, params, batch, step):
+        pixels = (jnp.asarray(batch["image"], jnp.float32) - 127.5) / 127.5
+        return jnp.mean((pixels - params["params"]["level"]) ** 2), Aux({})
+
+
+def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
+    trainer = Trainer(Mean(), optax.sgd(0.1), key=jax.random.key(0),
+                      mesh=MeshSpec(), layout=Layout(), checkpoints=checkpoints)
+    return trainer.fit(data, steps=steps, log_every=steps, eval_every=None,
+                       checkpoint_every=checkpoint_every)
+
+
+def test_the_streaming_spec_cannot_report_a_position(monkeypatch, stop):
+    """The iterator is the single answer to whether a run can checkpoint: the
+    fetch stream carries no get_state, and `tokenized` does not invent one."""
+    data = _online_spec(monkeypatch, 12, 1, stop).load(batch=4)
+
+    stream = data.train()
+    assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
+
+
+def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch, stop):
+    """The whole point of the gate: an online stream is trainable, six steps of
+    it, as long as the run does not ask for a position it cannot have."""
+    data = _online_spec(monkeypatch, 24, 6, stop).load(batch=8)
+
+    state = _run(data, steps=6)
+
+    assert int(state.step) == 6
+    assert jnp.isfinite(state.params["params"]["level"])
+
+
+def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, stop, tmp_path):
+    """And the other half: the refusal is by name, before any training."""
+    data = _online_spec(monkeypatch, 24, 6, stop).load(batch=8)
+
+    with pytest.raises(ValueError, match=r"checkpoint_every=None"):
+        _run(data, steps=6, checkpoints=Checkpoints(str(tmp_path / "ckpt")),
+             checkpoint_every=2)

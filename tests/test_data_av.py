@@ -6,6 +6,7 @@ plumbing is checked against a stubbed reader so it runs everywhere; the tests
 that decode real media skip when the libraries are missing.
 """
 
+import importlib
 import shutil
 import subprocess
 import sys
@@ -82,9 +83,19 @@ def test_read_av_improved_without_an_end_reads_to_the_clip_end(stub_reader):
 # Real decoding: needs the native readers and ffmpeg
 # ---------------------------------------------------------------------------------
 
+def needs_rsreader():
+    """`video-reader-rs` is not in the `av` extra and its wheel needs libwebp
+    present, so a test that decodes through it skips rather than fails. A
+    missing module and a module whose native library will not load are the
+    same thing here; pytest.importorskip re-raises the second."""
+    try:
+        importlib.import_module("video_reader")
+    except ImportError as error:
+        pytest.skip(f"PyVideoReader is unusable here: {error}")
+
+
 @pytest.fixture(scope="module")
 def synthesized_clip(tmp_path_factory):
-    pytest.importorskip("video_reader", reason="PyVideoReader is not installed")
     if shutil.which("ffmpeg") is None:
         pytest.skip("needs the ffmpeg binary")
 
@@ -104,6 +115,7 @@ def synthesized_clip(tmp_path_factory):
 
 
 def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
+    needs_rsreader()
     audio, video = read_av_improved(str(synthesized_clip), start=5, end=15, fps=FPS)
 
     assert len(video) == 10
@@ -113,14 +125,18 @@ def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
     assert len(full_video) > len(video)
 
 
-# Each random-clip reader's own decoder; all of them also need PyVideoReader.
+# Each random-clip reader's own decoder. 'moviepy' is the default and reads
+# from wheels alone; the other two decode their frames with PyVideoReader.
 _CLIP_READER_DEPS = {"pyav": "av", "alt": "moviepy", "moviepy": "moviepy"}
+_CLIP_READERS_NEEDING_RSREADER = ("pyav", "alt")
 
 
 @pytest.mark.parametrize("method", sorted(_CLIP_READER_DEPS))
 def test_random_clip_readers_are_seeded_locally(synthesized_clip, method):
     """Same seed, same clip; and no reader may reseed the process-global RNG."""
     pytest.importorskip(_CLIP_READER_DEPS[method])
+    if method in _CLIP_READERS_NEEDING_RSREADER:
+        needs_rsreader()
 
     np.random.seed(99)
     global_state = np.random.get_state()[1].copy()
@@ -140,3 +156,30 @@ def test_random_clip_readers_are_seeded_locally(synthesized_clip, method):
     assert first_frames.shape[0] == 8
     assert first_audio.shape[0] == 8 + 2  # padded on both sides
     assert np.array_equal(global_state, np.random.get_state()[1])
+
+
+def test_the_fps_conversion_takes_a_path_the_shell_would_have_eaten(tmp_path, monkeypatch):
+    """The conversion runs ffmpeg on a caller's path. Built as a shell string
+    it split on a space and ran anything after a metacharacter, so the two
+    paths a shell would mangle are what this reads."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs the ffmpeg binary")
+    from dew.data.sources.av_utils import read_video
+
+    work = tmp_path / "a dir"
+    work.mkdir()
+    clip = work / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", f"testsrc=duration=1:size=32x32:rate={int(FPS)}", str(clip)],
+        check=True, capture_output=True)
+    dangerous = work / "clip; touch injected.txt"
+    dangerous.write_bytes(clip.read_bytes())
+    monkeypatch.chdir(work)
+
+    spaced = read_video(str(clip), change_fps=True, reader="opencv")
+    metacharacter = read_video(str(dangerous), change_fps=True, reader="opencv")
+
+    assert len(spaced) == len(metacharacter) > 0
+    assert spaced[0].shape == (32, 32, 3)
+    assert not (work / "injected.txt").exists(), "the path reached a shell"

@@ -54,10 +54,13 @@ class Dataset:
 
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
-    is int32 ids under "text". Grain-backed iterators carry `get_state` and
-    `set_state`, which is what a checkpoint records the run's position with;
-    a stream without them cannot resume mid-epoch, and the trainer refuses
-    to checkpoint one.
+    is int32 ids under "text".
+
+    Whether a run can checkpoint its position is the iterator's own answer:
+    grain-backed iterators carry `get_state` and `set_state`, a
+    fetch-as-you-go stream carries neither, and `tokenized` forwards the pair
+    rather than hiding it. A run over a stream without them trains with
+    `checkpoint_every=None` and is refused otherwise.
     """
 
     train: Callable[[], Iterator[Batch]]
@@ -89,6 +92,11 @@ CAPTION = "caption"
 conditions read it."""
 
 
+def _no_captions(captions: Sequence[str]) -> Mapping[str, Any]:
+    """What an unconditional run reads out of a batch's captions: nothing."""
+    return {}
+
+
 def tokenized(stream: Callable[[], Iterator[Batch]],
               tokenize: Callable[[Sequence[str]], Mapping[str, Any]] | None
               ) -> Callable[[], Iterator[Batch]]:
@@ -107,9 +115,7 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     unconditional run wants; a caller that wants the words keeps them with
     a reader that hands them back.
     """
-    if tokenize is None:
-        def tokenize(captions):
-            return {}
+    read = tokenize if tokenize is not None else _no_captions
 
     class Tokenizing:
         """The stream's iterator with the caption stage on its end."""
@@ -123,7 +129,7 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         def __next__(self) -> Batch:
             batch = dict(next(self.source))
             captions = [str(caption) for caption in batch.pop(CAPTION)]
-            batch.update(tokenize(captions))
+            batch.update(read(captions))
             return batch
 
         def __getattr__(self, name):

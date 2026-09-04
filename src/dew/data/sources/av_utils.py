@@ -43,7 +43,13 @@ def get_video_fps(video_path: str):
     cam.release()
     return fps
 
-def read_video(video_path: str, change_fps=False, reader="rsreader"):
+def read_video(video_path: str, change_fps=False, reader="opencv"):
+    """Every frame of `video_path` as RGB uint8.
+
+    `reader` defaults to opencv because it works from the wheels the `av`
+    extra installs. `decord` and `rsreader` are faster on long files and stay
+    reachable by name; each needs more than a wheel, and says so.
+    """
     temp_dir = None
     try:
         if change_fps:
@@ -52,11 +58,13 @@ def read_video(video_path: str, change_fps=False, reader="rsreader"):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             os.makedirs(temp_dir, exist_ok=True)
-            command = (
-                f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
-            )
-            subprocess.run(command, shell=True)
             target_video_path = os.path.join(temp_dir, "video.mp4")
+            # An argument list, not a shell string: a path holds spaces and a
+            # caller's path is not the place to run a shell.
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-nostdin", "-i", video_path,
+                 "-r", "25", "-crf", "18", target_video_path],
+                check=True)
         else:
             target_video_path = video_path
 
@@ -76,6 +84,8 @@ def read_video(video_path: str, change_fps=False, reader="rsreader"):
             shutil.rmtree(temp_dir)
 
 def read_video_decord(video_path: str):
+    """`decord`, whose wheel is x86-64 Linux only; opencv is the default for
+    that reason."""
     from decord import VideoReader
     vr = VideoReader(video_path)
     video_frames = vr[:].asnumpy()
@@ -97,6 +107,10 @@ def read_video_opencv(video_path):
         cap.release()
 
 def read_video_rsreader(video_path, fast=False):
+    """`video-reader-rs`, which is not in the `av` extra: its wheel links
+    libwebp's libsharpyuv and does not carry it, so it imports only where
+    that library is installed system-wide. Install it yourself if you want
+    it, and pass `reader="rsreader"`."""
     from video_reader import PyVideoReader
     vr = PyVideoReader(video_path)
     return vr.decode_fast() if fast else vr.decode()
@@ -104,11 +118,10 @@ def read_video_rsreader(video_path, fast=False):
 def read_audio_decord(audio_path:str):
     from decord import AudioReader
     ar = AudioReader(audio_path)
-    audio_frames = ar[:].asnumpy()
-    ar.seek(0)
-    return audio_frames
+    # The whole track in one read; decord's AudioReader has no seek to rewind.
+    return ar[:].asnumpy()
 
-def read_av_decord(path: str, start: int=0, end: int = None, ctx=None):
+def read_av_decord(path: str, start: int = 0, end: int | None = None, ctx=None):
     from decord import AVReader, cpu
     if ctx is None:
         ctx = cpu(0)
@@ -242,7 +255,9 @@ def read_av_random_clip_moviepy(
     # Load the video
     video = VideoFileClip(video_path).with_fps(target_fps)
     original_duration = video.duration
-    total_frames = video.n_frames#int(original_duration * target_fps)
+    if original_duration is None:
+        raise ValueError(f"{video_path} reports no duration, so no clip can be cut from it")
+    total_frames = int(original_duration * target_fps)
     
     # Calculate effective padding needed based on audio segmentation
     effective_padding = max(audio_frame_padding, (audio_frames_per_video_frame) // 2)
@@ -283,10 +298,10 @@ def read_av_random_clip_moviepy(
         raise ValueError(f"Audio start time {audio_start_time} or end time {audio_end_time} is out of bounds for video duration {original_duration}")
     
     # Extract the subclip
-    clip : VideoFileClip = video.subclipped(audio_start_time, audio_end_time)
-    # Extract audio
-    audio = clip.audio.with_fps(target_sr)
-    audio_data = audio.to_soundarray()
+    clip = video.subclipped(audio_start_time, audio_end_time)
+    if clip.audio is None:
+        raise ValueError(f"{video_path} has no audio track")
+    audio_data = clip.audio.to_soundarray(fps=target_sr)
     # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
     num_audio_samples_required = int(round(audio_duration * target_sr))
     if len(audio_data) < num_audio_samples_required:
@@ -382,8 +397,11 @@ def read_av_random_clip_alt(
     assert audio_start_time >= 0, f"Audio start time {audio_start_time} is negative"
     
     # Extract the subclip
-    audio_clip : AudioFileClip = VideoFileClip(video_path).audio.with_fps(target_sr).subclipped(audio_start_time, audio_end_time)
-    audio_data = audio_clip.to_soundarray()
+    track = VideoFileClip(video_path).audio
+    if track is None:
+        raise ValueError(f"{video_path} has no audio track")
+    audio_clip = track.subclipped(audio_start_time, audio_end_time)
+    audio_data = audio_clip.to_soundarray(fps=target_sr)
     # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
     num_audio_samples_required = int(round(audio_duration * target_sr))
     
@@ -464,17 +482,18 @@ def read_av_random_clip_pyav(
     audio_start_time = max(0.0, (start_idx - eff_pad) / target_fps)
     audio_end_time = (end_idx + eff_pad) / target_fps
     with av.open(video_path) as container:
-        audio_stream = next((s for s in container.streams if s.type == "audio"), None)
-        if audio_stream is None:
+        if not container.streams.audio:
             raise ValueError("No audio stream found in the file.")
+        audio_stream = container.streams.audio[0]
 
         # --- 4) Decode all audio, resample to s16 mono @ target_sr ---
         resampler = av.AudioResampler(format="s16", layout="mono", rate=target_sr)
         audio_segments = []
         segment_times = []
+        sample_rate = audio_stream.codec_context.sample_rate
         for packet in container.demux(audio_stream):
             for frame in packet.decode():
-                if frame.pts is None:
+                if not isinstance(frame, av.AudioFrame) or frame.pts is None:
                     continue
                 out = resampler.resample(frame)
                 out = [out] if not isinstance(out, list) else out
@@ -482,7 +501,7 @@ def read_av_random_clip_pyav(
                     # Extract samples from the PyAV audio frame
                     arr = oframe.to_ndarray()   # shape: (1, samples) for mono
                     samples = arr.flatten().astype(np.int16)
-                    start_t = float(oframe.pts * audio_stream.time_base)
+                    start_t = float((oframe.pts or 0) * (oframe.time_base or 0))
                     end_t = start_t + oframe.samples / oframe.sample_rate
                     audio_segments.append(samples)
                     segment_times.append((start_t, end_t))
@@ -504,7 +523,7 @@ def read_av_random_clip_pyav(
             return len(full_audio)
         for i, (st, ed) in enumerate(segment_times):
             if st <= t < ed:
-                seg_offset = int(round((t - st) * audio_stream.rate))
+                seg_offset = int(round((t - st) * (sample_rate or target_sr)))
                 return offsets[i] + min(seg_offset, seg_lens[i] - 1)
         return len(full_audio)
 
@@ -564,7 +583,7 @@ def read_av_random_clip(
     target_sr: int = 16000,
     target_fps: float = 25.0,
     random_seed: Optional[int] = None,
-    method: str = 'alt'
+    method: str = 'moviepy'
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Read a random clip of audio and video frames using specified method.
@@ -577,7 +596,10 @@ def read_av_random_clip(
         target_fps (float): Target frames per second for video.
         random_seed (Optional[int]): Seed for random number generator.
         method (str): Method to use for reading the clip.
-            Options: 'moviepy', 'alt', 'pyav'.
+            Options: 'moviepy', 'alt', 'pyav'. 'moviepy' is the default
+            because it reads from the wheels the `av` extra installs; 'alt'
+            and 'pyav' decode their frames with `video-reader-rs`, which the
+            extra does not install (see `read_video_rsreader`).
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray]: Tuple of (frame_wise_audio, full_padded_audio, video_frames).
             - frame_wise_audio: Shape (1, num_frames, 1, audio_data_per_frame)
