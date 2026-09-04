@@ -147,8 +147,8 @@ def main(config: JepaRunConfig) -> TrainState:
 
     probes = ()
     if config.probe_classes:
-        probes = (metrics["linear_probe"](config.probe_classes),
-                  metrics["knn_probe"](config.probe_classes, k=config.knn_k))
+        probes = (metrics.linear_probe(config.probe_classes),
+                  metrics.knn_probe(config.probe_classes, k=config.knn_k))
 
     name = config.trainer.name or (
         f"jepa-{datasets.name_of(type(config.data))}/res-{sample.shape[-2]}/"
