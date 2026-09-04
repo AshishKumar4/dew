@@ -458,6 +458,30 @@ PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the 
            "bread and jam", "birds at dawn", "a short note", "the sun set"]
 
 
+class GlobalMean:
+    """A metric that reads a whole batch field with numpy.
+
+    Every shipped image metric pairs its rows with the artifact's, so it only
+    ever reads the leading rows, which come back replicated. A metric is
+    allowed to read the whole field, and on a pool that field is a shard of a
+    global array numpy cannot touch, so this is what pins the contract that
+    the trainer brings the batch home and the number covers the global batch.
+    """
+
+    name = "global_mean"
+
+    def __init__(self):
+        from dew.artifacts import ImageGrid
+
+        self.reads = ImageGrid
+
+    def __call__(self, artifact, batch) -> float:
+        return float(np.asarray(batch["image"], np.float64).mean())
+
+    def reduce(self, values) -> float:
+        return float(np.mean(values))
+
+
 def mode_validate(args) -> dict:
     """A real diffusion validation pass in the pool, scored by the clip metric.
 
@@ -495,7 +519,7 @@ def mode_validate(args) -> dict:
     data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
-                        metrics=(clip(modelname=tiny),))
+                        metrics=(clip(modelname=tiny), GlobalMean()))
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),

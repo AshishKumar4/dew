@@ -648,6 +648,10 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
     assert drawn[0]["captions"] == worker.PROMPTS[:4]
     score = reports[0]["scores"]["val/clip_similarity"]
     assert np.isfinite(score)
+    # A metric that reads the whole field sees the global batch, not the rows
+    # this rank happens to hold.
+    assert reports[0]["scores"]["val/global_mean"] == pytest.approx(
+        float(worker.global_images().mean()), rel=1e-6)
 
     single = run_worker("validate", tmp_path / "single.json", steps=1)
     assert single["scores"]["val/clip_similarity"] == pytest.approx(
