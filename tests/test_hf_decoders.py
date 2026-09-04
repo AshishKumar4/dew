@@ -517,6 +517,66 @@ def test_partial_rotary_on_a_sliding_layer_is_refused():
         translate_config(config)
 
 
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma3", "gemma4_unified", "gemma3n"])
+def test_a_multimodal_wrapper_config_is_refused_by_name(model_type):
+    """What a user pointing at google/gemma-4-E2B hits. The repo's
+    config.json is the wrapper, not the decoder: its model_type names the
+    whole model, its decoder is under text_config, and its weights sit under
+    model.language_model.* beside towers nothing here runs. Refusing names
+    all three, where before the wrapper passed the family gate and died on a
+    missing hidden_size."""
+    wrapper = {"model_type": model_type,
+               "text_config": gemma4_config("gemma4-e2b"),
+               "vision_config": {"hidden_size": 8}}
+
+    with pytest.raises(ValueError, match="multimodal wrapper") as raised:
+        translate_config(wrapper)
+    assert "text_config" in str(raised.value)
+    assert "model.language_model" in str(raised.value)
+
+    # The decoder underneath it still translates, which is what the message says.
+    assert translate_config(wrapper["text_config"])["num_kv_shared_layers"] == 2
+
+
+def test_a_wrapper_shaped_config_of_an_unknown_family_is_refused_as_one():
+    """A config with a text_config and a model_type this has never heard of
+    is the same shape of thing, so it gets the same answer rather than the
+    bare family list."""
+    with pytest.raises(ValueError, match="multimodal wrapper"):
+        translate_config({"model_type": "someone_elses_vlm",
+                          "text_config": gemma4_config("gemma4-ple")})
+
+
+@pytest.mark.parametrize("field", ["num_global_key_value_heads", "per_layer_config"])
+def test_a_per_layer_key_value_head_count_is_refused(field):
+    """The reference lets a layer kind carry its own key/value head count
+    (Gemma4TextAttention reads layer_config.num_key_value_heads). The
+    backbone has one count for the model, so a config that varies it is
+    refused by name instead of building a model whose K/V width is wrong and
+    failing later on a shape."""
+    config = gemma4_config("gemma4-e2b")
+    model_kv = config["num_key_value_heads"]
+    if field == "num_global_key_value_heads":
+        config[field] = model_kv + 1
+    else:
+        config[field] = {"1": {"head_dim": 32, "num_key_value_heads": model_kv + 1}}
+
+    with pytest.raises(ValueError, match=field) as raised:
+        translate_config(config)
+    assert "key/value head count" in str(raised.value)
+    assert str(model_kv) in str(raised.value)
+
+
+def test_a_per_layer_count_equal_to_the_models_still_translates():
+    """Only a count that differs is a refusal: the reference fills
+    per_layer_config with the model's own value for every layer."""
+    config = gemma4_config("gemma4-e2b")
+    config["per_layer_config"] = {
+        "1": {"head_dim": 32, "num_key_value_heads": config["num_key_value_heads"]}}
+
+    assert translate_config(config)["kinds"]["full_attention"] == {"head_dim": 32}
+
+
 @pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
