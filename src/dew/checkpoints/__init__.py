@@ -131,9 +131,15 @@ class Checkpoints:
             step = manager.latest_step()
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        stored = manager.item_metadata(step).keys()
+        metadata = manager.item_metadata(step)
+        stored = metadata.keys()
         if template is None:
-            restored = manager.restore(step, args=ocp.args.PyTreeRestore())
+            # Typed as host arrays, so orbax reads no sharding file and warns
+            # about none.
+            restore_args = jax.tree.map(
+                lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), dict(metadata))
+            restored = manager.restore(step, args=ocp.args.PyTreeRestore(
+                restore_args=restore_args))
         else:
             item = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
