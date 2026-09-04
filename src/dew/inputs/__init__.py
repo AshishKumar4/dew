@@ -15,7 +15,7 @@ every diffusion loss, sample, artifact and image metric lives in.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -65,10 +65,26 @@ class Condition:
 @dataclass(frozen=True)
 class InputSpec:
     """The sample field and the conditions, keyed by the model keyword each
-    is passed under: `{"textcontext": Condition(...)}`."""
+    is passed under: `{"textcontext": Condition(...)}`.
+
+    `tokenize` is what a captioning dataset hands its text to: every
+    condition tokenizes the batch's captions under its own field, so the
+    encoder a run names decides the ids and the context length and a
+    dataset carries the words alone.
+    """
 
     sample: Field
     conditions: Mapping[str, Condition] = field(default_factory=dict)
+
+    def tokenize(self, captions: Sequence[str]) -> dict[str, dict]:
+        """The batch fields this run's conditions read out of `captions`.
+
+        Empty for a run that conditions on nothing, which is how the
+        captions stop at the loader instead of riding a string array into a
+        device.
+        """
+        return {condition.field: condition.encoder.tokenize(captions)
+                for condition in self.conditions.values()}
 
     def to_json(self) -> dict:
         return {"sample": {"key": self.sample.key, "shape": list(self.sample.shape)},

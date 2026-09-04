@@ -251,7 +251,7 @@ class Unsized(ImageDataset):
         return element["image"], "", element["index"]
 
 
-def test_a_source_without_a_length_needs_an_explicit_count(stub_tokenizer):
+def test_a_source_without_a_length_needs_an_explicit_count():
     """The factory guessed a million records for such a source, so the
     sampler drew indices past the data and the run reported the guess."""
     with pytest.raises(ValueError, match="count="):
@@ -547,15 +547,13 @@ def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monk
 
     monkeypatch.setattr(av_utils, "read_av_random_clip", fake_read_av_random_clip)
     monkeypatch.setattr(video, "AutoAudioProcessor", FakeAudioProcessor)
-    monkeypatch.setattr(video, "AutoTextTokenizer", _StubTokenizer)
 
     batch = video.AudioVideoTransform(spec).random_map(records[0], np.random.default_rng(0))
 
     assert seen["video_path"] == records[0]["video_path"]
     assert seen["num_frames"] == 4 and seen["audio_frame_padding"] == 1
     assert batch["video"].shape == (4, 32, 32, 3)          # resized to frame_size
-    assert np.array_equal(batch["text"]["input_ids"],
-                          _StubTokenizer()("a video of id00012")["input_ids"][0])
+    assert batch["caption"] == "a video of id00012"
     assert batch["audio"]["full_audio"].shape == (6, frame_samples)
     assert batch["audio"]["framewise_audio"].shape == (1, 4, 1, frame_samples)
     assert batch["audio"]["input_values"].shape == (6, frame_samples)
@@ -581,28 +579,15 @@ def test_av_benchmark_script_imports_against_the_real_av_utils():
 # The streaming collate
 # ---------------------------------------------------------------------------------
 
-class _StubTokenizer:
-    """Offline stand-in for the CLIP tokenizer the transforms build.
-
-    The ids are a digest of the caption, so a caption stays comparable after a
-    trip through grain's worker processes.
-    """
-
-    def __init__(self, tensor_type="np"):
-        self.tensor_type = tensor_type
-
-    def __call__(self, captions):
-        single = isinstance(captions, str)
-        rows = [captions] if single else list(captions)
-        ids = np.stack([np.frombuffer(hashlib.blake2s(c.encode(), digest_size=8).digest(), np.int32)
-                        for c in rows])
-        return {"input_ids": ids, "attention_mask": np.ones((len(rows), 2), np.int32)}
+def keep_captions(captions):
+    """A caption reader that hands the words back, so a test reads what the
+    dataset wrote before a run's encoder tokenizes it."""
+    return {"caption": np.asarray(captions)}
 
 
 def test_image_collate_resizes_mixed_shapes_to_the_largest(monkeypatch):
     """cv2.resize takes (width, height); passing (height, width) transposed every
     non-square image, np.stack failed, and the except branch fed zero images on."""
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     collate = online_loader.generate_collate_fn("image")
     batch = [
         {"image": np.full((16, 24, 3), 200, np.uint8), "caption": "wide"},
@@ -611,13 +596,12 @@ def test_image_collate_resizes_mixed_shapes_to_the_largest(monkeypatch):
     out = collate(batch)
     assert out["image"].shape == (2, 20, 24, 3)
     assert out["image"][0].min() == 200 and out["image"][1].min() == 100
-    assert out["text"]["input_ids"].shape == (2, 2)
+    assert list(out["caption"]) == ["wide", "tall"]
 
 
 def test_image_collate_raises_on_a_malformed_sample(monkeypatch):
     """The whole-batch try/except returned zeros captioned "Error processing
     image" for any failure, and a batch of zeros trains as data."""
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     collate = online_loader.generate_collate_fn("image")
     batch = [
         {"image": np.full((16, 16, 3), 200, np.uint8), "caption": "fine"},
@@ -630,7 +614,6 @@ def test_image_collate_raises_on_a_malformed_sample(monkeypatch):
 
 def test_collate_raises_on_a_sample_without_a_caption(monkeypatch):
     """A sample without a caption raises instead of collating as the empty string."""
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     image_collate = online_loader.generate_collate_fn("image")
     video_collate = online_loader.generate_collate_fn("video")
 
@@ -641,7 +624,6 @@ def test_collate_raises_on_a_sample_without_a_caption(monkeypatch):
 
 
 def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     collate = online_loader.generate_collate_fn("video")
     batch = [
         {"video": np.zeros((2, 8, 8, 3), np.uint8), "caption": "fine"},
@@ -653,17 +635,15 @@ def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
 
 
 def test_image_collate_stacks_a_batch_of_one(monkeypatch):
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     collate = online_loader.generate_collate_fn("image")
     out = collate([{"image": np.zeros((8, 8, 3), np.uint8), "caption": "one"}])
     assert out["image"].shape == (1, 8, 8, 3)
-    assert out["text"]["input_ids"].shape == (1, 2)
+    assert list(out["caption"]) == ["one"]
 
 
 def test_image_collate_raises_when_a_grayscale_record_meets_colour_ones(monkeypatch):
     """Resizing to the largest shape cannot rescue a record with no channels,
     and stacking it silently would be worse."""
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     collate = online_loader.generate_collate_fn("image")
     batch = [
         {"image": np.zeros((8, 8, 3), np.uint8), "caption": "colour"},
@@ -682,8 +662,8 @@ class Augmenting(ImageDataset):
     """Deterministic images and class captions, addressed by index, through
     the real image transform: resize, flip, jitter and the prompt template
     all draw from grain's per-record rng, which is what a worker count could
-    move. The tokenizer is stubbed with a digest of the caption, so a caption
-    stays comparable after a trip through a worker process."""
+    move. The captions are read back as text, so one stays comparable after a
+    trip through a worker process."""
 
     length: int = 16
 
@@ -708,23 +688,18 @@ class _Images:
         return {"index": index, "image": rng.randint(0, 256, (12, 12, 3), np.uint8)}
 
 
-@pytest.fixture
-def stub_tokenizer(monkeypatch):
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
-
-
 def _rows(batch):
-    """(index, pixels, caption ids) per record, so a comparison covers all three."""
+    """(index, pixels, caption) per record, so a comparison covers all three."""
     return [(int(batch["label"][row]), batch["image"][row].tobytes(),
-             batch["text"]["input_ids"][row].tobytes())
+             str(batch["caption"][row]))
             for row in range(len(batch["label"]))]
 
 
 def _augmented(worker_count, length=16, batch=4, seed=3):
-    """{record index: (pixels, caption ids)} for one epoch at this worker count."""
+    """{record index: (pixels, caption)} for one epoch at this worker count."""
     data = Augmenting(length=length, image_size=8, seed=seed, val_batches=None,
                       worker_count=worker_count, read_threads=1, read_buffer=1,
-                      worker_buffer=1).load(batch=batch)
+                      worker_buffer=1).load(batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
             for b in itertools.islice(data.train(), data.steps_per_epoch)
             for index, pixels, caption in _rows(b)}
@@ -733,7 +708,7 @@ def _augmented(worker_count, length=16, batch=4, seed=3):
 @pytest.mark.slow
 @pytest.mark.parametrize("worker_count", [1, 2, 4])
 def test_a_records_pixels_and_caption_do_not_depend_on_worker_count(
-        stub_tokenizer, worker_count):
+        worker_count):
     """The flip, the colour jitter and the prompt template all come from the
     per-record rng, which grain keys by record index, so the number of workers
     that produced a batch cannot change what is in it."""
@@ -744,7 +719,7 @@ def test_a_records_pixels_and_caption_do_not_depend_on_worker_count(
     assert serial == parallel
 
 
-def test_augmentation_really_moves_the_pixels(stub_tokenizer):
+def test_augmentation_really_moves_the_pixels():
     """Guards the test above: identical records at every worker count would
     also be true of a pipeline that augmented nothing."""
     records = _augmented(0)
@@ -758,7 +733,7 @@ def test_augmentation_really_moves_the_pixels(stub_tokenizer):
 
 @pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
 def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
-        stub_tokenizer, worker_count):
+        worker_count):
     """The trainer saves the iterator's position in its checkpoint, so a
     restored run owes the epoch its unseen records, no more and no fewer.
 
@@ -771,7 +746,8 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     """
     def loader():
         return Augmenting(image_size=8, seed=3, val_batches=2, worker_count=worker_count,
-                          read_threads=1, read_buffer=1, worker_buffer=1).load(batch=4)
+                          read_threads=1, read_buffer=1, worker_buffer=1).load(
+        batch=4, tokenize=keep_captions)
 
     interrupted = loader().train()
     seen = _rows(next(interrupted))
@@ -790,14 +766,15 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
 
 
 def _validated(length, val_batches, batch, **read):
-    """{record index: (pixels, caption ids)} for one validation pass."""
+    """{record index: (pixels, caption)} for one validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
-                      worker_count=0, worker_buffer=1, **read).load(batch=batch)
+                      worker_count=0, worker_buffer=1, **read).load(
+        batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
             for b in data.val() for index, pixels, caption in _rows(b)}
 
 
-def test_validation_pixels_do_not_depend_on_the_read_thread_count(stub_tokenizer):
+def test_validation_pixels_do_not_depend_on_the_read_thread_count():
     """The validation pass transforms its records inside grain's prefetch
     threads, and albumentations keeps the generators a call draws from on the
     pipeline itself, so a pipeline shared by those threads had one record's
@@ -814,7 +791,7 @@ def test_validation_pixels_do_not_depend_on_the_read_thread_count(stub_tokenizer
 
 @pytest.mark.parametrize("process_count", [2, 8])
 def test_a_validation_record_does_not_depend_on_the_process_count(
-        stub_tokenizer, monkeypatch, process_count):
+        monkeypatch, process_count):
     """Process p of n validates records p, p + n, ... of the split. The rng
     behind a record's flip, jitter and caption has to be keyed by its place in
     the split, not in that slice, or the same seed validates one record with
@@ -924,9 +901,9 @@ def test_a_truncated_image_raises_rather_than_becoming_an_array():
         decode_image(truncated)
 
 
-def test_the_image_transform_resizes_augments_and_tokenizes_one_record(stub_tokenizer):
-    """What every image dataset hands the model: the resized uint8 image, the
-    caption's ids and, for a class-labelled record, its index."""
+def test_the_image_transform_resizes_augments_and_captions_one_record():
+    """What every image dataset hands the loader: the resized uint8 image,
+    the caption text and, for a class-labelled record, its index."""
     spec = Augmenting(image_size=8, augmentation="none")
     element = _Images(16)[5]
 
@@ -934,7 +911,7 @@ def test_the_image_transform_resizes_augments_and_tokenizes_one_record(stub_toke
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
-    assert out["text"]["input_ids"].shape == (2,) and out["label"] == 5
+    assert out["caption"] == "A photo of a rose flower" and out["label"] == 5
     assert out["label"].dtype == np.int32
 
 
@@ -950,3 +927,44 @@ def test_an_overlong_caption_is_truncated_to_the_text_context():
     assert out["input_ids"].shape == (2, context)
     assert int(out["attention_mask"][1].sum()) == context
     assert int(out["attention_mask"][0].sum()) < context
+
+
+# ---------------------------------------------------------------------------------
+# Whose tokenizer: the run's condition, not the dataset
+# ---------------------------------------------------------------------------------
+
+def test_a_batch_carries_captions_and_each_encoder_tokenizes_them_its_own_way():
+    """The dataset writes the words; how many ids they become is the run's
+    condition. The same dataset, read once per encoder, gives CLIP's context
+    and the char table's eight, and neither encoder is named in the data
+    pipeline."""
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+
+    spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
+    captions = next(spec.load(batch=4, tokenize=keep_captions).train())["caption"]
+    assert [str(caption) for caption in captions] and captions.shape == (4,)
+
+    def tokens(encoder):
+        inputs = InputSpec(Field("image", (8, 8, 3)),
+                           {"textcontext": Condition(encoder, field="text")})
+        batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train())
+        assert "caption" not in batch, "strings cannot ride a batch onto a device"
+        return batch["text"]["input_ids"].shape
+
+    wide = CharTable.from_pretrained(tokens=77)
+    narrow = CharTable.from_pretrained(tokens=8)
+    assert tokens(wide) == (4, 77)
+    assert tokens(narrow) == (4, 8)
+
+
+def test_a_run_with_no_condition_leaves_no_captions_in_the_batch():
+    """An unconditional run reads nothing out of the captions, and the words
+    stop at the loader: a string array cannot be placed on a device."""
+    from dew.inputs import Field, InputSpec
+
+    spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
+    inputs = InputSpec(Field("image", (8, 8, 3)))
+
+    batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train())
+
+    assert sorted(batch) == ["image", "label"]

@@ -45,9 +45,10 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 
 def main(config: Config, data=None, inputs=None):
-    data = data or OxfordFlowers(image_size=config.image_size).load(batch=config.batch_size)
-    steps = config.steps or config.epochs * data.steps_per_epoch
     inputs = inputs or text_conditioned_inputs(config.image_size)
+    data = data or OxfordFlowers(image_size=config.image_size).load(
+        batch=config.batch_size, tokenize=inputs.tokenize)
+    steps = config.steps or config.epochs * data.steps_per_epoch
     fields = dict(config.model, output_channels=3, dtype="bfloat16")
     model = models.build("simple_dit", **fields)
     process = presets.EDM()()
