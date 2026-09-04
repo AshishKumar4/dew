@@ -8,12 +8,13 @@ load_pretrained_decoder returns a (model, variables, config) triple that a
 forward pass takes straight away, config being the dew config the model was
 built from.
 
-The families covered are the ones CausalTransformer can express: llama, qwen3
-and gemma3_text. qwen2 is refused rather than half-loaded, since its q/k/v
-biases without an o_proj bias have no counterpart in the backbone's one
-attention_bias flag. A config field that changes what the model computes and
-has no dew counterpart raises a ValueError naming it, rather than loading a
-model that silently computes something else.
+The families covered are the ones CausalTransformer can express: llama, qwen3,
+gemma3_text and gemma4_text. qwen2 is refused rather than half-loaded, since
+its q/k/v biases without an o_proj bias have no counterpart in the backbone's
+one attention_bias flag, and a multimodal wrapper config is refused rather
+than loading its text half. A config field that changes what the model
+computes and has no dew counterpart raises a ValueError naming it, rather
+than loading a model that silently computes something else.
 """
 
 import json
@@ -37,8 +38,15 @@ DEFAULT_MAX_SEQ_LEN = 8192
 # are the two the covered families use; anything else is refused by name.
 _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
 
-_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4', 'gemma4_text')
+_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4_text')
 _GEMMA = 'gemma3_text'
+_FAMILIES = ('llama', 'qwen3', 'gemma3_text', 'gemma4_text')
+
+# A multimodal repo's config.json is a wrapper whose model_type names the
+# whole model and whose text_config holds the decoder. Its own weights live
+# under model.language_model.*, next to vision and audio towers this has no
+# counterpart for, so the wrapper is refused by name.
+_WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n')
 
 _IGNORED_FIELDS = {
     'architectures', 'attention_dropout', 'attn_implementation', 'bos_token_id',
@@ -233,9 +241,22 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse("model_type 'qwen2'",
                 "its q/k/v projections carry biases and o_proj does not, which "
                 "the one attention_bias flag cannot say")
-    if model_type not in ('llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'):
+    if model_type in _WRAPPERS or (model_type not in _FAMILIES
+                                   and 'text_config' in hf_config):
+        # google/gemma-4-E2B is one of these: the decoder is real and its
+        # text_config translates, but the repo is a multimodal model whose
+        # weights sit under model.language_model.* beside vision and audio
+        # towers, and loading the text half would build something that is not
+        # the checkpoint. The refusal names the text config so a caller who
+        # wants the decoder alone asks for it deliberately.
         _refuse(f"model_type {model_type!r}",
-                "expected one of 'llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'")
+                "it is a multimodal wrapper whose vision and audio towers have "
+                "no counterpart here; its decoder is the text_config, which "
+                "translates on its own, and its weights are the "
+                "model.language_model.* half of the checkpoint")
+    if model_type not in _FAMILIES:
+        _refuse(f"model_type {model_type!r}",
+                f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
 
     if hf_config.get('use_bidirectional_attention', False):
         _refuse("use_bidirectional_attention=True", "the backbone is causal")
@@ -261,7 +282,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse(f"hidden_act {activation!r}",
                 "the gated MLP supports 'swiglu' and 'geglu'")
 
-    if model_type in ('gemma4', 'gemma4_text'):
+    if model_type == 'gemma4_text':
         # Proportional partial rotary is a gemma4 shape with its own reader below.
         rope_theta, rope_local_theta = 10000.0, None
     else:
@@ -303,7 +324,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         # does) has to take its family's default rather than a single one
         # here.
         'tie_embeddings': bool(hf_config.get(
-            'tie_word_embeddings', model_type in (_GEMMA, 'gemma4', 'gemma4_text'))),
+            'tie_word_embeddings', model_type in (_GEMMA, 'gemma4_text'))),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
@@ -317,7 +338,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         softcap = hf_config.get('final_logit_softcapping')
         if softcap is not None:
             config['final_logit_softcap'] = float(softcap)
-    if model_type in ('gemma4', 'gemma4_text'):
+    if model_type == 'gemma4_text':
         if hf_config.get('attention_k_eq_v'):
             _refuse("attention_k_eq_v=True",
                     "the backbone always projects its own values")
@@ -334,9 +355,28 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
                     f"it does not divide into {heads} heads")
         full_dim = sliding_dim
         entries = hf_config.get('per_layer_config') or {}
+        model_kv = heads if kv_heads is None else int(kv_heads)
         for entry in (entries.values() if isinstance(entries, Mapping) else entries):
-            if isinstance(entry, Mapping) and entry.get('head_dim') is not None:
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get('head_dim') is not None:
                 full_dim = int(entry['head_dim'])
+            # The reference gives a layer kind its own key/value head count as
+            # well as its own head dim (modeling_gemma4.py,
+            # Gemma4TextAttention reads layer_config.num_key_value_heads).
+            # The backbone has one count for the model, so a config that
+            # varies it is refused rather than built at the wrong K/V width.
+            if (entry.get('num_key_value_heads') is not None
+                    and int(entry['num_key_value_heads']) != model_kv):
+                _refuse(f"per_layer_config num_key_value_heads "
+                        f"{int(entry['num_key_value_heads'])}",
+                        f"the backbone has one key/value head count for the "
+                        f"model, which this config sets to {model_kv}")
+        global_kv = hf_config.get('num_global_key_value_heads')
+        if global_kv is not None and int(global_kv) != model_kv:
+            _refuse(f"num_global_key_value_heads {int(global_kv)}",
+                    f"the backbone has one key/value head count for the model, "
+                    f"which this config sets to {model_kv}")
         if hf_config.get('global_head_dim') is not None:
             full_dim = int(hf_config['global_head_dim'])
         used.update(('per_layer_config', 'global_head_dim',
