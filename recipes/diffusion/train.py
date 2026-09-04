@@ -15,7 +15,6 @@ import os
 import re
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Literal, Optional
 
 import jax
@@ -31,6 +30,7 @@ from dew.registry import apply_precision_policy, build_model, canonicalize_archi
 from dew.sampling.euler import EulerAncestralSampler
 from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
 from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
+from dew.training.runtime import run_timestamp
 
 warnings.filterwarnings("ignore")
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
@@ -174,7 +174,7 @@ def run_summary(config: DiffusionRunConfig, model_config: dict, arguments_hash: 
         "learning_rate": config.optim.learning_rate,
         "epochs": config.trainer.epochs,
         "arguments_hash": arguments_hash,
-        "date": datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
+        "date": run_timestamp(),
     }
 
 

@@ -7,11 +7,13 @@ recipes call this once at the top of main().
 
 import os
 import resource
+from datetime import datetime
 from typing import Optional
 
 import jax
 
 from dew.telemetry.devices import apply_xla_flags
+from dew.training.distributed import broadcast_from_process_zero
 
 
 def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
@@ -52,3 +54,13 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
     print(f"Number of devices: {jax.device_count()}")
+
+
+def run_timestamp() -> str:
+    """Process 0's wall clock as `%Y-%m-%d_%H:%M:%S`, on every process.
+
+    A default run name carries it, and the name is the checkpoint directory
+    every process writes into, so a process that read its own clock a second
+    later would write into a directory of its own.
+    """
+    return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))

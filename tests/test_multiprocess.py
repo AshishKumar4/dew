@@ -218,6 +218,18 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_default_run_name_takes_its_timestamp_from_process_zero(two_processes):
+    """The date in a default run name is the checkpoint directory's name, and
+    every process writes into that directory. Each process used to read its
+    own clock; the worker sets process 1's a year ahead, and a name built
+    from it would put process 1's shards in a directory of their own."""
+    stamps = [report["run_timestamp"] for report in two_processes]
+    assert stamps[0] == stamps[1]
+    assert int(stamps[0][:4]) == two_processes[0]["own_year"]
+    assert int(stamps[1][:4]) != two_processes[1]["own_year"], "the skew did not apply"
+
+
+@pytest.mark.distributed
 def test_the_global_batch_is_the_union_of_the_process_slices(two_processes):
     """Each process hands shard_batch its own rows and gets the whole batch.
 
