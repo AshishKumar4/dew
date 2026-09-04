@@ -1,5 +1,9 @@
 """RunConfig: the typed record of a run, its round trip, and what it builds."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 import dataclasses
 
 import jax.numpy as jnp
@@ -116,3 +120,20 @@ def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
     assert type(config.data) is datasets["token_windows"]
     assert config.data.path == "tokens" and config.data.seq_len == 8
     assert RunConfig.from_dict(config.to_dict()) == config
+
+
+def test_a_fresh_process_resolves_models_and_datasets_through_the_config():
+    """The lm and jepa recipes run in a process that imports nothing else
+    first, and both resolve a model and a dataset by name through this
+    module, so importing it has to be enough to fill those registries."""
+    root = Path(__file__).resolve().parents[1]
+    code = ("from dew.config import ModelConfig;"
+            "from dew.registry import datasets, models;"
+            "print('causal_transformer' in models, 'token_windows' in datasets,"
+            " ModelConfig(architecture='causal_transformer').fields()['dtype'])")
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        env={"PYTHONPATH": str(root / "src"), "JAX_PLATFORMS": "cpu",
+             "PATH": os.environ.get("PATH", "")})
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == "True True bfloat16"
