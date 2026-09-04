@@ -23,10 +23,101 @@ import PIL.Image
 import traceback
 
 # The lazy `datasets` import lives with the source that owns hub datasets.
+from .processors import AutoTextTokenizer
 from .sources.hf import _STREAMING_HINT, _hf_datasets
 
 if TYPE_CHECKING:
     from datasets import Dataset
+
+
+def load_rows(sources: List[str], split: str = "train"):
+    """The rows of `sources`, concatenated and shuffled once.
+
+    A `gs://` path is a dataset saved with `save_to_disk`; anything else is
+    a hub dataset name read at `split`.
+    """
+    hf = _hf_datasets()
+    loaded = [hf.load_from_disk(source) if "gs://" in source
+              else hf.load_dataset(source, split=split) for source in sources]
+    if len(loaded) == 1:
+        return loaded[0]
+    return hf.concatenate_datasets(loaded).shuffle(seed=0)
+
+
+def generate_collate_fn(media_type="image"):
+    """The collate for one media type: stacked pixels and tokenized captions.
+
+    A malformed sample raises: a batch that silently became zeros trained as
+    data. Records of mixed shapes are resized to the largest.
+    """
+    auto_tokenize = AutoTextTokenizer(tensor_type="np")
+
+    def image_collate(batch):
+        captions = [sample["caption"] for sample in batch]
+        results = auto_tokenize(captions)
+
+        image_shapes = [sample["image"].shape for sample in batch]
+        if len(set(str(shape) for shape in image_shapes)) > 1:
+            # cv2 takes (width, height).
+            target_h = max(shape[0] for shape in image_shapes)
+            target_w = max(shape[1] for shape in image_shapes)
+            images = np.stack([
+                cv2.resize(sample["image"], (target_w, target_h))
+                if sample["image"].shape[:2] != (target_h, target_w) else sample["image"]
+                for sample in batch
+            ], axis=0)
+        else:
+            images = np.stack([sample["image"] for sample in batch], axis=0)
+
+        return {
+            "image": images,
+            "text": {
+                "input_ids": results['input_ids'],
+                "attention_mask": results['attention_mask'],
+            }
+        }
+
+    def video_collate(batch):
+        captions = [sample["caption"] for sample in batch]
+        results = auto_tokenize(captions)
+
+        video_shapes = [sample["video"].shape for sample in batch]
+        if len(set(str(shape) for shape in video_shapes)) > 1:
+            max_frames = max(shape[0] for shape in video_shapes)
+            max_height = max(shape[1] for shape in video_shapes)
+            max_width = max(shape[2] for shape in video_shapes)
+
+            videos = []
+            for sample in batch:
+                video = sample["video"]
+                num_frames, height, width = video.shape[:3]
+
+                if height != max_height or width != max_width:
+                    video = np.array([
+                        cv2.resize(frame, (max_width, max_height))
+                        for frame in video
+                    ])
+
+                if num_frames < max_frames:
+                    # Pad with duplicates of the last frame
+                    padding = np.tile(video[-1:], (max_frames - num_frames, 1, 1, 1))
+                    video = np.concatenate([video, padding], axis=0)
+
+                videos.append(video)
+
+            videos = np.stack(videos, axis=0)
+        else:
+            videos = np.stack([sample["video"] for sample in batch], axis=0)
+
+        return {
+            "video": videos,
+            "text": {
+                "input_ids": results['input_ids'],
+                "attention_mask": results['attention_mask'],
+            }
+        }
+
+    return video_collate if media_type == "video" else image_collate
 
 
 @lru_cache(maxsize=1)
@@ -834,7 +925,6 @@ class OnlineStreamingDataLoader:
         num_frames=16,
         num_workers=16,
         num_threads=512,
-        default_split="all",
         global_process_count=1,
         global_process_index=0,
         prefetch=1000,
@@ -851,7 +941,7 @@ class OnlineStreamingDataLoader:
         """Initialize an online streaming data loader.
         
         Args:
-            dataset: Dataset to load from, can be a path or a dataset object.
+            dataset: The loaded HF dataset of rows to fetch (see `load_rows`).
             batch_size: Batch size.
             media_type: Type of media ("image" or "video").
             image_shape: Target shape for images.
@@ -861,7 +951,6 @@ class OnlineStreamingDataLoader:
             num_frames: Target number of frames for videos.
             num_workers: Number of worker processes.
             num_threads: Number of threads per worker.
-            default_split: Default split to use when loading datasets.
             global_process_count: Total number of processes.
             global_process_index: Index of this process.
             prefetch: Number of batches to prefetch.
@@ -876,44 +965,14 @@ class OnlineStreamingDataLoader:
             feature_extractor: Function to extract features from samples.
             resource_manager: Resource manager to use.
         """
-        # Load dataset from path if needed
-        if isinstance(dataset, str):
-            hf = _hf_datasets()
-            dataset_path = dataset
-            print(f"Loading dataset from path: {dataset_path}")
-            if "gs://" in dataset:
-                dataset = hf.load_from_disk(dataset_path)
-            else:
-                dataset = hf.load_dataset(dataset_path, split=default_split)
-        elif isinstance(dataset, list):
-            hf = _hf_datasets()
-            if isinstance(dataset[0], str):
-                print("Loading multiple datasets from paths")
-                dataset = [
-                    hf.load_from_disk(dataset_path) if "gs://" in dataset_path 
-                    else hf.load_dataset(dataset_path, split=default_split) 
-                    for dataset_path in dataset
-                ]
-            print(f"Concatenating {len(dataset)} datasets")
-            dataset = hf.concatenate_datasets(dataset)
-            dataset = dataset.shuffle(seed=0)
-            
         # Shard dataset for distributed training
         self.dataset = dataset.shard(
             num_shards=global_process_count, index=global_process_index)
-        print(f"Dataset length: {len(dataset)}")
         
         # Get or create resource manager
         self.resource_manager = resource_manager or ResourceManager()
         
-        # Choose default collate function if not provided
         if collate_fn is None:
-            # The data layer has one collate implementation; it lives next to
-            # the grain factories, which reach back into this module for the
-            # streaming loader, so the import goes here rather than at module
-            # scope.
-            from .dataloaders import generate_collate_fn
-
             collate_fn = generate_collate_fn(media_type)
         
         # Create media batch iterator

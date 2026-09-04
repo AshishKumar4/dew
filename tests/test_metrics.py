@@ -18,16 +18,19 @@ import numpy as np
 import pytest
 
 import dew.eval as metrics
+from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
-    EvaluationMetric,
-    get_clip_metric,
-    get_clip_score_metric,
-    get_psnr_metric,
-    get_ssim_metric,
-    psnr,
-    ssim,
+    ImageMetric,
+    clip,
+    clip_score,
+    fid,
+    peak_signal_noise_ratio as psnr,
+    psnr as psnr_metric,
+    ssim as ssim_metric,
+    structural_similarity as ssim,
 )
-from dew.eval.fid import frechet_distance, get_fid_metric
+from dew.eval.fid import frechet_distance
+from dew.registry import metrics as registry
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
@@ -55,9 +58,9 @@ def test_frechet_distance_grows_with_covariance_mismatch():
 
 @pytest.mark.network
 def test_fid_metric_scores_real_images_better_than_noise(rng):
-    metric = get_fid_metric()
-    assert isinstance(metric, EvaluationMetric)
-    assert metric.name == 'fid' and metric.higher_is_better is False
+    metric = fid()
+    assert isinstance(metric, ImageMetric)
+    assert metric.name == 'fid' and metric.reads is ImageGrid
 
     key_real, key_noise = jax.random.split(rng)
     real = jax.random.randint(key_real, (8, 64, 64, 3), 0, 256, dtype=jnp.int32).astype(jnp.uint8)
@@ -65,8 +68,8 @@ def test_fid_metric_scores_real_images_better_than_noise(rng):
 
     # Generated samples live in [-1, 1]; the same images should score far
     # closer to the batch than unrelated noise does
-    matching = metric.function((jnp.asarray(real, jnp.float32) - 127.5) / 127.5, batch)
-    unrelated = metric.function(jax.random.normal(key_noise, (8, 64, 64, 3)), batch)
+    matching = metric(ImageGrid((jnp.asarray(real, jnp.float32) - 127.5) / 127.5), batch)
+    unrelated = metric(ImageGrid(jax.random.normal(key_noise, (8, 64, 64, 3))), batch)
     assert np.isfinite(matching) and np.isfinite(unrelated)
     assert matching < unrelated
 
@@ -195,39 +198,40 @@ def test_metrics_reject_unbatched_inputs(metric_fn):
 
 
 def test_psnr_metric_factory_wires_up_the_trainer_contract(rng):
-    metric = get_psnr_metric()
-    assert isinstance(metric, EvaluationMetric)
-    assert metric.name == 'psnr' and metric.higher_is_better is True
+    metric = psnr_metric()
+    assert isinstance(metric, ImageMetric)
+    assert metric.name == 'psnr' and metric.reads is ImageGrid
 
     batch = _uint8_batch((2, 32, 32, 3), rng)
     degraded = _normalised(batch) + 0.1
-    assert float(metric.function(degraded, batch)) == pytest.approx(
+    assert metric(ImageGrid(degraded), batch) == pytest.approx(
         float(psnr(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
     )
+    assert metric.reduce([1.0, 3.0]) == 2.0
 
 
 def test_ssim_metric_factory_wires_up_the_trainer_contract(rng):
-    metric = get_ssim_metric()
-    assert isinstance(metric, EvaluationMetric)
-    assert metric.name == 'ssim' and metric.higher_is_better is True
+    metric = ssim_metric()
+    assert isinstance(metric, ImageMetric)
+    assert metric.name == 'ssim' and metric.reads is ImageGrid
 
     batch = _uint8_batch((2, 32, 32, 3), rng)
     degraded = _blur(_normalised(batch))
-    assert float(metric.function(degraded, batch)) == pytest.approx(
+    assert metric(ImageGrid(degraded), batch) == pytest.approx(
         float(ssim(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
     )
 
 
 def test_psnr_metric_scores_a_perfect_reconstruction_as_infinite(rng):
-    """The trainer hands the metric the sampler's [-1, 1] output and the
+    """The trainer hands the metric the objective's [-1, 1] artifact and the
     loader's uint8 batch, and the same image on both sides has zero error."""
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    assert jnp.isinf(get_psnr_metric().function(_normalised(batch), batch))
+    assert np.isinf(psnr_metric()(ImageGrid(_normalised(batch)), batch))
 
 
 def test_ssim_metric_scores_a_perfect_reconstruction_as_one(rng):
     batch = _uint8_batch((2, 32, 32, 3), rng)
-    assert float(get_ssim_metric().function(_normalised(batch), batch)) == pytest.approx(1.0, abs=1e-4)
+    assert ssim_metric()(ImageGrid(_normalised(batch)), batch) == pytest.approx(1.0, abs=1e-4)
 
 
 def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
@@ -236,7 +240,7 @@ def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
     batch = {'image': jnp.full((2, 8, 8, 3), 100, dtype=jnp.uint8)}
     generated = jnp.full((2, 8, 8, 3), (151 - 127.5) / 127.5)
     expected = 10.0 * np.log10(2.0**2 / 0.4**2)
-    assert float(get_psnr_metric().function(generated, batch)) == pytest.approx(expected, rel=1e-5)
+    assert psnr_metric()(ImageGrid(generated), batch) == pytest.approx(expected, rel=1e-5)
 
 
 def test_ssim_metric_matches_the_closed_form_on_constant_images():
@@ -248,27 +252,41 @@ def test_ssim_metric_matches_the_closed_form_on_constant_images():
     mu_y = (128 - 127.5) / 127.5
     c1 = (0.01 * 2.0) ** 2
     expected = c1 / (mu_y**2 + c1)
-    assert float(get_ssim_metric().function(jnp.zeros((1, 16, 16, 1)), batch)) == pytest.approx(
+    assert ssim_metric()(ImageGrid(jnp.zeros((1, 16, 16, 1))), batch) == pytest.approx(
         expected, rel=1e-4
     )
 
 
+def test_a_video_metric_scores_the_clips(rng):
+    """A metric built to read VideoGrid scores the clips as the flattened
+    frames, against the batch's video field."""
+    batch = {'video': _uint8_batch((6, 16, 16, 3), rng)['image'].reshape(2, 3, 16, 16, 3)}
+    reference = (jnp.asarray(batch['video'], jnp.float32) - 127.5) / 127.5
+    degraded = reference + 0.1
+    metric = ImageMetric(name='psnr', reads=VideoGrid, measure=psnr_metric(field='video').measure)
+    assert metric(VideoGrid(degraded), batch) == pytest.approx(
+        float(psnr(degraded, reference, data_range=2.0)), rel=1e-5)
+
+
 def test_metrics_package_exports_resolve():
-    """The package surface the trainer configures metrics from."""
+    """The package surface the trainer configures metrics from, and the
+    registry the design names them in."""
     assert set(metrics.__all__) == {
-        'EvaluationMetric',
-        'get_clip_metric',
-        'get_clip_score_metric',
-        'get_fid_metric',
+        'ImageMetric',
+        'frames',
+        'clip',
+        'clip_score',
+        'fid',
         'frechet_distance',
+        'peak_signal_noise_ratio',
         'psnr',
-        'get_psnr_metric',
+        'structural_similarity',
         'ssim',
-        'get_ssim_metric',
-        'get_perplexity_metric',
     }
     for name in metrics.__all__:
         assert getattr(metrics, name) is not None
+    assert registry['psnr'] is psnr_metric and registry.psnr is psnr_metric
+    assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
 
 
 ############################################################################################################
@@ -305,12 +323,12 @@ def test_clip_metric_scores_the_reference_cosine():
     mean(1 - cos): observed 3.2e-08 off it against a tolerance of 1e-5. Before
     the towers were vendored, the factory raised ImportError on
     `FlaxCLIPModel`, which transformers 5 removed."""
-    metric = get_clip_metric(modelname=str(CLIP_TINY))
-    assert isinstance(metric, EvaluationMetric)
-    assert metric.name == 'clip_similarity' and metric.higher_is_better is False
+    metric = clip(modelname=str(CLIP_TINY))
+    assert isinstance(metric, ImageMetric)
+    assert metric.name == 'clip_similarity' and metric.reads is ImageGrid
     generated, batch, cosine = clip_fixture()
 
-    score = float(metric.function(generated, batch))
+    score = metric(ImageGrid(generated), batch)
 
     expected = np.mean(1.0 - cosine)
     assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
@@ -321,12 +339,12 @@ def test_clip_score_metric_clamps_the_reference_cosine():
     cosine (-0.072) among three positive ones, so the clamp does work here.
     Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
     against a tolerance of 1e-3 on a score of order 15."""
-    metric = get_clip_score_metric(modelname=str(CLIP_TINY))
-    assert metric.name == 'clip_score' and metric.higher_is_better is True
+    metric = clip_score(modelname=str(CLIP_TINY))
+    assert metric.name == 'clip_score'
     generated, batch, cosine = clip_fixture()
     assert (cosine < 0).any() and (cosine > 0).any()
 
-    score = float(metric.function(generated, batch))
+    score = metric(ImageGrid(generated), batch)
 
     expected = np.mean(100.0 * np.maximum(cosine, 0.0))
     assert abs(score - expected) < CLIP_SCORE_TOLERANCE, f"{score} against {expected}"
@@ -337,10 +355,10 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
     it to a dark pixel, which the old metric did; the score of an overshooting
     white image has to be the score of a white one."""
-    metric = get_clip_score_metric(modelname=str(CLIP_TINY))
+    metric = clip_score(modelname=str(CLIP_TINY))
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
-    assert float(metric.function(1.2 * white, batch)) == float(metric.function(white, batch))
-    assert float(metric.function(-1.2 * white, batch)) == float(metric.function(-white, batch))
-    assert float(metric.function(white, batch)) != float(metric.function(-white, batch))
+    assert metric(ImageGrid(1.2 * white), batch) == metric(ImageGrid(white), batch)
+    assert metric(ImageGrid(-1.2 * white), batch) == metric(ImageGrid(-white), batch)
+    assert metric(ImageGrid(white), batch) != metric(ImageGrid(-white), batch)
