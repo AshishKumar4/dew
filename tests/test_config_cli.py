@@ -128,35 +128,12 @@ def _batches(batch):
     return lambda: _Batches(batch)
 
 
-class _Checkpointable:
-    """Explicit position methods over a tokenized stream."""
-    # tokenized forwards get_state and set_state through __getattr__. A
-    # runtime_checkable isinstance does not see that forwarding, so fit
-    # refuses the stream when checkpoints are asked for. This class states
-    # the pair where the checker looks. The real caption stage stays underneath.
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self._inner)
-
-    def get_state(self):
-        return self._inner.get_state()
-
-    def set_state(self, state):
-        return self._inner.set_state(state)
-
-
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
     recipe = load_recipe("diffusion")
     batch = 8
     def load(self, *, batch, tokenize=None):
         train = tokenized(_batches(batch), tokenize)
-        return Dataset(train=lambda: _Checkpointable(train()),
+        return Dataset(train=train,
                        val=tokenized(lambda: itertools.islice(_batches(batch)(), 1), tokenize),
                        records=4 * batch, batch=batch)
 
