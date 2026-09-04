@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from etils import epath
 import jax
 
+from dew.checkpoints import is_uri
 from dew.config import RUN_FILE
 from dew.training.tracker import WandbTracker
 
@@ -45,7 +46,7 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     artifact = wandb.Artifact(name=name, type="model")
     path = epath.Path(directory)
     spec = path.parent / RUN_FILE
-    if "://" in directory:
+    if is_uri(directory):
         artifact.add_reference(str(path))
         if spec.exists():
             artifact.add_reference(str(spec))

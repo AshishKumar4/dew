@@ -52,11 +52,13 @@ def read_video(video_path: str, change_fps=False, reader="rsreader"):
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
             os.makedirs(temp_dir, exist_ok=True)
-            command = (
-                f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
-            )
-            subprocess.run(command, shell=True)
             target_video_path = os.path.join(temp_dir, "video.mp4")
+            # An argument list, not a shell string: a path holds spaces and a
+            # caller's path is not the place to run a shell.
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-nostdin", "-i", video_path,
+                 "-r", "25", "-crf", "18", target_video_path],
+                check=True)
         else:
             target_video_path = video_path
 
