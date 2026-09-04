@@ -171,3 +171,33 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
     generated = generate(model, params, prompt, PAYLOAD, key=jax.random.PRNGKey(1),
                          temperature=0)
     assert jnp.array_equal(generated[:, PAYLOAD + 1:], held_out[:, :PAYLOAD])
+
+
+def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
+    """Where a decode lands is part of the contract: the tokens are read on
+    the host, decoded to text and logged, so every device that reads a row
+    holds the whole row. Without the pinned out sharding the layout is the
+    compiler's choice and can shard the batch, which a decode must not
+    depend on."""
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import batch_sharding, build_mesh
+
+    model = tiny(max_seq_len=8)
+    mesh = build_mesh(MeshSpec(fsdp=2))
+    params = model.init(rng, jnp.ones((2, 4), jnp.int32))
+    placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
+    # The prompt arrives the way a validation batch does, split over the
+    # mesh, which is what the output layout would otherwise follow.
+    prompt = jax.device_put(jax.random.randint(rng, (8, 3), 0, VOCAB),
+                            batch_sharding(mesh))
+
+    generated = generate(model, placed, prompt, 3, key=jax.random.PRNGKey(0),
+                         temperature=0)
+
+    assert generated.sharding.mesh == mesh
+    assert generated.sharding.spec == jax.sharding.PartitionSpec()
+    assert len(generated.addressable_shards) == len(mesh.devices.flatten())
+    whole = jax.device_get(generated)
+    for shard in generated.addressable_shards:
+        assert shard.data.shape == generated.shape
+        assert jnp.array_equal(jax.device_get(shard.data), whole)
