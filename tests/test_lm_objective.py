@@ -1,13 +1,14 @@
-"""Language modelling: the shifted cross entropy, and a trainer with no input config.
+"""Language modelling: the shifted cross entropy, what evaluation produces,
+and the objective through the general trainer.
 
 The model here is a small causal stack that honors the backbone's contract
-(int32 ids in, float32 logits out, a `train` flag for dropout) and
-`dew.sampling.text.generate` is recorded rather than run, so what is under
-test is the objective: that the loss is the cross entropy of the shifted
-sequence and nothing else, that padding is excluded only when a pad id is
-named, and that the trainer drives it on both a data-parallel and an FSDP mesh
-without a DiffusionInputConfig to describe the inputs. The real sampler runs
-in test_lm_recipe.
+(int32 ids in, float32 logits out, a `train` flag for dropout, the head split
+off behind `hidden_states` and `head_weight`) and `dew.sampling.text.generate`
+is recorded rather than run, so what is under test is the objective: that the
+loss is the cross entropy of the shifted sequence and nothing else, that
+padding is excluded only when a pad id is named, that a pass is scored per
+token, and that the trainer drives it on both a data-parallel and an FSDP
+mesh. The real sampler runs in test_lm_recipe.
 """
 
 from typing import Optional
@@ -22,11 +23,11 @@ import pytest
 pytestmark = pytest.mark.mesh
 from flax import linen as nn
 
-from dew.eval import get_perplexity_metric
-from dew.objectives.base import EMASpec, Objective
-from dew.objectives.lm import LMObjective, TEXT_KEY
-from dew.training import ObjectiveTrainer
-from dew.training.objective_trainer import TrainState
+from dew.artifacts import TextSamples, TokenScores
+from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective, Perplexity, Samples, TEXT_KEY
+from dew.registry import metrics
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 VOCAB = 8
 SEQ = 16
@@ -61,8 +62,6 @@ class TinyCausalLM(nn.Module):
                                 name="lm_head")
 
     def __call__(self, tokens, train: bool = False, **packing):
-        # `packing` is the positions and segment ids a packed subclass reads;
-        # this model has no use for them and its hidden_states refuses them.
         logits = self.lm_head(self.hidden_states(tokens, train=train, **packing))
         if self.final_logit_softcap is not None:
             cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
@@ -96,37 +95,12 @@ class TinyCausalLM(nn.Module):
         return params["lm_head"]["kernel"].astype(jnp.float32)
 
 
-class WandbRecorder:
-    """Just enough of a wandb run to see what validation logged."""
-
-    def __init__(self):
-        self.logged = {}
-
-    def log(self, values, step=None):
-        self.logged.update(values)
-
-
-class ShapelessObjective(Objective):
-    """An objective that says nothing about its inputs."""
-
-    tag = "shapeless"
-
-    def __init__(self):
-        self.ema = EMASpec(decay=lambda step: 0.0)
-
-    def init_params(self, rng):
-        return {"params": {"w": jnp.zeros(())}}
-
-    def loss(self, params, ema_params, batch, rng, step):
-        return jnp.zeros(()), {}
-
-    def make_validation_step(self, **kwargs):
-        return lambda val_state, batch: None
-
-
 def make_objective(seq=SEQ, model=None, **kwargs):
-    return LMObjective(model or TinyCausalLM(vocab_size=VOCAB), seq,
-                       vocab_size=VOCAB, **kwargs)
+    return LMObjective(model or TinyCausalLM(vocab_size=VOCAB), seq, **kwargs)
+
+
+def step_at(index=0, key=1, ema=None):
+    return Step(step=jnp.asarray(index), key=jax.random.key(key), ema=ema)
 
 
 def token_batch(batch=4, seq=SEQ, seed=0):
@@ -149,6 +123,16 @@ def cycle_batches(batch=BATCH, seq=SEQ, seed=0):
         yield {TEXT_KEY: ((offsets + positions) % VOCAB).astype(np.int32)}
 
 
+class Data:
+    def __init__(self, train, val=None, batch=BATCH):
+        self._train, self.val, self.batch, self.records = train, val, batch, None
+
+    def train(self):
+        return self._train()
+
+    steps_per_epoch = None
+
+
 def reference_cross_entropy(logits, targets, pad_id=None):
     """Shifted cross entropy in numpy, from the model's own logits."""
     logits = np.asarray(logits, np.float64)
@@ -159,23 +143,15 @@ def reference_cross_entropy(logits, targets, pad_id=None):
     return float((picked * weights).sum() / weights.sum())
 
 
-def make_val_state(params, ema_params=None, rngs=None):
-    return TrainState.create(
-        apply_fn=None, params=params,
-        ema_params=params if ema_params is None else ema_params,
-        tx=optax.sgd(0.0), rngs=jax.random.PRNGKey(0) if rngs is None else rngs,
-        metrics=None, dynamic_scale=None)
-
-
 @pytest.fixture
 def recorded_generate(monkeypatch):
     """Stand in for `dew.sampling.text.generate` and record how it was called."""
     calls = []
 
-    def generate(model, params, prompt, max_new_tokens, *, rng, temperature=1.0,
+    def generate(model, params, prompt, max_new_tokens, *, key, temperature=1.0,
                  top_k=None):
         calls.append({"model": model, "params": params, "prompt": prompt,
-                      "max_new_tokens": max_new_tokens, "rng": rng,
+                      "max_new_tokens": max_new_tokens, "key": key,
                       "temperature": temperature, "top_k": top_k})
         return jnp.concatenate(
             [prompt, jnp.zeros((prompt.shape[0], max_new_tokens), jnp.int32)], axis=1)
@@ -189,11 +165,11 @@ def recorded_generate(monkeypatch):
 
 def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    loss, _ = objective.loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     expected = reference_cross_entropy(logits, tokens[:, 1:])
@@ -206,12 +182,12 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
 def test_padded_targets_are_left_out_of_the_average():
     pad_id = 0
     objective = make_objective(pad_id=pad_id)
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch(seed=3)
     tokens = np.asarray(batch[TEXT_KEY])
     assert (tokens[:, 1:] == pad_id).any(), "this batch has no padding to skip"
 
-    loss, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    loss, _ = objective.loss(params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     masked = reference_cross_entropy(logits, tokens[:, 1:], pad_id=pad_id)
@@ -222,48 +198,50 @@ def test_padded_targets_are_left_out_of_the_average():
 
 def test_a_batch_of_only_padding_does_not_divide_by_zero():
     objective = make_objective(pad_id=5)
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = {TEXT_KEY: jnp.full((2, SEQ + 1), 5, jnp.int32)}
 
-    loss, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
-    assert float(loss) == 0.0 and bool(jnp.isfinite(aux["perplexity"]))
+    loss, aux = objective.loss(params, batch, step_at())
+    assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
 
 
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    loss, aux = objective.loss(params, batch, step_at())
 
-    assert set(aux) == {"ce", "perplexity", "token_accuracy"}
-    assert float(aux["ce"]) == pytest.approx(float(loss))
-    assert float(aux["perplexity"]) == pytest.approx(float(jnp.exp(loss)), rel=1e-5)
+    assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
+    assert aux.variables is None
+    assert float(aux.metrics["ce"]) == pytest.approx(float(loss))
+    assert float(aux.metrics["perplexity"]) == pytest.approx(float(jnp.exp(loss)), rel=1e-5)
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     predicted = np.argmax(np.asarray(logits), axis=-1)
     accuracy = (predicted == np.asarray(batch[TEXT_KEY][:, 1:])).mean()
-    assert float(aux["token_accuracy"]) == pytest.approx(accuracy)
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
 
 
 def test_a_batch_with_no_room_for_the_shift_is_rejected():
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = {TEXT_KEY: jnp.zeros((2, SEQ), jnp.int32)}
 
     with pytest.raises(ValueError, match=f"{SEQ + 1} ids per row"):
-        objective.loss(params, params, batch, jax.random.PRNGKey(0), 0)
+        objective.loss(params, batch, step_at())
 
 
 def test_dropout_runs_on_the_step_key():
-    """The loss passes a dropout rng, so a model with dropout is stochastic."""
+    """The loss passes the step key as the dropout rng, so a model with
+    dropout is stochastic across keys and reproducible under one."""
     objective = make_objective(model=TinyCausalLM(vocab_size=VOCAB, dropout_rate=0.5))
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    first, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
-    again, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
-    other, _ = objective.loss(params, params, batch, jax.random.PRNGKey(2), 0)
+    first, _ = objective.loss(params, batch, step_at(key=1))
+    again, _ = objective.loss(params, batch, step_at(key=1))
+    other, _ = objective.loss(params, batch, step_at(key=2))
 
     assert float(first) == pytest.approx(float(again))
     assert float(first) != pytest.approx(float(other))
@@ -278,16 +256,15 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
                             dtype=jnp.bfloat16)(tokens)
 
     objective = make_objective(model=Bf16LM(vocab_size=VOCAB))
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     inputs = token_batch()[TEXT_KEY][:, :-1]
-    hidden = objective.model.apply(params, inputs,
-                                   method=Bf16LM.hidden_states)
-    loss, aux = objective.loss(params, params, token_batch(), jax.random.PRNGKey(0), 0)
+    hidden = objective.model.apply(params, inputs, method=Bf16LM.hidden_states)
+    loss, aux = objective.loss(params, token_batch(), step_at())
 
     assert hidden.dtype == jnp.bfloat16
     assert objective.model.apply(params, inputs).dtype == jnp.float32
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
-    assert loss.dtype == jnp.float32 and aux["ce"].dtype == jnp.float32
+    assert loss.dtype == jnp.float32 and aux.metrics["ce"].dtype == jnp.float32
 
 
 def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
@@ -304,13 +281,14 @@ def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
     model = CausalTransformer(vocab_size=vocab, emb_features=32, num_layers=1,
                               num_heads=4, mlp_ratio=2, max_seq_len=16,
                               dtype=jnp.bfloat16)
-    objective = LMObjective(model, seq, vocab_size=vocab, head_chunks=4)
-    params = objective.init_params(jax.random.PRNGKey(0))
+    objective = LMObjective(model, seq, head_chunks=4)
+    params = objective.init(jax.random.key(0))
     tokens = jnp.zeros((batch, seq + 1), jnp.int32)
     batch_dict = {TEXT_KEY: tokens}
 
     def chunked(p):
-        return objective.loss(p, p, batch_dict, jax.random.PRNGKey(0), 0)
+        loss, aux = objective.loss(p, batch_dict, step_at())
+        return loss, aux.metrics
 
     def full_vocabulary(p):
         logits = model.apply(p, tokens[:, :-1])
@@ -337,285 +315,254 @@ def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
 
 
 def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
-    """The frozen metric, against the implementation it replaced."""
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
 
-    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    _, aux = objective.loss(params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = (np.argmax(np.asarray(logits), axis=-1) == targets).mean()
-    assert float(aux["token_accuracy"]) == pytest.approx(expected)
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected)
 
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
     objective = make_objective(pad_id=0)
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch(seed=3)
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
     assert (targets == 0).any(), "this batch has no padding to skip"
 
-    _, aux = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    _, aux = objective.loss(params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
     kept = targets != 0
     expected = ((np.argmax(logits, axis=-1) == targets) & kept).sum() / kept.sum()
-    assert float(aux["token_accuracy"]) == pytest.approx(expected)
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected)
 
 
 # --- what the trainer needs ------------------------------------------------
 
-def test_input_shapes_declare_one_int32_token_sequence():
-    assert make_objective().input_shapes == {"tokens": ((SEQ,), jnp.int32)}
+def test_the_inputs_declare_one_token_row():
+    inputs = make_objective().inputs
+    assert inputs.sample.key == TEXT_KEY and inputs.sample.shape == (SEQ + 1,)
+    assert dict(inputs.conditions) == {}
+
+
+def test_init_builds_the_tree_from_int32_ids():
+    """An init batch of floats is not token ids."""
+    objective = make_objective()
+    params = objective.init(jax.random.key(0))
+    assert set(params) == {"params"}
+    assert params["params"]["lm_head"]["kernel"].shape == (16, VOCAB)
 
 
 def test_the_ema_tracks_the_whole_parameter_tree():
     ema = make_objective(ema_decay=0.995).ema
-    assert ema.path == ()
+    assert ema.select(("params", "anything"))
     assert float(ema.decay(0)) == pytest.approx(0.995)
     assert float(ema.decay(10_000)) == pytest.approx(0.995)
 
 
-def test_pretrained_weights_are_what_init_params_returns():
+def test_pretrained_weights_are_what_init_returns():
     """Continued pretraining: the trainer's whole initial state is the
     checkpoint, not a fresh init that happens to have the same shapes."""
     objective = make_objective()
-    trained = objective.init_params(jax.random.PRNGKey(0))
+    trained = objective.init(jax.random.key(0))
     loaded = jax.tree.map(lambda leaf: leaf + 1.0, trained)
 
-    resumed = make_objective(pretrained=loaded).init_params(jax.random.PRNGKey(1))
+    resumed = make_objective(pretrained=loaded).init(jax.random.key(1))
 
     for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded)):
         assert jnp.array_equal(restored, expected)
 
 
 def test_pretrained_params_without_the_variables_dict_are_refused():
-    params = make_objective().init_params(jax.random.PRNGKey(0))["params"]
+    params = make_objective().init(jax.random.key(0))["params"]
     with pytest.raises(ValueError, match="variables dict"):
-        make_objective(pretrained=params).init_params(jax.random.PRNGKey(0))
+        make_objective(pretrained=params).init(jax.random.key(0))
 
 
-def make_trainer(tmp_path, fsdp_size=1, seq=SEQ, learning_rate=3e-3, **objective_kwargs):
-    model = TinyCausalLM(vocab_size=VOCAB)
-    objective = LMObjective(model, seq, vocab_size=VOCAB, **objective_kwargs)
-    return ObjectiveTrainer(
-        model=model,
-        optimizer=optax.adam(learning_rate),
-        rngs=jax.random.PRNGKey(0),
-        input_config=None,
-        objective=objective,
-        name=f"lm-smoke-fsdp{fsdp_size}",
-        wandb_config=None,
-        distributed_training=True,
-        fsdp_size=fsdp_size,
-        fsdp_min_param_size=TINY,
-        checkpoint_base_path=str(tmp_path),
-        eval_metrics=[get_perplexity_metric()],
+def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **objective_kwargs):
+    return Trainer(
+        make_objective(**objective_kwargs),
+        optax.adam(learning_rate),
+        key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp),
+        layout=Layout(min_shard=TINY),
+        checkpoints=None if tmp_path is None else Checkpoints(str(tmp_path / "lm")),
+        tracker=tracker,
     )
 
 
-def test_the_trainer_takes_its_input_shapes_from_the_objective(tmp_path):
-    trainer = make_trainer(tmp_path)
-    assert trainer.input_shapes == {"tokens": ((SEQ,), jnp.int32)}
-    ones = trainer.get_input_ones()
-    assert ones["tokens"].shape == (1, SEQ)
-    assert ones["tokens"].dtype == jnp.int32, "an init batch of floats is not token ids"
-
-
-def test_a_trainer_with_neither_an_input_config_nor_input_shapes_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="input_shapes"):
-        ObjectiveTrainer(
-            model=TinyCausalLM(vocab_size=VOCAB),
-            optimizer=optax.adam(1e-3),
-            rngs=jax.random.PRNGKey(0),
-            objective=ShapelessObjective(),
-            wandb_config=None,
-            distributed_training=False,
-            checkpoint_base_path=str(tmp_path),
-        )
-
-
-@pytest.mark.parametrize("fsdp_size", [1, 4])
-def test_the_objective_trains_through_the_trainer(tmp_path, fsdp_size):
+@pytest.mark.parametrize("fsdp", [1, 4])
+def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     """The whole seam on the simulated mesh: 8x1 data parallel, then 2x4 FSDP.
 
     Compiling is not the claim. The loss on the copy task has to actually fall,
     the parameters have to stay on the mesh they were built on, and the run has
     to leave a checkpoint behind.
     """
-    trainer = make_trainer(tmp_path, fsdp_size=fsdp_size)
-    assert trainer.mesh.shape['fsdp'] == fsdp_size
-    assert trainer.mesh.shape['data'] == jax.device_count() // fsdp_size
-    specs = [p.sharding.spec for p in jax.tree.leaves(trainer.state.params)]
-    if fsdp_size > 1:
-        sharded = [p for p in jax.tree.leaves(trainer.state.params)
-                   if 'fsdp' in str(p.sharding.spec)]
-        assert sharded, "no parameter was sharded over the fsdp axis"
-
+    trainer = make_trainer(tmp_path, fsdp=fsdp)
     batch = next(cycle_batches(seed=7))
-    scored = jax.jit(lambda params: trainer.objective.loss(
-        params, params, batch, jax.random.PRNGKey(0), 0)[0])
-    before = float(scored(trainer.state.params))
+    scored = jax.jit(lambda params: trainer.objective.loss(params, batch, step_at())[0])
+    before = float(scored(trainer.initial_state().params))
 
-    state = trainer.fit(
-        {"train": cycle_batches, "train_len": 64, "local_batch_size": BATCH},
-        training_steps_per_epoch=STEPS, epochs=1, val_steps_per_epoch=0)
+    state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
     after = float(scored(state.params))
 
+    specs = [p.sharding.spec for p in jax.tree.leaves(state.params)]
+    if fsdp > 1:
+        assert any('fsdp' in str(spec) for spec in specs), "no parameter was sharded"
     assert before > 1.5, "the untrained model already knew the task"
     assert after < 0.3, f"the loss did not fall on the copy task: {before} -> {after}"
-    assert specs == [p.sharding.spec for p in jax.tree.leaves(state.params)]
-    trainer.wait_for_checkpoints()
-    assert trainer.checkpointer.latest_step() == STEPS
+    assert Checkpoints(str(tmp_path / "lm")).latest == STEPS
 
 
-# --- validation ------------------------------------------------------------
+# --- evaluation ------------------------------------------------------------
 
-def test_validation_reports_the_teacher_forced_cross_entropy():
+def test_evaluation_scores_every_target_of_the_batch():
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    artifacts = objective.make_validation_step()(make_val_state(params), batch)
+    scores = objective.evaluate(params, batch, step_at())
 
-    assert set(artifacts) == {"ce"}
+    assert isinstance(scores, TokenScores)
+    assert scores.losses.shape == scores.weights.shape == (4, SEQ)
+    np.testing.assert_array_equal(scores.weights, 1.0)
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
-    assert float(artifacts["ce"]) == pytest.approx(expected, rel=1e-5)
+    assert float(jnp.mean(scores.losses)) == pytest.approx(expected, rel=1e-5)
 
 
-def test_validation_generates_from_the_ema_copy(recorded_generate):
-    objective = make_objective(samples={
-        "prompt": [1, 2, 3], "max_new_tokens": 4, "temperature": 0.0,
-        "decode": lambda ids: "".join(str(i) for i in ids)})
-    params = objective.init_params(jax.random.PRNGKey(0))
-    ema_params = jax.tree.map(lambda leaf: leaf + 1, params)
+def test_evaluation_reads_the_ema_copy():
+    objective = make_objective()
+    params = objective.init(jax.random.key(0))
+    ema = jax.tree.map(lambda leaf: leaf + 1, params)
+    batch = token_batch()
 
-    artifacts = objective.make_validation_step()(
-        make_val_state(params, ema_params), token_batch())
+    live = objective.evaluate(params, batch, step_at())
+    averaged = objective.evaluate(params, batch, step_at(ema=ema))
 
-    assert artifacts["tokens"].shape == (1, 3 + 4)
+    logits = objective.model.apply(ema, batch[TEXT_KEY][:, :-1])
+    expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
+    assert float(jnp.mean(averaged.losses)) == pytest.approx(expected, rel=1e-4)
+    assert float(jnp.mean(live.losses)) != pytest.approx(expected)
+
+
+def test_evaluation_writes_text_from_the_ema_copy(recorded_generate):
+    objective = make_objective(samples=Samples(
+        prompt=[1, 2, 3], max_new_tokens=4, temperature=0.0,
+        decode=lambda ids: "".join(str(i) for i in ids)))
+    params = objective.init(jax.random.key(0))
+    ema = jax.tree.map(lambda leaf: leaf + 1, params)
+
+    scores, samples = objective.evaluate(params, token_batch(), step_at(key=5, ema=ema))
+
+    assert isinstance(scores, TokenScores) and isinstance(samples, TextSamples)
+    assert samples.tokens.shape == (1, 3 + 4)
+    assert samples.prompt == "123" and samples.texts == ("1230000",)
     call, = recorded_generate
-    assert call["params"] is ema_params, "samples were drawn from the live params"
+    assert call["params"] is ema, "samples were drawn from the live params"
     assert call["model"] is objective.model
     assert np.array_equal(np.asarray(call["prompt"]), [[1, 2, 3]])
     assert call["max_new_tokens"] == 4 and call["temperature"] == 0.0
     assert call["top_k"] is None
+    assert jnp.array_equal(jax.random.key_data(call["key"]),
+                           jax.random.key_data(jax.random.key(5)))
 
 
-def test_validation_falls_back_to_the_live_params_without_an_ema(recorded_generate):
-    objective = make_objective(samples={"prompt": [[1, 2], [3, 4]], "max_new_tokens": 2})
-    params = objective.init_params(jax.random.PRNGKey(0))
-    state = make_val_state(params).replace(ema_params=None)
+def test_evaluation_without_an_ema_writes_from_the_live_params(recorded_generate):
+    objective = make_objective(samples=Samples(prompt=[[1, 2], [3, 4]], max_new_tokens=2))
+    params = objective.init(jax.random.key(0))
 
-    artifacts = objective.make_validation_step()(state, token_batch())
+    _, samples = objective.evaluate(params, token_batch(), step_at())
 
-    assert artifacts["tokens"].shape == (2, 4)
+    assert samples.tokens.shape == (2, 4)
     assert recorded_generate[0]["params"] is params
     assert recorded_generate[0]["temperature"] == 1.0
 
 
 def test_prompts_that_cannot_be_batched_are_rejected():
-    ragged = make_objective(samples={"prompt": [[1, 2], [3]], "max_new_tokens": 1})
     with pytest.raises(ValueError, match="equal length"):
-        ragged.make_validation_step()
-
-    empty = make_objective(samples={"prompt": [], "max_new_tokens": 1})
+        make_objective(samples=Samples(prompt=[[1, 2], [3]], max_new_tokens=1))
     with pytest.raises(ValueError, match="non-empty"):
-        empty.make_validation_step()
+        make_objective(samples=Samples(prompt=[], max_new_tokens=1))
 
 
-def test_log_validation_artifacts_reports_decoded_text():
-    objective = make_objective(samples={
-        "prompt": [1, 2], "max_new_tokens": 3,
-        "decode": lambda ids: "|".join(str(i) for i in ids)})
-    run = WandbRecorder()
+# --- perplexity ------------------------------------------------------------
 
-    objective.log_validation_artifacts(run, {
-        "ce": jnp.asarray(1.5),
-        "tokens": jnp.asarray([[1, 2, 0, 1, 2]], jnp.int32),
-    }, step=7)
+def test_perplexity_weighs_every_batch_by_its_counted_targets():
+    """exp(sum(loss * weight) / sum(weight)) over the pass: a batch with more
+    counted targets moves the score more, which the mean of per-batch means
+    gets wrong the moment counts differ."""
+    metric = metrics.perplexity()
+    assert isinstance(metric, Perplexity) and metric.reads is TokenScores
+    heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)))
+    light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]))
 
-    assert list(run.logged) == ["val/samples"]
-    assert run.logged["val/samples"].data == [[0, "1|2|0|1|2"]]
+    score = metric.reduce([metric(heavy, None), metric(light, None)])
 
-
-def test_log_validation_artifacts_without_samples_is_empty():
-    run = WandbRecorder()
-    make_objective().log_validation_artifacts(run, {"ce": jnp.asarray(0.5)}, step=1)
-    assert run.logged == {}
+    assert score == pytest.approx(np.exp((4 * 1.0 + 1 * 3.0) / 5))
+    assert score != pytest.approx(np.exp(np.mean([1.0, 3.0])))
 
 
-def test_perplexity_metric_reads_the_cross_entropy_artifact():
-    metric = get_perplexity_metric()
-    assert metric.name == "perplexity" and metric.higher_is_better is False
-    assert metric.function({"ce": jnp.asarray(2.0)}, None) == pytest.approx(2.0)
-    assert metric.reducer([0.0, 2.0]) == pytest.approx(np.exp(1.0))
+def test_a_batch_with_no_counted_target_weighs_nothing():
+    metric = metrics.perplexity()
+    scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)))
+    empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)))
+
+    assert metric.reduce([metric(scored, None), metric(empty, None)]) == pytest.approx(np.exp(2.0))
+    with pytest.raises(ValueError, match="no counted target"):
+        metric.reduce([metric(empty, None)])
 
 
-def test_the_validation_loop_scores_perplexity(tmp_path):
-    """Objective artifacts through the trainer's loop and into the metric."""
-    trainer = make_trainer(tmp_path)
-    trainer.validation_loop(trainer.state, trainer._define_validation_step(),
-                            lambda: iter([token_batch(batch=BATCH)]), 1, 0)
-
-    ce = float(trainer.objective.make_validation_step()(
-        trainer.state, token_batch(batch=BATCH))["ce"])
-    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(
-        float(np.exp(ce)), rel=1e-4)
-
-
-def test_a_validation_stream_that_ends_early_still_scores_the_epoch(tmp_path):
-    """A pass over a held-out split ends with the records, which is before
-    the val_steps_per_epoch batches the loop asks for whenever the split is
-    smaller than that. The StopIteration that ended the stream jumped past
-    the reduction, so an epoch reported no perplexity at all.
-    """
-    trainer = make_trainer(tmp_path)
-    batches = [token_batch(batch=BATCH, seed=seed) for seed in (0, 1)]
-
-    trainer.validation_loop(trainer.state, trainer._define_validation_step(),
-                            lambda: iter(batches), 8, 0)
-
-    val_step = trainer.objective.make_validation_step()
-    cross_entropies = [float(val_step(trainer.state, batch)["ce"])
-                       for batch in batches]
-    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(
-        float(np.exp(np.mean(cross_entropies))), rel=1e-4)
-
-
-def test_the_epoch_score_is_the_same_however_the_pass_ends(tmp_path):
-    """Two held-out batches are one epoch's score whether the loop asked for
-    two batches or for eight and the split ran out at two."""
-    batches = [token_batch(batch=BATCH, seed=seed) for seed in (0, 1)]
-
-    def perplexity(val_steps_per_epoch):
-        trainer = make_trainer(tmp_path / f"steps{val_steps_per_epoch}")
-        trainer.validation_loop(trainer.state, trainer._define_validation_step(),
-                                lambda: iter(batches), val_steps_per_epoch, 0)
-        return trainer.best_val_metrics["val/perplexity"]
-
-    assert perplexity(8) == pytest.approx(perplexity(2), rel=1e-6)
-
-
-def test_validation_exponentiates_after_averaging_cross_entropy(tmp_path):
-    trainer = make_trainer(tmp_path)
-    cross_entropies = iter([jnp.asarray(0.0), jnp.asarray(2.0)])
-
-    trainer.validation_loop(
-        trainer.state,
-        lambda state, batch: {"ce": next(cross_entropies)},
-        None,
-        val_steps_per_epoch=2,
-        current_step=0,
-    )
-
+def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
+    metric = metrics.perplexity()
+    values = [metric(TokenScores(losses=jnp.full((1, 2), ce), weights=jnp.ones((1, 2))), None)
+              for ce in (0.0, 2.0)]
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)
-    assert trainer.best_val_metrics["val/perplexity"] == pytest.approx(expected)
+    assert metric.reduce(values) == pytest.approx(expected)
+
+
+class RecordingTracker:
+    def __init__(self):
+        self.scalars = []
+        self.artifacts = []
+
+    def log(self, scalars, step):
+        self.scalars.append((step, dict(scalars)))
+
+    def artifact(self, value, step):
+        self.artifacts.append((step, value))
+
+
+def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
+    """Objective artifacts through the trainer's loop and into the metric:
+    two batches of different padding weigh by their counted targets."""
+    padded = {TEXT_KEY: jnp.asarray(np.where(np.arange(SEQ + 1) < 9, token_batch(BATCH)[TEXT_KEY], 0))}
+    batches = [token_batch(BATCH, seed=1), padded]
+    tracker = RecordingTracker()
+    trainer = make_trainer(pad_id=0, tracker=tracker)
+    trainer.fit(Data(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+                eval_every=1, metrics=(metrics.perplexity(),))
+
+    state = trainer.initial_state()
+    total, count = 0.0, 0.0
+    for batch in batches:
+        scores = trainer.objective.evaluate(state.params, batch, step_at())
+        total += float(jnp.sum(scores.losses * scores.weights))
+        count += float(jnp.sum(scores.weights))
+    logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
+    assert len(logged) == 1
+    # The initial parameters moved one step before the pass, so the pass
+    # scores are close, not equal; what the assertion pins is the weighting.
+    assert 0 < count < 2 * BATCH * SEQ
+    assert logged[0] == pytest.approx(np.exp(total / count), rel=5e-2)
 
 
 # --- packed batches --------------------------------------------------------
@@ -655,7 +602,7 @@ class PackedTinyLM(TinyCausalLM):
 
 
 def packed_objective(seq=SEQ, **kwargs):
-    return LMObjective(PackedTinyLM(vocab_size=VOCAB), seq, vocab_size=VOCAB, **kwargs)
+    return LMObjective(PackedTinyLM(vocab_size=VOCAB), seq, **kwargs)
 
 
 def documents(first=7, second=3, seq=SEQ):
@@ -695,12 +642,16 @@ def counted_losses(objective, params, tokens, segment_ids, positions):
     return np.asarray(losses[0]), np.asarray(weights[0])
 
 
+def weighted_mean(losses, weights):
+    return float(jnp.sum(losses * weights) / jnp.sum(weights))
+
+
 def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     objective = packed_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, _) = documents()
 
-    ce, aux = objective.shifted_cross_entropy(
+    scored_losses, scored_weights, _, _ = objective.token_scores(
         params, tokens, segment_ids=segment_ids, positions=positions)
 
     losses, weights = counted_losses(objective, params, tokens, segment_ids, positions)
@@ -710,35 +661,34 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     assert weights[boundary] == 0
     assert weights[:boundary].all() and weights[boundary + 1] == 1
     assert weights[len(doc_a) + 2:].sum() == 0, "padding was trained on"
-    assert float(ce) == pytest.approx(
+    np.testing.assert_array_equal(np.asarray(scored_weights[0]), weights)
+    assert weighted_mean(scored_losses, scored_weights) == pytest.approx(
         float((losses * weights).sum() / weights.sum()), rel=1e-6)
-    assert float(aux["token_accuracy"]) <= 1.0
 
 
 def test_a_packed_batch_scores_like_its_documents_alone():
     """Packing is only a layout: the two documents' losses have to be the ones
     they get on their own, and the boundary target is dropped on both sides."""
     objective = packed_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
 
-    ce, _ = objective.shifted_cross_entropy(
+    losses, weights, _, _ = objective.token_scores(
         params, tokens, segment_ids=segment_ids, positions=positions)
+    ce = weighted_mean(losses, weights)
 
     total, count = 0.0, 0.0
     for document in (doc_a, doc_b):
         alone = only_document(document)
-        losses, weights = counted_losses(objective, params, *alone)
-        total += float((losses * weights).sum())
-        count += float(weights.sum())
+        alone_losses, alone_weights = counted_losses(objective, params, *alone)
+        total += float((alone_losses * alone_weights).sum())
+        count += float(alone_weights.sum())
 
     packed_losses, packed_weights = counted_losses(
         objective, params, tokens, segment_ids, positions)
     assert count == packed_weights.sum() == len(doc_a) + len(doc_b) - 2
-    # Position by position, so a mismatch says which target moved.
-    assert float(ce) == pytest.approx(total / count, rel=1e-5)
-    assert float(ce) == pytest.approx(
-        float((packed_losses * packed_weights).sum() / count), rel=1e-6)
+    assert ce == pytest.approx(total / count, rel=1e-5)
+    assert ce == pytest.approx(float((packed_losses * packed_weights).sum() / count), rel=1e-6)
 
 
 def test_a_packed_batch_scores_like_its_documents_through_the_chunked_head():
@@ -746,45 +696,60 @@ def test_a_packed_batch_scores_like_its_documents_through_the_chunked_head():
     scored in chunks. The loss has to be the one the documents get on their
     own through the same chunked head, weighted by the targets each counts."""
     objective = packed_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
 
-    packed, _ = objective.shifted_cross_entropy(
+    losses, weights, _, _ = objective.token_scores(
         params, tokens, segment_ids=segment_ids, positions=positions)
+    packed = weighted_mean(losses, weights)
 
     total, count = 0.0, 0
     for document in (doc_a, doc_b):
         alone_tokens, alone_segments, alone_positions = only_document(document)
-        alone, _ = objective.shifted_cross_entropy(
-            params, alone_tokens, segment_ids=alone_segments,
-            positions=alone_positions)
+        alone_losses, alone_weights, _, _ = objective.token_scores(
+            params, alone_tokens, segment_ids=alone_segments, positions=alone_positions)
         # Every transition inside the document; its last target is padding.
         counted = len(document) - 1
-        total += float(alone) * counted
+        assert float(jnp.sum(alone_weights)) == counted
+        total += weighted_mean(alone_losses, alone_weights) * counted
         count += counted
 
     assert count == len(doc_a) + len(doc_b) - 2
     # Largest relative difference observed on CPU: 7.1e-08.
-    assert float(packed) == pytest.approx(total / count, rel=1e-6)
+    assert packed == pytest.approx(total / count, rel=1e-6)
 
 
 def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     objective = packed_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, _ = documents()
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
              "text_positions": positions}
 
-    packed, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
-    unpacked, _ = objective.loss(params, params, {TEXT_KEY: tokens},
-                                 jax.random.PRNGKey(1), 0)
+    packed, _ = objective.loss(params, batch, step_at())
+    unpacked, _ = objective.loss(params, {TEXT_KEY: tokens}, step_at())
 
-    expected, _ = objective.shifted_cross_entropy(
-        params, tokens, train=True, rngs={"dropout": jax.random.PRNGKey(1)},
+    losses, weights, _, _ = objective.token_scores(
+        params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
         segment_ids=segment_ids, positions=positions)
-    assert float(packed) == pytest.approx(float(expected))
+    assert float(packed) == pytest.approx(weighted_mean(losses, weights))
     assert abs(float(packed) - float(unpacked)) > 1e-3, (
         "the packed keys made no difference to the loss")
+
+
+def test_a_packed_evaluation_carries_the_document_weights():
+    """The pass scores what the loss counts: TokenScores of a packed batch
+    carry zero weight on the boundary and the padding."""
+    objective = packed_objective()
+    params = objective.init(jax.random.key(0))
+    tokens, segment_ids, positions, (doc_a, doc_b) = documents()
+    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": positions}
+
+    scores = objective.evaluate(params, batch, step_at())
+
+    assert float(jnp.sum(scores.weights)) == len(doc_a) + len(doc_b) - 2
+    _, weights = counted_losses(objective, params, tokens, segment_ids, positions)
+    np.testing.assert_array_equal(np.asarray(scores.weights[0]), weights)
 
 
 def test_a_fixed_window_batch_is_scored_exactly_as_before():
@@ -792,10 +757,10 @@ def test_a_fixed_window_batch_is_scored_exactly_as_before():
     the packed path existed: the model is called without them, and every
     target counts."""
     objective = make_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, _ = objective.loss(params, params, batch, jax.random.PRNGKey(1), 0)
+    loss, _ = objective.loss(params, batch, step_at())
 
     tokens = np.asarray(batch[TEXT_KEY])
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
@@ -805,10 +770,12 @@ def test_a_fixed_window_batch_is_scored_exactly_as_before():
 
 def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     objective = packed_objective()
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens = jnp.zeros((2, SEQ + 1), jnp.int32)
     segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
+    batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": segment_ids}
 
-    loss, aux = objective.shifted_cross_entropy(
-        params, tokens, segment_ids=segment_ids, positions=segment_ids)
-    assert float(loss) == 0.0 and bool(jnp.isfinite(aux["perplexity"]))
+    loss, aux = objective.loss(params, batch, step_at())
+    assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
+    scores = objective.evaluate(params, batch, step_at())
+    assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
