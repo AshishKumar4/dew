@@ -438,6 +438,57 @@ class DecoderBlock(nn.Module):
     @property
     def _gate_activation(self) -> str:
         return getattr(self.mlp, 'activation', 'swiglu')
+
+@logical_axes({
+    ("eh_proj",): ("embed", "embed"),
+})
+class MTPBlock(nn.Module):
+    """One multi-token-prediction depth: the next depth's hidden states.
+
+    The depth reads the previous hidden states through `enorm` and the token
+    embeddings through `hnorm`, projects the concatenated pair back to the
+    model width, and runs one decoder block over it
+    (modeling_deepseek_v3.py, DeepseekV3MultiTokenPredictor). `block` is a
+    plain forward block: multi-token prediction is a training-time
+    auxiliary, so there is no decode path and no cache.
+    """
+    mixer: Callable[..., nn.Module]
+    feedforward: Callable[..., nn.Module]
+    emb_features: int
+    norm_eps: float = 1e-5
+    scale_offset: bool = False
+    scale_after_cast: bool = False
+    sandwich_norms: bool = False
+    dropout_rate: float = 0.0
+    dtype: Optional[Dtype] = None
+    precision: PrecisionLike = None
+
+    def setup(self):
+        norm = functools.partial(
+            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+        self.enorm = norm(name='enorm')
+        self.hnorm = norm(name='hnorm')
+        self.eh_proj = nn.Dense(
+            self.emb_features, use_bias=False,
+            dtype=self.dtype, precision=self.precision, name='eh_proj')
+        self.block = DecoderBlock(
+            mixer=self.mixer, feedforward=self.feedforward,
+            emb_features=self.emb_features,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            sandwich_norms=self.sandwich_norms,
+            dropout_rate=self.dropout_rate,
+            dtype=self.dtype, precision=self.precision, name='block')
+        self.final_norm = norm(name='final_norm')
+
+    def __call__(self, hidden, embeds, train: bool = False):
+        fused = self.eh_proj(jnp.concatenate(
+            [self.enorm(hidden), self.hnorm(embeds)], axis=-1))
+        return self.final_norm(self.block(fused, train=train))
+
+
 @models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
@@ -495,6 +546,12 @@ class CausalTransformer(nn.Module):
     reads its own record and ignores the GQA projection geometry
     (num_kv_heads, head_dim) the context still carries; those fields stay
     validated, so a translation fills them with consistent values.
+
+    `num_nextn_predict_layers` stacks that many multi-token-prediction
+    depths after the final norm, each an `MTPBlock` with the model-level
+    mixer and a dense feed-forward; 0 is a plain decoder and leaves the
+    tree unchanged. A depth predicts one token further out, so depth d
+    scores what follows position p + d.
     """
     vocab_size: int
     emb_features: int = 512
@@ -532,6 +589,7 @@ class CausalTransformer(nn.Module):
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
+    num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -712,6 +770,10 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"per_layer_input_dim is the width of a layer's own input, got "
                 f"{ple}; None is a model without them")
+        if self.num_nextn_predict_layers < 0:
+            raise ValueError(
+                f"num_nextn_predict_layers counts prediction depths, got "
+                f"{self.num_nextn_predict_layers}; 0 is a model without them")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -776,6 +838,29 @@ class CausalTransformer(nn.Module):
                 precision=self.precision,
                 name=f'layers_{index}')
             for index, layer_type in enumerate(types)]
+        # Prediction depths mirror whole-sequence hidden states, so their
+        # mixer builds from the full-attention kind where the pattern has
+        # one, else from the first layer's kind; the feed-forward is dense.
+        mtp_type = 'full_attention' if 'full_attention' in types else types[0]
+        mtp_mixer = mixer_spec.build(self.mixer_context(
+            kinds[mtp_type], mtp_type, False))
+        mtp_feedforward = functools.partial(
+            GatedMLP,
+            hidden_features=self.hidden_features,
+            out_features=self.emb_features,
+            activation=self.mlp,
+            precision=self.precision)
+        self.mtp = [
+            MTPBlock(
+                mixer=mtp_mixer, feedforward=mtp_feedforward,
+                emb_features=self.emb_features,
+                norm_eps=self.norm_eps,
+                scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast,
+                sandwich_norms=self.sandwich_norms,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
+            for depth in range(self.num_nextn_predict_layers)]
         self.norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
@@ -788,7 +873,10 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
                                positions=positions, segment_ids=segment_ids)
+        return self._logits(x)
 
+    def _logits(self, x):
+        """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
         # fp32 head, as in the DiT output projection: the loss is computed in fp32
         if self.tie_embeddings:
             logits = jnp.einsum(
@@ -802,6 +890,26 @@ class CausalTransformer(nn.Module):
             cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
             logits = cap * jnp.tanh(logits / cap)
         return logits
+
+    def mtp_logits(self, hidden, tokens, train: bool = False):
+        """One `[B, S, vocab]` fp32 logits array per prediction depth.
+
+        Depth d reads the previous hidden states and the token embeddings
+        and scores what follows each position d tokens out, through the
+        shared head. Empty without prediction depths.
+
+        Flax initializes the setups a call reaches, so a plain init of the
+        main forward leaves these depths uninitialized: initialize with a
+        method running both paths, `method=lambda m, x: (m(x),
+        m.mtp_logits(m.hidden_states(x), x))`, which is the one tree the
+        trainer and the checks below hold.
+        """
+        embeds = self.embed_tokens(tokens)
+        depth_logits = []
+        for block in self.mtp:
+            hidden = block(hidden, embeds, train=train)
+            depth_logits.append(self._logits(hidden))
+        return depth_logits
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None):
