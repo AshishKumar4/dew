@@ -269,7 +269,7 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trained = trainer.fit(Data(), steps=3, log_every=1)
 
     resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
-    state, shardings, position = resumed._place(trainer_module.build_mesh(resumed.mesh))
+    state, shardings, position = resumed.place()
 
     assert int(state.step) == 3, "the step counter was reset"
     for field in ("params", "opt_state", "ema"):
@@ -505,7 +505,7 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tracker=tracker)
-    compile_step = trainer._compile
+    compile_step = trainer.compile
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -517,7 +517,7 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
             return outputs
         return timed
 
-    monkeypatch.setattr(trainer, "_compile", compile_then_time_each_step)
+    monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     trainer.fit(Data(endless), steps=3, log_every=1)
 
     assert [s["train/step_time_ms"] for _, s in tracker.scalars] == pytest.approx([1000.0] * 3)

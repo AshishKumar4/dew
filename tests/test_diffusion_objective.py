@@ -24,7 +24,7 @@ from dew.inputs import Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, select
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
-from dew.registry import models
+from dew.registry import encoders, models
 from dew.sampling import CFG, DDIM, Euler
 from dew.training import Trainer
 
@@ -34,17 +34,20 @@ FEATURES = 6
 VOCAB = 11
 
 
+@encoders("stub_text")
 @dataclass(frozen=True, eq=False)
 class StubText(ConditionEncoder):
     """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
     ids by character behind a start token, encode looks them up. Small, and
-    shaped like CLIP's output, so the models' text keyword takes it."""
+    shaped like CLIP's output, so the models' text keyword takes it; registered,
+    so a run's text condition can name it."""
 
+    checkpoint: str
     params: dict
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, **fields):
-        return cls(params={"table": jnp.asarray(
+        return cls(checkpoint=checkpoint, params={"table": jnp.asarray(
             np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))})
 
     def tokenize(self, texts):
@@ -65,7 +68,7 @@ class StubText(ConditionEncoder):
                      for row in np.asarray(tokens["input_ids"]))
 
     def to_json(self):
-        return {"checkpoint": "stub"}
+        return {"checkpoint": self.checkpoint}
 
 
 def make_objective(**kwargs):

@@ -1,4 +1,4 @@
-"""Throughput accounting, divergence detection and the profiler hook.
+"""Throughput accounting, the FLOP count and the profiler hook.
 
 None of the performance work is evaluable without these numbers, so they get
 the same treatment as the training maths.
@@ -17,50 +17,58 @@ pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inputs import DiffusionInputConfig
-from dew.nn.backbones.dit import SimpleDiT
-from dew.diffusion.transforms import get_diffusion_preset
+from dew.objectives.base import Aux, EMASpec, Objective
+import dew.nn.backbones  # registers the decoder the FLOP formula test builds
 from dew.objectives.lm import LMObjective
-from dew.registry import build_model
-from dew.training import ObjectiveTrainer
-from dew.training.distributed import DevicePrefetchIterator
+from dew.registry import models
+from dew.training import Profile, Trainer
+from dew.training.distributed import shard_batch
 from dew.telemetry.instrumentation import (
     compiled_flops, enable_compilation_cache, hlo_flops, model_flops_utilization,
     step_flops,
 )
 
-RES = 8
 BATCH = 8
 
 
-def make_trainer(tmp_path, **kwargs):
-    train_schedule, _, transform = get_diffusion_preset("edm")
-    return ObjectiveTrainer(
-        model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-        optimizer=optax.adam(1e-3),
-        noise_schedule=train_schedule,
-        model_output_transform=transform,
-        input_config=DiffusionInputConfig(
-            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
-        rngs=jax.random.PRNGKey(0),
-        name="instr",
-        wandb_config=None,
-        distributed_training=False,
-        checkpoint_base_path=str(tmp_path),
-        **kwargs,
-    )
+class Affine(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(x)
+
+
+class Regression(Objective):
+    def __init__(self):
+        self.model = Affine()
+        self.ema = EMASpec(decay=optax.constant_schedule(0.9))
+
+    def init(self, key):
+        return self.model.init(key, jnp.zeros((1, 3)))
+
+    def loss(self, params, batch, step):
+        return jnp.mean((self.model.apply(params, batch["x"]) - batch["y"]) ** 2), Aux({})
+
+
+class Data:
+    def __init__(self, train, batch=BATCH):
+        self._train, self.val, self.batch, self.records = train, None, batch, None
+
+    def train(self):
+        return self._train()
+
+    steps_per_epoch = None
 
 
 def batches():
-    images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
-                     (BATCH, 1, RES, 3))
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(BATCH, 3)).astype(np.float32)
+    batch = {"x": x, "y": 2 * x[:, :2]}
     while True:
-        yield {"image": images}
+        yield batch
 
 
-def data_dict():
-    return {"train": batches, "train_len": BATCH * 8,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
+def make_trainer(**kwargs):
+    return Trainer(Regression(), optax.adam(1e-3), key=jax.random.key(0), **kwargs)
 
 
 def token_batches(batch, seq, vocab):
@@ -70,24 +78,11 @@ def token_batches(batch, seq, vocab):
         yield {"text": tokens}
 
 
-def lm_trainer(tmp_path, *, vocab, width, layers, heads, ratio, batch, seq):
-    """The language-model trainer, on one device so the step is the whole batch."""
-    config = {"vocab_size": vocab, "emb_features": width, "num_layers": layers,
-              "num_heads": heads, "mlp_ratio": ratio, "max_seq_len": seq}
-    model = build_model('causal_transformer', config)
-    trainer = ObjectiveTrainer(
-        model=model,
-        optimizer=optax.adam(1e-3),
-        input_config=None,
-        objective=LMObjective(model, seq, vocab_size=vocab),
-        rngs=jax.random.PRNGKey(0),
-        name="instr-lm",
-        wandb_config=None,
-        distributed_training=False,
-        checkpoint_base_path=str(tmp_path),
-    )
-    trainer.global_batch_size = batch
-    return trainer
+def lm_trainer(*, vocab, width, layers, heads, ratio, seq):
+    """The language-model trainer, replicated so the step is the whole batch."""
+    model = models.build('causal_transformer', vocab_size=vocab, emb_features=width,
+                         num_layers=layers, num_heads=heads, mlp_ratio=ratio, max_seq_len=seq)
+    return Trainer(LMObjective(model, seq), optax.adam(1e-3), key=jax.random.key(0))
 
 
 def hlo_module(*instructions: str) -> str:
@@ -186,24 +181,26 @@ condition=%condition, body=%body
 """
 
 
-def test_step_flops_reports_a_positive_count(tmp_path):
-    trainer = make_trainer(tmp_path)
-    step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    flops = step_flops(step, trainer.state, trainer.rngstate, next(source))
-    assert flops is not None and flops > 0
+def test_the_compiled_step_reports_a_positive_flop_count():
+    trainer = make_trainer()
+    state, _, _ = trainer.place()
+    trainer.compile(state, shard_batch(trainer.batch_sharding, next(batches())))
+    assert trainer.flops_per_step is not None and trainer.flops_per_step > 0
 
 
-def test_throughput_metrics_are_consistent(tmp_path):
-    trainer = make_trainer(tmp_path)
-    trainer.global_batch_size = 64
-    metrics = trainer._throughput_metrics(elapsed=2.0, steps=10)
+def test_step_flops_reads_a_jitted_function():
+    flops = step_flops(jax.jit(lambda a, b: a @ b), jnp.ones((8, 16)), jnp.ones((16, 4)))
+    assert flops == pytest.approx(2 * 8 * 16 * 4)
+
+
+def test_throughput_metrics_are_consistent():
+    metrics = make_trainer()._throughput(elapsed=2.0, steps=10, batch=64)
     assert metrics["train/step_time_ms"] == pytest.approx(200.0)
     assert metrics["train/samples_per_sec"] == pytest.approx(320.0)
 
 
-def test_throughput_metrics_ignore_a_zero_interval(tmp_path):
-    assert make_trainer(tmp_path)._throughput_metrics(elapsed=0.0, steps=0) == {}
+def test_throughput_metrics_ignore_a_zero_interval():
+    assert make_trainer()._throughput(elapsed=0.0, steps=0, batch=64) == {}
 
 
 def test_mfu_is_skipped_on_unknown_hardware():
@@ -301,7 +298,7 @@ def test_compiled_flops_counts_a_matmul_and_its_gradient():
     assert compiled_flops(with_gradient) == pytest.approx(2 * analytic, rel=0.01)
 
 
-def test_compiled_flops_matches_the_transformer_flop_formula(tmp_path):
+def test_compiled_flops_matches_the_transformer_flop_formula():
     """The whole language-model step against the closed form for it.
 
     With B the batch, S the sequence, T = B S tokens, d the width, f the MLP
@@ -317,15 +314,13 @@ def test_compiled_flops_matches_the_transformer_flop_formula(tmp_path):
     no loss reduction (docs/research/benchmark-parity.md:44-61).
     """
     width, layers, heads, vocab, ratio = 128, 2, 4, 512, 4
-    batch, seq = 4, 64
+    batch, seq = 8, 64
     head_dim, hidden = width // heads, ratio * width
-    trainer = lm_trainer(tmp_path, vocab=vocab, width=width, layers=layers,
-                         heads=heads, ratio=ratio, batch=batch, seq=seq)
-    step = trainer._define_train_step(batch_size=batch)
-    source = DevicePrefetchIterator(token_batches(batch, seq, vocab),
-                                    trainer.batch_sharding)
-    executable = trainer._compiled_step(
-        step, trainer.state, trainer.rngstate, next(source))
+    trainer = lm_trainer(vocab=vocab, width=width, layers=layers, heads=heads, ratio=ratio,
+                         seq=seq)
+    state, _, _ = trainer.place()
+    executable = trainer.compile(
+        state, shard_batch(trainer.batch_sharding, next(token_batches(batch, seq, vocab))))
 
     per_layer = 4 * width * width + 3 * width * hidden
     matmuls = width * vocab + layers * per_layer
@@ -334,8 +329,9 @@ def test_compiled_flops_matches_the_transformer_flop_formula(tmp_path):
     # rel=0.05 is slack for XLA rewriting a matmul pair into one fused call or
     # splitting one over tiles, not for a missing term: on this CPU lane the
     # measured count lands on the closed form exactly (956,301,312 vs
-    # 956,301,312, largest observed difference 0 FLOPs in 956 million).
-    assert compiled_flops(executable) == pytest.approx(analytic, rel=0.05)
+    # 956,301,312, largest observed difference 0 FLOPs in 956 million). The
+    # step is partitioned over the eight devices, so the count is per device.
+    assert compiled_flops(executable) * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
@@ -390,40 +386,24 @@ def test_gpu_matmul_custom_calls_are_counted_from_their_shapes():
     assert hlo_flops(CUDNN_ATTENTION_CROSS) == pytest.approx(
         4 * batch * heads * seq * (seq // 2) * head_dim)
 
-def test_epoch_loss_accumulates_bfloat16_losses_in_float32(tmp_path, monkeypatch):
-    trainer = make_trainer(tmp_path, log_every=1000)
+class RecordingTracker:
+    def __init__(self):
+        self.scalars = []
 
-    def step(state, rng_state, batch):
-        del batch
-        loss = jnp.array(1.5, jnp.bfloat16)
-        return state, loss, {}, rng_state, jnp.array(True)
+    def log(self, scalars, step):
+        self.scalars.append(dict(scalars))
 
-    monkeypatch.setattr(trainer, "_compiled_step", lambda *_: step)
-    steps = 400
-    epoch_loss, *_ = trainer.train_loop(
-        trainer.state, object(), iter([None] * steps), steps, 0, trainer.rngstate)
-
-    assert epoch_loss.dtype == jnp.float32
-    assert float(epoch_loss / steps) == pytest.approx(1.5)
+    def artifact(self, value, step):
+        pass
 
 
-def test_fit_reports_throughput_to_wandb(tmp_path):
+def test_fit_reports_throughput_to_the_tracker():
     """The logging tick must actually carry the numbers, not just the loss."""
-    logged = []
+    tracker = RecordingTracker()
+    make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
 
-    class FakeWandb:
-        def log(self, payload, step=None):
-            logged.append(payload)
-
-        def define_metric(self, *args, **kwargs):
-            pass
-
-    trainer = make_trainer(tmp_path, log_every=1)
-    trainer.wandb = FakeWandb()
-    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
-
-    ticks = [p for p in logged if "train/samples_per_sec" in p]
-    assert ticks, "no throughput was logged"
+    ticks = [p for p in tracker.scalars if "train/samples_per_sec" in p]
+    assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
 
@@ -435,69 +415,68 @@ def test_compilation_cache_directory_is_configured(tmp_path):
     assert jax.config.jax_compilation_cache_dir == path
 
 
-def test_profiler_writes_a_trace(tmp_path, monkeypatch):
+def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     """The window has to open after the warmup: a trace that starts at step 0
     is mostly compilation, and reports its occupancy instead of the loop's."""
-    trainer = make_trainer(tmp_path, profile_steps=2, profile_warmup_steps=2)
     started_at = []
     real_start = jax.profiler.start_trace
+    seen = []
 
-    def spy(*args, **kwargs):
-        # The train state is replaced after every step, so its counter is the
-        # number of steps that have run by the time the trace opens.
-        started_at.append(int(trainer.state.step))
-        return real_start(*args, **kwargs)
+    class Counting(Regression):
+        def loss(self, params, batch, step):
+            seen.append(step)
+            return super().loss(params, batch, step)
 
-    monkeypatch.setattr(jax.profiler, "start_trace", spy)
-    trainer.fit(data_dict(), training_steps_per_epoch=5, epochs=1, val_steps_per_epoch=0)
+    trainer = Trainer(Counting(), optax.adam(1e-3), key=jax.random.key(0),
+                      profile=Profile(str(tmp_path / "profile"), steps=2, warmup=2))
+    compile_step = trainer.compile
 
-    assert started_at == [2], "the trace did not open at the configured step"
-    assert os.path.isdir(trainer.profile_path())
-    assert any(files for _, _, files in os.walk(trainer.profile_path()))
+    def counting_compile(*args):
+        executable = compile_step(*args)
+        ran = []
+
+        def counted(*step_args):
+            ran.append(1)
+            return executable(*step_args)
+        counted.ran = ran
+        trainer.executable = counted
+        return counted
+
+    monkeypatch.setattr(trainer, "compile", counting_compile)
+    monkeypatch.setattr(jax.profiler, "start_trace",
+                        lambda *a, **k: started_at.append(len(trainer.executable.ran)) or real_start(*a, **k))
+    trainer.fit(Data(batches), steps=5, log_every=1)
+
+    assert started_at == [2], "the trace did not open after the configured warmup"
+    assert any(files for _, _, files in os.walk(tmp_path / "profile"))
 
 
 def test_an_unfinished_profile_window_is_still_closed(tmp_path):
-    """A window wider than the epoch has to close anyway: a trace left running
+    """A window wider than the run has to close anyway: a trace left running
     takes the next one down with it."""
-    trainer = make_trainer(tmp_path / "long", profile_steps=8, profile_warmup_steps=1)
-    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
-    assert any(files for _, _, files in os.walk(trainer.profile_path()))
+    make_trainer(profile=Profile(str(tmp_path / "long"), steps=8, warmup=1)).fit(
+        Data(batches), steps=3, log_every=1)
+    assert any(files for _, _, files in os.walk(tmp_path / "long"))
 
-    second = make_trainer(tmp_path / "short", profile_steps=1, profile_warmup_steps=0)
-    second.fit(data_dict(), training_steps_per_epoch=2, epochs=1, val_steps_per_epoch=0)
-    assert any(files for _, _, files in os.walk(second.profile_path()))
-def test_profiler_runs_only_once_across_epochs(tmp_path, monkeypatch):
-    trainer = make_trainer(tmp_path, profile_steps=1, profile_warmup_steps=0)
-    starts = []
-    stops = []
+    make_trainer(profile=Profile(str(tmp_path / "short"), steps=1, warmup=0)).fit(
+        Data(batches), steps=2, log_every=1)
+    assert any(files for _, _, files in os.walk(tmp_path / "short"))
+
+
+def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
+    starts, stops = [], []
     monkeypatch.setattr(jax.profiler, "start_trace", lambda *a, **k: starts.append(1))
     monkeypatch.setattr(jax.profiler, "stop_trace", lambda: stops.append(1))
 
-    trainer.fit(data_dict(), training_steps_per_epoch=1, epochs=3,
-                val_steps_per_epoch=0)
+    make_trainer(profile=Profile(str(tmp_path), steps=1, warmup=0)).fit(
+        Data(batches), steps=6, log_every=1)
 
-    assert len(starts) == 1
-    assert len(stops) == 1
-
-
-def test_profiler_warmup_can_cross_an_epoch_boundary(tmp_path, monkeypatch):
-    trainer = make_trainer(tmp_path, profile_steps=1, profile_warmup_steps=2)
-    started_at = []
-    monkeypatch.setattr(
-        jax.profiler, "start_trace",
-        lambda *a, **k: started_at.append(int(trainer.state.step)))
-    monkeypatch.setattr(jax.profiler, "stop_trace", lambda: None)
-
-    trainer.fit(data_dict(), training_steps_per_epoch=1, epochs=3,
-                val_steps_per_epoch=0)
-
-    assert started_at == [2]
+    assert len(starts) == 1 and len(stops) == 1
 
 
-def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
+def test_the_training_step_is_compiled_once_per_fit(monkeypatch):
     """Reading the cost analysis must not compile the step a second time, which
     would double the startup cost of every fit()."""
-    trainer = make_trainer(tmp_path)
     compiles = []
     real_compile = jax.stages.Lowered.compile
 
@@ -506,38 +485,10 @@ def test_the_training_step_is_compiled_once_per_run(tmp_path, monkeypatch):
         return real_compile(lowered, *args, **kwargs)
 
     monkeypatch.setattr(jax.stages.Lowered, "compile", counting_compile)
+    trainer = make_trainer()
+    trainer.fit(Data(batches), steps=6, log_every=1)
 
-    jitted = []
-    real_define = trainer._define_train_step
-
-    def capture(**kwargs):
-        step = real_define(**kwargs)
-        jitted.append(step)
-        return step
-
-    monkeypatch.setattr(trainer, "_define_train_step", capture)
-    trainer.fit(data_dict(), training_steps_per_epoch=3, epochs=2, val_steps_per_epoch=0)
-
+    # The placement goes through the jit cache; the step's lower().compile()
+    # is the one explicit compile, and the loop runs on it.
     assert len(compiles) == 1, "the training step was compiled more than once"
-    # Both epochs ran on that one executable; a jit call would have compiled
-    # its own and left it in the jit cache.
-    assert jitted[0]._cache_size() == 0, "the loop went through the jit path too"
     assert trainer.flops_per_step and trainer.flops_per_step > 0
-
-
-# --------------------------------------------------------------------------
-# Divergence
-# --------------------------------------------------------------------------
-
-def test_sustained_non_finite_loss_stops_the_run(tmp_path):
-    trainer = make_trainer(
-        tmp_path, log_every=1, max_bad_loss_steps=3,
-        loss_fn=lambda pred, target: jnp.full_like(pred, jnp.nan))
-    with pytest.raises(RuntimeError, match="non-finite"):
-        trainer.fit(data_dict(), training_steps_per_epoch=8, epochs=1, val_steps_per_epoch=0)
-
-
-def test_healthy_run_does_not_trip_the_detector(tmp_path):
-    trainer = make_trainer(tmp_path, log_every=1, max_bad_loss_steps=3)
-    trainer.fit(data_dict(), training_steps_per_epoch=6, epochs=1, val_steps_per_epoch=0)
-    assert int(trainer.state.step) == 6

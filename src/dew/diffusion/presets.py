@@ -1,9 +1,9 @@
-"""Named conventions, as the dataclasses a run manifest stores.
+"""Named conventions, as the dataclasses a run's `run.json` stores.
 
 A preset is a frozen dataclass of the numbers that define a convention;
 calling it builds the `Process`. Both training and inference build from the
 same preset, so a model is always sampled with the convention it was trained
-with, and a manifest that holds the preset's fields rebuilds it exactly.
+with, and a record that holds the preset's fields rebuilds it exactly.
 """
 
 from dataclasses import dataclass

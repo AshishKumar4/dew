@@ -304,3 +304,19 @@ def test_the_fixture_holds_the_inputs_the_generator_names():
     assert REFERENCE["epsilon_low"] == np.float32(generator.EPSILON_LOW)
     assert REFERENCE["epsilon_high"] == np.float32(generator.EPSILON_HIGH)
     assert REFERENCE["dual_clip"] == np.float32(generator.DUAL_CLIP)
+
+
+def test_token_mean_divides_by_the_exact_token_count():
+    """The denominator is the token count with no epsilon: on one live token
+    the mean is that token's value exactly, where masked_mean's 1e-8 puts it
+    1e-8 relative below, and that factor would scale the gradient. In float32
+    a 1e-8 denominator shift rounds away, so the check runs in float64, where
+    the arithmetic is what the docstring claims."""
+    from dew.rl.advantage import masked_mean
+    from dew.rl.surrogate import token_mean
+
+    with jax.enable_x64():
+        x = jnp.asarray([[2.0, 5.0, 7.0]], jnp.float64)
+        mask = jnp.asarray([[0, 1, 0]])
+        assert float(token_mean(x, mask)) == 5.0
+        assert float(masked_mean(x, mask)) != 5.0
