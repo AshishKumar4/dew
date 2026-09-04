@@ -85,10 +85,9 @@ def test_the_documented_code_runs(path, tmp_path, monkeypatch):
         pytest.skip("no python blocks")
     monkeypatch.chdir(tmp_path)
     namespace = tiny_world(tmp_path)
-    # Concept pages name library things bare, so the run starts with jax's names.
+    # Concept pages name jax bare where a snippet builds an array.
     if path != ROOT / "README.md":
-        namespace.update(dict(jnp=__import__("jax.numpy", fromlist=["x"]), jax=__import__("jax"),
-                                int32=__import__("jax.numpy", fromlist=["x"]).int32))
+        namespace.update(dict(jnp=__import__("jax.numpy", fromlist=["x"]), jax=__import__("jax")))
     for line, source in found:
         where = f"{path.relative_to(ROOT)}:{line}"
         code = compile(source, where, "exec")
