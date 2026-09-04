@@ -6,6 +6,7 @@ import einops
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import NormalAttention, scaled_dot_product_attention
+from .sharding import logical_axes
 
 def unpatchify(x, channels=3, H_P=None, W_P=None):
     patch_size = int((x.shape[2] // channels) ** 0.5)
@@ -176,6 +177,7 @@ class RoPEAttention(NormalAttention):
 # --- adaLN-Zero ---
 
 
+@logical_axes({("ada_proj",): ("embed", "modulation")})
 class AdaLNParams(nn.Module): # Renamed for clarity
     features: int
     dtype: Optional[Dtype] = None

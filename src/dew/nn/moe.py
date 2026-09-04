@@ -153,8 +153,10 @@ class Router(nn.Module):
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
         # The load each expert took, for the step that balances the bias:
-        # written only when a caller opens the 'router' collection.
-        self.sow('router', 'indices', indices)
+        # written only when a caller opens the 'router' collection, and never
+        # into the tree init returns, where it is not a variable.
+        if not self.is_initializing():
+            self.sow('router', 'indices', indices)
         weights = jnp.take_along_axis(scores, indices, axis=-1)
         if self.normalize_weights:
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)

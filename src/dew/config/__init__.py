@@ -1,22 +1,28 @@
 """Typed configuration for a training run.
 
 One dataclass tree describes a run: what to build, what to feed it, how to
-optimize it, and where the checkpoints go. Recipes parse it with tyro and hand
-the pieces to the trainer, so `to_dict()` is a full record of a run and
+optimize it, and how the trainer runs. Recipes parse it with tyro and hand the
+pieces to the trainer, so `to_dict()` is a full record of a run and
 `from_dict()` puts it back together.
 
 Model kwargs stay an opaque JSON dict. The registry already knows which
 architecture takes which fields, and mirroring them here would be a second
-place to keep in sync.
+place to keep in sync. A dataset is the registered spec itself, which tyro
+turns into a subcommand (`data:token-windows --data.path ...`).
 """
 
 import dataclasses
 import json
+import typing
 from typing import Annotated, Any, Literal, Mapping, Optional, Self
 
 import tyro
 
+import dew.data
+from dew import registry
+from dew.registry import datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
+from dew.training.distributed import Layout, MeshSpec
 
 JsonDict = Annotated[
     dict[str, Any],
@@ -30,16 +36,15 @@ JsonDict = Annotated[
 ]
 """A dict, written as a single JSON string on the command line."""
 
+REGISTRIES = (registry.models, registry.presets, registry.samplers, registry.datasets,
+              registry.encoders, registry.metrics, registry.objectives)
+
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
-    """Architecture name and the kwargs `dew.registry.build_model` receives.
+    """Architecture name and the fields `models.build` receives."""
 
-    The name may carry the +2d/+hilbert/+zigzag suffixes the registry
-    canonicalizes.
-    """
-
-    architecture: str = "unet"
+    architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
     dtype: Literal["float32", "bfloat16"] = "bfloat16"
     """Compute dtype; params stay float32."""
@@ -47,40 +52,18 @@ class ModelConfig:
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
 
+    def fields(self) -> dict[str, Any]:
+        """The model's fields with the run's precision settings in them."""
+        return with_precision(self.architecture, self.config,
+                              dtype=self.dtype, attention_impl=self.attention_impl)
 
-@dataclasses.dataclass(frozen=True)
-class DataConfig:
-    """Which dataset, at what resolution, through which loader."""
+    def build(self):
+        return models.build(self.architecture, **self.fields())
 
-    dataset: str = "oxford_flowers102"
-    dataset_path: Optional[str] = None
-    """Root the dataset's source resolves its files against; TFDS datasets
-    ignore it and read from the TFDS data dir."""
-    dataset_seed: int = 0
-    batch_size: int = 32
-    image_size: int = 128
-    val_steps_per_epoch: int = 4
-    loader: Literal["auto", "grain", "online"] = "auto"
-    """'auto' reads the registries: a name registered only for streaming
-    streams, anything else goes through grain."""
-    augmentation_mode: Literal["none", "flip_only", "flip_jitter"] = "flip_jitter"
-    worker_count: int = 32
-    read_thread_count: int = 140
-    read_buffer_size: int = 96
-    worker_buffer_size: int = 100
-    sequence_length: Optional[int] = None
-    """Tokens per training window, when the dataset is a tokenized text
-    directory from tools/tokenize_text.py."""
-    tokenizer: Optional[str] = None
-    pack_sequences: bool = False
-    """Pack whole documents into the training windows instead of reading
-    fixed strides. The token files must then hold eos ids between documents
-    (tools/tokenize_text.py --pack), and every batch row carries
-    `text_segment_ids` / `text_positions` for the backbone's mask."""
 
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
-    """Optimizer, learning-rate schedule and gradient handling."""
+    """Optimizer, learning-rate schedule and gradient clipping."""
 
     optimizer: Literal["adam", "adamw", "lamb", "muon"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
@@ -89,72 +72,102 @@ class OptimConfig:
     learning_rate_peak: float = 3e-4
     learning_rate_end: float = 2e-4
     learning_rate_warmup_steps: int = 10000
-    learning_rate_decay_epochs: int = 1
+    learning_rate_decay_steps: Optional[int] = None
+    """Steps the cosine decays over; unset decays over the run."""
     weight_decay: Optional[float] = None
     clip_grads: float = 0.0
-    grad_accum_steps: int = 1
-    use_dynamic_scale: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
-    """Loop length, checkpointing, sharding and run tracking."""
+    """Run length, checkpointing, sharding and run tracking."""
 
     name: Optional[str] = None
-    epochs: int = 100
-    steps_per_epoch: Optional[int] = None
     checkpoint_dir: str = "./checkpoints"
-    checkpoint_fs: Literal["local", "gcs"] = "local"
-    checkpoint_step: Optional[int] = None
-    load_from_checkpoint: Optional[str] = None
-    resume_last_run: Optional[str] = None
-    max_checkpoints_to_keep: int = 1
-    checkpoint_every_steps: Optional[int] = None
-    """Save a checkpoint every N global steps, not only at epoch boundaries."""
-    distributed_training: bool = True
-    multi_host: Optional[bool] = None
-    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
-    fsdp_size: int = 1
-    expert_size: int = 1
-    """Devices the expert dimension of an MoE layer is split over. 1 replicates every expert."""
-    fsdp_min_param_size: Optional[int] = None
-    logical_axis_rules: Optional[JsonDict] = None
-    """Replaces the logical-axis-to-mesh-axis table, e.g. {"mlp": "fsdp"}. Unset uses DEFAULT_LOGICAL_AXIS_RULES, which reproduces the shape heuristic."""
-    sharding_tolerance: Optional[float] = None
-    """Fail the run when more than this fraction of shardable parameter elements ended up replicated. 1.0 disables the check. Unset uses DEFAULT_SHARDING_TOLERANCE."""
-    ema_decay: float = 0.999
-    best_tracker_metric: Optional[str] = None
+    keep: int = 2
+    """Latest checkpoints kept, besides the best one."""
+    batch_size: int = 32
+    """Global batch, over every process."""
+    steps: Optional[int] = None
+    epochs: Optional[int] = None
+    """Run length as passes over the data; `steps` names it directly instead."""
+    log_every: int = 100
+    eval_every: Optional[int] = None
+    checkpoint_every: Optional[int] = None
+    accumulation: int = 1
+    """Micro-batches per optimizer update."""
+    dynamic_scale: bool = False
+    mesh: MeshSpec = MeshSpec()
+    layout: Layout = Layout()
     profile_steps: int = 0
     compilation_cache_dir: Optional[str] = dataclasses.field(
         default_factory=default_compilation_cache_dir)
     """Persisted XLA cache, so a restart skips recompiling the step. None
     compiles from scratch every run."""
-    log_every: int = 100
     wandb_project: Optional[str] = None
-    """Unset runs without wandb: nothing is logged and nothing is published."""
+    """Unset runs without a tracker."""
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
+    multi_host: Optional[bool] = None
+    """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     xla_flags: Optional[str] = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
     themselves; see docs/performance.md for what was measured."""
 
     def __post_init__(self):
-        if self.resume_last_run is not None and self.wandb_project is None:
+        if self.steps is not None and self.epochs is not None:
+            raise ValueError("steps and epochs both name the run length; set one")
+
+    def total_steps(self, data) -> int:
+        """The run's length in steps, from `steps` or from `epochs` over `data`."""
+        if self.steps is not None:
+            return self.steps
+        if self.epochs is None:
+            raise ValueError("the run length is --trainer.steps or --trainer.epochs")
+        if data.steps_per_epoch is None:
             raise ValueError(
-                "resume_last_run is a wandb run id and needs wandb_project set "
-                "to resolve it")
+                "epochs need a dataset with a record count; this one streams without "
+                "one, so give the run length as --trainer.steps")
+        return self.epochs * data.steps_per_epoch
 
 
-def _rebuild(cls, values: Mapping[str, Any]):
-    kwargs = {}
-    for field in dataclasses.fields(cls):
-        if field.name not in values:
-            continue
-        value = values[field.name]
-        kwargs[field.name] = (_rebuild(field.type, value)
-                              if dataclasses.is_dataclass(field.type) else value)
-    return cls(**kwargs)
+def _registry_for(annotation):
+    """The registry whose members the annotation names, or None."""
+    members = typing.get_args(annotation) or (annotation,)
+    for held in REGISTRIES:
+        if all(any(member is m for m in held.values()) for member in members):
+            return held
+    return None
+
+
+def _to_json(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        held = _registry_for(type(value))
+        fields = {f.name: _to_json(getattr(value, f.name))
+                  for f in dataclasses.fields(value)}
+        return {"name": held.name_of(type(value)), "fields": fields} if held else fields
+    if isinstance(value, (list, tuple)):
+        return [_to_json(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _to_json(item) for key, item in value.items()}
+    return value
+
+
+def _fields(cls, values):
+    hints = typing.get_type_hints(cls)
+    return {f.name: _rebuild(hints[f.name], values[f.name])
+            for f in dataclasses.fields(cls) if f.name in values}
+
+
+def _rebuild(annotation, value):
+    held = _registry_for(annotation)
+    if held is not None:
+        member = held[value["name"]]
+        return member(**_fields(member, value["fields"]))
+    if dataclasses.is_dataclass(annotation):
+        return annotation(**_fields(annotation, value))
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,13 +175,15 @@ class RunConfig:
     """A whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataConfig = dataclasses.field(default_factory=DataConfig)
+    data: datasets.union = dataclasses.field(
+        default_factory=lambda: datasets["oxford_flowers102"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-safe record of the run."""
-        return dataclasses.asdict(self)
+        """JSON-safe record of the run; a registered member is written as its
+        name and fields."""
+        return _to_json(self)
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> Self:
