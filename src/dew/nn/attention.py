@@ -140,8 +140,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
-      whatever the inputs are. dtype is ignored, the other two are rejected
-      rather than silently dropped.
+      whatever the inputs are. A dtype that asks for anything other than the
+      inputs' own dtype is rejected rather than silently dropped, as are the
+      other two.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -192,6 +193,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             "force_fp32_for_softmax=False: fused attention runs the softmax in "
             "fp32 regardless. Leave it True, or use the reference implementation "
             "(attention_impl 'reference').")
+    if dtype is not None and jnp.dtype(dtype) != query.dtype:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            f"dtype={dtype}: fused attention computes in the inputs' dtype "
+            f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
+            "the reference implementation (attention_impl 'reference').")
 
     if implementation in ('xla', 'cudnn'):
         if implementation == 'cudnn' and query.dtype not in (jnp.bfloat16, jnp.float16):
@@ -344,7 +351,7 @@ class FlaxGEGLU(nn.Module):
     dim: int
     dropout: float = 0.0
     dtype: Optional[Dtype] = jnp.float32
-    precision: Any = jax.lax.Precision.DEFAULT
+    precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
     def setup(self):
         inner_dim = self.dim * 4
@@ -376,7 +383,7 @@ class FlaxFeedForward(nn.Module):
 
     dim: int
     dtype: Optional[Dtype] = jnp.float32
-    precision: Any = jax.lax.Precision.DEFAULT
+    precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
     def setup(self):
         # The second linear layer needs to be called

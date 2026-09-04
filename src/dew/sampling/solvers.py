@@ -66,7 +66,7 @@ class DDPM:
 
     One step draws from the forward posterior q(x_s | x_t, x_0) for
     x_t = alpha_t x_0 + sigma_t eps, written in signal and noise rates so it
-    holds for any schedule and any step stride, not just t -> t-1. The
+    holds for any schedule and any step stride. The
     posterior mean is alpha_s x_0 + alpha_t sigma_s^2 / (alpha_s sigma_t) eps
     and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
     """
@@ -131,8 +131,9 @@ class Euler:
 @samplers("simplified_euler")
 @dataclass(frozen=True)
 class SimplifiedEuler:
-    """Euler for the forward process x_{t+1} = x_t + sigma_t eps_t, where
-    the derivative is (x - x_0) / sigma."""
+    """Euler for the variance exploding forward process x_{t+1} = x_t + sigma_t eps_t,
+    where the derivative is (x - x_0) / sigma. Integrates a
+    `GeneralizedNoiseScheduler`."""
 
     State = tuple
 
@@ -140,6 +141,7 @@ class SimplifiedEuler:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        _sigma_integrator("SimplifiedEuler", process)
         (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
         dt = sigma_s - sigma_t
         dx = (x - denoised) / sigma_t
@@ -149,7 +151,8 @@ class SimplifiedEuler:
 @samplers("euler_ancestral")
 @dataclass(frozen=True)
 class EulerAncestral:
-    """Euler with the ancestral noise injection of k-diffusion."""
+    """Euler with the ancestral noise injection of k-diffusion, on a variance
+    exploding schedule."""
 
     State = tuple
 
@@ -157,6 +160,7 @@ class EulerAncestral:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        _sigma_integrator("EulerAncestral", process)
         (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
         sigma_up = (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5
         sigma_down = (sigma_s ** 2 - sigma_up ** 2) ** 0.5
