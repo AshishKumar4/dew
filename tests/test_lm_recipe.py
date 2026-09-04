@@ -83,7 +83,7 @@ def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path):
 @pytest.mark.parametrize("packed", [False, True])
 def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     """A run from the command line: the windows or packed documents through
-    the trainer, perplexity scored on val.bin, the manifest and a checkpoint
+    the trainer, perplexity scored on val.bin, the run spec and a checkpoint
     at the final step."""
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -98,7 +98,5 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
     data = config.data.load(batch=8)
     assert int(state.step) == data.steps_per_epoch > 0
-    manifest = json.loads((tmp_path / "runs" / "run" / "manifest.json").read_text())
-    assert manifest["model"]["fields"]["vocab_size"] == 256
-    assert manifest["model"]["fields"]["max_seq_len"] == SEQ
+    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "run")) == config
     assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()

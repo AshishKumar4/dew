@@ -26,6 +26,7 @@ from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.objectives.base import Aux, EMASpec, Objective, Step, under
+from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM
@@ -34,6 +35,20 @@ from dew.sampling.solvers import DDIM
 VALIDATION_SAMPLES = 4
 
 
+def check_solver(process, sampler) -> None:
+    """One abstract solver step, so a solver that refuses the process's
+    schedule says so when the objective is built and not at the first
+    validation pass, an epoch in."""
+    x = jnp.zeros((1, 1), jnp.float32)
+    t = jnp.ones((1,), jnp.float32)
+    key = jax.ShapeDtypeStruct((2,), jnp.uint32)
+    jax.eval_shape(
+        lambda x, key: sampler.step(x, t, t * 0.5, x, x, sampler.init(x), key, process,
+                                    lambda x_t, t_: (x_t, x_t)),
+        x, key)
+
+
+@objectives("diffusion")
 class DiffusionObjective(Objective):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
@@ -64,6 +79,7 @@ class DiffusionObjective(Objective):
         self.steps = steps
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params"))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
+        check_solver(process, sampler)
         # The unconditional datum, tokenized once on the host; encoded on
         # device wherever a branch needs it.
         self.unconditional_tokens = {

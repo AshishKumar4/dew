@@ -117,8 +117,8 @@ def test_the_encoder_loads_and_encodes():
     assert encoder.captions(tokens)[0] == "a red bird"
 
 
-def test_the_manifest_fields_rebuild_an_encoder_that_agrees():
-    """A run manifest stores the spec as JSON, and inference rebuilds the
+def test_the_json_fields_rebuild_an_encoder_that_agrees():
+    """A run's record stores the spec as JSON, and inference rebuilds the
     encoder from it, so the round-trip has to come back as the same encoder
     and not just the same fields."""
     spec = InputSpec(Field("image", (8, 8, 3)),

@@ -6,7 +6,7 @@ parameters are a leaf of the objective's tree, placed by the trainer's layout
 like any other, so a frozen tower's weights arrive at the compiled step as
 arguments and never as constants baked into it.
 
-An encoder is rebuilt from a run manifest by `encoders[name].from_pretrained(
+An encoder is rebuilt from a run's record by `encoders[name].from_pretrained(
 **fields)`, where `fields` is what `to_json` wrote.
 """
 

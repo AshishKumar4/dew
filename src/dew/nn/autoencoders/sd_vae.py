@@ -15,7 +15,7 @@ class StableDiffusionVAE(AutoEncoder):
     def __init__(self, modelname = "CompVis/stable-diffusion-v1-4", revision="bf16", dtype=jnp.bfloat16,
                  latent_shift=None, latent_scale=None):
 
-        pretrained = load_pretrained_vae(modelname)
+        pretrained = load_pretrained_vae(modelname, revision=revision)
         config = pretrained["config"]
         params = pretrained["params"]
 
