@@ -323,18 +323,6 @@ def test_batch_mapping_propagates_feature_extractor_errors():
 # The streaming spec: what a run gets from OnlineImages
 # ---------------------------------------------------------------------------------
 
-class _StubTokenizer:
-    """The collate's tokenizer; the real one downloads CLIP."""
-
-    def __init__(self, tensor_type="np"):
-        pass
-
-    def __call__(self, captions):
-        n = len(captions)
-        return {"input_ids": np.zeros((n, 4), np.int32),
-                "attention_mask": np.ones((n, 4), np.int32)}
-
-
 def _producer_of(rows, passes, stop):
     """A fetcher that walks `rows` records `passes` times, then stays alive."""
 
@@ -352,7 +340,6 @@ def _online_spec(monkeypatch, rows, passes, stop):
     """OnlineImages over a stub table, with the fetcher pool replaced."""
     from dew.data import OnlineImages
 
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader",
                         _producer_of(rows, passes, stop))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubDataset(rows))
@@ -419,7 +406,6 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
 
     from dew.data import OnlineImages
 
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader", exhausted)
     monkeypatch.setattr(online_loader, "MediaBatchIterator",
                         functools.partial(MediaBatchIterator, queue_timeout=0.05))
