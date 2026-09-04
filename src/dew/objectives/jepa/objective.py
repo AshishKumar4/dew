@@ -34,6 +34,7 @@ import optax
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
 from dew.objectives.base import Aux, EMASpec, Objective, Step, under
+from dew.registry import objectives
 from .masking import MultiBlockMask
 
 CONTEXT_ENCODER = "context_encoder"
@@ -76,6 +77,7 @@ def normalize_targets(x, epsilon: float = 1e-6):
     return (x - mean) * jax.lax.rsqrt(variance + epsilon)
 
 
+@objectives("jepa")
 class JepaObjective(Objective):
     """Joint-embedding prediction over images (B,H,W,C) or video (B,T,H,W,C).
 
