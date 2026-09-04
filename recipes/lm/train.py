@@ -61,6 +61,10 @@ class LmRunConfig(RunConfig):
     """Hugging Face decoder to continue training: a hub repo id or a local
     directory in that layout. The checkpoint decides the architecture, so
     --model.config may then carry max_seq_len and nothing else."""
+    balance_rate: Optional[float] = None
+    """How far a sparse run moves each router's balancing bias against its
+    load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
+    with bias=True; unset leaves the bias where it is."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
@@ -222,6 +226,7 @@ def main(config: LmRunConfig) -> TrainState:
         ema_decay=config.ema_decay,
         samples=samples,
         pretrained=pretrained,
+        balance_rate=config.balance_rate,
     )
 
     name = config.trainer.name or (
