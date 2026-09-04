@@ -23,7 +23,7 @@ import PIL.Image
 import traceback
 
 # The lazy `datasets` import lives with the source that owns hub datasets.
-from .processors import AutoTextTokenizer
+from .dataset import CAPTION
 from .sources.hf import _STREAMING_HINT, _hf_datasets
 
 if TYPE_CHECKING:
@@ -45,16 +45,14 @@ def load_rows(sources: List[str], split: str = "train"):
 
 
 def generate_collate_fn(media_type="image"):
-    """The collate for one media type: stacked pixels and tokenized captions.
+    """The collate for one media type: stacked pixels and the captions.
 
     A malformed sample raises: a batch that silently became zeros trained as
-    data. Records of mixed shapes are resized to the largest.
+    data. Records of mixed shapes are resized to the largest. The captions
+    leave as text; the run's condition is what reads them.
     """
-    auto_tokenize = AutoTextTokenizer(tensor_type="np")
-
     def image_collate(batch):
-        captions = [sample["caption"] for sample in batch]
-        results = auto_tokenize(captions)
+        captions = np.asarray([sample["caption"] for sample in batch])
 
         image_shapes = [sample["image"].shape for sample in batch]
         if len(set(str(shape) for shape in image_shapes)) > 1:
@@ -69,17 +67,10 @@ def generate_collate_fn(media_type="image"):
         else:
             images = np.stack([sample["image"] for sample in batch], axis=0)
 
-        return {
-            "image": images,
-            "text": {
-                "input_ids": results['input_ids'],
-                "attention_mask": results['attention_mask'],
-            }
-        }
+        return {"image": images, CAPTION: captions}
 
     def video_collate(batch):
-        captions = [sample["caption"] for sample in batch]
-        results = auto_tokenize(captions)
+        captions = np.asarray([sample["caption"] for sample in batch])
 
         video_shapes = [sample["video"].shape for sample in batch]
         if len(set(str(shape) for shape in video_shapes)) > 1:
@@ -109,13 +100,7 @@ def generate_collate_fn(media_type="image"):
         else:
             videos = np.stack([sample["video"] for sample in batch], axis=0)
 
-        return {
-            "video": videos,
-            "text": {
-                "input_ids": results['input_ids'],
-                "attention_mask": results['attention_mask'],
-            }
-        }
+        return {"video": videos, CAPTION: captions}
 
     return video_collate if media_type == "video" else image_collate
 

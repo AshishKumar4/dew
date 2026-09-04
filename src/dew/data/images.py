@@ -3,10 +3,12 @@
 Every image dataset resizes, augments and captions its records the same way;
 what differs is where the records come from and how one is read, which is
 the three hooks a subclass fills in. Records leave as
-`{"image": uint8 [size, size, 3], "text": {"input_ids", "attention_mask"}}`,
-plus `"label"` when the source carries a class index. cv2, albumentations,
-tensorflow_datasets and HF datasets are imported on use, so `import dew.data`
-costs none of them.
+`{"image": uint8 [size, size, 3], "caption": str}`, plus `"label"` when the
+source carries a class index, and `load(tokenize=)` is where a run's own
+condition reads the captions: the dataset carries the text, the encoder
+decides what tokens it becomes. cv2, albumentations, tensorflow_datasets
+and HF datasets are imported on use, so `import dew.data` costs none of
+them.
 """
 
 from __future__ import annotations
@@ -25,8 +27,8 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, hold_out, local_batch, train_stream, validation_pass
-from .processors import AutoTextTokenizer
+from .dataset import (CAPTION, Dataset, DatasetSpec, hold_out, local_batch, tokenized,
+                      train_stream, validation_pass)
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
@@ -144,19 +146,11 @@ class ImageTransform(pygrain.RandomMapTransform):
     def __init__(self, spec: "ImageDataset"):
         self.spec = spec
         self.augments = image_augmentations(spec.augmentation)
-        self.tokenize = AutoTextTokenizer(tensor_type="np")
 
     def random_map(self, element, rng: np.random.Generator) -> dict[str, Any]:
         image, caption, label = self.spec.record(element, rng)
         image = augment_image(self.augments, resize_image(image, self.spec.image_size), rng)
-        tokens = self.tokenize(caption)
-        record = {
-            "image": image,
-            "text": {
-                "input_ids": tokens["input_ids"][0],
-                "attention_mask": tokens["attention_mask"][0],
-            },
-        }
+        record = {"image": image, CAPTION: caption}
         if label is not None:
             # the class index, which the JEPA linear/kNN probes score against
             record["label"] = np.int32(label)
@@ -207,7 +201,7 @@ class ImageDataset(DatasetSpec):
                 f"count {self.count} is more than the {len(source)} records of {name}")
         return self.count
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize=None) -> Dataset:
         source = self.source()
         train, val = hold_out(source, self.records(source),
                               (self.val_batches or 0) * batch, type(self).__name__)
@@ -215,8 +209,9 @@ class ImageDataset(DatasetSpec):
                      read_threads=self.read_threads, read_buffer=self.read_buffer,
                      worker_buffer=self.worker_buffer)
         return Dataset(
-            train=train_stream(train, [ImageTransform(self)], **knobs),
-            val=None if val is None else validation_pass(val, [ImageTransform(self)], **knobs),
+            train=tokenized(train_stream(train, [ImageTransform(self)], **knobs), tokenize),
+            val=None if val is None else tokenized(
+                validation_pass(val, [ImageTransform(self)], **knobs), tokenize),
             records=len(train),
             batch=batch,
         )

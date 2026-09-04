@@ -8,7 +8,7 @@ import jax
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, local_batch
+from .dataset import Dataset, DatasetSpec, local_batch, tokenized
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,7 +34,7 @@ class OnlineImages(DatasetSpec):
     timeout: int = 15
     retries: int = 3
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize=None) -> Dataset:
         from .online_loader import OnlineStreamingDataLoader, load_rows
 
         if not self.sources:
@@ -57,7 +57,8 @@ class OnlineImages(DatasetSpec):
                 retries=self.retries,
             )
 
-        return Dataset(train=stream, val=None, records=len(rows), batch=batch)
+        return Dataset(train=tokenized(stream, tokenize), val=None,
+                       records=len(rows), batch=batch)
 
 
 @datasets("combined_online")
