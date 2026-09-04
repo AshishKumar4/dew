@@ -24,7 +24,8 @@ from dew.telemetry.instrumentation import (
 from .distributed import (
     DEFAULT_MIN_SHARD_SIZE, DEFAULT_SHARDING_TOLERANCE, DevicePrefetchIterator,
     LogicalAxisRuleConfig, assert_params_sufficiently_sharded, batch_sharding,
-    build_mesh, shard_batch, state_sharding_tree,
+    broadcast_from_process_zero, build_mesh, gather_positions,
+    minimum_across_processes, own_position, shard_batch, state_sharding_tree,
 )
 from flax.training import dynamic_scale as dynamic_scale_lib
 
@@ -43,6 +44,16 @@ PROCESS_COLOR_MAP = {
 class Metrics(metrics.Collection):
     accuracy: metrics.Accuracy
     loss: metrics.Average#.from_output('loss')
+
+
+def _processes(count: int) -> str:
+    return f"{count} process" + ("es" if count != 1 else "")
+
+
+def _is_uri(path: str) -> bool:
+    """A `<scheme>://` location, such as a gs:// bucket, which has no local form."""
+    return '://' in path
+
 
 # Define the TrainState
 class SimpleTrainState(train_state.TrainState):
@@ -128,7 +139,7 @@ class SimpleTrainer:
                 # If resuming from a previous run, and train_start_step_override is not set, 
                 # set the start step to the last step of the previous run
                 if train_start_step_override is None:
-                    train_start_step_override = run.summary['train/step'] + 1
+                    train_start_step_override = int(run.summary['train/step']) + 1
                 print(f"Resuming from previous run {wandb_config['id']} with start step {train_start_step_override}")
                 
                 # If load_from_checkpoint is not set, and an artifact is found, load the artifact
@@ -159,6 +170,14 @@ class SimpleTrainer:
                 self.wandb_sweep = api.sweep(f"{self.wandb.entity}/{self.wandb.project}/{self.wandb.sweep_id}")
                 print(f"Running sweep {self.wandb_sweep.id} with id {self.wandb.sweep_id}")
             
+        if wandb_config is not None and 'id' in wandb_config:
+            # Process 0 resolved the run id into a start step and a checkpoint.
+            # A process that kept its own values would resume from another
+            # step and other weights than the rest of the pool.
+            train_start_step_override, load_from_checkpoint, load_directly_from_dir = (
+                broadcast_from_process_zero((
+                    train_start_step_override, load_from_checkpoint, load_directly_from_dir)))
+
         # The latest few steps so a resume has something recent, plus the one
         # step with the lowest epoch loss. BestN reads `reverse=True` as
         # "smallest metric wins"; best_fn is what writes the metric into the
@@ -275,10 +294,12 @@ class SimpleTrainer:
 
     def checkpoint_path(self):
         path = os.path.join(self.checkpoint_base_path, self.name.replace(' ', '_').lower())
-        # Convert the path to an absolute path
+        if _is_uri(path):
+            # orbax opens a bucket URI itself; abspath and makedirs would turn
+            # it into a local directory named gs:.
+            return path
         path = os.path.abspath(path)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
         return path
 
     def _checkpoint_template(self, stored_keys):
@@ -289,10 +310,10 @@ class SimpleTrainer:
         Restoring untyped would silently discard opt_state and reset the step
         counter (and with it the lr schedule) on every resume.
 
-        The template names only the keys this run restores. Checkpoints
-        predating iterator tracking, or written from an iterator that cannot
-        report a position, have no dataset_state; older ones carry a second
-        train state under 'best_state', which nothing here reads.
+        The template names only the keys this run restores. A checkpoint
+        written from an iterator that cannot report a position has no
+        position; older ones carry a second train state under 'best_state',
+        which nothing here reads.
         """
         template = {
             'rngs': self.get_rngstate(),
@@ -300,10 +321,12 @@ class SimpleTrainer:
             'best_loss': np.array(self.best_loss),
             'epoch': 0,
         }
-        if 'dataset_state' in stored_keys:
-            # Length varies with the iterator's position, so orbax takes the
-            # shape from the checkpoint rather than from this placeholder.
-            template['dataset_state'] = np.zeros((1,), np.uint8)
+        if 'position' in stored_keys:
+            # The table's shape depends on the process count and the
+            # iterator's position, so orbax takes it from the checkpoint
+            # rather than from this placeholder.
+            template['position'] = {'rows': np.zeros((1, 1), np.uint8),
+                                    'lengths': np.zeros((1,), np.int64)}
         restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(), template)
         # Only the train state is placed onto the mesh; everything else is
         # bookkeeping that belongs on the host.
@@ -312,6 +335,10 @@ class SimpleTrainer:
         return template, restore_args
 
     def load(self, checkpoint_path, checkpoint_step=None, load_directly_from_dir=False):
+        if not _is_uri(checkpoint_path):
+            # orbax takes local paths absolute only, and a recipe's is
+            # ./checkpoints/<run>.
+            checkpoint_path = os.path.abspath(checkpoint_path)
         # The handler has to be registered for item_metadata to report the
         # checkpoint's structure, which is what the template is built against.
         manager = ocp.CheckpointManager(
@@ -346,16 +373,34 @@ class SimpleTrainer:
 
         self.state = ckpt['state']
         self.rngstate = ckpt['rngs']
-        stored_position = ckpt.get('dataset_state')
-        self.dataset_state = (
-            None if stored_position is None
-            else np.asarray(stored_position, np.uint8).tobytes())
+        self.dataset_state = self._stored_position(ckpt)
         self.best_loss = float(ckpt['best_loss'])
         if self.best_loss == 0:
             # It cant be zero as that must have been some problem
             self.best_loss = 1e9
         print(f"Loaded model from checkpoint at step {step}", self.best_loss)
         return step
+
+    def _stored_position(self, ckpt) -> Optional[bytes]:
+        """The data iterator position this process resumes from, if any.
+
+        Positions are per process: each shards the data by its own index, so
+        one process's position means nothing to another and a table written
+        by a different process count has no row for this process at all.
+        """
+        table = ckpt.get('position')
+        if table is None:
+            return None
+        written = len(table['lengths'])
+        if written != jax.process_count():
+            raise ValueError(
+                f"The checkpoint at {self.loaded_checkpoint_path} holds a data "
+                f"iterator position for each of {_processes(written)} and this run "
+                f"has {_processes(jax.process_count())}. A position is where one "
+                f"process's shard of the data stopped and cannot be translated to "
+                f"another shard count, so resume it on {_processes(written)}; only a "
+                f"checkpoint that holds no data position resumes on any count.")
+        return own_position(table)
 
     def save(self, epoch=0, step=0, state=None, rngstate=None, metrics=None):
         print(f"Saving model at epoch {epoch} step {step}")
@@ -370,8 +415,9 @@ class SimpleTrainer:
         }
         if self.dataset_state is not None:
             # Grain reports its position as JSON bytes, which tensorstore has no
-            # dtype for; the raw bytes ride along as a uint8 array instead.
-            ckpt['dataset_state'] = np.frombuffer(self.dataset_state, np.uint8)
+            # dtype for; the raw bytes ride along as uint8 rows instead, one per
+            # process, so each resumes its own shard where it left it.
+            ckpt['position'] = gather_positions(self.dataset_state)
         # Deliberately unguarded: a checkpoint that failed to write is data
         # loss, and printing it while the run carries on hides exactly that.
         # The write is async, so a failure inside it surfaces from
@@ -400,6 +446,27 @@ class SimpleTrainer:
             "input_shapes": self.input_shapes
         }
 
+    def _validation_batches(self, val_ds, val_steps_per_epoch) -> list:
+        """The batches a validation pass scores, the same count on every process.
+
+        val_steps_per_epoch bounds the pass, and a held-out split that runs
+        out first ends it, which is not an error to report. Where it runs out
+        differs by process: the token and packed splits are whole files
+        strided per process, so one process can hold a batch more than
+        another, and a process that left the pass while the others waited in
+        its collectives would wedge the pool. The count is agreed before the
+        loop, which is why the batches are pulled onto the host first; a pass
+        holds val_steps_per_epoch of them at most.
+        """
+        if val_ds is None:
+            return [None] * val_steps_per_epoch
+        batches = list(itertools.islice(iter(val_ds()), val_steps_per_epoch))
+        agreed = minimum_across_processes(len(batches))
+        if agreed < len(batches):
+            print(f"Validation on process {jax.process_index()} scores {agreed} of "
+                  f"its {len(batches)} batches, the count every process has")
+        return batches[:agreed]
+
     def validation_loop(
         self,
         val_state: SimpleTrainState,
@@ -409,11 +476,7 @@ class SimpleTrainer:
         current_step,
     ):
         process_index = jax.process_index()
-        
-        # val_steps_per_epoch bounds the pass, and a held-out split that runs
-        # out first ends it, which is not an error to report.
-        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
-                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
+        batches = self._validation_batches(val_ds, val_steps_per_epoch)
         for i, batch in enumerate(batches):
             if batch is not None:
                 batch = shard_batch(self.batch_sharding, batch)

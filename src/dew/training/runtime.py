@@ -7,11 +7,14 @@ recipes call this once at the top of main().
 
 import os
 import resource
+from datetime import datetime
 from typing import Optional
 
 import jax
+from jax.experimental import multihost_utils
 
 from dew.telemetry.devices import apply_xla_flags
+from dew.training.distributed import broadcast_from_process_zero
 
 
 def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
@@ -51,4 +54,24 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
         else:
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
+            # One collective while the processes are still in lockstep, which
+            # they are only here: initialize() returns on every process once
+            # the last one has connected. On CPU, collectives rendezvous
+            # through the coordinator with a 30 second deadline, and the
+            # first one otherwise falls inside orbax's checkpoint-manager
+            # barrier in the trainer, by which time the processes are as far
+            # apart as a wandb init, an artifact download and their model
+            # builds. A process that arrives late dies in gloo rather than in
+            # anything the run can report.
+            multihost_utils.sync_global_devices("dew process pool joined")
     print(f"Number of devices: {jax.device_count()}")
+
+
+def run_timestamp() -> str:
+    """Process 0's wall clock as `%Y-%m-%d_%H:%M:%S`, on every process.
+
+    A default run name carries it, and the name is the checkpoint directory
+    every process writes into, so a process that read its own clock a second
+    later would write into a directory of its own.
+    """
+    return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))

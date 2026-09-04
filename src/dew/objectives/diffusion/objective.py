@@ -17,6 +17,9 @@ from dew.inputs import DiffusionInputConfig
 from dew.random_state import RandomMarkovState
 
 
+# Samples a validation batch draws, conditioned or not.
+VALIDATION_SAMPLES = 4
+
 class DiffusionObjective(Objective):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
@@ -113,8 +116,12 @@ class DiffusionObjective(Objective):
         sequence_length = self._sequence_length()
 
         def generate_samples(val_state, batch):
-            model_conditioning_inputs = [cond_input(batch) for cond_input in conditional_inputs]
-            batch_size = len(model_conditioning_inputs[0]) if model_conditioning_inputs else 4
+            # A pass samples a few images per batch, at 200 sampler steps
+            # each, so the count is capped whatever the batch size is.
+            model_conditioning_inputs = [
+                cond_input(batch)[:VALIDATION_SAMPLES] for cond_input in conditional_inputs]
+            batch_size = (len(model_conditioning_inputs[0]) if model_conditioning_inputs
+                          else VALIDATION_SAMPLES)
             return sampler.generate_samples(
                 params=val_state.ema_params,
                 resolution=image_size,

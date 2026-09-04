@@ -310,6 +310,53 @@ def test_get_latest_checkpoint_reports_an_empty_directory(tmp_path):
         get_latest_checkpoint(str(tmp_path))
 
 
+# --------------------------------------------------------------------------
+# Where the checkpoints go
+# --------------------------------------------------------------------------
+
+class RecordingManager:
+    """Orbax as far as the constructor reads it, remembering where it was pointed.
+
+    A bucket URI is the one directory the trainer must hand over untouched,
+    and a test that let orbax open it would need a bucket.
+    """
+
+    def __init__(self, directory, **kwargs):
+        self.directory = directory
+
+    def latest_step(self):
+        return None
+
+
+def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
+    """`--trainer.checkpoint-fs gcs` prefixes the directory with gs://, and
+    checkpoint_path used to run it through abspath and makedirs: orbax got
+    <cwd>/gs:/bucket/... and a local directory named `gs:` appeared under the
+    working directory. A URI has no local form and goes through as it is."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(trainer_module.ocp, "CheckpointManager", RecordingManager)
+    trainer = make_trainer("gs://bucket/checkpoints", name="Bucket Run")
+
+    assert trainer.checkpoint_path() == "gs://bucket/checkpoints/bucket_run"
+    assert trainer.checkpointer.directory == "gs://bucket/checkpoints/bucket_run"
+    assert not (tmp_path / "gs:").exists(), "a local directory named gs: was created"
+
+
+def test_a_relative_checkpoint_path_resumes(tmp_path, monkeypatch):
+    """`--trainer.load-from-checkpoint ./checkpoints/<run>` is what the README
+    shows. checkpoint_path resolves its own directory; load handed the path
+    straight to orbax, which refuses a relative one."""
+    trainer = make_trainer(tmp_path, name="relative")
+    trainer.save(epoch=0, step=2)
+    trainer.wait_for_checkpoints()
+
+    monkeypatch.chdir(tmp_path)
+    resumed = make_trainer(tmp_path, name="relative-resumed", load_from_checkpoint="./relative")
+    assert resumed.latest_step == 2
+    assert resumed.loaded_checkpoint_path == str(tmp_path / "relative" / "2")
+
+
+
 class ExplodingCheckpointer:
     """Orbax when the filesystem refuses the write.
 
@@ -373,6 +420,64 @@ def test_a_failing_metric_fails_the_validation_pass(tmp_path):
     with pytest.raises(ZeroDivisionError):
         trainer.validation_loop(trainer.state, trainer._define_validation_step(),
                                 batch_iterator, 1, 0)
+
+
+class UnreadableSplit:
+    """A validation split whose first record cannot be read."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise OSError("val.bin: Input/output error")
+
+
+def test_a_failing_validation_loader_fails_the_pass(tmp_path):
+    """A split that cannot be read has the same duty as a step that cannot
+    run. The train side already stops on a record it cannot read; the
+    validation side printed the error and scored nothing."""
+    trainer = make_trainer(tmp_path, name="failing-loader")
+    with pytest.raises(OSError, match="val.bin"):
+        trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                                UnreadableSplit, 1, 0)
+
+
+def test_a_latent_trainer_validates_at_the_input_resolution(tmp_path):
+    """sample_data_shape is the pixel shape and get_input_shapes divides it
+    by the autoencoder's factor for the model, so the default
+    native_resolution multiplied by that factor once more: a model trained on
+    4x4 latents of 8x8 images sampled 8x8 latents and decoded 16x16 images.
+    Every validation artifact has to come out at the data's 8x8."""
+    from dew.nn.autoencoders.simple import SimpleAutoEncoder
+
+    autoencoder = SimpleAutoEncoder(latent_channels=4, feature_depths=(8,),
+                                    key=jax.random.PRNGKey(1))
+    assert autoencoder.downscale_factor == 2
+    train_schedule, _, transform = get_diffusion_preset("edm")
+    seen = []
+    trainer = ObjectiveTrainer(
+        model=SimpleDiT(output_channels=4, patch_size=2, emb_features=16, num_layers=1,
+                        num_heads=2, mlp_ratio=1),
+        optimizer=optax.adam(1e-3),
+        noise_schedule=train_schedule,
+        model_output_transform=transform,
+        input_config=DiffusionInputConfig(
+            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
+        autoencoder=autoencoder,
+        rngs=jax.random.PRNGKey(0),
+        name="latent",
+        wandb_config=None,
+        distributed_training=False,
+        checkpoint_base_path=str(tmp_path),
+        eval_metrics=[EvaluationMetric(
+            function=lambda artifacts, batch: seen.append(np.asarray(artifacts).shape) or 0.0,
+            name="shape")],
+    )
+    assert trainer.objective.native_resolution == RES
+    trainer.objective.diffusion_steps = 2
+    trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                            batch_iterator, 1, 0)
+    assert seen == [(4, RES, RES, 3)]
 
 
 def test_a_failing_validation_step_fails_the_base_pass(tmp_path):

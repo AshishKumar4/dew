@@ -7,7 +7,6 @@ from typing import Callable, List, Dict, Tuple, Union, Any, Sequence, Optional
 from dataclasses import field, dataclass
 import jax.numpy as jnp
 import optax
-import itertools
 import functools
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import DiffusionPredictionTransform, EpsilonPredictionTransform
@@ -125,10 +124,9 @@ class ObjectiveTrainer(SimpleTrainer):
         self.grad_accum_steps = grad_accum_steps
 
         if native_resolution is None and input_config is not None:
-            sample_shape = input_config.sample_data_shape
-            native_resolution = sample_shape[-2]
-            if autoencoder is not None:
-                native_resolution = native_resolution * autoencoder.downscale_factor
+            # sample_data_shape is already pixels; get_input_shapes divides it
+            # by the autoencoder's factor for the model.
+            native_resolution = input_config.sample_data_shape[-2]
 
         if objective is None:
             objective = DiffusionObjective(
@@ -321,12 +319,9 @@ class ObjectiveTrainer(SimpleTrainer):
         Score the objective's validation artifacts and let it visualize them.
         """
         process_index = jax.process_index()
-
-        # val_steps_per_epoch bounds the pass, and a held-out split that runs
-        # out first ends it. What it scored before that is the epoch's score,
-        # so the reduction below has to be reached either way.
-        batches = (itertools.islice(iter(val_ds()), val_steps_per_epoch)
-                   if val_ds else itertools.repeat(None, val_steps_per_epoch))
+        # What the pass scored is the epoch's score however it ended, so the
+        # reduction below has to be reached either way.
+        batches = self._validation_batches(val_ds, val_steps_per_epoch)
         print(f"Validation loop started for process index {process_index} "
               f"with {jax.device_count()} devices.")
         metrics = {metric.name: [] for metric in self.eval_metrics} if self.eval_metrics else {}

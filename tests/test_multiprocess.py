@@ -10,10 +10,14 @@ itself.
 
 The pool runs on CPU with the simulated eight devices split among its
 processes, so the global device count is the one the rest of the suite uses.
+The processes join through `prepare_process` from the environment a launcher
+leaves, so the production join and the rendezvous right after it are what
+every pool test runs.
 """
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -155,18 +159,20 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     return directory
 
 
-def document_corpus(directory: Path, documents: int, length: int) -> Path:
+def document_corpus(directory: Path, documents: int, length) -> Path:
     """A corpus whose documents each say which document they are.
 
-    Document i is the token value i + 1 repeated, closed by the eos id 0, so
-    the values in a packed window name the documents packed into it and
-    padding, which is also 0, names none.
+    Document i is the token value i + 1 repeated `length` times (one length
+    for all, or one per document), closed by the eos id 0, so the values in a
+    packed window name the documents packed into it and padding, which is
+    also 0, names none.
     """
     directory.mkdir(parents=True, exist_ok=True)
+    lengths = [length] * documents if isinstance(length, int) else list(length)
     # The dtype has to stay uint16 through the join, or the file holds twice
     # the bytes and reads back as a different corpus entirely.
     stream = np.concatenate([
-        np.array([index + 1] * length + [0], np.uint16)
+        np.array([index + 1] * lengths[index] + [0], np.uint16)
         for index in range(documents)])
     assert stream.dtype == np.uint16
     (directory / "train.bin").write_bytes(stream.tobytes())
@@ -201,7 +207,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["process_count"] == 2
         assert report["device_count"] == DEVICES
         assert report["local_device_count"] == DEVICES // 2
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "fsdp": 2}
+        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2}
         assert report["mesh_devices"] == DEVICES
         assert report["mesh_process_indices"] == [0, 1]
 
@@ -213,8 +219,20 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == DEVICES // 4
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "fsdp": 2}
+        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
+
+
+@pytest.mark.distributed
+def test_a_default_run_name_takes_its_timestamp_from_process_zero(two_processes):
+    """The date in a default run name is the checkpoint directory's name, and
+    every process writes into that directory. Each process used to read its
+    own clock; the worker sets process 1's a year ahead, and a name built
+    from it would put process 1's shards in a directory of their own."""
+    stamps = [report["run_timestamp"] for report in two_processes]
+    assert stamps[0] == stamps[1]
+    assert int(stamps[0][:4]) == two_processes[0]["own_year"]
+    assert int(stamps[1][:4]) != two_processes[1]["own_year"], "the skew did not apply"
 
 
 @pytest.mark.distributed
@@ -289,6 +307,32 @@ def test_processes_pack_disjoint_documents(tmp_path):
     for report in reports:
         assert report["local_batch_size"] == worker.BATCH // 2
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
+
+
+@pytest.mark.distributed
+def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
+    """Every process scores the batch count all of them have.
+
+    The packed split strides its documents over the processes and packs each
+    stride on its own. Of these 60 documents, 16 on process 0's stride and
+    20 on process 1's fill a window and the rest are one eos each, so the
+    strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each process
+    used to bound its own pass with an islice: asked for 5, process 1 issued
+    a fifth validation collective after process 0 had left the pass, and the
+    pool sat in it until the heartbeat killed both. The count is agreed
+    before the loop, so both score 4.
+    """
+    seq_len, val_steps = 8, 5
+    lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
+    corpus = document_corpus(tmp_path / "corpus", 60, lengths)
+    reports = run_pool("fit", tmp_path / "out", 2, name="uneven", run_dir=tmp_path / "run",
+                       fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
+                       seq_len=seq_len, val_steps=val_steps)
+
+    assert [report["val_available"] for report in reports] == [4, 5]
+    for report in reports:
+        assert report["val_batches"] == 4
+        assert report["step"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -368,10 +412,106 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "fsdp": 4}
+        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4}
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
+
+
+# --------------------------------------------------------------------------
+# Resuming a pool
+# --------------------------------------------------------------------------
+
+POOL_STEPS = 3
+
+
+def shard_of(position: str) -> int:
+    """The process whose shard a saved grain position belongs to."""
+    return int(re.search(r"shard_index=(\d+)", json.loads(position)["sampler"]).group(1))
+
+
+@pytest.fixture(scope="module")
+def pool_checkpoint(tmp_path_factory):
+    """A three-step fit on two processes, saved with each one's data position."""
+    directory = tmp_path_factory.mktemp("pool-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, name="pool", run_dir=directory / "run",
+                       fsdp_size=2, steps=POOL_STEPS, records=RECORDS)
+    for index, report in enumerate(reports):
+        assert report["written_steps"] == [POOL_STEPS]
+        assert shard_of(report["dataset_state"]) == index
+    return {"checkpoints": worker.checkpoint_dir(directory / "run", "pool"),
+            "reports": reports}
+
+
+@pytest.mark.distributed
+def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpoint):
+    """A checkpoint hands each process back the position that process wrote.
+
+    The steps-mode checkpoint tests above never call fit, so they save no
+    position and this could not show up there: a checkpoint holding one
+    position, which orbax writes from process 0, hands process 0's shard to
+    process 1, and grain refuses a sampler whose shard_index is not its own.
+    Process 1 died at load and process 0 followed in its next collective.
+    With one row per process the resumed pool has to land where a pool
+    nobody stopped lands, at the same final position with the same
+    parameters.
+    """
+    resumed = run_pool("fit", tmp_path / "resumed", 2, name="pool",
+                       run_dir=tmp_path / "resumed-run", fsdp_size=2,
+                       steps=2 * POOL_STEPS, records=RECORDS,
+                       load=pool_checkpoint["checkpoints"])
+    whole = run_pool("fit", tmp_path / "whole", 2, name="whole",
+                     run_dir=tmp_path / "whole-run", fsdp_size=2,
+                     steps=2 * POOL_STEPS, records=RECORDS)
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["restored_dataset_state"] == pool_checkpoint["reports"][index]["dataset_state"]
+        assert shard_of(report["restored_dataset_state"]) == index
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_checkpoint):
+    """One process cannot take over two processes' positions, and says so.
+
+    Each position is where one shard stopped, and a sampler over one shard
+    of one has no such place. Before the positions were per process this
+    surfaced as grain's repr comparison of two samplers; now it stops at load
+    with both counts in the message.
+    """
+    refused = spawn("fit", tmp_path / "single.json", fsdp_size=1, steps=2 * POOL_STEPS,
+                    records=RECORDS, name="single", run_dir=tmp_path / "single-run",
+                    load=pool_checkpoint["checkpoints"])
+    log = refused.communicate(timeout=600)[0]
+    assert refused.returncode != 0, "one process resumed a two-process position"
+    assert "position for each of 2 processes and this run has 1 process" in log
+    assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
+
+
+@pytest.mark.distributed
+def test_a_resumed_run_id_starts_every_process_where_process_zero_does(tmp_path, pool_checkpoint):
+    """resume_last_run is answered by wandb, which only process 0 opens.
+
+    Process 0 learned the step the run had reached and downloaded its model
+    artifact; every other process kept a start step of 0 and no checkpoint,
+    trained from scratch and issued its collectives on another schedule.
+    What process 0 resolves is broadcast, so every process starts at the
+    summary's step plus one from the artifact's weights, trains the one step
+    left, and lands on the same parameters.
+    """
+    summary_step = POOL_STEPS + 1
+    reports = run_pool("fit", tmp_path / "out", 2, name="resumed", run_dir=tmp_path / "run",
+                       fsdp_size=2, steps=summary_step + 2, records=RECORDS,
+                       resume_run_step=summary_step,
+                       artifact=pool_checkpoint["checkpoints"] / str(POOL_STEPS))
+    for report in reports:
+        assert report["restored_step"] == summary_step + 1
+        assert report["step"] == POOL_STEPS + 1
+    assert largest_difference(dumped_params(tmp_path / "out" / "process0.json"),
+                              dumped_params(tmp_path / "out" / "process1.json")) == 0.0
 
 
 # --------------------------------------------------------------------------
