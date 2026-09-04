@@ -135,16 +135,22 @@ def _value_type(annotation: Any) -> Any:
     """The value class `annotation` asks for, looking through Optional only.
 
     A container of values is not itself a value, so `Mapping[str, LayerKind]`
-    answers None and its entries are walked instead.
+    answers None and its entries are walked instead. A union of several
+    values names no single one either — a mixer's `{"kind": ...}` record
+    stays a record for the owner to dispatch on its kind — so only a union
+    with one value answers it, which is what `Optional[Mixture]` is. This is
+    the same opaque treatment `_entry_type` and `RunConfig._rebuild` already
+    give a multi-member union.
     """
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
         return annotation
     if typing.get_origin(annotation) not in (Union, types.UnionType):
         return None
-    for argument in typing.get_args(annotation):
-        if dataclasses.is_dataclass(argument) and isinstance(argument, type):
-            return argument
-    return None
+    members = [argument for argument in typing.get_args(annotation)
+               if argument is not type(None)
+               and dataclasses.is_dataclass(argument)
+               and isinstance(argument, type)]
+    return members[0] if len(members) == 1 else None
 
 
 def _entry_type(annotation: Any) -> Any:
