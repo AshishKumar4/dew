@@ -92,6 +92,11 @@ CAPTION = "caption"
 conditions read it."""
 
 
+def _no_captions(captions: Sequence[str]) -> Mapping[str, Any]:
+    """What an unconditional run reads out of a batch's captions: nothing."""
+    return {}
+
+
 def tokenized(stream: Callable[[], Iterator[Batch]],
               tokenize: Callable[[Sequence[str]], Mapping[str, Any]] | None
               ) -> Callable[[], Iterator[Batch]]:
@@ -110,9 +115,7 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     unconditional run wants; a caller that wants the words keeps them with
     a reader that hands them back.
     """
-    if tokenize is None:
-        def tokenize(captions):
-            return {}
+    read = tokenize if tokenize is not None else _no_captions
 
     class Tokenizing:
         """The stream's iterator with the caption stage on its end."""
@@ -126,7 +129,7 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         def __next__(self) -> Batch:
             batch = dict(next(self.source))
             captions = [str(caption) for caption in batch.pop(CAPTION)]
-            batch.update(tokenize(captions))
+            batch.update(read(captions))
             return batch
 
         def __getattr__(self, name):

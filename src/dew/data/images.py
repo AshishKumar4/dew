@@ -58,6 +58,8 @@ def decode_image(encoded: bytes) -> np.ndarray:
     """
     import cv2
     image = cv2.imdecode(np.asarray(bytearray(encoded), dtype="uint8"), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
@@ -147,7 +149,7 @@ class ImageTransform(pygrain.RandomMapTransform):
         self.spec = spec
         self.augments = image_augmentations(spec.augmentation)
 
-    def random_map(self, element, rng: np.random.Generator) -> dict[str, Any]:
+    def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
         image, caption, label = self.spec.record(element, rng)
         image = augment_image(self.augments, resize_image(image, self.spec.image_size), rng)
         record = {"image": image, CAPTION: caption}
@@ -202,11 +204,10 @@ class ImageDataset(DatasetSpec):
         source = self.source()
         train, val = hold_out(source, self.records(source),
                               (self.val_batches or 0) * batch, type(self).__name__)
-        knobs = dict(batch=local_batch(batch), seed=self.seed, loading=self.loading)
         return Dataset(
-            train=tokenized(train_stream(train, [ImageTransform(self)], **knobs), tokenize),
+            train=tokenized(train_stream(train, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             val=None if val is None else tokenized(
-                validation_pass(val, [ImageTransform(self)], **knobs), tokenize),
+                validation_pass(val, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             records=len(train),
             batch=batch,
         )

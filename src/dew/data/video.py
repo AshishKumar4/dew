@@ -43,14 +43,14 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
         self.spec = spec
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 
-    def random_map(self, element, rng: np.random.Generator) -> dict[str, Any]:
+    def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
         # cv2 comes in with the reader, on the first record rather than on import.
         from .sources.av_utils import read_av_random_clip
         framewise_audio, full_audio, frames = read_av_random_clip(
             element["video_path"],
             num_frames=self.spec.frames,
             audio_frame_padding=self.spec.audio_padding,
-            random_seed=rng.integers(0, 2**32 - 1),
+            random_seed=int(rng.integers(0, 2**32 - 1)),
         )
         size = self.spec.frame_size
         if frames.shape[1] != size or frames.shape[2] != size:
@@ -102,11 +102,10 @@ class VideoDataset(DatasetSpec):
         if records > len(source):
             raise ValueError(f"count {self.count} is more than the {len(source)} records of {name}")
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, name)
-        knobs = dict(batch=local_batch(batch), seed=self.seed, loading=self.loading)
         return Dataset(
-            train=tokenized(train_stream(train, [AudioVideoTransform(self)], **knobs), tokenize),
+            train=tokenized(train_stream(train, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             val=None if val is None else tokenized(
-                validation_pass(val, [AudioVideoTransform(self)], **knobs), tokenize),
+                validation_pass(val, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             records=len(train),
             batch=batch,
         )
