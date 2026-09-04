@@ -145,6 +145,49 @@ def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
 
     return ('full_attention',) * layers
 
+def _gemma4_rope(entries: Mapping[str, Any]) -> Tuple[float, Optional[float], Optional[float]]:
+    """(rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
+
+    The full layers may rotate a fraction of their head dims (proportional
+    partial rotary); the sliding layers rotate all of theirs. Anything but
+    those two shapes refuses with the entry named.
+    """
+    full = entries.get('full_attention') or {}
+    sliding = entries.get('sliding_attention') or {}
+    for kind, entry in (('sliding_attention', sliding),):
+        factor = entry.get('partial_rotary_factor')
+        if factor not in (None, 1, 1.0):
+            _refuse(f"rope_parameters.{kind} partial_rotary_factor {factor}",
+                    "partial rotary applies to the full layers only")
+        _rope_theta({**entry, 'rope_type': entry.get('rope_type', entry.get('type', 'default'))},
+                    f"rope_parameters.{kind}")
+    local = sliding.get('rope_theta', 10000.0)
+    kind, entry = 'full_attention', full
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    factor = entry.get('partial_rotary_factor')
+    if rope_type == 'proportional':
+        if factor is None:
+            _refuse("rope_parameters.full_attention",
+                    "proportional rope needs its partial_rotary_factor")
+        extra = sorted(set(entry) - {'rope_type', 'type', 'rope_theta',
+                                     'partial_rotary_factor', 'factor'})
+        if extra or entry.get('factor', 1.0) not in (1, 1.0):
+            _refuse("rope_parameters.full_attention scaling",
+                    "the backbone applies plain rotary positions at rope_theta")
+        partial = float(factor)
+        theta = float(entry.get('rope_theta', 1000000.0))
+    elif rope_type in ('default', 'none'):
+        if factor not in (None, 1, 1.0):
+            _refuse("rope_parameters.full_attention partial_rotary_factor",
+                    "partial rotary comes spelled proportional")
+        partial = None
+        theta = _rope_theta(entry, 'rope_parameters.full_attention') or 10000.0
+    else:
+        _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
+                "the backbone applies plain rotary positions at rope_theta")
+    local = float(local)
+    return theta, (None if local == theta else local), partial
+
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
@@ -190,7 +233,11 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse(f"hidden_act {activation!r}",
                 "the gated MLP supports 'swiglu' and 'geglu'")
 
-    rope_theta, rope_local_theta = _rope(hf_config, used)
+    if model_type in ('gemma4', 'gemma4_text'):
+        # Proportional partial rotary is a gemma4 shape with its own reader below.
+        rope_theta, rope_local_theta = 10000.0, None
+    else:
+        rope_theta, rope_local_theta = _rope(hf_config, used)
     layer_types = _layer_types(hf_config, used)
     sliding_window = hf_config.get('sliding_window')
     used.add('sliding_window')
@@ -250,52 +297,55 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         if hf_config.get('enable_moe_block'):
             _refuse("enable_moe_block=True",
                     "the parallel MoE branch has no counterpart here")
-        if hf_config.get('use_double_wide_mlp'):
-            _refuse("use_double_wide_mlp=True",
-                    "the widened MLP on sharing layers has no counterpart here")
-        # The reference defaults the cap to 50.0, so only an explicit null
-        # means no softcap; Dew's kernels apply none.
-        if hf_config.get('attention_logit_cap', 50.0) is not None:
-            _refuse("attention_logit_cap",
-                    "the attention kernels apply no softcap to the logits")
-        used.update(('attention_k_eq_v', 'enable_moe_block', 'use_double_wide_mlp',
-                     'attention_logit_cap'))
-        # Full layers may override the head dim through per_layer_config;
-        # sliding layers use hidden // heads. Dew keeps one head_dim, so the
-        # two have to agree (they do not on gemma-4-E2B: 512 against 192).
+        used.update(('attention_k_eq_v', 'enable_moe_block'))
+        # Full layers may override the head dim and the sliding layers use
+        # hidden // heads; the two live side by side as head_dim and
+        # global_head_dim.
         sliding_dim = hidden // heads
-        full_dims = {sliding_dim}
+        if hidden % heads:
+            _refuse(f"hidden_size {hidden}",
+                    f"it does not divide into {heads} heads")
+        full_dim = sliding_dim
         entries = hf_config.get('per_layer_config') or {}
         for entry in (entries.values() if isinstance(entries, Mapping) else entries):
             if isinstance(entry, Mapping) and entry.get('head_dim') is not None:
-                full_dims.add(int(entry['head_dim']))
-        global_dim = hf_config.get('global_head_dim')
-        if global_dim is not None:
-            full_dims.add(int(global_dim))
-        if full_dims != {sliding_dim}:
-            _refuse(f"global_head_dim {sorted(full_dims)}",
-                    "every layer has to share hidden // heads: the backbone "
-                    "keeps one head_dim")
+                full_dim = int(entry['head_dim'])
+        if hf_config.get('global_head_dim') is not None:
+            full_dim = int(hf_config['global_head_dim'])
         used.update(('per_layer_config', 'global_head_dim',
                      'num_global_key_value_heads'))
+        # Proportional rope rotates a fraction of the full layers' head dims
+        # and passes the rest through; sliding layers rotate all of theirs.
+        entries = hf_config.get('rope_parameters') or {}
+        rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
+        used.update(('rope_parameters', 'rope_theta'))
         config.update(
             sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
             v_norm=True,
+            head_dim=sliding_dim,
+            global_head_dim=(None if full_dim == sliding_dim else full_dim),
+            rope_theta=rope_theta, rope_local_theta=rope_local_theta,
+            partial_rotary_factor=partial,
+            use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
             num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
             per_layer_input_dim=int(hf_config.get('hidden_size_per_layer_input', 0)),
             per_layer_input_vocab=int(hf_config.get(
                 'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
         )
-        used.update(('num_kv_shared_layers', 'hidden_size_per_layer_input',
-                     'vocab_size_per_layer_input', 'final_logit_softcapping'))
+        used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
+                     'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
+                     'final_logit_softcapping'))
+        # attention_logit_cap is read by no text path: Gemma4TextAttention
+        # never passes it to its attention call (modeling_gemma4.py,
+        # Gemma4TextAttention.forward), so it changes nothing and maps to
+        # nothing. Only the audio attention applies one.
+        used.add('attention_logit_cap')
         softcap = hf_config.get('final_logit_softcapping')
         if softcap is not None:
             config['final_logit_softcap'] = float(softcap)
-        used.update(('attention_k_eq_v', 'enable_moe_block', 'use_double_wide_mlp',
-                     'attention_logit_cap'))
         # MoE sizing keys with the branch off: refused above when it is on.
-        used.update(('moe_intermediate_size', 'num_experts', 'top_k_experts',
-                     'chunk_size_feed_forward'))
+        used.update(('moe_intermediate_size', 'expert_intermediate_size',
+                     'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})

@@ -77,17 +77,25 @@ class RMSNorm(nn.Module):
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
-
-
-def rotary_freqs(positions, head_dim: int, theta: float):
+def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None):
     """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
 
     `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
     documents each restart at 0); the angle axes line up with the trailing
     [B, S] either way. Computed in fp32 so a token gets the same rotation
     whether it arrives in a prefill or comes back as a single decode step.
+
+    rot_dim narrows the rotation to the first rot_dim dimensions, the rest
+    keeping frequency zero (cosine one, sine zero, so the rotation is the
+    identity there). That is proportional partial rotary
+    (modeling_rope_utils.py, _compute_proportional_rope_parameters), whose
+    exponents run over the full head_dim with a zero tail.
     """
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / head_dim))
+    if rot_dim is not None:
+        padding = head_dim // 2 - pairs
+        inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
     positions = jnp.asarray(positions, jnp.float32)
     if positions.ndim == 1:
         angles = positions[:, None] * inv_freq[None, :]
@@ -161,6 +169,7 @@ class CausalSelfAttention(nn.Module):
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
@@ -191,6 +200,18 @@ class CausalSelfAttention(nn.Module):
             # parameters either way.
             self.values_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
                                        dtype=self.dtype, name='v_norm')
+
+    def _rot_dim(self) -> int | None:
+        """Head dims the rotary rotates, or None for all of them."""
+        factor = self.partial_rotary_factor
+        if factor is None:
+            return None
+        rot_dim = int(self.head_dim * factor)
+        if not 0 < factor <= 1 or rot_dim % 2:
+            raise ValueError(
+                f"partial_rotary_factor must rotate an even positive number of "
+                f"head dims, got {factor} of head_dim {self.head_dim}")
+        return rot_dim
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -233,7 +254,8 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.arange(S)
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
-        freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
+        freqs_cos, freqs_sin = rotary_freqs(
+            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim())
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -294,7 +316,6 @@ class CausalSelfAttention(nn.Module):
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
-
 
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
@@ -454,6 +475,12 @@ class CausalTransformer(nn.Module):
     keys and values of the last earlier layer of their own type instead of
     projecting their own (Gemma 3n/4 cross-layer KV sharing). 0 is a plain
     decoder and leaves the tree unchanged.
+
+    global_head_dim gives the full-attention layers their own head dim while
+    sliding layers keep head_dim. partial_rotary_factor rotates that fraction
+    of the full layers' head dims and passes the rest through.
+    use_double_wide_mlp doubles the MLP width of the sharing layers. Each
+    defaults to off, and off leaves the tree unchanged.
     """
     vocab_size: int
     emb_features: int = 512
@@ -461,12 +488,14 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: Optional[int] = None       # None: as many as the query heads
     head_dim: Optional[int] = None           # None: emb_features // num_heads
+    global_head_dim: Optional[int] = None    # full layers; None: head_dim
     mlp: str = 'swiglu'                      # 'swiglu' | 'geglu'
     mlp_ratio: int = 4
     mlp_features: Optional[int] = None       # None: mlp_ratio * emb_features
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # full attention layers
     rope_local_theta: Optional[float] = None  # sliding layers, None: rope_theta
+    partial_rotary_factor: Optional[float] = None  # full layers; None: every dim rotates
     layer_types: Optional[Tuple[str, ...]] = None  # per layer, see LAYER_TYPES
     sliding_window: Optional[int] = None     # keys a sliding layer keeps
     norm_eps: float = 1e-5
@@ -490,6 +519,7 @@ class CausalTransformer(nn.Module):
     moe_every: Optional[int] = None          # sparse layer cadence
     moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
     expert_bias: bool = False                # DeepSeek's aux-loss-free balancing bias
+    use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
     causal: bool = True                      # False: full attention, no cache
     per_layer_input_dim: int = 0             # Gemma 3n/4 per-layer inputs; 0 disables
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
@@ -567,14 +597,20 @@ class CausalTransformer(nn.Module):
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
     def setup(self):
-        head_dim = self.features_per_head
-        if head_dim % 2:
-            raise ValueError(
-                f"rotary positions rotate pairs, so head_dim must be even, got {head_dim}")
+        local_dim = self.features_per_head
+        full_dim = self.global_head_dim or local_dim
+        for name, dim in (("head_dim", local_dim), ("global_head_dim", full_dim)):
+            if dim % 2:
+                raise ValueError(
+                    f"rotary positions rotate pairs, so {name} must be even, got {dim}")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
                 f"({self.kv_heads})")
+        if self.partial_rotary_factor is not None and not 0 < self.partial_rotary_factor <= 1:
+            raise ValueError(
+                "partial_rotary_factor must be within (0, 1], "
+                f"got {self.partial_rotary_factor}")
         types = self.per_layer_types
         if len(types) != self.num_layers:
             raise ValueError(
@@ -634,13 +670,16 @@ class CausalTransformer(nn.Module):
                     emb_features=self.emb_features,
                     num_heads=self.num_heads,
                     num_kv_heads=self.kv_heads,
-                    head_dim=head_dim,
+                    head_dim=(local_dim if layer_type == 'sliding_attention'
+                              else full_dim),
                     max_seq_len=self.max_seq_len,
                     causal=self.causal,
                     rope_theta=(self.rope_local_theta
                                 if layer_type == 'sliding_attention'
                                 and self.rope_local_theta is not None
                                 else self.rope_theta),
+                    partial_rotary_factor=(None if layer_type == 'sliding_attention'
+                                           else self.partial_rotary_factor),
                     qk_norm=self.qk_norm,
                     v_norm=self.v_norm,
                     norm_eps=self.norm_eps,
@@ -670,7 +709,9 @@ class CausalTransformer(nn.Module):
                     if index in sparse else
                     functools.partial(
                         GatedMLP,
-                        hidden_features=self.hidden_features,
+                        hidden_features=(2 * self.hidden_features
+                                         if self.use_double_wide_mlp and index in sharing
+                                         else self.hidden_features),
                         out_features=self.emb_features,
                         activation=self.mlp,
                         precision=self.precision)),

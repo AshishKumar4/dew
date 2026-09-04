@@ -1,0 +1,6 @@
+{
+  "note": "E2B-shaped tiny config: every Gemma 4 gap at once (partial rotary, mixed head dims 16/32, logit cap 50, double-wide MLP, KV sharing, per-layer inputs, values norm). Weights fully live; parity is fully live on both branches.",
+  "seed": 2,
+  "torch": "2.14.0+cpu",
+  "transformers": "5.16.1"
+}
