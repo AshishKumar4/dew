@@ -33,11 +33,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import (
-    causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
+    RMSNorm, apply_rotary, causal_attention_mask, open_kv_cache, rotary_freqs,
+    scaled_dot_product_attention,
 )
-from ..mixers import (
-    AttentionMixer, MixerBase, MixerContext, mixer_from_record, mixers,
-)
+from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
 from ..sharding import logical_axes
 from dew.registry import models
@@ -53,12 +52,29 @@ class LayerKind:
     model's unless this kind states its own. Rotary positions rotate every
     dimension of a windowed kind, which is where Gemma 4 puts its partial
     rotary (the global layers') and where the sliding layers rotate whole.
+
+    `mixer` is this kind's token mixer, a value from the `mixers` registry;
+    None rides the model's mixer. A hybrid stack names its per-layer mixers
+    here, keyed by the names already in the pattern, instead of growing a
+    second switch on layer names.
     """
 
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
     head_dim: Optional[int] = None
+    mixer: Optional[MixerBase] = None
+    """This kind's mixer value or its record; None is the model's mixer."""
+
+    def __post_init__(self):
+        # A kind's mixer arrives as a value from code and as a record from a
+        # config, like the model's own; anything else is neither.
+        if isinstance(self.mixer, Mapping):
+            object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
+        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
+            raise ValueError(
+                f"a kind's mixer is a mixer value, its record, or None, "
+                f"not {self.mixer!r}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,13 +84,14 @@ class ResolvedKind:
     `LayerKind` is what a config states, so a field it leaves to the model is
     None there. This is what the model resolved it to, so `rope_theta` and
     `head_dim` are numbers; only the window stays optional, because attending
-    the whole sequence is what a kind without one does.
+    the whole sequence is what a kind without one does. `mixer` passes
+    through: it needs no resolution, only the model's default when unset.
     """
 
     window: Optional[int]
     rope_theta: float
     head_dim: int
-
+    mixer: Optional[MixerBase]
 
 @dataclasses.dataclass(frozen=True)
 class Mixture:
@@ -115,92 +132,6 @@ class Mixture:
                 "sparse layers, so only one of them can be set")
         if self.every is not None and self.every < 1:
             raise ValueError(f"every must be positive, got {self.every}")
-
-
-class RMSNorm(nn.Module):
-    """RMSNorm normalized in fp32, with Gemma's (1 + w) scale behind a flag.
-
-    scale_offset also flips the initializer to zeros, so the identity is the
-    starting point either way and a Gemma checkpoint's stored weights land
-    unchanged.
-
-    The families differ in where the scale meets the activation dtype. Gemma
-    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150);
-    Llama and Qwen3 cast the normalized activations first and multiply by
-    the scale in that dtype (modeling_qwen3.py:61-64), which
-    scale_after_cast reproduces. The two agree at fp32 and differ under bf16.
-    """
-    epsilon: float = 1e-5
-    scale_offset: bool = False
-    scale_after_cast: bool = False
-    with_scale: bool = True
-    dtype: Optional[Dtype] = None
-
-    @nn.compact
-    def __call__(self, x):
-        dtype = self.dtype if self.dtype is not None else x.dtype
-        y = x.astype(jnp.float32)
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
-        if not self.with_scale:
-            # A pure normalization with no learned weight, as Gemma 4 norms
-            # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
-            return y.astype(dtype)
-        scale = self.param(
-            'scale',
-            nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
-            (x.shape[-1],), jnp.float32)
-        weight = (1.0 + scale) if self.scale_offset else scale
-        if self.scale_after_cast:
-            return y.astype(dtype) * weight.astype(dtype)
-        return (y * weight).astype(dtype)
-def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None):
-    """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
-
-    `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
-    documents each restart at 0); the angle axes line up with the trailing
-    [B, S] either way. Computed in fp32 so a token gets the same rotation
-    whether it arrives in a prefill or comes back as a single decode step.
-
-    rot_dim narrows the rotation to the first rot_dim dimensions, the rest
-    keeping frequency zero (cosine one, sine zero, so the rotation is the
-    identity there). That is proportional partial rotary
-    (modeling_rope_utils.py, _compute_proportional_rope_parameters), whose
-    exponents run over the full head_dim with a zero tail.
-    """
-    pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / head_dim))
-    if rot_dim is not None:
-        padding = head_dim // 2 - pairs
-        inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
-    positions = jnp.asarray(positions, jnp.float32)
-    if positions.ndim == 1:
-        angles = positions[:, None] * inv_freq[None, :]
-    else:
-        angles = positions[:, :, None] * inv_freq[None, None, :]
-    return jnp.cos(angles), jnp.sin(angles)
-
-
-def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
-
-    The freqs are [S, D] for one sequence, or [B, S, D] when a packed batch
-    restarts positions per document. `scale` multiplies the rotated heads
-    inside the fp32 arithmetic, so a query's attention scale narrows once,
-    with the product.
-    """
-    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
-    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
-    if cos.ndim == 3:
-        cos = cos[:, :, None, :]
-        sin = sin[:, :, None, :]
-    else:
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-    fp32 = x.astype(jnp.float32)
-    x1, x2 = jnp.split(fp32, 2, axis=-1)
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    out = fp32 * cos + rotated * sin
-    return (out if scale is None else out * scale).astype(x.dtype)
 
 
 @logical_axes({
@@ -600,7 +531,7 @@ class CausalTransformer(nn.Module):
     per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    mixer: "mixers.union | None" = None      # None: today's attention; a kind value or its record
+    mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -655,7 +586,8 @@ class CausalTransformer(nn.Module):
         return ResolvedKind(
             window=kind.window,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim))
+            head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
+            mixer=kind.mixer)
 
     @property
     def sparse_layers(self) -> Tuple[int, ...]:
@@ -814,13 +746,14 @@ class CausalTransformer(nn.Module):
             expert_bias=mixture.bias,
             dtype=self.dtype,
             precision=self.precision)
-        # None is today's attention; a kind value builds every layer's mixer
-        # from its context, which is the one place the mixer is chosen.
+        # None is today's attention; a kind names its own mixer on LayerKind
+        # and otherwise rides the model's. The one dispatch stays build over
+        # the layer's context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
         self.layers = [
             DecoderBlock(
-                mixer=mixer_spec.build(self.mixer_context(
-                    kinds[layer_type], layer_type, index in sharing)),
+                mixer=(kinds[layer_type].mixer or mixer_spec).build(
+                    self.mixer_context(kinds[layer_type], layer_type, index in sharing)),
                 feedforward=(
                     routed
                     if index in sparse and routed is not None else
