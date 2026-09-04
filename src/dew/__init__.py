@@ -9,9 +9,10 @@ when they are built.
 
 __version__ = "0.1.0"
 
-from dew.registry import (  # noqa: E402
-    datasets, encoders, metrics, models, objectives, presets, samplers,
-)
+# `objectives` is not re-exported here: `dew.objectives` is the package that
+# holds the Objective classes, and a registry cannot share its name. It is
+# `dew.registry.objectives`.
+from dew.registry import datasets, encoders, metrics, models, presets, samplers  # noqa: E402
 
 # Each of these registers its members with the registries above as a side
 # effect of being imported; the names are re-exported for the API's nouns.
@@ -38,7 +39,7 @@ from dew.training import (  # noqa: E402
 
 __all__ = [
     "__version__",
-    "models", "presets", "samplers", "datasets", "encoders", "metrics", "objectives",
+    "models", "presets", "samplers", "datasets", "encoders", "metrics",
     "Trainer", "TrainState", "Step", "Aux", "EMASpec", "MeshSpec", "Layout",
     "Checkpoints", "Tracker", "WandbTracker",
     "Objective", "Dataset", "Process", "InputSpec", "Field", "Condition",
