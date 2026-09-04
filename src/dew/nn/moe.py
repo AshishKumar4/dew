@@ -11,9 +11,11 @@ grouped matmul over tokens sorted by expert (`:1500` `sparse_matmul`).
 The two routers this reproduces are `MixtralSparseMoeBlock`, which softmaxes
 over the experts, takes the top k and renormalises, and `DeepseekV3MoE`, which
 scores with a sigmoid, selects with a per-expert bias added, limits the choice
-to the best expert groups, renormalises and scales. Both are transformers
-5.16.1; `tests/test_moe.py` holds the fp32 parity numbers and
-`tools/moe_reference.py` writes the fixtures they run against.
+to the best expert groups, renormalises and scales, then adds one shared
+expert every token takes. DeepSeek V4's `DeepseekV4TopKRouter` and
+`DeepseekV4Experts` contribute the sqrt(softplus) score and the swiglu limit.
+All are transformers 5.16.1; `tests/test_moe.py` holds the fp32 parity
+numbers and `tools/moe_reference.py` writes the fixtures they run against.
 
 Parameters follow the Hugging Face layout of a sparse decoder layer, with the
 experts stacked on an expert dimension: `mlp/gate/kernel` is `[embed, exp]`,
