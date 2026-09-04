@@ -15,7 +15,9 @@ process pool). A syntax error or a misspelled import in it still fails.
 """
 
 import itertools
+import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -89,3 +91,13 @@ def test_the_documented_code_runs(path, tmp_path, monkeypatch):
             exec(code, namespace)
         except Exception as error:  # noqa: BLE001 - the report names the block
             raise AssertionError(f"{where} failed: {type(error).__name__}: {error}") from error
+
+
+def test_the_api_page_is_the_code():
+    """docs/api.md is generated; a module whose exports changed regenerates it."""
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "api_page.py"), "--check"],
+        cwd=ROOT, capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu"})
+    assert result.returncode == 0, result.stderr
