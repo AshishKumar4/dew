@@ -9,19 +9,28 @@ tiny (two T5 layers, a two-stage VAE, one MMDiT block) so it runs on CPU in
 seconds; what it proves is that the shapes and the seams line up, not that
 the model learns anything.
 
-What the released SD3.5 and Flux checkpoints would need beyond this, named
-rather than approximated:
+What the released SD3.5 checkpoints would need beyond this, named rather
+than approximated. The values are `transformer/config.json` of
+stable-diffusion-3.5-large (read from an ungated mirror, stabilityai's own
+repo being gated), against `SD3Transformer2DModel.__init__` in diffusers
+0.34:
 
-- `pooled_projection_dim`: SD3 conditions adaLN on a pooled projection of its
-  two CLIP text encoders, a second condition beside the T5 context that
-  enters the joint stream. `SimpleMMDiT` pools the one context it is given
-  (`ConditioningEmbed`, mask-weighted), so a released checkpoint's
-  `time_text_embed.text_embedder` has nowhere to load.
-- `pos_embed_max_size`: SD3 adds learned patch position embeddings and crops
-  that table to the sampled resolution. `SimpleMMDiT` uses RoPE, so there is
-  no `pos_embed.pos_embed` table in its tree.
-- `dual_attention_layers`: SD3.5-large runs an extra image-stream
-  self-attention in some layers. `MMDiTBlock` has one attention per stream.
+- `pooled_projection_dim` (2048): SD3 conditions adaLN on a pooled
+  projection of its two CLIP text encoders, a second condition beside the
+  4096-wide T5 context that enters the joint stream. `SimpleMMDiT` pools the
+  one context it is given (`ConditioningEmbed`, mask-weighted), so a released
+  checkpoint's `time_text_embed.text_embedder` has nowhere to load.
+- `pos_embed_max_size` (192): SD3 adds a learned patch position embedding
+  table and crops it to the sampled resolution. `SimpleMMDiT` uses RoPE, so
+  its tree holds no `pos_embed.pos_embed`.
+- `dual_attention_layers`: an extra image-stream self-attention in the
+  layers it names, null in 3.5-large and set in 3.5-medium. `MMDiTBlock` has
+  one attention per stream.
+
+What does line up: `in_channels` 16 and `patch_size` 2 are what this test
+runs, `caption_projection_dim` is `emb_features` through `txt_embed`,
+`joint_attention_dim` is the T5 width the tower emits, and `qk_norm`
+("rms_norm") is `SimpleMMDiT(qk_norm=True)`.
 """
 
 from pathlib import Path
