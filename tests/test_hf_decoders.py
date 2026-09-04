@@ -401,3 +401,213 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
 
     difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+
+# --------------------------------------------------------------------------
+# Gemma 4 gaps: per-layer input embeddings and cross-layer KV sharing
+# --------------------------------------------------------------------------
+
+GEMMA4 = ("gemma4-ple", "gemma4-kvshare")
+
+
+def gemma4_config(name):
+    return json.loads((FIXTURES / name / "config.json").read_text())
+
+
+def test_gemma4_config_translates_field_by_field():
+    """The two new features are reachable from the config: a gemma4_text
+    config with standard rope, uniform head dim, silu MLP and no logit cap
+    translates without a caller setting anything by hand."""
+    config = translate_config(gemma4_config("gemma4-ple"))
+
+    assert config["num_kv_shared_layers"] == 0
+    assert config["per_layer_input_dim"] == 8
+    assert config["per_layer_input_vocab"] == 64
+    assert config["v_norm"] and config["qk_norm"]
+    assert config["attention_scale"] == 1.0
+    assert config["sandwich_norms"] and config["embedding_scale"]
+    assert config["mlp"] == "swiglu" and config["tie_embeddings"]
+    assert config["rope_theta"] == 10000.0 and config["rope_local_theta"] is None
+    assert config["layer_types"] == ("sliding_attention",) * 3 + ("full_attention",)
+    assert config["head_dim"] == 8 and not config["scale_after_cast"]
+
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    assert config["num_kv_shared_layers"] == 2
+    assert config["per_layer_input_dim"] == 0
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attention_k_eq_v", True),
+    ("enable_moe_block", True),
+    ("use_double_wide_mlp", True),
+    ("attention_logit_cap", 50.0),
+    ("global_head_dim", 512),
+    ("hidden_act", "gelu"),
+])
+def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
+    """Every gemma4 knob Dew cannot express names itself instead of loading
+    a model that computes something else."""
+    config = gemma4_config("gemma4-ple")
+    config[field] = value
+    with pytest.raises(ValueError, match=field):
+        translate_config(config)
+
+
+def test_proportional_rotary_is_refused():
+    config = gemma4_config("gemma4-ple")
+    config["rope_parameters"]["full_attention"]["rope_type"] = "proportional"
+    with pytest.raises(ValueError, match="rope_parameters.full_attention"):
+        translate_config(config)
+
+
+def test_the_real_e2b_config_is_refused_naming_a_gap():
+    """google/gemma-4-E2B needs partial rotary, a wider global head dim, a
+    logit cap and the double-wide MLP, none of which the backbone expresses.
+    The refusal names the first gap hit, not the schema."""
+    e2b = Path(
+        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
+        "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
+    if not e2b.exists():
+        pytest.skip("the E2B config is a local hub cache read, not a download")
+    config = json.loads(e2b.read_text())
+    with pytest.raises(ValueError, match="proportional|global_head_dim|double_wide|logit_cap"):
+        translate_config(config.get("text_config", config))
+
+
+@pytest.mark.parametrize("name", GEMMA4)
+def test_gemma4_checkpoints_load_through_the_translator(name):
+    """The full load path on a gemma4 checkpoint: translate, weights, build,
+    shape check. Sharing layers own no K/V leaves and the per-layer table
+    lands, which is what _check_tree enforces leaf for leaf."""
+    directory = FIXTURES / name
+    model, variables, _ = fp32_decoder(directory)
+    assert model.v_norm and model.attention_scale == 1.0
+    if name == "gemma4-kvshare":
+        assert set(model.kv_sharing) == {2, 3}
+        leaves = flat_tree(variables["params"])
+        assert "layers_2.self_attn.k_proj.kernel" not in leaves
+        assert "layers_0.self_attn.k_proj.kernel" in leaves
+    else:
+        assert model.per_layer_input_dim == 8
+        assert "embed_tokens_per_layer.embedding" in flat_tree(variables["params"])
+
+
+@pytest.mark.parametrize("name", GEMMA4)
+def test_gemma4_logits_match_the_reference_implementation(name):
+    """Full-model parity, fully live on both branches: the values norm is a
+    scale-free RMSNorm with no checkpoint weight, implemented, not worked
+    around. Largest observed max |logit difference| on CPU: gemma4-ple
+    4.9e-07, gemma4-kvshare 4.4e-07."""
+    directory = FIXTURES / name
+    model, variables, _ = fp32_decoder(directory)
+    ids = np.load(directory / "input_ids.npy")
+    reference = np.load(directory / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_sharing_layers_own_no_kv_and_name_their_provider(rng):
+    """The tree shape of sharing on a translated model: layers past the
+    cutoff keep q_proj, o_proj and q_norm but lose k_proj, v_proj and k_norm;
+    the provider map follows the layer type, not the position."""
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="xla"))
+    params = model.init(rng, jnp.ones((1, 4), jnp.int32))["params"]
+
+    assert set(model.kv_sharing) == {2, 3}
+    assert model.kv_sharing[2] == 0 and model.kv_sharing[3] == 1
+    for index in (2, 3):
+        attention = params[f"layers_{index}"]["self_attn"]
+        assert set(attention) == {"q_proj", "o_proj", "q_norm"}, set(attention)
+    for index in (0, 1):
+        attention = params[f"layers_{index}"]["self_attn"]
+        assert {"k_proj", "v_proj", "k_norm"} <= set(attention)
+
+
+def test_sharing_without_a_provider_and_sharing_everything_are_refused(rng):
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    base = with_precision("causal_transformer", config,
+                          dtype="float32", attention_impl="xla")
+    with pytest.raises(ValueError, match="no earlier full_attention layer"):
+        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 3}).kv_sharing
+    with pytest.raises(ValueError, match="leave a provider"):
+        models.build("causal_transformer", **{**base, "num_kv_shared_layers": 4}).kv_sharing
+
+
+def test_the_features_leave_a_plain_tree_unchanged(rng):
+    """Off by default: no PLE leaves, no missing K/V, same leaves as before."""
+    config = translate_config(gemma4_config("gemma4-ple"))
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**config, "per_layer_input_dim": 0,
+                               "num_kv_shared_layers": 0, "v_norm": False},
+        dtype="float32", attention_impl="xla"))
+    assert model.kv_sharing == {}
+    flat = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
+    assert not [name for name in flat if "per_layer" in name]
+    assert "layers_0.self_attn.k_proj.kernel" in flat
+
+
+def test_new_leaves_are_declared_or_heuristic(rng):
+    """The coverage sweep builds default configs only, so the new leaves are
+    asserted here: the packed table and the projections are declared, the
+    scalar norms fall under rank one, and the values norm holds no weight."""
+    from dew.nn.sharding import declared_axes, is_heuristic
+
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**config, "per_layer_input_dim": 8},
+        dtype="float32", attention_impl="xla"))
+    variables = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    uncovered = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(variables)[0]:
+        if leaf.ndim < 2:
+            continue
+        if declared_axes(path, leaf.ndim) is None and not is_heuristic(path):
+            uncovered.append(jax.tree_util.keystr(path))
+    assert uncovered == []
+
+
+def test_a_sharing_model_decodes_like_it_prefills(rng):
+    """The decode path of sharing: prefill writes the provider's cache, each
+    single-token step reads it, and the tokens match a full forward."""
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**config, "max_seq_len": 16},
+        dtype="float32", attention_impl="xla"))
+    params = model.init(rng, jnp.ones((1, 4), jnp.int32))
+    prompt = jax.random.randint(rng, (1, 3), 0, 64)
+
+    cache = model.apply(params, 1, method=type(model).init_cache, mutable=["cache"])[1]["cache"]
+    variables = {**params, "cache": cache}
+    logits, mutated = model.apply(variables, prompt, decode=True, mutable=["cache"])
+    first = jnp.argmax(logits[:, -1], axis=-1)
+    token, variables = first[:, None], {**params, "cache": mutated["cache"]}
+    generated = [first]
+    for _ in range(3):
+        logits, mutated = model.apply(variables, token, decode=True, mutable=["cache"])
+        token = jnp.argmax(logits[:, -1], axis=-1)[:, None]
+        variables = {**params, "cache": mutated["cache"]}
+        generated.append(token[:, 0])
+    decoded = jnp.concatenate([prompt, jnp.stack(generated, axis=1)], axis=1)
+
+    assert jnp.array_equal(
+        model.apply(params, decoded)[:, -1].argmax(axis=-1),
+        jnp.asarray(generated[-1]))
+
+
+def test_export_refuses_the_new_features(tmp_path, rng):
+    """The three exported families have neither, so a model with any of them
+    set is refused instead of silently dropping its leaves."""
+    config = translate_config(gemma4_config("gemma4-kvshare"))
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="xla"))
+    variables = model.init(rng, jnp.ones((1, 4), jnp.int32))
+    with pytest.raises(ValueError, match="num_kv_shared_layers"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
