@@ -19,9 +19,8 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import Loading, PackedTokens, TokenWindows
+from dew.data import ByteTokenizer, Loading, PackedTokens, TokenWindows
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
-from dew.data.text import ByteTokenizer
 from dew.nn.backbones import causal_transformer as backbone
 from dew.objectives.lm import LMObjective
 from dew.training import Step
@@ -102,7 +101,7 @@ def test_byte_tokenizer_decode_tolerates_junk_bytes():
 
 def _hf_tokenizer():
     try:
-        from dew.data.text import HFTokenizer
+        from dew.data import HFTokenizer
         return HFTokenizer("gpt2")
     except Exception as exc:  # no transformers, no cache, no network
         pytest.skip(f"the HF tokenizer is unavailable here: {exc}")
@@ -121,7 +120,7 @@ def test_hf_tokenizer_imports_lazily():
     """Constructing HFTokenizer must not import transformers."""
     import subprocess as sp
     probe = (
-        "from dew.data.text import HFTokenizer;"
+        "from dew.data import HFTokenizer;"
         "import sys;"
         "HFTokenizer('gpt2');"
         "assert 'transformers' not in sys.modules, 'imported at construction'"

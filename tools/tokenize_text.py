@@ -100,7 +100,7 @@ def main(args: TokenizeArgs):
     if not 0.0 <= args.val_fraction < 1.0:
         raise SystemExit("--val-fraction must be within [0, 1)")
 
-    from dew.data.text import ByteTokenizer, HFTokenizer
+    from dew.data import ByteTokenizer, HFTokenizer
 
     if args.tokenizer == "byte":
         tokenizer = ByteTokenizer()
