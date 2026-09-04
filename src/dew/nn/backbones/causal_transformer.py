@@ -35,9 +35,7 @@ from flax.typing import Dtype, PrecisionLike
 from ..attention import (
     causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
 )
-from ..mixers import (
-    AttentionMixer, MixerBase, MixerContext, mixer_from_record, mixers,
-)
+from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
 from ..sharding import logical_axes
 from dew.registry import models
@@ -600,7 +598,7 @@ class CausalTransformer(nn.Module):
     per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    mixer: "mixers.union | None" = None      # None: today's attention; a kind value or its record
+    mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
 
     def __post_init__(self):
         if self.layer_types is not None:
