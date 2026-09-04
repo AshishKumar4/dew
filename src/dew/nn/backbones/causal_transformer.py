@@ -26,6 +26,7 @@ import functools
 import math
 from typing import Callable, Mapping, Optional, Tuple
 
+import flax.core
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -577,6 +578,18 @@ class CausalTransformer(nn.Module):
     def __post_init__(self):
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        # A value arrives as a record from a config and as itself from code,
+        # and `models.build` already reads one; doing it here too means the
+        # plain constructor takes the same records, which is what a test or
+        # a notebook writes.
+        if isinstance(self.mixture, Mapping):
+            object.__setattr__(self, "mixture", Mixture(**self.mixture))
+        if self.kinds is not None:
+            # Frozen, because a module's fields are static to jit and a plain
+            # dict cannot be hashed.
+            object.__setattr__(self, "kinds", flax.core.freeze({
+                name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
+                for name, kind in self.kinds.items()}))
         super().__post_init__()
 
 

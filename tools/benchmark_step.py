@@ -119,7 +119,8 @@ class Case:
 
     @property
     def label(self) -> str:
-        experts = f" x{self.config['num_experts']}experts" if self.config.get("num_experts") else ""
+        mixture = self.config.get("mixture")
+        experts = f" x{mixture['experts']}experts" if mixture else ""
         return (f"{self.architecture}{experts} b{self.batch_size} fsdp{self.fsdp_size} "
                 f"expert{self.expert_size}")
 
@@ -136,7 +137,7 @@ def cpu_smoke_cases() -> list[Case]:
                         "num_layers": 1, "num_heads": 2, "mlp_ratio": 2},
              batch_size=8, image_size=16, fsdp_min_param_size=256),
         Case("causal_transformer", {"vocab_size": 256, "emb_features": 32, "num_layers": 2,
-                                    "num_heads": 2, "mlp_ratio": 2, "max_seq_len": 16},
+                                    "num_heads": 2, "mlp_features": 64, "max_seq_len": 16},
              batch_size=8, seq_len=16, fsdp_min_param_size=256),
     ]
 
@@ -178,13 +179,13 @@ def small_cases(dtype: str) -> list[Case]:
              batch_size=4, image_size=64, frames=8),
         # GPT-2 small's width and heads at a quarter of its depth, 512-token windows
         Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                                    "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512},
+                                    "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512},
              batch_size=16, seq_len=512),
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
         Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                     "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512,
-                     "num_experts": 8, "top_k": 2, "moe_every": 2},
+                     "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512,
+                     "mixture": {"experts": 8, "top_k": 2, "every": 2}},
              batch_size=16, seq_len=512),
     ]
     cases = [dataclasses.replace(case, dtype=dtype) for case in cases]

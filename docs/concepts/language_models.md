@@ -60,7 +60,7 @@ python tools/benchmark_step.py --preset small --architectures causal_transformer
 python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --attention-impl xla
 
 LONG='{"architecture": "causal_transformer", "config": {"vocab_size": 50304,
-  "emb_features": 768, "num_layers": 3, "num_heads": 12, "mlp_ratio": 4,
+  "emb_features": 768, "num_layers": 3, "num_heads": 12, "mlp_features": 3072,
   "max_seq_len": 2048}, "batch_size": 4, "seq_len": 2048, "dtype": "bfloat16"}'
 python tools/benchmark_step.py --steps 20 --cases "[$LONG]"
 python tools/benchmark_step.py --steps 20 --cases "[$LONG]" --packed-documents 4

@@ -14,18 +14,19 @@ from dew.nn.moe import SparseMLP
 layer = SparseMLP(num_experts=8, top_k=2, hidden_features=2048, out_features=512)
 ```
 
-`CausalTransformer` builds them from four fields. `num_experts` and `top_k` size the routing, and the sparse layers are `moe_layers` by index, or every `moe_every`-th layer, or all of them when neither is set:
+`CausalTransformer` builds them from one value, `mixture`, because none of its dials means anything without experts to route to. `experts` and `top_k` size the routing, and the sparse layers are `layers` by index, or every `every`-th layer, or all of them when neither is set:
 
 ```python
 from dew import models
 
 model = models.build("causal_transformer", vocab_size=50304, emb_features=64, num_layers=1,
-                             num_heads=2, num_kv_heads=1, num_experts=8, top_k=2, moe_every=1)
+                     num_heads=2, num_kv_heads=1,
+                     mixture={"experts": 8, "top_k": 2, "every": 1})
 ```
 
-That is the same rule Qwen3-MoE's `decoder_sparse_step` means, counting from the end of the first group, and DeepSeek's first dense layers are `moe_layers`. A dense layer keeps every leaf it had, so a checkpoint of the dense model still loads into the dense layers of the sparse one.
+The value takes a record from a config or a `Mixture` from code, and the two build the same model. That cadence is the same rule Qwen3-MoE's `decoder_sparse_step` means, counting from the end of the first group, and DeepSeek's first dense layers are the mixture's `layers`. A dense layer keeps every leaf it had, so a checkpoint of the dense model still loads into the dense layers of the sparse one.
 
-The registry name is `moe`, which is `CausalTransformer` with the expert fields set.
+The registry name is `moe`, which is `CausalTransformer` with a mixture set.
 
 ## The router
 
@@ -51,7 +52,7 @@ indices = jnp.asarray([[0, 3], [1, 3], [2, 3]], jnp.int32)
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
-It is `+rate` for every expert below the average load, `-rate` for every expert above it. A training step that applies it owns the write, and no Dew trainer does that yet. `SparseMLP` and `CausalTransformer` build routers without the bias, so a sparse decoder today routes on the scores alone; the bias is reachable by building a `Router` with `expert_bias=True`, which is what the parity test against DeepSeek does and what a DeepSeek checkpoint will need.
+It is `+rate` for every expert below the average load, `-rate` for every expert above it. A training step that applies it owns the write, and no Dew trainer does that yet. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what the LM objective's `balance_rate` moves and what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices, `score_function`, `scaling`, `groups` and `groups_per_token`, which no config could name before.
 
 ## The grouped matmul
 

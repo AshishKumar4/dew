@@ -172,7 +172,7 @@ CASES = [
     # Eight experts so the expert dimension divides every mesh this file
     # builds, on the second layer only, so one dense and one sparse
     # feed-forward go through the same run.
-    Case("causal_transformer", {**LM, "num_experts": 8, "top_k": 2, "moe_layers": (1,)},
+    Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
          seq_len=SEQ_LEN, label="moe"),
 ]
 

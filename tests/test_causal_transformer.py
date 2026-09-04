@@ -528,8 +528,11 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
     ({'head_dim': 7}, "even"),
     ({'num_kv_heads': 3}, "multiple"),
     ({'layer_types': ('full_attention',)}, "entries"),
-    ({'layer_types': ('full_attention', 'linear_attention')}, "unknown layer types"),
-    ({'layer_types': ('sliding_attention',) * 2}, "sliding_window"),
+    ({'kinds': {'linear_attention': {'window': 2}}}, "name no layer"),
+    ({'kinds': {'full_attention': {'window': 0}}}, "window"),
+    ({'kinds': {'full_attention': {'head_dim': 7}}}, "even"),
+    ({'use_double_wide_mlp': True}, "num_kv_shared_layers"),
+    ({'per_layer_input_dim': 0}, "None is a model without them"),
     ({'mlp': 'relu'}, "swiglu"),
 ])
 def test_rejected_configs(rng, config, message):
