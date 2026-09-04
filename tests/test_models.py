@@ -15,6 +15,8 @@ from dew.nn.dit import TextContext
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.uvit import UViT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
+from dew.nn.attention import Stage
+from dew.registry import models
 
 RES = 32
 
@@ -294,8 +296,8 @@ def test_non_symmetric_attention_configs_init(rng):
     config = dict(
         emb_features=64,
         feature_depths=[16, 32],
-        attention_configs=[{"heads": 2, "dtype": jnp.float32,
-                            "use_projection": False, "use_self_and_cross": False}, None],
+        attention_configs=[Stage(heads=2, dtype=jnp.float32,
+                                 use_projection=False, use_self_and_cross=False), None],
         num_res_blocks=1,
         num_middle_res_blocks=1,
     )
@@ -307,3 +309,87 @@ def test_non_symmetric_attention_configs_init(rng):
 
     video = jax.random.normal(rng, (2, 3, 16, 16, 3))
     UNet3D(**config, temporal_heads=2).init(rng, video, temb, textcontext)
+
+############################################################################################################
+# A unet stage is a declared value
+############################################################################################################
+
+def test_a_stage_with_an_unknown_field_is_refused():
+    """Design rule 6: an unknown field raises. A stage used to be an untyped
+    dict read with `.get`, so a typo turned the dial it named off in silence."""
+    stages = [None, {"heads": 2, "use_projeciton": True}]
+    with pytest.raises(ValueError, match="use_projeciton"):
+        models.build("unet", feature_depths=(8, 16), attention_configs=stages,
+                     num_res_blocks=1, norm_groups=4)
+
+
+def test_a_stage_record_builds_the_value():
+    """A stage arrives as a dict from a command line or a run record and is
+    the declared value by the time the model holds it."""
+    model = models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
+                         attention_configs=[None, {"heads": 2, "use_projection": True}])
+    assert model.attention_configs[0] is None
+    assert model.attention_configs[1] == Stage(heads=2, use_projection=True)
+    assert models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
+                        attention_configs=[None, Stage(heads=2, use_projection=True)]
+                        ).attention_configs[1] == model.attention_configs[1]
+
+
+def test_a_stage_names_the_dials_the_block_supports(rng):
+    """`use_linear_attention` and `norm_epsilon` are TransformerBlock dials no
+    config could name while a stage was a dict: the unets passed neither, so
+    the projection kind and the norm epsilon were unreachable from a run."""
+    x = jax.random.normal(rng, (2, 16, 16, 3))
+    temb = jnp.ones((2,))
+    context = text(features=64)
+
+    def output(**stage):
+        model = Unet(output_channels=3, emb_features=32, feature_depths=(8, 16),
+                     num_res_blocks=1, norm_groups=4,
+                     attention_configs=(None, Stage(heads=2, **stage)))
+        return model.apply(model.init(rng, x, temb, context), x, temb, context)
+
+    projected = output(use_projection=True)
+    assert not jnp.allclose(projected, output(use_projection=True,
+                                              use_linear_attention=False), atol=1e-5)
+    assert not jnp.allclose(projected, output(use_projection=True, norm_epsilon=1.0), atol=1e-5)
+
+
+def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
+    """The run's dtype and the fused-kernel softmax reach into every stage,
+    which is what `with_precision` exists for; a stage is now a value, and a
+    record of one still arrives from a logged config."""
+    from dew.registry import with_precision
+
+    record, value = ({"heads": 2}, Stage(heads=2))
+    from_record = with_precision("unet", {"attention_configs": [None, record]},
+                                 dtype="bfloat16", attention_impl="xla")
+    from_value = with_precision("unet", {"attention_configs": [None, value]},
+                                dtype="bfloat16", attention_impl="xla")
+    # A record stays a record and a value stays a value; the build boundary
+    # makes the two agree.
+    assert from_record["attention_configs"][1] == {
+        "heads": 2, "dtype": "bfloat16", "force_fp32_for_softmax": True}
+    assert from_value["attention_configs"][1] == Stage(
+        heads=2, dtype="bfloat16", force_fp32_for_softmax=True)
+    built = [models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
+                          **fields) for fields in (from_record, from_value)]
+    assert built[0].attention_configs == built[1].attention_configs
+    assert built[0].attention_configs[1].dtype == jnp.bfloat16
+    assert built[0].attention_configs[1].force_fp32_for_softmax is True
+
+
+def test_a_block_pattern_and_a_ratio_together_are_refused():
+    """`block_pattern` used to win over `ssm_attention_ratio` in silence
+    (ssm_dit.py's own docstring said "overrides"). The ratio stays: its "3:1"
+    default is length-independent and a pattern cannot express that, so the
+    two are refused together rather than one being dropped."""
+    model = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
+                                  block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
+    with pytest.raises(ValueError, match="ssm_attention_ratio"):
+        model.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
+    # Either alone still builds.
+    for alone in (dict(block_pattern=("ssm", "attn")), dict(ssm_attention_ratio="1:1")):
+        HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
+                              **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
+                                            jnp.ones((1,)))

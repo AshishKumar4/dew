@@ -5,7 +5,7 @@ from flax.typing import Dtype, PrecisionLike
 from typing import Dict, Callable, Sequence, Any, Union, Optional
 import einops
 from ..blocks import kernel_init, ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
-from ..attention import TransformerBlock
+from ..attention import Stage, TransformerBlock
 from functools import partial
 from dew.registry import models
 
@@ -14,7 +14,10 @@ class Unet(nn.Module):
     output_channels:int=3
     emb_features:int=64*4
     feature_depths:list=(64, 128, 256, 512)
-    attention_configs:list=({"heads":8}, {"heads":8}, {"heads":8}, {"heads":8})
+    attention_configs: Sequence[Optional[Stage]] = (
+        Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
+    """Attention per resolution stage, one entry per feature depth; None is a
+    stage with no attention."""
     num_res_blocks:int=2
     num_middle_res_blocks:int=1
     activation:Callable = jax.nn.swish
@@ -80,15 +83,17 @@ class Unet(nn.Module):
                     named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:   # Apply attention only on the last block
-                    x = TransformerBlock(heads=attention_config['heads'], dtype=attention_config.get('dtype', jnp.float32), attention_impl=self.attention_impl,
-                                        dim_head=dim_in // attention_config['heads'],
-                                        use_projection=attention_config.get("use_projection", False),
-                                        use_self_and_cross=attention_config.get("use_self_and_cross", True),
-                                        precision=attention_config.get("precision", self.precision),
-                                        only_pure_attention=attention_config.get("only_pure_attention", True),
-                                        force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
-                                        norm_inputs=attention_config.get("norm_inputs", True),
-                                        explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
+                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
+                                        dim_head=dim_in // attention_config.heads,
+                                        use_projection=attention_config.use_projection,
+                                        use_self_and_cross=attention_config.use_self_and_cross,
+                                        precision=attention_config.precision,
+                                        only_pure_attention=attention_config.only_pure_attention,
+                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
+                                        norm_inputs=attention_config.norm_inputs,
+                                        explicitly_add_residual=attention_config.explicitly_add_residual,
+                                        use_linear_attention=attention_config.use_linear_attention,
+                                        norm_epsilon=attention_config.norm_epsilon,
                                         name=f"down_{i}_attention_{j}")(x, text)
                 # print("down residual for feature level", i, "is of shape", x.shape, "features", dim_in)
                 downs.append(x)
@@ -120,16 +125,17 @@ class Unet(nn.Module):
                 named_norms=self.named_norms
             )(x, temb)
             if middle_attention is not None and j == self.num_middle_res_blocks - 1:   # Apply attention only on the last block
-                x = TransformerBlock(heads=middle_attention['heads'], dtype=middle_attention.get('dtype', jnp.float32), attention_impl=self.attention_impl,
-                                    dim_head=middle_dim_out // middle_attention['heads'],
-                                    use_linear_attention=False,
-                                    use_projection=middle_attention.get("use_projection", False),
+                x = TransformerBlock(heads=middle_attention.heads, dtype=middle_attention.dtype, attention_impl=self.attention_impl,
+                                    dim_head=middle_dim_out // middle_attention.heads,
+                                    use_projection=middle_attention.use_projection,
                                     use_self_and_cross=False,
-                                    precision=middle_attention.get("precision", self.precision),
-                                    only_pure_attention=middle_attention.get("only_pure_attention", True),
-                                    force_fp32_for_softmax=middle_attention.get("force_fp32_for_softmax", False),
-                                    norm_inputs=middle_attention.get("norm_inputs", True),
-                                    explicitly_add_residual=middle_attention.get("explicitly_add_residual", True),
+                                    precision=middle_attention.precision,
+                                    only_pure_attention=middle_attention.only_pure_attention,
+                                    force_fp32_for_softmax=middle_attention.force_fp32_for_softmax,
+                                    norm_inputs=middle_attention.norm_inputs,
+                                    explicitly_add_residual=middle_attention.explicitly_add_residual,
+                                    use_linear_attention=middle_attention.use_linear_attention,
+                                    norm_epsilon=middle_attention.norm_epsilon,
                                     name=f"middle_attention_{j}")(x, text)
             x = ResidualBlock(
                 middle_conv_type,
@@ -165,15 +171,17 @@ class Unet(nn.Module):
                     named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:   # Apply attention only on the last block
-                    x = TransformerBlock(heads=attention_config['heads'], dtype=attention_config.get('dtype', jnp.float32), attention_impl=self.attention_impl, 
-                                        dim_head=dim_out // attention_config['heads'],
-                                        use_projection=attention_config.get("use_projection", False),
-                                        use_self_and_cross=attention_config.get("use_self_and_cross", True),
-                                        precision=attention_config.get("precision", self.precision),
-                                        only_pure_attention=attention_config.get("only_pure_attention", True),
-                                        force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
-                                        norm_inputs=attention_config.get("norm_inputs", True),
-                                        explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
+                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl, 
+                                        dim_head=dim_out // attention_config.heads,
+                                        use_projection=attention_config.use_projection,
+                                        use_self_and_cross=attention_config.use_self_and_cross,
+                                        precision=attention_config.precision,
+                                        only_pure_attention=attention_config.only_pure_attention,
+                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
+                                        norm_inputs=attention_config.norm_inputs,
+                                        explicitly_add_residual=attention_config.explicitly_add_residual,
+                                        use_linear_attention=attention_config.use_linear_attention,
+                                        norm_epsilon=attention_config.norm_epsilon,
                                         name=f"up_{i}_attention_{j}")(x, text)
             # print("Upscaling ", i, x.shape)
             if i != len(feature_depths) - 1:
