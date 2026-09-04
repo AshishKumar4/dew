@@ -473,6 +473,29 @@ def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_chec
     assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
+@pytest.mark.distributed
+def test_a_resumed_run_id_starts_every_process_where_process_zero_does(tmp_path, pool_checkpoint):
+    """resume_last_run is answered by wandb, which only process 0 opens.
+
+    Process 0 learned the step the run had reached and downloaded its model
+    artifact; every other process kept a start step of 0 and no checkpoint,
+    trained from scratch and issued its collectives on another schedule.
+    What process 0 resolves is broadcast, so every process starts at the
+    summary's step plus one from the artifact's weights, trains the one step
+    left, and lands on the same parameters.
+    """
+    summary_step = POOL_STEPS + 1
+    reports = run_pool("fit", tmp_path / "out", 2, name="resumed", run_dir=tmp_path / "run",
+                       fsdp_size=2, steps=summary_step + 2, records=RECORDS,
+                       resume_run_step=summary_step,
+                       artifact=pool_checkpoint["checkpoints"] / str(POOL_STEPS))
+    for report in reports:
+        assert report["restored_step"] == summary_step + 1
+        assert report["step"] == POOL_STEPS + 1
+    assert largest_difference(dumped_params(tmp_path / "out" / "process0.json"),
+                              dumped_params(tmp_path / "out" / "process1.json")) == 0.0
+
+
 # --------------------------------------------------------------------------
 # Preemption
 # --------------------------------------------------------------------------

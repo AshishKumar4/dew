@@ -44,7 +44,8 @@ def checkpoint_dir(base: str | Path, name: str) -> Path:
     return Path(base) / name
 
 
-def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
+def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, wandb_config=None,
+                  **kwargs):
     """The trainer a recipe would build, at the smallest size that still shards.
 
     dew is imported here rather than at module scope because a JAX backend
@@ -69,7 +70,7 @@ def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
             sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
         rngs=jax.random.PRNGKey(0),
         name=name,
-        wandb_config=None,
+        wandb_config=wandb_config,
         distributed_training=True,
         fsdp_size=fsdp_size,
         fsdp_min_param_size=TINY,
@@ -77,6 +78,52 @@ def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
         load_from_checkpoint=load,
         **kwargs,
     )
+
+
+def install_wandb_stub(summary_step: int, artifact_dir: str) -> dict:
+    """The slice of wandb a resumed run id reaches, in place of the module.
+
+    Only process 0 opens wandb, and what it learns there, the step the run
+    reached and the model artifact it logged, is what the whole pool has to
+    resume from. Returns the wandb_config that names the run.
+    """
+    import sys
+    import types
+
+    class Run:
+        summary = {"train/step": summary_step}
+        sweep_id = None
+
+        def define_metric(self, *args, **kwargs):
+            pass
+
+        def log(self, *args, **kwargs):
+            pass
+
+    class Artifact:
+        type = "model"
+        name = "model:v0"
+
+        def download(self):
+            return artifact_dir
+
+    class ApiRun:
+        def logged_artifacts(self):
+            return [Artifact()]
+
+    class Api:
+        def run(self, path):
+            return ApiRun()
+
+        def runs(self, **kwargs):
+            return []
+
+    module = types.ModuleType("wandb")
+    module.init = lambda **kwargs: Run()
+    module.Api = Api
+    sys.modules["wandb"] = module
+    return {"project": "dew", "entity": "tests", "name": "resumed", "id": "run",
+            "config": {"arguments": {"dataset": "indexed"}}}
 
 
 def as_numpy(tree):
@@ -314,8 +361,11 @@ def scored_batches():
 
 
 def mode_fit(args) -> dict:
+    wandb_config = None
+    if args.resume_run_step is not None:
+        wandb_config = install_wandb_stub(args.resume_run_step, args.artifact)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load,
-                            eval_metrics=[scored_batches()])
+                            wandb_config=wandb_config, eval_metrics=[scored_batches()])
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored, restored_step = trainer.dataset_state, trainer.latest_step
     rows = BATCH // args.processes
@@ -372,6 +422,9 @@ def parse_args(argv=None):
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
     parser.add_argument("--load", help="checkpoint directory to resume from")
+    parser.add_argument("--resume-run-step", type=int,
+                        help="resume a wandb run id whose summary reached this step")
+    parser.add_argument("--artifact", help="the step directory that run's model artifact holds")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
