@@ -103,6 +103,9 @@ class DiscreteDenoiser:
 
     The model's own logits at an unmasked position are irrelevant: the
     position keeps its token, which is MDLM's carry-over parameterization.
+    The mask token itself carries no mass: it marks corruption, so the
+    categorical a reveal draws from never offers it, however the model
+    scores it.
     """
 
     process: DiscreteProcess
@@ -111,6 +114,7 @@ class DiscreteDenoiser:
 
     def __call__(self, x_t, t):
         logits = self.model.apply(self.params, x_t)
+        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = x_t == self.process.mask_id
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)

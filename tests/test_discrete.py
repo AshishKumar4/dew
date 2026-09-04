@@ -117,6 +117,24 @@ def test_sample_walks_the_grid_to_a_fully_revealed_row(rng):
     assert jnp.array_equal(out, jnp.broadcast_to(jnp.arange(8) % (VOCAB - 1), (5, 8)))
 
 
+def test_unmasking_never_emits_the_mask_id(rng):
+    """The mask token marks corruption; it is not a token a sample can end
+    with, however the model scores it. A model that puts all its mass there
+    must still unmask to real tokens."""
+    class MaskLoving(nn.Module):
+        @nn.compact
+        def __call__(self, tokens):
+            scale = self.param("scale", nn.initializers.constant(20.0), ())
+            return scale * jnp.broadcast_to(jax.nn.one_hot(MASK, VOCAB),
+                                            (*tokens.shape, VOCAB))
+
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    model = MaskLoving()
+    denoise = process.denoiser(model, model.init(rng, jnp.zeros((1, 8), jnp.int32)))
+    out = sample(denoise, process.noise(rng, (5, 8)), 6, solver=Unmask(), key=rng)
+    assert not jnp.any(out == MASK)
+
+
 def test_unmask_refuses_a_gaussian_process(rng):
     process = Process(CosineNoiseScheduler(10), EpsilonPredictionTransform())
     x = jnp.zeros((2, 4))
