@@ -60,6 +60,15 @@ tfds = ["tensorflow-datasets", "tensorflow"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
 
+[tool.pyright]
+# The declared boundary: dew's own source, checked against the project venv.
+# Vendored numeric code is included, not excluded; a checker finding is either
+# a real weakness or a type that is not yet true, and both get fixed rather
+# than silenced. No file list, no ignore comments, no lowered severity.
+include = ["src/dew"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # "src" resolves the dew package from source; "." lets tests load the recipes
@@ -105,6 +114,9 @@ filterwarnings = [
 
 [tool.setuptools.dynamic]
 version = {attr = "dew.__version__"}
+
+[tool.setuptools.package-data]
+dew = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
