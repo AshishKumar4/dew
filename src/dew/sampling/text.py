@@ -50,8 +50,29 @@ def _generate(model, params, prompt, key, max_new_tokens: int,
 
 # The model, the length and the sampling knobs are compile-time constants, so
 # repeated calls with the same settings hit the same compiled loop.
-_jit_generate = jax.jit(
-    _generate, static_argnames=('model', 'max_new_tokens', 'temperature', 'top_k'))
+_STATIC = ('model', 'max_new_tokens', 'temperature', 'top_k')
+
+
+def _replication(params):
+    """Replication on the mesh the parameters live on, or None off a mesh.
+
+    The sampled tokens are read on the host, decoded to text and logged, so
+    where they land is part of the contract rather than a layout the compiler
+    is free to choose: every device that reads a row has to hold the whole
+    row. A tracer or a numpy tree carries no mesh, and then there is nothing
+    to pin.
+    """
+    for leaf in jax.tree.leaves(params):
+        mesh = getattr(getattr(leaf, 'sharding', None), 'mesh', None)
+        if mesh is not None and not mesh.empty:
+            return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled(out_sharding):
+    """The compiled loop for one output sharding; one entry per mesh."""
+    return jax.jit(_generate, static_argnames=_STATIC, out_shardings=out_sharding)
 
 
 def generate(model, params, prompt, max_new_tokens: int, *, key,
@@ -80,7 +101,8 @@ def generate(model, params, prompt, max_new_tokens: int, *, key,
         raise ValueError(
             f"{prompt.shape[1]} prompt tokens plus {max_new_tokens} new ones "
             f"exceed the model's KV cache of {cache_len}; raise max_seq_len.")
-    return _jit_generate(model=model, params=params, prompt=prompt, key=key,
-                         max_new_tokens=int(max_new_tokens),
-                         temperature=float(temperature),
-                         top_k=None if top_k is None else int(top_k))
+    compiled = _compiled(_replication(params))
+    return compiled(model=model, params=params, prompt=prompt, key=key,
+                    max_new_tokens=int(max_new_tokens),
+                    temperature=float(temperature),
+                    top_k=None if top_k is None else int(top_k))

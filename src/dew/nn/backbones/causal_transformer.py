@@ -59,6 +59,21 @@ class LayerKind:
 
 
 @dataclasses.dataclass(frozen=True)
+class ResolvedKind:
+    """One kind of layer with the model's defaults filled in.
+
+    `LayerKind` is what a config states, so a field it leaves to the model is
+    None there. This is what the model resolved it to, so `rope_theta` and
+    `head_dim` are numbers; only the window stays optional, because attending
+    the whole sequence is what a kind without one does.
+    """
+
+    window: Optional[int]
+    rope_theta: float
+    head_dim: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
@@ -301,12 +316,11 @@ class CausalSelfAttention(nn.Module):
         # packed batch supplies the position inside its document instead of
         # the row index, which is what restarts RoPE at every boundary.
         append = None
+        kv_len = key.shape[-3]
         if decode:
             if not self.causal:
                 raise ValueError("full attention has no KV cache to decode against")
-            if self.kv_shared:
-                kv_len = key.shape[-3]
-            else:
+            if not self.kv_shared:
                 positions, append = open_kv_cache(self, key, self.max_seq_len)
         elif positions is None and not self.kv_shared:
             positions = jnp.arange(S)
@@ -613,10 +627,10 @@ class CausalTransformer(nn.Module):
             return ('full_attention',) * self.num_layers
         return tuple(self.layer_types)
 
-    def kind_of(self, layer_type: str) -> LayerKind:
+    def kind_of(self, layer_type: str) -> "ResolvedKind":
         """What the layers of `layer_type` do, the model's defaults included."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
-        return LayerKind(
+        return ResolvedKind(
             window=kind.window,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim))
@@ -728,6 +742,21 @@ class CausalTransformer(nn.Module):
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
+        mixture = self.mixture
+        routed = None if mixture is None else functools.partial(
+            SparseMLP,
+            num_experts=mixture.experts,
+            top_k=mixture.top_k,
+            hidden_features=self.hidden_features,
+            out_features=self.emb_features,
+            activation=self.mlp,
+            score_function=mixture.score_function,
+            routed_scaling_factor=mixture.scaling,
+            expert_groups=mixture.groups,
+            groups_per_token=mixture.groups_per_token,
+            expert_bias=mixture.bias,
+            dtype=self.dtype,
+            precision=self.precision)
         self.layers = [
             DecoderBlock(
                 mixer=functools.partial(
@@ -759,21 +788,8 @@ class CausalTransformer(nn.Module):
                     attention_impl=self.attention_impl,
                     force_fp32_for_softmax=self.force_fp32_for_softmax),
                 feedforward=(
-                    functools.partial(
-                        SparseMLP,
-                        num_experts=self.mixture.experts,
-                        top_k=self.mixture.top_k,
-                        hidden_features=self.hidden_features,
-                        out_features=self.emb_features,
-                        activation=self.mlp,
-                        score_function=self.mixture.score_function,
-                        routed_scaling_factor=self.mixture.scaling,
-                        expert_groups=self.mixture.groups,
-                        groups_per_token=self.mixture.groups_per_token,
-                        expert_bias=self.mixture.bias,
-                        dtype=self.dtype,
-                        precision=self.precision)
-                    if index in sparse else
+                    routed
+                    if index in sparse and routed is not None else
                     functools.partial(
                         GatedMLP,
                         hidden_features=(2 * self.hidden_features
@@ -860,6 +876,10 @@ class CausalTransformer(nn.Module):
         (modeling_gemma4.py, get_per_layer_inputs/project_per_layer_inputs).
         """
         ple = self.per_layer_input_dim
+        if ple is None:
+            raise ValueError(
+                "per_layer_inputs is the signal of a model with per-layer input "
+                "embeddings, and this one has none: per_layer_input_dim is unset")
         table = self.embed_tokens_per_layer(tokens).reshape(
             *tokens.shape, self.num_layers, ple)
         # The reference scales by sqrt(P) cast to the table's weight dtype
