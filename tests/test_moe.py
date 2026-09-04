@@ -508,7 +508,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     ({"num_experts": 4, "moe_every": 0}, "positive"),
     ({"num_experts": 4, "top_k": 5}, "top_k"),
 ])
-def test_a_sparse_configuration_that_cannot_be_built_is_rejected(settings, message):
+def test_a_misconfigured_sparse_stack_is_rejected(settings, message):
     with pytest.raises(ValueError, match=message):
         decoder(**settings).init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
 
