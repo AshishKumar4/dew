@@ -35,6 +35,9 @@ from flax.typing import Dtype, PrecisionLike
 from ..attention import (
     causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
 )
+from ..mixers import (
+    AttentionMixer, MixerBase, MixerContext, mixer_from_record, mixers,
+)
 from ..moe import SparseMLP
 from ..sharding import logical_axes
 from dew.registry import models
@@ -552,6 +555,15 @@ class CausalTransformer(nn.Module):
     partial_rotary_factor rotates that fraction of an unwindowed kind's head
     dims and passes the rest through, which is Gemma 4's global layers; a
     windowed kind rotates whole.
+
+    `mixer` names the per-layer token mixer as a value from the `mixers`
+    registry, one frozen dataclass per kind carrying the reference's field
+    names (`mixer={"kind": "mla", ...}` from a config and the dataclass from
+    code agree; an unknown kind or field raises). None is today's
+    grouped-query causal attention with no config change. A non-standard kind
+    reads its own record and ignores the GQA projection geometry
+    (num_kv_heads, head_dim) the context still carries; those fields stay
+    validated, so a translation fills them with consistent values.
     """
     vocab_size: int
     emb_features: int = 512
@@ -588,6 +600,7 @@ class CausalTransformer(nn.Module):
     per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
+    mixer: "mixers.union | None" = None      # None: today's attention; a kind value or its record
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -604,6 +617,15 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "kinds", flax.core.freeze({
                 name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
                 for name, kind in self.kinds.items()}))
+        # A mixer arrives as a kind value from code and as a {"kind": ...}
+        # record from a config; the record dispatches on its kind through the
+        # same `mixers.build` a value is constructed with, so an unknown kind
+        # or field raises either way. Anything else is neither.
+        if isinstance(self.mixer, Mapping):
+            object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
+        elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
+            raise ValueError(
+                f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         super().__post_init__()
 
 
@@ -678,6 +700,41 @@ class CausalTransformer(nn.Module):
     @property
     def per_layer_vocab(self) -> int:
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
+
+    def mixer_context(self, kind: "ResolvedKind", layer_type: str,
+                      kv_shared: bool) -> MixerContext:
+        """One layer's mixer geometry: the kind's resolved values as a context.
+
+        `head_dim`, `rope_theta` and `window` already carry the layer kind's
+        overrides; a windowed kind rotates every dimension, so the partial
+        rotary belongs to the kinds that attend the whole sequence, which is
+        where Gemma 4 puts it. A kind builds its `DecoderBlock` factory from
+        this and its own record, which is the one place the mixer is chosen.
+        """
+        return MixerContext(
+            emb_features=self.emb_features,
+            num_heads=self.num_heads,
+            num_kv_heads=self.kv_heads,
+            head_dim=kind.head_dim,
+            max_seq_len=self.max_seq_len,
+            causal=self.causal,
+            rope_theta=kind.rope_theta,
+            qk_norm=self.qk_norm,
+            v_norm=self.v_norm,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            kv_shared=kv_shared,
+            kv_store_key=layer_type,
+            sliding_window=kind.window,
+            attention_bias=self.attention_bias,
+            attention_scale=self.attention_scale,
+            dtype=self.dtype,
+            precision=self.precision,
+            attention_impl=self.attention_impl,
+            force_fp32_for_softmax=self.force_fp32_for_softmax,
+            partial_rotary_factor=(None if kind.window is not None
+                                   else self.partial_rotary_factor))
 
     def setup(self):
         types = self.per_layer_types
@@ -757,36 +814,13 @@ class CausalTransformer(nn.Module):
             expert_bias=mixture.bias,
             dtype=self.dtype,
             precision=self.precision)
+        # None is today's attention; a kind value builds every layer's mixer
+        # from its context, which is the one place the mixer is chosen.
+        mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
         self.layers = [
             DecoderBlock(
-                mixer=functools.partial(
-                    CausalSelfAttention,
-                    emb_features=self.emb_features,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.kv_heads,
-                    head_dim=kinds[layer_type].head_dim,
-                    max_seq_len=self.max_seq_len,
-                    causal=self.causal,
-                    rope_theta=kinds[layer_type].rope_theta,
-                    # A windowed kind rotates every dimension; the partial
-                    # rotary belongs to the kinds that attend the whole
-                    # sequence, which is where Gemma 4 puts it.
-                    partial_rotary_factor=(None if kinds[layer_type].window is not None
-                                           else self.partial_rotary_factor),
-                    qk_norm=self.qk_norm,
-                    v_norm=self.v_norm,
-                    norm_eps=self.norm_eps,
-                    scale_offset=self.scale_offset,
-                    scale_after_cast=self.scale_after_cast,
-                    kv_shared=index in sharing,
-                    kv_store_key=layer_type,
-                    sliding_window=kinds[layer_type].window,
-                    attention_bias=self.attention_bias,
-                    attention_scale=self.attention_scale,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    attention_impl=self.attention_impl,
-                    force_fp32_for_softmax=self.force_fp32_for_softmax),
+                mixer=mixer_spec.build(self.mixer_context(
+                    kinds[layer_type], layer_type, index in sharing)),
                 feedforward=(
                     routed
                     if index in sparse and routed is not None else
