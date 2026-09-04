@@ -6,8 +6,10 @@ same preset, so a model is always sampled with the convention it was trained
 with, and a record that holds the preset's fields rebuilds it exactly.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import (
@@ -20,13 +22,16 @@ from dew.diffusion.transforms import (
 )
 from dew.registry import presets
 
+if TYPE_CHECKING:
+    from dew.diffusion.discrete import DiscreteProcess
+
 
 @runtime_checkable
 class Preset(Protocol):
     """What every member of the `presets` registry is: a frozen dataclass of a
     convention's numbers, callable to the `Process` it describes."""
 
-    def __call__(self) -> Process: ...
+    def __call__(self) -> Process | DiscreteProcess: ...
 
 
 def _weighting(min_snr_gamma: float | None) -> Weighting:
