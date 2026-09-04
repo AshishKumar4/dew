@@ -24,6 +24,7 @@ from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.data.text import ByteTokenizer
 from dew.nn.backbones import causal_transformer as backbone
 from dew.objectives.lm import LMObjective
+from dew.training import Step
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -819,13 +820,13 @@ def _counted_cross_entropy(batch, seq_len):
     """
     model = _tiny_backbone(seq_len)
     objective = LMObjective(model, seq_len)
-    params = objective.init_params(jax.random.PRNGKey(0))
+    params = objective.init(jax.random.key(0))
     tokens = jnp.asarray(batch["text"], jnp.int32)
     segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
     positions = jnp.asarray(batch["text_positions"], jnp.int32)
 
-    ce, _ = objective.shifted_cross_entropy(params, tokens, segment_ids=segment_ids,
-                                            positions=positions)
+    ce, _ = objective.loss(params, batch, Step(step=jnp.zeros((), jnp.int32),
+                                                key=jax.random.key(1), ema=None))
 
     logits = model.apply(params, tokens[:, :-1], positions=positions[:, :-1],
                          segment_ids=segment_ids[:, :-1])
