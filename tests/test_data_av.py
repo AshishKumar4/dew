@@ -1,9 +1,10 @@
 """Audio-video reader tests.
 
-`read_av_improved` and the random-clip readers need optional native libraries
-(`video_reader`/PyVideoReader, pyav, moviepy) plus ffmpeg. The frame-window
-plumbing is checked against a stubbed reader so it runs everywhere; the tests
-that decode real media skip when the libraries are missing.
+`read_av_improved` decodes frames with PyAV, which the `av` extra installs;
+the random-clip readers need more (`video_reader`/PyVideoReader, moviepy)
+plus ffmpeg. The frame-window plumbing is checked against a stubbed reader
+so it runs everywhere; the tests that decode real media skip when the
+libraries are missing.
 """
 
 import importlib
@@ -26,25 +27,34 @@ CLIP_FRAMES = int(FPS * CLIP_SECONDS)
 
 @pytest.fixture
 def stub_reader(monkeypatch):
-    """Install a fake `video_reader` module and audio reader, recording calls."""
+    """Install a fake `av` module and audio reader, recording calls."""
     calls = {}
 
-    class PyVideoReader:
+    class FakeFrame:
+        def __init__(self, index):
+            self.index = index
+
+        def to_ndarray(self, format="rgb24"):
+            assert format == "rgb24"
+            return np.full((4, 4, 3), self.index, dtype=np.uint8)
+
+    class FakeContainer:
         def __init__(self, path):
             calls["path"] = path
+            self.streams = types.SimpleNamespace(video=[object()])
 
-        def decode(self, start_frame=0, end_frame=None):
-            calls["start_frame"] = start_frame
-            calls["end_frame"] = end_frame
-            stop = CLIP_FRAMES if end_frame is None else end_frame
-            return np.zeros((stop - start_frame, 4, 4, 3), dtype=np.uint8)
+        def __enter__(self):
+            return self
 
-        def get_info(self):
-            return {"frame_count": CLIP_FRAMES}
+        def __exit__(self, *exc):
+            return False
 
-    module = types.ModuleType("video_reader")
-    module.PyVideoReader = PyVideoReader
-    monkeypatch.setitem(sys.modules, "video_reader", module)
+        def decode(self, stream):
+            return [FakeFrame(index) for index in range(CLIP_FRAMES)]
+
+    module = types.ModuleType("av")
+    module.open = lambda path: FakeContainer(path)
+    monkeypatch.setitem(sys.modules, "av", module)
 
     def fake_read_audio(path, start_time=None, duration=None, target_sr=SAMPLE_RATE,
                         method='ffmpeg'):
@@ -58,13 +68,13 @@ def stub_reader(monkeypatch):
 
 
 def test_read_av_improved_stops_at_the_end_frame(stub_reader):
-    """`end` was accepted and then dropped: decode() always got end_frame=None,
-    so every call decoded the rest of the clip."""
+    """Only `[start, end)` comes back: the stub numbers its frames, so the
+    window is checked by content, not just by length."""
     audio, video = read_av_improved("clip.mp4", start=5, end=10, fps=FPS)
 
-    assert stub_reader["start_frame"] == 5
-    assert stub_reader["end_frame"] == 10
-    assert len(video) == 5
+    assert video.shape == (5, 4, 4, 3)
+    assert video[0, 0, 0, 0] == 5
+    assert video[-1, 0, 0, 0] == 9
     # The audio window must line up with the frame window
     assert stub_reader["start_time"] == pytest.approx(5 / FPS)
     assert stub_reader["duration"] == pytest.approx(5 / FPS)
@@ -74,9 +84,9 @@ def test_read_av_improved_stops_at_the_end_frame(stub_reader):
 def test_read_av_improved_without_an_end_reads_to_the_clip_end(stub_reader):
     _, video = read_av_improved("clip.mp4", start=5, fps=FPS)
 
-    assert stub_reader["end_frame"] is None
     assert stub_reader["duration"] is None
-    assert len(video) == CLIP_FRAMES - 5
+    assert video.shape == (CLIP_FRAMES - 5, 4, 4, 3)
+    assert video[0, 0, 0, 0] == 5
 
 
 # ---------------------------------------------------------------------------------
@@ -115,7 +125,7 @@ def synthesized_clip(tmp_path_factory):
 
 
 def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
-    needs_rsreader()
+    pytest.importorskip("av")
     audio, video = read_av_improved(str(synthesized_clip), start=5, end=15, fps=FPS)
 
     assert len(video) == 10
