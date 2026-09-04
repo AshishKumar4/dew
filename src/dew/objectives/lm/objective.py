@@ -37,7 +37,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.moe import calculate_load_balance_updates
 from dew.objectives.base import Aux, EMASpec, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
-from dew.registry import metrics
+from dew.registry import metrics, objectives
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -105,6 +105,7 @@ def balance(moe: Variables, routing: Variables, rate: float
                       "moe/min_load": jnp.mean(jnp.stack(lightest))}
 
 
+@objectives("lm")
 class LMObjective(Objective):
     """Shifted cross entropy; evaluation scores tokens and writes text."""
 

@@ -11,7 +11,6 @@ import dataclasses
 from dataclasses import dataclass
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -21,68 +20,34 @@ from dew.config import ModelConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.inputs import ConditionEncoder, Field
-from dew.nn.dit import TextContext
+from dew.inputs import Field
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-from dew.registry import encoders, presets, samplers
+from dew.registry import presets, samplers
+from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 from dew.sampling import CFG, Heun, TextToImage
 from dew.training import Checkpoints, Trainer
 
 RES = 8
-TOKENS = 5
-FEATURES = 6
-VOCAB = 11
 MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-@encoders("stub_text")
-@dataclass(frozen=True, eq=False)
-class StubText(ConditionEncoder):
-    """A table lookup standing in for CLIP, rebuilt from the run's text
-    condition the way the real encoder is."""
-
-    checkpoint: str
-    params: dict
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, **fields):
-        seed = int(checkpoint.rsplit("-", 1)[-1])
-        return cls(checkpoint=checkpoint, params={"table": jnp.asarray(
-            np.random.RandomState(seed).normal(size=(VOCAB, FEATURES)).astype(np.float32))})
-
-    def tokenize(self, texts):
-        ids = np.zeros((len(texts), TOKENS), np.int32)
-        mask = np.zeros((len(texts), TOKENS), np.int32)
-        for row, text in enumerate(texts):
-            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-    def encode(self, params, tokens):
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint}
-
-
-def run_config(directory, preset=presets.EDM(), seed=3):
-    """The resolved config of a tiny conditional DiT run in `directory`."""
+def run_config(directory, preset=presets.EDM()):
+    """The resolved config of a tiny conditional DiT run in `directory`; the
+    text condition names the registered stub encoder."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, sampler=samplers.Euler(), sampling_steps=3,
-        text=TextCondition(encoder="stub_text", checkpoint=f"stub-{seed}"))
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"))
 
 
-def make_run(directory, preset=presets.EDM(), seed=3):
+def make_run(directory, preset=presets.EDM()):
     """Two training steps of the tiny conditional DiT, its checkpoint and its
     `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build."""
-    config = run_config(directory, preset, seed)
+    config = run_config(directory, preset)
     objective = config.build()
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
@@ -124,7 +89,7 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
     assert type(pipe.model).__name__ == "SimpleDiT" and pipe.model.emb_features == 16
     assert pipe.model.output_channels == 3
     assert pipe.inputs.sample == Field("image", (RES, RES, 3))
-    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-3"
+    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
 
     images = pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0,
                   key=jax.random.PRNGKey(0))
@@ -148,7 +113,7 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
         jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"])))
-    # the frozen encoder's table is the manifest's, not something re-drawn
+    # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
         np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
@@ -170,7 +135,7 @@ def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatc
     import dew.interop.hub as hub
     monkeypatch.setattr(hub, "pull_from_hub", lambda repo_id, revision=None: tmp_path)
     pipe = TextToImage.from_pretrained("user/flowers-dit")
-    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-3"
+    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):

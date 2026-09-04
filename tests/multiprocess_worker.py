@@ -22,14 +22,13 @@ import numpy as np
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
-# lower it or fsdp_size > 1 would silently mean "everything replicated".
+# lower it or fsdp > 1 would silently mean "everything replicated".
 TINY = 256
 
 
 def global_images(count: int = BATCH) -> np.ndarray:
     """The global batch every topology trains on, in the range data arrives in."""
-    return np.random.default_rng(0).integers(
-        0, 256, size=(count, RES, RES, 3)).astype(np.float32)
+    return np.random.default_rng(0).integers(0, 256, size=(count, RES, RES, 3)).astype(np.uint8)
 
 
 def row_marked_batch(count: int = BATCH) -> np.ndarray:
@@ -38,94 +37,87 @@ def row_marked_batch(count: int = BATCH) -> np.ndarray:
     Which rows of the global batch reached which process's devices is otherwise
     only visible in the loss.
     """
-    return np.stack([np.full((RES, RES, 3), row, np.float32) for row in range(count)])
+    return np.stack([np.full((RES, RES, 3), row, np.uint8) for row in range(count)])
 
 
 def checkpoint_dir(base: str | Path, name: str) -> Path:
-    """Where SimpleTrainer.checkpoint_path() puts a run named by one word."""
+    """Where a run named by one word keeps its checkpoints."""
     return Path(base) / name
 
 
-def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, wandb_config=None,
-                  **kwargs):
-    """The trainer a recipe would build, at the smallest size that still shards.
+def make_objective():
+    """Squared error against the input through the real DiT, no randomness.
 
     dew is imported here rather than at module scope because a JAX backend
     opened before jax.distributed.initialize() would pin the process to its own
     devices, and this module is imported before the pool is joined.
     """
+    import jax.numpy as jnp
+    import optax
+    from dew.artifacts import Representations
+    from dew.inputs import unit_range
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.base import Aux, EMASpec, Objective
+
+    class Reconstruction(Objective):
+        artifact = Representations
+
+        def __init__(self):
+            self.model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                   mlp_ratio=1)
+            self.ema = EMASpec(decay=optax.constant_schedule(0.999))
+
+        def init(self, key):
+            return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
+
+        def loss(self, params, batch, step):
+            data = unit_range(batch["image"])
+            preds = self.model.apply(params, data, jnp.zeros((data.shape[0],), jnp.float32))
+            return jnp.mean((preds - data) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            # The validation split here is a token split whose contents the
+            # objective has no use for: what the pass exercises is its length.
+            return Representations(features=jnp.zeros((1, 1)), labels=jnp.zeros((1,), jnp.int32))
+
+    return Reconstruction()
+
+
+def build_trainer(name, checkpoint_base, fsdp=1, tracker=None):
+    """The trainer a recipe would build, at the smallest size that still shards."""
     import jax
     import optax
-    from dew.diffusion.transforms import get_diffusion_preset
-    from dew.inputs import DiffusionInputConfig
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.training import ObjectiveTrainer
+    from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
-    schedule, _, transform = get_diffusion_preset("edm")
-    return ObjectiveTrainer(
-        model=SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                        mlp_ratio=1),
-        optimizer=optax.adam(1e-3),
-        noise_schedule=schedule,
-        model_output_transform=transform,
-        input_config=DiffusionInputConfig(
-            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
-        rngs=jax.random.PRNGKey(0),
-        name=name,
-        wandb_config=wandb_config,
-        distributed_training=True,
-        fsdp_size=fsdp_size,
-        fsdp_min_param_size=TINY,
-        checkpoint_base_path=str(checkpoint_base),
-        load_from_checkpoint=load,
-        **kwargs,
-    )
+    return Trainer(
+        make_objective(), optax.adam(1e-3), key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4),
+        tracker=tracker)
 
 
-def install_wandb_stub(summary_step: int, artifact_dir: str) -> dict:
-    """The slice of wandb a resumed run id reaches, in place of the module.
+class LossRecorder:
+    def __init__(self):
+        self.losses = []
 
-    Only process 0 opens wandb, and what it learns there, the step the run
-    reached and the model artifact it logged, is what the whole pool has to
-    resume from. Returns the wandb_config that names the run.
-    """
-    import sys
-    import types
+    def log(self, scalars, step):
+        if "train/loss" in scalars:
+            self.losses.append(scalars["train/loss"])
 
-    class Run:
-        summary = {"train/step": summary_step}
-        sweep_id = None
+    def artifact(self, value, step):
+        pass
 
-        def define_metric(self, *args, **kwargs):
-            pass
 
-        def log(self, *args, **kwargs):
-            pass
+class Data:
+    def __init__(self, train, val=None, batch=BATCH, records=None):
+        self._train, self.val, self.batch, self.records = train, val, batch, records
 
-    class Artifact:
-        type = "model"
-        name = "model:v0"
+    def train(self):
+        return self._train()
 
-        def download(self):
-            return artifact_dir
-
-    class ApiRun:
-        def logged_artifacts(self):
-            return [Artifact()]
-
-    class Api:
-        def run(self, path):
-            return ApiRun()
-
-        def runs(self, **kwargs):
-            return []
-
-    module = types.ModuleType("wandb")
-    module.init = lambda **kwargs: Run()
-    module.Api = Api
-    sys.modules["wandb"] = module
-    return {"project": "dew", "entity": "tests", "name": "resumed", "id": "run",
-            "config": {"arguments": {"dataset": "indexed"}}}
+    @property
+    def steps_per_epoch(self):
+        return None if self.records is None else self.records // self.batch
 
 
 def as_numpy(tree):
@@ -145,24 +137,6 @@ def as_numpy(tree):
     return multihost_utils.process_allgather(tree, tiled=True)
 
 
-def run_losses(trainer, steps, images):
-    """Per-step losses from the real compiled step over this process's rows.
-
-    `images` is this process's slice of the global batch; shard_batch is what
-    assembles the slices into the one global array the step is compiled for.
-    """
-    from dew.training.distributed import shard_batch
-
-    train_step = trainer._define_train_step(batch_size=len(images))
-    state, rng = trainer.state, trainer.rngstate
-    losses = []
-    for _ in range(steps):
-        state, loss, _, rng, _ = train_step(
-            state, rng, shard_batch(trainer.batch_sharding, {"image": images}))
-        losses.append(float(as_numpy(loss)))
-    return state, rng, losses
-
-
 def indexed_loader(records: int, batch: int = BATCH):
     """A checkpointable source whose batches say which records they hold.
 
@@ -174,7 +148,7 @@ def indexed_loader(records: int, batch: int = BATCH):
 
     class ToImage(pygrain.MapTransform):
         def map(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.float32)}
+            return {"image": np.full((RES, RES, 3), index, np.uint8)}
 
     return pygrain.DataLoader(
         data_source=pygrain.RangeDataSource(0, records, 1),
@@ -271,11 +245,11 @@ class YearAhead(datetime):
 def mode_topology(args) -> dict:
     import jax
     from dew.training import runtime
-    from dew.training.distributed import batch_sharding, build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, batch_sharding, build_mesh, shard_batch
 
     if args.process_id > 0:
         runtime.datetime = YearAhead
-    mesh = build_mesh(args.fsdp_size)
+    mesh = build_mesh(MeshSpec(fsdp=args.fsdp_size))
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     sharded = shard_batch(batch_sharding(mesh), {"image": local})["image"]
@@ -299,18 +273,15 @@ def mode_topology(args) -> dict:
 
 
 def mode_data(args) -> dict:
+    """One pass over the held-out split, which ends by itself."""
     import jax
-    from dew.data.dataloaders import get_token_dataset_grain
+    from dew.data import TokenWindows, local_batch
 
-    tokens = Path(args.tokens)
-    data = get_token_dataset_grain(
-        str(tokens / "train.bin"), str(tokens / "val.bin"),
-        batch_size=BATCH, seq_len=args.seq_len, num_epochs=1,
-        worker_count=args.workers, read_thread_count=1, read_buffer_size=8,
-        worker_buffer_size=1)
-
+    data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
+                        worker_count=args.workers, read_threads=1, read_buffer=8,
+                        worker_buffer=1).load(batch=BATCH)
     records, batches = [], 0
-    for batch in data["train"]():
+    for batch in data.val():
         window = np.asarray(batch["text"])
         # The corpus is a token ramp, so a window's first token names its record.
         records.extend(int(row[0]) // args.seq_len for row in window)
@@ -319,24 +290,20 @@ def mode_data(args) -> dict:
         "process_index": jax.process_index(),
         "records": records,
         "batches": batches,
-        "local_batch_size": data["local_batch_size"],
-        "global_batch_size": data["global_batch_size"],
-        "train_len": data["train_len"],
+        "local_batch_size": local_batch(data.batch),
+        "global_batch_size": data.batch,
+        "train_len": data.records,
     }
 
 
 def mode_packed(args) -> dict:
     import jax
-    from dew.data.dataloaders import get_packed_token_dataset_grain
+    from dew.data import PackedTokens, local_batch
 
-    tokens = Path(args.tokens)
-    data = get_packed_token_dataset_grain(
-        str(tokens / "train.bin"), str(tokens / "val.bin"),
-        batch_size=BATCH, seq_len=args.seq_len, num_epochs=1,
-        worker_count=args.workers, worker_buffer_size=1)
-
+    data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
+                        worker_count=args.workers, worker_buffer=1).load(batch=BATCH)
     documents, windows = set(), 0
-    for batch in data["train"]():
+    for batch in data.val():
         text = np.asarray(batch["text"])
         # Every document is one token value repeated, so the values in a
         # window name the documents packed into it. Padding and the eos that
@@ -347,83 +314,104 @@ def mode_packed(args) -> dict:
         "process_index": jax.process_index(),
         "documents": sorted(documents),
         "windows": windows,
-        "local_batch_size": data["local_batch_size"],
-        "train_len": data["train_len"],
+        "local_batch_size": local_batch(data.batch),
     }
 
 
+def restored_state(checkpoints):
+    """The step and this process's data position a run directory holds."""
+    if checkpoints.latest is None:
+        return None, None
+    _, position = checkpoints.restore()
+    return checkpoints.latest, None if position is None else position.decode()
+
+
 def mode_steps(args) -> dict:
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
+    """`--steps` more steps of the executable fit runs, from the directory's state.
+
+    Driven step by step here rather than through fit so every process records
+    the losses it computed; fit reports them through the tracker on process 0
+    alone.
+    """
+    from dew.training.distributed import shard_batch
+
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
+    restored, _ = restored_state(trainer.checkpoints)
+    state, _, _ = trainer.place()
     rows = BATCH // args.processes
     images = global_images()[args.process_id * rows:(args.process_id + 1) * rows]
-    state, rng, losses = run_losses(trainer, args.steps, images)
-    trainer.state, trainer.rngstate = state, rng
-    if args.save:
-        trainer.save(epoch=0, step=args.steps)
-        trainer.wait_for_checkpoints()
+    batch = shard_batch(trainer.batch_sharding, {"image": images})
+    compiled = trainer.compile(state, batch)
+    losses = []
+    for _ in range(args.steps):
+        state, _, loss, _, _ = compiled(state, None, batch)
+        losses.append(float(as_numpy(loss)))
+    if args.save and args.steps:
+        trainer.checkpoints.save(int(as_numpy(state.step)), state, None)
+        trainer.checkpoints.wait()
     dump_params(args.out.with_suffix(".npz"), state.params)
     return {
         "losses": losses,
         "step": int(as_numpy(state.step)),
-        "restored_step": trainer.latest_step,
-        "checkpoint_path": trainer.checkpoint_path(),
+        "restored_step": restored,
+        "checkpoint_path": trainer.checkpoints.directory,
         "sharding": sharding_facts(state.params),
-        "mesh_shape": {axis: int(size) for axis, size in trainer.mesh.shape.items()},
+        "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
     }
 
 
-def scored_batches():
-    """An EvaluationMetric whose epoch score is how many batches the pass scored."""
-    from dew.eval.common import EvaluationMetric
+class Batches:
+    """A metric whose pass score is how many batches the pass scored."""
+    name = "batches"
 
-    return EvaluationMetric(function=lambda artifacts, batch: 1.0, name="batches",
-                            reducer=np.sum)
+    def __init__(self):
+        from dew.artifacts import Representations
+        self.reads = Representations
+
+    def __call__(self, artifact, batch):
+        return 1.0
+
+    def reduce(self, values):
+        return float(np.sum(values))
 
 
 def mode_fit(args) -> dict:
-    wandb_config = None
-    if args.resume_run_step is not None:
-        wandb_config = install_wandb_stub(args.resume_run_step, args.artifact)
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load,
-                            wandb_config=wandb_config, eval_metrics=[scored_batches()])
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     # Where the checkpoint on disk left this run, read before fit trains past it.
-    restored, restored_step = trainer.dataset_state, trainer.latest_step
+    restored_step, restored = restored_state(trainer.checkpoints)
     rows = BATCH // args.processes
     loader = indexed_loader(args.records, rows)
     if args.block_after:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
-    data = {"train": lambda: loader, "train_len": args.records,
-            "local_batch_size": rows, "global_batch_size": BATCH}
-    available = None
+    val, available = None, None
+    scored = []
+    evaluate = trainer.objective.evaluate
+    trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
     if args.tokens:
         # The packed token split, whose documents are strided over the
-        # processes before packing. The sampler that validation runs ignores
-        # an unconditional batch's contents, so the split only has to shard.
-        from dew.data.dataloaders import get_packed_token_dataset_grain
+        # processes before packing. The objective's evaluation ignores the
+        # batch's contents, so the split only has to shard.
+        from dew.data import PackedTokens
 
-        tokens = Path(args.tokens)
-        data["val"] = get_packed_token_dataset_grain(
-            str(tokens / "train.bin"), str(tokens / "val.bin"), batch_size=BATCH,
-            seq_len=args.seq_len, num_epochs=1, worker_count=args.workers)["val"]
-        available = sum(1 for _ in data["val"]())
-        # 200 sampler steps per validation batch is the production default and
-        # pure overhead here.
-        trainer.objective.diffusion_steps = 4
-    state = trainer.fit(data, training_steps_per_epoch=args.steps, epochs=1,
-                        val_steps_per_epoch=args.val_steps,
-                        checkpoint_every_steps=args.save_every)
-    trainer.wait_for_checkpoints()
+        data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
+                            worker_count=args.workers).load(batch=BATCH)
+        val = data.val
+        available = sum(1 for _ in data.val())
+    state = trainer.fit(Data(lambda: iter(loader), val=val, records=args.records),
+                        steps=args.steps, log_every=1,
+                        eval_every=args.steps if args.tokens else None,
+                        checkpoint_every=args.save_every, metrics=(Batches(),))
     dump_params(args.out.with_suffix(".npz"), state.params)
+    _, final_position = restored_state(trainer.checkpoints)
     return {
         "step": int(as_numpy(state.step)),
         "restored_step": restored_step,
-        "restored_dataset_state": None if restored is None else restored.decode(),
-        "checkpoint_path": trainer.checkpoint_path(),
-        "written_steps": sorted(int(step) for step in trainer.checkpointer.all_steps()),
-        "dataset_state": trainer.dataset_state.decode(),
+        "restored_dataset_state": restored,
+        "checkpoint_path": trainer.checkpoints.directory,
+        "written_steps": sorted(int(step) for step in trainer.checkpoints._open().all_steps()),
+        "dataset_state": final_position,
         "val_available": available,
-        "val_batches": (None if available is None
-                        else int(trainer.best_val_metrics["val/batches"])),
+        "val_batches": None if available is None else len(scored),
     }
 
 
@@ -441,10 +429,6 @@ def parse_args(argv=None):
     parser.add_argument("--fsdp-size", type=int, default=1)
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
-    parser.add_argument("--load", help="checkpoint directory to resume from")
-    parser.add_argument("--resume-run-step", type=int,
-                        help="resume a wandb run id whose summary reached this step")
-    parser.add_argument("--artifact", help="the step directory that run's model artifact holds")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
@@ -476,7 +460,7 @@ def main(argv=None) -> None:
         })
     from dew.training.runtime import prepare_process
 
-    prepare_process("none", multi_host=bool(args.coordinator))
+    prepare_process(multi_host=bool(args.coordinator))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 

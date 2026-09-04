@@ -30,13 +30,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP
 from dew.nn.moe import (
     ExpertMLP, Router, SparseMLP, calculate_load_balance_updates,
 )
-from dew.objectives.lm import LMObjective
-from dew.registry import build_model
-from dew.training import ObjectiveTrainer
-from dew.training.distributed import (
-    DevicePrefetchIterator, assert_params_sufficiently_sharded, batch_sharding,
-    build_mesh, state_sharding_tree,
-)
+from dew.objectives.base import Step
+from dew.objectives.lm import LMObjective, TEXT_KEY
+from dew.registry import models
+from dew.training import Layout, MeshSpec, Trainer, build_mesh
+from dew.training.distributed import batch_sharding
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
@@ -510,7 +508,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     ({"num_experts": 4, "moe_every": 0}, "positive"),
     ({"num_experts": 4, "top_k": 5}, "top_k"),
 ])
-def test_a_sparse_configuration_that_cannot_be_built_is_rejected(settings, message):
+def test_a_misconfigured_sparse_stack_is_rejected(settings, message):
     with pytest.raises(ValueError, match=message):
         decoder(**settings).init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
 
@@ -524,8 +522,8 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
                       out_features=32)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 4, 32)))
-    mesh = build_mesh(fsdp_size=fsdp_size, expert_size=expert_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=min_shard_size)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    shardings = Layout(min_shard=min_shard_size).shardings(mesh, variables)
     return mesh, jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
 
@@ -561,11 +559,12 @@ def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
         expert_size, fsdp_size):
-    model = build_model("moe", moe_config())
+    model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(fsdp_size=fsdp_size, expert_size=expert_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size, expert=expert_size))
+    layout = Layout(min_shard=TINY_SHARD)
+    shardings = layout.shardings(mesh, variables)
 
     for (path, leaf), sharding in zip(
             jax.tree_util.tree_flatten_with_path(variables)[0],
@@ -576,8 +575,7 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
             axes = (entry,) if isinstance(entry, str) else entry
             size = int(np.prod([mesh.shape[axis] for axis in axes]))
             assert leaf.shape[dimension] % size == 0, (path, sharding.spec)
-    assert_params_sufficiently_sharded(
-        variables["params"], shardings["params"], mesh, min_shard_size=TINY_SHARD)
+    layout.check(variables["params"], shardings["params"], mesh)
 
 
 def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
@@ -586,27 +584,26 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
     see that, which the fsdp-only rule could not: it returned as soon as the
     fsdp axis was one.
     """
-    model = build_model("moe", moe_config())
+    model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    mesh = build_mesh(fsdp_size=1, expert_size=8)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY_SHARD)
+    mesh = build_mesh(MeshSpec(fsdp=1, expert=8))
+    layout = Layout(min_shard=TINY_SHARD)
+    shardings = layout.shardings(mesh, variables)
 
     with pytest.raises(ValueError, match="replicated"):
-        assert_params_sufficiently_sharded(
-            variables["params"], shardings["params"], mesh,
-            min_shard_size=TINY_SHARD)
+        layout.check(variables["params"], shardings["params"], mesh)
 
 
 def test_build_mesh_rejects_an_expert_size_the_devices_cannot_hold():
-    with pytest.raises(ValueError, match="expert_size"):
-        build_mesh(fsdp_size=4, expert_size=4)
+    with pytest.raises(ValueError, match="expert 4"):
+        build_mesh(MeshSpec(fsdp=4, expert=4))
 
 
 def test_the_batch_is_split_over_the_expert_axis_too():
     """Expert parallelism must not cost data parallelism: every device holds a
     slice of the batch whichever axis it sits on."""
-    mesh = build_mesh(fsdp_size=2, expert_size=4)
+    mesh = build_mesh(MeshSpec(fsdp=2, expert=4))
     batch = jax.make_array_from_process_local_data(
         batch_sharding(mesh), np.zeros((jax.device_count(), 4), np.float32))
 
@@ -633,44 +630,50 @@ def token_batches():
         yield batch
 
 
-def moe_trainer(tmp_path, name, expert_size, fsdp_size):
-    model = build_model("moe", moe_config())
-    return ObjectiveTrainer(
-        model=model,
-        objective=LMObjective(model, SEQ_LEN, vocab_size=VOCAB),
-        input_config=None,
-        optimizer=optax.adam(1e-3),
-        rngs=jax.random.PRNGKey(0),
-        name=name,
-        wandb_config=None,
-        distributed_training=True,
-        fsdp_size=fsdp_size,
-        expert_size=expert_size,
-        fsdp_min_param_size=TINY_SHARD,
-        checkpoint_base_path=str(tmp_path),
-    )
+class Data:
+    def __init__(self, train):
+        self._train, self.val, self.batch, self.records = train, None, BATCH, None
+
+    def train(self):
+        return self._train()
+
+    steps_per_epoch = None
+
+
+class RecordingTracker:
+    def __init__(self):
+        self.scalars = []
+
+    def log(self, scalars, step):
+        self.scalars.append(dict(scalars))
+
+    def artifact(self, value, step):
+        pass
+
+
+def moe_trainer(expert_size, fsdp_size, tracker=None, **model_overrides):
+    model = models.build("causal_transformer", **{**moe_config(), **model_overrides})
+    return Trainer(
+        LMObjective(model, SEQ_LEN, balance_rate=0.01 if model_overrides.get("expert_bias") else None),
+        optax.adam(1e-3), key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp_size, expert=expert_size),
+        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
 
 
 def run_losses(trainer, steps):
-    """Per-step losses from the real compiled training step."""
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(token_batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
-    losses = []
-    for _ in range(steps):
-        state, loss, _, rng, is_finite = train_step(state, rng, next(source))
-        assert bool(is_finite)
-        losses.append(float(loss))
-    return losses
+    """Per-step losses of a fit, as the tracker receives them."""
+    trainer.tracker = tracker = RecordingTracker()
+    trainer.fit(Data(token_batches), steps=steps, log_every=1)
+    return [entry["train/loss"] for entry in tracker.scalars]
 
 
-def test_the_expert_shards_train_the_same_model(tmp_path):
+def test_the_expert_shards_train_the_same_model():
     """Fifty steps of the same sparse decoder at the same seed, with the
     experts on one shard and on four. Expert parallelism moves where the
     experts live, so the losses have to be the same run."""
     steps = 50
-    one = run_losses(moe_trainer(tmp_path / "one", "one", 1, 2), steps)
-    four = run_losses(moe_trainer(tmp_path / "four", "four", 4, 2), steps)
+    one = run_losses(moe_trainer(1, 2), steps)
+    four = run_losses(moe_trainer(4, 2), steps)
 
     assert len(one) == steps and np.all(np.isfinite(one))
     assert one[-1] < one[0] / 2, one
@@ -681,12 +684,56 @@ def test_the_expert_shards_train_the_same_model(tmp_path):
     assert difference < 1e-6, difference
 
 
-def test_the_experts_are_really_split_across_the_expert_axis(tmp_path):
-    trainer = moe_trainer(tmp_path, "shapes", expert_size=4, fsdp_size=2)
-    experts = trainer.state.params["params"]["layers_1"]["mlp"]["experts"]
+def test_the_experts_are_really_split_across_the_expert_axis():
+    state = moe_trainer(expert_size=4, fsdp_size=2).fit(Data(token_batches), steps=0)
+    experts = state.params["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
     assert 'expert' in str(kernel.sharding.spec)
     assert kernel.addressable_shards[0].data.shape == (2, 32, 32)
-    moments = trainer.state.opt_state[0].mu["params"]["layers_1"]["mlp"]["experts"]
+    moments = state.opt_state[0].mu["layers_1"]["mlp"]["experts"]
     assert moments["gate_proj"]["kernel"].sharding.spec == kernel.sharding.spec
+
+
+# --------------------------------------------------------------------------
+# The balancing bias through Aux.variables
+# --------------------------------------------------------------------------
+
+def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
+    """The aux-loss-free balancing end to end: the routers sow their loads,
+    the loss reports them and hands the bias update back through
+    Aux.variables, and the trainer writes it into the `moe` collection.
+
+    The bias starts at zero on every expert and the router is skewed by the
+    tokens, so after a run the busiest experts carry a negative bias, the
+    idlest a positive one, and the bias is not what a fresh init holds.
+    """
+    steps = 30
+    tracker = RecordingTracker()
+    trainer = moe_trainer(1, 2, tracker=tracker, expert_bias=True)
+    fresh = trainer.initial_state()
+    assert set(fresh.params) == {"params", "moe"}
+    np.testing.assert_array_equal(
+        np.asarray(fresh.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]), 0.0)
+
+    state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
+
+    bias = np.asarray(state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
+    assert np.any(bias != 0), "the bias never moved"
+    assert bias.min() < 0 < bias.max(), bias
+    # Every step moved every expert by the rate, one way or the other.
+    np.testing.assert_allclose(np.abs(bias) / 0.01, np.round(np.abs(bias) / 0.01), atol=1e-4)
+    loads = [entry["train/moe/max_load"] for entry in tracker.scalars]
+    assert len(loads) == steps and all(1 / 8 <= load <= 1.0 for load in loads)
+    assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in tracker.scalars)
+    # The bias is state, not a parameter: the optimizer holds no moment for it.
+    assert "moe" not in state.opt_state[0].mu
+
+
+def test_balancing_needs_a_router_with_a_bias():
+    trainer = moe_trainer(1, 2)
+    trainer.objective.balance_rate = 0.01
+    params = trainer.initial_state().params
+    with pytest.raises(ValueError, match="expert_bias"):
+        trainer.objective.loss(params, next(token_batches()),
+                               Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
