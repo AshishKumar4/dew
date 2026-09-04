@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
-from typing import Any, Protocol, TypeAlias
+from typing import Protocol, TypeAlias
 
+import jax
 import numpy as np
 
 from dew.artifacts import ImageGrid, Representations, TextSamples, VideoGrid
@@ -21,10 +22,10 @@ from dew.artifacts import ImageGrid, Representations, TextSamples, VideoGrid
 class Tracker(Protocol):
     def log(self, scalars: Mapping[str, float], step: int) -> None: ...
 
-    def artifact(self, value: Any, step: int) -> None: ...
+    def artifact(self, value: object, step: int) -> None: ...
 
 
-def _home(array) -> np.ndarray:
+def _home(array: jax.Array | np.ndarray) -> np.ndarray:
     """`array` as numpy, refusing a shard of a global array.
 
     A tracker draws on process zero alone, and completing a global array needs
@@ -32,28 +33,26 @@ def _home(array) -> np.ndarray:
     `dew.artifacts.host`. Refusing names the missing call instead of hanging in
     a collective one process entered by itself.
     """
-    if not getattr(array, "is_fully_addressable", True):
+    if isinstance(array, jax.Array) and not array.is_fully_addressable:
         raise ValueError(
             "a tracker was handed a shard of a global array, which it cannot "
             "complete from one process: bring the artifact home with "
             "dew.artifacts.host on every process before drawing it")
     return np.asarray(array)
 
-
-def _uint8(images) -> np.ndarray:
+def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:
     """[-1, 1] floats as the bytes an image viewer reads."""
     return np.clip((_home(images).astype(np.float32) + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
 
-Payload: TypeAlias = dict[str, Any]
+Payload: TypeAlias = dict[str, object]
 
 
 @functools.singledispatch
-def render(value, step: int) -> Payload | None:
+def render(value: object, step: int) -> Payload | None:
     """The wandb payload for one artifact, or None for a type nothing draws
     (a metric reads it instead)."""
     return None
-
 
 @render.register
 def _(value: ImageGrid, step: int) -> Payload | None:
@@ -102,7 +101,7 @@ class WandbTracker:
     render = staticmethod(render)
 
     def __init__(self, project: str, name: str | None = None, *,
-                 entity: str | None = None, config: Mapping[str, Any] | None = None,
+                 entity: str | None = None, config: Mapping[str, object] | None = None,
                  offline: bool = False, id: str | None = None):
         self.project = project
         self.name = name
@@ -129,7 +128,7 @@ class WandbTracker:
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self.run.log({name: float(value) for name, value in scalars.items()}, step=step)
 
-    def artifact(self, value: Any, step: int) -> None:
+    def artifact(self, value: object, step: int) -> None:
         payload = self.render(value, step)
         if payload is not None:
             self.run.log(payload, step=step)

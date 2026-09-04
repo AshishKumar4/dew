@@ -45,7 +45,7 @@ BATCH_AXES = frozenset({'exp'})
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
-def _matrix_sides(path, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
+def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """The contracted axes and the output axes of a declared parameter.
 
     A dimension continues the side before it when the declaration leaves it
@@ -94,8 +94,9 @@ def muon_weight_dimension_numbers(params):
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
     """
-    def leaf(path, param):
-        if param.ndim < 2 or getattr(path[-1], 'key', None) == 'bias':
+    def leaf(path: jax.tree_util.KeyPath, param: jax.Array) -> optax.contrib.MuonDimensionNumbers | None:
+        last = path[-1]
+        if param.ndim < 2 or (isinstance(last, jax.tree_util.DictKey) and last.key == "bias"):
             return None
         axes = declared_axes(path, param.ndim)
         if axes is None:
