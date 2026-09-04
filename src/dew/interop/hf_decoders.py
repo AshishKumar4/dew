@@ -9,12 +9,16 @@ forward pass takes straight away, config being the dew config the model was
 built from.
 
 The families covered are the ones CausalTransformer can express: llama, qwen3,
-gemma3_text and gemma4_text. qwen2 is refused rather than half-loaded, since
-its q/k/v biases without an o_proj bias have no counterpart in the backbone's
-one attention_bias flag, and a multimodal wrapper config is refused rather
-than loading its text half. A config field that changes what the model
-computes and has no dew counterpart raises a ValueError naming it, rather
-than loading a model that silently computes something else.
+gemma3_text, gemma4_text, deepseek_v3 and deepseek_v32. qwen2 is refused
+rather than half-loaded, since its q/k/v biases without an o_proj bias have
+no counterpart in the backbone's one attention_bias flag, and a multimodal
+wrapper config is refused rather than loading its text half. DeepSeek loads
+through the MLA mixer with DeepSeek's MoE sizing, and its released
+checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
+translation builds the base model the weights describe. A config field that
+changes what the model computes and has no dew counterpart raises a
+ValueError naming it, rather than loading a model that silently computes
+something else.
 """
 
 import json
@@ -40,8 +44,8 @@ _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
 
 _QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4_text')
 _GEMMA = 'gemma3_text'
-_FAMILIES = ('llama', 'qwen3', 'gemma3_text', 'gemma4_text')
-
+_DEEPSEEK = ('deepseek_v3', 'deepseek_v32')
+_FAMILIES = ('llama', 'qwen3', 'gemma3_text', 'gemma4_text') + _DEEPSEEK
 # A multimodal repo's config.json is a wrapper whose model_type names the
 # whole model and whose text_config holds the decoder. Its own weights live
 # under model.language_model.*, next to vision and audio towers this has no
@@ -49,12 +53,13 @@ _FAMILIES = ('llama', 'qwen3', 'gemma3_text', 'gemma4_text')
 _WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n')
 
 _IGNORED_FIELDS = {
-    'architectures', 'attention_dropout', 'attn_implementation', 'bos_token_id',
-    'cache_implementation', 'dtype', 'eos_token_id', 'id2label',
-    'initializer_range', 'is_encoder_decoder', 'label2id', 'max_window_layers',
-    'mlp_bias', 'output_attentions', 'output_hidden_states', 'pad_token_id',
-    'pretraining_tp', 'problem_type', 'return_dict', 'use_cache',
-    'use_sliding_window', 'torch_dtype', 'transformers_version',
+    'architectures', 'attention_dropout', 'attn_implementation', 'auto_map',
+    'bos_token_id', 'cache_implementation', 'dtype', 'eos_token_id',
+    'id2label', 'initializer_range', 'is_encoder_decoder', 'label2id',
+    'max_window_layers', 'mlp_bias', 'output_attentions',
+    'output_hidden_states', 'pad_token_id', 'pretraining_tp',
+    'problem_type', 'return_dict', 'use_cache', 'use_sliding_window',
+    'torch_dtype', 'transformers_version',
 }
 
 # The fields above have no effect on an eval-time forward pass: metadata,
@@ -247,16 +252,175 @@ def _gemma4_rope(entries: Mapping[str, Any]) -> Tuple[float, Optional[float], Op
         _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
     local = float(local)
+
     return theta, (None if local == theta else local), partial
+
+_YARN_FIELDS = frozenset({
+    'rope_type', 'type', 'rope_theta', 'factor', 'beta_fast', 'beta_slow',
+    'mscale', 'mscale_all_dim', 'original_max_position_embeddings',
+    'truncate', 'attention_factor', 'partial_rotary_factor',
+})
+
+
+def _yarn_record(entry: Mapping[str, Any], field: str, theta: float,
+                 max_pos: int) -> Dict[str, Any]:
+    """The mixer's yarn record out of a YaRN rope entry.
+
+    Keeps the reference's names, so translation renames nothing; the
+    mixer's YarnScaling is built from these keys. An explicit
+    `attention_factor` rides along (the reference scales cos/sin by it
+    instead of deriving one), while a partial rotary inside a YaRN entry
+    has no counterpart in the mixer's full-width ramp and refuses. A
+    missing factor falls back the way the reference does, to the context
+    ratio off the original length.
+    """
+    unknown = sorted(set(entry) - _YARN_FIELDS)
+    if unknown:
+        _refuse(f"{field} fields {unknown}",
+                "the YaRN ramp reads no such fields")
+    partial = entry.get('partial_rotary_factor')
+    if partial not in (None, 1, 1.0):
+        _refuse(f"{field} partial_rotary_factor {partial}",
+                "the mixer's YaRN ramp runs over the whole rope width")
+    factor = entry.get('factor')
+    if factor is None:
+        factor = (float(max_pos)
+                  / float(entry['original_max_position_embeddings']))
+    return {
+        'rope_type': 'yarn',
+        'rope_theta': theta,
+        'factor': float(factor),
+        'original_max_position_embeddings': int(
+            entry['original_max_position_embeddings']),
+        'beta_fast': float(entry.get('beta_fast') or 32),
+        'beta_slow': float(entry.get('beta_slow') or 1),
+        'mscale': (None if entry.get('mscale') is None
+                   else float(entry['mscale'])),
+        'mscale_all_dim': (None if entry.get('mscale_all_dim') is None
+                           else float(entry['mscale_all_dim'])),
+        'truncate': bool(entry.get('truncate', True)),
+        'attention_factor': (None if entry.get('attention_factor') is None
+                             else float(entry['attention_factor'])),
+    }
+
+
+def _deepseek_rope(hf_config: Mapping[str, Any], used: set
+                   ) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """(rope_theta, yarn record) from either rope spelling.
+
+    Both released DeepSeek configs spell it the old way (`rope_scaling`
+    with `type: yarn`); transformers prefers `rope_scaling` when both are
+    present (convert_rope_params_to_dict), so this does too. Plain rope
+    reuses the shared reader; anything but plain or YaRN changes the
+    frequencies and refuses with the entry named.
+    """
+    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
+    scaling = hf_config.get('rope_scaling')
+    parameters = hf_config.get('rope_parameters')
+    entry = (scaling if isinstance(scaling, Mapping)
+             else parameters if isinstance(parameters, Mapping) else None)
+    theta = float(hf_config.get('rope_theta', 10000.0))
+    max_pos = int(hf_config.get('max_position_embeddings',
+                                DEFAULT_MAX_SEQ_LEN))
+    if entry is None:
+        return theta, None
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    field = ('rope_scaling' if scaling is entry else 'rope_parameters')
+    if rope_type in ('default', 'none'):
+        plain = _rope_theta(dict(entry, rope_theta=entry.get(
+            'rope_theta', theta)), field)
+        return plain or theta, None
+    if rope_type == 'yarn':
+        entry_theta = float(entry.get('rope_theta', theta))
+        return entry_theta, _yarn_record(
+            dict(entry, rope_theta=entry_theta), field, entry_theta, max_pos)
+    _refuse(f"rope scaling (rope_type {rope_type!r})",
+            "the mixer applies plain or YaRN rotary positions")
+    raise AssertionError("unreachable")
+
+
+def _deepseek_mixture(hf_config: Mapping[str, Any], layers: int,
+                      used: set) -> Dict[str, Any]:
+    """The mixture record out of a DeepSeek MoE config.
+
+    The first `first_k_dense_replace` layers stay dense and the rest route;
+    transformers never reads `moe_layer_freq`, so anything but every layer
+    past the dense ones refuses, since the reference would build something
+    else. `norm_topk_prob: false` has no Mixture knob yet and refuses with
+    the field named rather than renormalising behind the config's back.
+    """
+    used.update(('n_routed_experts', 'num_local_experts',
+                 'num_experts_per_tok', 'routed_scaling_factor',
+                 'norm_topk_prob', 'n_group', 'topk_group',
+                 'n_shared_experts', 'moe_intermediate_size',
+                 'first_k_dense_replace', 'moe_layer_freq', 'topk_method',
+                 'scoring_func', 'mlp_layer_types'))
+    experts = hf_config.get('n_routed_experts',
+                            hf_config.get('num_local_experts'))
+    if experts is None:
+        _refuse("n_routed_experts",
+                "a DeepSeek MoE layer needs its expert count")
+    scoring = hf_config.get('scoring_func', 'sigmoid')
+    if scoring != 'sigmoid':
+        _refuse(f"scoring_func {scoring!r}",
+                "dew's router scores softmax, sigmoid or sqrtsoftplus, and "
+                "this family's reference scores sigmoid")
+    if hf_config.get('norm_topk_prob', True) is not True:
+        _refuse("norm_topk_prob=False",
+                "the mixture always renormalises the top-k weights; a knob "
+                "not to is what this field would need")
+    method = hf_config.get('topk_method')
+    if method is not None and method != 'noaux_tc':
+        _refuse(f"topk_method {method!r}",
+                "the reference selects with the bias and the group limit, "
+                "which is what noaux_tc names")
+    freq = hf_config.get('moe_layer_freq')
+    if freq is not None and freq != 1:
+        _refuse(f"moe_layer_freq {freq!r}",
+                "transformers builds every layer past the dense ones as MoE, "
+                "whatever this field says")
+    first_k = int(hf_config.get('first_k_dense_replace', 0) or 0)
+    if not 0 <= first_k <= layers:
+        _refuse(f"first_k_dense_replace {first_k!r}",
+                f"it names dense layers of a {layers}-layer model")
+    sparse = tuple(range(first_k, layers))
+    pattern = hf_config.get('mlp_layer_types')
+    if pattern is not None:
+        expected = (['dense'] * first_k
+                    + ['sparse'] * (layers - first_k))
+        if list(pattern) != expected:
+            _refuse(f"mlp_layer_types {list(pattern)!r}",
+                    "it disagrees with first_k_dense_replace, which is what "
+                    "the reference builds")
+    shared = int(hf_config.get('n_shared_experts', 0) or 0)
+    shared_features = 0
+    if shared:
+        width = hf_config.get('moe_intermediate_size')
+        if width is None:
+            _refuse("moe_intermediate_size",
+                    "the shared experts need their width")
+        shared_features = shared * int(width)
+    return {
+        'experts': int(experts),
+        'top_k': int(hf_config['num_experts_per_tok']),
+        'layers': sparse,
+        'score_function': 'sigmoid',
+        'scaling': float(hf_config.get('routed_scaling_factor', 1.0)),
+        'groups': int(hf_config.get('n_group') or 1),
+        'groups_per_token': int(hf_config.get('topk_group') or 1),
+        'bias': True,
+        'shared_features': shared_features,
+        'expert_features': int(hf_config['moe_intermediate_size']),
+    }
 
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
 
     Accepts the text decoder families CausalTransformer can express: llama,
-    qwen3, gemma3_text and gemma4_text. Every field that changes what a
-    forward pass computes and has no dew counterpart raises, naming the
-    field."""
+    qwen3, gemma3_text, gemma4_text, deepseek_v3 and deepseek_v32. Every field
+    that changes what a forward pass computes and has no dew counterpart
+    raises, naming the field."""
 
     model_type = hf_config.get('model_type')
     if model_type == 'qwen2':
@@ -310,8 +474,13 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     if model_type == 'gemma4_text':
         # Proportional partial rotary is a gemma4 shape with its own reader below.
         rope_theta, rope_local_theta = 10000.0, None
+        yarn = None
+    elif model_type in _DEEPSEEK:
+        rope_theta, yarn = _deepseek_rope(hf_config, used)
+        rope_local_theta = None
     else:
         rope_theta, rope_local_theta = _rope(hf_config, used)
+        yarn = None
     layer_types = _layer_types(hf_config, used)
     sliding_window = hf_config.get('sliding_window')
     used.add('sliding_window')
@@ -442,6 +611,89 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         used.update(('moe_intermediate_size', 'expert_intermediate_size',
                      'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
 
+    if model_type in _DEEPSEEK:
+        layers = int(hf_config['num_hidden_layers'])
+        sparse_name = ('deepseek_sparse_attention'
+                       if model_type == 'deepseek_v32' else 'full_attention')
+        if hf_config.get('layer_types') is None:
+            # Neither released config names its pattern: V3 is dense MLA
+            # throughout and V3.2 sparse attention throughout.
+            layer_types = (sparse_name,) * layers
+            config['layer_types'] = layer_types
+        for entry in layer_types:
+            if entry != sparse_name:
+                _refuse(f"layer_types entry {entry!r}",
+                        f"a {model_type} model mixes no attention kinds: "
+                        f"every layer is {sparse_name}")
+        nope = int(hf_config['qk_nope_head_dim'])
+        rope = int(hf_config['qk_rope_head_dim'])
+        head_dim = hf_config.get('head_dim')
+        if head_dim is not None and int(head_dim) != rope:
+            _refuse(f"head_dim {head_dim!r}",
+                    "DeepSeek points head_dim at the rope slice, "
+                    f"which is {rope} wide here")
+        derived = hf_config.get('qk_head_dim')
+        if derived is not None and int(derived) != nope + rope:
+            _refuse(f"qk_head_dim {derived!r}",
+                    f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
+                    f"which is {nope + rope} here")
+        v_dim = hf_config.get('v_head_dim')
+        if v_dim is None:
+            _refuse("v_head_dim",
+                    "the values need their width, and no default keeps a "
+                    "checkpoint's layout")
+        kv_rank = hf_config.get('kv_lora_rank')
+        if kv_rank is None:
+            _refuse("kv_lora_rank",
+                    "the latent needs its width, and no default keeps a "
+                    "checkpoint's layout")
+        interleave = hf_config.get('rope_interleave', True)
+        if model_type == 'deepseek_v32' and interleave is not True:
+            _refuse(f"rope_interleave {interleave!r}",
+                    "the V3.2 reference always rotates interleaved pairs; a "
+                    "flag saying otherwise describes no released model")
+        index: Optional[Dict[str, int]] = None
+        if model_type == 'deepseek_v32':
+            index = {
+                'index_topk': int(hf_config['index_topk']),
+                'index_n_heads': int(hf_config['index_n_heads']),
+                'index_head_dim': int(hf_config['index_head_dim']),
+            }
+            used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
+        # The released checkpoints ship no mtp.* weights (91991 tensors on
+        # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP), so the field
+        # builds the base model the weights describe. Weight translation
+        # refuses mtp.* tensors loudly, so a checkpoint that ships them
+        # cannot drop them silently.
+        # The fp8 scales name the stored dtype, not the computation: dew
+        # loads the dequantized weights, and the reader names an unreadable
+        # dtype where it meets one. ep_size is a runtime parallel hint.
+        used.update(('num_nextn_predict_layers', 'num_mtp_layers'))
+        used.update(('quantization_config', 'ep_size'))
+        used.update(('qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
+                     'kv_lora_rank', 'q_lora_rank', 'qk_head_dim',
+                     'rope_interleave'))
+        config.update(
+            head_dim=nope + rope,
+            mixer={
+                'kind': 'mla',
+                'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
+                                else int(hf_config['q_lora_rank'])),
+                'kv_lora_rank': int(kv_rank),
+                'qk_nope_head_dim': nope,
+                'qk_rope_head_dim': rope,
+                'v_head_dim': int(v_dim),
+                'rope_interleave': bool(interleave),
+                'yarn': yarn,
+                'index_topk': None if index is None else index['index_topk'],
+                'index_n_heads': None if index is None else index['index_n_heads'],
+                'index_head_dim': (None if index is None
+                                   else index['index_head_dim']),
+            },
+            mixture=_deepseek_mixture(hf_config, layers, used),
+            num_nextn_predict_layers=0,
+        )
+
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})
     if unknown:
@@ -469,8 +721,17 @@ _SANDWICH_NORMS = {
     'post_feedforward_layernorm': 'mlp_output_norm',
 }
 _PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj'),
-                'mlp': ('gate_proj', 'up_proj', 'down_proj')}
+                'mlp': ('gate_proj', 'up_proj', 'down_proj', 'gate')}
 _HEAD_NORMS = ('q_norm', 'k_norm')
+# The MLA projections and norms live under self_attn beside the standard
+# ones, with no counterpart in another family, so they extend the map by
+# pattern: a tensor that is present maps, whatever the family.
+_MLA_PROJECTIONS = ('q_a_proj', 'q_b_proj', 'kv_a_proj_with_mqa',
+                    'kv_b_proj', 'o_proj')
+_MLA_NORMS = ('q_a_layernorm', 'kv_a_layernorm')
+# One leaf per projection for the router and the shared experts; the routed
+# experts stack per-expert tensors (see _stack_experts).
+_MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 
 
 def _norm_names(sandwich: bool) -> Dict[str, str]:
@@ -510,6 +771,34 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
             if (module == 'self_attn' and sublayer in _HEAD_NORMS
                     and leaf == 'weight'):
                 return (layer, module, sublayer, 'scale')
+            if (module == 'self_attn' and sublayer in _MLA_PROJECTIONS
+                    and leaf in ('weight', 'bias')):
+                return (layer, module, sublayer,
+                        'kernel' if leaf == 'weight' else 'bias')
+            if (module == 'self_attn' and sublayer in _MLA_NORMS
+                    and leaf == 'weight'):
+                return (layer, module, sublayer, 'scale')
+        if (len(parts) == 7 and module == 'self_attn'
+                and parts[4] == 'indexer'):
+            # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
+            # and k_norm.{weight,bias}: the sparse selector's own tensors.
+            sublayer, leaf = parts[5], parts[6]
+            if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
+                return (layer, 'self_attn', 'indexer', sublayer, 'kernel')
+            if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
+                return (layer, 'self_attn', 'indexer', sublayer,
+                        'scale' if leaf == 'weight' else 'bias')
+        if (len(parts) == 8 and module == 'mlp'
+                and parts[4] in ('experts', 'shared_experts')):
+            # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
+            # tensor per expert, stacked by _stack_experts below; and the
+            # dense shared experts beside them.
+            group, index, projection = parts[4], parts[5], parts[6]
+            if projection in _MOE_SHARED and leaf == 'weight':
+                if group == 'shared_experts':
+                    return (layer, 'mlp', group, projection, 'kernel')
+                if group == 'experts' and index.isdigit():
+                    return (layer, 'mlp', group, index, projection, 'kernel')
         # Gemma 4's per-layer residual: gate and projection are kernels, the
         # post norm is a scale. The values norm carries no weight, so it maps
         # nothing.
@@ -522,6 +811,42 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
         if len(parts) == 5 and module in norms and leaf == 'weight':
             return (layer, norms[module], 'scale')
     raise ValueError(f"unknown tensor name {hf_name!r}")
+
+
+def _stack_experts(params: Dict[str, Any]) -> None:
+    """Per-expert `experts/K/projection` dicts into stacked `[E, ...]` leaves.
+
+    A checkpoint names one tensor per expert while the tree keeps one leaf
+    per projection stacked on an expert dimension, so after the flat map
+    each sparse layer's digit-keyed dicts stack in expert order. A layer
+    whose experts do not form a dense `0..E-1` run refuses rather than
+    stacking a shuffled or partial set.
+    """
+    for layer, block in params.items():
+        if not (isinstance(block, dict) and layer.startswith('layers_')):
+            continue
+        mlp = block.get('mlp')
+        if not isinstance(mlp, dict):
+            continue
+        experts = mlp.get('experts')
+        if not isinstance(experts, dict):
+            continue
+        indices = sorted(experts, key=int)
+        if ([int(index) for index in indices]
+                != list(range(len(indices)))):
+            raise ValueError(
+                f"{layer} experts {indices} are not a dense 0..E-1 run")
+        stacked = {}
+        for projection in experts[indices[0]]:
+            leaves = [np.ascontiguousarray(experts[index][projection]['kernel'])
+                      for index in indices]
+            shapes = {leaf.shape for leaf in leaves}
+            if len(shapes) != 1:
+                raise ValueError(
+                    f"{layer} experts disagree on {projection}: "
+                    f"{sorted(shapes)}")
+            stacked[projection] = {'kernel': np.stack(leaves)}
+        mlp['experts'] = stacked
 
 
 def translate_weights(hf_tensors: Mapping[str, np.ndarray],
@@ -537,6 +862,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     embedding (Qwen3-0.6B does). The copy is checked and dropped: the tree has
     one leaf for the two, and a checkpoint whose "tied" head is a different
     matrix would otherwise load as a model that computes something else.
+    DeepSeek's routed experts arrive one tensor per expert and stack onto
+    an expert dimension here; its dense shared experts, MLA projections
+    and indexer map by pattern like everything else.
     """
     tied_head = hf_tensors.get('lm_head.weight')
     if config['tie_embeddings'] and tied_head is not None:
@@ -558,6 +886,7 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
         for key in path[:-1]:
             node = node.setdefault(key, {})
         node[path[-1]] = leaf
+    _stack_experts(params)
     return {'params': params}
 
 
