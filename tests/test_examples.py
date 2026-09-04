@@ -1,101 +1,99 @@
-"""The example scripts run end to end with a tiny model and no downloads."""
+"""The three examples run end to end on stub data: train, evaluate, export."""
 
+import dataclasses
 import importlib.util
+import itertools
+import json
 import sys
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
-from PIL import Image
 
-from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
+from dew.data import Dataset, TokenWindows
+from dew.inputs import Condition, Field, InputSpec
+from test_diffusion_objective import RES, TOKENS, StubText
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_config_cli import RES, TOKENS, StubTextEncoder  # noqa: E402
+pytestmark = pytest.mark.mesh
 
-EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
-
-
-def fake_captioned_dataset(batch):
-    """Uniform-noise images with empty captions, batch sized for the 8 simulated devices."""
-    def batches():
-        rs = np.random.RandomState(0)
-        while True:
-            yield {"image": rs.uniform(0, 255, (batch, RES, RES, 3)).astype(np.float32),
-                   "text": {"input_ids": np.zeros((batch, TOKENS), np.int32),
-                            "attention_mask": np.ones((batch, TOKENS), np.int32)}}
-    return {"train": batches, "val": batches, "train_len": 4 * batch,
-            "local_batch_size": batch, "global_batch_size": batch}
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_example(name):
-    spec = importlib.util.spec_from_file_location(f"examples.{name}", EXAMPLES / f"{name}.py")
+    path = REPO_ROOT / "examples" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"example_{name}", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
+def _batches(batch, classes=None, size=RES):
+    """Endless captioned batches of noise images; labels when `classes` is set."""
+    def stream():
+        rng = np.random.RandomState(0)
+        while True:
+            record = {"image": rng.randint(0, 256, (batch, size, size, 3), np.uint8),
+                      "text": {"input_ids": np.ones((batch, TOKENS), np.int32),
+                               "attention_mask": np.ones((batch, TOKENS), np.int32)}}
+            if classes is not None:
+                record["label"] = rng.randint(0, classes, (batch,), np.int32)
+            yield record
+    return stream
+
+
+def fake_dataset(batch, classes=None, size=RES):
+    return Dataset(train=_batches(batch, classes, size),
+                   val=lambda: itertools.islice(_batches(batch, classes, size)(), 1),
+                   records=4 * batch, batch=batch)
+
+
 def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     example = load_example("train_diffusion")
-    inputs = DiffusionInputConfig(
-        sample_data_key="image", sample_data_shape=(RES, RES, 3),
-        conditions=[ConditionalInputConfig(
-            encoder=StubTextEncoder(model="stub", tokenizer=None), conditioning_data_key="text",
-            pretokenized=True, unconditional_input="", model_key_override="textcontext")])
-    config = example.Config(
-        image_size=RES, batch_size=8, epochs=1, steps_per_epoch=3,
-        model=dict(patch_size=8, emb_features=32, num_layers=1, num_heads=2), prompts=("a", "b"),
-        out=tmp_path / "run")
-    config.out.mkdir()
+    config = example.Config(image_size=RES, batch_size=8, steps=3, prompts=("a", "b"),
+                            model=dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
+                            out=tmp_path)
+    inputs = InputSpec(Field("image", (RES, RES, 3)),
+                       {"textcontext": Condition(StubText.from_pretrained("stub"))})
 
-    state = example.main(config, data=fake_captioned_dataset(8), inputs=inputs)
+    state = example.main(config, data=fake_dataset(8), inputs=inputs)
 
     assert int(state.step) == 3
-    grid = np.asarray(Image.open(config.out / "samples.png"))
+    grid = np.asarray(__import__("PIL.Image").Image.open(tmp_path / "samples.png"))
     assert grid.shape == (RES, 2 * RES, 3) and grid.dtype == np.uint8
-    assert (config.out / "export" / "model.safetensors").exists()
-    assert (config.out / "export" / "config.json").exists()
-    assert any((config.out / "checkpoints").rglob("*"))
-
-
-def fake_labelled_dataset(batch, classes):
-    def batches():
-        rs = np.random.RandomState(0)
-        while True:
-            yield {"image": rs.uniform(0, 255, (batch, RES, RES, 3)).astype(np.float32),
-                   "label": rs.randint(0, classes, batch).astype(np.int32)}
-    return {"train": batches, "val": batches, "train_len": 4 * batch,
-            "local_batch_size": batch, "global_batch_size": batch}
+    assert (tmp_path / "export" / "model.safetensors").exists()
+    assert (tmp_path / "export" / "config.json").exists()
+    assert any((tmp_path / "checkpoints").iterdir())
 
 
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     example = load_example("train_jepa")
-    config = example.Config(
-        classes=5, image_size=RES, patch_size=4, batch_size=8, epochs=1, steps_per_epoch=3,
-        emb_features=32, num_layers=2, num_heads=2, out=tmp_path / "run")
-    config.out.mkdir()
+    # An 8x8 patch grid, the smallest the default mask geometry fits on.
+    config = example.Config(classes=5, image_size=32, patch_size=4, batch_size=8, steps=3,
+                            model=dict(emb_features=32, num_layers=2, num_heads=2), out=tmp_path)
 
-    state = example.main(config, data=fake_labelled_dataset(8, 5))
+    state = example.main(config, data=fake_dataset(8, classes=5, size=32))
 
     assert int(state.step) == 3
-    assert (config.out / "encoder.safetensors").stat().st_size > 0
+    assert (tmp_path / "encoder.safetensors").stat().st_size > 0
 
 
 def test_train_lm_example_trains_and_generates(tmp_path):
-    example = load_example("train_lm")
     tokens = tmp_path / "tokens"
     tokens.mkdir()
-    rs = np.random.RandomState(0)
-    for name, n in (("train.bin", 40_000), ("val.bin", 4_000)):
-        (tokens / name).write_bytes(rs.randint(97, 123, n).astype(np.uint8).tobytes())
-    (tokens / "meta.json").write_text('{"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}')
-    config = example.Config(
-        tokens=tokens, sequence_length=32, batch_size=8, epochs=1, steps_per_epoch=3,
-        emb_features=32, num_layers=1, num_heads=2, prompt="ab", sample_tokens=8, out=tmp_path / "run")
-    config.out.mkdir()
+    text = ("ab" * 2000).encode()
+    (tokens / "train.bin").write_bytes(text[:3600])
+    (tokens / "val.bin").write_bytes(text[3600:])
+    (tokens / "meta.json").write_text(json.dumps(
+        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
+    example = load_example("train_lm")
+    config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=3,
+                            model=dict(emb_features=16, num_layers=1, num_heads=2),
+                            prompt="ab", sample_tokens=8, out=tmp_path / "run")
 
     state = example.main(config)
 
     assert int(state.step) == 3
-    text = (config.out / "sample.txt").read_text()
-    assert text.startswith("ab") and len(text) > 2
+    sample = (tmp_path / "run" / "sample.txt").read_text()
+    assert sample.startswith("ab") and len(sample) > 2

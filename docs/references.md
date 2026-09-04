@@ -11,6 +11,7 @@
 - Pseudo Numerical Methods for Diffusion Models on Manifolds (PNMDM) [paper](https://arxiv.org/abs/2202.09778)
 - The DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps [paper](https://arxiv.org/pdf/2206.00927)
 - Scalable Diffusion Models with Transformers (DiT) [paper](https://arxiv.org/abs/2212.09748)
+  SimpleDiT's time embedder is EDM's random Fourier feature embedding (`nn/blocks.py` `FourierEmbedding`, Gaussian frequencies at scale 16, which takes an input of order one), not DiT's sinusoidal one; the flow preset multiplies its shifted time by 1000 before the embedder because the flow models were trained that way, not because the embedder asks for it.
 - Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (SD3) [paper](https://arxiv.org/abs/2403.03206)
 - Flow Matching for Generative Modeling [paper](https://arxiv.org/abs/2210.02747)
 - Efficient Diffusion Training via Min-SNR Weighting Strategy [paper](https://arxiv.org/abs/2303.09556)
