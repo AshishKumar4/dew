@@ -1,7 +1,6 @@
-"""I-JEPA and V-JEPA: masking, shapes, the objective, and collapse telemetry."""
+"""I-JEPA and V-JEPA: masking, shapes, the objective, collapse telemetry, and
+the objective through the general trainer."""
 
-import importlib.util
-from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,14 +10,16 @@ import pytest
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
-from dew.inputs import DiffusionInputConfig
+from dew.artifacts import Representations
+from dew.inputs import Field
+from dew.objectives.base import Step
 from dew.objectives.jepa import (
     JepaEncoder, JepaVideoEncoder, JepaObjective, multi_block_mask,
-    representation_health, normalize_targets, linear_probe, knn_probe,
+    representation_health, normalize_targets, linear_probe_accuracy, knn_probe_accuracy,
 )
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.training import ObjectiveTrainer
-from dew.training.distributed import DevicePrefetchIterator
+from dew.registry import metrics, models
+from dew.training import Layout, MeshSpec, Trainer
 
 RES = 32
 PATCH = 4
@@ -43,7 +44,22 @@ def make_predictor(**kwargs):
 
 def make_objective(mask, **kwargs):
     return JepaObjective(make_encoder(), make_predictor(), mask,
-                         sample_data_key="image", sample_data_shape=(RES, RES, 3), **kwargs)
+                         sample=Field("image", (RES, RES, 3)), **kwargs)
+
+
+def step_with(params, key=7, index=0):
+    """What the trainer hands the objective: the EMA copy is the params themselves."""
+    return Step(step=jnp.asarray(index), key=jax.random.PRNGKey(key), ema=params)
+
+
+class Data:
+    def __init__(self, train, val=None, batch=4):
+        self._train, self.val, self.batch, self.records = train, val, batch, None
+
+    def train(self):
+        return self._train()
+
+    steps_per_epoch = None
 
 
 def images(seed=0, batch=4):
@@ -170,11 +186,11 @@ def test_encoder_runs_on_the_ssm_mixer(mask, rng):
 
 def test_fresh_loss_is_non_trivial_and_training_reduces_it(mask, rng):
     objective = make_objective(mask)
-    params = objective.init_params(rng)
+    params = objective.init(rng)
     batch = {"image": images()}
 
     def loss_of(p):
-        return objective.loss(p, params, batch, jax.random.PRNGKey(7), 0)[0]
+        return objective.loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     assert initial > 0.1, "a fresh model already predicts the targets"
@@ -194,12 +210,12 @@ def test_video_objective_trains(mask, rng):
         JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
                          num_heads=2, mlp_ratio=2),
         make_predictor(factorized=True), mask,
-        sample_data_key="video", sample_data_shape=(FRAMES, RES, RES, 3))
-    params = objective.init_params(rng)
+        sample=Field("video", (FRAMES, RES, RES, 3)))
+    params = objective.init(rng)
     batch = {"video": videos()}
 
     def loss_of(p):
-        return objective.loss(p, params, batch, jax.random.PRNGKey(7), 0)[0]
+        return objective.loss(p, batch, step_with(params))[0]
 
     initial = float(loss_of(params))
     optimizer = optax.adam(3e-3)
@@ -217,13 +233,11 @@ def test_bf16_models_keep_the_loss_in_fp32(mask, rng):
     must not be quantized to the models' bf16 compute dtype."""
     objective = JepaObjective(make_encoder(dtype=jnp.bfloat16),
                               make_predictor(dtype=jnp.bfloat16), mask,
-                              sample_data_key="image",
-                              sample_data_shape=(RES, RES, 3))
-    params = objective.init_params(rng)
-    loss, aux = objective.loss(params, params, {"image": images()},
-                               jax.random.PRNGKey(7), 0)
+                              sample=Field("image", (RES, RES, 3)))
+    params = objective.init(rng)
+    loss, aux = objective.loss(params, {"image": images()}, step_with(params))
     assert loss.dtype == jnp.float32
-    assert all(a.dtype == jnp.float32 for a in aux.values())
+    assert all(a.dtype == jnp.float32 for a in aux.metrics.values())
 
 
 def solid_colour_images(rs, n):
@@ -254,29 +268,29 @@ def context_ablation(objective, params, ema, data, mask, rng):
     return error(context), error(jnp.roll(context, 1, axis=0))
 
 
-def test_training_makes_the_prediction_depend_on_the_context(tmp_path, mask):
+def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
-    ignoring the context entirely - which would teach the encoder nothing.
+    ignoring the context entirely, which would teach the encoder nothing.
     Swapping in another image's context must cost real accuracy."""
     rs = np.random.RandomState(0)
     train_x, test_x = solid_colour_images(rs, 128), solid_colour_images(rs, 32)
     normalized_test = (test_x - 127.5) / 127.5
 
-    trainer = make_jepa_trainer(tmp_path, mask, learning_rate=3e-3,
+    trainer = make_jepa_trainer(mask, learning_rate=3e-3,
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
-    before = context_ablation(objective, trainer.state.params, trainer.state.ema_params,
+    initial = trainer.initial_state()
+    before = context_ablation(objective, initial.params, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
     assert before[1] / before[0] < 1.5, "a fresh predictor should not favour any context"
 
     def batches():
         while True:
-            yield {"image": train_x[rs.randint(0, len(train_x), 16)]}
+            yield {"image": np.asarray(train_x[rs.randint(0, len(train_x), 16)], np.uint8)}
 
-    state = trainer.fit({"train": batches, "train_len": 128, "local_batch_size": 16},
-                        training_steps_per_epoch=150, epochs=1, val_steps_per_epoch=0)
+    state = trainer.fit(Data(batches, batch=16), steps=150, log_every=50)
 
-    after = context_ablation(objective, state.params, state.ema_params,
+    after = context_ablation(objective, state.params, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
     assert after[0] < before[0] / 2, "held-out prediction error did not improve"
     assert after[1] / after[0] > 5.0, "the predictor still ignores its context"
@@ -285,11 +299,11 @@ def test_training_makes_the_prediction_depend_on_the_context(tmp_path, mask):
 def test_no_gradient_reaches_the_target_branch(mask, rng):
     """stop_gradient on the target encoder is what stops the trivial solution."""
     objective = make_objective(mask)
-    params = objective.init_params(rng)
+    params = objective.init(rng)
     batch = {"image": images()}
 
     grads = jax.grad(
-        lambda ema: objective.loss(params, ema, batch, jax.random.PRNGKey(7), 0)[0]
+        lambda ema: objective.loss(params, batch, step_with(ema))[0]
     )(params)
     assert all(float(jnp.max(jnp.abs(g))) == 0.0 for g in jax.tree.leaves(grads))
 
@@ -315,18 +329,16 @@ def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
     collapsed = JepaObjective(
         ConstantEncoder(patch_size=PATCH, emb_features=32, num_layers=2, num_heads=2,
                         mlp_ratio=2),
-        make_predictor(), mask, "image", (RES, RES, 3))
-    collapsed_params = collapsed.init_params(rng)
-    _, collapsed_aux = collapsed.loss(
-        collapsed_params, collapsed_params, batch, jax.random.PRNGKey(7), 0)
+        make_predictor(), mask, sample=Field("image", (RES, RES, 3)))
+    collapsed_params = collapsed.init(rng)
+    _, collapsed_aux = collapsed.loss(collapsed_params, batch, step_with(collapsed_params))
 
     healthy = make_objective(mask)
-    healthy_params = healthy.init_params(rng)
-    _, healthy_aux = healthy.loss(
-        healthy_params, healthy_params, batch, jax.random.PRNGKey(7), 0)
+    healthy_params = healthy.init(rng)
+    _, healthy_aux = healthy.loss(healthy_params, batch, step_with(healthy_params))
 
-    assert float(collapsed_aux["repr_std"]) < 1e-5
-    assert float(healthy_aux["repr_std"]) > 1e-3
+    assert float(collapsed_aux.metrics["repr_std"]) < 1e-5
+    assert float(healthy_aux.metrics["repr_std"]) > 1e-3
 
 
 def test_offdiagonal_covariance_rises_with_redundant_dimensions():
@@ -343,101 +355,108 @@ def test_momentum_schedule_endpoints(mask):
     objective = make_objective(mask, momentum=(0.996, 1.0), momentum_steps=1000)
     assert float(objective.ema.decay(0)) == pytest.approx(0.996)
     assert float(objective.ema.decay(1000)) == pytest.approx(1.0)
-    assert objective.ema.path == ("params", "context_encoder")
+    assert objective.ema.select(("params", "context_encoder", "anything"))
+    assert not objective.ema.select(("params", "predictor", "anything"))
 
 
-def make_jepa_trainer(tmp_path, mask, learning_rate=1e-3, fsdp_size=1, **kwargs):
-    encoder = make_encoder()
-    return ObjectiveTrainer(
-        model=encoder,
-        optimizer=optax.adam(learning_rate),
-        input_config=DiffusionInputConfig(
-            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
-        rngs=jax.random.PRNGKey(0),
-        objective=JepaObjective(encoder, make_predictor(), mask, "image",
-                                (RES, RES, 3), **kwargs),
-        name="jepa-smoke", wandb_config=None,
-        distributed_training=fsdp_size > 1,
-        fsdp_size=fsdp_size,
+def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):
+    return Trainer(
+        JepaObjective(make_encoder(), make_predictor(), mask,
+                      sample=Field("image", (RES, RES, 3)), **kwargs),
+        optax.adam(learning_rate),
+        key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp),
         # This encoder's parameters are far below the production shard
         # threshold, so lower it or "FSDP on" would mean "all replicated"
-        fsdp_min_param_size=256,
-        checkpoint_base_path=str(tmp_path),
+        layout=Layout(min_shard=256),
     )
 
 
-def test_target_encoder_tracks_the_context_encoder(tmp_path, mask):
-    trainer = make_jepa_trainer(tmp_path, mask, momentum=(0.5, 0.5), momentum_steps=1)
-    # Copied to the host: the train step donates the state, so the device
-    # buffers behind this reference are gone once fit has run.
-    initial = jax.tree.map(np.asarray, trainer.state.ema_params)
+def image_batches(batch=8):
+    while True:
+        yield {"image": np.asarray(images(batch=batch), np.uint8),
+               "label": np.arange(batch) % 4}
 
-    def batches():
-        while True:
-            yield {"image": images()}
 
-    state = trainer.fit({"train": batches, "train_len": 16, "local_batch_size": 4},
-                        training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
+def test_target_encoder_tracks_the_context_encoder(mask):
+    trainer = make_jepa_trainer(mask, momentum=(0.5, 0.5), momentum_steps=1)
+    initial = jax.tree.map(np.asarray, trainer.initial_state().ema)
 
+    state = trainer.fit(Data(image_batches, batch=8), steps=3, log_every=1)
+
+    # The EMA holds the context encoder alone: the predictor is not averaged.
+    assert set(state.ema["params"]) == {"context_encoder"}
     context_moved = any(
         not np.allclose(a, b) for a, b in zip(
-            jax.tree.leaves(state.ema_params["params"]["context_encoder"]),
+            jax.tree.leaves(state.ema["params"]["context_encoder"]),
             jax.tree.leaves(initial["params"]["context_encoder"])))
-    predictor_frozen = all(
-        np.allclose(a, b) for a, b in zip(
-            jax.tree.leaves(state.ema_params["params"]["predictor"]),
-            jax.tree.leaves(initial["params"]["predictor"])))
     assert context_moved, "the target encoder never followed the context encoder"
-    assert predictor_frozen, "EMA leaked outside the context encoder subtree"
 
     # and it followed rather than jumped: still between where it started and now
-    ema = jax.tree.leaves(state.ema_params["params"]["context_encoder"])
+    ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
     live = jax.tree.leaves(state.params["params"]["context_encoder"])
     assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
 
 
-def test_jepa_trains_under_fsdp(tmp_path, mask):
+def test_jepa_trains_under_fsdp(mask):
     """Where the two halves of the trainer meet: an objective that owns a
     multi-encoder parameter tree, run through the sharded, donating train step.
 
-    Compiling is not the claim - the parameters have to be genuinely split
+    Compiling is not the claim. The parameters have to be genuinely split
     across the fsdp axis, the EMA target encoder has to follow their layout,
     and the loss has to come back finite with its collapse telemetry intact.
     """
-    trainer = make_jepa_trainer(tmp_path, mask, fsdp_size=2)
-    specs = [p.sharding.spec for p in jax.tree.leaves(trainer.state.params)]
+    logged = []
 
-    sharded = [p for p in jax.tree.leaves(trainer.state.params)
-               if 'fsdp' in str(p.sharding.spec)]
+    class Tracker:
+        def log(self, scalars, step):
+            logged.append(dict(scalars))
+
+        def artifact(self, value, step):
+            pass
+
+    trainer = make_jepa_trainer(mask, fsdp=2)
+    trainer.tracker = Tracker()
+    state = trainer.fit(Data(image_batches, batch=jax.device_count()), steps=2, log_every=1)
+
+    sharded = [p for p in jax.tree.leaves(state.params) if 'fsdp' in str(p.sharding.spec)]
     assert sharded, "no JEPA parameter was sharded over the fsdp axis"
     for param in sharded:
         assert param.addressable_shards[0].data.size == param.size // 2
 
-    # The target encoder is a second copy of the same tree, so it must land on
-    # the mesh the same way rather than being gathered onto every device
-    assert specs == [p.sharding.spec for p in jax.tree.leaves(trainer.state.ema_params)]
-
-    def batches():
-        while True:
-            yield {"image": np.asarray(images(batch=jax.device_count()))}
-
-    train_step = trainer._define_train_step(batch_size=jax.device_count())
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
-    for _ in range(2):
-        state, loss, aux, rng, is_finite = train_step(state, rng, next(source))
-        assert bool(is_finite)
-        assert float(aux["repr_std"]) > 0, "collapse telemetry was lost in the step"
-
+    # The target encoder is a second copy of the same subtree, so it must land
+    # on the mesh the same way rather than being gathered onto every device
+    encoder_specs = [p.sharding.spec for p in
+                     jax.tree.leaves(state.params["params"]["context_encoder"])]
+    assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]
     assert int(state.step) == 2
-    assert specs == [p.sharding.spec for p in jax.tree.leaves(state.params)]
+    assert all(np.isfinite(entry["train/loss"]) for entry in logged)
+    assert all(entry["train/repr_std"] > 0 for entry in logged), "collapse telemetry was lost"
 
 
-def test_validation_step_returns_pooled_embeddings(tmp_path, mask):
-    trainer = make_jepa_trainer(tmp_path, mask)
-    embed = trainer._define_validation_step()
-    out = embed(trainer.state, {"image": images()})
-    assert out.shape == (4, 32)
+def test_evaluation_returns_pooled_embeddings_with_the_labels(mask):
+    objective = make_objective(mask)
+    params = objective.init(jax.random.PRNGKey(0))
+    batch = {"image": images(), "label": jnp.asarray([0, 1, 2, 3])}
+
+    out = objective.evaluate(params, batch, step_with(params))
+
+    assert isinstance(out, Representations)
+    assert out.features.shape == (4, 32)
+    np.testing.assert_array_equal(out.labels, [0, 1, 2, 3])
+
+
+def test_evaluation_reads_the_ema_encoder(mask):
+    objective = make_objective(mask)
+    params = objective.init(jax.random.PRNGKey(0))
+    ema = {"params": {"context_encoder": jax.tree.map(
+        lambda p: p + 0.1, params["params"]["context_encoder"])}}
+    batch = {"image": images(), "label": jnp.zeros((4,), jnp.int32)}
+    from dew.objectives.base import merge
+
+    live = objective.evaluate(params, batch, step_with(params))
+    averaged = objective.evaluate(params, batch, step_with(merge(params, ema)))
+    assert not np.allclose(live.features, averaged.features)
 
 
 # --- probes ----------------------------------------------------------------
@@ -453,90 +472,30 @@ def separable_embeddings(num_classes=4, per_class=8, dim=6, noise=0.05):
 
 def test_probes_separate_clustered_embeddings():
     x, y = separable_embeddings()
-    assert float(linear_probe(x, y, num_classes=4, steps=200)) > 0.9
-    assert float(knn_probe(x, y, num_classes=4, k=3)) > 0.9
+    assert float(linear_probe_accuracy(x, y, num_classes=4, steps=200)) > 0.9
+    assert float(knn_probe_accuracy(x, y, num_classes=4, k=3)) > 0.9
+
+
+def test_probe_metrics_score_representations_and_average_over_the_pass():
+    x, y = separable_embeddings()
+    representations = Representations(features=x, labels=y)
+    linear, knn = metrics.linear_probe(4, steps=200), metrics.knn_probe(4, k=3)
+    assert linear.reads is Representations and linear.name == "linear_probe_accuracy"
+    assert linear.reduce([linear(representations, None), 0.0]) == pytest.approx(
+        float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)
+    assert knn.reduce([knn(representations, None)]) > 0.9
 
 
 def test_probes_are_at_chance_on_noise():
     x = jax.random.normal(jax.random.PRNGKey(0), (64, 6))
     y = jnp.asarray(np.random.RandomState(1).randint(0, 4, 64))
-    assert float(knn_probe(x, y, num_classes=4, k=5)) < 0.6
+    assert float(knn_probe_accuracy(x, y, num_classes=4, k=5)) < 0.6
 
 
-# --- registry and entrypoint ----------------------------------------------
+# --- registry ---------------------------------------------------------------
 
 @pytest.mark.parametrize("architecture", ["jepa_encoder", "jepa_video_encoder"])
 def test_registry_builds_the_jepa_models(architecture):
-    from dew.registry import build_model
-    model = build_model(f"{architecture}+hilbert",
-                        {"patch_size": PATCH, "emb_features": 32, "num_layers": 1})
+    model = models.build(architecture, patch_size=PATCH, emb_features=32, num_layers=1,
+                         scan_order="hilbert")
     assert model.emb_features == 32 and model.scan_order == 'hilbert'
-
-
-def load_recipe():
-    """The recipe module, loaded from its path the way the CLI runs it."""
-    spec = importlib.util.spec_from_file_location(
-        "jepa_train_recipe", Path(__file__).resolve().parents[1] / "recipes" / "jepa" / "train.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_the_predictor_follows_the_run_precision_policy():
-    """The predictor is as much part of the run as the encoder: one dtype knob,
-    one kernel knob, and a predictor JSON holds no second opinion on either."""
-    from dew.config import ModelConfig
-
-    recipe = load_recipe()
-    model = ModelConfig("jepa_encoder", {
-        "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
-        "mlp_ratio": 2}, dtype="bfloat16", attention_impl="xla")
-    predictor_json = {"predictor_features": 16, "num_layers": 1, "num_heads": 2}
-
-    config = recipe.JepaRunConfig(model=model, predictor=predictor_json)
-    encoder, encoder_config = recipe.build_encoder(config)
-    predictor, _ = recipe.build_predictor(config, encoder_config, encoder, GRID, False)
-    assert predictor.dtype is jnp.bfloat16
-    assert predictor.attention_impl == "xla"
-
-    with pytest.raises(ValueError, match="--model.dtype"):
-        recipe.build_predictor(
-            recipe.JepaRunConfig(model=model,
-                                 predictor={**predictor_json, "dtype": "float32"}),
-            encoder_config, encoder, GRID, False)
-
-
-def test_training_entrypoint_runs_end_to_end(tmp_path, monkeypatch):
-    """Registry -> mask -> objective -> trainer -> probes, as the recipe wires them."""
-    from dew.config import DataConfig, ModelConfig, TrainerConfig
-
-    training_jepa = load_recipe()
-
-    classes = 4
-
-    def fake_dataset(*args, **kwargs):
-        def batches():
-            rs = np.random.RandomState(0)
-            while True:
-                yield {"image": jnp.asarray(rs.uniform(0, 255, (4, RES, RES, 3))),
-                       "label": jnp.asarray(rs.randint(0, classes, 4))}
-        return {"train": batches, "val": batches, "train_len": 16, "local_batch_size": 4}
-
-    monkeypatch.setattr(training_jepa, "load_data", fake_dataset)
-    config = training_jepa.JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {
-            "patch_size": PATCH, "emb_features": 32, "num_layers": 1, "num_heads": 2,
-            "mlp_ratio": 2, "ssm_attention_ratio": "3:1", "ssm_state_dim": 8,
-        }),
-        data=DataConfig(image_size=RES, batch_size=4, val_steps_per_epoch=1),
-        trainer=TrainerConfig(epochs=1, steps_per_epoch=2, distributed_training=False,
-                              checkpoint_dir=str(tmp_path), compilation_cache_dir=None, multi_host=False),
-        predictor={"predictor_features": 16, "num_layers": 1, "num_heads": 2},
-        probe_classes=classes,
-    )
-    trainer = training_jepa.main(config)
-
-    assert trainer.objective.tag == 'jepa'
-    assert trainer.state.step == 2
-    # No wandb project configured, so the run never opened one
-    assert trainer.wandb is None
