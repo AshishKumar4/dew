@@ -72,9 +72,12 @@ def main(config: DiffusionRunConfig) -> TrainState:
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
     print(f"Local devices: {jax.local_devices()}")
 
-    data = config.data.load(batch=config.trainer.batch_size)
-    steps = config.trainer.total_steps(data)
+    # The objective first: its conditions are what read the dataset's
+    # captions, so the encoder the run names decides the tokens.
     objective = config.build()
+    data = config.data.load(batch=config.trainer.batch_size,
+                            tokenize=objective.inputs.tokenize)
+    steps = config.trainer.total_steps(data)
     fields = config.model_fields(objective.autoencoder)
 
     run_config = config.to_dict()

@@ -49,29 +49,15 @@ def _table(records=RECORDS, size=IMAGE_SIZE):
     })
 
 
-class _StubTokenizer:
-    """Offline stand-in for the CLIP tokenizer the real transform builds.
-
-    The ids are a digest of the caption, so a caption stays comparable after a
-    trip through grain's worker processes.
-    """
-
-    def __init__(self, tensor_type="np"):
-        self.tensor_type = tensor_type
-
-    def __call__(self, caption):
-        digest = hashlib.blake2s(caption.encode(), digest_size=8).digest()
-        return {
-            "input_ids": np.frombuffer(digest, np.int32)[None, :],
-            "attention_mask": np.ones((1, 2), np.int32),
-        }
+def keep_captions(captions):
+    """A caption reader that hands the words back, so a test reads what the
+    dataset wrote before a run's encoder tokenizes it."""
+    return {"caption": np.asarray(captions)}
 
 
-def _caption_ids(*records):
-    """The ids the stub tokenizer produces for those records' captions."""
-    tokenizer = _StubTokenizer()
-    return np.concatenate(
-        [tokenizer(f"caption number {i}")["input_ids"] for i in records])
+def _captions(*records):
+    """The captions those records carry, in table order."""
+    return [f"caption number {i}" for i in records]
 
 
 @pytest.fixture
@@ -84,7 +70,6 @@ def hub(monkeypatch):
         return _table()
 
     monkeypatch.setattr(datasets, "load_dataset", load_dataset)
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
     return calls
 
 
@@ -198,14 +183,15 @@ def test_records_do_not_depend_on_worker_count():
 
 def test_a_hub_dataset_spec_builds_the_image_pipeline(hub):
     """No registry entry per dataset and no path: the name carries the table."""
-    data = _hub_images(val_batches=None).load(batch=4)
+    data = _hub_images(val_batches=None).load(batch=4, tokenize=keep_captions)
 
     assert hub == [{"name": "acme/pets", "split": "train"}]
     assert data.records == RECORDS and data.val is None
 
     batch = next(data.train())
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
-    assert batch["text"]["input_ids"].shape == (4, 2)
+    # The train stream shuffles, so the captions are the table's, in some order.
+    assert set(map(str, batch["caption"])) <= set(_captions(*range(RECORDS)))
     # A caption dataset carries no class index, and the transform invents none.
     assert "label" not in batch
 
@@ -223,17 +209,17 @@ def test_the_caption_comes_from_the_record(hub):
     The validation loader reads the held-out records in table order, so which
     caption belongs in which row is known here.
     """
-    data = _hub_images(val_batches=1).load(batch=2)
+    data = _hub_images(val_batches=1).load(batch=2, tokenize=keep_captions)
     batch = next(data.val())
 
-    assert np.array_equal(batch["text"]["input_ids"], _caption_ids(0, 1))
+    assert list(map(str, batch["caption"])) == _captions(0, 1)
 
 
 def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
-    data = _hub_images(val_batches=1).load(batch=4)
+    data = _hub_images(val_batches=1).load(batch=4, tokenize=keep_captions)
 
     assert data.records == RECORDS - 4 and data.steps_per_epoch == 3
     batch = next(data.val())
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     # The held-out records, in table order.
-    assert np.array_equal(batch["text"]["input_ids"], _caption_ids(0, 1, 2, 3))
+    assert list(map(str, batch["caption"])) == _captions(0, 1, 2, 3)

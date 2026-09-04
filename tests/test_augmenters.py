@@ -47,22 +47,10 @@ DRAWS = 32
 RECORDS = 16
 
 
-class _StubTokenizer:
-    """Offline stand-in for the CLIP tokenizer the real transform builds.
-
-    The ids are a digest of the caption, so a caption stays comparable after a
-    trip through grain's worker processes.
-    """
-
-    def __init__(self, tensor_type="np"):
-        self.tensor_type = tensor_type
-
-    def __call__(self, caption):
-        digest = hashlib.blake2s(caption.encode(), digest_size=8).digest()
-        return {
-            "input_ids": np.frombuffer(digest, np.int32)[None, :],
-            "attention_mask": np.ones((1, 2), np.int32),
-        }
+def keep_captions(captions):
+    """A caption reader that hands the words back, so a test can read what
+    the dataset wrote before a run's encoder tokenizes it."""
+    return {"caption": np.asarray(captions)}
 
 
 def _write_labels(tmp_path):
@@ -101,7 +89,6 @@ def _spec(kind, labels_file, augmentation="flip_jitter"):
 
 
 def _make_transform(kind, labels_file, monkeypatch, augmentation="flip_jitter"):
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
     return ImageTransform(_spec(kind, labels_file, augmentation))
 
 
@@ -182,7 +169,7 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path, monke
     assert out["image"].dtype == np.uint8
     np.testing.assert_array_equal(out["image"], _resized(kind, element))
     # the surrounding record wiring stays intact
-    assert "input_ids" in out["text"] and "attention_mask" in out["text"]
+    assert out["caption"] == "a yellow tulip" if kind == "gcs" else out["caption"]
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
@@ -232,7 +219,6 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
 def test_the_default_augmentation_is_flip_jitter(kind, tmp_path, monkeypatch):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
     spec = dataclasses.replace(_spec(kind, labels_file), augmentation=OxfordFlowers().augmentation)
     transform = ImageTransform(spec)
 
@@ -265,7 +251,7 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
     two = other.random_map(element, _record_rng(7))
 
     np.testing.assert_array_equal(one["image"], two["image"])
-    np.testing.assert_array_equal(one["text"]["input_ids"], two["text"]["input_ids"])
+    assert one["caption"] == two["caption"]
     assert np.array_equal(numpy_state, np.random.get_state()[1])
     assert random.getstate() == python_state
 
@@ -298,7 +284,6 @@ def test_a_record_with_no_caption_column_says_what_it_has():
 def test_a_hub_record_captions_from_the_record_and_reads_no_label_file(monkeypatch):
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
     transform = ImageTransform(images.HFImages(name="acme/pets", image_size=SCALE,
                                                augmentation="none"))
 
@@ -308,8 +293,7 @@ def test_a_hub_record_captions_from_the_record_and_reads_no_label_file(monkeypat
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (SCALE, SCALE),
                                  interpolation=cv2.INTER_AREA))
-    np.testing.assert_array_equal(
-        out["text"]["input_ids"], _StubTokenizer()("a yellow tulip")["input_ids"][0])
+    assert out["caption"] == "a yellow tulip"
     assert "label" not in out
 
 
@@ -327,23 +311,23 @@ class Flowers(OxfordFlowers):
 
 
 def _by_record(spec, worker_count):
-    """label -> (image, caption ids) for every record of one epoch.
+    """label -> (image, caption) for every record of one epoch.
 
     Keyed by label rather than compared batch for batch: grain gives each
     worker its own slice of the index stream, so batch composition follows
     worker_count while record content must not.
     """
-    data = dataclasses.replace(spec, worker_count=worker_count).load(batch=4)
+    data = dataclasses.replace(spec, worker_count=worker_count).load(
+        batch=4, tokenize=keep_captions)
     records = {}
     for batch in itertools.islice(data.train(), data.steps_per_epoch):
         for position, label in enumerate(batch["label"]):
             records[int(label)] = (batch["image"][position].tobytes(),
-                                   batch["text"]["input_ids"][position].tobytes())
+                                   str(batch["caption"][position]))
     return records
 
 
-def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path, monkeypatch):
-    monkeypatch.setattr(images, "AutoTextTokenizer", _StubTokenizer)
+def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path):
     labels_file = tmp_path / "indexed_labels.txt"
     labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
     spec = Flowers(image_size=SCALE, labels=str(labels_file), val_batches=None, seed=7,

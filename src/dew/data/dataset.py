@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import grain.python as pygrain
 import jax
@@ -54,11 +54,69 @@ class Dataset:
 
 
 class DatasetSpec(ABC):
-    """What a dataset is and how it is read; a frozen dataclass per kind."""
+    """What a dataset is and how it is read; a frozen dataclass per kind.
+
+    A dataset that captions its records takes `tokenize` as well: the
+    captions are the dataset's own product and which encoder reads them, at
+    which context length, belongs to the run's condition, not to the source
+    of the pictures.
+    """
 
     @abstractmethod
     def load(self, *, batch: int) -> Dataset:
         """The dataset's batches, `batch` records a step across every process."""
+
+
+CAPTION = "caption"
+"""The batch field a captioning dataset writes its text in, before a run's
+conditions read it."""
+
+
+def tokenized(stream: Callable[[], Iterator[Batch]],
+              tokenize: Callable[[Sequence[str]], Mapping[str, Any]] | None
+              ) -> Callable[[], Iterator[Batch]]:
+    """`stream` with each batch's captions replaced by what `tokenize` reads
+    out of them.
+
+    `tokenize` takes the batch's captions and returns the batch fields a
+    run's conditions want, so an encoder's context length is the encoder's
+    business and `--text.encoder char_table` and `--text.encoder clip_text`
+    read the same dataset. It runs here, on the host, once per batch and
+    outside the grain workers, so no encoder's weights are pickled into
+    them.
+
+    The captions never survive the stage: they are strings and a device
+    takes numbers. None reads nothing out of them, which is what an
+    unconditional run wants; a caller that wants the words keeps them with
+    a reader that hands them back.
+    """
+    if tokenize is None:
+        def tokenize(captions):
+            return {}
+
+    class Tokenizing:
+        """The stream's iterator with the caption stage on its end."""
+
+        def __init__(self, source):
+            self.source = source
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> Batch:
+            batch = dict(next(self.source))
+            captions = [str(caption) for caption in batch.pop(CAPTION)]
+            batch.update(tokenize(captions))
+            return batch
+
+        def __getattr__(self, name):
+            # get_state/set_state belong to the grain iterator underneath,
+            # and a stream without them stays a stream without them.
+            if name in ("get_state", "set_state"):
+                return getattr(self.source, name)
+            raise AttributeError(name)
+
+    return lambda: Tokenizing(iter(stream()))
 
 
 def local_batch(batch: int) -> int:
