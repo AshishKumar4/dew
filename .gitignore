@@ -32,3 +32,4 @@ NEWREPO.md
 tutorials/executed/
 samples/
 .pytest_cache/
+build/
