@@ -16,6 +16,7 @@ parameter of every registered model is declared or listed as heuristic, and
 every declared name is carried by some parameter.
 """
 
+import fnmatch
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -187,28 +188,41 @@ def test_every_registry_architecture_is_trained_here():
     assert COVERED == set(models)
 
 
-def model_variables(case: Case):
+def model_variables(case: Case, concrete: bool = False):
+    """The case's variables as shapes, or as arrays when `concrete` (the
+    hilbert scan builds its permutation on the host and does not trace)."""
     model = models.build(case.architecture, **case.config)
     rng = jax.random.key(0)
+    init = model.init if concrete else (lambda *args: jax.eval_shape(model.init, *args))
     if case.is_lm:
-        return jax.eval_shape(model.init, rng, jnp.ones((1, case.seq_len), jnp.int32))
+        return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
     sample = jnp.ones((1, *case.sample_shape), jnp.float32)
     if case.is_jepa:
-        return jax.eval_shape(
-            model.init, rng, sample, jnp.arange(MASK.num_context, dtype=jnp.int32)[None])
-    return jax.eval_shape(
-        model.init, rng, sample, jnp.ones((1,)),
-        TextContext(jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)), jnp.ones((1, TEXT_TOKENS), bool)))
+        return init(rng, sample, jnp.arange(MASK.num_context, dtype=jnp.int32)[None])
+    return init(rng, sample, jnp.ones((1,)),
+                TextContext(jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)), jnp.ones((1, TEXT_TOKENS), bool)))
+
+
+# Options the trained cases leave off but whose modules are declared: shapes
+# only, so the declarations behind them are checked without a training run.
+VARIANTS = [
+    replace(case, config={**case.config, "tie_embeddings": False}, label="untied")
+    for case in CASES if case.is_lm and "num_experts" not in case.config
+] + [
+    Case("simple_dit", {**DIT, "scan_order": "hilbert"}, label="hilbert"),
+    Case("hybrid_dit", {**DIT, "num_layers": 4, "ssm_state_dim": 8,
+                        "ssm_attention_ratio": "3:1", "use_2d_fusion": True}, label="fusion"),
+    Case("uvit", {"patch_size": PATCH, "emb_features": 64, "num_layers": 4, "num_heads": 2,
+                  "add_residualblock_output": True}, label="residual"),
+]
 
 
 def every_leaf():
-    """Every parameter leaf of every case, with the untied head the LM cases
-    do not build."""
-    untied = [replace(case, config={**case.config, "tie_embeddings": False}, label="untied")
-              for case in CASES if case.is_lm and "num_experts" not in case.config]
-    predictor = Case("jepa_predictor", PREDICTOR)
-    for case in CASES + untied:
+    """Every parameter leaf of every case and variant, the predictor included."""
+    for case in CASES:
         yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
+    for case in VARIANTS:
+        yield from jax.tree_util.tree_flatten_with_path(model_variables(case, concrete=True))[0]
     model = models.build("jepa_predictor", **PREDICTOR)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, MASK.num_context, 32)),
@@ -237,9 +251,7 @@ def test_every_declared_name_is_carried_by_a_parameter():
                  if not any(module[-len(key):] == key for module in modules)]
     assert unmatched == []
     paths = {parameter_path(path) for path, _ in every_leaf()}
-    HEURISTIC_PATHS = list(HEURISTIC)
-    import fnmatch
-    unused = [pattern for pattern in HEURISTIC_PATHS if not any(
+    unused = [pattern for pattern in HEURISTIC if not any(
         all(fnmatch.fnmatchcase(name, glob) for name, glob in zip(names[start:], pattern))
         for names in paths for start in range(len(names) - len(pattern) + 1))]
     assert unused == []
