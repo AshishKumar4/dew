@@ -397,7 +397,7 @@ def mode_fit(args) -> dict:
                             worker_count=args.workers).load(batch=BATCH)
         val = data.val
         available = sum(1 for _ in data.val())
-    state = trainer.fit(Data(lambda: loader, val=val, records=args.records),
+    state = trainer.fit(Data(lambda: iter(loader), val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(Batches(),))
