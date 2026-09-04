@@ -120,10 +120,12 @@ class TrainerConfig:
     log_every: int = 100
     eval_every: Union[int, Literal["epoch"], None] = "epoch"
     """Steps between validation passes: a number of steps, "epoch" for one
-    pass over the data, None to never validate."""
+    pass over the data, None to never validate. "epoch" over a stream that
+    reports no record count is refused by name, since it has no pass."""
     checkpoint_every: Union[int, Literal["epoch"], None] = "epoch"
-    """Steps between checkpoints, the same three answers. None is the only
-    way to train on a dataset that cannot report its read position."""
+    """Steps between checkpoints, the same three answers. None is what a
+    stream whose iterator cannot report a read position trains with; the
+    trainer refuses any other answer for one."""
     accumulation: int = 1
     """Micro-batches per optimizer update."""
     dynamic_scale: bool = False
@@ -166,19 +168,8 @@ class TrainerConfig:
         return self._interval(self.eval_every, data, "eval-every")
 
     def checkpoint_interval(self, data) -> Optional[int]:
-        """Steps between checkpoints over `data`, or None for never.
-
-        A dataset that cannot report its read position is refused here rather
-        than after the first interval has passed: the checkpoint would carry
-        no position and the resume would replay data the run had trained on.
-        """
-        every = self._interval(self.checkpoint_every, data, "checkpoint-every")
-        if every is not None and not data.resumable:
-            raise ValueError(
-                "this dataset cannot report its read position, so a checkpoint "
-                "would replay data on resume; train it with "
-                "--trainer.checkpoint-every None")
-        return every
+        """Steps between checkpoints over `data`, or None for never."""
+        return self._interval(self.checkpoint_every, data, "checkpoint-every")
 
     @staticmethod
     def _interval(value, data, flag: str) -> Optional[int]:

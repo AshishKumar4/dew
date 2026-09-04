@@ -79,3 +79,13 @@ def test_training_imports_no_modality():
         env={"PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu"})
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip() == "[]", out.stdout
+
+
+def test_the_export_list_and_the_lazy_table_hold_the_same_names():
+    """__all__ is written out so tools can read the public surface without
+    running the lazy lookup, and this is what keeps the two from drifting."""
+    import dew
+
+    assert set(dew.__all__) - {"__version__"} == set(dew._EXPORTS)
+    for name in dew.__all__:
+        assert getattr(dew, name) is not None

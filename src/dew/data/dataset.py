@@ -56,18 +56,17 @@ class Dataset:
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
-    `resumable` is the dataset's own answer to whether a checkpoint can
-    record the run's position: grain-backed iterators carry `get_state` and
-    `set_state`, a fetch-as-you-go stream carries neither. A run over a
-    dataset that answers False either never checkpoints or is refused, so
-    nobody discovers mid-run that a resume would replay the data.
+    Whether a run can checkpoint its position is the iterator's own answer:
+    grain-backed iterators carry `get_state` and `set_state`, a
+    fetch-as-you-go stream carries neither, and `tokenized` forwards the pair
+    rather than hiding it. A run over a stream without them trains with
+    `checkpoint_every=None` and is refused otherwise.
     """
 
     train: Callable[[], Iterator[Batch]]
     val: Callable[[], Iterator[Batch]] | None
     records: int | None
     batch: int
-    resumable: bool = True
 
     @property
     def steps_per_epoch(self) -> int | None:

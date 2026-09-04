@@ -173,6 +173,7 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
+        restored = dict(restored)
         table = restored.pop('position', None)
         if table is None:
             position = None
