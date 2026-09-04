@@ -1,7 +1,7 @@
 """Train a text-to-image diffusion model on Oxford Flowers, sample from it, export the weights.
 
     python examples/train_diffusion.py --epochs 200 --image-size 128
-    python examples/train_diffusion.py --epochs 1 --steps-per-epoch 20 --image-size 32   # smoke run
+    python examples/train_diffusion.py --steps 20 --image-size 32   # smoke run
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,68 +12,60 @@ import optax
 import tyro
 from PIL import Image
 
-from dew.data.dataloaders import get_dataset_grain
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.image_ops import denormalize_images
-from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
-from dew.inputs.encoders import CLIPTextEncoder
+from dew.data import OxfordFlowers
+from dew.diffusion import presets
+from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
-from dew.registry import apply_precision_policy, build_model
-from dew.sampling import EulerAncestralSampler
-from dew.training import ObjectiveTrainer
+from dew.objectives.diffusion import DiffusionObjective
+import dew.nn.backbones  # registers the models
+from dew.registry import models
+from dew.sampling import CFG, Heun, TextToImage
+from dew.training import Checkpoints, MeshSpec, Trainer
 
 
 @dataclass
 class Config:
-    dataset: str = "oxford_flowers102"
     image_size: int = 128
     batch_size: int = 32
     epochs: int = 200
-    steps_per_epoch: int | None = None
+    steps: int | None = None
+    """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 2e-4
-    fsdp_size: int = 1
+    fsdp: int = 1
     model: dict = field(default_factory=lambda: dict(patch_size=4, emb_features=512, num_layers=12, num_heads=8))
     prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
     out: Path = Path("runs/flowers")
 
 
-def text_conditioned_inputs(image_size: int) -> DiffusionInputConfig:
-    """The sample and its conditions: an image, conditioned on a CLIP text embedding."""
-    text_encoder = CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14")
-    return DiffusionInputConfig(
-        sample_data_key="image",
-        sample_data_shape=(image_size, image_size, 3),
-        conditions=[ConditionalInputConfig(encoder=text_encoder)],
-    )
+def text_conditioned_inputs(image_size: int) -> InputSpec:
+    """Images conditioned on CLIP text under the model's `textcontext` keyword."""
+    return InputSpec(
+        sample=Field("image", (image_size, image_size, 3)),
+        conditions={"textcontext": Condition(CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
 
 
 def main(config: Config, data=None, inputs=None):
-    data = data or get_dataset_grain(config.dataset, batch_size=config.batch_size, image_scale=config.image_size)
+    data = data or OxfordFlowers(image_size=config.image_size).load(batch=config.batch_size)
+    steps = config.steps or config.epochs * data.steps_per_epoch
     inputs = inputs or text_conditioned_inputs(config.image_size)
+    fields = dict(config.model, output_channels=3, dtype="bfloat16")
+    model = models.build("simple_dit", **fields)
+    process = presets.EDM()()
+    objective = DiffusionObjective(model, process, inputs, sampler=Heun(), guidance=CFG(3.0), steps=40)
 
-    # A preset is a training schedule, a sampling schedule and a prediction transform that belong together.
-    train_schedule, sample_schedule, transform = get_diffusion_preset("edm")
-    model_config = apply_precision_policy("simple_dit", config.model, dtype="bfloat16", attention_impl="auto")
-    model = build_model("simple_dit", model_config)
+    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=config.fsdp),
+                      checkpoints=Checkpoints(str(config.out / "checkpoints")))
+    state = trainer.fit(data, steps=steps, log_every=50)
 
-    trainer = ObjectiveTrainer(
-        model, optax.adamw(config.learning_rate), input_config=inputs,
-        noise_schedule=train_schedule, model_output_transform=transform,
-        rngs=jax.random.PRNGKey(0), name=config.out.name, checkpoint_base_path=str(config.out / "checkpoints"),
-        fsdp_size=config.fsdp_size,
-    )
-    steps = config.steps_per_epoch or data["train_len"] // config.batch_size
-    state = trainer.fit(data, training_steps_per_epoch=steps, epochs=config.epochs,
-                        sampler_class=EulerAncestralSampler, sampling_noise_schedule=sample_schedule)
-
-    sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs, guidance_scale=3.0)
-    images = sampler.generate_samples(params=state.ema_params, num_samples=len(config.prompts),
-                                      resolution=config.image_size, diffusion_steps=50,
-                                      conditioning=list(config.prompts))
-    grid = np.concatenate(np.asarray(denormalize_images(images)), axis=1)
+    pipe = TextToImage(model=model, process=process, inputs=inputs, params={**state.params, **state.ema})
+    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), key=jax.random.key(1))
+    pixels = np.clip(np.round((np.asarray(images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    grid = np.concatenate(list(pixels), axis=1)
+    config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")
 
-    save_hf_layout(state.ema_params, config={"architecture": "simple_dit", **model_config}, directory=config.out / "export")
+    save_hf_layout(state.ema["params"], {"architecture": "simple_dit", **fields}, config.out / "export")
     return state
 
 

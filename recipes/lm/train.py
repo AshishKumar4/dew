@@ -268,7 +268,7 @@ def main(config: LmRunConfig) -> TrainState:
         log_every=config.trainer.log_every,
         eval_every=config.trainer.eval_every or data.steps_per_epoch,
         checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
-        metrics=(metrics["perplexity"](),),
+        metrics=(metrics.perplexity(),),
     )
     print(f"Training finished in {time.time() - start:.0f}s")
     if tracker is not None:

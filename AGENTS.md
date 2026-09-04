@@ -6,7 +6,7 @@ Read `CONTRIBUTING.md` first. It is the contract; this file is the checklist an 
 
 - Find the primitive before writing code: `jax.nn.dot_product_attention`, `flax.linen`, `optax`, `orbax`, `grain`, and Google's JAX code (MaxText, tokamax, the `gemma` library). A reimplementation needs a reason a reader can check, written where the code is.
 - Read the seam you are about to touch and the tests that cover it. The seams: models are pure Flax modules; objectives own parameters, loss and validation; the trainer owns the mesh, the compiled step, EMA, checkpoints and logging; data sources produce records and transforms are Grain transforms.
-- Frozen, never changed without a migration and a converter test: parameter tree leaf names and shapes, the checkpoint layout, wandb metric keys (`train/*`, `val/*`), the `Objective` methods, the Hugging Face parameter layout of `CausalTransformer`.
+- Frozen at 1.0, never changed after it without a migration and a converter test: parameter tree leaf names and shapes, the checkpoint layout, wandb metric keys (`train/*`, `val/*`), the `Objective` methods, the Hugging Face parameter layout of `CausalTransformer`. Before 1.0 they change outright, with no converter.
 - Optimizations carry no tradeoffs: no numerics change, no reduced-precision path, nothing observable removed. If a faster version does not match the old one to fp32 tolerance, it is not accepted.
 
 ## While you write

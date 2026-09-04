@@ -1,13 +1,11 @@
-"""Train a byte-level language model on a tokenized corpus, then generate from it.
+"""Train a byte-level language model on a directory of token files, then generate.
 
-Tokenize first (Tiny Shakespeare takes a second):
-
-    python tools/tokenize_text.py --input shakespeare.txt --out data/shakespeare --tokenizer byte --val-fraction 0.02
+    python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte
     python examples/train_lm.py --tokens data/shakespeare --epochs 4
-    python examples/train_lm.py --tokens data/shakespeare --epochs 1 --steps-per-epoch 20 --num-layers 1   # smoke run
+    python examples/train_lm.py --tokens data/shakespeare --steps 20 --sequence-length 32   # smoke run
 """
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
@@ -15,12 +13,12 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data.dataloaders import get_token_dataset_grain
-from dew.data.text import ByteTokenizer
-from dew.objectives.lm import LMObjective
-from dew.registry import apply_precision_policy, build_model
-from dew.sampling.text import generate
-from dew.training import ObjectiveTrainer
+from dew.data import ByteTokenizer, TokenWindows
+from dew.objectives.lm import LMObjective, Samples
+import dew.nn.backbones  # registers the models
+from dew.registry import models
+from dew.sampling import generate
+from dew.training import Checkpoints, Trainer
 
 
 @dataclass
@@ -29,11 +27,10 @@ class Config:
     sequence_length: int = 256
     batch_size: int = 64
     epochs: int = 4
-    steps_per_epoch: int = 300
+    steps: int | None = None
+    """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 1e-3
-    emb_features: int = 384
-    num_layers: int = 6
-    num_heads: int = 6
+    model: dict = field(default_factory=lambda: dict(emb_features=384, num_layers=6, num_heads=6))
     prompt: str = "ROMEO:"
     sample_tokens: int = 300
     out: Path = Path("runs/shakespeare")
@@ -42,30 +39,26 @@ class Config:
 def main(config: Config):
     meta = json.loads((config.tokens / "meta.json").read_text())
     tokenizer = ByteTokenizer()
-    data = get_token_dataset_grain(
-        config.tokens / "train.bin", config.tokens / "val.bin",
-        batch_size=config.batch_size, seq_len=config.sequence_length, worker_count=4,
-    )
+    data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length,
+                        worker_count=4).load(batch=config.batch_size)
+    steps = config.steps or config.epochs * data.steps_per_epoch
 
-    # The KV cache is sized when the model is built, so the context covers the longest sample.
-    model_config = apply_precision_policy("causal_transformer", dict(
-        vocab_size=meta["vocab_size"], emb_features=config.emb_features,
-        num_layers=config.num_layers, num_heads=config.num_heads,
-        max_seq_len=max(config.sequence_length, len(config.prompt) + config.sample_tokens),
-    ), dtype="bfloat16", attention_impl="auto")
-    model = build_model("causal_transformer", model_config)
-    objective = LMObjective(model, config.sequence_length, vocab_size=meta["vocab_size"])
+    prompt = tokenizer.encode(config.prompt)
+    model = models.build("causal_transformer", **config.model, vocab_size=int(meta["vocab_size"]),
+                         max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
+                         dtype="bfloat16")
+    objective = LMObjective(model, config.sequence_length,
+                            samples=Samples(prompt, config.sample_tokens, temperature=0.8, top_k=40,
+                                            decode=tokenizer.decode))
 
-    trainer = ObjectiveTrainer(
-        model, optax.adamw(config.learning_rate), objective=objective, input_config=None,
-        rngs=jax.random.PRNGKey(0), name=config.out.name, checkpoint_base_path=str(config.out / "checkpoints"),
-    )
-    state = trainer.fit(data, training_steps_per_epoch=config.steps_per_epoch, epochs=config.epochs)
+    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(config.out / "checkpoints")))
+    state = trainer.fit(data, steps=steps, log_every=50)
 
-    prompt = jnp.asarray([tokenizer.encode(config.prompt)], jnp.int32)
-    tokens = generate(model, state.ema_params, prompt, max_new_tokens=config.sample_tokens,
-                      rng=jax.random.PRNGKey(0), temperature=0.8, top_k=40)
+    tokens = generate(model, {**state.params, **state.ema}, jnp.asarray([prompt], jnp.int32),
+                      config.sample_tokens, key=jax.random.key(1), temperature=0.8, top_k=40)
     text = tokenizer.decode(tokens[0])
+    config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)
     print(text)
     return state
