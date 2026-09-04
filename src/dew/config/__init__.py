@@ -88,6 +88,8 @@ class TrainerConfig:
     """Latest checkpoints kept, besides the best one."""
     batch_size: int = 32
     """Global batch, over every process."""
+    seed: int = 0
+    """Seed of the run key: parameter init and every per-step draw."""
     steps: Optional[int] = None
     epochs: Optional[int] = None
     """Run length as passes over the data; `steps` names it directly instead."""
