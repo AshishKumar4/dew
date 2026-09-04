@@ -21,10 +21,12 @@ CausalSelfAttention becomes self_attn without the block changing, which is
 where a linear-attention mixer goes.
 """
 
+import dataclasses
 import functools
 import math
-from typing import Callable, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
+import flax.core
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -38,7 +40,63 @@ from ..sharding import logical_axes
 from dew.registry import models
 
 
-LAYER_TYPES = ('full_attention', 'sliding_attention')
+@dataclasses.dataclass(frozen=True)
+class LayerKind:
+    """What the layers of one kind in the pattern do differently.
+
+    The pattern already names each layer's kind, so what the kind means
+    belongs here rather than in a field name: a windowed kind is what
+    "sliding attention" used to say, and `rope_theta` and `head_dim` are the
+    model's unless this kind states its own. Rotary positions rotate every
+    dimension of a windowed kind, which is where Gemma 4 puts its partial
+    rotary (the global layers') and where the sliding layers rotate whole.
+    """
+
+    window: Optional[int] = None
+    """Keys a layer of this kind attends, its own included; None attends all."""
+    rope_theta: Optional[float] = None
+    head_dim: Optional[int] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Mixture:
+    """The experts some layers route to, and how the router chooses.
+
+    `experts` is what the rest depends on, which is why they live together:
+    a top_k, a cadence or a balancing bias says nothing about a model with
+    no experts. `layers` names the sparse layers by index, or `every` makes
+    every nth layer sparse counting from the end of the first group, which
+    is what Qwen3-MoE's decoder_sparse_step means; neither makes every layer
+    sparse, which is Mixtral.
+
+    The routing options are `Router`'s: `score_function` softmax or sigmoid,
+    `scaling` on the routed output, `groups` with `groups_per_token` for
+    DeepSeek's node limit, and `bias` for its aux-loss-free balancing bias.
+    """
+
+    experts: int
+    top_k: int = 2
+    layers: Optional[Tuple[int, ...]] = None
+    every: Optional[int] = None
+    score_function: str = 'softmax'
+    scaling: float = 1.0
+    groups: int = 1
+    groups_per_token: int = 1
+    bias: bool = False
+
+    def __post_init__(self):
+        if self.layers is not None:
+            object.__setattr__(self, "layers", tuple(self.layers))
+        if self.experts < 1:
+            raise ValueError(
+                f"a mixture needs experts to route to, got {self.experts}; a "
+                "dense model has no mixture at all")
+        if self.layers is not None and self.every is not None:
+            raise ValueError(
+                f"layers ({self.layers}) and every ({self.every}) both choose the "
+                "sparse layers, so only one of them can be set")
+        if self.every is not None and self.every < 1:
+            raise ValueError(f"every must be positive, got {self.every}")
 
 
 class RMSNorm(nn.Module):
@@ -441,46 +499,45 @@ class DecoderBlock(nn.Module):
 })
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
+
     The defaults are a from-scratch training recipe (multi-head attention,
     swiglu, tied embeddings, no softcap); the fields that differ between the
     open decoders are all here, so a Qwen3 or Gemma3 config is a field
     mapping: num_kv_heads/head_dim for grouped-query attention,
-    attention_bias, rope_theta with rope_local_theta for Gemma3's two rope
-    bases, norm_eps with scale_offset for Gemma's (1 + w) norms and
+    attention_bias, norm_eps with scale_offset for Gemma's (1 + w) norms and
     sandwich_norms for its second pair of them, attention_scale for its
     query_pre_attn_scalar, embedding_scale and final_logit_softcap for the
-    rest of Gemma, and
-    layer_types with sliding_window for the mixed full/sliding stacks. How a
-    checkpoint's config derives layer_types (Qwen3 makes every layer past
-    max_window_layers sliding) belongs to that translation, not here: this
-    takes the tuple.
+    rest of Gemma.
 
-    num_experts turns the feed-forward of some layers into `moe.SparseMLP`,
-    routing each token to top_k of num_experts gated MLPs of the same width a
-    dense layer would use. Which layers is moe_layers, or every moe_every-th
-    layer counting from the end of the first group, which is the rule
-    Qwen3-MoE's decoder_sparse_step means, or every layer when neither is set,
-    which is Mixtral. A dense layer keeps the leaves it always had.
-    expert_bias adds DeepSeek's balancing bias to every router, kept in the
-    `moe` collection; the LM objective's balance_rate is what moves it.
+    `layer_types` is the pattern, one kind per layer, and `kinds` says what a
+    kind does: its window, and its own rope base or head dim where it has
+    one. How a checkpoint's config derives the pattern (Qwen3 makes every
+    layer past max_window_layers sliding) belongs to that translation, not
+    here: this takes the tuple.
+
+    `mixture` turns the feed-forward of some layers into `moe.SparseMLP`,
+    routing each token to a few of its experts; a dense layer keeps the
+    leaves it always had, and None is a dense model. The LM objective's
+    balance_rate is what moves a mixture's balancing bias.
+
     causal=False turns every layer into full attention with no cache, the
     encoder a masked diffusion language model denoises with; the parameter
+    tree is the same either way.
 
     per_layer_input_dim turns on Gemma 3n/4 style per-layer input embeddings:
     an extra table of per_layer_input_vocab by layers times dim rows, read
-    per layer and added to that layer's input through its own gate. 0 is a
+    per layer and added to that layer's input through its own gate. None is a
     plain decoder and leaves the tree unchanged.
 
     num_kv_shared_layers makes the trailing layers of that count reuse the
-    keys and values of the last earlier layer of their own type instead of
+    keys and values of the last earlier layer of their own kind instead of
     projecting their own (Gemma 3n/4 cross-layer KV sharing). 0 is a plain
-    decoder and leaves the tree unchanged.
+    decoder and leaves the tree unchanged, and use_double_wide_mlp, which
+    widens the sharing layers' MLP, needs it.
 
-    global_head_dim gives the full-attention layers their own head dim while
-    sliding layers keep head_dim. partial_rotary_factor rotates that fraction
-    of the full layers' head dims and passes the rest through.
-    use_double_wide_mlp doubles the MLP width of the sharing layers. Each
-    defaults to off, and off leaves the tree unchanged.
+    partial_rotary_factor rotates that fraction of an unwindowed kind's head
+    dims and passes the rest through, which is Gemma 4's global layers; a
+    windowed kind rotates whole.
     """
     vocab_size: int
     emb_features: int = 512
@@ -488,22 +545,19 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: Optional[int] = None       # None: as many as the query heads
     head_dim: Optional[int] = None           # None: emb_features // num_heads
-    global_head_dim: Optional[int] = None    # full layers; None: head_dim
     mlp: str = 'swiglu'                      # 'swiglu' | 'geglu'
-    mlp_ratio: int = 4
-    mlp_features: Optional[int] = None       # None: mlp_ratio * emb_features
+    mlp_features: Optional[int] = None       # None: four times emb_features
     max_seq_len: int = 2048
-    rope_theta: float = 10000.0              # full attention layers
-    rope_local_theta: Optional[float] = None  # sliding layers, None: rope_theta
-    partial_rotary_factor: Optional[float] = None  # full layers; None: every dim rotates
-    layer_types: Optional[Tuple[str, ...]] = None  # per layer, see LAYER_TYPES
-    sliding_window: Optional[int] = None     # keys a sliding layer keeps
+    rope_theta: float = 10000.0              # the base a kind does not override
+    partial_rotary_factor: Optional[float] = None  # None: every dim rotates
+    layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
+    kinds: Optional[Mapping[str, LayerKind]] = None  # what each named kind does
     norm_eps: float = 1e-5
     scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
     qk_norm: bool = True
-    v_norm: bool = False                      # Gemma 4's scale-free values norm
+    v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -514,22 +568,28 @@ class CausalTransformer(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     attention_impl: Optional[str] = None
-    num_experts: int = 0                     # 0: every layer is dense
-    top_k: int = 2                           # experts each token routes to
-    moe_every: Optional[int] = None          # sparse layer cadence
-    moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
-    expert_bias: bool = False                # DeepSeek's aux-loss-free balancing bias
+    mixture: Optional[Mixture] = None        # None: every layer is dense
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
     causal: bool = True                      # False: full attention, no cache
-    per_layer_input_dim: int = 0             # Gemma 3n/4 per-layer inputs; 0 disables
+    per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
 
     def __post_init__(self):
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
-        if self.moe_layers is not None:
-            object.__setattr__(self, "moe_layers", tuple(self.moe_layers))
+        # A value arrives as a record from a config and as itself from code,
+        # and `models.build` already reads one; doing it here too means the
+        # plain constructor takes the same records, which is what a test or
+        # a notebook writes.
+        if isinstance(self.mixture, Mapping):
+            object.__setattr__(self, "mixture", Mixture(**self.mixture))
+        if self.kinds is not None:
+            # Frozen, because a module's fields are static to jit and a plain
+            # dict cannot be hashed.
+            object.__setattr__(self, "kinds", flax.core.freeze({
+                name: kind if isinstance(kind, LayerKind) else LayerKind(**kind)
+                for name, kind in self.kinds.items()}))
         super().__post_init__()
 
 
@@ -544,7 +604,7 @@ class CausalTransformer(nn.Module):
 
     @property
     def hidden_features(self) -> int:
-        return (self.mlp_ratio * self.emb_features
+        return (4 * self.emb_features
                 if self.mlp_features is None else self.mlp_features)
 
     @property
@@ -553,16 +613,25 @@ class CausalTransformer(nn.Module):
             return ('full_attention',) * self.num_layers
         return tuple(self.layer_types)
 
+    def kind_of(self, layer_type: str) -> LayerKind:
+        """What the layers of `layer_type` do, the model's defaults included."""
+        kind = (self.kinds or {}).get(layer_type, LayerKind())
+        return LayerKind(
+            window=kind.window,
+            rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
+            head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim))
+
     @property
     def sparse_layers(self) -> Tuple[int, ...]:
         """The layers whose feed-forward routes to experts."""
-        if self.num_experts == 0:
+        mixture = self.mixture
+        if mixture is None:
             return ()
-        if self.moe_layers is not None:
-            return tuple(self.moe_layers)
-        if self.moe_every is not None:
+        if mixture.layers is not None:
+            return tuple(mixture.layers)
+        if mixture.every is not None:
             return tuple(index for index in range(self.num_layers)
-                         if (index + 1) % self.moe_every == 0)
+                         if (index + 1) % mixture.every == 0)
         return tuple(range(self.num_layers))
 
     @property
@@ -597,12 +666,24 @@ class CausalTransformer(nn.Module):
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
     def setup(self):
-        local_dim = self.features_per_head
-        full_dim = self.global_head_dim or local_dim
-        for name, dim in (("head_dim", local_dim), ("global_head_dim", full_dim)):
-            if dim % 2:
+        types = self.per_layer_types
+        if len(types) != self.num_layers:
+            raise ValueError(
+                f"layer_types has {len(types)} entries for {self.num_layers} layers")
+        unnamed = sorted(set(self.kinds or {}) - set(types))
+        if unnamed:
+            raise ValueError(
+                f"kinds {unnamed} name no layer of this model, whose pattern is "
+                f"{sorted(set(types))}")
+        kinds = {layer_type: self.kind_of(layer_type) for layer_type in set(types)}
+        for layer_type, kind in sorted(kinds.items()):
+            if kind.head_dim % 2:
                 raise ValueError(
-                    f"rotary positions rotate pairs, so {name} must be even, got {dim}")
+                    "rotary positions rotate pairs, so the head dim of "
+                    f"{layer_type!r} must be even, got {kind.head_dim}")
+            if kind.window is not None and kind.window < 1:
+                raise ValueError(
+                    f"the window of {layer_type!r} must be positive, got {kind.window}")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -611,39 +692,23 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "partial_rotary_factor must be within (0, 1], "
                 f"got {self.partial_rotary_factor}")
-        types = self.per_layer_types
-        if len(types) != self.num_layers:
-            raise ValueError(
-                f"layer_types has {len(types)} entries for {self.num_layers} layers")
-        unknown = sorted(set(types) - set(LAYER_TYPES))
-        if unknown:
-            raise ValueError(
-                f"unknown layer types {unknown}, expected one of {list(LAYER_TYPES)}")
-        if 'sliding_attention' in types and self.sliding_window is None:
-            raise ValueError("sliding attention layers need sliding_window set")
-        if self.num_experts == 0 and (self.moe_every is not None
-                                      or self.moe_layers is not None):
-            raise ValueError(
-                "moe_every and moe_layers name the sparse layers of a model "
-                "that has experts, so num_experts has to be set")
-        if self.moe_every is not None and self.moe_layers is not None:
-            raise ValueError(
-                f"moe_every ({self.moe_every}) and moe_layers "
-                f"({self.moe_layers}) both choose the sparse layers, so only "
-                "one of them can be set")
-        if self.moe_every is not None and self.moe_every < 1:
-            raise ValueError(f"moe_every must be positive, got {self.moe_every}")
         sparse = self.sparse_layers
         outside = sorted(index for index in sparse
                          if not 0 <= index < self.num_layers)
         if outside:
             raise ValueError(
-                f"moe_layers {outside} are outside the {self.num_layers} layers "
-                "of this model")
+                f"the mixture's layers {outside} are outside the "
+                f"{self.num_layers} layers of this model")
         sharing = self.kv_sharing
+        if self.use_double_wide_mlp and not sharing:
+            raise ValueError(
+                "use_double_wide_mlp widens the MLP of the layers that share "
+                "their keys and values, so it needs num_kv_shared_layers set")
         ple = self.per_layer_input_dim
-        if ple < 0:
-            raise ValueError(f"per_layer_input_dim must be non-negative, got {ple}")
+        if ple is not None and ple < 1:
+            raise ValueError(
+                f"per_layer_input_dim is the width of a layer's own input, got "
+                f"{ple}; None is a model without them")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -670,15 +735,14 @@ class CausalTransformer(nn.Module):
                     emb_features=self.emb_features,
                     num_heads=self.num_heads,
                     num_kv_heads=self.kv_heads,
-                    head_dim=(local_dim if layer_type == 'sliding_attention'
-                              else full_dim),
+                    head_dim=kinds[layer_type].head_dim,
                     max_seq_len=self.max_seq_len,
                     causal=self.causal,
-                    rope_theta=(self.rope_local_theta
-                                if layer_type == 'sliding_attention'
-                                and self.rope_local_theta is not None
-                                else self.rope_theta),
-                    partial_rotary_factor=(None if layer_type == 'sliding_attention'
+                    rope_theta=kinds[layer_type].rope_theta,
+                    # A windowed kind rotates every dimension; the partial
+                    # rotary belongs to the kinds that attend the whole
+                    # sequence, which is where Gemma 4 puts it.
+                    partial_rotary_factor=(None if kinds[layer_type].window is not None
                                            else self.partial_rotary_factor),
                     qk_norm=self.qk_norm,
                     v_norm=self.v_norm,
@@ -687,8 +751,7 @@ class CausalTransformer(nn.Module):
                     scale_after_cast=self.scale_after_cast,
                     kv_shared=index in sharing,
                     kv_store_key=layer_type,
-                    sliding_window=(self.sliding_window
-                                    if layer_type == 'sliding_attention' else None),
+                    sliding_window=kinds[layer_type].window,
                     attention_bias=self.attention_bias,
                     attention_scale=self.attention_scale,
                     dtype=self.dtype,
@@ -698,12 +761,16 @@ class CausalTransformer(nn.Module):
                 feedforward=(
                     functools.partial(
                         SparseMLP,
-                        num_experts=self.num_experts,
-                        top_k=self.top_k,
+                        num_experts=self.mixture.experts,
+                        top_k=self.mixture.top_k,
                         hidden_features=self.hidden_features,
                         out_features=self.emb_features,
                         activation=self.mlp,
-                        expert_bias=self.expert_bias,
+                        score_function=self.mixture.score_function,
+                        routed_scaling_factor=self.mixture.scaling,
+                        expert_groups=self.mixture.groups,
+                        groups_per_token=self.mixture.groups_per_token,
+                        expert_bias=self.mixture.bias,
                         dtype=self.dtype,
                         precision=self.precision)
                     if index in sparse else
@@ -720,7 +787,7 @@ class CausalTransformer(nn.Module):
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
-                per_layer_input_dim=ple,
+                per_layer_input_dim=ple or 0,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
                 precision=self.precision,

@@ -279,7 +279,7 @@ def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
 
     vocab, batch, seq = 512, 2, 8
     model = CausalTransformer(vocab_size=vocab, emb_features=32, num_layers=1,
-                              num_heads=4, mlp_ratio=2, max_seq_len=16,
+                              num_heads=4, mlp_features=64, max_seq_len=16,
                               dtype=jnp.bfloat16)
     objective = LMObjective(model, seq, head_chunks=4)
     params = objective.init(jax.random.key(0))

@@ -134,8 +134,8 @@ class LMObjective(Objective):
 
         `balance_rate` moves each sparse layer's routing bias against its
         load by this much every step (DeepSeek's aux-loss-free balancing);
-        the model has to keep that bias, `expert_bias=True` on the
-        CausalTransformer. Unset leaves the bias where it is."""
+        the model has to keep that bias, `bias=True` on the
+        CausalTransformer's mixture. Unset leaves the bias where it is."""
         self.model = model
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -226,7 +226,7 @@ class LMObjective(Objective):
             if "moe" not in params:
                 raise ValueError(
                     "balance_rate moves the routers' balancing bias, so the model "
-                    "needs sparse layers with expert_bias=True")
+                    "needs a mixture with bias=True")
             balanced, load = balance(params["moe"], routing, self.balance_rate)
             reported.update(load)
             variables = {"moe": balanced}

@@ -92,9 +92,11 @@ def preset(model: str, size: str) -> Case:
     if model == 'causal_transformer':
         if size == 'small':
             return Case(model, dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
-                                    mlp_ratio=4, max_seq_len=512), batch_size=16, seq_len=512)
+                                    mlp_features=3072, max_seq_len=512),
+                        batch_size=16, seq_len=512)
         return Case(model, dict(vocab_size=50304, emb_features=768, num_layers=12, num_heads=12,
-                                mlp_ratio=4, max_seq_len=1024), batch_size=8, seq_len=1024)
+                                mlp_features=3072, max_seq_len=1024),
+                    batch_size=8, seq_len=1024)
     if model == 'simple_dit':
         if size == 'small':
             return Case(model, dict(patch_size=4, emb_features=384, num_layers=6, num_heads=6, mlp_ratio=4),
@@ -273,7 +275,7 @@ class CausalTransformer(nn.Module):
         super().__init__()
         d, L, H = cfg['emb_features'], cfg['num_layers'], cfg['num_heads']
         head_dim = d // H
-        hidden = cfg['mlp_ratio'] * d
+        hidden = cfg['mlp_features']
         self.embed_tokens = nn.Parameter(torch.empty(cfg['vocab_size'], d))
         nn.init.normal_(self.embed_tokens, std=math.sqrt(1.0 / d))  # flax Embed default: variance_scaling fan_in
         self.layers = nn.ModuleList(DecoderBlock(d, H, head_dim, hidden, attention) for _ in range(L))
@@ -748,7 +750,7 @@ def analytic_flops(case: Case):
     cfg, B = case.config, case.batch_size
     if case.model == 'causal_transformer':
         d, L, H, S, V = cfg['emb_features'], cfg['num_layers'], cfg['num_heads'], case.seq_len, cfg['vocab_size']
-        Fh = cfg['mlp_ratio'] * d
+        Fh = cfg['mlp_features']
         per_layer = 4 * d * d + 3 * d * Fh
         T = B * S
         return dict(matmul=6 * (L * per_layer + d * V) * T, attention=12 * L * B * S * S * d,

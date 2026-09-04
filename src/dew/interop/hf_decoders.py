@@ -145,6 +145,34 @@ def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
 
     return ('full_attention',) * layers
 
+
+def _kinds(layer_types: Tuple[str, ...], window: Optional[int],
+           local_theta: Optional[float], full_theta: Optional[float],
+           full_head_dim: Optional[int]) -> Dict[str, Dict[str, Any]]:
+    """What each named kind of the pattern does, as records.
+
+    A family states its window and its local rope base for the sliding
+    layers and its own head dim for the global ones; the pattern already
+    names which layer is which, so each of those lands on that kind and the
+    model's own `rope_theta` and `head_dim` stay the defaults.
+    """
+    kinds: Dict[str, Dict[str, Any]] = {}
+    if 'sliding_attention' in layer_types:
+        sliding = {'window': window}
+        if local_theta is not None:
+            sliding['rope_theta'] = local_theta
+        kinds['sliding_attention'] = sliding
+    if 'full_attention' in layer_types:
+        full = {}
+        if full_theta is not None:
+            full['rope_theta'] = full_theta
+        if full_head_dim is not None:
+            full['head_dim'] = full_head_dim
+        if full:
+            kinds['full_attention'] = full
+    return kinds
+
+
 def _gemma4_rope(entries: Mapping[str, Any]) -> Tuple[float, Optional[float], Optional[float]]:
     """(rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
 
@@ -260,9 +288,8 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
                                              DEFAULT_MAX_SEQ_LEN)),
                            DEFAULT_MAX_SEQ_LEN),
         'rope_theta': rope_theta,
-        'rope_local_theta': rope_local_theta,
         'layer_types': layer_types,
-        'sliding_window': sliding_window,
+        'kinds': _kinds(layer_types, sliding_window, rope_local_theta, None, None),
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
         # LlamaRMSNorm and Qwen3RMSNorm multiply the scale into the
         # activations after casting them (modeling_qwen3.py:61-64); Gemma3's
@@ -298,9 +325,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
             _refuse("enable_moe_block=True",
                     "the parallel MoE branch has no counterpart here")
         used.update(('attention_k_eq_v', 'enable_moe_block'))
-        # Full layers may override the head dim and the sliding layers use
-        # hidden // heads; the two live side by side as head_dim and
-        # global_head_dim.
+        # The full layers may override the head dim; the sliding ones use
+        # hidden // heads, so that is the model's and the override lands on
+        # the full kind.
         sliding_dim = hidden // heads
         if hidden % heads:
             _refuse(f"hidden_size {hidden}",
@@ -319,16 +346,19 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         entries = hf_config.get('rope_parameters') or {}
         rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
         used.update(('rope_parameters', 'rope_theta'))
+        per_layer = int(hf_config.get('hidden_size_per_layer_input', 0))
         config.update(
             sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
             v_norm=True,
             head_dim=sliding_dim,
-            global_head_dim=(None if full_dim == sliding_dim else full_dim),
-            rope_theta=rope_theta, rope_local_theta=rope_local_theta,
+            rope_theta=rope_theta,
+            kinds=_kinds(layer_types, config['kinds'].get(
+                'sliding_attention', {}).get('window'), rope_local_theta, None,
+                None if full_dim == sliding_dim else full_dim),
             partial_rotary_factor=partial,
             use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
             num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
-            per_layer_input_dim=int(hf_config.get('hidden_size_per_layer_input', 0)),
+            per_layer_input_dim=per_layer or None,
             per_layer_input_vocab=int(hf_config.get(
                 'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
         )
@@ -648,21 +678,23 @@ def _export_config(model) -> Dict[str, Any]:
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
-    if model.rope_local_theta is not None:
+    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
+    if local_theta is not None:
         if sandwich:
             config['rope_parameters'] = {
                 'full_attention': {'rope_type': 'default',
                                    'rope_theta': model.rope_theta},
                 'sliding_attention': {'rope_type': 'default',
-                                      'rope_theta': model.rope_local_theta},
+                                      'rope_theta': local_theta},
             }
         else:
             config['rope_theta'] = model.rope_theta
-            config['rope_local_base_freq'] = model.rope_local_theta
+            config['rope_local_base_freq'] = local_theta
     else:
         config['rope_theta'] = model.rope_theta
-    if model.sliding_window is not None:
-        config['sliding_window'] = model.sliding_window
+    if sliding is not None and sliding.window is not None:
+        config['sliding_window'] = sliding.window
     if model_type == 'gemma3_text':
         config.update(
             hidden_activation='gelu_pytorch_tanh',
@@ -673,8 +705,9 @@ def _export_config(model) -> Dict[str, Any]:
             use_bidirectional_attention=False,
         )
     if model_type == 'qwen3':
-        config['use_sliding_window'] = model.sliding_window is not None
-        if model.sliding_window is not None:
+        window = None if sliding is None else sliding.window
+        config['use_sliding_window'] = window is not None
+        if window is not None:
             config['max_window_layers'] = 0
     return {key: value for key, value in config.items() if value is not None}
 

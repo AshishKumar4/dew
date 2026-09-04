@@ -206,7 +206,7 @@ def test_causal_transformer_axes_land_on_the_dimensions_they_name():
     declares, which is what a declared axis has to mean."""
     model = CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
+        num_kv_heads=1, mlp_features=64, max_seq_len=8, tie_embeddings=False)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
@@ -370,7 +370,7 @@ def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
     only ever divided by two would show up."""
     model = CausalTransformer(
         vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
+        num_kv_heads=1, mlp_features=128, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
     mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
@@ -872,7 +872,7 @@ def test_muon_group_moments_take_the_spec_their_parameter_declared():
     """
     model = CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
-        num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
+        num_kv_heads=1, mlp_features=64, max_seq_len=8, tie_embeddings=False)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
     param_specs, opt_state_specs = muon_state_specs(variables, {"mlp": "fsdp"})
@@ -988,7 +988,7 @@ def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it
     """
     model = CausalTransformer(
         vocab_size=64, emb_features=62, num_layers=1, num_heads=1, num_kv_heads=1,
-        mlp_ratio=2, max_seq_len=8)
+        mlp_features=124, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
     mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
