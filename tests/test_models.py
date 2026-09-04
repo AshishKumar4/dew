@@ -41,8 +41,8 @@ def test_unet_forward(rng):
     model = Unet(
         emb_features=64,
         feature_depths=[16, 32],
-        attention_configs=[None, {"heads": 2, "dtype": jnp.float32,
-                                  "use_projection": False, "use_self_and_cross": False}],
+        attention_configs=[None, Stage(heads=2, dtype=jnp.float32,
+                                       use_projection=False, use_self_and_cross=False)],
         num_res_blocks=1,
         num_middle_res_blocks=1,
     )
@@ -245,8 +245,8 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     config = dict(
         emb_features=64,
         feature_depths=[16, 32],
-        attention_configs=[None, {"heads": 2, "dtype": jnp.float32,
-                                  "use_projection": False, "use_self_and_cross": False}],
+        attention_configs=[None, Stage(heads=2, dtype=jnp.float32,
+                                       use_projection=False, use_self_and_cross=False)],
         num_res_blocks=1,
         num_middle_res_blocks=1,
     )
@@ -366,12 +366,13 @@ def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
                                  dtype="bfloat16", attention_impl="xla")
     from_value = with_precision("unet", {"attention_configs": [None, value]},
                                 dtype="bfloat16", attention_impl="xla")
-    # A record stays a record and a value stays a value; the build boundary
-    # makes the two agree.
+    # A record keeps the dtype's name, which `build` resolves with every
+    # other field; a value is resolved where it is written, since nothing
+    # resolves it afterwards. The build boundary makes the two agree.
     assert from_record["attention_configs"][1] == {
         "heads": 2, "dtype": "bfloat16", "force_fp32_for_softmax": True}
     assert from_value["attention_configs"][1] == Stage(
-        heads=2, dtype="bfloat16", force_fp32_for_softmax=True)
+        heads=2, dtype=jnp.bfloat16, force_fp32_for_softmax=True)
     built = [models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
                           **fields) for fields in (from_record, from_value)]
     assert built[0].attention_configs == built[1].attention_configs

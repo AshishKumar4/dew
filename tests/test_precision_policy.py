@@ -120,9 +120,9 @@ def test_auto_on_gpu_rejects_float32_inputs(monkeypatch):
 
 
 def test_policy_reaches_nested_unet_attention_configs():
-    """The unet keeps its attention settings in nested dicts that do not
-    inherit the model dtype, so the policy has to write into them too, and the
-    build has to resolve the dtype it wrote."""
+    """The unet keeps its attention settings per stage, and a stage does not
+    inherit the model dtype, so the policy has to write into every stage too,
+    and the build has to resolve the dtype it wrote."""
     fields = with_precision(
         'unet', {"attention_configs": [None, {"heads": 8}], "precision": "default"},
         dtype="bfloat16", attention_impl="auto")
@@ -135,16 +135,16 @@ def test_policy_reaches_nested_unet_attention_configs():
 
     model = models.build('unet', **fields)
     assert model.dtype is jnp.bfloat16
-    assert model.attention_configs[1]["dtype"] is jnp.bfloat16
-    assert model.attention_configs[1]["force_fp32_for_softmax"] is True
+    assert model.attention_configs[1].dtype is jnp.bfloat16
+    assert model.attention_configs[1].force_fp32_for_softmax is True
 
 
 def test_policy_fills_in_the_stages_the_config_left_at_the_default():
     """A config that never mentions attention_configs still gets bf16
     attention: the unet's own default stages compute in fp32."""
     fields = with_precision('unet', {}, dtype="bfloat16", attention_impl="reference")
-    assert [stage["dtype"] for stage in fields["attention_configs"]] == \
-        ["bfloat16"] * len(models['unet'].attention_configs)
+    assert [stage.dtype for stage in fields["attention_configs"]] == \
+        [jnp.bfloat16] * len(models['unet'].attention_configs)
 
 
 def test_policy_spells_the_reference_kernel_as_none():

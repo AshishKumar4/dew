@@ -255,3 +255,22 @@ def test_a_fresh_process_resolves_metrics_and_models_through_the_config():
              "PATH": os.environ.get("PATH", "")})
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip() == "psnr True"
+
+def test_guidance_is_a_value_with_its_interval(tmp_path):
+    """`guidance` was a bare scale whose 0 stood for "off", so `CFG.interval`
+    could not be named from a run at all. It is the value now: a record
+    builds one, None is the conditional prediction alone, and the interval
+    survives the round trip."""
+    config = dataclasses.replace(run_config(tmp_path), guidance=CFG(4.0, (0.2, 0.8)))
+    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
+    assert config.to_dict()["guidance"] == {"scale": 4.0, "interval": [0.2, 0.8]}
+
+    # The record a command line or a run.json carries builds the same value.
+    from_record = DiffusionRunConfig.from_dict(
+        {**config.to_dict(), "guidance": {"scale": 4.0, "interval": [0.2, 0.8]}})
+    assert from_record.guidance == CFG(4.0, (0.2, 0.8))
+    assert from_record.build().guidance == CFG(4.0, (0.2, 0.8))
+
+    unguided = dataclasses.replace(config, guidance=None)
+    assert unguided.build().guidance is None
+    assert DiffusionRunConfig.from_dict(unguided.to_dict()).guidance is None

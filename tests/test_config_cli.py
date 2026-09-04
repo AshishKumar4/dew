@@ -77,7 +77,7 @@ def test_a_spec_field_the_dataset_lacks_is_a_command_line_error(capsys):
 def test_a_recipe_config_round_trips_through_its_json_record(name):
     recipe = load_recipe(name)
     cls = {"diffusion": "DiffusionRunConfig", "lm": "LmRunConfig", "jepa": "JepaRunConfig"}[name]
-    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6", "--guidance", "2.5"],
+    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6", "--guidance.scale", "2.5"],
             "lm": ["--data.path", "d", "--sample-tokens", "4", "--ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--momentum", "0.9", "0.99"]}[name]
     config = parse(getattr(recipe, cls), [*args, "--trainer.steps", "5"])
