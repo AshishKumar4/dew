@@ -7,12 +7,12 @@ scale and epoch counters are the loop's business and are rebuilt on resume.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from typing import Any
 
 import jax
 import numpy as np
+from etils import epath
 import orbax.checkpoint as ocp
 from jax.experimental import multihost_utils
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
@@ -20,9 +20,26 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 STATE_LEAVES = ("step", "params", "opt_state", "ema", "key")
 
 
-def _is_uri(path: str) -> bool:
-    """A `<scheme>://` location, such as a gs:// bucket, which has no local form."""
+def is_uri(path: str) -> bool:
+    """A `<scheme>://` location, such as a gs:// bucket, which has no local form.
+
+    The package's one test for it, because the two callers need opposite
+    things from the answer: orbax wants an absolute path for a local
+    directory, and a tracker uploads a directory it can open while a bucket
+    is referenced where it already lies.
+    """
     return '://' in path
+
+
+def location(directory: str) -> epath.Path:
+    """Where a run's files go: a bucket URI as given, a local path absolute.
+
+    `epath` reads and writes both, but `Path.resolve` turns `gs://bucket/run`
+    into a local `gs:/bucket/run`, so the absolute step is for a path with no
+    scheme.
+    """
+    path = epath.Path(directory)
+    return path if is_uri(directory) else path.resolve()
 
 
 def _processes(count: int) -> str:
@@ -65,9 +82,7 @@ class Checkpoints:
     """
 
     def __init__(self, directory: str, *, keep: int = 2):
-        # orbax opens a bucket URI itself; abspath would turn it into a local
-        # directory named gs:. A local path has to be absolute for orbax.
-        self.directory = directory if _is_uri(directory) else os.path.abspath(directory)
+        self.directory = str(location(directory))
         self.keep = keep
         self._manager = None
 
@@ -97,7 +112,7 @@ class Checkpoints:
         return self._open().best_step()
 
     def path(self, step: int) -> str:
-        return os.path.join(self.directory, str(step))
+        return str(epath.Path(self.directory) / str(step))
 
     def save(self, step: int, state, position: bytes | None,
              metrics: Mapping[str, float] | None = None) -> None:
