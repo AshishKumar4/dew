@@ -68,6 +68,9 @@ interop = ["safetensors"]
 include = ["src/dew"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
+# Name the environment, or two people get two counts for the same tree.
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

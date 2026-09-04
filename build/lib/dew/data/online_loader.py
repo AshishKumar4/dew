@@ -1,0 +1,1035 @@
+from __future__ import annotations
+
+import multiprocessing
+import threading
+from multiprocessing import Queue
+import time
+import queue
+import cv2
+from functools import lru_cache, partial
+from typing import Any, Dict, List, Tuple, Optional, Union, Callable, TYPE_CHECKING
+
+import numpy as np
+
+from concurrent.futures import ThreadPoolExecutor
+import io
+# `import urllib` leaves urllib.request undefined, so the fetch below reached
+# it only when something else in the process had imported it. A worker that
+# was not forked imports neither.
+import urllib.request
+import os
+
+import PIL.Image
+import traceback
+
+# The lazy `datasets` import lives with the source that owns hub datasets.
+from .dataset import CAPTION
+from .sources.hf import _STREAMING_HINT, _hf_datasets
+
+if TYPE_CHECKING:
+    from datasets import Dataset
+
+
+def load_rows(sources: List[str], split: str = "train"):
+    """The rows of `sources`, concatenated and shuffled once.
+
+    A `gs://` path is a dataset saved with `save_to_disk`; anything else is
+    a hub dataset name read at `split`.
+    """
+    hf = _hf_datasets()
+    loaded = [hf.load_from_disk(source) if "gs://" in source
+              else hf.load_dataset(source, split=split) for source in sources]
+    if len(loaded) == 1:
+        return loaded[0]
+    return hf.concatenate_datasets(loaded).shuffle(seed=0)
+
+
+def generate_collate_fn(media_type="image"):
+    """The collate for one media type: stacked pixels and the captions.
+
+    A malformed sample raises: a batch that silently became zeros trained as
+    data. Records of mixed shapes are resized to the largest. The captions
+    leave as text; the run's condition is what reads them.
+    """
+    def image_collate(batch):
+        captions = np.asarray([sample["caption"] for sample in batch])
+
+        image_shapes = [sample["image"].shape for sample in batch]
+        if len(set(str(shape) for shape in image_shapes)) > 1:
+            # cv2 takes (width, height).
+            target_h = max(shape[0] for shape in image_shapes)
+            target_w = max(shape[1] for shape in image_shapes)
+            images = np.stack([
+                cv2.resize(sample["image"], (target_w, target_h))
+                if sample["image"].shape[:2] != (target_h, target_w) else sample["image"]
+                for sample in batch
+            ], axis=0)
+        else:
+            images = np.stack([sample["image"] for sample in batch], axis=0)
+
+        return {"image": images, CAPTION: captions}
+
+    def video_collate(batch):
+        captions = np.asarray([sample["caption"] for sample in batch])
+
+        video_shapes = [sample["video"].shape for sample in batch]
+        if len(set(str(shape) for shape in video_shapes)) > 1:
+            max_frames = max(shape[0] for shape in video_shapes)
+            max_height = max(shape[1] for shape in video_shapes)
+            max_width = max(shape[2] for shape in video_shapes)
+
+            videos = []
+            for sample in batch:
+                video = sample["video"]
+                num_frames, height, width = video.shape[:3]
+
+                if height != max_height or width != max_width:
+                    video = np.array([
+                        cv2.resize(frame, (max_width, max_height))
+                        for frame in video
+                    ])
+
+                if num_frames < max_frames:
+                    # Pad with duplicates of the last frame
+                    padding = np.tile(video[-1:], (max_frames - num_frames, 1, 1, 1))
+                    video = np.concatenate([video, padding], axis=0)
+
+                videos.append(video)
+
+            videos = np.stack(videos, axis=0)
+        else:
+            videos = np.stack([sample["video"] for sample in batch], axis=0)
+
+        return {"video": videos, CAPTION: captions}
+
+    return video_collate if media_type == "video" else image_collate
+
+
+@lru_cache(maxsize=1)
+def _user_agent() -> str:
+    """The user agent HF datasets advertises, resolved on the first fetch."""
+    try:
+        from datasets.utils.file_utils import get_datasets_user_agent
+    except ImportError as exc:
+        raise ImportError(_STREAMING_HINT) from exc
+    return get_datasets_user_agent()
+
+
+# A queue entry under this key is a fetch the workers dropped (dead URL, too
+# small, wrong aspect ratio). The iterator counts them and moves on, so a run
+# can read its drop rate instead of inferring it from throughput. The name is
+# reserved: a feature extractor could plausibly emit one called "dropped".
+DROPPED_SAMPLE = "__dropped__"
+
+
+# The fetcher's worker processes are started without forking this one. This
+# loader runs inside a training process, and os.fork carries over only the
+# calling thread, so a child inherits mutexes that JAX's and CUDA's other
+# threads were holding and hangs the first time it allocates or logs. The
+# sample queue comes from the same context, because a semaphore created for
+# the fork context is unlinked as soon as it exists and a spawned worker
+# cannot reopen it.
+_WORKER_CONTEXT = multiprocessing.get_context("spawn")
+
+
+class ResourceManager:
+    """A manager for shared resources across data loading processes."""
+    
+    def __init__(self, max_queue_size: int = 32000):
+        """Initialize a resource manager.
+        
+        Args:
+            max_queue_size: Maximum size of the data queue.
+        """
+        self.data_queue = _WORKER_CONTEXT.Queue(max_queue_size)
+    
+    def get_data_queue(self) -> Queue:
+        """Get the data queue."""
+        return self.data_queue
+
+
+def fetch_single_image(image_url: str, timeout: Optional[int] = None, retries: int = 0) -> Optional[PIL.Image.Image]:
+    """Fetch a single image from a URL.
+    
+    Args:
+        image_url: URL of the image to fetch.
+        timeout: Timeout in seconds for the request.
+        retries: Number of times to retry the request.
+        
+    Returns:
+        A PIL image or None if the image couldn't be fetched.
+    """
+    for attempt in range(retries + 1):
+        try:
+            request = urllib.request.Request(
+                image_url,
+                data=None,
+                headers={"user-agent": _user_agent()},
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as req:
+                image = PIL.Image.open(io.BytesIO(req.read()))
+            return image
+        except Exception as e:
+            if attempt < retries:
+                # Wait a bit before retrying
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            # Log the error on the final attempt
+            print(f"Error fetching image {image_url}: {e}")
+            return None
+
+
+def fetch_single_video(video_url: str, timeout: Optional[int] = None, retries: int = 0, 
+                       max_frames: int = 32) -> Optional[List[np.ndarray]]:
+    """Fetch a single video from a URL.
+    
+    Args:
+        video_url: URL of the video to fetch.
+        timeout: Timeout in seconds for the request.
+        retries: Number of times to retry the request.
+        max_frames: Maximum number of frames to extract.
+        
+    Returns:
+        A list of video frames as numpy arrays or None if the video couldn't be fetched.
+    """
+    # Create a temporary file to download the video
+    import tempfile
+    
+    for attempt in range(retries + 1):
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                
+            request = urllib.request.Request(
+                video_url,
+                data=None,
+                headers={"user-agent": _user_agent()},
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as req:
+                with open(tmp_path, 'wb') as f:
+                    f.write(req.read())
+            
+            # Load the video frames
+            cap = cv2.VideoCapture(tmp_path)
+            frames = []
+            
+            while len(frames) < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            
+            cap.release()
+            
+            # Delete the temporary file
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+                
+            return frames if frames else None
+            
+        except Exception as e:
+            if attempt < retries:
+                # Wait a bit before retrying
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            # Log the error on the final attempt
+            print(f"Error fetching video {video_url}: {e}")
+            
+            # Clean up the temporary file
+            try:
+                if 'tmp_path' in locals():
+                    os.remove(tmp_path)
+            except:
+                pass
+                
+            return None
+
+
+def default_image_processor(
+    image: PIL.Image.Image, 
+    image_shape: Tuple[int, int], 
+    min_image_shape: Tuple[int, int] = (128, 128),
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+) -> Tuple[Optional[np.ndarray], int, int]:
+    """Process an image for training.
+    
+    Args:
+        image: PIL image to process.
+        image_shape: Target shape (height, width).
+        min_image_shape: Minimum acceptable shape.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        
+    Returns:
+        Tuple of (processed image, original height, original width).
+        Processed image may be None if the image couldn't be processed.
+    """
+    try:
+        # Convert to numpy
+        image = np.array(image)
+        
+        # Check if image has 3 channels
+        if len(image.shape) != 3 or image.shape[2] != 3:
+            return None, 0, 0
+            
+        original_height, original_width = image.shape[:2]
+        
+        # Check if the image is too small
+        if min(original_height, original_width) < min(min_image_shape):
+            return None, original_height, original_width
+            
+        # Check if wrong aspect ratio
+        if max(original_height, original_width) / min(original_height, original_width) > 2.4:
+            return None, original_height, original_width
+            
+        # Check if the variance is too low (likely a blank/solid color image)
+        if np.std(image) < 1e-5:
+            return None, original_height, original_width
+            
+        # Choose interpolation method based on whether we're upscaling or downscaling
+        downscale = max(original_width, original_height) > max(image_shape)
+        interpolation = downscale_interpolation if downscale else upscale_interpolation
+
+        # Resize the longest side to the target, keeping the aspect ratio.
+        # albumentations 2.x has neither longest_max_size nor pad any more, and
+        # cv2 is the resize path everywhere else in the data layer.
+        scale = max(image_shape) / max(original_height, original_width)
+        resized = (max(1, round(original_width * scale)),
+                   max(1, round(original_height * scale)))
+        image = cv2.resize(image, resized, interpolation=interpolation)
+
+        # Pad to the target shape, centred, on white
+        pad_height = max(0, image_shape[0] - image.shape[0])
+        pad_width = max(0, image_shape[1] - image.shape[1])
+        if pad_height or pad_width:
+            top, left = pad_height // 2, pad_width // 2
+            image = cv2.copyMakeBorder(
+                image, top, pad_height - top, left, pad_width - left,
+                cv2.BORDER_CONSTANT, value=(255, 255, 255),
+            )
+        
+        return image, original_height, original_width
+        
+    except Exception as e:
+        # Log the error
+        print(f"Error processing image: {e}")
+        return None, 0, 0
+
+
+def default_video_processor(
+    frames: List[np.ndarray],
+    frame_size: int = 256,
+    min_frame_size: int = 128,
+    num_frames: int = 16,
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+) -> Tuple[Optional[np.ndarray], int, int]:
+    """Process video frames for training.
+    
+    Args:
+        frames: List of video frames as numpy arrays.
+        frame_size: Target size for each frame.
+        min_frame_size: Minimum acceptable frame size.
+        num_frames: Target number of frames.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        
+    Returns:
+        Tuple of (processed video array, original height, original width).
+        Processed video may be None if the video couldn't be processed.
+    """
+    try:
+        if not frames or len(frames) == 0:
+            return None, 0, 0
+            
+        # Get dimensions of the first frame
+        first_frame = frames[0]
+        original_height, original_width = first_frame.shape[:2]
+        
+        # Check if frames are too small
+        if min(original_height, original_width) < min_frame_size:
+            return None, original_height, original_width
+            
+        # Sample frames evenly
+        if len(frames) < num_frames:
+            # Not enough frames, duplicate some
+            indices = np.linspace(0, len(frames) - 1, num_frames, dtype=int)
+            sampled_frames = [frames[i] for i in indices]
+        else:
+            # Sample frames evenly
+            indices = np.linspace(0, len(frames) - 1, num_frames, dtype=int)
+            sampled_frames = [frames[i] for i in indices]
+        
+        # Process each frame
+        processed_frames = []
+        for frame in sampled_frames:
+            # Choose interpolation method based on whether we're upscaling or downscaling
+            downscale = max(frame.shape[1], frame.shape[0]) > frame_size
+            interpolation = downscale_interpolation if downscale else upscale_interpolation
+            
+            # Resize frame
+            resized_frame = cv2.resize(frame, (frame_size, frame_size), interpolation=interpolation)
+            processed_frames.append(resized_frame)
+        
+        # Stack frames into a video tensor [num_frames, height, width, channels]
+        video_tensor = np.stack(processed_frames, axis=0)
+        
+        return video_tensor, original_height, original_width
+        
+    except Exception as e:
+        # Log the error
+        print(f"Error processing video: {e}")
+        return None, 0, 0
+
+
+def map_image_sample(
+    url: str,
+    caption: str,
+    data_queue: Queue,
+    image_shape: Tuple[int, int] = (256, 256),
+    min_image_shape: Tuple[int, int] = (128, 128),
+    timeout: int = 15,
+    retries: int = 3,
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+    image_processor: Callable = default_image_processor,
+):
+    """Process a single image sample and put it in the queue.
+    
+    Args:
+        url: URL of the image.
+        caption: Caption for the image.
+        data_queue: Queue to put the processed sample in.
+        image_shape: Target shape for the image.
+        min_image_shape: Minimum acceptable shape.
+        timeout: Timeout for image fetching.
+        retries: Number of retries for image fetching.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        image_processor: Function to process the image.
+    """
+    try:
+        # Fetch the image
+        image = fetch_single_image(url, timeout=timeout, retries=retries)
+        if image is None:
+            data_queue.put({DROPPED_SAMPLE: url})
+            return
+
+        # Process the image
+        image, original_height, original_width = image_processor(
+            image, image_shape, min_image_shape=min_image_shape,
+            upscale_interpolation=upscale_interpolation,
+            downscale_interpolation=downscale_interpolation,
+        )
+
+        if image is None:
+            data_queue.put({DROPPED_SAMPLE: url})
+            return
+
+        # Put the processed sample in the queue
+        data_queue.put({
+            "url": url,
+            "caption": caption,
+            "image": image,
+            "original_height": original_height,
+            "original_width": original_width,
+        })
+        
+    except Exception as e:
+        # Log the error
+        print(f"Error mapping image sample {url}: {e}")
+        data_queue.put({DROPPED_SAMPLE: url})
+
+
+def map_video_sample(
+    url: str,
+    caption: str,
+    data_queue: Queue,
+    frame_size: int = 256,
+    min_frame_size: int = 128,
+    num_frames: int = 16,
+    timeout: int = 30,
+    retries: int = 3,
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+    video_processor: Callable = default_video_processor,
+):
+    """Process a single video sample and put it in the queue.
+    
+    Args:
+        url: URL of the video.
+        caption: Caption for the video.
+        data_queue: Queue to put the processed sample in.
+        frame_size: Target size for each frame.
+        min_frame_size: Minimum acceptable frame size.
+        num_frames: Target number of frames.
+        timeout: Timeout for video fetching.
+        retries: Number of retries for video fetching.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        video_processor: Function to process the video.
+    """
+    try:
+        # Fetch the video frames
+        frames = fetch_single_video(url, timeout=timeout, retries=retries, max_frames=num_frames*2)
+        if frames is None or len(frames) == 0:
+            data_queue.put({DROPPED_SAMPLE: url})
+            return
+
+        # Process the video
+        video, original_height, original_width = video_processor(
+            frames, frame_size, min_frame_size=min_frame_size,
+            num_frames=num_frames,
+            upscale_interpolation=upscale_interpolation,
+            downscale_interpolation=downscale_interpolation,
+        )
+
+        if video is None:
+            data_queue.put({DROPPED_SAMPLE: url})
+            return
+
+        # Put the processed sample in the queue
+        data_queue.put({
+            "url": url,
+            "caption": caption,
+            "video": video,
+            "original_height": original_height,
+            "original_width": original_width,
+        })
+        
+    except Exception as e:
+        # Log the error
+        print(f"Error mapping video sample {url}: {e}")
+        data_queue.put({DROPPED_SAMPLE: url})
+
+
+def default_feature_extractor(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract features from a sample.
+    
+    Args:
+        sample: Sample to extract features from.
+        
+    Returns:
+        Dictionary with extracted url and caption.
+    """
+    # Extract URL
+    url = None
+    for key in ["url", "URL", "image_url", "video_url"]:
+        if key in sample:
+            url = sample[key]
+            break
+    
+    if url is None:
+        raise ValueError(f"No URL found in sample with keys {list(sample)}")
+    
+    # Extract caption
+    caption = None
+    for key in ["caption", "CAPTION", "txt", "TEXT", "text"]:
+        if key in sample and sample[key] is not None:
+            caption = sample[key]
+            break
+    
+    if caption is None:
+        raise ValueError(f"No caption found in sample with keys {list(sample)}")
+        
+    return {
+        "url": url,
+        "caption": caption,
+    }
+    
+
+def map_batch(
+    batch: Dict[str, Any],
+    data_queue: Queue,
+    media_type: str = "image",
+    num_threads: int = 256,
+    image_shape: Tuple[int, int] = (256, 256),
+    min_image_shape: Tuple[int, int] = (128, 128),
+    frame_size: int = 256,
+    min_frame_size: int = 128,
+    num_frames: int = 16,
+    timeout: int = 15,
+    retries: int = 3,
+    image_processor: Callable = default_image_processor,
+    video_processor: Callable = default_video_processor,
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+    feature_extractor: Callable = default_feature_extractor,
+):
+    """Map a batch of samples and process them in parallel.
+    
+    Args:
+        batch: Batch of samples to process.
+        data_queue: Queue to put processed samples in.
+        media_type: Type of media ("image" or "video").
+        num_threads: Number of threads to use for processing.
+        image_shape: Target shape for images.
+        min_image_shape: Minimum acceptable shape for images.
+        frame_size: Target size for video frames.
+        min_frame_size: Minimum acceptable size for video frames.
+        num_frames: Target number of frames for videos.
+        timeout: Timeout for fetching.
+        retries: Number of retries for fetching.
+        image_processor: Function to process images.
+        video_processor: Function to process videos.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        feature_extractor: Function to extract features from samples.
+    """
+    try:
+        # Choose mapping function based on media type
+        if media_type == "video":
+            map_func = partial(
+                map_video_sample,
+                data_queue=data_queue,
+                frame_size=frame_size,
+                min_frame_size=min_frame_size,
+                num_frames=num_frames,
+                timeout=timeout,
+                retries=retries,
+                video_processor=video_processor,
+                upscale_interpolation=upscale_interpolation,
+                downscale_interpolation=downscale_interpolation,
+            )
+        else:  # Default to image
+            map_func = partial(
+                map_image_sample,
+                data_queue=data_queue,
+                image_shape=image_shape,
+                min_image_shape=min_image_shape,
+                timeout=timeout,
+                retries=retries,
+                image_processor=image_processor,
+                upscale_interpolation=upscale_interpolation,
+                downscale_interpolation=downscale_interpolation,
+            )
+        
+        # Extract features from batch
+        features = feature_extractor(batch)
+        urls, captions = features["url"], features["caption"]
+        
+        if urls is None or captions is None:
+            raise ValueError("feature extractor returned no URLs or captions")
+        
+        # Process samples in parallel
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            executor.map(map_func, urls, captions)
+    
+    except Exception as e:
+        # Log the error
+        print(f"Error mapping batch: {e}")
+        traceback.print_exc()
+        raise
+
+
+# The sample queue each pool worker inherited through the Pool initializer. A
+# multiprocessing.Queue can only cross a process boundary while the process is
+# being created, so handing it to pool.map as an argument raised "Queue objects
+# should only be shared between processes through inheritance" before the pool
+# had fetched anything.
+_worker_queue = None
+
+
+def _init_media_worker(data_queue: Queue):
+    """Pool initializer: keep the queue this process inherited."""
+    global _worker_queue
+    _worker_queue = data_queue
+
+
+def _map_shard(batch: Dict[str, Any], **kwargs):
+    """Pool entry point: map one shard onto this process's queue."""
+    map_batch(batch, data_queue=_worker_queue, **kwargs)
+
+
+def parallel_media_loader(
+    dataset: Dataset,
+    data_queue: Queue,
+    media_type: str = "image",
+    num_workers: int = 8,
+    image_shape: Tuple[int, int] = (256, 256),
+    min_image_shape: Tuple[int, int] = (128, 128),
+    frame_size: int = 256,
+    min_frame_size: int = 128,
+    num_frames: int = 16,
+    num_threads: int = 256,
+    timeout: int = 15,
+    retries: int = 3,
+    image_processor: Callable = default_image_processor,
+    video_processor: Callable = default_video_processor,
+    upscale_interpolation: int = cv2.INTER_CUBIC,
+    downscale_interpolation: int = cv2.INTER_AREA,
+    feature_extractor: Callable = default_feature_extractor,
+):
+    """Load and process media from a dataset in parallel.
+    
+    Args:
+        dataset: Dataset to load from.
+        data_queue: Queue to put processed samples in.
+        media_type: Type of media ("image" or "video").
+        num_workers: Number of worker processes.
+        image_shape: Target shape for images.
+        min_image_shape: Minimum acceptable shape for images.
+        frame_size: Target size for video frames.
+        min_frame_size: Minimum acceptable size for video frames.
+        num_frames: Target number of frames for videos.
+        num_threads: Number of threads per worker.
+        timeout: Timeout for fetching.
+        retries: Number of retries for fetching.
+        image_processor: Function to process images.
+        video_processor: Function to process videos.
+        upscale_interpolation: Interpolation method for upscaling.
+        downscale_interpolation: Interpolation method for downscaling.
+        feature_extractor: Function to extract features from samples.
+    """
+    # Create mapping function
+    map_batch_fn = partial(
+        _map_shard,
+        media_type=media_type,
+        num_threads=num_threads,
+        image_shape=image_shape,
+        min_image_shape=min_image_shape,
+        frame_size=frame_size,
+        min_frame_size=min_frame_size,
+        num_frames=num_frames,
+        timeout=timeout,
+        retries=retries,
+        image_processor=image_processor,
+        video_processor=video_processor,
+        upscale_interpolation=upscale_interpolation,
+        downscale_interpolation=downscale_interpolation,
+        feature_extractor=feature_extractor
+    )
+    
+    # Calculate shard length
+    shard_len = len(dataset) // num_workers
+    print(f"Local Shard length: {shard_len}")
+    
+    with _WORKER_CONTEXT.Pool(num_workers, initializer=_init_media_worker,
+                              initargs=(data_queue,)) as pool:
+        iteration = 0
+        while True:
+            # Create shards for each worker
+            shards = [dataset[i*shard_len:(i+1)*shard_len] for i in range(num_workers)]
+            print(f"Mapping {len(shards)} shards")
+            
+            # Process shards in parallel
+            pool.map(map_batch_fn, shards)
+            
+            # Shuffle dataset for next iteration
+            iteration += 1
+            print(f"Shuffling dataset with seed {iteration}")
+            dataset = dataset.shuffle(seed=iteration)
+
+
+class MediaBatchIterator:
+    """Iterator for batches of media samples.
+
+    Every batch is `batch_size` samples the fetcher really produced. A quiet
+    queue is not a batch: while the producer lives the iterator keeps waiting,
+    and once it is gone iteration ends, or raises if it died of an exception.
+    `dropped` counts the fetches its workers threw away.
+    """
+    
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int = 64,
+        media_type: str = "image",
+        image_shape: Tuple[int, int] = (256, 256),
+        min_image_shape: Tuple[int, int] = (128, 128),
+        frame_size: int = 256,
+        min_frame_size: int = 128,
+        num_frames: int = 16,
+        num_workers: int = 8,
+        num_threads: int = 256,
+        timeout: int = 15,
+        retries: int = 3,
+        image_processor: Callable = default_image_processor,
+        video_processor: Callable = default_video_processor,
+        upscale_interpolation: int = cv2.INTER_CUBIC,
+        downscale_interpolation: int = cv2.INTER_AREA,
+        feature_extractor: Callable = default_feature_extractor,
+        resource_manager: Optional[ResourceManager] = None,
+        queue_timeout: float = 60.0,
+    ):
+        """Initialize a media batch iterator.
+        
+        Args:
+            dataset: Dataset to iterate over.
+            batch_size: Batch size.
+            media_type: Type of media ("image" or "video").
+            image_shape: Target shape for images.
+            min_image_shape: Minimum acceptable shape for images.
+            frame_size: Target size for video frames.
+            min_frame_size: Minimum acceptable size for video frames.
+            num_frames: Target number of frames for videos.
+            num_workers: Number of worker processes.
+            num_threads: Number of threads per worker.
+            timeout: Timeout for fetching.
+            retries: Number of retries for fetching.
+            image_processor: Function to process images.
+            video_processor: Function to process videos.
+            upscale_interpolation: Interpolation method for upscaling.
+            downscale_interpolation: Interpolation method for downscaling.
+            feature_extractor: Function to extract features from samples.
+            resource_manager: Resource manager to use. Will create one if None.
+            queue_timeout: Seconds without a sample before the producer is
+                checked for life.
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.media_type = media_type
+        self.queue_timeout = queue_timeout
+        self.dropped = 0
+        self._producer_error = None
+        self._waiting_logged = False
+
+        # Create or use resource manager
+        self.resource_manager = resource_manager or ResourceManager()
+        self.data_queue = self.resource_manager.get_data_queue()
+        
+        # Start loader thread
+        loader = partial(
+            parallel_media_loader,
+            data_queue=self.data_queue,
+            media_type=media_type,
+            num_workers=num_workers,
+            image_shape=image_shape,
+            min_image_shape=min_image_shape,
+            frame_size=frame_size,
+            min_frame_size=min_frame_size,
+            num_frames=num_frames,
+            num_threads=num_threads,
+            timeout=timeout,
+            retries=retries,
+            image_processor=image_processor,
+            video_processor=video_processor,
+            upscale_interpolation=upscale_interpolation,
+            downscale_interpolation=downscale_interpolation,
+            feature_extractor=feature_extractor
+        )
+
+        # The producer's exception is kept rather than printed and forgotten:
+        # __next__ re-raises it instead of waiting on a queue nobody fills.
+        def produce():
+            try:
+                loader(dataset)
+            except Exception as error:
+                self._producer_error = error
+
+        # Start loader in background thread
+        self.thread = threading.Thread(target=produce, daemon=True)
+        self.thread.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Get the next batch of samples."""
+        batch = []
+        while len(batch) < self.batch_size:
+            try:
+                sample = self.data_queue.get(timeout=self.queue_timeout)
+            except queue.Empty:
+                self._check_producer()
+                continue
+            if DROPPED_SAMPLE in sample:
+                self.dropped += 1
+                continue
+            batch.append(sample)
+        return batch
+
+    def _check_producer(self):
+        """Raise when there is nothing left to wait for; a live producer is
+        only slow, and its samples are worth more than zeros."""
+        if self.thread.is_alive():
+            if not self._waiting_logged:
+                self._waiting_logged = True
+                print(f"No sample in {self.queue_timeout}s, still fetching "
+                      f"({self.dropped} dropped so far)")
+            return
+        if self._producer_error is not None:
+            raise RuntimeError("the media fetcher died") from self._producer_error
+        raise StopIteration
+
+    def __len__(self):
+        """Get the number of batches in the dataset."""
+        return len(self.dataset) // self.batch_size
+
+
+def dataMapper(map: Dict[str, Any]):
+    """Create a function to map dataset samples to a standard format.
+    
+    Args:
+        map: Dictionary mapping standard keys to dataset-specific keys.
+        
+    Returns:
+        Function that maps a sample to the standard format.
+    """
+    def _map(sample) -> Dict[str, Any]:
+        return {
+            "url": sample[map["url"]],
+            "caption": sample[map["caption"]],
+        }
+    return _map
+
+
+# Sentinel the prefetch thread leaves behind when it stops, so a consumer
+# waiting on the batch queue hears about it now rather than in 60 seconds.
+_STREAM_END = object()
+
+
+class OnlineStreamingDataLoader:
+    """Data loader for streaming media data from online sources.
+
+    Repeat contract: this loader is an endless stream. The worker pool in
+    `parallel_media_loader` walks its shards in a `while True` loop, reshuffling
+    the dataset between passes, and `__next__` retries rather than stopping when
+    the queue is briefly empty - so iteration ends only once the background
+    loader thread is gone: StopIteration if it ran out, and the thread's own
+    exception if it failed. Callers bound training themselves
+    (steps per epoch); `for batch in loader` never terminates on its own.
+
+    Sharding is decided once, at construction: the dataset is sharded by
+    `global_process_index`/`global_process_count` and each process then repeats
+    only its own shard forever.
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        batch_size=64,
+        media_type="image",
+        image_shape=(256, 256),
+        min_image_shape=(128, 128),
+        frame_size=256,
+        min_frame_size=128,
+        num_frames=16,
+        num_workers=16,
+        num_threads=512,
+        global_process_count=1,
+        global_process_index=0,
+        prefetch=1000,
+        collate_fn=None,
+        timeout=15,
+        retries=3,
+        image_processor=default_image_processor,
+        video_processor=default_video_processor,
+        upscale_interpolation=cv2.INTER_CUBIC,
+        downscale_interpolation=cv2.INTER_AREA,
+        feature_extractor=default_feature_extractor,
+        resource_manager=None,
+    ):
+        """Initialize an online streaming data loader.
+        
+        Args:
+            dataset: The loaded HF dataset of rows to fetch (see `load_rows`).
+            batch_size: Batch size.
+            media_type: Type of media ("image" or "video").
+            image_shape: Target shape for images.
+            min_image_shape: Minimum acceptable shape for images.
+            frame_size: Target size for video frames.
+            min_frame_size: Minimum acceptable size for video frames.
+            num_frames: Target number of frames for videos.
+            num_workers: Number of worker processes.
+            num_threads: Number of threads per worker.
+            global_process_count: Total number of processes.
+            global_process_index: Index of this process.
+            prefetch: Number of batches to prefetch.
+            collate_fn: Function to collate samples into batches. Defaults to
+                the data layer's collate for this media type.
+            timeout: Timeout for fetching.
+            retries: Number of retries for fetching.
+            image_processor: Function to process images.
+            video_processor: Function to process videos.
+            upscale_interpolation: Interpolation method for upscaling.
+            downscale_interpolation: Interpolation method for downscaling.
+            feature_extractor: Function to extract features from samples.
+            resource_manager: Resource manager to use.
+        """
+        # Shard dataset for distributed training
+        self.dataset = dataset.shard(
+            num_shards=global_process_count, index=global_process_index)
+        
+        # Get or create resource manager
+        self.resource_manager = resource_manager or ResourceManager()
+        
+        if collate_fn is None:
+            collate_fn = generate_collate_fn(media_type)
+        
+        # Create media batch iterator
+        self.iterator = MediaBatchIterator(
+            self.dataset,
+            batch_size=batch_size,
+            media_type=media_type,
+            image_shape=image_shape,
+            min_image_shape=min_image_shape,
+            frame_size=frame_size,
+            min_frame_size=min_frame_size,
+            num_frames=num_frames,
+            num_workers=num_workers,
+            num_threads=num_threads,
+            timeout=timeout,
+            retries=retries,
+            image_processor=image_processor,
+            video_processor=video_processor,
+            upscale_interpolation=upscale_interpolation,
+            downscale_interpolation=downscale_interpolation,
+            feature_extractor=feature_extractor,
+            resource_manager=self.resource_manager,
+        )
+        
+        self.batch_size = batch_size
+        self.collate_fn = collate_fn
+
+        # Create batch queue for prefetching
+        self.batch_queue = queue.Queue(prefetch)
+        self._loader_error = None
+        self._stream_ended = False
+
+        # Start batch loader thread
+        def batch_loader():
+            try:
+                for batch in self.iterator:
+                    self.batch_queue.put(collate_fn(batch))
+            except Exception as error:
+                self._loader_error = error
+            self.batch_queue.put(_STREAM_END)
+
+        self.loader_thread = threading.Thread(target=batch_loader, daemon=True)
+        self.loader_thread.start()
+
+    def __iter__(self):
+        """Get an iterator for the data loader."""
+        return self
+
+    def __next__(self):
+        """Get the next batch."""
+        while True:
+            if self._stream_ended:
+                self._raise_stream_end()
+            try:
+                batch = self.batch_queue.get(timeout=60)
+            except queue.Empty:
+                if not self.loader_thread.is_alive():
+                    self._stream_ended = True
+                    self._raise_stream_end()
+                print("Timeout waiting for batch, retrying...")
+                continue
+            if batch is _STREAM_END:
+                self._stream_ended = True
+                self._raise_stream_end()
+            return batch
+
+    def _raise_stream_end(self):
+        """The batch loader is gone: hand on its exception, or stop."""
+        if self._loader_error is not None:
+            raise RuntimeError("the streaming data loader died") from self._loader_error
+        raise StopIteration
+
+    def __len__(self):
+        """Get the number of samples in the dataset."""
+        return len(self.dataset)
