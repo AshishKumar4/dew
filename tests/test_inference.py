@@ -22,8 +22,7 @@ import pytest
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, TrainerConfig
-from dew.data import Dataset, OxfordFlowers
-from dew.data.video import VideoDataset
+from dew.data import Dataset, OxfordFlowers, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.inputs import Field, unit_range
