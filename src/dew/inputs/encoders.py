@@ -73,6 +73,9 @@ class CLIPText(ConditionEncoder):
     params: Any
     tokenizer: Any
     dtype: Optional[Any] = None
+    revision: Optional[str] = None
+    """The checkpoint's git revision, recorded so a rebuild reads the same
+    weights and the same tokenizer."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
@@ -82,7 +85,8 @@ class CLIPText(ConditionEncoder):
         dtype = resolve_dtype(dtype)
         model = CLIPTextModel.from_pretrained(checkpoint, dtype=dtype, revision=revision)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
-                   tokenizer=AutoTokenizer.from_pretrained(checkpoint), dtype=dtype)
+                   tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
+                   dtype=dtype, revision=revision)
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(texts), padding="max_length",
@@ -101,7 +105,8 @@ class CLIPText(ConditionEncoder):
             np.asarray(tokens["input_ids"]), skip_special_tokens=True))
 
     def to_json(self) -> dict:
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype)}
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
+                **({} if self.revision is None else {"revision": self.revision})}
 
 
 @encoders("audio")
@@ -162,6 +167,9 @@ class T5Text(ConditionEncoder):
     tokenizer: Any
     max_length: int = 256
     dtype: Optional[Any] = None
+    revision: Optional[str] = None
+    """The checkpoint's git revision, recorded so a rebuild reads the same
+    weights and the same tokenizer."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_T5_MODEL, *, dtype=None,
@@ -173,7 +181,7 @@ class T5Text(ConditionEncoder):
         model = T5EncoderModel.from_pretrained(checkpoint, dtype=dtype, revision=revision)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
-                   max_length=max_length, dtype=dtype)
+                   max_length=max_length, dtype=dtype, revision=revision)
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.max_length,
@@ -192,7 +200,8 @@ class T5Text(ConditionEncoder):
 
     def to_json(self) -> dict:
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
-                "max_length": self.max_length}
+                "max_length": self.max_length,
+                **({} if self.revision is None else {"revision": self.revision})}
 
 
 @encoders("char_table")

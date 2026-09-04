@@ -712,6 +712,11 @@ def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
     return params
 
 
+# The SD1-era flax weights live on their own branches, so these name a layout
+# rather than a revision anyone pinned.
+FLAX_REVISIONS = ("bf16", "flax")
+
+
 def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     """A pretrained AutoencoderKL's config and params, from a local directory
     or the Hub.
@@ -722,6 +727,11 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
     reads by name, so the newer latent spaces load through the same seam.
     Returns a dict with `config` (dict) and `params` (nested param tree).
+
+    `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
+    the torch path then reads the repo's default branch. Any other revision is
+    a pin: the torch path reads exactly it and raises rather than falling back
+    to the default branch, so a rerun cannot quietly read other weights.
     """
     from flax.serialization import msgpack_restore
 
@@ -752,7 +762,10 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             last_error = e
 
-    for candidate in ({"subfolder": "vae"}, {}):
+    pinned = revision not in FLAX_REVISIONS
+    torch_candidates = ([{"revision": revision, "subfolder": "vae"}, {"revision": revision}]
+                        if pinned else [{"subfolder": "vae"}, {}])
+    for candidate in torch_candidates:
         try:
             config_path = hf_hub_download(modelname, "config.json", **candidate)
             hf_hub_download(modelname, "diffusion_pytorch_model.safetensors", **candidate)
@@ -765,8 +778,10 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         return {"config": config, "params": _read_vae_weights(directory)}
 
     raise FileNotFoundError(
-        f"no VAE weights in {modelname}: neither flax "
-        "diffusion_flax_model.msgpack nor torch diffusion_pytorch_model.safetensors"
+        f"no VAE weights in {modelname}"
+        + (f" at revision {revision!r}" if pinned else "")
+        + ": neither flax diffusion_flax_model.msgpack nor torch "
+        "diffusion_pytorch_model.safetensors"
     ) from last_error
 
 
