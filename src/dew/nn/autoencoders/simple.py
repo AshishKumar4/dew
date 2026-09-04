@@ -176,16 +176,12 @@ class SimpleAutoEncoder(AutoEncoder):
         decoder_params = self.decoder.init(decode_key, latent)["params"]
         return {"encoder": encoder_params, "decoder": decoder_params}
 
-    def __encode__(self, images: jnp.ndarray, key: jax.Array = None, **kwargs) -> jnp.ndarray:
-        """Encode images [B, H, W, C] to latents [B, H/f, W/f, latent_channels].
-
-        `key` is part of the AutoEncoder contract but unused: this encoder is
-        deterministic.
-        """
+    def encode_batch(self, images: jnp.ndarray, key=None) -> jnp.ndarray:
+        """`key` is part of the AutoEncoder contract but unused: this encoder
+        is deterministic."""
         return self.encode_single_frame(images)
 
-    def __decode__(self, latents: jnp.ndarray, **kwargs) -> jnp.ndarray:
-        """Decode latents [B, h, w, latent_channels] to images [B, h*f, w*f, C]."""
+    def decode_batch(self, latents: jnp.ndarray) -> jnp.ndarray:
         return self.decode_single_frame(latents)
 
     @property

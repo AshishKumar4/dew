@@ -205,7 +205,7 @@ class SimpleMMDiT(nn.Module):
         B, H, W, C = x.shape
 
         img, inv_idx = self.embed(x)
-        txt = self.txt_embed(textcontext)
+        txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = neutralized_rope_freqs(self.rope, img.shape[1], self.scan_order)
 
@@ -441,7 +441,7 @@ class HierarchicalMMDiT(nn.Module):
         img, _ = self.embed(x)
         cond_base = self.conditioning(temb, textcontext)
         conds = [proj(cond_base) for proj in self.cond_projs]
-        txts = [embed(textcontext) for embed in self.txt_embeds]
+        txts = [embed(textcontext.hidden) for embed in self.txt_embeds]
 
         # --- Encoder path ---
         H_P, W_P = H // self.base_patch_size, W // self.base_patch_size

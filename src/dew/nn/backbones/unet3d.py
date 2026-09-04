@@ -97,7 +97,7 @@ class UNet3D(nn.Module):
         x = x.reshape(B * T, H, W, C)
         temb = jnp.repeat(temb, T, axis=0)
         if textcontext is not None:
-            textcontext = jnp.repeat(textcontext, T, axis=0)
+            textcontext = jnp.repeat(textcontext.hidden, T, axis=0)
 
         temb = FourierEmbedding(features=self.emb_features)(temb)
         temb = TimeProjection(features=self.emb_features)(temb)

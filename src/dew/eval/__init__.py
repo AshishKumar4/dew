@@ -1,23 +1,25 @@
-from .common import EvaluationMetric
-from .images import get_clip_metric, get_clip_score_metric
-from .fid import get_fid_metric, frechet_distance
-from .psnr import psnr, get_psnr_metric
-from .ssim import ssim, get_ssim_metric
-from .perplexity import get_perplexity_metric
+"""Image metrics behind `dew.registry.metrics`: `metrics.fid()`,
+`metrics.clip_score()`, `metrics.psnr()`, `metrics.ssim()`, `metrics.clip()`,
+each a factory returning a `Metric` the trainer scores an `ImageGrid` with."""
+
+from .common import ImageMetric, frames
+from .images import clip, clip_score
+from .fid import fid, frechet_distance
+from .psnr import peak_signal_noise_ratio, psnr
+from .ssim import structural_similarity, ssim
 
 __all__ = [
-    "EvaluationMetric",
+    "ImageMetric",
+    "frames",
     # CLIP-based
-    "get_clip_metric",
-    "get_clip_score_metric",
+    "clip",
+    "clip_score",
     # FID
-    "get_fid_metric",
+    "fid",
     "frechet_distance",
     # Pixel-level
+    "peak_signal_noise_ratio",
     "psnr",
-    "get_psnr_metric",
+    "structural_similarity",
     "ssim",
-    "get_ssim_metric",
-    # Language modelling
-    "get_perplexity_metric",
 ]

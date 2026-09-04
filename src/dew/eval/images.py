@@ -7,9 +7,11 @@ what the reference computes for the same pixels and tokens;
 `tests/test_metrics.py` states the tolerance and the difference observed.
 """
 
-from .common import EvaluationMetric
 import jax.numpy as jnp
 import numpy as np
+
+from dew.registry import metrics
+from .common import ImageMetric
 
 
 # Cache the CLIP model so multiple metrics share one copy of the weights
@@ -28,13 +30,13 @@ def _get_clip(modelname: str):
     return _clip_cache[modelname]
 
 
-def _clip_image_text_cosine(model, processor, generated, batch):
+def _clip_image_text_cosine(model, processor, artifact, batch, field):
     """Per-sample cos(image, text) of shape [B], normalized the way
     `CLIPModel.forward` normalizes before its logits."""
-    text = batch['text']
+    text = batch[field]
     # The sampler's [-1, 1] floats as uint8 pixels: nearest value, and clipped
     # because a sample can leave the range.
-    images = np.clip(np.round((np.asarray(generated) + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    images = np.clip(np.round((np.asarray(artifact.images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
     pixel_values = processor(images=images, return_tensors="np")["pixel_values"]
     image_embeds = model.get_image_features(pixel_values)
     text_embeds = model.get_text_features(text['input_ids'], text['attention_mask'])
@@ -43,36 +45,30 @@ def _clip_image_text_cosine(model, processor, generated, batch):
     return jnp.einsum('bd,bd->b', image_embeds, text_embeds)
 
 
-def get_clip_metric(
-    modelname: str = "openai/clip-vit-large-patch14",
-):
-    """Old CLIP distance metric: mean(1 - cos(image, text)), lower is better.
-    Kept so older runs ranked by best_val/clip_similarity stay comparable;
-    prefer get_clip_score_metric for new runs.
+@metrics("clip")
+def clip(modelname: str = "openai/clip-vit-large-patch14", field: str = "text") -> ImageMetric:
+    """CLIP distance, mean(1 - cos(image, text)), lower is better. Older runs
+    were ranked by it as val/clip_similarity; `clip_score` is the standard
+    number for a new run.
     """
     model, processor = _get_clip(modelname)
 
-    def clip_metric(generated: jnp.ndarray, batch):
-        cos = _clip_image_text_cosine(model, processor, generated, batch)
-        return jnp.mean(1.0 - cos)
+    def measure(artifact, batch):
+        return jnp.mean(1.0 - _clip_image_text_cosine(model, processor, artifact, batch, field))
 
-    return EvaluationMetric(function=clip_metric, name='clip_similarity')
+    return ImageMetric(name="clip_similarity", measure=measure)
 
 
-def get_clip_score_metric(
-    modelname: str = "openai/clip-vit-large-patch14",
-):
+@metrics("clip_score")
+def clip_score(modelname: str = "openai/clip-vit-large-patch14",
+               field: str = "text") -> ImageMetric:
     """Standard CLIPScore: 100 * max(cos(img, text), 0), higher is better.
     Typical T2I models score around 25-35 on natural prompts.
     """
     model, processor = _get_clip(modelname)
 
-    def clip_score_metric(generated: jnp.ndarray, batch):
-        cos = _clip_image_text_cosine(model, processor, generated, batch)
+    def measure(artifact, batch):
+        cos = _clip_image_text_cosine(model, processor, artifact, batch, field)
         return jnp.mean(100.0 * jnp.maximum(cos, 0.0))
 
-    return EvaluationMetric(
-        function=clip_score_metric,
-        name='clip_score',
-        higher_is_better=True,
-    )
+    return ImageMetric(name="clip_score", measure=measure)

@@ -12,7 +12,7 @@ from flax.typing import Dtype, PrecisionLike
 from functools import partial
 from ..scan_orders import hilbert_indices, inverse_permutation, hilbert_patchify, hilbert_unpatchify
 from ..vit import unpatchify, PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams
-from ..dit import ModulatedBlock, remat_block
+from ..dit import ModulatedBlock, remat_block, masked_mean
 from dew.registry import models
 
 
@@ -198,7 +198,7 @@ class UViT(nn.Module):
 
         if textcontext is not None:
             text_tokens = self.text_proj(
-                textcontext.astype(self.dtype))
+                textcontext.hidden.astype(self.dtype))
             num_text_tokens = text_tokens.shape[1]
             x = jnp.concatenate([x_patches, time_token, text_tokens], axis=1)
         else:
@@ -398,10 +398,8 @@ class SimpleUDiT(nn.Module):
 
         cond_emb = t_emb
         if textcontext is not None:
-            text_emb = self.text_proj(textcontext.astype(self.dtype))
-            if text_emb.ndim == 3:
-                text_emb = jnp.mean(text_emb, axis=1)
-            cond_emb = cond_emb + text_emb
+            text_emb = self.text_proj(textcontext.hidden.astype(self.dtype))
+            cond_emb = cond_emb + masked_mean(text_emb, textcontext.mask)
 
         skips = []
         for i in range(self.num_layers // 2):

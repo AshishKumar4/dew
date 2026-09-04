@@ -1,9 +1,4 @@
-from .common import (
-    NoiseScheduler,
-    GeneralizedNoiseScheduler,
-    get_coeff_shapes_tuple,
-    reshape_rates,
-)
+from .common import NoiseScheduler, GeneralizedNoiseScheduler, expand
 from .discrete import DiscreteNoiseScheduler
 from .continuous import ContinuousNoiseScheduler
 from .cosine import (
@@ -42,6 +37,5 @@ __all__ = [
     "FlowMatchingScheduler",
     "compute_resolution_shift",
     # Helpers
-    "get_coeff_shapes_tuple",
-    "reshape_rates",
+    "expand",
 ]

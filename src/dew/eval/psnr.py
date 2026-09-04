@@ -6,7 +6,9 @@ to (B*T, H, W, C) and every frame scores independently.
 
 import jax.numpy as jnp
 
-from .common import EvaluationMetric
+from dew.inputs import unit_range
+from dew.registry import metrics
+from .common import ImageMetric, frames
 
 
 def _as_frame_batch(images: jnp.ndarray) -> tuple[jnp.ndarray, bool]:
@@ -21,7 +23,7 @@ def _as_frame_batch(images: jnp.ndarray) -> tuple[jnp.ndarray, bool]:
     return images, False
 
 
-def psnr(
+def peak_signal_noise_ratio(
     predictions: jnp.ndarray,
     targets: jnp.ndarray,
     data_range: float,
@@ -47,22 +49,16 @@ def psnr(
     return scores if per_example else jnp.mean(scores)
 
 
-def get_psnr_metric(
-    data_range: float = 2.0,
-    per_example: bool = False,
-) -> EvaluationMetric:
-    """Mean PSNR in dB between generated and reference frames, higher is better.
+@metrics("psnr")
+def psnr(data_range: float = 2.0, field: str = "image") -> ImageMetric:
+    """Mean PSNR in dB between the sampled frames and the batch's, higher is
+    better.
 
-    The trainer passes the sampler's [-1, 1] samples and the loader's uint8
-    batch. The batch is scaled the way the objective scales it, so both sides
-    span the [-1, 1] range that the default data_range of 2.0 describes.
+    The artifact is in [-1, 1] and the batch holds uint8 pixels, which are
+    put on the objective's scale, so both sides span the range that the
+    default data_range of 2.0 describes.
     """
-    def psnr_metric(generated: jnp.ndarray, batch):
-        reference = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
-        return psnr(generated, reference, data_range, per_example)
+    def measure(artifact, batch):
+        return peak_signal_noise_ratio(frames(artifact), unit_range(batch[field]), data_range)
 
-    return EvaluationMetric(
-        function=psnr_metric,
-        name="psnr",
-        higher_is_better=True,
-    )
+    return ImageMetric(name="psnr", measure=measure)

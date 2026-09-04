@@ -1,181 +1,89 @@
+"""What a generative objective is fed: the sample field and its conditions.
+
+`InputSpec` names the batch field the model learns to generate and, keyed by
+the model's own keyword arguments, the conditions it is given. A `Condition`
+is an encoder, the batch field it reads and the raw datum that stands for
+"no condition", which classifier-free guidance and conditioning dropout
+substitute. Nothing here runs a model: the spec is a description, and the
+objective encodes.
+
+Image and video batches arrive as uint8 pixels in [0, 255], the way the data
+workers write them; `unit_range` is the one conversion to the [-1, 1] range
+every diffusion loss, sample, artifact and image metric lives in.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Mapping
+
 import jax
 import jax.numpy as jnp
-import flax.struct as struct
-import flax.linen as nn
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from dataclasses import dataclass
-from functools import partial
-import numpy as np
-from jax.sharding import Mesh, PartitionSpec as P
-from abc import ABC, abstractmethod
 
-from dew.nn.autoencoders import AutoEncoder
-from .encoders import *
+from dew.registry import encoders
+from .encoders import Audio, CLIPText, ConditionEncoder
 
-@dataclass
-class ConditionalInputConfig:
-    """Class representing a conditional input for the model."""
-    encoder: ConditioningEncoder
-    conditioning_data_key: str = None       # Key in the batch for this conditioning input
-    pretokenized: bool = False
-    unconditional_input: Any = None
-    model_key_override: Optional[str] = None  # Optional key override for the model
-    
-    __uncond_cache__ = None  # Cache for unconditional input
-    
+
+def unit_range(pixels) -> jax.Array:
+    """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
+    return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
+
+
+@dataclass(frozen=True)
+class Field:
+    """A batch field and its per-example shape: `Field("image", (128, 128, 3))`."""
+
+    key: str
+    shape: tuple[int, ...]
+
     def __post_init__(self):
-        if self.unconditional_input is not None:
-            uncond = self.encoder([self.unconditional_input])
-        else:
-            uncond = self.encoder([""])  # Default empty text
-        self.__uncond_cache__ = uncond  # Cache the unconditional input
-    
-    def __call__(self, batch_data):
-        """Process batch data to produce conditioning."""
-        key =  self.conditioning_data_key if self.conditioning_data_key else self.encoder.key
-        if self.pretokenized:
-            return self.encoder.encode_from_tokens(batch_data[key])
-        return self.encoder(batch_data[key])
-    
-    def get_unconditional(self):
-        """Get unconditional version of this input."""
-        return self.__uncond_cache__
-    
-    def serialize(self):
-        """Serialize the configuration."""
-        serialized_config = {
-            "encoder": self.encoder.serialize(),
-            "encoder_key": self.encoder.key,
-            "conditioning_data_key": self.conditioning_data_key,
-            "pretokenized": self.pretokenized,
-            "unconditional_input": self.unconditional_input,
-            "model_key_override": self.model_key_override,
-        }
-        return serialized_config
-    
-    @staticmethod
-    def deserialize(serialized_config):
-        """Deserialize the configuration."""
-        encoder_key = serialized_config["encoder_key"]
-        encoder_class = CONDITIONAL_ENCODERS_REGISTRY.get(encoder_key)
-        if encoder_class is None:
-            raise ValueError(f"Unknown encoder type: {encoder_key}")
-        
-        # Create the encoder instance
-        encoder = encoder_class.deserialize(serialized_config["encoder"])
-        # Deserialize the rest of the configuration
-        conditioning_data_key = serialized_config.get("conditioning_data_key")
-        # Configs written before pretokenization was serialized carry the
-        # dataclass default, which is what those runs trained with.
-        pretokenized = serialized_config.get("pretokenized", False)
-        unconditional_input = serialized_config.get("unconditional_input")
-        model_key_override = serialized_config.get("model_key_override")
-        return ConditionalInputConfig(
-            encoder=encoder,
-            conditioning_data_key=conditioning_data_key,
-            pretokenized=pretokenized,
-            unconditional_input=unconditional_input,
-            model_key_override=model_key_override,
-        )
-    
-@dataclass
-class DiffusionInputConfig:
-    """Configuration for the input data."""
-    sample_data_key: str         # Key in the batch for the sample data
-    sample_data_shape: Tuple[int, ...]
-    conditions: List[ConditionalInputConfig]
-    
-    def get_input_shapes(
-        self, 
-        autoencoder: AutoEncoder = None, 
-        sample_model_key:str = 'x',
-        time_embeddings_model_key:str = 'temb',
-    ) -> Dict[str, Tuple[int, ...]]:
-        """Get the shapes of the input data."""
-        if len(self.sample_data_shape) == 3:
-            T = None
-            H, W, C = self.sample_data_shape
-        elif len(self.sample_data_shape) == 4:
-            T, H, W, C = self.sample_data_shape
-        else:
-            raise ValueError(f"Unsupported shape for sample data {self.sample_data_shape}")
-        if autoencoder is not None:
-            downscale_factor = autoencoder.downscale_factor
-            H = H // downscale_factor
-            W = W // downscale_factor
-            C = autoencoder.latent_channels
-        
-        # Video models init against the full (T, H, W, C) sample shape
-        sample_shape = (H, W, C) if T is None else (T, H, W, C)
-        input_shapes = {
-            sample_model_key: sample_shape,
-            time_embeddings_model_key: (),
-        }
-        for cond in self.conditions:
-            # Get the shape of the conditioning data by calling the get_unconditional method
-            unconditional = cond.get_unconditional()
-            key = cond.model_key_override if cond.model_key_override else cond.encoder.key
-            input_shapes[key] = unconditional[0].shape
-            
-        print(f"Calculated input shapes: {input_shapes}")
-        return input_shapes
-    
-    def get_unconditionals(self):
-        """Get unconditional inputs for all conditions."""
-        unconditionals = []
-        for cond in self.conditions:
-            uncond = cond.get_unconditional()
-            unconditionals.append(uncond)
-        return unconditionals
-    
-    def process_conditioning(self, batch_data, uncond_mask: Optional[jnp.ndarray] = None):
-        """Process the conditioning data."""
-        results = []
-            
-        for cond in self.conditions:
-            cond_embeddings = cond(batch_data)
-            if uncond_mask is not None:
-                assert len(uncond_mask) == len(cond_embeddings), "Unconditional mask length must match the batch size."
-                uncond_embedding = cond.get_unconditional()
-                    
-                # Reshape uncond_mask to be broadcastable with the conditioning embeddings
-                # If cond_embeddings has shape (B, T, D), reshape uncond_mask to (B, 1, 1)
-                broadcast_shape = [len(uncond_mask)] + [1] * (cond_embeddings.ndim - 1)
-                reshaped_mask = jnp.reshape(uncond_mask, broadcast_shape)
-                    
-                # Repeat uncond_embedding to match batch size
-                batch_size = len(cond_embeddings)
-                repeated_uncond = jnp.repeat(uncond_embedding, batch_size, axis=0)
-                    
-                # Apply unconditional embedding based on the mask
-                cond_embeddings = jnp.where(reshaped_mask, repeated_uncond, cond_embeddings)
-                
-            results.append(cond_embeddings)
-        return results
-    
-    def serialize(self):
-        """Serialize the configuration."""
-        serialized_config = {
-            "sample_data_key": self.sample_data_key,
-            "sample_data_shape": self.sample_data_shape,
-            "conditions": [cond.serialize() for cond in self.conditions],
-        }
-        return serialized_config
-    
-    @staticmethod
-    def deserialize(serialized_config):
-        """Deserialize the configuration."""
-        sample_data_key = serialized_config["sample_data_key"]
-        sample_data_shape = tuple(serialized_config["sample_data_shape"])
-        conditions = serialized_config["conditions"]
-        
-        # Deserialize each condition
-        deserialized_conditions = []
-        for cond in conditions:
-            deserialized_conditions.append(ConditionalInputConfig.deserialize(cond))
-        
-        return DiffusionInputConfig(
-            sample_data_key=sample_data_key,
-            sample_data_shape=sample_data_shape,
-            conditions=deserialized_conditions,
-        )
+        object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
+
+
+@dataclass(frozen=True)
+class Condition:
+    """One conditioning input: the encoder, the batch field holding its
+    tokens, and the raw datum for the unconditional branch."""
+
+    encoder: ConditionEncoder
+    field: str = "text"
+    unconditional: str | float = ""
+
+    def to_json(self) -> dict:
+        return {"encoder": {"name": encoders.name_of(type(self.encoder)),
+                            "fields": self.encoder.to_json()},
+                "field": self.field,
+                "unconditional": self.unconditional}
+
+    @classmethod
+    def from_json(cls, data: Mapping) -> "Condition":
+        encoder = data["encoder"]
+        return cls(encoder=encoders[encoder["name"]].from_pretrained(**encoder["fields"]),
+                   field=data["field"], unconditional=data["unconditional"])
+
+
+@dataclass(frozen=True)
+class InputSpec:
+    """The sample field and the conditions, keyed by the model keyword each
+    is passed under: `{"textcontext": Condition(...)}`."""
+
+    sample: Field
+    conditions: Mapping[str, Condition] = field(default_factory=dict)
+
+    def to_json(self) -> dict:
+        return {"sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
+                "conditions": {keyword: condition.to_json()
+                               for keyword, condition in self.conditions.items()}}
+
+    @classmethod
+    def from_json(cls, data: Mapping) -> "InputSpec":
+        """Rebuild the spec, loading each encoder's weights; the one place a
+        spec opens files."""
+        sample = data["sample"]
+        return cls(sample=Field(sample["key"], tuple(sample["shape"])),
+                   conditions={keyword: Condition.from_json(condition)
+                               for keyword, condition in data["conditions"].items()})
+
+
+__all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "Audio",
+           "unit_range"]

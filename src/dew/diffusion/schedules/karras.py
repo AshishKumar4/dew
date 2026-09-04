@@ -1,78 +1,52 @@
 import jax
 import jax.numpy as jnp
+
 from .common import GeneralizedNoiseScheduler
-from dew.random_state import RandomMarkovState
+
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
-    def __init__(self, timesteps=1.0, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5,
-                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
-        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
-                         dtype=dtype, clip_min=clip_min, clip_max=clip_max,
-                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
+    """Sigmas placed along t with the rho spacing of Karras et al. 2022 (Eq. 5):
+    sigma(t) = (sigma_max^(1/rho) + (1 - t) (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho,
+    so a uniform grid in t is the paper's sampling grid in sigma."""
+
+    def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0, rho: float = 7.0,
+                 sigma_data: float = 0.5):
+        super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data)
+        self.rho = rho
         self.min_inv_rho = sigma_min ** (1 / rho)
         self.max_inv_rho = sigma_max ** (1 / rho)
-        self.rho = rho
-        
-    def get_sigmas(self, steps) -> jnp.ndarray:
-        # Ensure steps are properly normalized and clamped to avoid edge cases
-        ramp = jnp.clip(1 - steps / self.max_timesteps, 0.0, 1.0)
-        sigmas = (self.max_inv_rho + ramp * (self.min_inv_rho - self.max_inv_rho)) ** self.rho
-        return sigmas
-        
-    def get_schedule_weights(self, steps, shape=(-1, 1, 1, 1)) -> jnp.ndarray:
-        sigma = self.get_sigmas(steps)
-        # EDM lambda(sigma) = (sigma^2 + sd^2) / (sigma * sd)^2, written in a
-        # form that needs no epsilon guard (the old guard halved the weight at
-        # sigma_min where (sigma * sd)^2 == 1e-6)
-        weights = 1 / self.sigma_data ** 2 + 1 / sigma ** 2
-        return weights.reshape(shape)
-    
-    def transform_inputs(self, x, steps, num_discrete_chunks=1000) -> tuple[jnp.ndarray, jnp.ndarray]:
-        sigmas = self.get_sigmas(steps)
-        # Avoid log(0) by adding a small epsilon
-        epsilon = 1e-12
-        sigmas = jnp.log(sigmas + epsilon) / 4
-        return x, sigmas
-    
-    def get_timesteps(self, sigmas:jnp.ndarray) -> jnp.ndarray:
-        sigmas = sigmas.reshape(-1)
-        # Add epsilon for numerical stability
-        epsilon = 1e-12
-        inv_rho = (sigmas + epsilon) ** (1 / self.rho)
-        # Ensure proper clamping to avoid numerical issues
-        denominator = (self.min_inv_rho - self.max_inv_rho)
-        if abs(denominator) < 1e-7:
-            denominator = jnp.sign(denominator) * 1e-7
-        ramp = jnp.clip((inv_rho - self.max_inv_rho) / denominator, 0.0, 1.0)
-        steps = jnp.clip(1 - ramp, 0.0, 1.0) * self.max_timesteps
-        return steps
-    
-    def generate_timesteps(self, batch_size, state:RandomMarkovState) -> tuple[jnp.ndarray, RandomMarkovState]:
-        timesteps, state = super().generate_timesteps(batch_size, state)
-        timesteps = timesteps.astype(jnp.float32)
-        return timesteps, state
-    
-class EDMNoiseScheduler(KarrasVENoiseScheduler):
-    """Training sigmas drawn from exp(N(P_mean, P_std^2)).
+
+    def sigmas(self, t):
+        ramp = jnp.clip(1 - jnp.asarray(t, jnp.float32) / self.T, 0.0, 1.0)
+        return (self.max_inv_rho + ramp * (self.min_inv_rho - self.max_inv_rho)) ** self.rho
+
+    def t_of_sigma(self, sigma):
+        inv_rho = jnp.asarray(sigma, jnp.float32) ** (1 / self.rho)
+        ramp = jnp.clip((inv_rho - self.max_inv_rho) / (self.min_inv_rho - self.max_inv_rho),
+                        0.0, 1.0)
+        return (1 - ramp) * self.T
+
+
+class EDMNoiseScheduler(GeneralizedNoiseScheduler):
+    """Training sigmas drawn from exp(N(P_mean, P_std^2)): t is the standard
+    normal draw and sigma(t) = exp(P_mean + P_std t).
 
     Defaults are EDM2's (Karras et al. 2024); EDM1's -1.2/1.2 concentrated too
     much mass on low noise levels for larger models. Pass them explicitly to
     reproduce an EDM1 run.
     """
-    def __init__(self, timesteps, sigma_min=0.002, sigma_max=80, rho=7., sigma_data=0.5,
-                 P_mean=-0.4, P_std=1.0,
-                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
-        super().__init__(timesteps=timesteps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho, sigma_data=sigma_data,
-                         dtype=dtype, clip_min=clip_min, clip_max=clip_max,
-                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
+
+    def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0, sigma_data: float = 0.5,
+                 P_mean: float = -0.4, P_std: float = 1.0):
+        super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data)
         self.P_mean = P_mean
         self.P_std = P_std
 
-    def get_sigmas(self, steps) -> jnp.ndarray:
-        space = steps / self.max_timesteps
-        return jnp.exp(space * self.P_std + self.P_mean)
-    
-    def generate_timesteps(self, batch_size, state:RandomMarkovState) -> tuple[jnp.ndarray, RandomMarkovState]:
-        state, rng = state.get_random_key()
-        timesteps = jax.random.normal(rng, (batch_size,), dtype=jnp.float32)
-        return timesteps, state
+    def sigmas(self, t):
+        return jnp.exp(jnp.asarray(t, jnp.float32) / self.T * self.P_std + self.P_mean)
+
+    def t_of_sigma(self, sigma):
+        return (jnp.log(jnp.asarray(sigma, jnp.float32)) - self.P_mean) / self.P_std * self.T
+
+    def sample_t(self, key, n):
+        return jax.random.normal(key, (n,), dtype=jnp.float32)

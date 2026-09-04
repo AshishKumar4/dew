@@ -100,33 +100,10 @@ class StableDiffusionVAE(AutoEncoder):
         print(f"Downscale factor: {self.__downscale_factor__}")
         print(f"Latent channels: {self.__latent_channels__}")
 
-    def __encode__(self, images, key: jax.random.PRNGKey = None, **kwargs):
-        """Encode a batch of images to latent representations.
-        
-        Implements the abstract method from the parent class.
-        
-        Args:
-            images: Image tensor of shape [B, H, W, C]
-            key: Optional random key for stochastic encoding
-            **kwargs: Additional arguments (unused)
-            
-        Returns:
-            Latent representations of shape [B, h, w, c]
-        """
+    def encode_batch(self, images, key=None):
         return self.encode_single_frame(images, key)
-    
-    def __decode__(self, latents, **kwargs):
-        """Decode latent representations to images.
-        
-        Implements the abstract method from the parent class.
-        
-        Args:
-            latents: Latent tensor of shape [B, h, w, c]
-            **kwargs: Additional arguments (unused)
-            
-        Returns:
-            Decoded images of shape [B, H, W, C]
-        """
+
+    def decode_batch(self, latents):
         return self.decode_single_frame(latents)
 
     @property
