@@ -712,3 +712,42 @@ def test_export_refuses_the_new_features(tmp_path, rng):
     variables = model.init(rng, jnp.ones((1, 4), jnp.int32))
     with pytest.raises(ValueError, match="num_kv_shared_layers"):
         save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
+    """A gemma4_text config need not carry layer_types: its own config class
+    fills the 5:1 pattern at a fixed period of six and forces the last layer
+    full. This read such a config as an all-full stack, which is a different
+    model with the same weights. The expected pattern comes from the
+    reference class, not from a copy of the rule."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    config = gemma4_config("gemma4-e2b")
+    del config["layer_types"]
+    config["num_hidden_layers"] = 14
+    config["num_kv_shared_layers"] = 2
+
+    derived = translate_config(config)["layer_types"]
+
+    reference = Gemma4TextConfig(**{**config, "layer_types": None}).layer_types
+    assert derived == tuple(reference)
+    assert derived.count("sliding_attention") == 11
+    assert derived[-1] == "full_attention"
+
+
+def test_a_gemma4_pattern_ending_in_a_sliding_layer_is_read_as_full():
+    """Gemma4TextConfig rewrites a trailing sliding layer to full and warns,
+    so the weights of such a checkpoint were trained with a full last layer;
+    reading the config at its word would build a different model."""
+    config = gemma4_config("gemma4-e2b")
+    config["layer_types"] = ["full_attention", "sliding_attention"] * 3
+
+    assert translate_config(config)["layer_types"][-1] == "full_attention"
+
+
+def test_a_gemma3_pattern_keeps_its_last_layer():
+    """The rule is Gemma 4's: gemma3_text has no such rewrite, and its own
+    1B checkpoint ends on a sliding layer."""
+    config = fixture_config("gemma3-1b")
+
+    assert translate_config(config)["layer_types"][-1] == "sliding_attention"
