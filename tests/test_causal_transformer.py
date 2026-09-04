@@ -350,6 +350,21 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     assert not jnp.allclose(model.apply(params, ids), other_theta.apply(params, ids))
 
 
+def test_a_kinds_rope_base_wins_over_the_models(rng):
+    """A kind that states its own base keeps it when the model states one too."""
+    ids = tokens(rng)
+    pattern = ('sliding_attention', 'sliding_attention')
+    both = tiny(rope_theta=111.0, layer_types=pattern,
+                kinds={'sliding_attention': {'window': 4, 'rope_theta': 1e6}})
+    params = both.init(rng, ids)
+    kind_only = tiny(layer_types=pattern,
+                     kinds={'sliding_attention': {'window': 4, 'rope_theta': 1e6}})
+    assert jnp.allclose(both.apply(params, ids), kind_only.apply(params, ids))
+    model_only = tiny(rope_theta=1e6, layer_types=pattern,
+                      kinds={'sliding_attention': {'window': 4}})
+    assert jnp.allclose(both.apply(params, ids), model_only.apply(params, ids))
+
+
 def param_paths(params):
     return {'.'.join(str(entry.key) for entry in path)
             for path, _ in jax.tree_util.tree_flatten_with_path(params)[0]}
