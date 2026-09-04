@@ -12,7 +12,7 @@ The public modules and the names each exports. This page is written by
 | `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
 | `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `resolve_dtype`, `dtype_name`, `with_precision` |
 | `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid` |
-| `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig` |
+| `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig`, `Wandb` |
 
 ## Training
 
@@ -68,7 +68,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `Audio`, `CharTable`, `unit_range` |
-| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
+| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
 
 ## Evaluation and interop
 

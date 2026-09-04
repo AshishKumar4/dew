@@ -25,7 +25,7 @@ import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import HFImages, images  # noqa: E402
+from dew.data import HFImages, Loading, images  # noqa: E402
 from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
@@ -74,8 +74,9 @@ def hub(monkeypatch):
 
 
 def _hub_images(**fields):
-    return HFImages(name="acme/pets", image_size=SCALE, augmentation="none", worker_count=0,
-                    read_threads=1, read_buffer=1, worker_buffer=1, **fields)
+    return HFImages(name="acme/pets", image_size=SCALE, augmentation="none",
+                    loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+                    **fields)
 
 
 # ---------------------------------------------------------------------------------

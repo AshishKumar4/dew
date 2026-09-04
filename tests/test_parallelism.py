@@ -9,6 +9,7 @@ not the ones we meant.
 import json
 
 import jax
+from dew.data import Loading
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -462,7 +463,7 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, worker_count=0,
+    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()

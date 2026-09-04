@@ -27,7 +27,7 @@ import pytest
 import dew.data
 from dew.data import (Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
                       OxfordFlowers, TokenWindows, VoxCeleb2, local_batch)
-from dew.data import images, online_loader, video
+from dew.data import Loading, images, online_loader, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
@@ -37,7 +37,7 @@ from dew.registry import datasets
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-WORKERS = dict(worker_count=0, read_threads=1, read_buffer=1, worker_buffer=1)
+WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
 
 # ---------------------------------------------------------------------------------
@@ -155,7 +155,7 @@ class Indexed(DatasetSpec):
     val_batches: int | None = None
     count: int | None = None
     seed: int = 0
-    worker_count: int = 0
+    loading: Loading = Loading(workers=0)
 
     def source(self):
         return _Indexed(self.length)
@@ -165,8 +165,7 @@ class Indexed(DatasetSpec):
         records = len(source) if self.count is None else self.count
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, "Indexed")
         knobs = dict(batch=local_batch(batch), seed=self.seed,
-                     worker_count=self.worker_count, read_threads=1, read_buffer=1,
-                     worker_buffer=1)
+                     loading=self.loading)
         return Dataset(train=train_stream(train, [], **knobs),
                        val=None if val is None else validation_pass(val, [], **knobs),
                        records=len(train), batch=batch)
@@ -219,7 +218,7 @@ def test_a_validation_pass_reads_every_held_out_record_once(workers):
     and the unbounded num_epochs a run leaves at None let it read that slice
     again to do so.
     """
-    data = Indexed(val_batches=3, worker_count=workers).load(batch=8)
+    data = Indexed(val_batches=3, loading=Loading(workers=workers)).load(batch=8)
 
     batches, ended = _bounded(data.val(), 12)
     assert [[int(i) for i in b["index"]] for b in batches] == [
@@ -698,8 +697,8 @@ def _rows(batch):
 def _augmented(worker_count, length=16, batch=4, seed=3):
     """{record index: (pixels, caption)} for one epoch at this worker count."""
     data = Augmenting(length=length, image_size=8, seed=seed, val_batches=None,
-                      worker_count=worker_count, read_threads=1, read_buffer=1,
-                      worker_buffer=1).load(batch=batch, tokenize=keep_captions)
+                      loading=Loading(workers=worker_count, threads=1, read_buffer=1,
+                                      worker_buffer=1)).load(batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
             for b in itertools.islice(data.train(), data.steps_per_epoch)
             for index, pixels, caption in _rows(b)}
@@ -745,8 +744,9 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     worker batches its own slice and drops what is left over.
     """
     def loader():
-        return Augmenting(image_size=8, seed=3, val_batches=2, worker_count=worker_count,
-                          read_threads=1, read_buffer=1, worker_buffer=1).load(
+        return Augmenting(image_size=8, seed=3, val_batches=2,
+                          loading=Loading(workers=worker_count, threads=1, read_buffer=1,
+                                          worker_buffer=1)).load(
         batch=4, tokenize=keep_captions)
 
     interrupted = loader().train()
@@ -768,7 +768,7 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
 def _validated(length, val_batches, batch, **read):
     """{record index: (pixels, caption)} for one validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
-                      worker_count=0, worker_buffer=1, **read).load(
+                      loading=Loading(workers=0, worker_buffer=1, **read)).load(
         batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
             for b in data.val() for index, pixels, caption in _rows(b)}
@@ -782,8 +782,8 @@ def test_validation_pixels_do_not_depend_on_the_read_thread_count():
     differed between a 32-thread pass and a serial one, pass to pass, before
     each thread got a copy of its own. The captions come from the per-record
     rng directly and never moved."""
-    serial = _validated(512, 64, 4, read_threads=1, read_buffer=1)
-    threaded = _validated(512, 64, 4, read_threads=32, read_buffer=128)
+    serial = _validated(512, 64, 4, threads=1, read_buffer=1)
+    threaded = _validated(512, 64, 4, threads=32, read_buffer=128)
 
     assert sorted(serial) == list(range(256))
     assert threaded == serial
@@ -797,13 +797,13 @@ def test_a_validation_record_does_not_depend_on_the_process_count(
     the split, not in that slice, or the same seed validates one record with
     one augmentation on a single host and another on a pod: keyed by the
     slice, every record but the first differed at two processes."""
-    alone = _validated(64, 4, 8, read_threads=1, read_buffer=1)
+    alone = _validated(64, 4, 8, threads=1, read_buffer=1)
 
     together = {}
     monkeypatch.setattr(jax, "process_count", lambda: process_count)
     for index in range(process_count):
         monkeypatch.setattr(jax, "process_index", lambda index=index: index)
-        together.update(_validated(64, 4, 8, read_threads=1, read_buffer=1))
+        together.update(_validated(64, 4, 8, threads=1, read_buffer=1))
 
     assert sorted(alone) == list(range(32))
     assert together == alone
@@ -842,7 +842,7 @@ def test_a_record_that_cannot_be_read_stops_the_stream(worker_count):
     """The source's own error has to reach the trainer. A pipeline that caught
     it would train on whatever it substituted, and a worker's exception is the
     easiest one to lose."""
-    data = Raising(length=8, bad=3, worker_count=worker_count).load(batch=2)
+    data = Raising(length=8, bad=3, loading=Loading(workers=worker_count)).load(batch=2)
 
     delivered = []
     with pytest.raises(RuntimeError, match="record 3 is unreadable"):

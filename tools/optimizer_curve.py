@@ -31,7 +31,7 @@ import tyro
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recipes" / "lm"))
 
 from dew.config import OptimConfig  # noqa: E402
-from dew.data import TokenWindows  # noqa: E402
+from dew.data import Loading, TokenWindows  # noqa: E402
 from dew.objectives.lm import LMObjective  # noqa: E402
 from dew import models  # noqa: E402  naming a registry fills it
 from dew.registry import with_precision  # noqa: E402
@@ -84,8 +84,8 @@ def run(config: Comparison) -> dict:
     # One worker and one read thread: the arms must see identical batches, and
     # a curve is not a throughput measurement.
     data = TokenWindows(path=config.dataset, seq_len=config.sequence_length, seed=config.seed,
-                        worker_count=0, read_threads=1, read_buffer=1,
-                        worker_buffer=1).load(batch=config.batch_size)
+                        loading=Loading(workers=0, threads=1, read_buffer=1,
+                                        worker_buffer=1)).load(batch=config.batch_size)
     fields = with_precision(
         "causal_transformer",
         dict(vocab_size=vocab_size, emb_features=config.emb_features,

@@ -12,7 +12,7 @@ AV readers and `transformers` are imported by a spec on use, so a host that
 only needs the token loaders never pays for the image stack, and vice versa.
 """
 
-from .dataset import Batch, Dataset, DatasetSpec, local_batch
+from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch
 from .images import (AestheticCoyo, CC3M, CC12M, Combined30M, CombinedAesthetic,
                      CombinedMsml612, DiffusionDB, HFImages, ImageDataset, Laion2bAesthetic,
                      Laion12mCoco, LaionaCoco, LaionaCocoCoyo, OxfordFlowers)
@@ -29,6 +29,6 @@ __all__ = [
     "CC12M", "CC3M", "Combined30M", "CombinedAesthetic", "CombinedMsml612", "CombinedOnline",
     "Dataset", "DatasetSpec", "DiffusionDB", "HFDatasetSource", "HFImages", "HFTokenizer",
     "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
-    "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "TokenDocumentSource",
+    "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "TokenDocumentSource",
     "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "local_batch",
 ]

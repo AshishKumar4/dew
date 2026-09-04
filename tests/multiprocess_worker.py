@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from dew.data import Loading
 
 RES = 8
 BATCH = 8
@@ -278,8 +279,8 @@ def mode_data(args) -> dict:
     from dew.data import TokenWindows, local_batch
 
     data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
-                        worker_count=args.workers, read_threads=1, read_buffer=8,
-                        worker_buffer=1).load(batch=BATCH)
+                        loading=Loading(workers=args.workers, threads=1,
+                                        read_buffer=8, worker_buffer=1)).load(batch=BATCH)
     records, batches = [], 0
     for batch in data.val():
         window = np.asarray(batch["text"])
@@ -301,7 +302,8 @@ def mode_packed(args) -> dict:
     from dew.data import PackedTokens, local_batch
 
     data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
-                        worker_count=args.workers, worker_buffer=1).load(batch=BATCH)
+                        loading=Loading(workers=args.workers,
+                                        worker_buffer=1)).load(batch=BATCH)
     documents, windows = set(), 0
     for batch in data.val():
         text = np.asarray(batch["text"])
@@ -394,7 +396,7 @@ def mode_fit(args) -> dict:
         from dew.data import PackedTokens
 
         data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
-                            worker_count=args.workers).load(batch=BATCH)
+                            loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
         available = sum(1 for _ in data.val())
     state = trainer.fit(Data(lambda: iter(loader), val=val, records=args.records),

@@ -43,7 +43,7 @@ def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=N
 def run_config(recipe, tokens, *args):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
-        *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.worker-count", "0",
+        *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.log-every", "1", "--model.dtype", "float32",

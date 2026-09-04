@@ -19,7 +19,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import PackedTokens, TokenWindows
+from dew.data import Loading, PackedTokens, TokenWindows
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.data.text import ByteTokenizer
 from dew.nn.backbones import causal_transformer as backbone
@@ -192,14 +192,15 @@ def test_token_file_source_rejects_files_too_short(tmp_path):
 
 def _windows(tmp_path, **fields):
     """The fixed-window spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None, "worker_count": 0, "read_threads": 1, "read_buffer": 1,
-              "worker_buffer": 1, **fields}
+    fields = {"val_batches": None,
+              "loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+              **fields}
     return TokenWindows(path=str(tmp_path), **fields)
 
 
 def _packed_tokens(tmp_path, **fields):
     """The packed spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None, "worker_count": 0, "worker_buffer": 1, **fields}
+    fields = {"val_batches": None, "loading": Loading(workers=0, worker_buffer=1), **fields}
     return PackedTokens(path=str(tmp_path), **fields)
 
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
@@ -259,7 +260,7 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
                seq_len=seq_len)
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
-    data = _windows(tmp_path, seq_len=seq_len, seed=0, worker_count=worker_count).load(batch=4)
+    data = _windows(tmp_path, seq_len=seq_len, seed=0, loading=Loading(workers=worker_count)).load(batch=4)
 
     windows = [list(window) for batch in itertools.islice(data.val(), 12)
                for window in batch["text"]]
@@ -274,7 +275,7 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
                seq_len=seq_len)
 
     def by_record(worker_count):
-        data = _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=worker_count).load(batch=4)
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(batch=4)
         out = {}
         for b in itertools.islice(data.train(), data.steps_per_epoch):
             for row in b["text"]:
@@ -293,7 +294,7 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
                seq_len=seq_len)
 
     def first_batch(seed):
-        data = _windows(tmp_path, seq_len=seq_len, seed=seed, worker_count=0).load(batch=4)
+        data = _windows(tmp_path, seq_len=seq_len, seed=seed, loading=Loading(workers=0)).load(batch=4)
         return next(data.train())["text"]
 
     assert not np.array_equal(first_batch(0), first_batch(1))
@@ -310,7 +311,7 @@ def test_a_registered_token_spec_reads_the_directory(tmp_path):
     from dew.registry import datasets
 
     data = datasets.build("token_windows", path=str(tmp_path), seq_len=seq_len,
-                          worker_count=0).load(batch=4)
+                          loading=Loading(workers=0)).load(batch=4)
     batch = next(data.train())
     assert batch["text"].shape == (4, seq_len + 1)
     assert batch["text"].dtype == np.int32
@@ -323,16 +324,16 @@ def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, spec):
     pass scored windows the model was training on."""
     _token_dir(tmp_path, train_tokens=64, eos_id=0)
     with pytest.raises(ValueError, match=r"val\.bin.*tokenize_text\.py --val-fraction"):
-        spec(path=str(tmp_path), seq_len=8, worker_count=0).load(batch=4)
+        spec(path=str(tmp_path), seq_len=8, loading=Loading(workers=0)).load(batch=4)
 
 
 @pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
 def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
     (tmp_path / "not_a_dataset.txt").write_text("hello")
     with pytest.raises(ValueError, match="no train.bin"):
-        spec(path=str(tmp_path), worker_count=0).load(batch=4)
+        spec(path=str(tmp_path), loading=Loading(workers=0)).load(batch=4)
     with pytest.raises(ValueError, match="path="):
-        spec(worker_count=0).load(batch=4)
+        spec(loading=Loading(workers=0)).load(batch=4)
 
 
 # ---------------------------------------------------------------------------------
@@ -529,7 +530,8 @@ def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 70, 3)])
 
     def windows(worker_count):
-        data = _packed_tokens(tmp_path, seq_len=8, worker_count=worker_count, packing_bins=2).load(batch=2)
+        data = _packed_tokens(tmp_path, seq_len=8, loading=Loading(workers=worker_count, worker_buffer=1),
+                              packing_bins=2).load(batch=2)
         return sorted(row.tobytes() for batch in data.val()
                       for row in batch["text"])
 
@@ -935,7 +937,7 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
 
     def windows(workers):
-        data = _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=workers).load(batch=4)
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=workers)).load(batch=4)
         return sorted(row.tobytes()
                       for batch in itertools.islice(data.train(), data.steps_per_epoch)
                       for row in batch["text"])
@@ -956,7 +958,7 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
 
     def loader():
-        return _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=2).load(batch=4)
+        return _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=2)).load(batch=4)
 
     data = loader()
     epoch = data.steps_per_epoch  # 32 windows in eight batches
@@ -985,7 +987,8 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 100, 3)])
 
     def loader():
-        return _packed_tokens(tmp_path, seq_len=8, worker_count=2, packing_bins=2).load(batch=2)
+        return _packed_tokens(tmp_path, seq_len=8, loading=Loading(workers=2, worker_buffer=1),
+                              packing_bins=2).load(batch=2)
 
     interrupted = loader().val()
     seen = [row.tobytes() for row in next(interrupted)["text"]]
