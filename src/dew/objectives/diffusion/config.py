@@ -148,15 +148,8 @@ class DiffusionRunConfig(RunConfig):
         settings and the channels the model denoises, over `model.config`."""
         fields = self.model.fields()
         sample = self.sample_field()
-        if autoencoder is None:
-            channels, size = sample.shape[-1], sample.shape[-2]
-        else:
-            channels = autoencoder.latent_channels
-            size = sample.shape[-2] // autoencoder.downscale_factor
-        if self.model.architecture == "diffusers_unet_simple":
-            fields.update(sample_size=size, in_channels=channels, out_channels=channels)
-        else:
-            fields["output_channels"] = channels
+        fields["output_channels"] = (sample.shape[-1] if autoencoder is None
+                                     else autoencoder.latent_channels)
         return fields
 
     def build(self) -> DiffusionObjective:

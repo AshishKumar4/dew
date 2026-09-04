@@ -11,6 +11,14 @@ import flax.linen as nn
 from typing import Callable, Optional, Sequence, Tuple, Union, Any
 from . import utils
 
+# The FID feature extractor's weights: the jax-fid pickle, mirrored on the Hub
+# so a revision and a digest can be pinned. The bytes are byte-identical to
+# what this metric has always used, so no reported FID moves.
+FID_WEIGHTS_REPO = 'hayden-donnelly/inception-v3-fid'
+FID_WEIGHTS_FILE = 'inception_v3_fid.pickle'
+FID_WEIGHTS_REVISION = 'ccb3ff416ff491ae7fd964c5e7c01d12ab7c48bf'
+FID_WEIGHTS_DIGEST = '4e030efa5bccac3222d975f658d1884f9e00fab24f2812082884539220b90d77'
+
 PRNGKey = Any
 Array = Any
 Shape = Tuple[int]
@@ -37,13 +45,17 @@ class InceptionV3(nn.Module):
     pretrained: bool=False
     transform_input: bool=False
     aux_logits: bool=False
-    ckpt_path: str='https://www.dropbox.com/s/xt6zvlvt22dcwck/inception_v3_weights_fid.pickle?dl=1'
+    ckpt_repo: str=FID_WEIGHTS_REPO
+    ckpt_file: str=FID_WEIGHTS_FILE
+    ckpt_revision: str=FID_WEIGHTS_REVISION
+    ckpt_digest: str=FID_WEIGHTS_DIGEST
     dtype: str='float32'
 
     def setup(self):
         if self.pretrained:
-            ckpt_file = utils.download(self.ckpt_path)
-            self.params_dict = utils.load_arrays(ckpt_file)
+            path = utils.fetch(self.ckpt_repo, self.ckpt_file,
+                               self.ckpt_revision, self.ckpt_digest)
+            self.params_dict = utils.load_arrays(path)
             self.num_classes_ = 1000
         else:
             self.params_dict = None

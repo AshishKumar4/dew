@@ -429,6 +429,22 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
         load_arrays(hostile)
 
 
+def test_the_weights_are_pinned_by_digest():
+    """The weights came from a consumer file-sharing link with no checksum,
+    which a released package unpickled, so whoever held the link chose what
+    ran. They come from a Hub revision now and the digest is checked as well,
+    so a file that is not the one this code was written against is refused
+    before anything reads it."""
+    from dew.eval import inception
+    from dew.eval.utils import fetch
+
+    assert len(inception.FID_WEIGHTS_DIGEST) == 64
+    assert len(inception.FID_WEIGHTS_REVISION) == 40
+    with pytest.raises(ValueError, match="hashes to"):
+        fetch(inception.FID_WEIGHTS_REPO, inception.FID_WEIGHTS_FILE,
+              inception.FID_WEIGHTS_REVISION, "0" * 64)
+
+
 @pytest.mark.network
 def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
     """The calibration the metric exists for: two disjoint halves of the same
