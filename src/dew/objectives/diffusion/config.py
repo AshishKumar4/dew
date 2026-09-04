@@ -29,6 +29,12 @@ ATTENTION = {
     "use_self_and_cross": True, "only_pure_attention": True,
 }
 
+# Architectures that run the text as a second stream through every block's
+# joint attention: with no text there is no sequence to project, so an
+# unconditional run names something else instead of failing in the first
+# attention softmax over an empty slice.
+TEXT_STREAM_MODELS = ("simple_mmdit", "hierarchical_mmdit")
+
 # The default unet: attention everywhere but the full-resolution stage, where
 # it costs the most. Every other architecture takes its own kwargs as JSON.
 DEFAULT_MODEL_CONFIG = {
@@ -132,6 +138,11 @@ class DiffusionRunConfig(RunConfig):
         """The objective this run trains: the model, the process, the inputs
         and the autoencoder, with validation sampling as configured. The one
         construction, shared by the recipe and by `TextToImage.from_run`."""
+        if self.text is None and self.model.architecture in TEXT_STREAM_MODELS:
+            raise ValueError(
+                f"an unconditional run needs a model that attends without text, and "
+                f"{self.model.architecture!r} runs the text as a second stream through "
+                "every block")
         autoencoder = None if self.autoencoder is None else self.autoencoder.build()
         conditions = {} if self.text is None else {"textcontext": self.text.build()}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)

@@ -179,6 +179,44 @@ def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
     assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
 
 
+def test_an_unconditional_default_model_takes_a_step():
+    """text=None on the default unet builds, inits and takes one trainer
+    step: with no text the cross-attention blocks fall back to
+    self-attention."""
+    from dew.data import Dataset
+    from dew.objectives.base import Step
+    from dew.training import Trainer
+    config = DiffusionRunConfig(text=None)
+    objective = config.build()
+    images = np.zeros((8, 128, 128, 3), np.uint8)
+
+    def batches():
+        while True:
+            yield {"image": images}
+
+    state = Trainer(objective, optax.adam(1e-3),
+                    key=jax.random.PRNGKey(0)).fit(
+        Dataset(train=batches, val=None, records=None, batch=8), steps=1, log_every=100)
+
+    assert int(state.step) == 1
+    leaves = jax.tree.leaves(state.params["params"])
+    assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
+
+
+def test_joint_stream_models_refuse_an_unconditional_run():
+    """SimpleMMDiT and HierarchicalMMDiT run the text as a second stream
+    through every block's joint attention, so with no text there is no
+    sequence to project; the run is refused by name instead of failing in
+    the first attention softmax over an empty slice."""
+    from dew.config import ModelConfig
+
+    base = DiffusionRunConfig(text=None)
+    for architecture in ("simple_mmdit", "hierarchical_mmdit"):
+        config = dataclasses.replace(base, model=ModelConfig(architecture, {}))
+        with pytest.raises(ValueError, match="unconditional"):
+            config.build()
+
+
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: the
     factories read that grid there, and the image-only metrics are refused
