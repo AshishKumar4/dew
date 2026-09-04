@@ -17,7 +17,7 @@ from dew.data import Dataset, OxfordFlowers, PackedTokens, TokenWindows
 from dew.data.dataset import tokenized
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
-from test_diffusion_objective import RES, TOKENS, StubText
+from test_diffusion_objective import RES, StubText
 
 # The manifest names the encoder through the registry.
 encoders("stub_text")(StubText)
