@@ -121,7 +121,7 @@ class SimpleAutoEncoder(AutoEncoder):
         latent_shift: float = 0.0,
         latent_scale: float = 1.0,
         params=None,
-        key: jax.Array = None,
+        key: Optional[jax.Array] = None,
     ):
         self.latent_shift = latent_shift
         self.latent_scale = latent_scale
@@ -177,13 +177,13 @@ class SimpleAutoEncoder(AutoEncoder):
         decoder_params = self.decoder.init(decode_key, latent)["params"]
         return {"encoder": encoder_params, "decoder": decoder_params}
 
-    def encode_batch(self, params, images: jnp.ndarray, key=None) -> jnp.ndarray:
+    def encode_batch(self, params, x: jnp.ndarray, key=None) -> jnp.ndarray:
         """`key` is part of the AutoEncoder contract but unused: this encoder
         is deterministic."""
-        return self.encode_single_frame(params, images)
+        return self.encode_single_frame(params, x)
 
-    def decode_batch(self, params, latents: jnp.ndarray) -> jnp.ndarray:
-        return self.decode_single_frame(params, latents)
+    def decode_batch(self, params, z: jnp.ndarray) -> jnp.ndarray:
+        return self.decode_single_frame(params, z)
 
     @property
     def downscale_factor(self) -> int:

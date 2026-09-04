@@ -44,7 +44,7 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
         offset = np.eye(sigma_a.shape[0]) * eps
         covmean = linalg.sqrtm((sigma_a + offset).dot(sigma_b + offset))
     if np.iscomplexobj(covmean):
-        covmean = covmean.real
+        covmean = np.real(covmean)
 
     diff = mu_a - mu_b
     return float(diff.dot(diff) + np.trace(sigma_a) + np.trace(sigma_b) - 2 * np.trace(covmean))
@@ -70,6 +70,9 @@ def fid(field: str = "image") -> ImageMetric:
         # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
         features = model.apply(params, resized, train=False)
+        # apply returns the output alone unless mutable collections were asked
+        # for, and none were.
+        assert not isinstance(features, tuple)
         return features.reshape(features.shape[0], -1)
 
     def measure(artifact, batch):

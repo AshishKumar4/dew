@@ -125,6 +125,16 @@ class JepaObjective(Objective):
         return self.encoder.apply({"params": encoder_params}, data, token_idx,
                                   train=train, rngs=rngs)
 
+    def _target_params(self, step: Step):
+        """The target encoder's parameters: the EMA copy of the context encoder.
+
+        The objective declares an EMASpec, so the trainer always hands it an
+        EMA tree; without one there is no target branch to run.
+        """
+        if step.ema is None:
+            raise ValueError("the JEPA target branch needs the trainer's EMA variables")
+        return step.ema["params"][CONTEXT_ENCODER]
+
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.sample.key])
         batch_size = data.shape[0]
@@ -133,7 +143,7 @@ class JepaObjective(Objective):
         num_targets = self.mask.num_targets
 
         # Target branch: the whole view through the EMA encoder, no gradient
-        full = normalize_targets(self.encode(step.ema["params"][CONTEXT_ENCODER], data))
+        full = normalize_targets(self.encode(self._target_params(step), data))
         # [B, (T,) S, F] -> [B, M, (T,) n_tgt, F]
         frame_axis = (1,) if self.is_video else ()
         gather_idx = target_idx.reshape(batch_size, num_targets, *frame_axis, -1, 1)
@@ -162,7 +172,7 @@ class JepaObjective(Objective):
 
     def evaluate(self, params, batch, step: Step):
         """The frozen target encoder's pooled embeddings, with the batch labels."""
-        features = self._embed(step.ema["params"][CONTEXT_ENCODER], batch[self.sample.key])
+        features = self._embed(self._target_params(step), batch[self.sample.key])
         return Representations(features=features, labels=jnp.asarray(batch[self.label_key]))
 
     @functools.cached_property

@@ -10,7 +10,7 @@ same file, so the two cannot drift.
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from dew.config import JsonDict, ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, VideoDataset
@@ -23,6 +23,19 @@ from .objective import DiffusionObjective
 
 import dew.eval  # noqa: F401  registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
+
+if TYPE_CHECKING:
+    from dew.diffusion.presets import Preset
+    from dew.sampling.solvers import Solver
+
+    # A registry's `union` is built from what has registered by import time, so
+    # only the run sees it. Statically the fields hold what every member of
+    # those tables is, which is what a reader and a checker need.
+    PresetSpec = Preset
+    SamplerSpec = Solver
+else:
+    PresetSpec = presets.union
+    SamplerSpec = samplers.union
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
@@ -99,9 +112,9 @@ class DiffusionRunConfig(RunConfig):
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    preset: presets.union = dataclasses.field(default_factory=presets.EDM)
+    preset: PresetSpec = dataclasses.field(default_factory=presets.EDM)
     """The convention the model is trained and sampled with."""
-    sampler: samplers.union = dataclasses.field(default_factory=samplers.EulerAncestral)
+    sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
     """The solver validation samples with."""
     guidance: Optional[CFG] = dataclasses.field(default_factory=lambda: CFG(3.0))
     """How validation samples are guided; None samples the conditional

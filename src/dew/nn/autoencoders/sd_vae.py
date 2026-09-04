@@ -76,10 +76,13 @@ class StableDiffusionVAE(AutoEncoder):
         self.latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
         print(f"Latent shift: {self.latent_shift}, latent scale: {self.latent_scale}")
 
-        def encode_single_frame(params, images, rngkey=None):
-            latents = enc.apply({"params": params['encoder']}, images, deterministic=True)
+        def encode_single_frame(params, x, rngkey=None):
+            latents = enc.apply({"params": params['encoder']}, x, deterministic=True)
             if quant_conv is not None:
                 latents = quant_conv.apply({"params": params['quant_conv']}, latents)
+            # apply returns the output alone unless mutable collections were
+            # asked for, and none were.
+            assert not isinstance(latents, tuple)
             if rngkey is not None:
                 mean, log_std = jnp.split(latents, 2, axis=-1)
                 log_std = jnp.clip(log_std, -30, 20)
@@ -89,10 +92,10 @@ class StableDiffusionVAE(AutoEncoder):
                 latents, _ = jnp.split(latents, 2, axis=-1)
             return latents
 
-        def decode_single_frame(params, latents):
+        def decode_single_frame(params, z):
             if post_quant_conv is not None:
-                latents = post_quant_conv.apply({"params": params['post_quant_conv']}, latents)
-            return dec.apply({"params": params['decoder']}, latents)
+                z = post_quant_conv.apply({"params": params['post_quant_conv']}, z)
+            return dec.apply({"params": params['decoder']}, z)
 
         self.encode_single_frame = jax.jit(encode_single_frame)
         self.decode_single_frame = jax.jit(decode_single_frame)
@@ -104,11 +107,11 @@ class StableDiffusionVAE(AutoEncoder):
         self.__downscale_factor__ = dummy_input.shape[1] // dummy_latents.shape[1]
         self.__latent_channels__ = dummy_latents.shape[-1]
 
-    def encode_batch(self, params, images, key=None):
-        return self.encode_single_frame(params, images, key)
+    def encode_batch(self, params, x, key=None):
+        return self.encode_single_frame(params, x, key)
 
-    def decode_batch(self, params, latents):
-        return self.decode_single_frame(params, latents)
+    def decode_batch(self, params, z):
+        return self.decode_single_frame(params, z)
 
     @property
     def downscale_factor(self) -> int:

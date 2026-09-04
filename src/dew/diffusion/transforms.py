@@ -17,6 +17,8 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 
+from jax.typing import ArrayLike
+
 from dew.diffusion.schedules import NoiseScheduler, expand
 
 
@@ -26,7 +28,8 @@ class PredictionTransform:
     def pred_transform(self, x_t, preds, rates) -> jax.Array:
         return preds
 
-    def forward_diffusion(self, x_0, epsilon, rates) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def forward_diffusion(self, x_0, epsilon,
+                          rates) -> tuple[jax.Array, ArrayLike, jax.Array]:
         """`(x_t, c_in, target)`: the noised sample, the model input scale and
         what the model should output for it."""
         signal_rate, noise_rate = rates
@@ -40,10 +43,10 @@ class PredictionTransform:
     def get_target(self, x_0, epsilon, rates) -> jax.Array:
         return x_0
 
-    def get_input_scale(self, rates):
+    def get_input_scale(self, rates) -> ArrayLike:
         return 1
 
-    def target_error_scale(self, snr) -> jax.Array:
+    def target_error_scale(self, snr) -> ArrayLike:
         """||target error||^2 / ||x_0 error||^2 at the given SNR.
 
         Loss weights (min-SNR-gamma and friends) are defined on the x_0 loss;
@@ -136,8 +139,10 @@ class KarrasPredictionTransform(PredictionTransform):
 
 
 class Weighting(Protocol):
-    def __call__(self, schedule: NoiseScheduler, prediction: PredictionTransform, t) -> jax.Array:
+    def __call__(self, schedule: NoiseScheduler, prediction: PredictionTransform,
+                 t) -> jax.Array:
         """Per-example loss weight at `t`, shaped like `t`."""
+        ...
 
 
 @dataclass(frozen=True)

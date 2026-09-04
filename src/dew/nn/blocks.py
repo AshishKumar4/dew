@@ -175,7 +175,7 @@ class ConvLayer(nn.Module):
                 precision=self.precision
             )
 
-    def __call__(self, x):
+    def __call__(self, x) -> jax.Array:
         return self.conv(x)
 
 class Upsample(nn.Module):
