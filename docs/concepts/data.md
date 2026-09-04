@@ -28,7 +28,7 @@ Every process holds the same number of validation batches; the trainer confirms 
 
 ## Determinism
 
-Decoding, resizing and augmentation draw their randomness from the record's own generator, seeded from the spec's `seed` and the record's index. Each grain read thread runs its own copy of the augmentation pipeline, so a record gets the same pixels and the same caption at any `worker_count`, any `read_threads`, and any number of hosts. A failed record is dropped and counted; nothing is ever replaced with zeros.
+Decoding, resizing and augmentation draw their randomness from the record's own generator, seeded from the spec's `seed` and the record's index. Each grain read thread runs its own copy of the augmentation pipeline, so a record gets the same pixels and the same caption at any `loading.workers`, any `loading.threads`, and any number of hosts. A failed record is dropped and counted; nothing is ever replaced with zeros.
 
 ## The specs
 
