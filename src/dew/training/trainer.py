@@ -163,12 +163,27 @@ class Trainer:
             key=run_key,
         )
 
-    def _place(self, mesh):
-        """The abstract state, its shardings, and the state itself, fresh or
-        restored, on the mesh."""
+    @functools.cached_property
+    def device_mesh(self):
+        """The mesh `MeshSpec` describes over this process pool's devices,
+        built on first use."""
+        return build_mesh(self.mesh)
+
+    @property
+    def batch_sharding(self) -> NamedSharding:
+        """How a global batch is placed: split over every device."""
+        return batch_sharding(self.device_mesh)
+
+    def shardings(self, state: TrainState):
+        """The layout's placement of `state`, leaf for leaf."""
+        return self.layout.shardings(self.device_mesh, state)
+
+    def _place(self):
+        """The state itself, fresh or restored, on the mesh, with its shardings
+        and the data position a resume continues from."""
         abstract = jax.eval_shape(self.initial_state)
-        shardings = self.layout.shardings(mesh, abstract)
-        self.layout.check(abstract.params, shardings.params, mesh)
+        shardings = self.shardings(abstract)
+        self.layout.check(abstract.params, shardings.params, self.device_mesh)
         resume = None if self.checkpoints is None else self.checkpoints.latest
         if resume is None:
             state = jax.jit(self.initial_state, out_shardings=shardings)()
@@ -259,17 +274,25 @@ class Trainer:
 
         return step
 
-    def _compile(self, body, shardings, mesh, state, scale, batch):
-        """The training step's executable, compiled once per fit.
+    def compile(self, state: TrainState, batch, scale=None):
+        """The training step's executable, the one `fit` runs, compiled ahead
+        of time over `state` and one global `batch`.
+
+        The executable takes `(state, scale, batch)` and returns `(state,
+        scale, loss, metrics, finite)`; `scale` is the `DynamicScale` of a
+        mixed-precision run and None otherwise. Its shardings are the layout's
+        and it donates the state, so a benchmark that runs it measures the
+        step a real run runs.
 
         Calling a jitted function compiles it, and asking the compiler for its
         cost analysis compiles it a second time: `lower(...).compile()` builds
         an executable of its own that the jit cache knows nothing about. Running
         the loop on that executable pays for one compilation and reads the FLOP
-        count off it. The lowering carries the jit's shardings and donation, so
-        the loop donates its train state.
+        count off it.
         """
-        replicated = NamedSharding(mesh, P())
+        body = self._step_body()
+        shardings = self.shardings(state)
+        replicated = NamedSharding(self.device_mesh, P())
 
         def step(state, scale, batch):
             state, scale, loss, aux = body(state, scale, batch)
@@ -278,7 +301,7 @@ class Trainer:
         jitted = jax.jit(
             step,
             in_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
-                          batch_sharding(mesh)),
+                          self.batch_sharding),
             out_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
                            replicated, replicated, replicated),
             donate_argnums=(0,),
@@ -304,10 +327,10 @@ class Trainer:
         Every `checkpoint_every` steps, and at the end, the state and the data
         position are written.
         """
-        mesh = build_mesh(self.mesh)
-        sharding = batch_sharding(mesh)
+        mesh = self.device_mesh
+        sharding = self.batch_sharding
         process_zero = jax.process_index() == 0
-        state, shardings, position = self._place(mesh)
+        state, shardings, position = self._place()
         current = int(state.step)
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
@@ -320,7 +343,6 @@ class Trainer:
                 f"the data position would replay the data on resume")
         train = DevicePrefetchIterator(source, sharding, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
-        body = self._step_body()
         compiled = None
         last_saved = current if self.checkpoints is not None and current else None
         interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
@@ -339,7 +361,7 @@ class Trainer:
         while current < steps:
             batch = next(train)
             if compiled is None:
-                compiled = self._compile(body, shardings, mesh, state, scale, batch)
+                compiled = self.compile(state, batch, scale)
                 # The interval clock starts once the executable exists, so the
                 # first tick reports step time rather than compile time.
                 last_log_time = time.time()
@@ -430,7 +452,7 @@ class Trainer:
         """
         if data.val is None:
             return {}
-        sharding = batch_sharding(mesh)
+        sharding = self.batch_sharding
         process_zero = jax.process_index() == 0
         info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
                     ema=with_ema(state.params, state.ema))
