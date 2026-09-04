@@ -2,6 +2,8 @@
 Some Code ported from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_flax.py
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -450,6 +452,41 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = hidden_states + self.ff(self.norm3(hidden_states))
         
         return hidden_states
+
+
+@dataclasses.dataclass(frozen=True)
+class Stage:
+    """One resolution stage's attention in a UNet, or `None` for a stage that
+    has none.
+
+    Every field is a `TransformerBlock` dial, defaulted exactly as the dict
+    read it replaced defaulted it, so a stage names what it changes and
+    nothing else and no default moved. `dim_head` is not here: the block's
+    head width is the stage's channel count divided by `heads`, which the
+    unet knows and a config does not.
+
+    It replaces a dict read with `.get`, which accepted a misspelled dial and
+    quietly left it at its default; `dew.registry.from_record` builds one from
+    a record at the build boundary, so a stage still arrives as
+    `{"heads": 8}` from a command line or a run record.
+
+    `dtype` is float32 and not the model's, which is what `with_precision`
+    exists to write into every stage. `precision` is the one field whose None
+    means "the model's", as the dict read's default did.
+    """
+
+    heads: int
+    use_linear_attention: bool = True
+    use_projection: bool = False
+    use_self_and_cross: bool = True
+    only_pure_attention: bool = True
+    force_fp32_for_softmax: bool = False
+    norm_inputs: bool = True
+    explicitly_add_residual: bool = True
+    norm_epsilon: float = 1e-4
+    dtype: Optional[Dtype] = jnp.float32
+    precision: PrecisionLike = None
+
 
 class TransformerBlock(nn.Module):
     heads: int = 4

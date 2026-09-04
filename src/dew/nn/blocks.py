@@ -246,14 +246,13 @@ class ResidualBlock(nn.Module):
     norm_groups:int=8
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
-    named_norms:bool=False
     norm_epsilon: float = 1e-4 # Added epsilon parameter, increased default
     
     def setup(self):
         if self.norm_groups > 0:
             norm = partial(nn.GroupNorm, self.norm_groups, epsilon=self.norm_epsilon)
-            self.norm1 = norm(name="GroupNorm_0") if self.named_norms else norm()
-            self.norm2 = norm(name="GroupNorm_1") if self.named_norms else norm()
+            self.norm1 = norm()
+            self.norm2 = norm()
         else:
             norm = partial(nn.RMSNorm, epsilon=self.norm_epsilon)
             self.norm1 = norm()
