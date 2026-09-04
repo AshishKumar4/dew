@@ -16,18 +16,23 @@ from .schedules import (
     EDMNoiseScheduler,
     FlowMatchingScheduler,
     compute_resolution_shift,
-    get_coeff_shapes_tuple,
-    reshape_rates,
+    expand,
 )
 from .transforms import (
-    DiffusionPredictionTransform,
+    PredictionTransform,
     EpsilonPredictionTransform,
     DirectPredictionTransform,
     VPredictionTransform,
     FlowMatchPredictionTransform,
     KarrasPredictionTransform,
-    get_diffusion_preset,
+    Weighting,
+    ScheduleWeighting,
+    MinSNR,
+    broadcast_rates,
 )
+from .process import Process, Denoiser
+from . import presets
+from . import discrete
 
 __all__ = [
     # Schedules
@@ -48,14 +53,21 @@ __all__ = [
     "EDMNoiseScheduler",
     "FlowMatchingScheduler",
     "compute_resolution_shift",
-    "get_coeff_shapes_tuple",
-    "reshape_rates",
-    # Prediction transforms
-    "DiffusionPredictionTransform",
+    "expand",
+    # Prediction transforms and weightings
+    "PredictionTransform",
     "EpsilonPredictionTransform",
     "DirectPredictionTransform",
     "VPredictionTransform",
     "FlowMatchPredictionTransform",
     "KarrasPredictionTransform",
-    "get_diffusion_preset",
+    "Weighting",
+    "ScheduleWeighting",
+    "MinSNR",
+    "broadcast_rates",
+    # One convention
+    "Process",
+    "Denoiser",
+    "presets",
+    "discrete",
 ]

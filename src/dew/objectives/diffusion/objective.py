@@ -1,163 +1,163 @@
-"""The denoising diffusion objective."""
+"""The denoising diffusion objective.
 
-from typing import Callable, Dict, Tuple, Type
+Sample a noise level, corrupt, predict, weight. The convention (schedule,
+parameterization, weighting) is the `Process`; the sample field and the
+conditions are the `InputSpec`; every draw comes from the step's key. The
+frozen encoders' weights live in the tree's `encoders` collection, so they
+reach the compiled step as arguments and the optimizer never sees them.
+
+Evaluation samples a few images from the validation batch's conditions with
+the averaged weights, through the same `sample` inference uses.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.objectives.base import Objective, EMASpec
-from dew.diffusion.schedules import NoiseScheduler, get_coeff_shapes_tuple
-from dew.diffusion.transforms import DiffusionPredictionTransform
-from dew.sampling.common import DiffusionSampler
-from dew.sampling.ddim import DDIMSampler
+from dew.artifacts import ImageGrid, VideoGrid
+from dew.diffusion.process import Process
+from dew.diffusion.schedules import expand
+from dew.diffusion.transforms import broadcast_rates
+from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders.api import AutoEncoder
-from dew.inputs import DiffusionInputConfig
-from dew.random_state import RandomMarkovState
-
+from dew.objectives.base import Aux, EMASpec, Objective, Step, under
+from dew.sampling.guidance import CFG
+from dew.sampling.sample import sample
+from dew.sampling.solvers import DDIM
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
 
+
 class DiffusionObjective(Objective):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
-
-    tag = "diffusion"
 
     def __init__(
         self,
         model,
-        noise_schedule: NoiseScheduler,
-        model_output_transform: DiffusionPredictionTransform,
-        input_config: DiffusionInputConfig,
-        input_shapes: Dict[str, Tuple[int, ...]],
-        autoencoder: AutoEncoder = None,
+        process: Process,
+        inputs: InputSpec,
+        *,
+        autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
         loss_fn: Callable = optax.l2_loss,
         ema_decay: float = 0.999,
-        native_resolution: int = None,
-        diffusion_steps: int = 200,
+        sampler=DDIM(),
+        guidance: Optional[CFG] = CFG(3.0),
+        steps: int = 200,
     ):
+        """`sampler`, `guidance` and `steps` are how evaluation samples;
+        `guidance` None is the plain conditional prediction."""
         self.model = model
-        self.noise_schedule = noise_schedule
-        self.model_output_transform = model_output_transform
-        self.input_config = input_config
-        self.input_shapes = input_shapes
+        self.process = process
+        self.inputs = inputs
         self.autoencoder = autoencoder
         self.unconditional_prob = unconditional_prob
         self.loss_fn = loss_fn
-        self.native_resolution = native_resolution
-        self.diffusion_steps = diffusion_steps
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.sampler = sampler
+        self.guidance = guidance
+        self.steps = steps
+        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params"))
+        self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
+        # The unconditional datum, tokenized once on the host; encoded on
+        # device wherever a branch needs it.
+        self.unconditional_tokens = {
+            keyword: condition.encoder.tokenize([condition.unconditional])
+            for keyword, condition in inputs.conditions.items()}
+        self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def init_params(self, rng):
-        input_ones = {k: jnp.ones((1, *v)) for k, v in self.input_shapes.items()}
-        return self.model.init(rng, **input_ones)
+    @property
+    def latent_shape(self) -> tuple[int, ...]:
+        """The per-example shape the model denoises: the sample field's, or
+        its latent when an autoencoder sits in front of the model."""
+        shape = self.inputs.sample.shape
+        if self.autoencoder is None:
+            return shape
+        *lead, height, width, _ = shape
+        factor = self.autoencoder.downscale_factor
+        return (*lead, height // factor, width // factor, self.autoencoder.latent_channels)
 
-    def loss(self, params, ema_params, batch, rng, step):
-        local_rng_state = RandomMarkovState(rng)
+    def encoder_params(self) -> dict:
+        return {keyword: condition.encoder.params
+                for keyword, condition in self.inputs.conditions.items()}
 
-        # Extract and normalize data (works for both images and videos)
-        data = batch[self.input_config.sample_data_key]
-        local_batch_size = data.shape[0]
-        data = (jnp.asarray(data, dtype=jnp.float32) - 127.5) / 127.5
+    def encode(self, encoders, tokens: dict) -> dict:
+        """Every condition's value from its tokens, under the tree's encoder
+        parameters."""
+        return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
+                for keyword, condition in self.inputs.conditions.items()}
 
+    def init(self, key):
+        encoders = self.encoder_params()
+        conditions = self.encode(encoders, self.unconditional_tokens)
+        variables = self.model.init(
+            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
+        return {**variables, "encoders": encoders}
+
+    def loss(self, params, batch, step: Step):
+        data = unit_range(batch[self.inputs.sample.key])
+        encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            local_rng_state, enc_key = local_rng_state.get_random_key()
-            data = self.autoencoder.encode(data, enc_key)
+            data = self.autoencoder.encode(data, encode_key)
+        count = data.shape[0]
 
-        local_rng_state, uncond_key = local_rng_state.get_random_key()
-        uncond_mask = jax.random.bernoulli(
-            uncond_key, shape=(local_batch_size,), p=self.unconditional_prob)
-        all_conditional_inputs = self.input_config.process_conditioning(
-            batch, uncond_mask=uncond_mask)
+        # Conditioning dropout: a row drawn for the unconditional branch reads
+        # the unconditional value in every one of its conditions.
+        dropped = jax.random.bernoulli(drop_key, self.unconditional_prob, (count,))
+        tokens = {keyword: batch[condition.field]
+                  for keyword, condition in self.inputs.conditions.items()}
+        given = self.encode(params["encoders"], tokens)
+        null = self.encode(params["encoders"], self.unconditional_tokens)
+        conditions = jax.tree.map(
+            lambda value, blank: jnp.where(
+                expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
+            given, null)
 
-        noise_level, local_rng_state = self.noise_schedule.generate_timesteps(
-            local_batch_size, local_rng_state)
+        schedule = self.process.schedule
+        t = schedule.sample_t(time_key, count)
+        noise = jax.random.normal(noise_key, data.shape, dtype=jnp.float32)
+        rates = broadcast_rates(schedule, t, data)
+        noisy, c_in, target = self.process.prediction.forward_diffusion(data, noise, rates)
 
-        local_rng_state, noise_key = local_rng_state.get_random_key()
-        noise = jax.random.normal(noise_key, shape=data.shape, dtype=jnp.float32)
-
-        local_rng_state, dropout_key = local_rng_state.get_random_key()
-
-        rates = self.noise_schedule.get_rates(noise_level, get_coeff_shapes_tuple(data))
-        noisy_data, c_in, expected_output = self.model_output_transform.forward_diffusion(
-            data, noise, rates)
-
-        inputs = self.noise_schedule.transform_inputs(noisy_data * c_in, noise_level)
+        variables = {name: value for name, value in params.items() if name != "encoders"}
         preds = self.model.apply(
-            params, *inputs, *all_conditional_inputs,
-            train=True, rngs={'dropout': dropout_key},
-        )
+            variables, noisy * c_in, schedule.model_time(t), **conditions,
+            train=True, rngs={"dropout": dropout_key})
+        preds = self.process.prediction.pred_transform(noisy, preds, rates)
+        losses = self.loss_fn(preds, target)
+        weights = expand(self.process.weight(t), losses)
+        return jnp.mean(losses * weights), Aux(metrics={})
 
-        preds = self.model_output_transform.pred_transform(noisy_data, preds, rates)
-        sample_losses = self.loss_fn(preds, expected_output)
+    def _sample_impl(self, params, tokens, key, *, count: int):
+        given = self.encode(params["encoders"], tokens)
+        null = self.encode(params["encoders"], self.unconditional_tokens)
+        variables = {name: value for name, value in params.items() if name != "encoders"}
+        denoise = self.process.denoiser(
+            self.model, variables, given, None if self.guidance is None else null)
+        noise_key, sample_key = jax.random.split(key)
+        x_T = self.process.noise(noise_key, (count, *self.latent_shape))
+        samples = sample(denoise, x_T, self.steps, solver=self.sampler,
+                         guidance=self.guidance, key=sample_key)
+        if self.autoencoder is not None:
+            samples = self.autoencoder.decode(samples)
+        return jnp.clip(samples, -1.0, 1.0)
 
-        weights = self.noise_schedule.get_weights(
-            noise_level, get_coeff_shapes_tuple(sample_losses))
-        return jnp.mean(sample_losses * weights), {}
-
-    def make_validation_step(
-        self,
-        sampler_class: Type[DiffusionSampler] = DDIMSampler,
-        sampling_noise_schedule: NoiseScheduler = None,
-    ):
-        sampler = sampler_class(
-            model=self.model,
-            noise_schedule=self.noise_schedule if sampling_noise_schedule is None else sampling_noise_schedule,
-            model_output_transform=self.model_output_transform,
-            input_config=self.input_config,
-            autoencoder=self.autoencoder,
-            guidance_scale=3.0,
-        )
-        conditional_inputs = self.input_config.conditions
-        image_size = self._image_size()
-        sequence_length = self._sequence_length()
-
-        def generate_samples(val_state, batch):
-            # A pass samples a few images per batch, at 200 sampler steps
-            # each, so the count is capped whatever the batch size is.
-            model_conditioning_inputs = [
-                cond_input(batch)[:VALIDATION_SAMPLES] for cond_input in conditional_inputs]
-            batch_size = (len(model_conditioning_inputs[0]) if model_conditioning_inputs
-                          else VALIDATION_SAMPLES)
-            return sampler.generate_samples(
-                params=val_state.ema_params,
-                resolution=image_size,
-                num_samples=batch_size,
-                sequence_length=sequence_length,  # None for images
-                diffusion_steps=self.diffusion_steps,
-                end_step=0,
-                priors=None,
-                # Folded so successive validations start from different noise
-                # while any one step stays reproducible.
-                rngstate=RandomMarkovState(jax.random.fold_in(val_state.rngs, val_state.step)),
-                model_conditioning_inputs=tuple(model_conditioning_inputs),
-            )
-
-        return generate_samples
-
-    def log_validation_artifacts(self, wandb, artifacts, step: int):
-        is_video = len(artifacts.shape) == 5
-        for i in range(artifacts.shape[0]):
-            sample = np.clip((np.array(artifacts[i]) + 1) * 127.5, 0, 255).astype(np.uint8)
-            if is_video:
-                from wandb import Video as wandbVideo
-                wandb.log({f"video_sample_{i}": wandbVideo(
-                    sample, fps=10, caption=f"Video Sample {i} at step {step}")}, step=step)
-            else:
-                from wandb import Image as wandbImage
-                wandb.log({f"sample_{i}": wandbImage(
-                    sample, caption=f"Sample {i} at step {step}")}, step=step)
-
-    def _is_video(self):
-        return len(self.input_config.sample_data_shape) == 4
-
-    def _image_size(self):
-        if self.native_resolution is not None:
-            return self.native_resolution
-        return self.input_config.sample_data_shape[-2]
-
-    def _sequence_length(self):
-        return self.input_config.sample_data_shape[0] if self._is_video() else None
+    def evaluate(self, params, batch, step: Step):
+        """`VALIDATION_SAMPLES` samples from the batch's conditions, with the
+        averaged weights when the run keeps them, seeded by the step's key."""
+        params = params if step.ema is None else step.ema
+        count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
+        tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
+                  for keyword, condition in self.inputs.conditions.items()}
+        captions = ()
+        for keyword, condition in self.inputs.conditions.items():
+            captions = condition.encoder.captions(jax.tree.map(np.asarray, tokens[keyword]))
+            if captions:
+                break
+        samples = self._sample(params, tokens, step.key, count=count)
+        return self.artifact(samples, captions)

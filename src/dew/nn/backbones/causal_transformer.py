@@ -112,12 +112,17 @@ class CausalSelfAttention(nn.Module):
     are one code path. Keys are rotated before they enter the cache, which is
     why the rotary positions come from the cache index rather than from the row
     index of the token.
+
+    causal=False is full attention over the sequence, which a masked
+    diffusion model reads the whole corrupted sequence with; there is no
+    cache to decode against then, so decode=True raises.
     """
     emb_features: int
     num_heads: int
     num_kv_heads: int
     head_dim: int
     max_seq_len: int
+    causal: bool = True
     rope_theta: float = 10000.0
     qk_norm: bool = True
     norm_eps: float = 1e-5
@@ -162,6 +167,8 @@ class CausalSelfAttention(nn.Module):
         # the row index, which is what restarts RoPE at every boundary.
         append = None
         if decode:
+            if not self.causal:
+                raise ValueError("full attention has no KV cache to decode against")
             positions, append = open_kv_cache(self, key, self.max_seq_len)
         elif positions is None:
             positions = jnp.arange(S)
@@ -179,7 +186,7 @@ class CausalSelfAttention(nn.Module):
                    else self.attention_scale * math.sqrt(self.head_dim)))
         key = apply_rotary(key, freqs_cos, freqs_sin)
 
-        causal, mask = True, None
+        causal, mask = self.causal, None
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
         if append is not None:
@@ -194,8 +201,10 @@ class CausalSelfAttention(nn.Module):
             segment_ids = jnp.asarray(segment_ids)
             inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
                       & (segment_ids[:, :, None] != 0))[:, None]
-            mask = jnp.logical_and(
-                inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
+            mask = inside
+            if causal:
+                mask = jnp.logical_and(
+                    inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
             causal, window = False, None
             if implementation in ('auto', 'cudnn'):
                 # cuDNN has no mask argument: causality and the window are
@@ -319,6 +328,10 @@ class CausalTransformer(nn.Module):
     layer counting from the end of the first group, which is the rule
     Qwen3-MoE's decoder_sparse_step means, or every layer when neither is set,
     which is Mixtral. A dense layer keeps the leaves it always had.
+
+    causal=False turns every layer into full attention with no cache, the
+    encoder a masked diffusion language model denoises with; the parameter
+    tree is the same either way.
     """
     vocab_size: int
     emb_features: int = 512
@@ -352,6 +365,7 @@ class CausalTransformer(nn.Module):
     top_k: int = 2                           # experts each token routes to
     moe_every: Optional[int] = None          # sparse layer cadence
     moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
+    causal: bool = True                      # False: full attention, no cache
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -444,6 +458,7 @@ class CausalTransformer(nn.Module):
                     num_kv_heads=self.kv_heads,
                     head_dim=head_dim,
                     max_seq_len=self.max_seq_len,
+                    causal=self.causal,
                     rope_theta=(self.rope_local_theta
                                 if layer_type == 'sliding_attention'
                                 and self.rope_local_theta is not None
