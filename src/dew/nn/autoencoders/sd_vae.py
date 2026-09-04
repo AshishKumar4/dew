@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+from functools import partial
+
 from flax import linen as nn
 from .api import AutoEncoder
 from .vae import FlaxEncoder, FlaxDecoder, load_pretrained_vae
@@ -12,16 +14,27 @@ All credits for the model go to the developers of Stable Diffusion VAE and for t
 """
 
 class StableDiffusionVAE(AutoEncoder):
-    def __init__(self, modelname = "CompVis/stable-diffusion-v1-4", revision="bf16", dtype=jnp.bfloat16,
-                 latent_shift=None, latent_scale=None):
+    """A pretrained AutoencoderKL behind the `AutoEncoder` seam.
+
+    `modelname` is a Hub repo or a local directory. The config decides the
+    latent space, so the same class carries SD1's four channels and the
+    sixteen of SD3.5 and Flux; those newer configs also set `use_quant_conv`
+    and `use_post_quant_conv` false, and then there are no such layers to
+    apply. `params` overrides the loaded weights, which is how a test mutates
+    one.
+    """
+
+    def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
+                 dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None):
 
         pretrained = load_pretrained_vae(modelname, revision=revision)
         config = pretrained["config"]
-        params = pretrained["params"]
+        params = pretrained["params"] if params is None else params
 
         self.modelname = modelname
         self.revision = revision
         self.dtype = dtype
+        self.params = params
 
         enc = FlaxEncoder(
             in_channels=config["in_channels"],
@@ -46,21 +59,14 @@ class StableDiffusionVAE(AutoEncoder):
             dtype=dtype,
         )
 
-        quant_conv = nn.Conv(
-            2 * config["latent_channels"],
-            kernel_size=(1, 1),
-            strides=(1, 1),
-            padding="VALID",
-            dtype=dtype,
-        )
-
-        post_quant_conv = nn.Conv(
-            config["latent_channels"],
-            kernel_size=(1, 1),
-            strides=(1, 1),
-            padding="VALID",
-            dtype=dtype,
-        )
+        # SD3.5 and Flux fold the quantisation convolutions away, and their
+        # configs say so; SD1-era configs predate the keys and carry both.
+        use_quant_conv = config.get("use_quant_conv", True)
+        use_post_quant_conv = config.get("use_post_quant_conv", True)
+        one_by_one = partial(nn.Conv, kernel_size=(1, 1), strides=(1, 1),
+                             padding="VALID", dtype=dtype)
+        quant_conv = one_by_one(2 * config["latent_channels"]) if use_quant_conv else None
+        post_quant_conv = one_by_one(config["latent_channels"]) if use_post_quant_conv else None
 
         # The VAE's own latent normalization rides on the AutoEncoder seam, so a
         # caller can override it with per-dataset statistics without a second
@@ -72,7 +78,8 @@ class StableDiffusionVAE(AutoEncoder):
 
         def encode_single_frame(images, rngkey: jax.random.PRNGKey = None):
             latents = enc.apply({"params": params['encoder']}, images, deterministic=True)
-            latents = quant_conv.apply({"params": params['quant_conv']}, latents)
+            if quant_conv is not None:
+                latents = quant_conv.apply({"params": params['quant_conv']}, latents)
             if rngkey is not None:
                 mean, log_std = jnp.split(latents, 2, axis=-1)
                 log_std = jnp.clip(log_std, -30, 20)
@@ -83,7 +90,8 @@ class StableDiffusionVAE(AutoEncoder):
             return latents
 
         def decode_single_frame(latents):
-            latents = post_quant_conv.apply({"params": params['post_quant_conv']}, latents)
+            if post_quant_conv is not None:
+                latents = post_quant_conv.apply({"params": params['post_quant_conv']}, latents)
             return dec.apply({"params": params['decoder']}, latents)
         
         self.encode_single_frame = jax.jit(encode_single_frame)
@@ -91,7 +99,7 @@ class StableDiffusionVAE(AutoEncoder):
         
         # Calculate downscale factor by passing a dummy input through the encoder
         print("Calculating downscale factor...")
-        dummy_input = jnp.ones((1, 128, 128, 3), dtype=dtype)
+        dummy_input = jnp.ones((1, 128, 128, config["in_channels"]), dtype=dtype)
         dummy_latents = self.encode_single_frame(dummy_input)
         _, h, w, c = dummy_latents.shape
         _, H, W, C = dummy_input.shape
