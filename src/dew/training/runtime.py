@@ -1,8 +1,8 @@
 """Process setup every recipe runs before it builds anything.
 
-rlimits, the XLA flags, the JAX distributed pool and the augmenter/wandb env
-vars are the same in every recipe: library wiring, not recipe behavior. The
-recipes call this once at the top of main().
+rlimits, the XLA flags, the compilation cache, the JAX distributed pool and
+the wandb env var are the same in every recipe: library wiring, not recipe
+behavior. The recipes call this once at the top of main().
 """
 
 import os
@@ -14,12 +14,14 @@ import jax
 from jax.experimental import multihost_utils
 
 from dew.telemetry.devices import apply_xla_flags
+from dew.telemetry.instrumentation import enable_compilation_cache
 from dew.training.distributed import broadcast_from_process_zero
 
 
-def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
+def prepare_process(wandb_offline: bool = False,
                     multi_host: Optional[bool] = None,
-                    xla_flags: Optional[str] = None):
+                    xla_flags: Optional[str] = None,
+                    compilation_cache_dir: Optional[str] = None):
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
     jax.distributed.initialize() finds the coordinator from the environment on
@@ -34,11 +36,11 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
     process. That is what makes it a recipe's first line and why a library
     user, who never runs a recipe, sets XLA_FLAGS themselves.
     """
-    # The image augmenters read this at MapTransform construction time
-    os.environ['FLAXDIFF_AUGMENT_MODE'] = augmentation_mode
     if wandb_offline:
         os.environ['WANDB_MODE'] = 'offline'
     apply_xla_flags(xla_flags)
+    if compilation_cache_dir:
+        enable_compilation_cache(compilation_cache_dir)
 
     resource.setrlimit(
         resource.RLIMIT_CORE,
@@ -60,9 +62,9 @@ def prepare_process(augmentation_mode: str, wandb_offline: bool = False,
             # through the coordinator with a 30 second deadline, and the
             # first one otherwise falls inside orbax's checkpoint-manager
             # barrier in the trainer, by which time the processes are as far
-            # apart as a wandb init, an artifact download and their model
-            # builds. A process that arrives late dies in gloo rather than in
-            # anything the run can report.
+            # apart as a wandb init and their model builds. A process that
+            # arrives late dies in gloo rather than in anything the run can
+            # report.
             multihost_utils.sync_global_devices("dew process pool joined")
     print(f"Number of devices: {jax.device_count()}")
 

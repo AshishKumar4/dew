@@ -1,9 +1,10 @@
 """The optimizer a recipe builds from an OptimConfig.
 
 Every recipe wires the same solver: a warmup-cosine schedule when one is
-asked for, weight decay folded into the optimizer's own kwargs, global-norm
-clipping, and gradient accumulation over several micro-batches. That wiring
-is library behavior, so it lives here and the recipes call it.
+asked for, weight decay folded into the optimizer's own kwargs, and
+global-norm clipping. That wiring is library behavior, so it lives here and
+the recipes call it. Gradient accumulation is the Trainer's, which wraps the
+solver in `optax.MultiSteps` itself.
 
 The 'muon' entry is the production parameter-group split the labs converged
 on (docs/research/frontier-training.md:183): AdamW on the embeddings, the
@@ -14,11 +15,17 @@ spec that says which group a parameter belongs to and which of its axes are
 the matrix.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import jax
 import optax
 
-from dew.config import OptimConfig
-from dew.training import distributed
+from dew.nn.sharding import LogicalAxes, declared_axes
+
+if TYPE_CHECKING:
+    from dew.config import OptimConfig
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head, so the head dimensions count as one
@@ -38,16 +45,14 @@ BATCH_AXES = frozenset({'exp'})
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
-def _matrix_sides(
-    path, axes: distributed.LogicalAxes,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
+def _matrix_sides(path, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """The contracted axes and the output axes of a declared parameter.
 
-    A dimension continues the side before it when the table leaves it unnamed,
-    as the spatial dimensions of a patch embedding are, or when it and its
-    predecessor are both head dimensions. What is left has to be two sides,
-    one contracted and one output, which is what MaxText's per-name table
-    produces for its own trees (maxtext utils/muon_utils.py:100-175).
+    A dimension continues the side before it when the declaration leaves it
+    unnamed, as the spatial dimensions of a patch embedding are, or when it
+    and its predecessor are both head dimensions. What is left has to be two
+    sides, one contracted and one output, which is what MaxText's per-name
+    table produces for its own trees (maxtext utils/muon_utils.py:100-175).
     """
     sides: list[list[int]] = []
     for dimension, name in enumerate(axes):
@@ -72,13 +77,13 @@ def _matrix_sides(
 def muon_weight_dimension_numbers(params):
     """A `MuonDimensionNumbers` per parameter, None where AdamW steps in.
 
-    Which group a parameter lands in is read off the logical axes declared in
-    `distributed.DEFAULT_LOGICAL_PARAM_AXES`, the table the sharding
-    derivation already reads, so one declaration answers both questions. A
-    parameter of rank below two, a bias, and a parameter that maps into or out
-    of a discrete index, the vocabulary, the model's output space or the
-    expert a router picks, go to AdamW, which is the split four labs
-    cross-confirmed. Everything else is a matrix and goes to Muon.
+    Which group a parameter lands in is read off the logical axes its module
+    declares (`dew.nn.sharding`), the table the sharding derivation already
+    reads, so one declaration answers both questions. A parameter of rank
+    below two, a bias, and a parameter that maps into or out of a discrete
+    index, the vocabulary, the model's output space or the expert a router
+    picks, go to AdamW, which is the split four labs cross-confirmed.
+    Everything else is a matrix and goes to Muon.
 
     An undeclared matrix of rank two takes Linen's kernel convention,
     contracting axis 0 into axis 1. An undeclared parameter of higher rank
@@ -92,13 +97,13 @@ def muon_weight_dimension_numbers(params):
     def leaf(path, param):
         if param.ndim < 2 or getattr(path[-1], 'key', None) == 'bias':
             return None
-        axes = distributed.logical_axes(path, param.ndim)
+        axes = declared_axes(path, param.ndim)
         if axes is None:
             if param.ndim > 2:
                 raise ValueError(
                     f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
                     "declared logical axes, so Muon cannot tell which of its axes "
-                    "form the matrix. Declare it in DEFAULT_LOGICAL_PARAM_AXES.")
+                    "form the matrix. Declare it with @logical_axes on its module.")
             return optax.contrib.MuonDimensionNumbers()
         if SELECTION_AXES & set(axes) or axes[-1] in BATCH_AXES:
             return None
@@ -121,14 +126,18 @@ OPTIMIZER_MAP = {
     'muon': _muon_groups,
 }
 
-def build_optimizer(config: OptimConfig, steps_per_epoch: int) -> optax.GradientTransformation:
-    """The solver, with its schedule, clipping and gradient accumulation."""
+
+def build_optimizer(config: "OptimConfig", steps: int) -> optax.GradientTransformation:
+    """The solver, with its schedule and clipping; `steps` is the run's length,
+    which a cosine schedule decays over unless the config names its own."""
     learning_rate = config.learning_rate
     if config.learning_rate_schedule == 'cosine':
+        decay_steps = (steps if config.learning_rate_decay_steps is None
+                       else config.learning_rate_decay_steps)
         learning_rate = optax.warmup_cosine_decay_schedule(
             init_value=learning_rate, peak_value=config.learning_rate_peak,
             warmup_steps=config.learning_rate_warmup_steps,
-            decay_steps=steps_per_epoch * config.learning_rate_decay_epochs,
+            decay_steps=decay_steps,
             end_value=config.learning_rate_end,
         )
     opts = dict(config.optimizer_opts)
@@ -143,10 +152,4 @@ def build_optimizer(config: OptimConfig, steps_per_epoch: int) -> optax.Gradient
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
-    if config.grad_accum_steps > 1:
-        # Accumulate over several micro-batches so the effective batch can
-        # exceed what fits in device memory at once.
-        solver = optax.MultiSteps(solver, every_k_schedule=config.grad_accum_steps)
     return solver
-
-

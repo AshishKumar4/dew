@@ -1,11 +1,13 @@
-"""Device mesh, parameter sharding, host-to-device prefetch, and the values a
+"""Device mesh, parameter layout, host-to-device prefetch, and the values a
 process pool has to agree on."""
 
+from __future__ import annotations
+
+import dataclasses
 import json
 import math
 import queue
 import threading
-from collections.abc import Mapping, Sequence
 from typing import Iterator, Optional, TypeAlias
 
 import jax
@@ -13,6 +15,8 @@ import numpy as np
 from flax import linen as nn
 from jax.experimental import multihost_utils
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+
+from dew.nn.sharding import LogicalAxes, declared_axes
 
 DATA_AXIS = 'data'
 FSDP_AXIS = 'fsdp'
@@ -26,21 +30,13 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS)
 # parameters distinguish the axes.
 BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS))
 
-# Below this many elements a parameter costs more in collectives than it saves
-# in memory, so it stays replicated.
-DEFAULT_MIN_SHARD_SIZE = 2 ** 16
-DEFAULT_SHARDING_TOLERANCE = 0.02
-
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
-LogicalAxes: TypeAlias = tuple[Optional[str], ...]
 LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
-LogicalAxisRuleConfig: TypeAlias = (
-    Mapping[str, str | Sequence[str] | None] | LogicalAxisRules)
 
 # Rule order is precedence when two logical dimensions target the one fsdp axis.
 # It reproduces the largest-axis choice for the declared model shapes while
 # giving a config one place to redirect model semantics onto a future mesh.
-DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
+DEFAULT_RULES: LogicalAxisRules = (
     ("vocab", FSDP_AXIS),
     ("mlp", FSDP_AXIS),
     ("modulation", FSDP_AXIS),
@@ -56,41 +52,13 @@ DEFAULT_LOGICAL_AXIS_RULES: LogicalAxisRules = (
     ("stage", None),
 )
 
-# What a parameter's dimensions are, keyed by the module path that ends in
-# these names, outermost dimension first. A parameter takes the trailing names
-# its rank can hold, so a kernel takes all of them and its bias the output
-# ones. Declaring them here rather than on the initializers keeps the models
-# plain flax modules whose init returns arrays, and reaches optimizer moments
-# and EMA copies for free: their paths end in their parameter's.
-DEFAULT_LOGICAL_PARAM_AXES: Mapping[tuple[str, ...], LogicalAxes] = {
-    ("embed_tokens",): ("vocab", "embed"),
-    ("lm_head",): ("embed", "vocab"),
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    ("o_proj",): ("attention", "embed"),
-    ("gate_proj",): ("embed", "mlp"),
-    ("up_proj",): ("embed", "mlp"),
-    ("down_proj",): ("mlp", "embed"),
-    # A sparse layer's experts are stacked on one leaf, so the expert
-    # dimension is named here and the longer path wins over the dense
-    # projection above it.
-    ("experts", "gate_proj"): ("exp", "embed", "mlp"),
-    ("experts", "up_proj"): ("exp", "embed", "mlp"),
-    ("experts", "down_proj"): ("exp", "mlp", "embed"),
-    ("gate",): ("embed", "exp"),
-    ("patch_embed", "Conv_0"): (None, None, None, "embed"),
-    ("to_q",): ("embed", "heads", "head_dim"),
-    ("to_k",): ("embed", "heads", "head_dim"),
-    ("to_v",): ("embed", "heads", "head_dim"),
-    ("to_out_0",): ("heads", "head_dim", "embed"),
-    ("ada_proj",): ("embed", "modulation"),
-    ("final_ada_proj",): ("embed", "modulation"),
-    ("final_proj",): ("embed", "output"),
-    ("mlp", "layers_0"): ("embed", "mlp"),
-    ("mlp", "layers_2"): ("mlp", "embed"),
-    ("time_embed", "layers_2"): ("mlp", "embed"),
-}
+
+@dataclasses.dataclass(frozen=True)
+class MeshSpec:
+    """How many devices the parameter axes take; data parallelism fills the rest."""
+    fsdp: int = 1
+    expert: int = 1
+    """Devices the expert dimension of an MoE layer is split over."""
 
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
@@ -100,55 +68,7 @@ def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     return (assignment,) if isinstance(assignment, str) else tuple(assignment)
 
 
-def _parameter_path(path) -> tuple[str, ...]:
-    """The parameter's own path: the trailing run of dict keys under a leaf.
-
-    An optimizer state nests a copy of the parameter tree inside its own
-    structure, so what identifies a parameter is where its path ends.
-    """
-    names = []
-    for entry in reversed(path):
-        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
-            break
-        names.append(entry.key)
-    return tuple(reversed(names))
-
-
-def logical_axes(path, ndim: int) -> Optional[LogicalAxes]:
-    """The declared axes of the parameter at `path`, or None for an unnamed one."""
-    module = _parameter_path(path)[:-1]
-    for length in range(len(module), 0, -1):
-        axes = DEFAULT_LOGICAL_PARAM_AXES.get(module[-length:])
-        if axes is None:
-            continue
-        if ndim > len(axes):
-            raise ValueError(
-                f"{'/'.join(module[-length:])} is declared {axes}, which cannot "
-                f"name the {ndim} dimensions of {'/'.join(_parameter_path(path))}")
-        return axes[len(axes) - ndim:]
-    return None
-
-
-def _normalize_logical_axis_rules(
-    rules: Optional[LogicalAxisRuleConfig], mesh: Mesh,
-) -> LogicalAxisRules:
-    """Rules as flax wants them, minus mesh axes this mesh does not have.
-
-    Dropping absent axes is what lets one table name a future 'tensor' axis
-    and still apply on today's (data, expert, fsdp) mesh.
-    """
-    items = (DEFAULT_LOGICAL_AXIS_RULES if rules is None
-             else rules.items() if isinstance(rules, Mapping) else rules)
-    normalized = []
-    for logical_axis, mesh_axes in items:
-        axes = tuple(axis for axis in _mesh_axes(mesh_axes) if axis in mesh.axis_names)
-        normalized.append(
-            (logical_axis, axes[0] if len(axes) == 1 else axes or None))
-    return tuple(normalized)
-
-
-def build_mesh(fsdp_size: int = 1, expert_size: int = 1,
-               devices: Optional[list] = None) -> Mesh:
+def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
     """Three-axis device mesh: parameters shard over 'fsdp' and 'expert',
     batches over all three.
 
@@ -160,13 +80,13 @@ def build_mesh(fsdp_size: int = 1, expert_size: int = 1,
     rather than us writing them by hand.
     """
     devices = list(devices) if devices is not None else jax.devices()
-    sharded = fsdp_size * expert_size
-    if fsdp_size < 1 or expert_size < 1 or len(devices) % sharded:
+    sharded = spec.fsdp * spec.expert
+    if spec.fsdp < 1 or spec.expert < 1 or len(devices) % sharded:
         raise ValueError(
-            f"fsdp_size {fsdp_size} times expert_size {expert_size} must be a "
-            f"positive divisor of device count {len(devices)}")
+            f"fsdp {spec.fsdp} times expert {spec.expert} must be a positive "
+            f"divisor of device count {len(devices)}")
     return jax.make_mesh(
-        (len(devices) // sharded, expert_size, fsdp_size),
+        (len(devices) // sharded, spec.expert, spec.fsdp),
         (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS),
         devices=devices,
         axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto),
@@ -219,86 +139,103 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     return P(*entries)
 
 
-def state_sharding_tree(
-    mesh: Mesh,
-    abstract_state,
-    min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
-    logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
-):
-    """Derive physical shardings from the declared parameter axes.
+@dataclasses.dataclass(frozen=True)
+class Layout:
+    """How a train state is placed on a mesh.
 
-    A leaf whose path no entry names retains the largest-divisible-axis
-    heuristic, so a model family can be declared at a time. Flax metadata, if a
-    caller's own module attached any, is removed here, because the state the
-    trainer materialises against this tree carries plain arrays.
+    `rules` map the logical axes the modules declare (`dew.nn.sharding`) onto
+    mesh axes, in precedence order; a rule that names a mesh axis this mesh
+    does not have is dropped, which is what lets one table carry a future
+    'tensor' axis. Below `min_shard` elements a parameter costs more in
+    collectives than it saves in memory, so it stays replicated. `tolerance`
+    is the fraction of shardable parameter elements a layout may leave
+    replicated before `check` refuses it.
     """
-    rules = _normalize_logical_axis_rules(logical_axis_rules, mesh)
-    fsdp_size = mesh.shape[FSDP_AXIS]
-    sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
+    rules: LogicalAxisRules = DEFAULT_RULES
+    min_shard: int = 2 ** 16
+    tolerance: float = 0.02
 
-    def leaf_sharding(path, value):
-        axes = logical_axes(path, value.ndim)
-        size = int(np.prod(value.shape, dtype=np.int64))
-        if axes is None:
-            spec = parameter_spec(value.shape, fsdp_size, min_shard_size)
-        elif sharded_devices == 1 or size < min_shard_size:
-            spec = P()
-        else:
-            spec = _mesh_spec(value.shape, axes, rules, mesh)
-        return NamedSharding(mesh, spec)
+    def __post_init__(self):
+        if not 0.0 <= self.tolerance <= 1.0:
+            raise ValueError(
+                f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
 
-    return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(abstract_state))
+    def _rules_for(self, mesh: Mesh) -> LogicalAxisRules:
+        normalized = []
+        for logical_axis, mesh_axes in self.rules:
+            axes = tuple(axis for axis in _mesh_axes(mesh_axes) if axis in mesh.axis_names)
+            normalized.append(
+                (logical_axis, axes[0] if len(axes) == 1 else axes or None))
+        return tuple(normalized)
 
+    def shardings(self, mesh: Mesh, tree):
+        """A NamedSharding per leaf of `tree`, from the declared parameter axes.
 
-def assert_params_sufficiently_sharded(
-    params, shardings, mesh: Mesh,
-    tolerance: float = DEFAULT_SHARDING_TOLERANCE,
-    min_shard_size: int = DEFAULT_MIN_SHARD_SIZE,
-) -> None:
-    """Reject a layout that left too much of the model replicated.
+        A leaf whose path no module declares takes the largest-divisible-axis
+        heuristic, so a model family can be declared at a time. Flax metadata,
+        if a caller's own module attached any, is removed here, because the
+        state the trainer materialises against this tree carries plain arrays.
+        """
+        rules = self._rules_for(mesh)
+        fsdp_size = mesh.shape[FSDP_AXIS]
+        sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
 
-    MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
-    parameter axes divide none of the model's dimensions, which the shape
-    heuristic otherwise absorbs in silence.
+        def leaf_sharding(path, value):
+            axes = declared_axes(path, value.ndim)
+            size = int(np.prod(value.shape, dtype=np.int64))
+            if axes is None:
+                spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
+            elif sharded_devices == 1 or size < self.min_shard:
+                spec = P()
+            else:
+                spec = _mesh_spec(value.shape, axes, rules, mesh)
+            return NamedSharding(mesh, spec)
 
-    MaxText measures excess per-chip memory over perfect sharding across every
-    parameter. Here the same ratio is taken over the parameters the threshold
-    policy meant to shard: anything below min_shard_size is replicated on
-    purpose, so counting it would fire on models that are merely small.
-    """
-    if not 0.0 <= tolerance <= 1.0:
+        return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+
+    def check(self, params, shardings, mesh: Mesh) -> None:
+        """Reject a layout that left too much of the model replicated.
+
+        MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
+        parameter axes divide none of the model's dimensions, which the shape
+        heuristic otherwise absorbs in silence.
+
+        MaxText measures excess per-chip memory over perfect sharding across
+        every parameter. Here the same ratio is taken over the parameters the
+        threshold policy meant to shard: anything below min_shard is
+        replicated on purpose, so counting it would fire on models that are
+        merely small.
+        """
+        if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
+            return
+
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+        shardable_elements = 0
+        replicated = []
+        for (path, param), sharding in zip(
+                path_leaves, jax.tree.leaves(shardings), strict=True):
+            elements = int(np.prod(param.shape, dtype=np.int64))
+            if elements < self.min_shard:
+                continue
+            shardable_elements += elements
+            if any(axis in _mesh_axes(assignment)
+                   for assignment in sharding.spec for axis in PARAMETER_AXES):
+                continue
+            replicated.append((elements, jax.tree_util.keystr(path), param.shape))
+
+        if not shardable_elements:
+            return
+        fraction = sum(elements for elements, _, _ in replicated) / shardable_elements
+        if fraction <= self.tolerance:
+            return
+
+        details = "\n".join(
+            f"  {name}: shape={tuple(shape)}, elements={elements}"
+            for elements, name, shape in sorted(replicated, reverse=True)[:5])
         raise ValueError(
-            f"sharding_tolerance must be between 0 and 1, got {tolerance}")
-    if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
-        return
-
-    path_leaves, _ = jax.tree_util.tree_flatten_with_path(params)
-    shardable_elements = 0
-    replicated = []
-    for (path, param), sharding in zip(
-            path_leaves, jax.tree.leaves(shardings), strict=True):
-        elements = int(np.prod(param.shape, dtype=np.int64))
-        if elements < min_shard_size:
-            continue
-        shardable_elements += elements
-        if any(axis in _mesh_axes(assignment)
-               for assignment in sharding.spec for axis in PARAMETER_AXES):
-            continue
-        replicated.append((elements, jax.tree_util.keystr(path), param.shape))
-
-    if not shardable_elements:
-        return
-    fraction = sum(elements for elements, _, _ in replicated) / shardable_elements
-    if fraction <= tolerance:
-        return
-
-    details = "\n".join(
-        f"  {name}: shape={tuple(shape)}, elements={elements}"
-        for elements, name, shape in sorted(replicated, reverse=True)[:5])
-    raise ValueError(
-        f"{fraction:.2%} of shardable parameter elements are replicated, over "
-        f"the sharding_tolerance of {tolerance:.2%}.\n"
-        f"Largest replicated parameters:\n{details}")
+            f"{fraction:.2%} of shardable parameter elements are replicated, over "
+            f"the sharding tolerance of {self.tolerance:.2%}.\n"
+            f"Largest replicated parameters:\n{details}")
 
 
 def batch_sharding(mesh: Mesh) -> NamedSharding:
@@ -324,9 +261,9 @@ class DevicePrefetchIterator:
         self._sharding = sharding
         self._queue = queue.Queue(maxsize=depth)
         self._terminal: Optional[BaseException] = None
-        self._checkpointable = hasattr(self._iterator, 'get_state')
+        self.checkpointable = hasattr(self._iterator, 'get_state')
         if source_state is not None:
-            if not self._checkpointable:
+            if not self.checkpointable:
                 raise TypeError(
                     f"{type(self._iterator).__name__} cannot resume from a saved position")
             self._iterator.set_state(self._position_for(source_state))
@@ -352,7 +289,7 @@ class DevicePrefetchIterator:
             while True:
                 batch = next(self._iterator)
                 state = (self._position_as_bytes(self._iterator.get_state())
-                         if self._checkpointable else None)
+                         if self.checkpointable else None)
                 self._queue.put((shard_batch(self._sharding, batch), state))
         except StopIteration:
             self._queue.put(StopIteration())
@@ -394,25 +331,3 @@ def broadcast_from_process_zero(value):
 def minimum_across_processes(count: int) -> int:
     """The smallest `count` any process holds."""
     return int(multihost_utils.process_allgather(np.asarray(count, np.int64)).min())
-
-
-def gather_positions(position: bytes) -> dict:
-    """Every process's iterator position as one table, the checkpoint's `position`.
-
-    'rows' is a uint8 [process_count, longest] array with one row per
-    process, 'lengths' the unpadded length of each. A process holds the
-    position of its own shard of the data, and orbax writes a host array from
-    process 0 alone, so the rows are gathered onto every process before a
-    save. They differ in length, which is why the lengths ride along.
-    """
-    lengths = multihost_utils.process_allgather(np.asarray(len(position), np.int64))
-    row = np.zeros(int(lengths.max()), np.uint8)
-    row[:len(position)] = np.frombuffer(position, np.uint8)
-    return {'rows': multihost_utils.process_allgather(row), 'lengths': lengths}
-
-
-def own_position(table: dict) -> bytes:
-    """This process's row of a `gather_positions` table, without its padding."""
-    index = jax.process_index()
-    row = np.asarray(table['rows'][index], np.uint8)
-    return row[:int(table['lengths'][index])].tobytes()

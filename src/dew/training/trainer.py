@@ -1,759 +1,495 @@
-import tqdm
-from flax import linen as nn
+"""The trainer: mesh, compiled step, EMA, checkpoints, logging.
+
+What is learned is the objective's business (`dew.objectives.base`). The
+trainer materialises the objective's tree on the mesh, compiles one step over
+the global batch, keeps the EMA copy on the optimizer's clock, and hands
+effects to the capabilities it was given: a `Checkpoints` for disk, a
+`Tracker` for numbers and artifacts. Constructing one opens nothing; the mesh,
+the compiled step and the capabilities' resources come into being in `fit`.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from clu import metrics
-from flax.training import train_state  # Useful dataclass to keep train state
 import optax
-from flax import struct                # Flax dataclasses
-import itertools
-import time
-import os
-import orbax.checkpoint as ocp
-from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
+from flax import linen as nn
+from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
-from typing import Dict, Callable, Any, Tuple, Optional, Union
-from dew.random_state import RandomMarkovState
-from dew.objectives.base import shape_and_dtype
-from dew.checkpoints.utils import RestoredState
-from dew.telemetry.instrumentation import (
-    compiled_flops, enable_compilation_cache, model_flops_utilization,
+
+from dew.checkpoints import Checkpoints
+from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
+from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
+from dew.training.distributed import (
+    DevicePrefetchIterator, Layout, MeshSpec, batch_sharding, build_mesh,
+    minimum_across_processes, shard_batch,
 )
-from .distributed import (
-    DEFAULT_MIN_SHARD_SIZE, DEFAULT_SHARDING_TOLERANCE, DevicePrefetchIterator,
-    LogicalAxisRuleConfig, assert_params_sufficiently_sharded, batch_sharding,
-    broadcast_from_process_zero, build_mesh, gather_positions,
-    minimum_across_processes, own_position, shard_batch, state_sharding_tree,
-)
-from flax.training import dynamic_scale as dynamic_scale_lib
+from dew.training.state import TrainState
+from dew.training.tracker import Tracker
 
-PROCESS_COLOR_MAP = {
-    0: "green",
-    1: "yellow",
-    2: "magenta",
-    3: "cyan", 
-    4: "white",
-    5: "light_blue",
-    6: "light_red",
-    7: "light_cyan"
-}
+if TYPE_CHECKING:
+    from dew.data import Dataset
 
-@struct.dataclass
-class Metrics(metrics.Collection):
-    accuracy: metrics.Accuracy
-    loss: metrics.Average#.from_output('loss')
+# Consecutive non-finite losses that stop a run.
+BAD_LOSS_STEPS = 5
+
+StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
+"""A compiled step's body: the state and the global batch in, the new state,
+the loss and the objective's report out."""
 
 
-def _processes(count: int) -> str:
-    return f"{count} process" + ("es" if count != 1 else "")
+@dataclasses.dataclass(frozen=True)
+class Profile:
+    """One profiler window per fit: `steps` steps traced into `directory`
+    after `warmup` steps have run, so the trace holds the loop and not the
+    compile."""
+    directory: str
+    steps: int
+    warmup: int = 2
 
 
-def _is_uri(path: str) -> bool:
-    """A `<scheme>://` location, such as a gs:// bucket, which has no local form."""
-    return '://' in path
+def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
+    """The variables tree with the averaged leaves in place of the live ones."""
+    return None if ema is None else merge(params, ema)
 
 
-# Define the TrainState
-class SimpleTrainState(train_state.TrainState):
-    metrics: Metrics
-    dynamic_scale: dynamic_scale_lib.DynamicScale
+def _project(tree: Variables, like: Variables) -> Variables:
+    """The leaves of `tree` at the paths `like` holds, in `like`'s nesting."""
+    return {name: _project(tree[name], child) if isinstance(child, Mapping) else tree[name]
+            for name, child in like.items()}
 
-def _epoch_loss(metrics):
-    return metrics['loss']
 
-class SimpleTrainer:
-    def __init__(self,
-                 model: nn.Module,
-                 input_shapes: Dict[str, Tuple[int]],
-                 optimizer: optax.GradientTransformation,
-                 rngs: jax.random.PRNGKey,
-                 train_state: Union[SimpleTrainState, RestoredState] = None,
-                 name: str = "Simple",
-                 load_from_checkpoint: str = None,
-                 loss_fn=optax.l2_loss,
-                 wandb_config: Dict[str, Any] = None,
-                 distributed_training: bool = None,
-                 checkpoint_base_path: str = "./checkpoints",
-                 checkpoint_step: int = None,
-                 use_dynamic_scale: bool = False,
-                 max_checkpoints_to_keep: int = 2,
-                 train_start_step_override: int = None,
-                 fsdp_size: int = 1,
-                 expert_size: int = 1,
-                 fsdp_min_param_size: int = DEFAULT_MIN_SHARD_SIZE,
-                 logical_axis_rules: Optional[LogicalAxisRuleConfig] = None,
-                 sharding_tolerance: Optional[float] = None,
-                 compilation_cache_dir: str = None,
-                 profile_steps: int = 0,
-                 profile_warmup_steps: int = 2,
-                 log_every: int = 100,
-                 max_bad_loss_steps: int = 5,
-                 ):
-        if compilation_cache_dir:
-            enable_compilation_cache(compilation_cache_dir)
+def ema_update(ema: Variables, params: Variables, decay) -> Variables:
+    """One EMA step over the selected leaves; `decay` is the schedule's value."""
+    return jax.tree.map(lambda average, live: decay * average + (1 - decay) * live,
+                        ema, _project(params, ema))
 
-        # One code path for every topology: the mesh spans all devices unless
-        # the caller explicitly opts out, and a 1x1 mesh behaves exactly like
-        # the old single-device path.
-        if distributed_training is None:
-            distributed_training = jax.device_count() > 1
-        self.distributed_training = distributed_training
-        devices = jax.devices() if distributed_training else jax.devices()[:1]
-        self.mesh = build_mesh(fsdp_size, expert_size, devices=devices)
-        self.batch_sharding = batch_sharding(self.mesh)
-        self.replicated = NamedSharding(self.mesh, P())
-        self.fsdp_min_param_size = fsdp_min_param_size
-        self.logical_axis_rules = logical_axis_rules
-        self.sharding_tolerance = (DEFAULT_SHARDING_TOLERANCE
-                                   if sharding_tolerance is None else sharding_tolerance)
 
-        self.model = model
-        self.name = name
-        self.loss_fn = loss_fn
-        self.input_shapes = input_shapes
-        self.checkpoint_base_path = checkpoint_base_path
-        self.profile_steps = profile_steps
-        self.profile_warmup_steps = profile_warmup_steps
-        self._profile_seen_steps = 0
-        self._profile_complete = False
-        self.log_every = log_every
-        self.max_bad_loss_steps = max_bad_loss_steps
-        # Measured off the compiled step, once per run.
-        self.flops_per_step = None
-        # (jitted step, its executable). Compiled on the first step of a run
-        # and reused by every epoch after it.
-        self._compiled_train_step = (None, None)
-        self.global_batch_size = 0
+def write_back(params: Variables, variables: Variables | None) -> Variables:
+    """`params` with the collections in `variables` replaced whole."""
+    if variables is None:
+        return params
+    if "params" in variables:
+        raise ValueError("Aux.variables cannot carry the params collection; "
+                         "the optimizer owns it")
+    for name, collection in variables.items():
+        if name not in params:
+            raise ValueError(f"Aux.variables names {name!r}, which is not a collection "
+                             f"of the objective's tree {sorted(params)}")
+        if jax.tree.structure(collection) != jax.tree.structure(params[name]):
+            raise ValueError(f"Aux.variables[{name!r}] does not have the collection's "
+                             f"structure")
+    return {**params, **variables}
 
-        load_directly_from_dir = False
-        
-        self.wandb = None
-        if wandb_config is not None and jax.process_index() == 0:
-            import wandb
-            run = wandb.init(resume='allow', **wandb_config)
-            self.wandb = run
-            
-            if 'id' in wandb_config:
-                # If resuming from a previous run, and train_start_step_override is not set, 
-                # set the start step to the last step of the previous run
-                if train_start_step_override is None:
-                    train_start_step_override = int(run.summary['train/step']) + 1
-                print(f"Resuming from previous run {wandb_config['id']} with start step {train_start_step_override}")
-                
-                # If load_from_checkpoint is not set, and an artifact is found, load the artifact
-                if load_from_checkpoint is None:
-                    api_run = wandb.Api().run(f"{wandb_config['entity']}/{wandb_config['project']}/{wandb_config['id']}")
-                    model_artifacts = [i for i in api_run.logged_artifacts() if i.type == 'model']
-                    if model_artifacts:
-                        artifact = model_artifacts[0]
-                        artifact_dir = artifact.download()
-                        print(f"Loading model from artifact {artifact.name} at {artifact_dir}")
-                        # Move the artifact's contents
-                        load_from_checkpoint = artifact_dir
-                        load_directly_from_dir = True
-            
-            # define our custom x axis metric
-            self.wandb.define_metric("train/step")
-            self.wandb.define_metric("train/epoch")
-            
-            self.wandb.define_metric("train/loss", step_metric="train/step")
-            
-            self.wandb.define_metric("train/epoch_time", step_metric="train/epoch")
-            self.wandb.define_metric("train/avg_time_per_step", step_metric="train/epoch")
-            self.wandb.define_metric("train/avg_loss", step_metric="train/epoch")
-            self.wandb.define_metric("train/best_loss", step_metric="train/epoch")
-            
-            if self.wandb.sweep_id:
-                api = wandb.Api()
-                self.wandb_sweep = api.sweep(f"{self.wandb.entity}/{self.wandb.project}/{self.wandb.sweep_id}")
-                print(f"Running sweep {self.wandb_sweep.id} with id {self.wandb.sweep_id}")
-            
-        if wandb_config is not None and 'id' in wandb_config:
-            # Process 0 resolved the run id into a start step and a checkpoint.
-            # A process that kept its own values would resume from another
-            # step and other weights than the rest of the pool.
-            train_start_step_override, load_from_checkpoint, load_directly_from_dir = (
-                broadcast_from_process_zero((
-                    train_start_step_override, load_from_checkpoint, load_directly_from_dir)))
 
-        # The latest few steps so a resume has something recent, plus the one
-        # step with the lowest epoch loss. BestN reads `reverse=True` as
-        # "smallest metric wins"; best_fn is what writes the metric into the
-        # step directory, so best_step() still resolves on a reopened manager.
-        options = ocp.CheckpointManagerOptions(
-            preservation_policy=preservation.AnyPreservationPolicy([
-                preservation.LatestN(n=max_checkpoints_to_keep),
-                preservation.BestN(get_metric_fn=_epoch_loss, n=1,
-                                   keep_checkpoints_without_metrics=False,
-                                   reverse=True),
-            ]),
-            best_fn=_epoch_loss, best_mode='min',
-            create=True, enable_async_checkpointing=True)
-        self.checkpointer = ocp.CheckpointManager(self.checkpoint_path(), options=options)
+def _pick(artifacts: tuple, reads: type):
+    matching = [artifact for artifact in artifacts if isinstance(artifact, reads)]
+    if len(matching) != 1:
+        raise ValueError(
+            f"a metric reads {reads.__name__}, and the objective's evaluation produced "
+            f"{[type(a).__name__ for a in artifacts]}")
+    return matching[0]
 
-        # A run into a directory that already holds steps trains a whole epoch
-        # and only then discovers that orbax will not overwrite one. Nothing
-        # here guesses which way the caller meant it: resuming and starting
-        # over are both fine, and both have to be asked for.
-        written_step = self.checkpointer.latest_step()
-        if written_step is not None and load_from_checkpoint is None:
-            raise ValueError(
-                f"{self.checkpoint_path()} already holds checkpoints up to step "
-                f"{written_step}. Resume them with --trainer.load-from-checkpoint "
-                f"{self.checkpoint_path()}, or give this run a directory of its own "
-                f"with --trainer.name. Nothing has been deleted.")
 
-        self.rngstate = RandomMarkovState(rngs)
-        self.rngstate, subkey = self.rngstate.get_random_key()
+class Trainer:
+    """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
 
-        self.best_loss = 1e9
-        if train_state is None:
-            self.state = self.generate_states(optimizer, subkey, model, use_dynamic_scale)
-        elif isinstance(train_state, RestoredState):
-            # A checkpoint holds arrays without the model or optimizer that
-            # wrote them, so the types come from a fresh init and the values
-            # from the restored state, placed onto this run's shardings.
-            fresh = self.generate_states(optimizer, subkey, model, use_dynamic_scale)
-            self.state = jax.device_put(
-                train_state.restore_into(fresh), self.state_sharding)
-        else:
-            self.state = train_state
-            self.state_sharding = jax.tree.map(lambda x: x.sharding, train_state)
-        # Position of the data iterator, carried through checkpoints so a resume
-        # continues mid-epoch instead of replaying from the top.
-        self.dataset_state = None
-        # Highest step this trainer has written a checkpoint for, so the final
-        # save at the end of fit() does not duplicate an in-loop one.
-        self.last_saved_step = None
-
-        self.latest_step = 0
-        if train_state is not None and not isinstance(train_state, SimpleTrainState):
-            self.latest_step = int(train_state.step)
-        if load_from_checkpoint is not None:
-            self.latest_step = self.load(load_from_checkpoint, checkpoint_step, load_directly_from_dir)
-
-        if train_start_step_override is not None:
-            self.latest_step = train_start_step_override
-            print(f"Overriding start step to {self.latest_step}")
-
-    def get_input_ones(self):
-        ones = {}
-        for key, entry in self.input_shapes.items():
-            shape, dtype = shape_and_dtype(entry)
-            ones[key] = jnp.ones((1, *shape), dtype)
-        return ones
-
-    def _build_state(self, init_fn) -> SimpleTrainState:
-        """Materialise the train state directly into its sharded layout.
-
-        The layout comes from the abstract state, so optimizer moments and EMA
-        copies inherit the axes of the parameters they track. Unboxing is what
-        keeps a caller's own flax metadata out of the state the run carries.
-        """
-        abstract_state = jax.eval_shape(init_fn)
-        self.state_sharding = state_sharding_tree(
-            self.mesh, abstract_state, self.fsdp_min_param_size,
-            self.logical_axis_rules)
-        assert_params_sufficiently_sharded(
-            nn.unbox(abstract_state.params), self.state_sharding.params,
-            self.mesh, self.sharding_tolerance, self.fsdp_min_param_size)
-        return jax.jit(
-            lambda: nn.unbox(init_fn()), out_shardings=self.state_sharding)()
-
-    def generate_states(
+    def __init__(
         self,
+        objective: Objective,
         optimizer: optax.GradientTransformation,
-        rngs: jax.random.PRNGKey,
-        model: nn.Module = None,
-        use_dynamic_scale: bool = False
-    ) -> SimpleTrainState:
-        print("Generating states for SimpleTrainer")
+        *,
+        key: jax.Array,
+        mesh: MeshSpec = MeshSpec(),
+        layout: Layout = Layout(),
+        accumulation: int = 1,
+        dynamic_scale: bool = False,
+        checkpoints: Checkpoints | None = None,
+        tracker: Tracker | None = None,
+        step: Callable[[Objective, optax.GradientTransformation], StepFn] | None = None,
+        profile: Profile | None = None,
+    ):
+        """`accumulation` is the one owner of gradient accumulation: the
+        optimizer is wrapped in `optax.MultiSteps` here, and the EMA runs on
+        the update clock that wrapper defines. `step` replaces the compiled
+        step's body with `step(objective, optimizer)`, the one place for an
+        update that is not one loss (a GAN's alternating optimizers); it then
+        owns the step counter, the EMA and the `Aux.variables` write-back,
+        with `ema_update` and `write_back` at hand."""
+        if accumulation < 1:
+            raise ValueError(f"accumulation must be at least 1, got {accumulation}")
+        self.objective = objective
+        self.optimizer = (optax.MultiSteps(optimizer, every_k_schedule=accumulation)
+                          if accumulation > 1 else optimizer)
+        self.key = key
+        self.mesh = mesh
+        self.layout = layout
+        self.accumulation = accumulation
+        self.dynamic_scale = dynamic_scale
+        self.checkpoints = checkpoints
+        self.tracker = tracker
+        self.step = step
+        self.profile = profile
+        # Measured off the compiled step, once per fit.
+        self.flops_per_step = None
 
-        def init_fn():
-            _, subkey = jax.random.split(rngs)
-            return SimpleTrainState.create(
-                apply_fn=model.apply,
-                params=model.init(subkey, **self.get_input_ones()),
-                tx=optimizer,
-                metrics=Metrics.empty(),
-                dynamic_scale=dynamic_scale_lib.DynamicScale() if use_dynamic_scale else None,
-            )
+    # ------------------------------------------------------------------
+    # The state
+    # ------------------------------------------------------------------
 
-        return self._build_state(init_fn)
-
-    def get_state(self):
-        return self.get_np_tree(self.state)
-
-    def get_rngstate(self):
-        return self.get_np_tree(self.rngstate)
-
-    def get_np_tree(self, pytree):
-        return jax.tree_util.tree_map(lambda x : np.array(x), pytree)
-
-    def checkpoint_path(self):
-        path = os.path.join(self.checkpoint_base_path, self.name.replace(' ', '_').lower())
-        if _is_uri(path):
-            # orbax opens a bucket URI itself; abspath and makedirs would turn
-            # it into a local directory named gs:.
-            return path
-        path = os.path.abspath(path)
-        os.makedirs(path, exist_ok=True)
-        return path
-
-    def _checkpoint_template(self, stored_keys):
-        """Restore template plus the per-leaf args that place arrays on the mesh.
-
-        Shapes and types come from the freshly built state, so a checkpoint
-        written on one mesh restores onto whatever mesh this run is using.
-        Restoring untyped would silently discard opt_state and reset the step
-        counter (and with it the lr schedule) on every resume.
-
-        The template names only the keys this run restores. A checkpoint
-        written from an iterator that cannot report a position has no
-        position; older ones carry a second train state under 'best_state',
-        which nothing here reads.
-        """
-        template = {
-            'rngs': self.get_rngstate(),
-            'state': jax.eval_shape(lambda: self.state),
-            'best_loss': np.array(self.best_loss),
-            'epoch': 0,
-        }
-        if 'position' in stored_keys:
-            # The table's shape depends on the process count and the
-            # iterator's position, so orbax takes it from the checkpoint
-            # rather than from this placeholder.
-            template['position'] = {'rows': np.zeros((1, 1), np.uint8),
-                                    'lengths': np.zeros((1,), np.int64)}
-        restore_args = jax.tree.map(lambda _: ocp.RestoreArgs(), template)
-        # Only the train state is placed onto the mesh; everything else is
-        # bookkeeping that belongs on the host.
-        restore_args['state'] = jax.tree.map(
-            lambda s: ocp.ArrayRestoreArgs(sharding=s), self.state_sharding)
-        return template, restore_args
-
-    def load(self, checkpoint_path, checkpoint_step=None, load_directly_from_dir=False):
-        if not _is_uri(checkpoint_path):
-            # orbax takes local paths absolute only, and a recipe's is
-            # ./checkpoints/<run>.
-            checkpoint_path = os.path.abspath(checkpoint_path)
-        # The handler has to be registered for item_metadata to report the
-        # checkpoint's structure, which is what the template is built against.
-        manager = ocp.CheckpointManager(
-            checkpoint_path, options=ocp.CheckpointManagerOptions(max_to_keep=4, create=False),
-            item_handlers=ocp.PyTreeCheckpointHandler())
-
-        step = manager.latest_step() if checkpoint_step is None else checkpoint_step
-        print("Loading model from checkpoint at step ", step)
-        self.loaded_checkpoint_path = os.path.join(
-            checkpoint_path if checkpoint_path else self.checkpoint_path(), f"{step}")
-
-        target = checkpoint_path if load_directly_from_dir else step
-        template, restore_args = self._checkpoint_template(manager.item_metadata(target).keys())
-        # partial_restore: a key the checkpoint holds and the template does not
-        # is skipped instead of refused.
-        try:
-            ckpt = manager.restore(target, args=ocp.args.PyTreeRestore(
-                item=template, restore_args=restore_args, partial_restore=True))
-        except (TypeError, ValueError) as mismatch:
-            # A structural mismatch surfaces from inside orbax's tree walk as a
-            # key path and a pair of container types, which says nothing about
-            # what to do. opt_state is shaped by the optimizer and by the
-            # MultiSteps wrapper gradient accumulation puts around it, so
-            # changing either between runs is what usually lands here.
+    def initial_state(self) -> TrainState:
+        """The state a fresh run starts from. Pure, so `fit` traces it once
+        for its shapes and once, sharded, for its values."""
+        init_key, run_key = jax.random.split(self.key)
+        params = nn.unbox(self.objective.init(init_key))
+        if "params" not in params:
             raise ValueError(
-                f"The checkpoint at {self.loaded_checkpoint_path} does not fit this "
-                f"run's train state ({mismatch}). A checkpoint carries the optimizer "
-                f"state, so a resume needs the model, the optimizer and the gradient "
-                f"accumulation it was written with. Resume it with those, or start a "
-                f"fresh run with --trainer.name and no --trainer.load-from-checkpoint."
-            ) from mismatch
+                f"the objective's tree has no params collection, only {sorted(params)}; "
+                "the optimizer moves params and treats every other collection as state")
+        ema = self.objective.ema
+        return TrainState(
+            step=jnp.zeros((), jnp.int32),
+            params=params,
+            opt_state=self.optimizer.init(params["params"]),
+            ema=None if ema is None else select(params, ema.select),
+            key=run_key,
+        )
 
-        self.state = ckpt['state']
-        self.rngstate = ckpt['rngs']
-        self.dataset_state = self._stored_position(ckpt)
-        self.best_loss = float(ckpt['best_loss'])
-        if self.best_loss == 0:
-            # It cant be zero as that must have been some problem
-            self.best_loss = 1e9
-        print(f"Loaded model from checkpoint at step {step}", self.best_loss)
+    def _place(self, mesh):
+        """The abstract state, its shardings, and the state itself, fresh or
+        restored, on the mesh."""
+        abstract = jax.eval_shape(self.initial_state)
+        shardings = self.layout.shardings(mesh, abstract)
+        self.layout.check(abstract.params, shardings.params, mesh)
+        resume = None if self.checkpoints is None else self.checkpoints.latest
+        if resume is None:
+            state = jax.jit(self.initial_state, out_shardings=shardings)()
+            return state, shardings, None
+        template = jax.tree.map(
+            lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+            abstract, shardings)
+        state, position = self.checkpoints.restore(template, resume)
+        print(f"Resumed from step {resume} in {self.checkpoints.directory}")
+        return state, shardings, position
+
+    # ------------------------------------------------------------------
+    # The step
+    # ------------------------------------------------------------------
+
+    def _default_step(self):
+        """The compiled step's body over the global batch; GSPMD partitions it.
+
+        The loss is a mean over the batch-sharded axis, so its gradient
+        carries the cross-device all-reduce on its own. One key per step:
+        threefry is partitionable, so every device draws its own slice of the
+        same stream without folding in a device index.
+        """
+        objective = self.objective
+        optimizer = self.optimizer
+        ema_spec = objective.ema
+        accumulation = self.accumulation
+
+        def step(state: TrainState, scale, batch):
+            info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
+                        ema=with_ema(state.params, state.ema))
+
+            def loss_fn(trainable):
+                return objective.loss({**state.params, "params": trainable}, batch, info)
+
+            if scale is not None:
+                grad_fn = scale.value_and_grad(loss_fn, has_aux=True)
+                scale, finite, (loss, aux), grads = grad_fn(state.params["params"])
+            else:
+                (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                    state.params["params"])
+                finite = None
+
+            updates, opt_state = optimizer.update(grads, state.opt_state, state.params["params"])
+            params = write_back(
+                {**state.params, "params": optax.apply_updates(state.params["params"], updates)},
+                aux.variables)
+            new_state = state.replace(step=state.step + 1, params=params, opt_state=opt_state)
+
+            if finite is not None:
+                # Overflowed gradients mean the update did not happen, so the
+                # step counter, which every schedule reads, stays with the
+                # params and the optimizer state.
+                keep = functools.partial(jnp.where, finite)
+                new_state = new_state.replace(
+                    step=keep(new_state.step, state.step),
+                    params=jax.tree.map(keep, new_state.params, state.params),
+                    opt_state=jax.tree.map(keep, new_state.opt_state, state.opt_state))
+
+            if ema_spec is not None:
+                # `state.step` counts micro-batches, and under MultiSteps the
+                # params only move on every accumulation-th one. The EMA runs
+                # on that same clock: the schedule is indexed by completed
+                # updates and the average happens on the micro-step whose
+                # update lands. A rejected mixed-precision step is not an
+                # update either.
+                decay = ema_spec.decay(state.step // accumulation)
+                due = True if finite is None else finite
+                if accumulation > 1:
+                    due = due & ((state.step + 1) % accumulation == 0)
+                averaged = ema_update(state.ema, new_state.params, decay)
+                if due is not True:
+                    averaged = jax.tree.map(functools.partial(jnp.where, due),
+                                            averaged, state.ema)
+                new_state = new_state.replace(ema=averaged)
+            return new_state, scale, loss, aux
+
         return step
 
-    def _stored_position(self, ckpt) -> Optional[bytes]:
-        """The data iterator position this process resumes from, if any.
+    def _step_body(self):
+        if self.step is None:
+            return self._default_step()
+        custom = self.step(self.objective, self.optimizer)
 
-        Positions are per process: each shards the data by its own index, so
-        one process's position means nothing to another and a table written
-        by a different process count has no row for this process at all.
-        """
-        table = ckpt.get('position')
-        if table is None:
-            return None
-        written = len(table['lengths'])
-        if written != jax.process_count():
-            raise ValueError(
-                f"The checkpoint at {self.loaded_checkpoint_path} holds a data "
-                f"iterator position for each of {_processes(written)} and this run "
-                f"has {_processes(jax.process_count())}. A position is where one "
-                f"process's shard of the data stopped and cannot be translated to "
-                f"another shard count, so resume it on {_processes(written)}; only a "
-                f"checkpoint that holds no data position resumes on any count.")
-        return own_position(table)
+        def step(state, scale, batch):
+            state, loss, aux = custom(state, batch)
+            return state, scale, loss, aux
 
-    def save(self, epoch=0, step=0, state=None, rngstate=None, metrics=None):
-        print(f"Saving model at epoch {epoch} step {step}")
-        # Sharded arrays go straight to orbax: gathering them onto the host
-        # first would serialise the whole state through one process and undo
-        # the point of an async checkpointer.
-        ckpt = {
-            'rngs': self.get_rngstate() if rngstate is None else self.get_np_tree(rngstate),
-            'state': self.state if state is None else state,
-            'best_loss': np.array(self.best_loss),
-            'epoch': epoch,
-        }
-        if self.dataset_state is not None:
-            # Grain reports its position as JSON bytes, which tensorstore has no
-            # dtype for; the raw bytes ride along as uint8 rows instead, one per
-            # process, so each resumes its own shard where it left it.
-            ckpt['position'] = gather_positions(self.dataset_state)
-        # Deliberately unguarded: a checkpoint that failed to write is data
-        # loss, and printing it while the run carries on hides exactly that.
-        # The write is async, so a failure inside it surfaces from
-        # wait_for_checkpoints() rather than here.
-        # A save with no metric cannot become the best checkpoint.
-        self.checkpointer.save(step, args=ocp.args.PyTreeSave(ckpt), metrics=metrics,
-                               force=True)
-        self.last_saved_step = step
+        return step
 
-    def _define_train_step(self, **kwargs):
-        raise NotImplementedError("Subclasses must define their train step")
-
-    def _define_validation_step(self, **kwargs):
-        raise NotImplementedError("Subclasses must define their validation step")
-
-    def summary(self):
-        input_vars = self.get_input_ones()
-        print(self.model.tabulate(jax.random.key(0), **input_vars,
-              console_kwargs={"width": 200, "force_jupyter": True, }))
-
-    def config(self):
-        return {
-            "model": self.model,
-            "state": self.state,
-            "name": self.name,
-            "input_shapes": self.input_shapes
-        }
-
-    def _validation_batches(self, val_ds, val_steps_per_epoch) -> list:
-        """The batches a validation pass scores, the same count on every process.
-
-        val_steps_per_epoch bounds the pass, and a held-out split that runs
-        out first ends it, which is not an error to report. Where it runs out
-        differs by process: the token and packed splits are whole files
-        strided per process, so one process can hold a batch more than
-        another, and a process that left the pass while the others waited in
-        its collectives would wedge the pool. The count is agreed before the
-        loop, which is why the batches are pulled onto the host first; a pass
-        holds val_steps_per_epoch of them at most.
-        """
-        if val_ds is None:
-            return [None] * val_steps_per_epoch
-        batches = list(itertools.islice(iter(val_ds()), val_steps_per_epoch))
-        agreed = minimum_across_processes(len(batches))
-        if agreed < len(batches):
-            print(f"Validation on process {jax.process_index()} scores {agreed} of "
-                  f"its {len(batches)} batches, the count every process has")
-        return batches[:agreed]
-
-    def validation_loop(
-        self,
-        val_state: SimpleTrainState,
-        val_step_fn: Callable,
-        val_ds,
-        val_steps_per_epoch,
-        current_step,
-    ):
-        process_index = jax.process_index()
-        batches = self._validation_batches(val_ds, val_steps_per_epoch)
-        for i, batch in enumerate(batches):
-            if batch is not None:
-                batch = shard_batch(self.batch_sharding, batch)
-            if i == 0:
-                print(f"Evaluation started for process index {process_index}")
-            metrics = val_step_fn(val_state, batch)
-            if self.wandb is not None:
-                # metrics is a dict of metrics
-                if metrics and type(metrics) == dict:
-                    for key, value in metrics.items():
-                        if isinstance(value, jnp.ndarray):
-                            value = np.array(value)
-                        self.wandb.log({
-                            f"val/{key}": value,
-                        }, step=current_step)
-
-    def _compiled_step(self, train_step_fn: Callable, *args):
-        """The training step's executable, compiled at most once per run.
+    def _compile(self, body, shardings, mesh, state, scale, batch):
+        """The training step's executable, compiled once per fit.
 
         Calling a jitted function compiles it, and asking the compiler for its
         cost analysis compiles it a second time: `lower(...).compile()` builds
         an executable of its own that the jit cache knows nothing about. Running
         the loop on that executable pays for one compilation and reads the FLOP
         count off it. The lowering carries the jit's shardings and donation, so
-        the loop still donates its train state.
+        the loop donates its train state.
         """
-        cached_fn, compiled = self._compiled_train_step
-        if compiled is not None and cached_fn is train_step_fn:
-            return compiled
-        compiled = train_step_fn.lower(*args).compile()
-        self._compiled_train_step = (train_step_fn, compiled)
-        if self.flops_per_step is None:
-            self.flops_per_step = compiled_flops(compiled)
+        replicated = NamedSharding(mesh, P())
+
+        def step(state, scale, batch):
+            state, scale, loss, aux = body(state, scale, batch)
+            return state, scale, loss, aux.metrics, jnp.isfinite(loss)
+
+        jitted = jax.jit(
+            step,
+            in_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
+                          batch_sharding(mesh)),
+            out_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
+                           replicated, replicated, replicated),
+            donate_argnums=(0,),
+        )
+        compiled = jitted.lower(state, scale, batch).compile()
+        self.flops_per_step = compiled_flops(compiled)
         return compiled
 
-    def train_loop(
-        self,
-        train_state: SimpleTrainState,
-        train_step_fn: Callable,
-        train_ds,
-        train_steps_per_epoch,
-        current_step,
-        rng_state,
-        save_every:int=None,
-        val_every=None,
-    ):
-        process_index = jax.process_index()
-        log_every = self.log_every
+    # ------------------------------------------------------------------
+    # The loop
+    # ------------------------------------------------------------------
 
-        epoch_loss = jnp.zeros((), jnp.float32)
-        current_epoch = current_step // train_steps_per_epoch
-        steps_this_call = train_steps_per_epoch - current_step % train_steps_per_epoch
+    def fit(self, data: "Dataset", *, steps: int, log_every: int = 100,
+            eval_every: int | None = None, checkpoint_every: int | None = None,
+            metrics: Sequence[Metric] = ()) -> TrainState:
+        """Train to `steps` total steps, resuming from the checkpoints' latest
+        step when the directory holds one.
 
+        Every `log_every` steps the tracker receives the loss, the objective's
+        metrics and the throughput. Every `eval_every` steps, and at the end,
+        the validation split is scored: the objective's artifacts go to the
+        tracker and to `metrics`, whose reductions are logged as `val/<name>`.
+        Every `checkpoint_every` steps, and at the end, the state and the data
+        position are written.
+        """
+        mesh = build_mesh(self.mesh)
+        sharding = batch_sharding(mesh)
+        process_zero = jax.process_index() == 0
+        state, shardings, position = self._place(mesh)
+        current = int(state.step)
+        if current > steps:
+            raise ValueError(f"the run is at step {current}, past the {steps} asked for")
+
+        source = data.train()
+        if checkpoint_every and not hasattr(source, "get_state"):
+            raise ValueError(
+                f"checkpoint_every needs a training stream with get_state, and "
+                f"{type(source).__name__} has none; a checkpoint written without "
+                f"the data position would replay the data on resume")
+        train = DevicePrefetchIterator(source, sharding, source_state=position)
+        scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
+        body = self._step_body()
+        compiled = None
+        last_saved = current if self.checkpoints is not None and current else None
+        interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
+        steps_since_log = 0
         # Both counters live on device so the loop never blocks on a result.
-        # `worst_bad_run` remembers the longest streak of non-finite losses seen
-        # since the last host check, which is what decides whether to stop.
+        # `worst_bad_run` remembers the longest streak of non-finite losses
+        # seen since the last host check, which is what decides whether to stop.
         bad_run = jnp.zeros((), jnp.int32)
         worst_bad_run = jnp.zeros((), jnp.int32)
+        tracing, traced, seen = False, 0, 0
+        loss = None
 
-        if process_index == 0:
-            pbar = tqdm.tqdm(total=steps_this_call, desc=f'\t\tEpoch {current_epoch}', ncols=100, unit='step')
-        else:
-            pbar = None
-
-        steps_since_log = 0
-        compiled_step = None
-        # One profiler window per run; its warmup continues across epochs.
-        tracing = False
-        traced_steps = 0
-
-        for i in range(steps_this_call):
-            batch = next(train_ds)
-            if compiled_step is None:
-                compiled_step = self._compiled_step(
-                    train_step_fn, train_state, rng_state, batch)
+        if process_zero:
+            print(f"Training from step {current} to {steps} on "
+                  f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
+        while current < steps:
+            batch = next(train)
+            if compiled is None:
+                compiled = self._compile(body, shardings, mesh, state, scale, batch)
                 # The interval clock starts once the executable exists, so the
                 # first tick reports step time rather than compile time.
                 last_log_time = time.time()
-            if (not tracing and not self._profile_complete and self.profile_steps
-                    and self._profile_seen_steps >= self.profile_warmup_steps):
-                jax.profiler.start_trace(self.profile_path())
+            if (self.profile is not None and not tracing and traced == 0
+                    and seen >= self.profile.warmup):
+                jax.profiler.start_trace(self.profile.directory)
                 tracing = True
 
-            train_state, loss, aux, rng_state, is_finite = compiled_step(
-                train_state, rng_state, batch)
-            self._profile_seen_steps += 1
-            # No stale alias may outlive the step: its buffers were donated.
-            self.state, self.rngstate = train_state, rng_state
-            self.dataset_state = getattr(train_ds, 'source_state', None)
-
-            bad_run = jnp.where(is_finite, 0, bad_run + 1)
+            state, scale, loss, aux, finite = compiled(state, scale, batch)
+            position = train.source_state
+            current += 1
+            seen += 1
+            steps_since_log += 1
+            interval_loss = interval_loss + loss.astype(jnp.float32)
+            interval_steps += 1
+            bad_run = jnp.where(finite, 0, bad_run + 1)
             worst_bad_run = jnp.maximum(worst_bad_run, bad_run)
 
-            if i == 0:
-                print(f"Training started for process index {process_index} at step {current_step}")
-
-            epoch_loss += loss
-            current_step += 1
-            steps_since_log += 1
-
             if tracing:
-                traced_steps += 1
-                if traced_steps == self.profile_steps:
+                traced += 1
+                if traced == self.profile.steps:
                     tracing = False
-                    self._stop_trace(traced_steps, loss)
+                    self._stop_trace(traced, loss)
 
-            if i % log_every == 0:
-                self._check_finite(worst_bad_run, current_step)
+            if current % log_every == 0:
+                self._check_finite(worst_bad_run, current)
                 worst_bad_run = jnp.zeros((), jnp.int32)
-                if pbar is not None:
-                    # The one place per interval where waiting on the device is
-                    # justified: the numbers below are meaningless without it.
+                if process_zero:
+                    # The one place per interval where waiting on the device
+                    # is justified: the numbers below are meaningless without it.
                     loss.block_until_ready()
                     now = time.time()
-                    elapsed = now - last_log_time
-                    pbar.set_postfix(loss=f'{loss:.4f}')
-                    pbar.update(steps_since_log)
-                    if self.wandb is not None:
-                        self.wandb.log({
-                            "train/step": current_step,
-                            "train/loss": loss,
-                            **{f"train/{k}": v for k, v in aux.items()},
-                            **self._throughput_metrics(elapsed, steps_since_log),
-                        }, step=current_step)
+                    scalars = {"train/step": current, "train/loss": float(loss),
+                               **{f"train/{k}": float(v) for k, v in aux.items()},
+                               **self._throughput(now - last_log_time, steps_since_log,
+                                                  data.batch)}
+                    print(f"step {current}: loss {float(loss):.4f}")
+                    if self.tracker is not None:
+                        self.tracker.log(scalars, current)
                     last_log_time, steps_since_log = now, 0
 
-            # On its own clock, not the logging one: nested inside the log tick,
-            # a cadence that did not divide log_every never fired at all.
-            if (save_every and current_step % save_every == 0
-                    and i + 1 < steps_this_call):
-                self.save(current_epoch, current_step, train_state, rng_state)
+            if eval_every and current % eval_every == 0 and current < steps:
+                self._evaluate(state, data, metrics, mesh, current)
+
+            # On its own clock, not the logging one: nested inside the log
+            # tick, a cadence that did not divide log_every never fired at all.
+            if (checkpoint_every and current % checkpoint_every == 0
+                    and current < steps):
+                self.checkpoints.save(current, state, position,
+                                      {"loss": float(interval_loss / interval_steps)})
+                last_saved = current
+                interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
 
         if tracing:
-            # The window outlived the epoch, and a trace left running takes the
+            # The window outlived the run, and a trace left running takes the
             # next one down with it.
-            self._stop_trace(traced_steps, loss)
-        self._check_finite(worst_bad_run, current_step)
-        if pbar is not None:
-            # Whatever ran since the last tick is progress too.
-            pbar.update(steps_since_log)
-            pbar.close()
-        return epoch_loss, current_step, train_state, rng_state
+            self._stop_trace(traced, loss)
+        self._check_finite(worst_bad_run, current)
+        if eval_every:
+            self._evaluate(state, data, metrics, mesh, current)
+        if self.checkpoints is not None and last_saved != current:
+            # The in-loop saves are conditional, so the state the run ends on
+            # may never have been written. It goes out under its real step,
+            # because a step-0 checkpoint holding the final weights would make
+            # a resume restart the schedule from the beginning.
+            self.checkpoints.save(
+                current, state, position,
+                {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
+        if self.checkpoints is not None:
+            self.checkpoints.wait()
+        return state
 
-    def profile_path(self):
-        return os.path.join(self.checkpoint_path(), 'profile')
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced_steps: int, loss):
+    def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
+                  mesh, step: int) -> dict[str, float]:
+        """Score the validation split: the objective's artifacts through the
+        metrics and, on the first batch, to the tracker.
+
+        Every process scores the batch count all of them have. The held-out
+        split runs out at different points on different processes (the token
+        and packed splits are whole files strided per process), and a process
+        that left the pass while the others waited in its collectives would
+        wedge the pool, so each batch is agreed before it is scored. A metric
+        or a loader that raises takes the pass down with it.
+        """
+        if data.val is None:
+            return {}
+        sharding = batch_sharding(mesh)
+        process_zero = jax.process_index() == 0
+        info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
+                    ema=with_ema(state.params, state.ema))
+        values: dict[str, list] = {metric.name: [] for metric in metrics}
+        iterator = iter(data.val())
+        scored = 0
+        while True:
+            batch = next(iterator, None)
+            if not minimum_across_processes(int(batch is not None)):
+                break
+            batch = shard_batch(sharding, batch)
+            produced = self.objective.evaluate(state.params, batch, info)
+            produced = (() if produced is None
+                        else produced if isinstance(produced, tuple) else (produced,))
+            for metric in metrics:
+                values[metric.name].append(metric(_pick(produced, metric.reads), batch))
+            if scored == 0 and process_zero and self.tracker is not None:
+                for artifact in produced:
+                    self.tracker.artifact(artifact, step)
+            scored += 1
+        scores = {f"val/{name}": float(metric.reduce(values[name]))
+                  for metric in metrics for name in [metric.name] if values[name]}
+        if process_zero:
+            print(f"Validation at step {step} over {scored} batches: {scores}")
+            if self.tracker is not None and scores:
+                self.tracker.log(scores, step)
+        return scores
+
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+
+    def _stop_trace(self, traced: int, loss):
         """Close the profiler window once its last step has actually landed."""
         loss.block_until_ready()
         jax.profiler.stop_trace()
-        self._profile_complete = True
-        print(f"Wrote profile for {traced_steps} steps to {self.profile_path()}")
+        print(f"Wrote profile for {traced} steps to {self.profile.directory}")
 
-    def _check_finite(self, worst_bad_run, current_step):
+    def _check_finite(self, worst_bad_run, step: int):
         """Fail a diverged run loudly rather than papering over it.
 
         Deferred to the logging cadence so the step loop never synchronises;
         detection is late by at most that many steps, never missed.
         """
         streak = int(worst_bad_run)
-        if streak >= self.max_bad_loss_steps:
+        if streak >= BAD_LOSS_STEPS:
             raise RuntimeError(
                 f"Loss has been non-finite for {streak} consecutive steps "
-                f"ending near step {current_step}, stopping")
+                f"ending near step {step}, stopping")
         if streak:
-            print(colored(f"Non-finite loss for {streak} step(s) before {current_step}", 'red'))
+            print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
 
-    def _throughput_metrics(self, elapsed: float, steps: int) -> Dict[str, float]:
+    def _throughput(self, elapsed: float, steps: int, batch: int) -> dict[str, float]:
         if elapsed <= 0 or steps <= 0:
             return {}
         step_time = elapsed / steps
-        metrics = {
-            "train/step_time_ms": step_time * 1000,
-            "train/samples_per_sec": self.global_batch_size / step_time,
-        }
+        scalars = {"train/step_time_ms": step_time * 1000,
+                   "train/samples_per_sec": batch / step_time}
         mfu = model_flops_utilization(self.flops_per_step, step_time)
         if mfu is not None:
-            metrics["train/mfu"] = mfu
-        return metrics
-
-
-    def fit(self, data, train_steps_per_epoch, epochs, train_step_args={}, val_steps_per_epoch=5,
-            validation_step_args={}, checkpoint_every_steps: Optional[int] = None):
-        local_batch_size = data.get('local_batch_size', 0)
-        self.global_batch_size = data.get(
-            'global_batch_size', local_batch_size * jax.process_count())
-        train_ds = DevicePrefetchIterator(
-            data['train'](), self.batch_sharding, source_state=self.dataset_state)
-        val_ds = data.get('val', data.get('test', None))
-        train_step = self._define_train_step(**train_step_args)
-        val_step = self._define_validation_step(**validation_step_args)
-        train_state = self.state
-        rng_state = self.rngstate
-        process_index = jax.process_index()
-
-        if val_steps_per_epoch > 0:
-            # We should first run a validation step to make sure the model is working
-            print(f"Validation run for sanity check for process index {process_index}")
-            # Validation step
-            self.validation_loop(
-                train_state,
-                val_step,
-                val_ds,
-                val_steps_per_epoch,
-                self.latest_step,
-            )
-            print(colored(f"Sanity Validation done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
-                
-        while self.latest_step < epochs * train_steps_per_epoch:
-            current_epoch = self.latest_step // train_steps_per_epoch
-            start_step = self.latest_step
-            resumed_partial_epoch = bool(start_step % train_steps_per_epoch)
-            print(f"\nEpoch {current_epoch}/{epochs}")
-            start_time = time.time()
-            epoch_loss, current_step, train_state, rng_state = self.train_loop(
-                train_state,
-                train_step,
-                train_ds,
-                train_steps_per_epoch,
-                self.latest_step,
-                rng_state,
-                save_every=checkpoint_every_steps,
-            )
-            print(colored(f"Epoch done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
-            
-            self.latest_step = current_step
-            end_time = time.time()
-            self.state = train_state
-            self.rngstate = rng_state
-            total_time = end_time - start_time
-            steps_ran = current_step - start_step
-            avg_time_per_step = total_time / steps_ran
-            
-            if val_steps_per_epoch > 0:
-                print(f"Validation started for process index {process_index}")
-                # Validation step
-                self.validation_loop(
-                    train_state,
-                    val_step,
-                    val_ds,
-                    val_steps_per_epoch,
-                    current_step,
-                )
-                print(colored(f"Validation done on process index {process_index}", PROCESS_COLOR_MAP[process_index]))
-            
-            avg_loss = float(epoch_loss / steps_ran)
-            if not resumed_partial_epoch and avg_loss < self.best_loss:
-                self.best_loss = avg_loss
-                self.save(current_epoch, current_step, metrics={'loss': avg_loss})
-            elif (checkpoint_every_steps
-                  and current_step % checkpoint_every_steps == 0):
-                self.save(current_epoch, current_step)
-            if process_index == 0:
-                if self.wandb is not None:
-                    self.wandb.log({
-                        "train/epoch_time": total_time,
-                        "train/avg_time_per_step": avg_time_per_step,
-                        "train/avg_loss": avg_loss,
-                        "train/best_loss": self.best_loss,
-                        "train/epoch": current_epoch,
-                    }, step=current_step)
-                print(colored(f"\n\tEpoch {current_epoch} completed. Avg Loss: {avg_loss}, Time: {total_time:.2f}s, Best Loss: {self.best_loss}", 'green'))
-                    
-                
-        # The in-loop saves are conditional, so the state the run ends on may
-        # never have been written. It has to go out under its real step,
-        # because a step-0 checkpoint holding the final weights would make a
-        # resume restart the schedule from the beginning.
-        if self.last_saved_step != self.latest_step:
-            self.save(self.latest_step // train_steps_per_epoch, self.latest_step)
-        self.wait_for_checkpoints()
-        return self.state
-
-    def wait_for_checkpoints(self):
-        """Block until pending async checkpoint writes have landed on disk.
-
-        Saving is async so it stays off the training loop's critical path;
-        anything that reads the checkpoint back has to call this first.
-        """
-        self.checkpointer.wait_until_finished()
+            scalars["train/mfu"] = mfu
+        return scalars
