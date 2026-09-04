@@ -143,7 +143,7 @@ def _decode_frame_window_pyav(path: str, start: int = 0, end: int | None = None)
             if index >= start:
                 frames.append(frame.to_ndarray(format="rgb24"))
     if not frames:
-        return np.zeros((0, 0, 0, 3), dtype=np.uint8)
+        raise ValueError(f"{path} has no frames in [{start}, {end})")
     return np.stack(frames)
 
 def read_av_improved(
