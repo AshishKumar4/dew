@@ -356,7 +356,8 @@ class Trainer:
             raise ValueError(
                 f"checkpoint_every needs a training stream with get_state, and "
                 f"{type(source).__name__} has none; a checkpoint written without "
-                f"the data position would replay the data on resume")
+                f"the data position would replay the data on resume. Train it "
+                f"with checkpoint_every=None (--trainer.checkpoint-every None)")
         train = DevicePrefetchIterator(source, sharding, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
         compiled = None

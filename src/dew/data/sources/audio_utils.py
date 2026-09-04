@@ -134,10 +134,9 @@ def read_audio_moviepy(
     else:
         video = VideoFileClip(video_path)
     # Extract audio
-    audio = video.audio.with_fps(target_sr)
-    
-    # Get audio data
-    audio_data = audio.to_soundarray()
+    if video.audio is None:
+        raise ValueError(f"{video_path} has no audio track")
+    audio_data = video.audio.to_soundarray(fps=target_sr)
     
     # Convert to mono if stereo
     if audio_data.ndim > 1 and audio_data.shape[1] > 1:

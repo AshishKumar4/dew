@@ -891,13 +891,14 @@ def test_decoding_drops_alpha_and_hands_back_rgb():
 
 def test_a_truncated_image_raises_rather_than_becoming_an_array():
     """cv2.imdecode hands back None for a half-written jpeg, and None resized
-    to the training size would be a black record."""
+    to the training size would be a black record; the decoder says so by name
+    instead of letting the colour conversion raise cv2's own error."""
     whole = np.random.RandomState(0).randint(0, 256, (16, 16, 3), np.uint8)
     encoded, buffer = cv2.imencode(".jpg", whole)
     assert encoded
     truncated = buffer.tobytes()[:len(buffer) // 2]
 
-    with pytest.raises(cv2.error):
+    with pytest.raises(ValueError, match="could not decode"):
         decode_image(truncated)
 
 

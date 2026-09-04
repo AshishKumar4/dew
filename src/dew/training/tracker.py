@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 import numpy as np
 
@@ -45,15 +45,18 @@ def _uint8(images) -> np.ndarray:
     return np.clip((_home(images).astype(np.float32) + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
 
+Payload: TypeAlias = dict[str, Any]
+
+
 @functools.singledispatch
-def render(value, step: int):
-    """The wandb payload for one artifact, or NotImplemented for a type
-    nothing draws (a metric reads it instead)."""
-    return NotImplemented
+def render(value, step: int) -> Payload | None:
+    """The wandb payload for one artifact, or None for a type nothing draws
+    (a metric reads it instead)."""
+    return None
 
 
 @render.register
-def _(value: ImageGrid, step: int):
+def _(value: ImageGrid, step: int) -> Payload | None:
     import wandb
 
     captions = list(value.captions) + [None] * (len(value.images) - len(value.captions))
@@ -62,7 +65,7 @@ def _(value: ImageGrid, step: int):
 
 
 @render.register
-def _(value: VideoGrid, step: int):
+def _(value: VideoGrid, step: int) -> Payload | None:
     import wandb
 
     # wandb reads clips as [N, T, C, H, W].
@@ -71,23 +74,26 @@ def _(value: VideoGrid, step: int):
 
 
 @render.register
-def _(value: TextSamples, step: int):
+def _(value: TextSamples, step: int) -> Payload | None:
     import wandb
 
     texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
     rows = [[index, value.prompt, text] for index, text in enumerate(texts)]
-    return {"val/samples": wandb.Table(columns=["sample", "prompt", "text"], data=rows)}
+    table = wandb.Table(columns=["sample", "prompt", "text"])
+    for row in rows:
+        table.add_data(*row)
+    return {"val/samples": table}
 
 
 @render.register
-def _(value: Representations, step: int):
+def _(value: Representations, step: int) -> Payload | None:
     import wandb
 
     # The per-dimension spread across the batch: the collapse view of a
     # representation, which goes to zero when the encoder stops telling
     # inputs apart.
-    return {"val/representation_std": wandb.Histogram(
-        np.std(_home(value.features).astype(np.float32), axis=0))}
+    spread = np.std(_home(value.features).astype(np.float32), axis=0)
+    return {"val/representation_std": wandb.Histogram(spread.tolist())}
 
 
 class WandbTracker:
@@ -125,7 +131,7 @@ class WandbTracker:
 
     def artifact(self, value: Any, step: int) -> None:
         payload = self.render(value, step)
-        if payload is not NotImplemented:
+        if payload is not None:
             self.run.log(payload, step=step)
 
     def finish(self) -> None:

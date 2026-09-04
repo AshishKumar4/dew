@@ -101,7 +101,8 @@ def main(config: DiffusionRunConfig) -> TrainState:
                     "steps": steps})
 
     checkpoints = Checkpoints(directory, keep=config.trainer.keep)
-    config.save(checkpoints.directory)
+    if jax.process_index() == 0:
+        config.save(checkpoints.directory)
     trainer = Trainer(
         objective, build_optimizer(config.optim, steps),
         key=jax.random.key(config.trainer.seed),
@@ -118,8 +119,8 @@ def main(config: DiffusionRunConfig) -> TrainState:
     state = trainer.fit(
         data, steps=steps,
         log_every=config.trainer.log_every,
-        eval_every=config.trainer.eval_every or data.steps_per_epoch,
-        checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
+        eval_every=config.trainer.eval_interval(data),
+        checkpoint_every=config.trainer.checkpoint_interval(data),
         metrics=config.build_eval_metrics(),
     )
     if tracker is not None:
