@@ -22,7 +22,8 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import Batch, Dataset, DatasetSpec, local_batch, train_stream, validation_pass
+from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream,
+                      validation_pass)
 
 
 def token_files(path: str | None, name: str) -> tuple[str, str]:
@@ -63,10 +64,7 @@ class TokenWindows(DatasetSpec):
     seq_len: int = 256
     val_batches: int | None = 4
     seed: int = 0
-    worker_count: int = 32
-    read_threads: int = 64
-    read_buffer: int = 128
-    worker_buffer: int = 20
+    loading: Loading = Loading()
 
     def load(self, *, batch: int) -> Dataset:
         from .sources.text import TokenFileSource
@@ -74,9 +72,7 @@ class TokenWindows(DatasetSpec):
         train_bin, val_bin = token_files(self.path, "TokenWindows")
         train = TokenFileSource(train_bin, self.seq_len)
         val = TokenFileSource(val_bin, self.seq_len)
-        knobs = dict(batch=local_batch(batch), seed=self.seed, worker_count=self.worker_count,
-                     read_threads=self.read_threads, read_buffer=self.read_buffer,
-                     worker_buffer=self.worker_buffer)
+        knobs = dict(batch=local_batch(batch), seed=self.seed, loading=self.loading)
         return Dataset(
             train=train_stream(train, [], **knobs),
             val=bounded(validation_pass(val, [], **knobs), self.val_batches),
@@ -156,8 +152,9 @@ class PackedTokens(DatasetSpec):
     seq_len: int = 256
     val_batches: int | None = 4
     seed: int = 0
-    worker_count: int = 32
-    worker_buffer: int = 20
+    loading: Loading = Loading()
+    """The packer reads through grain's Dataset API, which takes no read
+    options, so `workers` and `worker_buffer` are the two that reach it."""
     packing_bins: int = 8
 
     def load(self, *, batch: int) -> Dataset:
@@ -183,14 +180,14 @@ class PackedTokens(DatasetSpec):
                 documents = documents.shuffle(self.seed)
             documents = documents.repeat(epochs)
             reads = documents.to_iter_dataset()
-            if self.worker_count:
+            if self.loading.workers:
                 # The workers read documents, and the packer stays behind them
                 # in this process: grain runs a whole pipeline per worker, so
                 # packing inside them would fill bins from one worker's slice
                 # of the documents and make the windows depend on worker_count.
                 reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
-                    num_workers=self.worker_count,
-                    per_worker_buffer_size=self.worker_buffer))
+                    num_workers=self.loading.workers,
+                    per_worker_buffer_size=self.loading.worker_buffer))
             packed = FirstFitPackIterDataset(
                 reads,
                 length_struct={"text": window},

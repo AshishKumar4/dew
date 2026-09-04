@@ -18,11 +18,15 @@ from dew.telemetry.instrumentation import enable_compilation_cache
 from dew.training.distributed import broadcast_from_process_zero
 
 
-def prepare_process(wandb_offline: bool = False,
+def prepare_process(wandb=None,
                     multi_host: Optional[bool] = None,
                     xla_flags: Optional[str] = None,
                     compilation_cache_dir: Optional[str] = None):
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
+
+    `wandb` is the run's `dew.config.Wandb`, or None for a run without a
+    tracker; only its offline switch is read, and it has to be read before
+    wandb opens a run.
 
     jax.distributed.initialize() finds the coordinator from the environment on
     TPU pods and Slurm/GKE clusters. On a machine with no cluster environment
@@ -36,7 +40,7 @@ def prepare_process(wandb_offline: bool = False,
     process. That is what makes it a recipe's first line and why a library
     user, who never runs a recipe, sets XLA_FLAGS themselves.
     """
-    if wandb_offline:
+    if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
     apply_xla_flags(xla_flags)
     if compilation_cache_dir:

@@ -31,6 +31,7 @@ from dew import registry
 from dew.registry import datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
+from dew.training.trainer import Profile
 
 JsonDict = Annotated[
     dict[str, Any],
@@ -89,6 +90,17 @@ class OptimConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class Wandb:
+    """Where a run reports to. Its presence is what turns tracking on: the
+    entity and the offline switch mean nothing without a project, and an
+    unset project used to stand in for running without a tracker."""
+
+    project: str
+    entity: Optional[str] = None
+    offline: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Run length, checkpointing, sharding and run tracking."""
 
@@ -111,15 +123,15 @@ class TrainerConfig:
     dynamic_scale: bool = False
     mesh: MeshSpec = MeshSpec()
     layout: Layout = Layout()
-    profile_steps: int = 0
+    profile: Optional[Profile] = None
+    """One profiler window: the steps to trace, the warmup before it and the
+    directory it is written to. Unset traces nothing."""
     compilation_cache_dir: Optional[str] = dataclasses.field(
         default_factory=default_compilation_cache_dir)
     """Persisted XLA cache, so a restart skips recompiling the step. None
     compiles from scratch every run."""
-    wandb_project: Optional[str] = None
+    wandb: Optional[Wandb] = None
     """Unset runs without a tracker."""
-    wandb_entity: Optional[str] = None
-    wandb_offline: bool = False
     multi_host: Optional[bool] = None
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     xla_flags: Optional[str] = None

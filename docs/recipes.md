@@ -9,7 +9,7 @@ A recipe is a training entry point: it reads a config, builds the model, the dat
 - `ModelConfig(architecture, config, dtype, attention_impl)`: the registry name and the fields the registry builds the model from, plus the run's compute dtype and attention kernel, which `dew.registry.with_precision` writes into the fields (and into a UNet's nested per-stage attention configs).
 - `data`: a dataset spec from the `datasets` registry, chosen as a subcommand. Its fields are the spec's own, so `data:oxford-flowers --data.image-size 128` and `data:token-windows --data.path data/shakespeare --data.seq-len 256` are the whole data configuration; there is no separate `DataConfig`.
 - `OptimConfig(optimizer, optimizer_opts, learning_rate, learning_rate_schedule, learning_rate_peak, learning_rate_end, learning_rate_warmup_steps, learning_rate_decay_steps, weight_decay, clip_grads)`. `optimizer` is `adam`, `adamw`, `lamb` or `muon`; `muon` splits the parameters into the matrices Muon orthogonalises and the embeddings, heads and norms AdamW steps, read off the same axis declarations the sharding uses.
-- `TrainerConfig(name, checkpoint_dir, keep, batch_size, seed, steps, epochs, log_every, eval_every, checkpoint_every, accumulation, dynamic_scale, mesh, layout, profile_steps, compilation_cache_dir, wandb_project, wandb_entity, wandb_offline, multi_host, xla_flags)`. `mesh` is `MeshSpec(fsdp, expert)` and `layout` is `Layout(min_shard, tolerance)`, so the flags are `--trainer.mesh.fsdp 4` and `--trainer.layout.min-shard 65536`. `wandb_project` unset means no tracker: the run logs to the terminal.
+- `TrainerConfig(name, checkpoint_dir, keep, batch_size, seed, steps, epochs, log_every, eval_every, checkpoint_every, accumulation, dynamic_scale, mesh, layout, profile, compilation_cache_dir, wandb, multi_host, xla_flags)`. `mesh` is `MeshSpec(fsdp, expert)`, `layout` is `Layout(min_shard, tolerance)`, `profile` is `Profile(directory, steps, warmup)` and `wandb` is `Wandb(project, entity, offline)`, so the flags are `--trainer.mesh.fsdp 4`, `--trainer.layout.min-shard 65536` and `--trainer.wandb.project dew`. `wandb` unset means no tracker: the run logs to the terminal. `profile` unset traces nothing.
 - `RunConfig(model, data, optim, trainer)`, with `save(directory)` and `load(directory)`. A recipe writes `run.json` next to the checkpoints before it trains, and `load` rebuilds the same class, raising on a field it does not know or one that is missing. Registry-typed fields (the data spec, a preset, a sampler) are stored as `{"name", "fields"}` and rebuilt through their registry.
 
 Each recipe subclasses `RunConfig` with the knobs its objective needs. `DiffusionRunConfig` adds `preset` and `sampler`, each a subcommand over its registry (`preset:edm --preset.sigma-data 0.5`, `sampler:heun`), and `guidance`, `sampling_steps`, `unconditional_prob`, `ema_decay`, `text_encoder`, `autoencoder`, `autoencoder_opts` and `val_metrics`. `JepaRunConfig` adds `predictor`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes`, `probe_label_key` and `knn_k`. `LmRunConfig` adds `tokenizer`, `ema_decay`, `sample_prompt`, `sample_tokens` and `pretrained`.
@@ -40,7 +40,7 @@ Dashes and underscores both parse, and booleans take the `--trainer.no-dynamic-s
 ```python
 # runs elsewhere: downloads Oxford Flowers and the CLIP text tower
 import sys; sys.path.insert(0, "recipes/diffusion")
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config import ModelConfig, OptimConfig, TrainerConfig, Wandb
 from dew.data import OxfordFlowers
 from dew.diffusion import presets
 from train import DiffusionRunConfig, main
@@ -50,7 +50,8 @@ config = DiffusionRunConfig(
     data=OxfordFlowers(image_size=128),
     preset=presets.EDM(),
     optim=OptimConfig(learning_rate=2e-4),
-    trainer=TrainerConfig(batch_size=32, epochs=100, accumulation=2, checkpoint_dir="./runs", wandb_offline=True),
+    trainer=TrainerConfig(batch_size=32, epochs=100, accumulation=2, checkpoint_dir="./runs",
+                          wandb=Wandb(project="dew", offline=True)),
 )
 state = main(config)
 ```

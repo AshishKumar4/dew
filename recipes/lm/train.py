@@ -30,7 +30,7 @@ from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import datasets, metrics, models
-from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
+from dew.training import (Checkpoints, Trainer, TrainState, WandbTracker,
                           build_optimizer, prepare_process, run_timestamp)
 
 # HF tokenizers fork a thread pool; grain's workers fork the process.
@@ -188,7 +188,7 @@ def run_summary(config: LmRunConfig, fields: dict) -> dict:
 
 
 def main(config: LmRunConfig) -> TrainState:
-    prepare_process(config.trainer.wandb_offline, config.trainer.multi_host,
+    prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
 
     meta = read_meta(config.data.path)
@@ -234,10 +234,10 @@ def main(config: LmRunConfig) -> TrainState:
 
     run_config = config.to_dict()
     tracker = None
-    if config.trainer.wandb_project is not None:
+    if config.trainer.wandb is not None:
         tracker = WandbTracker(
-            config.trainer.wandb_project, name, entity=config.trainer.wandb_entity,
-            offline=config.trainer.wandb_offline,
+            config.trainer.wandb.project, name, entity=config.trainer.wandb.entity,
+            offline=config.trainer.wandb.offline,
             config={"run_config": run_config, "model": fields,
                     "arguments": run_summary(config, fields),
                     "dataset": {"path": config.data.path, "records": data.records,
@@ -255,8 +255,7 @@ def main(config: LmRunConfig) -> TrainState:
         dynamic_scale=config.trainer.dynamic_scale,
         checkpoints=checkpoints,
         tracker=tracker,
-        profile=(Profile(os.path.join(directory, "profile"), config.trainer.profile_steps)
-                 if config.trainer.profile_steps else None),
+        profile=config.trainer.profile,
     )
 
     start = time.time()

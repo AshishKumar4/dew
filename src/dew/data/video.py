@@ -20,7 +20,7 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (CAPTION, Dataset, DatasetSpec, hold_out, local_batch, tokenized,
+from .dataset import (CAPTION, Dataset, DatasetSpec, Loading, hold_out, local_batch, tokenized,
                       train_stream, validation_pass)
 from .processors import AutoAudioProcessor
 
@@ -89,10 +89,7 @@ class VideoDataset(DatasetSpec):
     val_batches: int | None = 4
     count: int | None = None
     seed: int = 0
-    worker_count: int = 32
-    read_threads: int = 64
-    read_buffer: int = 128
-    worker_buffer: int = 20
+    loading: Loading = Loading()
 
     def source(self) -> list[dict[str, str]]:
         """One `{"video_path", "caption"}` record per clip, in a fixed order."""
@@ -105,9 +102,7 @@ class VideoDataset(DatasetSpec):
         if records > len(source):
             raise ValueError(f"count {self.count} is more than the {len(source)} records of {name}")
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, name)
-        knobs = dict(batch=local_batch(batch), seed=self.seed, worker_count=self.worker_count,
-                     read_threads=self.read_threads, read_buffer=self.read_buffer,
-                     worker_buffer=self.worker_buffer)
+        knobs = dict(batch=local_batch(batch), seed=self.seed, loading=self.loading)
         return Dataset(
             train=tokenized(train_stream(train, [AudioVideoTransform(self)], **knobs), tokenize),
             val=None if val is None else tokenized(

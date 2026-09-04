@@ -21,7 +21,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import OxfordFlowers
+from dew.data import Loading, OxfordFlowers
 
 pytestmark = pytest.mark.network
 
@@ -40,7 +40,7 @@ VAL_RECORDS = 4 * BATCH
 @pytest.fixture(scope="module")
 def flowers():
     """The Dataset a recipe loads from the registered spec, in-process."""
-    return OxfordFlowers(image_size=SIZE, worker_count=0).load(batch=BATCH)
+    return OxfordFlowers(image_size=SIZE, loading=Loading(workers=0)).load(batch=BATCH)
 
 
 def labels_of(batch):

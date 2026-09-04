@@ -21,7 +21,7 @@ import numpy as np
 import PIL.Image
 import pytest
 
-from dew.data import online_loader
+from dew.data import Loading, online_loader
 from dew.data.online_loader import (
     DROPPED_SAMPLE, MediaBatchIterator, OnlineStreamingDataLoader,
 )
@@ -352,11 +352,11 @@ def _online_spec(monkeypatch, rows, passes, stop):
     """OnlineImages over a stub table, with the fetcher pool replaced."""
     from dew.data import OnlineImages
 
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader",
                         _producer_of(rows, passes, stop))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubDataset(rows))
-    return OnlineImages(sources=("fake_online",), image_size=4, worker_count=1)
+    return OnlineImages(sources=("fake_online",), image_size=4,
+                        loading=Loading(workers=1))
 
 
 def test_the_streaming_spec_repeats_its_records_instead_of_ending(monkeypatch, stop):
@@ -419,13 +419,12 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
 
     from dew.data import OnlineImages
 
-    monkeypatch.setattr(online_loader, "AutoTextTokenizer", _StubTokenizer)
     monkeypatch.setattr(online_loader, "parallel_media_loader", exhausted)
     monkeypatch.setattr(online_loader, "MediaBatchIterator",
                         functools.partial(MediaBatchIterator, queue_timeout=0.05))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubDataset(4))
     loader = OnlineImages(sources=("fake_online",), image_size=4,
-                          worker_count=1).load(batch=4).train()
+                          loading=Loading(workers=1)).load(batch=4).train()
 
     assert len(next(loader)["image"]) == 4
     with pytest.raises(StopIteration):
