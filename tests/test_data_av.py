@@ -146,3 +146,30 @@ def test_random_clip_readers_are_seeded_locally(synthesized_clip, method):
     assert first_frames.shape[0] == 8
     assert first_audio.shape[0] == 8 + 2  # padded on both sides
     assert np.array_equal(global_state, np.random.get_state()[1])
+
+
+def test_the_fps_conversion_takes_a_path_the_shell_would_have_eaten(tmp_path, monkeypatch):
+    """The conversion runs ffmpeg on a caller's path. Built as a shell string
+    it split on a space and ran anything after a metacharacter, so the two
+    paths a shell would mangle are what this reads."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("needs the ffmpeg binary")
+    from dew.data.sources.av_utils import read_video
+
+    work = tmp_path / "a dir"
+    work.mkdir()
+    clip = work / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", f"testsrc=duration=1:size=32x32:rate={int(FPS)}", str(clip)],
+        check=True, capture_output=True)
+    dangerous = work / "clip; touch injected.txt"
+    dangerous.write_bytes(clip.read_bytes())
+    monkeypatch.chdir(work)
+
+    spaced = read_video(str(clip), change_fps=True, reader="opencv")
+    metacharacter = read_video(str(dangerous), change_fps=True, reader="opencv")
+
+    assert len(spaced) == len(metacharacter) > 0
+    assert spaced[0].shape == (32, 32, 3)
+    assert not (work / "injected.txt").exists(), "the path reached a shell"
