@@ -19,10 +19,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.config import DataConfig
-from dew.data.dataloaders import (
-    get_packed_token_dataset_grain, get_token_dataset_grain, load_data,
-)
+from dew.data import PackedTokens, TokenWindows
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.data.text import ByteTokenizer
 from dew.nn.backbones import causal_transformer as backbone
@@ -189,23 +186,32 @@ def test_token_file_source_rejects_files_too_short(tmp_path):
 
 
 # ---------------------------------------------------------------------------------
-# get_token_dataset_grain
+# TokenWindows
 # ---------------------------------------------------------------------------------
+
+def _windows(tmp_path, **fields):
+    """The fixed-window spec over `tmp_path`, read in this process."""
+    fields = {"val_batches": None, "worker_count": 0, "read_threads": 1, "read_buffer": 1,
+              "worker_buffer": 1, **fields}
+    return TokenWindows(path=str(tmp_path), **fields)
+
+
+def _packed_tokens(tmp_path, **fields):
+    """The packed spec over `tmp_path`, read in this process."""
+    fields = {"val_batches": None, "worker_count": 0, "worker_buffer": 1, **fields}
+    return PackedTokens(path=str(tmp_path), **fields)
 
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     seq_len, batch = 8, 4
     # (n - 1) // seq_len windows: 17*8 tokens -> 16 train, 5*8 -> 4 val.
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=5 * seq_len,
                seq_len=seq_len)
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=batch, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=batch)
 
-    assert data["train_len"] == 16 and data["val_len"] == 4
-    assert data["local_batch_size"] == batch and data["global_batch_size"] == batch
+    assert data.records == 16 and data.batch == batch and data.steps_per_epoch == 4
 
-    for split, windows in (("train", 16), ("val", 4)):
-        batches = list(data[split]())
+    for batches, windows in ((itertools.islice(data.train(), 4), 16), (data.val(), 4)):
+        batches = list(batches)
         assert len(batches) == windows // batch
         for b in batches:
             assert b["text"].shape == (batch, seq_len + 1)
@@ -223,11 +229,9 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
     (tmp_path / "train.bin").write_bytes(train_tokens.astype("<u2").tobytes())
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=4, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    val_batches = [b["text"] for b in data["val"]()]
+    val_batches = [b["text"] for b in data.val()]
     assert len(val_batches) == 2  # 8 windows, batch 4, drop_remainder
     # Unshuffled: windows come in file order, each overlapping the next by one.
     np.testing.assert_array_equal(val_batches[0][0], val_tokens[:seq_len + 1])
@@ -236,18 +240,17 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
 
     # Train and val are disjoint files: no train window equals a val window.
     train_windows = {w.tobytes() for w in np.concatenate(
-        [b["text"] for b in data["train"]()])}
+        [b["text"] for b in itertools.islice(data.train(), data.steps_per_epoch)])}
     val_windows = {w.tobytes() for w in np.concatenate(val_batches)}
     assert not (train_windows & val_windows)
 
 
 @pytest.mark.parametrize("worker_count", [0, 2])
 def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_count):
-    """num_epochs is the training stream's, and a run leaves it None.
-
-    Validation read val.bin through a sampler carrying the same unbounded
-    epoch count, and grain's DataLoader batches inside each worker, so a pass
-    never ended and its batches repeated windows the worker had already read.
+    """Validation read val.bin through a sampler carrying the training
+    stream's unbounded epoch count, and grain's DataLoader batches inside each
+    worker, so a pass never ended and its batches repeated windows the worker
+    had already read.
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 13 * seq_len, dtype=np.int64)  # 12 windows
@@ -255,11 +258,9 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
                seq_len=seq_len)
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=4, seq_len=seq_len, seed=0, worker_count=worker_count)
+    data = _windows(tmp_path, seq_len=seq_len, seed=0, worker_count=worker_count).load(batch=4)
 
-    windows = [list(window) for batch in itertools.islice(data["val"](), 12)
+    windows = [list(window) for batch in itertools.islice(data.val(), 12)
                for window in batch["text"]]
     assert windows == [list(val_tokens[start:start + seq_len + 1])
                        for start in range(0, 12 * seq_len, seq_len)]
@@ -268,15 +269,13 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
 def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     seq_len = 8
     records = 16  # (17 * 8 - 1) // 8 == 16 windows
-    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len,
+               seq_len=seq_len)
 
     def by_record(worker_count):
-        data = get_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
-            batch_size=4, seq_len=seq_len, seed=7, worker_count=worker_count,
-            num_epochs=1)
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=worker_count).load(batch=4)
         out = {}
-        for b in data["train"]():
+        for b in itertools.islice(data.train(), data.steps_per_epoch):
             for row in b["text"]:
                 # First token ids a window; the tail keeps the record's identity.
                 out[int(row[0]) * 4096 + int(row[-1])] = row.tobytes()
@@ -289,54 +288,50 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
 
 def test_token_loader_seeds_its_train_sampler(tmp_path):
     seq_len, records = 8, 24
-    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len,
+               seq_len=seq_len)
 
     def first_batch(seed):
-        data = get_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
-            batch_size=4, seq_len=seq_len, seed=seed, worker_count=0)
-        return next(iter(data["train"]()))["text"]
+        data = _windows(tmp_path, seq_len=seq_len, seed=seed, worker_count=0).load(batch=4)
+        return next(data.train())["text"]
 
     assert not np.array_equal(first_batch(0), first_batch(1))
 
 
 # ---------------------------------------------------------------------------------
-# load_data dispatch
+# The token directory a spec reads
 
-def test_load_data_dispatches_a_token_directory(tmp_path):
+def test_a_registered_token_spec_reads_the_directory(tmp_path):
     seq_len = 64
     # (41 * 64 - 1) // 64 == 40 train windows.
     _token_dir(tmp_path, train_tokens=41 * seq_len, val_tokens=8 * seq_len,
                seq_len=seq_len)
-    data = load_data(DataConfig(dataset=str(tmp_path), sequence_length=seq_len,
-                                batch_size=4, worker_count=0))
-    batch = next(iter(data["train"]()))
+    from dew.registry import datasets
+
+    data = datasets.build("token_windows", path=str(tmp_path), seq_len=seq_len,
+                          worker_count=0).load(batch=4)
+    batch = next(data.train())
     assert batch["text"].shape == (4, seq_len + 1)
     assert batch["text"].dtype == np.int32
-    assert data["train_len"] == 40
-    assert data["local_batch_size"] == 4
+    assert data.records == 40 and data.batch == 4
 
 
-def test_load_data_token_directory_requires_sequence_length(tmp_path):
-    _token_dir(tmp_path, train_tokens=64, val_tokens=16)
-    with pytest.raises(ValueError, match="sequence_length"):
-        load_data(DataConfig(dataset=str(tmp_path), batch_size=4,
-                             worker_count=0))
-
-
-def test_load_data_refuses_a_token_directory_without_a_val_split(tmp_path):
+@pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
+def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, spec):
     """With val.bin missing the validation loader read train.bin, so every
     pass scored windows the model was training on."""
-    _token_dir(tmp_path, train_tokens=64)
+    _token_dir(tmp_path, train_tokens=64, eos_id=0)
     with pytest.raises(ValueError, match=r"val\.bin.*tokenize_text\.py --val-fraction"):
-        load_data(DataConfig(dataset=str(tmp_path), sequence_length=8,
-                             batch_size=4, worker_count=0))
+        spec(path=str(tmp_path), seq_len=8, worker_count=0).load(batch=4)
 
 
-def test_load_data_does_not_dispatch_on_a_plain_directory(tmp_path):
+@pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
+def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
     (tmp_path / "not_a_dataset.txt").write_text("hello")
-    with pytest.raises(ValueError, match="not found in mediaDatasetMap"):
-        load_data(DataConfig(dataset=str(tmp_path), worker_count=0))
+    with pytest.raises(ValueError, match="no train.bin"):
+        spec(path=str(tmp_path), worker_count=0).load(batch=4)
+    with pytest.raises(ValueError, match="path="):
+        spec(worker_count=0).load(batch=4)
 
 
 # ---------------------------------------------------------------------------------
@@ -419,7 +414,7 @@ def test_tokenize_tool_writes_the_smallest_dtype_that_fits():
 
 
 # ---------------------------------------------------------------------------------
-# TokenDocumentSource and get_packed_token_dataset_grain
+# TokenDocumentSource and PackedTokens
 # ---------------------------------------------------------------------------------
 
 def test_document_source_reads_one_document_per_record(tmp_path):
@@ -466,14 +461,10 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     # 4, 6 and 5 ids once each eos is counted: first fit puts 4 + 5 in one
     # window and 6 in the next.
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23, 24], [30, 31, 32, 33]])
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=2, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
-        num_packing_bins=2)
+    data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=2).load(batch=2)
 
-    assert data["train_len"] == 3 and data["val_len"] == 3
-    assert data["local_batch_size"] == 2 and data["global_batch_size"] == 2
-    batch = next(iter(data["val"]()))
+    assert data.records == 3 and data.batch == 2
+    batch = next(data.val())
 
     for key in ("text", "text_segment_ids", "text_positions"):
         assert batch[key].shape == (2, seq_len + 1)
@@ -495,13 +486,10 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     each piece is its own segment and its positions start again at 0."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=1, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
-        num_packing_bins=1)
+    data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=1).load(batch=1)
 
-    rows = [batch["text"][0] for batch in data["val"]()]
-    positions = [batch["text_positions"][0] for batch in data["val"]()]
+    rows = [batch["text"][0] for batch in data.val()]
+    positions = [batch["text_positions"][0] for batch in data.val()]
     assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
     np.testing.assert_array_equal(np.concatenate(rows)[:10],
                                   list(range(10, 19)) + [0])
@@ -513,30 +501,24 @@ def test_packed_loader_lengths_count_windows_not_documents(tmp_path):
     that fills three windows cannot report one."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=1, seq_len=seq_len, seed=0, worker_count=0, num_epochs=1,
-        num_packing_bins=1)
+    data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=1).load(batch=1)
 
-    assert data["train_len"] == 3 and data["val_len"] == 3
-    assert len(list(data["val"]())) == 3, "the length is not the pass it counts"
+    assert data.records == 3
+    assert len(list(data.val())) == 3, "the length is not the pass it counts"
 
 
 def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
     """The trainer saves the iterator's position in the checkpoint, so a
     restored iterator has to carry on where the saved one had got to."""
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 60, 3)])
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=2, seq_len=8, seed=0, worker_count=0, num_epochs=1,
-        num_packing_bins=2)
+    data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    iterator = iter(data["val"]())
+    iterator = data.val()
     next(iterator)
     state = iterator.get_state()
     expected = [next(iterator)["text"] for _ in range(2)]
 
-    restored = iter(data["val"]())
+    restored = data.val()
     restored.set_state(state)
     for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)]):
         np.testing.assert_array_equal(wanted, got)
@@ -546,11 +528,8 @@ def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 70, 3)])
 
     def windows(worker_count):
-        data = get_packed_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-            batch_size=2, seq_len=8, seed=0, worker_count=worker_count,
-            num_epochs=1, num_packing_bins=2)
-        return sorted(row.tobytes() for batch in data["val"]()
+        data = _packed_tokens(tmp_path, seq_len=8, worker_count=worker_count, packing_bins=2).load(batch=2)
+        return sorted(row.tobytes() for batch in data.val()
                       for row in batch["text"])
 
     serial = windows(0)
@@ -559,28 +538,24 @@ def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
 
 
 def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
-    """num_epochs None is what a run uses, and the trainer keeps asking for
-    batches long after one pass over the documents."""
+    """The trainer keeps asking for batches long after one pass over the
+    documents."""
     _document_dir(tmp_path, [[i, i + 1] for i in range(10, 30, 2)])
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+    data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    iterator = iter(data["train"]())
+    iterator = data.train()
     assert len([next(iterator)["text"] for _ in range(20)]) == 20
 
 
 def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
-    """The same num_epochs repeated the documents before packing for
-    validation as well, so a run that leaves it None never finished a
-    validation pass and scored some documents several times over."""
+    """The training stream's repeat once applied to the documents packed for
+    validation as well, so a run never finished a validation pass and scored
+    some documents several times over."""
     documents = [[i, i + 1] for i in range(10, 30, 2)]
     _document_dir(tmp_path, documents)
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+    data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    batches = list(itertools.islice(data["val"](), 20))
+    batches = list(itertools.islice(data.val(), 20))
     # Ten documents of three ids (the eos counts) pack three to a nine-id
     # window, so four windows and two batches of two.
     assert len(batches) == 2
@@ -590,15 +565,13 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
 
 
 
-def test_load_data_selects_packing_only_when_asked(tmp_path):
+def test_only_the_packed_spec_carries_segment_ids_and_positions(tmp_path):
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]])
-    shared = dict(dataset=str(tmp_path), sequence_length=8, batch_size=2,
-                  worker_count=0)
 
-    packed = next(iter(load_data(DataConfig(pack_sequences=True, **shared))["train"]()))
+    packed = next(_packed_tokens(tmp_path, seq_len=8).load(batch=2).train())
     assert set(packed) == {"text", "text_segment_ids", "text_positions"}
 
-    fixed = next(iter(load_data(DataConfig(**shared))["train"]()))
+    fixed = next(_windows(tmp_path, seq_len=8).load(batch=2).train())
     assert set(fixed) == {"text"}, "the fixed-window loader grew packing keys"
 
 
@@ -622,9 +595,8 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
     assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
 
     seq_len = 63
-    data = load_data(DataConfig(dataset=str(out), sequence_length=seq_len,
-                                batch_size=1, worker_count=0, pack_sequences=True))
-    row = next(iter(data["val"]()))
+    data = _packed_tokens(out, seq_len=seq_len).load(batch=1)
+    row = next(data.val())
 
     padding = seq_len + 1 - len(val_tokens)
     np.testing.assert_array_equal(row["text"][0], val_tokens + [0] * padding)
@@ -638,11 +610,9 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
 # Stream termination on the token paths
 # ---------------------------------------------------------------------------------
 
-# Both token factories hand their validation sampler the num_epochs a run
-# passes, which is None, so today a validation pass never ends and the same
-# windows come round again. wave/fix-val-split owns that; the tests carrying
-# this reason are the contract its fix has to meet and they fail until it lands.
-ENDLESS_VAL = "an endless validation pass; wave/fix-val-split owns the sampler"
+# A validation pass that never ends scores the same windows again and again;
+# the tests carrying this reason are the contract a validation stream meets.
+ENDLESS_VAL = "an endless validation pass"
 
 
 def _bounded(loader, limit):
@@ -665,13 +635,10 @@ def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
     seq_len = 4
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
                seq_len=seq_len)
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    batches, ended = _bounded(data["val"](), 3)
+    batches, ended = _bounded(data.val(), 3)
 
-    assert data["val_len"] == 8
     assert len(batches) == 2 and ended, ENDLESS_VAL
     assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
 
@@ -689,14 +656,11 @@ def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=len(val_tokens),
                seq_len=seq_len)
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    batches, ended = _bounded(data["val"](), 3)
+    batches, ended = _bounded(data.val(), 3)
 
-    assert data["val_len"] == 10
-    assert len(batches) == data["val_len"] // 4 and ended, ENDLESS_VAL
+    assert len(batches) == 10 // 4 and ended, ENDLESS_VAL
     assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
     np.testing.assert_array_equal(batches[0]["text"][0], val_tokens[:seq_len + 1])
 
@@ -709,14 +673,12 @@ def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
     """
     documents = [[i, i + 1, i + 2] for i in range(10, 40, 3)]
     _document_dir(tmp_path, documents)
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=2, seq_len=8, seed=0, worker_count=0, num_packing_bins=2)
+    data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    batches, ended = _bounded(data["val"](), 2 + len(documents))
+    batches, ended = _bounded(data.val(), 2 + len(documents))
     heads = [int(t) for batch in batches for row in batch["text"] for t in row
              if int(t) in {d[0] for d in documents}]
-    again, _ = _bounded(data["val"](), len(batches))
+    again, _ = _bounded(data.val(), len(batches))
 
     assert ended, ENDLESS_VAL
     assert all(batch["text"].shape[0] == 2 for batch in batches)
@@ -724,18 +686,21 @@ def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
     assert _rows(again) == _rows(batches), "two passes read different windows"
 
 
-def test_a_validation_pass_through_load_data_ends(tmp_path):
-    """A run reaches these loaders through load_data, which passes no
-    num_epochs at all."""
+def test_val_batches_bounds_a_validation_pass(tmp_path):
+    """A run scores `val_batches` of val.bin per pass, or all of it when the
+    spec leaves that None."""
     seq_len = 4
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
                seq_len=seq_len)
-    data = load_data(DataConfig(dataset=str(tmp_path), sequence_length=seq_len,
-                                batch_size=4, worker_count=0))
 
-    batches, ended = _bounded(data["val"](), 3)
-
+    batches, ended = _bounded(_windows(tmp_path, seq_len=seq_len).load(batch=4).val(), 3)
     assert len(batches) == 2 and ended, ENDLESS_VAL
+
+    batches, ended = _bounded(
+        _windows(tmp_path, seq_len=seq_len, val_batches=1).load(batch=4).val(), 3)
+    assert len(batches) == 1 and ended
+    np.testing.assert_array_equal(batches[0]["text"][0],
+                                  np.fromfile(tmp_path / "val.bin", "<u2")[:seq_len + 1])
 
 
 def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
@@ -744,14 +709,12 @@ def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
     seq_len = 4
     _token_dir(tmp_path, train_tokens=9 * seq_len, val_tokens=5 * seq_len,
                seq_len=seq_len)
-    data = get_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=4, seq_len=seq_len, seed=0, worker_count=0)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    epoch = data["train_len"] // 4
-    batches, ended = _bounded(data["train"](), 3 * epoch)
+    epoch = data.records // 4
+    batches, ended = _bounded(data.train(), 3 * epoch)
 
-    assert data["train_len"] == 8 and not ended
+    assert data.records == 8 and not ended
     assert len(batches) == 3 * epoch
     assert len(set(_rows(batches[:epoch]))) == 8, "one pass reads distinct windows"
 
@@ -771,10 +734,8 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"), batch_size=batch,
-        seq_len=seq_len, seed=0, worker_count=0, num_epochs=1, num_packing_bins=bins)
-    return data, list(data["val"]())
+    data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins).load(batch=batch)
+    return data, list(data.val())
 
 
 def _tiny_backbone(seq_len):
@@ -884,7 +845,7 @@ def test_a_document_the_size_of_the_window_is_one_segment(tmp_path, monkeypatch)
     """Exactly the window is the case the chunker must not cut."""
     data, batches = _packed(tmp_path, [[2, 3, 4, 5]], seq_len=4, bins=1)
 
-    assert data["val_len"] == 1 and len(batches) == 1
+    assert len(batches) == 1
     np.testing.assert_array_equal(batches[0]["text"][0], [2, 3, 4, 5, PACK_EOS])
     np.testing.assert_array_equal(batches[0]["text_segment_ids"][0], [1] * 5)
     np.testing.assert_array_equal(batches[0]["text_positions"][0], range(5))
@@ -970,14 +931,12 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
     """Real worker processes, one epoch: the windows a pass reads are a
     function of the seed and the file, not of how many workers read them."""
     seq_len = 8
-    _token_dir(tmp_path, train_tokens=17 * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
 
     def windows(workers):
-        data = get_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
-            batch_size=4, seq_len=seq_len, seed=7, worker_count=workers,
-            num_epochs=1)
-        return sorted(row.tobytes() for batch in data["train"]()
+        data = _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=workers).load(batch=4)
+        return sorted(row.tobytes()
+                      for batch in itertools.islice(data.train(), data.steps_per_epoch)
                       for row in batch["text"])
 
     serial = windows(0)
@@ -993,30 +952,29 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     the description has to name the file, not an address in the process that
     wrote it."""
     seq_len = 8
-    _token_dir(tmp_path, train_tokens=33 * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
 
     def loader():
-        return get_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "train.bin"),
-            batch_size=4, seq_len=seq_len, seed=7, worker_count=2, num_epochs=1)
+        return _windows(tmp_path, seq_len=seq_len, seed=7, worker_count=2).load(batch=4)
 
-    interrupted = iter(loader()["train"]())
+    data = loader()
+    epoch = data.steps_per_epoch  # 32 windows in eight batches
+    interrupted = data.train()
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
-    rest, ended = _bounded(interrupted, 40)
+    rest = list(itertools.islice(interrupted, 2 * epoch - 1))
     unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
-    restored = iter(loader()["train"]())
+    restored = loader().train()
     restored.set_state(state)
-    after, ended_again = _bounded(restored, 40)
+    after = list(itertools.islice(restored, 2 * epoch - 1))
     resumed = [row.tobytes() for batch in after for row in batch["text"]]
 
     assert "object at 0x" not in json.loads(state)["data_source"], (
         "a source described by its address can only be restored in the process "
         "that saved it")
-    assert ended and ended_again
     assert resumed == unseen
-    assert len(set(seen + resumed)) == 32, "the epoch reads every window once"
+    assert len(set(seen + resumed[:(epoch - 1) * 4])) == 32, "the epoch reads every window once"
 
 
 @pytest.mark.slow
@@ -1026,17 +984,15 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 100, 3)])
 
     def loader():
-        return get_packed_token_dataset_grain(
-            str(tmp_path / "train.bin"), str(tmp_path / "val.bin"), batch_size=2,
-            seq_len=8, seed=0, worker_count=2, num_epochs=1, num_packing_bins=2)
+        return _packed_tokens(tmp_path, seq_len=8, worker_count=2, packing_bins=2).load(batch=2)
 
-    interrupted = iter(loader()["val"]())
+    interrupted = loader().val()
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
     rest, ended = _bounded(interrupted, 40)
     unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
-    restored = iter(loader()["val"]())
+    restored = loader().val()
     restored.set_state(state)
     after, ended_again = _bounded(restored, 40)
     resumed = [row.tobytes() for batch in after for row in batch["text"]]
