@@ -1,19 +1,26 @@
-"""Frozen-encoder probes, as evaluation metrics the validation loop can run.
+"""Frozen-encoder probes, as metrics the validation loop can run.
 
 A JEPA run has no samples to look at, so representation quality is the only
 signal that the training curve cannot give you. Both probes score the pooled
-embeddings the objective's validation step produces against the batch labels,
-fitting on the first half of the batch and scoring on the second - cheap
-enough to run every epoch, and honest, since nothing is scored on data it was
+embeddings the objective's evaluation produces against the batch labels,
+fitting on the first half of the batch and scoring on the second, cheap enough
+to run at every evaluation and honest, since nothing is scored on data it was
 fit on. They measure trend, not absolute transfer accuracy; a full-dataset
 probe is a separate offline job.
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
-from dew.eval.common import EvaluationMetric
+from dew.artifacts import Representations
+from dew.registry import metrics
 
 
 def _split(embeddings, labels):
@@ -61,19 +68,41 @@ def knn_probe(embeddings, labels, num_classes: int, k: int = 20):
     return jnp.mean(jnp.argmax(votes, axis=-1) == test_y)
 
 
-def get_linear_probe_metric(num_classes: int, label_key: str = "label", **kwargs):
-    return EvaluationMetric(
-        function=lambda embeddings, batch: linear_probe(
-            embeddings, jnp.asarray(batch[label_key]), num_classes, **kwargs),
-        name="linear_probe_accuracy",
-        higher_is_better=True,
-    )
+@metrics("linear_probe")
+@dataclass(frozen=True)
+class LinearProbe:
+    """Linear probe accuracy over each validation batch's representations."""
+    num_classes: int
+    steps: int = 100
+    learning_rate: float = 1e-2
+    weight_decay: float = 1e-4
+
+    name = "linear_probe_accuracy"
+    reads = Representations
+
+    def __call__(self, representations: Representations, batch) -> float:
+        return float(linear_probe(
+            representations.features, representations.labels, self.num_classes,
+            steps=self.steps, learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay))
+
+    def reduce(self, values: Sequence[float]) -> float:
+        return float(np.mean(values))
 
 
-def get_knn_probe_metric(num_classes: int, label_key: str = "label", k: int = 20):
-    return EvaluationMetric(
-        function=lambda embeddings, batch: knn_probe(
-            embeddings, jnp.asarray(batch[label_key]), num_classes, k=k),
-        name="knn_probe_accuracy",
-        higher_is_better=True,
-    )
+@metrics("knn_probe")
+@dataclass(frozen=True)
+class KnnProbe:
+    """Cosine k-NN accuracy over each validation batch's representations."""
+    num_classes: int
+    k: int = 20
+
+    name = "knn_probe_accuracy"
+    reads = Representations
+
+    def __call__(self, representations: Representations, batch) -> float:
+        return float(knn_probe(representations.features, representations.labels,
+                               self.num_classes, k=self.k))
+
+    def reduce(self, values: Sequence[float]) -> float:
+        return float(np.mean(values))

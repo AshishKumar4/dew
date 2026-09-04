@@ -23,7 +23,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
-from dew.registry import apply_precision_policy, build_model
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import models, with_precision
 
 CONFIG_FILE = "config.json"
 GENERATION_CONFIG_FILE = "generation_config.json"
@@ -217,6 +218,10 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         'layer_types': layer_types,
         'sliding_window': sliding_window,
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
+        # LlamaRMSNorm and Qwen3RMSNorm multiply the scale into the
+        # activations after casting them (modeling_qwen3.py:61-64); Gemma3's
+        # norm scales in fp32 and casts the product (modeling_gemma3.py:147-150).
+        'scale_after_cast': model_type != _GEMMA,
         'qk_norm': model_type in _QK_NORM_FAMILIES,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
         # Gemma3TextConfig ties by default and the others do not, so a config
@@ -427,10 +432,9 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
     tensors = _load_shards(directory)
     params = translate_weights(tensors, config)['params']
 
-    architecture = 'causal_transformer'
-    built = apply_precision_policy(architecture, dict(config),
-                                   dtype=dtype, attention_impl=attention_impl)
-    model = build_model(architecture, built)
+    built = with_precision('causal_transformer', config,
+                           dtype=dtype, attention_impl=attention_impl)
+    model = models.build('causal_transformer', **built)
     _check_tree(params, model)
     return model, {'params': params}, built
 
@@ -446,7 +450,6 @@ def save_pretrained_decoder(model, variables, directory, *,
     All three references build q/k/v/o with bias=config.attention_bias, so the
     flag exports as it stands.
     """
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.interop.safetensors_io import save_hf_layout
 
     if not isinstance(model, CausalTransformer):

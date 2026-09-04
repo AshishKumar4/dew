@@ -34,6 +34,7 @@ from ..attention import (
     causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
 )
 from ..moe import SparseMLP
+from ..sharding import logical_axes
 from dew.registry import models
 
 
@@ -46,9 +47,16 @@ class RMSNorm(nn.Module):
     scale_offset also flips the initializer to zeros, so the identity is the
     starting point either way and a Gemma checkpoint's stored weights land
     unchanged.
+
+    The families differ in where the scale meets the activation dtype. Gemma
+    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150);
+    Llama and Qwen3 cast the normalized activations first and multiply by
+    the scale in that dtype (modeling_qwen3.py:61-64), which
+    scale_after_cast reproduces. The two agree at fp32 and differ under bf16.
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
+    scale_after_cast: bool = False
     dtype: Optional[Dtype] = None
 
     @nn.compact
@@ -57,10 +65,13 @@ class RMSNorm(nn.Module):
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32)
+        dtype = self.dtype if self.dtype is not None else x.dtype
+        weight = (1.0 + scale) if self.scale_offset else scale
         y = x.astype(jnp.float32)
         y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
-        y = y * (1.0 + scale) if self.scale_offset else y * scale
-        return y.astype(self.dtype if self.dtype is not None else x.dtype)
+        if self.scale_after_cast:
+            return y.astype(dtype) * weight.astype(dtype)
+        return (y * weight).astype(dtype)
 
 
 def rotary_freqs(positions, head_dim: int, theta: float):
@@ -103,6 +114,12 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
+@logical_axes({
+    ("q_proj",): ("embed", "heads"),
+    ("k_proj",): ("embed", "kv"),
+    ("v_proj",): ("embed", "kv"),
+    ("o_proj",): ("attention", "embed"),
+})
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
@@ -127,6 +144,7 @@ class CausalSelfAttention(nn.Module):
     qk_norm: bool = True
     norm_eps: float = 1e-5
     scale_offset: bool = False
+    scale_after_cast: bool = False
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
@@ -143,12 +161,11 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.qk_norm:
-            self.q_norm = RMSNorm(
-                epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                dtype=self.dtype, name='q_norm')
-            self.k_norm = RMSNorm(
-                epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                dtype=self.dtype, name='k_norm')
+            norm = functools.partial(
+                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+            self.q_norm = norm(name='q_norm')
+            self.k_norm = norm(name='k_norm')
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -228,6 +245,11 @@ class CausalSelfAttention(nn.Module):
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 
+@logical_axes({
+    ("gate_proj",): ("embed", "mlp"),
+    ("up_proj",): ("embed", "mlp"),
+    ("down_proj",): ("mlp", "embed"),
+})
 class GatedMLP(nn.Module):
     """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is gelu.
 
@@ -274,6 +296,7 @@ class DecoderBlock(nn.Module):
     emb_features: int
     norm_eps: float = 1e-5
     scale_offset: bool = False
+    scale_after_cast: bool = False
     sandwich_norms: bool = False
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
@@ -281,7 +304,8 @@ class DecoderBlock(nn.Module):
 
     def setup(self):
         norm = functools.partial(
-            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset, dtype=self.dtype)
+            RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype)
         self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
         self.post_attention_layernorm = norm(name='post_attention_layernorm')
@@ -305,6 +329,10 @@ class DecoderBlock(nn.Module):
 
 
 @models("causal_transformer")
+@logical_axes({
+    ("embed_tokens",): ("vocab", "embed"),
+    ("lm_head",): ("embed", "vocab"),
+})
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -328,6 +356,8 @@ class CausalTransformer(nn.Module):
     layer counting from the end of the first group, which is the rule
     Qwen3-MoE's decoder_sparse_step means, or every layer when neither is set,
     which is Mixtral. A dense layer keeps the leaves it always had.
+    expert_bias adds DeepSeek's balancing bias to every router, kept in the
+    `moe` collection; the LM objective's balance_rate is what moves it.
 
     causal=False turns every layer into full attention with no cache, the
     encoder a masked diffusion language model denoises with; the parameter
@@ -349,6 +379,7 @@ class CausalTransformer(nn.Module):
     sliding_window: Optional[int] = None     # keys a sliding layer keeps
     norm_eps: float = 1e-5
     scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
+    scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
     qk_norm: bool = True
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
@@ -365,6 +396,7 @@ class CausalTransformer(nn.Module):
     top_k: int = 2                           # experts each token routes to
     moe_every: Optional[int] = None          # sparse layer cadence
     moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
+    expert_bias: bool = False                # DeepSeek's aux-loss-free balancing bias
     causal: bool = True                      # False: full attention, no cache
 
     def __post_init__(self):
@@ -466,6 +498,7 @@ class CausalTransformer(nn.Module):
                     qk_norm=self.qk_norm,
                     norm_eps=self.norm_eps,
                     scale_offset=self.scale_offset,
+                    scale_after_cast=self.scale_after_cast,
                     sliding_window=(self.sliding_window
                                     if layer_type == 'sliding_attention' else None),
                     attention_bias=self.attention_bias,
@@ -483,6 +516,7 @@ class CausalTransformer(nn.Module):
                         hidden_features=self.hidden_features,
                         out_features=self.emb_features,
                         activation=self.mlp,
+                        expert_bias=self.expert_bias,
                         dtype=self.dtype,
                         precision=self.precision)
                     if index in sparse else
@@ -495,6 +529,7 @@ class CausalTransformer(nn.Module):
                         precision=self.precision)),
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
@@ -503,7 +538,7 @@ class CausalTransformer(nn.Module):
             for index, layer_type in enumerate(types)]
         self.norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=self.scale_offset,
-            dtype=self.dtype, name='norm')
+            scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
