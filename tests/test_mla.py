@@ -18,7 +18,10 @@ import numpy as np
 import pytest
 
 from dew.interop.hf_decoders import _yarn_record, translate_weights
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.mixers import mixers
 from dew.nn.mla import (
+    MLAMixer,
     MultiHeadLatentAttention,
     YarnScaling,
     mla_rope_freqs,
@@ -171,4 +174,91 @@ def test_mla_reproduces_the_v32_block():
     dense = dict(CONFIG["v32"], index_topk=None, index_n_heads=None,
                  index_head_dim=None)
     assert block_output("mla_v32", dense) > 1.0
+
+
+def mla_record(settings: dict) -> dict:
+    """The fixture's reference config as the `mla` kind's record."""
+    return {
+        "kind": "mla",
+        "q_lora_rank": settings["q_lora_rank"],
+        "kv_lora_rank": settings["kv_lora_rank"],
+        "qk_nope_head_dim": settings["qk_nope_head_dim"],
+        "qk_rope_head_dim": settings["qk_rope_head_dim"],
+        "v_head_dim": settings["v_head_dim"],
+        "rope_interleave": settings.get("rope_interleave", True),
+        "yarn": _yarn_record(
+            dict(settings["rope_scaling"], rope_theta=settings["rope_theta"]),
+            "rope_scaling", float(settings["rope_theta"]),
+            int(settings["max_position_embeddings"])),
+        "index_topk": settings.get("index_topk"),
+        "index_n_heads": settings.get("index_n_heads"),
+        "index_head_dim": settings.get("index_head_dim"),
+    }
+
+
+def mla_model(settings: dict, **overrides) -> CausalTransformer:
+    """A one-layer decoder whose mixer is the fixture's block."""
+    fields = dict(
+        vocab_size=37, emb_features=settings["hidden_size"], num_layers=1,
+        num_heads=settings["num_attention_heads"],
+        head_dim=settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"],
+        mlp_features=48, max_seq_len=64, rope_theta=float(settings["rope_theta"]),
+        norm_eps=float(settings["rms_norm_eps"]), qk_norm=False,
+        attention_bias=bool(settings["attention_bias"]),
+        mixer=mla_record(settings))
+    return CausalTransformer(**{**fields, **overrides})
+
+
+def test_the_mla_record_and_value_agree():
+    """`mixer={"kind": "mla", ...}` from a config is the dataclass from code,
+    yarn record included."""
+    settings = CONFIG["v32"]
+    built = mla_model(settings).mixer
+    assert built == MLAMixer(
+        q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, qk_rope_head_dim=8,
+        v_head_dim=8, rope_interleave=True, yarn=yarn_of(settings),
+        index_topk=4, index_n_heads=2, index_head_dim=16)
+    assert mixers["mla"] is MLAMixer
+
+
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
+    """The kind lands the block at layers_0/self_attn with the translated
+    tree's names, and there it computes what the standalone block does on
+    the same weights: the fixture's output, within the block's tolerance."""
+    settings = CONFIG[SETTINGS[name]]
+    tensors = fixture(name)
+    model = mla_model(settings)
+    tokens = jnp.zeros((2, 7), jnp.int32)
+    variables = model.init(jax.random.key(0), tokens)
+    translated = block_variables(tensors)["params"]
+    layer = variables["params"]["layers_0"]
+    assert jax.tree_util.tree_structure(layer["self_attn"]) == (
+        jax.tree_util.tree_structure(translated))
+    variables = {**variables, "params": {
+        **variables["params"],
+        "layers_0": {**layer, "self_attn": translated}}}
+    hidden = jnp.asarray(tensors["hidden"])
+    inside = model.apply(
+        variables, hidden, method=lambda m, x: m.layers[0].self_attn(x))
+    standalone = mla_module(settings).apply(block_variables(tensors), hidden)
+    assert jnp.array_equal(inside, standalone)
+    assert float(np.max(np.abs(np.asarray(inside) - tensors["output"]))) < 2e-5
+    logits = model.apply(variables, jnp.arange(14, dtype=jnp.int32).reshape(2, 7))
+    assert logits.shape == (2, 7, 37)
+    assert bool(jnp.all(jnp.isfinite(logits)))
+
+
+def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
+    """A dial the standard attention reads and this kind would drop raises
+    at build, naming the dial, rather than building a different model."""
+    settings = CONFIG["v3"]
+    tokens = jnp.zeros((1, 4), jnp.int32)
+    with pytest.raises(ValueError, match="no attention_scale, v_norm"):
+        mla_model(settings, v_norm=True, attention_scale=0.25).init(
+            jax.random.key(0), tokens)
+    mismatched = dict(mla_record(settings))
+    mismatched["yarn"] = dict(mismatched["yarn"], rope_theta=5000.0)
+    with pytest.raises(ValueError, match="rope_theta .* disagree"):
+        mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
