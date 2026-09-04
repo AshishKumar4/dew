@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +46,8 @@ def checkpoint_dir(base: str | Path, name: str) -> Path:
     return Path(base) / name
 
 
-def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
+def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, wandb_config=None,
+                  **kwargs):
     """The trainer a recipe would build, at the smallest size that still shards.
 
     dew is imported here rather than at module scope because a JAX backend
@@ -69,7 +72,7 @@ def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
             sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
         rngs=jax.random.PRNGKey(0),
         name=name,
-        wandb_config=None,
+        wandb_config=wandb_config,
         distributed_training=True,
         fsdp_size=fsdp_size,
         fsdp_min_param_size=TINY,
@@ -77,6 +80,52 @@ def build_trainer(name, checkpoint_base, fsdp_size=1, load=None, **kwargs):
         load_from_checkpoint=load,
         **kwargs,
     )
+
+
+def install_wandb_stub(summary_step: int, artifact_dir: str) -> dict:
+    """The slice of wandb a resumed run id reaches, in place of the module.
+
+    Only process 0 opens wandb, and what it learns there, the step the run
+    reached and the model artifact it logged, is what the whole pool has to
+    resume from. Returns the wandb_config that names the run.
+    """
+    import sys
+    import types
+
+    class Run:
+        summary = {"train/step": summary_step}
+        sweep_id = None
+
+        def define_metric(self, *args, **kwargs):
+            pass
+
+        def log(self, *args, **kwargs):
+            pass
+
+    class Artifact:
+        type = "model"
+        name = "model:v0"
+
+        def download(self):
+            return artifact_dir
+
+    class ApiRun:
+        def logged_artifacts(self):
+            return [Artifact()]
+
+    class Api:
+        def run(self, path):
+            return ApiRun()
+
+        def runs(self, **kwargs):
+            return []
+
+    module = types.ModuleType("wandb")
+    module.init = lambda **kwargs: Run()
+    module.Api = Api
+    sys.modules["wandb"] = module
+    return {"project": "dew", "entity": "tests", "name": "resumed", "id": "run",
+            "config": {"arguments": {"dataset": "indexed"}}}
 
 
 def as_numpy(tree):
@@ -115,7 +164,12 @@ def run_losses(trainer, steps, images):
 
 
 def indexed_loader(records: int, batch: int = BATCH):
-    """A checkpointable source whose batches say which records they hold."""
+    """A checkpointable source whose batches say which records they hold.
+
+    Sharded by process, as every grain loader in dew is, so a process's
+    position names its own shard and a resume has to hand it back to that
+    process and no other.
+    """
     import grain.python as pygrain
 
     class ToImage(pygrain.MapTransform):
@@ -126,7 +180,7 @@ def indexed_loader(records: int, batch: int = BATCH):
         data_source=pygrain.RangeDataSource(0, records, 1),
         sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
                                      num_epochs=1,
-                                     shard_options=pygrain.NoSharding()),
+                                     shard_options=pygrain.ShardByJaxProcess()),
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
         worker_count=0,
     )
@@ -201,10 +255,26 @@ def dump_params(path: Path, params) -> None:
     np.savez(path, **params_dict(params))
 
 
+class YearAhead(datetime):
+    """A clock a year off, for every process but the first in topology mode.
+
+    Two processes on one machine read the same second nearly always, so a
+    run name that came from each process's own clock would agree in a test
+    and split on a pod. Skewing one clock a year makes the source visible.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime.now(tz) + timedelta(days=400)
+
+
 def mode_topology(args) -> dict:
     import jax
+    from dew.training import runtime
     from dew.training.distributed import batch_sharding, build_mesh, shard_batch
 
+    if args.process_id > 0:
+        runtime.datetime = YearAhead
     mesh = build_mesh(args.fsdp_size)
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
@@ -223,6 +293,8 @@ def mode_topology(args) -> dict:
         "local_rows": sorted(
             {int(value) for shard in sharded.addressable_shards
              for value in np.asarray(shard.data)[:, 0, 0, 0]}),
+        "run_timestamp": runtime.run_timestamp(),
+        "own_year": runtime.datetime.now().year,
     }
 
 
@@ -300,17 +372,46 @@ def mode_steps(args) -> dict:
     }
 
 
+def scored_batches():
+    """An EvaluationMetric whose epoch score is how many batches the pass scored."""
+    from dew.eval.common import EvaluationMetric
+
+    return EvaluationMetric(function=lambda artifacts, batch: 1.0, name="batches",
+                            reducer=np.sum)
+
+
 def mode_fit(args) -> dict:
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load)
+    wandb_config = None
+    if args.resume_run_step is not None:
+        wandb_config = install_wandb_stub(args.resume_run_step, args.artifact)
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, load=args.load,
+                            wandb_config=wandb_config, eval_metrics=[scored_batches()])
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored, restored_step = trainer.dataset_state, trainer.latest_step
-    loader = indexed_loader(args.records)
+    rows = BATCH // args.processes
+    loader = indexed_loader(args.records, rows)
     if args.block_after:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
     data = {"train": lambda: loader, "train_len": args.records,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
+            "local_batch_size": rows, "global_batch_size": BATCH}
+    available = None
+    if args.tokens:
+        # The packed token split, whose documents are strided over the
+        # processes before packing. The sampler that validation runs ignores
+        # an unconditional batch's contents, so the split only has to shard.
+        from dew.data.dataloaders import get_packed_token_dataset_grain
+
+        tokens = Path(args.tokens)
+        data["val"] = get_packed_token_dataset_grain(
+            str(tokens / "train.bin"), str(tokens / "val.bin"), batch_size=BATCH,
+            seq_len=args.seq_len, num_epochs=1, worker_count=args.workers)["val"]
+        available = sum(1 for _ in data["val"]())
+        # 200 sampler steps per validation batch is the production default and
+        # pure overhead here.
+        trainer.objective.diffusion_steps = 4
     state = trainer.fit(data, training_steps_per_epoch=args.steps, epochs=1,
-                        val_steps_per_epoch=0, checkpoint_every_steps=args.save_every)
+                        val_steps_per_epoch=args.val_steps,
+                        checkpoint_every_steps=args.save_every)
     trainer.wait_for_checkpoints()
     dump_params(args.out.with_suffix(".npz"), state.params)
     return {
@@ -320,6 +421,9 @@ def mode_fit(args) -> dict:
         "checkpoint_path": trainer.checkpoint_path(),
         "written_steps": sorted(int(step) for step in trainer.checkpointer.all_steps()),
         "dataset_state": trainer.dataset_state.decode(),
+        "val_available": available,
+        "val_batches": (None if available is None
+                        else int(trainer.best_val_metrics["val/batches"])),
     }
 
 
@@ -338,10 +442,15 @@ def parse_args(argv=None):
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
     parser.add_argument("--load", help="checkpoint directory to resume from")
+    parser.add_argument("--resume-run-step", type=int,
+                        help="resume a wandb run id whose summary reached this step")
+    parser.add_argument("--artifact", help="the step directory that run's model artifact holds")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
+    parser.add_argument("--val-steps", type=int, default=0,
+                        help="validation batches per pass, over the packed split of --tokens")
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
     parser.add_argument("--marker", help="file written once the source blocks")
@@ -354,19 +463,20 @@ def parse_args(argv=None):
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.coordinator:
-        import jax
-        from jax.experimental import multihost_utils
+        # What mpirun puts in the environment, which is how a pod run finds
+        # its pool: jax's OMPI detector reads the size and the ranks from it,
+        # and JAX_COORDINATOR_ADDRESS names the coordinator. The join and the
+        # rendezvous right after it are then the recipes' own.
+        os.environ.update({
+            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
+            "OMPI_COMM_WORLD_SIZE": str(args.processes),
+            "OMPI_COMM_WORLD_RANK": str(args.process_id),
+            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
+            "JAX_COORDINATOR_ADDRESS": args.coordinator,
+        })
+    from dew.training.runtime import prepare_process
 
-        jax.distributed.initialize(
-            coordinator_address=args.coordinator, num_processes=args.processes,
-            process_id=args.process_id)
-        # One collective while the processes are still in lockstep. CPU
-        # collectives rendezvous through the coordinator with a 30 second
-        # deadline, and the first one otherwise falls inside a checkpoint
-        # barrier, by which time the processes are as far apart as their model
-        # init and compile times. On a machine under load that is more than 30
-        # seconds and the run dies in gloo rather than in anything under test.
-        multihost_utils.sync_global_devices("worker ready")
+    prepare_process("none", multi_host=bool(args.coordinator))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 
