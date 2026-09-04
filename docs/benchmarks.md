@@ -123,8 +123,8 @@ FLOP/s for a CPU and no allocator counter behind it.
 ## Data loader
 
 ```
-python tools/benchmark_data.py --dataset oxford_flowers102 --batch-size 8 \
-    --image-size 64 --steps 100 --warmup 5 --worker-count {0,8}
+python tools/benchmark_data.py data:oxford-flowers --batch 8 \
+    --data.image-size 64 --steps 100 --warmup 5 --data.loading.workers {0,8}
 ```
 
 Oxford Flowers 102 from local TFDS array_record files, 8189 records, resize to

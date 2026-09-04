@@ -27,6 +27,23 @@ Batch = dict[str, Any]
 
 
 @dataclasses.dataclass(frozen=True)
+class Loading:
+    """How fast records are read: grain's worker processes, the threads each
+    of them reads with, and the two buffers held ahead of the step.
+
+    None of the four changes which records a run sees or what is in them, so
+    a host tuning them for its disk leaves the batches identical. The shuffle
+    seed is not one of them for that reason: it decides the order records
+    arrive in and keys the per-record rng that augments and captions them.
+    """
+
+    workers: int = 32
+    threads: int = 64
+    read_buffer: int = 128
+    worker_buffer: int = 20
+
+
+@dataclasses.dataclass(frozen=True)
 class Dataset:
     """Batches for a run.
 
@@ -187,8 +204,8 @@ def hold_out(source: Any, records: int, held_out: int, name: str):
 
 
 def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int, worker_count: int, read_threads: int,
-                 read_buffer: int, worker_buffer: int) -> Callable[[], Iterator[Batch]]:
+                 batch: int, seed: int,
+                 loading: Loading) -> Callable[[], Iterator[Batch]]:
     """An endless shuffled stream over `source`, batched per process.
 
     The sampler reshuffles every epoch from `seed` and shards by JAX process,
@@ -203,16 +220,16 @@ def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
         return iter(pygrain.DataLoader(
             data_source=source, sampler=sampler,
             operations=[*operations, pygrain.Batch(batch, drop_remainder=True)],
-            worker_count=worker_count,
-            read_options=pygrain.ReadOptions(read_threads, read_buffer),
-            worker_buffer_size=worker_buffer))
+            worker_count=loading.workers,
+            read_options=pygrain.ReadOptions(loading.threads, loading.read_buffer),
+            worker_buffer_size=loading.worker_buffer))
 
     return stream
 
 
 def validation_pass(source: Any, transformations: Sequence[pygrain.Transformation], *,
-                    batch: int, seed: int, worker_count: int, read_threads: int,
-                    read_buffer: int, worker_buffer: int) -> Callable[[], Iterator[Batch]]:
+                    batch: int, seed: int,
+                    loading: Loading) -> Callable[[], Iterator[Batch]]:
     """One pass over `source` in record order, batched in this process.
 
     grain's DataLoader applies its operations inside the worker processes, so
@@ -234,10 +251,11 @@ def validation_pass(source: Any, transformations: Sequence[pygrain.Transformatio
     def stream():
         records = pygrain.MapDataset.source(source).seed(seed).apply(list(transformations))
         reads = records[jax.process_index()::jax.process_count()].to_iter_dataset(
-            pygrain.ReadOptions(read_threads, read_buffer))
-        if worker_count:
+            pygrain.ReadOptions(loading.threads, loading.read_buffer))
+        if loading.workers:
             reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
-                num_workers=worker_count, per_worker_buffer_size=worker_buffer))
+                num_workers=loading.workers,
+                per_worker_buffer_size=loading.worker_buffer))
         return iter(reads.batch(batch, drop_remainder=True))
 
     return stream

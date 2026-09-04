@@ -8,7 +8,7 @@ import jax
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, local_batch, tokenized
+from .dataset import Dataset, DatasetSpec, Loading, local_batch, tokenized
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,10 +27,9 @@ class OnlineImages(DatasetSpec):
     image_size: int = 256
     min_image_size: int = 128
     """Rows whose image is smaller than this on a side are dropped."""
-    worker_count: int = 16
-    read_threads: int = 512
-    worker_buffer: int = 20
-    """Batches prefetched ahead of the run."""
+    loading: Loading = Loading(workers=16, threads=512)
+    """The fetch pool has no grain reader, so `read_buffer` does not reach
+    this path; `worker_buffer` is the batches prefetched ahead of the run."""
     timeout: int = 15
     retries: int = 3
 
@@ -46,13 +45,13 @@ class OnlineImages(DatasetSpec):
             return OnlineStreamingDataLoader(
                 rows,
                 batch_size=per_process,
-                num_workers=self.worker_count,
-                num_threads=self.read_threads,
+                num_workers=self.loading.workers,
+                num_threads=self.loading.threads,
                 image_shape=(self.image_size, self.image_size),
                 min_image_shape=(self.min_image_size, self.min_image_size),
                 global_process_count=jax.process_count(),
                 global_process_index=jax.process_index(),
-                prefetch=self.worker_buffer,
+                prefetch=self.loading.worker_buffer,
                 timeout=self.timeout,
                 retries=self.retries,
             )
