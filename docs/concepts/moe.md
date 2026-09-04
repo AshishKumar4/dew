@@ -17,8 +17,10 @@ layer = SparseMLP(num_experts=8, top_k=2, hidden_features=2048, out_features=512
 `CausalTransformer` builds them from four fields. `num_experts` and `top_k` size the routing, and the sparse layers are `moe_layers` by index, or every `moe_every`-th layer, or all of them when neither is set:
 
 ```python
-CausalTransformer(vocab_size=50304, emb_features=768, num_layers=12,
-                  num_heads=12, num_experts=8, top_k=2, moe_every=2)
+from dew import models
+
+model = models.build("causal_transformer", vocab_size=50304, emb_features=64, num_layers=1,
+                             num_heads=2, num_kv_heads=1, num_experts=8, top_k=2, moe_every=1)
 ```
 
 That is the same rule Qwen3-MoE's `decoder_sparse_step` means, counting from the end of the first group, and DeepSeek's first dense layers are `moe_layers`. A dense layer keeps every leaf it had, so a checkpoint of the dense model still loads into the dense layers of the sparse one.
@@ -42,8 +44,10 @@ The node limit scores each group of experts by its two best members and lets a t
 `expert_bias` is DeepSeek's aux-loss-free balancing bias (arXiv 2408.15664). It lives in the `moe` variable collection as `e_score_correction_bias`, it is fp32, and it enters the selection only: the weights are gathered from the unbiased scores, so balancing changes which experts a token gets and never what they contribute. The router reads it and never writes it, which is where transformers keeps it (`nn.Buffer`) and how MaxText hands the update back to its caller. The update itself is a function:
 
 ```python
+import jax.numpy as jnp
 from dew.nn.moe import calculate_load_balance_updates
 
+indices = jnp.asarray([[0, 3], [1, 3], [2, 3]], jnp.int32)
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
@@ -77,7 +81,7 @@ The translation is the one every Dew kernel takes, a transpose of each matrix, p
 
 ## Expert parallelism
 
-`build_mesh(fsdp_size, expert_size)` gives the expert dimension its own mesh axis, and one rules row (`exp` to `expert`) puts it there. On an eight-device mesh with `expert_size=4, fsdp_size=2`, an 8-expert `[8, 32, 64]` kernel holds two experts and half a width per device. See [distributed training](distributed.md) for the mesh and the rules table.
+`MeshSpec(fsdp, expert)` gives the expert dimension its own mesh axis, and one rules row (`exp` to `expert`) puts it there. On an eight-device mesh with `expert_size=4, fsdp_size=2`, an 8-expert `[8, 32, 64]` kernel holds two experts and half a width per device. See [distributed training](distributed.md) for the mesh and the rules table.
 
 ## What is measured
 
