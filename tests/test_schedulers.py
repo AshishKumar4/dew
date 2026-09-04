@@ -339,7 +339,7 @@ def test_edm_preset_samples_on_the_karras_grid():
 
 
 def test_presets_rebuild_from_their_fields():
-    """What the manifest stores is the preset's fields; building the registry
+    """What run.json stores is the preset's fields; building the registry
     member from them is the same process."""
     import dataclasses
     from dew.registry import presets as registry
