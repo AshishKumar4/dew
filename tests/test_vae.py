@@ -14,10 +14,18 @@ from dew.nn.autoencoders import AutoEncoder
 
 class IdentityAutoEncoder(AutoEncoder):
     """Latents are the input, so only the normalization seam is under test."""
-    def __encode__(self, x, **kwargs):
+    downscale_factor = 1
+    latent_channels = 4
+    name = "identity"
+
+    def __init__(self, latent_shift=0.0, latent_scale=1.0):
+        self.latent_shift = latent_shift
+        self.latent_scale = latent_scale
+
+    def encode_batch(self, x, key=None):
         return x
 
-    def __decode__(self, z, **kwargs):
+    def decode_batch(self, z):
         return z
 
     def serialize(self):

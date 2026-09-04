@@ -16,8 +16,6 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .base import DataSource
-
 _STREAMING_HINT = (
     "reading Hugging Face datasets needs the streaming extra: "
     "pip install 'dew-ml[streaming]'"
@@ -47,7 +45,7 @@ def _plain_value(value: Any) -> Any:
     return np.asarray(value) if hasattr(value, "__array_interface__") else value
 
 
-class HFDatasetSource(DataSource):
+class HFDatasetSource:
     """Random access over a Hugging Face `datasets.Dataset`.
 
     Either hand over a loaded dataset or name a hub dataset and split, which
@@ -75,10 +73,6 @@ class HFDatasetSource(DataSource):
         # dataset rather than an address, and without touching the table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"cache={self._cache_path!r})")
-
-    def get_source(self, path_override: Optional[str] = None) -> "HFDatasetSource":
-        """The record source itself: a hub dataset resolves by name, not by path."""
-        return self
 
     def _table(self):
         """The dataset, loaded once on first access.
