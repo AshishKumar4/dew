@@ -741,7 +741,7 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
 
 def _tiny_backbone(seq_len):
     return backbone.CausalTransformer(vocab_size=64, emb_features=16, num_layers=1,
-                                      num_heads=2, mlp_ratio=2,
+                                      num_heads=2, mlp_features=32,
                                       max_seq_len=seq_len + 1)
 
 

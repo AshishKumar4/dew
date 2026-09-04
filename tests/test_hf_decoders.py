@@ -67,8 +67,8 @@ def test_qwen3_config_translates_field_by_field():
     assert config == {
         'vocab_size': 256, 'emb_features': 64, 'num_layers': 2, 'num_heads': 4,
         'num_kv_heads': 2, 'head_dim': 16, 'mlp': 'swiglu', 'mlp_features': 128,
-        'max_seq_len': 64, 'rope_theta': 1e6, 'rope_local_theta': None,
-        'layer_types': ('full_attention', 'full_attention'), 'sliding_window': None,
+        'max_seq_len': 64, 'rope_theta': 1e6,
+        'layer_types': ('full_attention', 'full_attention'), 'kinds': {},
         'norm_eps': 1e-6, 'scale_after_cast': True, 'qk_norm': True, 'attention_bias': False,
         'tie_embeddings': True,
     }
@@ -84,9 +84,10 @@ def test_gemma3_config_carries_the_gemma_switches():
     assert config['attention_scale'] == pytest.approx(0.25)
     assert config['final_logit_softcap'] == 30.0
     assert config['layer_types'] == ('sliding_attention', 'full_attention')
-    assert config['sliding_window'] == 4
-    # rope_local_base_freq for the sliding layer, rope_theta for the full one
-    assert (config['rope_theta'], config['rope_local_theta']) == (1e6, 1e4)
+    # rope_local_base_freq and the window belong to the sliding kind,
+    # rope_theta to the model the full layers take it from
+    assert config['rope_theta'] == 1e6
+    assert config['kinds'] == {'sliding_attention': {'window': 4, 'rope_theta': 1e4}}
 
 
 def test_a_multimodal_gemma3_config_is_refused():
@@ -116,8 +117,8 @@ def test_the_real_gemma3_1b_config_translates():
     # default where Qwen and Llama do not
     assert config['vocab_size'] == 262144 and config['tie_embeddings'] is True
     assert config['attention_scale'] == pytest.approx(256 ** -0.5)
-    assert config['sliding_window'] == 512
-    assert (config['rope_theta'], config['rope_local_theta']) == (1e6, 1e4)
+    assert config['rope_theta'] == 1e6
+    assert config['kinds'] == {'sliding_attention': {'window': 512, 'rope_theta': 1e4}}
     assert config['sandwich_norms'] and config['scale_offset']
     # sliding_window_pattern 6: five sliding layers, then a full one
     assert config['layer_types'][:6] == (
@@ -435,16 +436,16 @@ def test_gemma4_config_translates_field_by_field():
     assert config["attention_scale"] == 1.0
     assert config["sandwich_norms"] and config["embedding_scale"]
     assert config["mlp"] == "swiglu" and config["tie_embeddings"]
-    assert config["rope_theta"] == 10000.0 and config["rope_local_theta"] is None
+    assert config["rope_theta"] == 10000.0
     assert config["partial_rotary_factor"] is None
-    assert config["global_head_dim"] is None
+    assert config["kinds"] == {"sliding_attention": {"window": 32}}
     assert "attention_logit_cap" not in config
     assert config["layer_types"] == ("sliding_attention",) * 3 + ("full_attention",)
     assert config["head_dim"] == 8 and not config["scale_after_cast"]
 
     config = translate_config(gemma4_config("gemma4-kvshare"))
     assert config["num_kv_shared_layers"] == 2
-    assert config["per_layer_input_dim"] == 0
+    assert config["per_layer_input_dim"] is None
 
 
 def test_the_e2b_shaped_config_translates_every_gap():
@@ -454,13 +455,15 @@ def test_the_e2b_shaped_config_translates_every_gap():
     config = translate_config(gemma4_config("gemma4-e2b"))
 
     assert config["partial_rotary_factor"] == 0.25
-    assert (config["head_dim"], config["global_head_dim"]) == (16, 32)
     assert "attention_logit_cap" not in config
     assert config["use_double_wide_mlp"]
     assert config["num_kv_shared_layers"] == 2
     assert config["per_layer_input_dim"] == 8
     assert config["v_norm"] and config["rope_theta"] == 1000000.0
-    assert config["rope_local_theta"] == 10000.0
+    # The full layers' own head dim and the sliding kind's window and base
+    assert config["head_dim"] == 16
+    assert config["kinds"] == {"sliding_attention": {"window": 32, "rope_theta": 10000.0},
+                               "full_attention": {"head_dim": 32}}
 
 
 def test_the_real_e2b_config_translates():
@@ -475,7 +478,9 @@ def test_the_real_e2b_config_translates():
     config = translate_config(json.loads(e2b.read_text()).get("text_config"))
 
     assert config["partial_rotary_factor"] == 0.25
-    assert (config["head_dim"], config["global_head_dim"]) == (192, 512)
+    assert config["head_dim"] == 192
+    assert config["kinds"]["full_attention"] == {"head_dim": 512}
+    assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
     assert config["num_kv_shared_layers"] == 20
     assert config["per_layer_input_dim"] == 256
     assert config["use_double_wide_mlp"]
@@ -580,7 +585,7 @@ def test_the_features_leave_a_plain_tree_unchanged(rng):
     """Off by default: no PLE leaves, no missing K/V, same leaves as before."""
     config = translate_config(gemma4_config("gemma4-ple"))
     model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**config, "per_layer_input_dim": 0,
+        "causal_transformer", {**config, "per_layer_input_dim": None,
                                "num_kv_shared_layers": 0, "v_norm": False},
         dtype="float32", attention_impl="xla"))
     assert model.kv_sharing == {}

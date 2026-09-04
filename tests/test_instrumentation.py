@@ -81,7 +81,8 @@ def token_batches(batch, seq, vocab):
 def lm_trainer(*, vocab, width, layers, heads, ratio, seq):
     """The language-model trainer, replicated so the step is the whole batch."""
     model = models.build('causal_transformer', vocab_size=vocab, emb_features=width,
-                         num_layers=layers, num_heads=heads, mlp_ratio=ratio, max_seq_len=seq)
+                         num_layers=layers, num_heads=heads, mlp_features=ratio * width,
+                         max_seq_len=seq)
     return Trainer(LMObjective(model, seq), optax.adam(1e-3), key=jax.random.key(0))
 
 
