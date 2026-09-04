@@ -7,11 +7,13 @@ from typing import Any, Mapping
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
 from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import (
     PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates,
 )
+from dew.objectives.base import Variables
 
 
 @dataclass(frozen=True)
@@ -67,8 +69,8 @@ class Denoiser:
     """A model, its parameters and its conditions as one denoising function."""
 
     process: Process
-    model: Any
-    params: Any
+    model: nn.Module
+    params: Variables
     conditions: dict[str, Any]
     unconditional: dict[str, Any] | None = None
 

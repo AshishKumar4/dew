@@ -24,7 +24,9 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
+from dew.objectives.base import Variables
 from dew.registry import presets, samplers
 
 
@@ -110,7 +112,7 @@ class DiscreteDenoiser:
 
     process: DiscreteProcess
     model: Any
-    params: Any
+    params: Variables
 
     def __call__(self, x_t, t):
         logits = self.model.apply(self.params, x_t)
