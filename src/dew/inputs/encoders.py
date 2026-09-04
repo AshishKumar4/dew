@@ -142,4 +142,49 @@ class Audio(ConditionEncoder):
         return {"checkpoint": self.checkpoint, "sampling_rate": self.sampling_rate}
 
 
-__all__ = ["ConditionEncoder", "CLIPText", "Audio"]
+@encoders("char_table")
+@dataclass(frozen=True, eq=False)
+class CharTable(ConditionEncoder):
+    """Text as a table lookup: each character is an id and each id a fixed
+    random vector. It costs nothing and downloads nothing, so it is the text
+    encoder of tests, benchmarks and smoke runs, and it has the shape of a
+    real one (`TextContext` with a mask), so a model that takes CLIP's output
+    takes this one unchanged.
+    """
+
+    params: dict
+    tokens: int = 8
+    features: int = 16
+    vocab: int = 130
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = 8,
+                        features: int = 16, vocab: int = 130, seed: int = 0):
+        table = np.random.RandomState(seed).normal(size=(vocab, features)).astype(np.float32)
+        return cls(params={"table": jnp.asarray(table)}, tokens=tokens,
+                   features=features, vocab=vocab)
+
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+        # id 0 is padding, 1 is the start token, characters follow.
+        ids = np.zeros((len(texts), self.tokens), np.int32)
+        mask = np.zeros((len(texts), self.tokens), np.int32)
+        for row, text in enumerate(texts):
+            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
+            ids[row, :len(codes)] = codes
+            mask[row, :len(codes)] = 1
+        return {"input_ids": ids, "attention_mask": mask}
+
+    def encode(self, params, tokens) -> TextContext:
+        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
+                           mask=jnp.asarray(tokens["attention_mask"]))
+
+    def captions(self, tokens) -> tuple[str, ...]:
+        return tuple("".join(chr(97 + (int(i) - 2) % 26) for i in row[row > 1])
+                     for row in np.asarray(tokens["input_ids"]))
+
+    def to_json(self) -> dict:
+        return {"checkpoint": "char_table", "tokens": self.tokens,
+                "features": self.features, "vocab": self.vocab}
+
+
+__all__ = ["ConditionEncoder", "CLIPText", "Audio", "CharTable"]

@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from dew import registry
-from .encoders import Audio, CLIPText, ConditionEncoder
+from .encoders import Audio, CharTable, CLIPText, ConditionEncoder
 
 
 def unit_range(pixels) -> jax.Array:
@@ -85,5 +85,5 @@ class InputSpec:
                                for keyword, condition in data["conditions"].items()})
 
 
-__all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "Audio",
+__all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "Audio", "CharTable",
            "unit_range"]
