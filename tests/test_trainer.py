@@ -241,6 +241,27 @@ def test_checkpoint_every_needs_a_stream_that_reports_its_position(tmp_path):
         make_trainer(tmp_path).fit(Data(endless), steps=2, checkpoint_every=1)
 
 
+def test_checkpoint_every_needs_a_stream_that_can_also_be_put_back(tmp_path):
+    """A stream that reports its position but cannot be set back to it would
+    write position=None into every checkpoint and fail only on resume, so it
+    is refused where a stream with no position is."""
+    class HalfCheckpointable:
+        def __init__(self):
+            self.inner = Counting()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.inner)
+
+        def get_state(self):
+            return self.inner.get_state()
+
+    with pytest.raises(ValueError, match="get_state"):
+        make_trainer(tmp_path).fit(Data(HalfCheckpointable), steps=2, checkpoint_every=1)
+
+
 def test_checkpoint_every_without_a_checkpointer_is_refused():
     """Asking for checkpoints from a trainer that has nowhere to write them
     used to reach the first save and fail on None."""

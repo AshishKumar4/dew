@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from dew import registry
-from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text
+from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -58,7 +58,7 @@ class Condition:
     @classmethod
     def from_json(cls, data: Mapping) -> "Condition":
         encoder = data["encoder"]
-        return cls(encoder=registry.encoders[encoder["name"]].from_pretrained(**encoder["fields"]),
+        return cls(encoder=rebuild(encoder["name"], encoder["fields"]),
                    field=data["field"], unconditional=data["unconditional"])
 
 
@@ -102,5 +102,5 @@ class InputSpec:
 
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "Audio", "CharTable",
+           "Audio", "CharTable", "rebuild",
            "unit_range"]

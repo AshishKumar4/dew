@@ -51,6 +51,9 @@ class TextToImage:
             jax.eval_shape(objective.init, jax.ShapeDtypeStruct((2,), jnp.uint32)))
         template = {"params": abstract}
         if ema:
+            if objective.ema is None:
+                raise ValueError(
+                    "this run's objective keeps no EMA; load its weights with ema=False")
             template["ema"] = select(abstract, objective.ema.select)
         values, _ = Checkpoints(directory).restore(template, step=step)
         params = values["params"]

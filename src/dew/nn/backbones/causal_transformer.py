@@ -57,7 +57,7 @@ class LayerKind:
 
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
-    rope_theta: Optional[float] = None
+    rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
     head_dim: Optional[int] = None
 
 

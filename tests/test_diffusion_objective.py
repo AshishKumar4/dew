@@ -120,7 +120,7 @@ class Zero(nn.Module):
 
 
 def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
-    """The two sigma integrators hold only when alpha is 1; the cosine
+    """The sigma integrators hold only when alpha is 1; the cosine
     preset is VP, and the mismatch surfaces when the objective is built."""
     from dew.sampling import RK4
     unconditional = InputSpec(Field("image", (RES, RES, 3)))
@@ -178,6 +178,36 @@ def test_the_compiled_step_carries_no_encoder_constants():
 
     leaky = Leaky(objective.model, objective.process, objective.inputs, steps=3)
     assert (VOCAB, FEATURES) in shapes_of_constants(leaky.loss)
+
+
+def test_the_compiled_step_carries_no_autoencoder_constants():
+    """T19, the VAE half: the autoencoder weights arrive through
+    `params["autoencoder"]`, so the loss's jaxpr has no constant of the
+    encoder kernel's shape. The mutation that reads them off the autoencoder
+    object instead bakes them in, and this assertion catches that."""
+    from dew.nn.autoencoders import SimpleAutoEncoder
+    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(8,))
+    inputs = InputSpec(Field("image", (RES, RES, 3)))
+    objective = DiffusionObjective(Zero(), presets.EDM()(), inputs,
+                                   autoencoder=autoencoder)
+    params = objective.init(jax.random.PRNGKey(0))
+    assert set(params) == {"params", "encoders", "autoencoder"}
+    batch = make_batch()
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+
+    def shapes_of_constants(fn):
+        closed = jax.make_jaxpr(fn)(params, batch, step)
+        return {np.shape(const) for const in closed.consts}
+
+    assert (3, 3, 3, 8) not in shapes_of_constants(objective.loss)
+
+    class Leaky(DiffusionObjective):
+        def loss(self, params, batch, step):
+            params = dict(params, autoencoder=self.autoencoder.params)
+            return super().loss(params, batch, step)
+
+    leaky = Leaky(Zero(), presets.EDM()(), inputs, autoencoder=autoencoder)
+    assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
 
 
 def test_evaluate_samples_from_the_batch_conditions():
