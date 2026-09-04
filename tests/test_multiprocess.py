@@ -10,6 +10,9 @@ itself.
 
 The pool runs on CPU with the simulated eight devices split among its
 processes, so the global device count is the one the rest of the suite uses.
+The processes join through `prepare_process` from the environment a launcher
+leaves, so the production join and the rendezvous right after it are what
+every pool test runs.
 """
 
 import json

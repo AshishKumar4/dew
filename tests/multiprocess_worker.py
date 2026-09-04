@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -462,19 +463,20 @@ def parse_args(argv=None):
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.coordinator:
-        import jax
-        from jax.experimental import multihost_utils
+        # What mpirun puts in the environment, which is how a pod run finds
+        # its pool: jax's OMPI detector reads the size and the ranks from it,
+        # and JAX_COORDINATOR_ADDRESS names the coordinator. The join and the
+        # rendezvous right after it are then the recipes' own.
+        os.environ.update({
+            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
+            "OMPI_COMM_WORLD_SIZE": str(args.processes),
+            "OMPI_COMM_WORLD_RANK": str(args.process_id),
+            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
+            "JAX_COORDINATOR_ADDRESS": args.coordinator,
+        })
+    from dew.training.runtime import prepare_process
 
-        jax.distributed.initialize(
-            coordinator_address=args.coordinator, num_processes=args.processes,
-            process_id=args.process_id)
-        # One collective while the processes are still in lockstep. CPU
-        # collectives rendezvous through the coordinator with a 30 second
-        # deadline, and the first one otherwise falls inside a checkpoint
-        # barrier, by which time the processes are as far apart as their model
-        # init and compile times. On a machine under load that is more than 30
-        # seconds and the run dies in gloo rather than in anything under test.
-        multihost_utils.sync_global_devices("worker ready")
+    prepare_process("none", multi_host=bool(args.coordinator))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 
