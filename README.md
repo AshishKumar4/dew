@@ -299,9 +299,9 @@ The data pipeline is built on [Grain](https://github.com/google/grain). A datase
 
 ```python
 # runs elsewhere: downloads Oxford Flowers
-from dew.data import OxfordFlowers
+from dew.data import Loading, OxfordFlowers
 
-data = OxfordFlowers(image_size=128, worker_count=8).load(batch=32)
+data = OxfordFlowers(image_size=128, loading=Loading(workers=8)).load(batch=32)
 batch = next(data.train())
 # batch["image"].shape == (32, 128, 128, 3), uint8; batch["text"] holds the tokenized captions
 # data.val() is the held-out records once, in a fixed order; data.steps_per_epoch is one pass over data.records
@@ -322,17 +322,17 @@ A dataset is a frozen spec in the `datasets` registry; its fields are its knobs,
 A run is a `RunConfig` with four parts, and [tyro](https://github.com/brentyi/tyro) turns the tree into a command line: `--optim.learning-rate 1e-4` sets `config.optim.learning_rate`. The recipes subclass it to add their objective's knobs.
 
 ```python
-from dew.config import RunConfig, ModelConfig, OptimConfig, TrainerConfig
-from dew.data import OxfordFlowers
+from dew.config import RunConfig, ModelConfig, OptimConfig, TrainerConfig, Wandb
+from dew.data import Loading, OxfordFlowers
 
 config = RunConfig(
     model=ModelConfig("simple_dit", dict(patch_size=4, emb_features=512, num_layers=12, num_heads=8),
                       dtype="bfloat16", attention_impl="auto"),
-    data=OxfordFlowers(image_size=128, worker_count=16),
+    data=OxfordFlowers(image_size=128, loading=Loading(workers=16)),
     optim=OptimConfig(optimizer="adamw", learning_rate=2e-4, learning_rate_schedule="cosine",
                       learning_rate_warmup_steps=2000, weight_decay=0.01, clip_grads=1.0),
     trainer=TrainerConfig(name="flowers-dit", batch_size=64, epochs=500, checkpoint_every=2000,
-                          wandb_project="dew"),
+                          wandb=Wandb(project="dew")),
 )
 config.save("runs/flowers-dit")        # run.json, next to the checkpoints; RunConfig.load rebuilds it, and raises on a field it does not know
 ```
@@ -342,7 +342,7 @@ config.save("runs/flowers-dit")        # run.json, next to the checkpoints; RunC
 | `model` | `architecture`, `config` (the fields the registry builds the model from), `dtype`, `attention_impl` |
 | `data` | a dataset spec, chosen as a subcommand (`data:oxford-flowers --data.image-size 128`); its fields are the spec's |
 | `optim` | `optimizer` (adam, adamw, lamb, muon), `learning_rate`, `learning_rate_schedule`, `learning_rate_peak`, `learning_rate_end`, `learning_rate_warmup_steps`, `weight_decay`, `clip_grads` |
-| `trainer` | `name`, `seed`, `batch_size`, `epochs`, `steps`, `checkpoint_dir`, `keep`, `checkpoint_every`, `eval_every`, `log_every`, `mesh` (`fsdp`, `expert`), `layout` (`min_shard`, `tolerance`), `accumulation`, `dynamic_scale`, `multi_host`, `xla_flags`, `profile_steps`, `compilation_cache_dir`, `wandb_project`, `wandb_entity`, `wandb_offline` |
+| `trainer` | `name`, `seed`, `batch_size`, `epochs`, `steps`, `checkpoint_dir`, `keep`, `checkpoint_every`, `eval_every`, `log_every`, `mesh` (`fsdp`, `expert`), `layout` (`min_shard`, `tolerance`), `accumulation`, `dynamic_scale`, `multi_host`, `xla_flags`, `profile` (`directory`, `steps`, `warmup`, unset traces nothing), `compilation_cache_dir`, `wandb` (`project`, `entity`, `offline`, unset runs without a tracker) |
 
 The diffusion recipe adds `preset` and `sampler` (each a subcommand over its registry: `preset:edm --preset.sigma-data 0.5`), `guidance`, `sampling_steps`, `unconditional_prob`, `ema_decay`, `text_encoder`, `autoencoder` and `val_metrics`; the JEPA recipe adds `predictor`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes` and `knn_k`; the language model recipe adds `tokenizer`, `ema_decay`, `sample_prompt`, `sample_tokens` and `pretrained`. The defaults carry no machine paths and no personal accounts. `--help` on any recipe prints the whole tree with its defaults. See [docs/recipes.md](docs/recipes.md) for more.
 
@@ -372,7 +372,7 @@ The run directory is the whole record: `run.json` is the resolved config the rec
 
 A `Tracker` receives scalars and artifacts; `WandbTracker` sends them to Weights & Biases and renders each artifact by its type, and no tracker means the terminal. Every `log_every` steps: `train/loss`, `train/step_time_ms`, `train/samples_per_sec`, `train/mfu`, and every metric the objective returned as `train/<name>`. Every `eval_every` steps: each metric as `val/<name>`, and the objective's artifacts drawn (an image grid, a table of generated text). Publishing is a recipe's step, not the trainer's: `dew.io.publish(directory, name, tracker=...)` uploads a checkpoint and its `run.json` to the model registry after `fit`.
 
-`train/mfu` is the step's FLOPs, counted off the compiled executable's optimized HLO, divided by the step time and by one device's dense peak; the table of peaks in `dew.telemetry.instrumentation` covers TPU v4 to v6e, A100, H100, H200 and the RTX 4080, and the metric is left out on hardware it does not know. `profile_steps=N` writes a profiler trace of `N` steps after a warmup to `<checkpoint dir>/profile`, for TensorBoard or Perfetto. The XLA compilation cache is on by default under `~/.cache/dew/xla`, so a restarted run compiles in seconds instead of minutes. A sustained non-finite loss stops the run.
+`train/mfu` is the step's FLOPs, counted off the compiled executable's optimized HLO, divided by the step time and by one device's dense peak; the table of peaks in `dew.telemetry.instrumentation` covers TPU v4 to v6e, A100, H100, H200 and the RTX 4080, and the metric is left out on hardware it does not know. `profile=Profile(directory, steps=N, warmup=2)` writes a profiler trace of `N` steps after the warmup into `directory`, for TensorBoard or Perfetto. The XLA compilation cache is on by default under `~/.cache/dew/xla`, so a restarted run compiles in seconds instead of minutes. A sustained non-finite loss stops the run.
 
 ## Extending Dew
 

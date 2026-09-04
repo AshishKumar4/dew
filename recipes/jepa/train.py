@@ -23,7 +23,7 @@ from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.registry import datasets, metrics, models
-from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
+from dew.training import (Checkpoints, Trainer, TrainState, WandbTracker,
                           build_optimizer, prepare_process, run_timestamp)
 
 # HF tokenizers fork a thread pool; grain's workers fork the process.
@@ -108,7 +108,7 @@ def run_summary(config: JepaRunConfig, encoder_fields: dict) -> dict:
 
 
 def main(config: JepaRunConfig) -> TrainState:
-    prepare_process(config.trainer.wandb_offline, config.trainer.multi_host,
+    prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
 
     data = config.data.load(batch=config.trainer.batch_size)
@@ -158,10 +158,10 @@ def main(config: JepaRunConfig) -> TrainState:
 
     run_config = config.to_dict()
     tracker = None
-    if config.trainer.wandb_project is not None:
+    if config.trainer.wandb is not None:
         tracker = WandbTracker(
-            config.trainer.wandb_project, name, entity=config.trainer.wandb_entity,
-            offline=config.trainer.wandb_offline,
+            config.trainer.wandb.project, name, entity=config.trainer.wandb.entity,
+            offline=config.trainer.wandb.offline,
             config={"run_config": run_config, "encoder": encoder_fields,
                     "predictor": predictor_fields,
                     "mask": {"grid": grid, "block_shapes": mask.block_shapes,
@@ -182,8 +182,7 @@ def main(config: JepaRunConfig) -> TrainState:
         dynamic_scale=config.trainer.dynamic_scale,
         checkpoints=checkpoints,
         tracker=tracker,
-        profile=(Profile(os.path.join(directory, "profile"), config.trainer.profile_steps)
-                 if config.trainer.profile_steps else None),
+        profile=config.trainer.profile,
     )
 
     start = time.time()

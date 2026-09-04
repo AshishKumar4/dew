@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import optax
 import tyro
 
-from dew.data import ByteTokenizer, TokenWindows
+from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 import dew.nn.backbones  # registers the models
 from dew.registry import models
@@ -40,7 +40,7 @@ def main(config: Config):
     meta = json.loads((config.tokens / "meta.json").read_text())
     tokenizer = ByteTokenizer()
     data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length,
-                        worker_count=4).load(batch=config.batch_size)
+                        loading=Loading(workers=4)).load(batch=config.batch_size)
     steps = config.steps or config.epochs * data.steps_per_epoch
 
     prompt = tokenizer.encode(config.prompt)

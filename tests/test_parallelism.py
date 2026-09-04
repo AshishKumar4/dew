@@ -9,6 +9,7 @@ not the ones we meant.
 import json
 
 import jax
+from dew.data import Loading
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -436,7 +437,7 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
         sampler=pygrain.IndexSampler(num_records=64, shuffle=False, seed=0, num_epochs=1,
                                      shard_options=pygrain.NoSharding()),
         operations=[pygrain.Batch(jax.device_count(), drop_remainder=True)],
-        worker_count=0,
+        loading=Loading(workers=0),
     )
     mesh = build_mesh()
     it = DevicePrefetchIterator(iter(loader), batch_sharding(mesh), depth=2)
@@ -462,7 +463,7 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, worker_count=0,
+    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()
@@ -741,7 +742,7 @@ def grain_image_loader(num_records=256):
         sampler=pygrain.IndexSampler(num_records=num_records, shuffle=False, seed=0,
                                      num_epochs=4, shard_options=pygrain.NoSharding()),
         operations=[ToImage(), pygrain.Batch(BATCH, drop_remainder=True)],
-        worker_count=0,
+        loading=Loading(workers=0),
     ))
 
 

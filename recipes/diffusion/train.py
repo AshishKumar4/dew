@@ -25,7 +25,7 @@ import tyro
 import dew.io
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.registry import datasets, presets
-from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
+from dew.training import (Checkpoints, Trainer, TrainState, WandbTracker,
                           build_optimizer, prepare_process, run_timestamp)
 
 # HF tokenizers fork a thread pool; grain's workers fork the process.
@@ -68,7 +68,7 @@ def experiment_name(config: DiffusionRunConfig, summary: dict) -> str:
 
 
 def main(config: DiffusionRunConfig) -> TrainState:
-    prepare_process(config.trainer.wandb_offline, config.trainer.multi_host,
+    prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
     print(f"Local devices: {jax.local_devices()}")
 
@@ -91,10 +91,10 @@ def main(config: DiffusionRunConfig) -> TrainState:
     directory = os.path.join(config.trainer.checkpoint_dir, name)
 
     tracker = None
-    if config.trainer.wandb_project is not None:
+    if config.trainer.wandb is not None:
         tracker = WandbTracker(
-            config.trainer.wandb_project, name, entity=config.trainer.wandb_entity,
-            offline=config.trainer.wandb_offline,
+            config.trainer.wandb.project, name, entity=config.trainer.wandb.entity,
+            offline=config.trainer.wandb.offline,
             config={"run_config": run_config, "model": fields, "arguments": summary,
                     "dataset": {"name": summary["dataset"], "records": data.records,
                                 "steps_per_epoch": data.steps_per_epoch},
@@ -111,8 +111,7 @@ def main(config: DiffusionRunConfig) -> TrainState:
         dynamic_scale=config.trainer.dynamic_scale,
         checkpoints=checkpoints,
         tracker=tracker,
-        profile=(Profile(os.path.join(directory, "profile"), config.trainer.profile_steps)
-                 if config.trainer.profile_steps else None),
+        profile=config.trainer.profile,
     )
     print(f"Training on {summary['dataset']} for {steps} steps "
           f"({data.steps_per_epoch} steps per epoch)")

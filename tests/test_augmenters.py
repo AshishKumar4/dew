@@ -36,7 +36,7 @@ if not flags.FLAGS.is_parsed():
 # test must import, construct and augment regardless.
 sys.modules["torchvision"] = None
 
-from dew.data import CC12M, OxfordFlowers, images  # noqa: E402
+from dew.data import CC12M, Loading, OxfordFlowers, images  # noqa: E402
 from dew.data.images import ImageTransform  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -317,7 +317,8 @@ def _by_record(spec, worker_count):
     worker its own slice of the index stream, so batch composition follows
     worker_count while record content must not.
     """
-    data = dataclasses.replace(spec, worker_count=worker_count).load(
+    data = dataclasses.replace(spec, loading=Loading(workers=worker_count, threads=1,
+                                                    read_buffer=1, worker_buffer=1)).load(
         batch=4, tokenize=keep_captions)
     records = {}
     for batch in itertools.islice(data.train(), data.steps_per_epoch):
@@ -331,7 +332,7 @@ def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path)
     labels_file = tmp_path / "indexed_labels.txt"
     labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
     spec = Flowers(image_size=SCALE, labels=str(labels_file), val_batches=None, seed=7,
-                   read_threads=1, read_buffer=1, worker_buffer=1)
+                   loading=Loading(threads=1, read_buffer=1, worker_buffer=1))
 
     serial = _by_record(spec, worker_count=0)
     parallel = _by_record(spec, worker_count=2)
