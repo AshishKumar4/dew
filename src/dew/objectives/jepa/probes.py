@@ -30,8 +30,8 @@ def _split(embeddings, labels):
     return embeddings[:fit], labels[:fit], embeddings[fit:], labels[fit:]
 
 
-def linear_probe(embeddings, labels, num_classes: int, steps: int = 100,
-                 learning_rate: float = 1e-2, weight_decay: float = 1e-4):
+def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100,
+                          learning_rate: float = 1e-2, weight_decay: float = 1e-4):
     """Accuracy of a logistic regression fit on half the batch, scored on the rest."""
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
@@ -56,7 +56,7 @@ def linear_probe(embeddings, labels, num_classes: int, steps: int = 100,
     return jnp.mean(predicted == test_y)
 
 
-def knn_probe(embeddings, labels, num_classes: int, k: int = 20):
+def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
     """Cosine k-NN accuracy, fit half against scored half."""
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     fit_x = fit_x / (jnp.linalg.norm(fit_x, axis=-1, keepdims=True) + 1e-8)
@@ -68,7 +68,6 @@ def knn_probe(embeddings, labels, num_classes: int, k: int = 20):
     return jnp.mean(jnp.argmax(votes, axis=-1) == test_y)
 
 
-@metrics("linear_probe")
 @dataclass(frozen=True)
 class LinearProbe:
     """Linear probe accuracy over each validation batch's representations."""
@@ -81,7 +80,7 @@ class LinearProbe:
     reads = Representations
 
     def __call__(self, representations: Representations, batch) -> float:
-        return float(linear_probe(
+        return float(linear_probe_accuracy(
             representations.features, representations.labels, self.num_classes,
             steps=self.steps, learning_rate=self.learning_rate,
             weight_decay=self.weight_decay))
@@ -90,7 +89,6 @@ class LinearProbe:
         return float(np.mean(values))
 
 
-@metrics("knn_probe")
 @dataclass(frozen=True)
 class KnnProbe:
     """Cosine k-NN accuracy over each validation batch's representations."""
@@ -101,8 +99,19 @@ class KnnProbe:
     reads = Representations
 
     def __call__(self, representations: Representations, batch) -> float:
-        return float(knn_probe(representations.features, representations.labels,
+        return float(knn_probe_accuracy(representations.features, representations.labels,
                                self.num_classes, k=self.k))
 
     def reduce(self, values: Sequence[float]) -> float:
         return float(np.mean(values))
+
+
+@metrics("linear_probe")
+def linear_probe(num_classes: int, steps: int = 100, learning_rate: float = 1e-2,
+                 weight_decay: float = 1e-4) -> LinearProbe:
+    return LinearProbe(num_classes, steps, learning_rate, weight_decay)
+
+
+@metrics("knn_probe")
+def knn_probe(num_classes: int, k: int = 20) -> KnnProbe:
+    return KnnProbe(num_classes, k)

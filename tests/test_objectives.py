@@ -1,14 +1,5 @@
-"""The Objective seam: the trainer owns mechanics, the objective owns the loss.
-
-The diffusion objective was lifted out of the trainer's train step, so the
-first test here is a golden fingerprint of the parameters, EMA and optimizer
-state after five real steps, captured from the implementation that inlined the
-objective. It must not move.
-
-The fingerprint is keyed to the step's RNG derivation, which draws one
-partitionable key per step rather than folding in a device index. Numbers
-captured against the older per-device folding do not carry over.
-"""
+"""The Objective seam: what an objective sees, what it reports, how a subtree
+is selected for the EMA and put back."""
 
 import jax
 import jax.numpy as jnp
@@ -16,173 +7,89 @@ import numpy as np
 import optax
 import pytest
 
-from dew.inputs import DiffusionInputConfig
-from dew.nn.backbones.dit import SimpleDiT
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.training import ObjectiveTrainer
-from dew.training.objective_trainer import TrainState
-from dew.objectives.base import EMASpec, Objective
-
-RES = 8
+from dew.objectives.base import (
+    Aux, EMASpec, Objective, Step, everything, merge, select, under,
+)
 
 
-def tree_fingerprint(tree):
-    # per-leaf sums accumulated in python floats, so the golden values below
-    # do not depend on float32 reduction order
-    return sum(float(jnp.sum(leaf)) for leaf in jax.tree.leaves(tree)
-               if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
+def tree():
+    return {"params": {"encoder": {"w": jnp.ones((2,))}, "head": {"w": jnp.zeros((2,))}},
+            "stats": {"seen": jnp.zeros(())}}
 
 
-def tree_magnitude(tree):
-    """Sum of absolute values: no cancellation, so a relative tolerance means what it says.
-
-    Adam's moments sum to ~1e-5 from terms of order one, and that residual moves
-    by 0.2% between CPUs; the magnitude moves by 1e-13.
-    """
-    return sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(tree)
-               if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
+def test_under_selects_a_prefix_and_everything_selects_all():
+    assert under("params", "encoder")(("params", "encoder", "w"))
+    assert not under("params", "encoder")(("params", "head", "w"))
+    assert not under("params", "encoder")(("params",))
+    assert everything(("stats", "seen"))
 
 
-def make_trainer(tmp_path, **kwargs):
-    train_schedule, _, transform = get_diffusion_preset("edm")
-    return ObjectiveTrainer(
-        model=SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
-        optimizer=optax.adam(1e-3),
-        noise_schedule=train_schedule,
-        model_output_transform=transform,
-        input_config=DiffusionInputConfig(
-            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
-        rngs=jax.random.PRNGKey(0),
-        name="objective-parity",
-        wandb_config=None,
-        distributed_training=False,
-        checkpoint_base_path=str(tmp_path),
-        **kwargs,
-    )
+def test_select_keeps_the_nesting_of_what_it_keeps():
+    selected = select(tree(), under("params", "encoder"))
+    assert selected == {"params": {"encoder": {"w": tree()["params"]["encoder"]["w"]}}}
+    assert set(select(tree(), everything)) == {"params", "stats"}
 
 
-def batch_iterator():
-    images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
-                     (8, 1, RES, 3))
-    while True:
-        yield {"image": jnp.asarray(images)}
+def test_merge_replaces_only_the_leaves_the_overlay_holds():
+    base = tree()
+    overlay = {"params": {"encoder": {"w": jnp.full((2,), 7.0)}}}
+    merged = merge(base, overlay)
+    np.testing.assert_array_equal(merged["params"]["encoder"]["w"], 7.0)
+    assert merged["params"]["head"] is base["params"]["head"]
+    assert merged["stats"] is base["stats"]
+    # and the base is untouched
+    np.testing.assert_array_equal(base["params"]["encoder"]["w"], 1.0)
 
 
-def test_diffusion_objective_reproduces_the_inlined_train_step(tmp_path):
-    trainer = make_trainer(tmp_path)
-    data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
-    state = trainer.fit(data, training_steps_per_epoch=5, epochs=1, val_steps_per_epoch=0)
-
-    # Relative tolerance, not absolute: XLA reassociates differently across
-    # CPUs, so the fingerprint moves ~1e-7 between machines. Any real change in
-    # what the objective computes would move it by orders of magnitude more.
-    assert tree_fingerprint(state.params) == pytest.approx(8.209761425852776, rel=1e-6)
-    assert tree_fingerprint(state.ema_params) == pytest.approx(8.22020611886387, rel=1e-6)
-    assert tree_magnitude(state.opt_state) == pytest.approx(2.6127838217179895, rel=1e-6)
+def test_merge_after_select_puts_the_averaged_leaves_where_they_came_from():
+    base = tree()
+    averaged = jax.tree.map(lambda x: x + 0.5, select(base, under("params", "encoder")))
+    merged = merge(base, averaged)
+    np.testing.assert_array_equal(merged["params"]["encoder"]["w"], 1.5)
+    np.testing.assert_array_equal(merged["params"]["head"]["w"], 0.0)
 
 
-def test_train_step_returns_auxiliary_metrics(tmp_path):
-    """value_and_grad runs with has_aux so objectives can report diagnostics."""
-    trainer = make_trainer(tmp_path)
-    train_step = trainer._define_train_step(batch_size=8)
-    batch = next(batch_iterator())
+def test_step_and_aux_cross_jit():
+    """What the compiled step hands an objective and takes back are pytrees."""
+    @jax.jit
+    def body(step: Step) -> Aux:
+        draw = jax.random.normal(step.key, ())
+        return Aux({"draw": draw, "step": step.step.astype(jnp.float32)},
+                   variables={"stats": {"seen": step.ema["stats"]["seen"] + 1}})
 
-    new_state, loss, aux, rng_state, is_finite = train_step(
-        trainer.state, trainer.rngstate, batch)
-    assert bool(is_finite)
-    assert isinstance(aux, dict)
-
-
-def test_validation_samples_follow_the_step(tmp_path):
-    """Successive validations draw fresh noise while a given step reproduces,
-    so the sampler seed has to come from the state's rngs folded with its step."""
-    trainer = make_trainer(tmp_path)
-    validate = trainer.objective.make_validation_step()
-    batch = next(batch_iterator())
-    state = trainer.state
-
-    first = validate(state, batch)
-    assert jnp.array_equal(validate(state, batch), first)
-    assert not jnp.allclose(validate(state.replace(step=state.step + 1), batch), first)
+    aux = body(Step(step=jnp.asarray(3), key=jax.random.key(0), ema=tree()))
+    assert float(aux.metrics["step"]) == 3.0
+    assert float(aux.variables["stats"]["seen"]) == 1.0
+    assert jnp.isfinite(aux.metrics["draw"])
 
 
-class ConstantObjective(Objective):
-    """Two independent parameter subtrees, so EMA scoping is observable."""
-
-    def __init__(self, ema):
-        self.ema = ema
-
-    def init_params(self, rng):
-        return {"params": {"tracked": {"w": jnp.ones((2,))},
-                           "untracked": {"w": jnp.ones((2,))}}}
-
-    def loss(self, params, ema_params, batch, rng, step):
-        total = sum(jnp.sum(leaf ** 2) for leaf in jax.tree.leaves(params))
-        return total, {"probe": jnp.asarray(1.0)}
-
-    def make_validation_step(self, **kwargs):
-        return lambda val_state, batch: None
+def test_ema_spec_defaults_to_the_whole_tree():
+    spec = EMASpec(decay=optax.constant_schedule(0.9))
+    assert spec.select is everything
+    assert float(spec.decay(1000)) == pytest.approx(0.9)
 
 
-def make_state(objective, params=None):
-    params = objective.init_params(jax.random.PRNGKey(0)) if params is None else params
-    return TrainState.create(
-        apply_fn=lambda *a, **k: None, params=params, ema_params=params,
-        tx=optax.sgd(0.0), rngs=jax.random.PRNGKey(0), metrics=None, dynamic_scale=None)
+class Minimal(Objective):
+    ema = None
+
+    def init(self, key):
+        return {"params": {"w": jnp.zeros(())}}
+
+    def loss(self, params, batch, step):
+        return params["params"]["w"] ** 2, Aux({})
 
 
-def test_ema_over_a_subtree_leaves_its_siblings_alone():
-    objective = ConstantObjective(EMASpec(decay=optax.constant_schedule(0.5),
-                                          path=("params", "tracked")))
-    state = make_state(objective)
-    state = state.replace(params=jax.tree.map(lambda p: p * 3.0, state.params))
-
-    updated = state.apply_ema(0.5, objective.ema.path)
-    assert jnp.allclose(updated.ema_params["params"]["tracked"]["w"], 2.0)
-    assert jnp.allclose(updated.ema_params["params"]["untracked"]["w"], 1.0)
+def test_evaluate_produces_nothing_unless_an_objective_says_so():
+    objective = Minimal()
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+    assert objective.evaluate(objective.init(jax.random.key(0)), {}, step) is None
+    assert objective.artifact is None
 
 
-def test_ema_over_the_whole_tree_is_the_default():
-    state = make_state(ConstantObjective(EMASpec(decay=optax.constant_schedule(0.5))))
-    state = state.replace(params=jax.tree.map(lambda p: p * 3.0, state.params))
+def test_an_objective_needs_init_and_loss():
+    class Incomplete(Objective):
+        def init(self, key):
+            return {}
 
-    updated = state.apply_ema(0.5)
-    assert jnp.allclose(updated.ema_params["params"]["tracked"]["w"], 2.0)
-    assert jnp.allclose(updated.ema_params["params"]["untracked"]["w"], 2.0)
-
-
-def test_ema_decay_follows_the_step_schedule():
-    """I-JEPA's momentum ramp: the trainer must read decay at the current step."""
-    ema = EMASpec(decay=optax.linear_schedule(0.996, 1.0, transition_steps=100))
-    assert float(ema.decay(0)) == pytest.approx(0.996)
-    assert float(ema.decay(100)) == pytest.approx(1.0)
-    assert float(ema.decay(50)) == pytest.approx(0.998)
-
-
-def test_trainer_drives_an_arbitrary_objective(tmp_path):
-    """The seam is real: a non-diffusion objective trains through the same loop."""
-    objective = ConstantObjective(EMASpec(decay=optax.constant_schedule(0.9),
-                                          path=("params", "tracked")))
-    trainer = make_trainer(tmp_path, objective=objective)
-    data = {"train": batch_iterator, "train_len": 32, "local_batch_size": 8}
-    state = trainer.fit(data, training_steps_per_epoch=3, epochs=1, val_steps_per_epoch=0)
-
-    assert int(state.step) == 3
-    # sum of squares under gradient descent must shrink
-    assert tree_fingerprint(state.params) < tree_fingerprint(objective.init_params(None))
-
-
-def test_mixed_precision_carries_the_objective_aux(tmp_path):
-    """The dynamic-scale branch differentiates the same has_aux loss, so an
-    objective's telemetry has to survive mixed precision as well."""
-    objective = ConstantObjective(EMASpec(decay=optax.constant_schedule(0.9)))
-    trainer = make_trainer(tmp_path, objective=objective, use_dynamic_scale=True)
-    train_step = trainer._define_train_step(batch_size=8)
-
-    state, loss, aux, _, is_finite = train_step(
-        trainer.state, trainer.rngstate, next(batch_iterator()))
-    # a live dynamic scale is exactly what selects that branch of the step
-    assert state.dynamic_scale is not None
-    assert bool(is_finite)
-    assert float(aux["probe"]) == 1.0
-    assert int(state.step) == 1
+    with pytest.raises(TypeError):
+        Incomplete()
