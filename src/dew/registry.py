@@ -171,3 +171,8 @@ datasets: Registry[type] = Registry("dataset")
 encoders: Registry[type] = Registry("encoder")
 metrics: Registry[Callable[..., Any]] = Registry("metric")
 objectives: Registry[type] = Registry("objective")
+
+__all__ = [
+    "Registry", "models", "presets", "samplers", "datasets", "encoders", "metrics", "objectives",
+    "resolve_dtype", "dtype_name", "with_precision",
+]
