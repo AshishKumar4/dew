@@ -106,7 +106,7 @@ class TextToImage:
                                             None if guidance is None else null)
             samples = sample(denoise, x_T, steps, solver=sampler, guidance=guidance, key=key)
             if self.autoencoder is not None:
-                samples = self.autoencoder.decode(samples)
+                samples = self.autoencoder.decode(params["autoencoder"], samples)
             return jnp.clip(samples, -1.0, 1.0)
 
         return run(self.params, given, null, x_T, jax.random.fold_in(key, 1))

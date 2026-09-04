@@ -110,13 +110,25 @@ class DiffusionObjective(Objective):
         conditions = self.encode(encoders, self.unconditional_tokens)
         variables = self.model.init(
             key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
-        return {**variables, "encoders": encoders}
+        state = {**variables, "encoders": encoders}
+        if self.autoencoder is not None:
+            # The frozen weights are state, like the encoders': an argument to
+            # the compiled step that the layout places, not a constant baked
+            # into it.
+            state["autoencoder"] = self.autoencoder.params
+        return state
+
+    def trainable(self, params) -> dict:
+        """The model's own collections: what is left once the frozen towers
+        are taken out."""
+        return {name: value for name, value in params.items()
+                if name not in ("encoders", "autoencoder")}
 
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            data = self.autoencoder.encode(data, encode_key)
+            data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
         count = data.shape[0]
 
         # Conditioning dropout: a row drawn for the unconditional branch reads
@@ -137,7 +149,7 @@ class DiffusionObjective(Objective):
         rates = broadcast_rates(schedule, t, data)
         noisy, c_in, target = self.process.prediction.forward_diffusion(data, noise, rates)
 
-        variables = {name: value for name, value in params.items() if name != "encoders"}
+        variables = self.trainable(params)
         preds = self.model.apply(
             variables, noisy * c_in, schedule.model_time(t), **conditions,
             train=True, rngs={"dropout": dropout_key})
@@ -149,7 +161,7 @@ class DiffusionObjective(Objective):
     def _sample_impl(self, params, tokens, key, *, count: int):
         given = self.encode(params["encoders"], tokens)
         null = self.encode(params["encoders"], self.unconditional_tokens)
-        variables = {name: value for name, value in params.items() if name != "encoders"}
+        variables = self.trainable(params)
         denoise = self.process.denoiser(
             self.model, variables, given, None if self.guidance is None else null)
         noise_key, sample_key = jax.random.split(key)
@@ -157,7 +169,7 @@ class DiffusionObjective(Objective):
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
                          guidance=self.guidance, key=sample_key)
         if self.autoencoder is not None:
-            samples = self.autoencoder.decode(samples)
+            samples = self.autoencoder.decode(params["autoencoder"], samples)
         return jnp.clip(samples, -1.0, 1.0)
 
     def evaluate(self, params, batch, step: Step):

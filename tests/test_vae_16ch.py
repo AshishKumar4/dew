@@ -64,7 +64,7 @@ def test_the_encoder_matches_the_reference_latent(autoencoder):
     """The posterior mean of the reference, from the same pixels, before the
     latent normalization the seam applies."""
     expected = reference()
-    raw = autoencoder.encode_batch(np.asarray(expected["sample"], np.float32))
+    raw = autoencoder.encode_batch(autoencoder.params, np.asarray(expected["sample"], np.float32))
 
     difference = largest_difference(raw, expected["latent"])
     assert difference < TOLERANCE, f"max |latent difference| {difference:.3e}"
@@ -72,7 +72,7 @@ def test_the_encoder_matches_the_reference_latent(autoencoder):
 
 def test_the_decoder_matches_the_reference_reconstruction(autoencoder):
     expected = reference()
-    decoded = autoencoder.decode_batch(np.asarray(expected["latent"], np.float32))
+    decoded = autoencoder.decode_batch(autoencoder.params, np.asarray(expected["latent"], np.float32))
 
     difference = largest_difference(decoded, expected["decoded"])
     assert difference < TOLERANCE, f"max |reconstruction difference| {difference:.3e}"
@@ -84,11 +84,11 @@ def test_the_normalized_latent_round_trips(autoencoder):
     expected = reference()
     sample = np.asarray(expected["sample"], np.float32)
 
-    latent = autoencoder.encode(sample)
+    latent = autoencoder.encode(autoencoder.params, sample)
     scaled = (np.asarray(expected["latent"]) - 0.0609) * 1.5305
     assert largest_difference(latent, scaled) < 1e-4
 
-    decoded = autoencoder.decode(latent)
+    decoded = autoencoder.decode(autoencoder.params, latent)
     difference = largest_difference(decoded, expected["decoded"])
     assert difference < 1e-4, f"max |round trip difference| {difference:.3e}"
 
@@ -106,7 +106,7 @@ def test_a_zeroed_input_convolution_fails_parity(autoencoder):
     mutated = StableDiffusionVAE(str(TINY), dtype=np.float32, params=broken)
 
     difference = largest_difference(
-        mutated.encode_batch(np.asarray(expected["sample"], np.float32)), expected["latent"])
+        mutated.encode_batch(mutated.params, np.asarray(expected["sample"], np.float32)), expected["latent"])
     assert difference > TOLERANCE, f"zeroed conv_in still matches: {difference:.3e}"
 
 
@@ -122,10 +122,10 @@ def test_the_real_sd3_vae_round_trips():
 
     ramp = jnp.linspace(-0.8, 0.8, 64)
     image = jnp.broadcast_to(ramp[None, :, None, None], (1, 64, 64, 3)).transpose(0, 2, 1, 3)
-    latent = vae.encode(image)
+    latent = vae.encode(vae.params, image)
     assert latent.shape == (1, 8, 8, 16)
 
-    reconstruction = vae.decode(latent)
+    reconstruction = vae.decode(vae.params, latent)
     mse = float(jnp.mean((reconstruction - image) ** 2))
     psnr = 10 * np.log10(4.0 / mse)
     assert psnr > 20, f"reconstruction too poor: {psnr:.1f}dB"
