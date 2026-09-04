@@ -26,11 +26,13 @@ from dew.diffusion.discrete import DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Objective, Step
 from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.registry import objectives
 from dew.sampling.sample import sample
 
 TEXT_KEY = "text"
 
 
+@objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective):
     """The MDLM negative ELBO over `[B, seq_len]` rows of `batch["text"]`."""
 

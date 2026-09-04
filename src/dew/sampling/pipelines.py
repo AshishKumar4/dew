@@ -11,26 +11,10 @@ import jax.numpy as jnp
 
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
-from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
-from dew.registry import models, presets
+from dew.nn.autoencoders import AutoEncoder
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM
-
-
-AUTOENCODERS = {"stable_diffusion": StableDiffusionVAE}
-
-
-def load_autoencoder(entry: Optional[dict]) -> Optional[AutoEncoder]:
-    """The autoencoder a manifest names, for the one kind that has a loader."""
-    if entry is None:
-        return None
-    try:
-        return AUTOENCODERS[entry["name"]](**entry["fields"])
-    except KeyError:
-        raise ValueError(
-            f"no loader rebuilds the {entry['name']!r} autoencoder from a manifest; "
-            f"known: {sorted(AUTOENCODERS)}") from None
 
 
 @dataclass(frozen=True, eq=False)
@@ -51,20 +35,13 @@ class TextToImage:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool = True,
                  step: Optional[int] = None) -> "TextToImage":
-        """The model, process, inputs and weights of the run in `directory`,
-        from its manifest and its latest checkpoint (or `step`)."""
+        """The run in `directory`: its `run.json` built the way the recipe
+        built it, and the weights of its latest checkpoint (or `step`)."""
         from dew.checkpoints import Checkpoints
-        from dew.interop.manifest import Manifest
         from dew.objectives.base import merge, select
-        from dew.objectives.diffusion import DiffusionObjective
+        from dew.objectives.diffusion import DiffusionRunConfig
 
-        manifest = Manifest.read(directory)
-        model = models.build(manifest.model["name"], **manifest.model["fields"])
-        process = presets.build(manifest.preset["name"], **manifest.preset["fields"])()
-        inputs = InputSpec.from_json(manifest.inputs)
-        autoencoder = load_autoencoder(manifest.autoencoder)
-        objective = DiffusionObjective(model, process, inputs, autoencoder=autoencoder)
-
+        objective = DiffusionRunConfig.load(directory).build()
         # Only shapes are traced, so the key is abstract too. Inference runs
         # on one process, so every leaf lands on the first device and the
         # sampling jit moves it from there.
@@ -79,8 +56,8 @@ class TextToImage:
         params = values["params"]
         if ema:
             params = merge(params, values["ema"])
-        return cls(model=model, process=process, inputs=inputs, params=params,
-                   autoencoder=autoencoder)
+        return cls(model=objective.model, process=objective.process, inputs=objective.inputs,
+                   params=params, autoencoder=objective.autoencoder)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool = True) -> "TextToImage":
