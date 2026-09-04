@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Generic, Mapping, Optional, Self, Sequence, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -22,28 +22,37 @@ import numpy as np
 
 from dew.nn.dit import TextContext
 from dew.nn.text_encoders import (
+    CLIPTowerOutput,
     DEFAULT_MODEL, DEFAULT_T5_MODEL, CLIPTextModel, CLIPTextTransformer,
     T5EncoderModel, T5EncoderTransformer,
 )
+from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
 
+Raw = TypeVar("Raw")
+"""One item of a modality's raw data: a prompt, a waveform."""
 
-class ConditionEncoder(ABC):
+
+class ConditionEncoder(ABC, Generic[Raw]):
     """A modality's path from raw data to a conditioning value."""
 
-    params: Any
+    params: Variables
 
     @classmethod
     @abstractmethod
-    def from_pretrained(cls, checkpoint: str, **fields) -> "ConditionEncoder":
-        """Load the tower named `checkpoint`; the one call that opens files."""
+    def from_pretrained(cls, checkpoint: str) -> Self:
+        """Load the tower named `checkpoint`; the one call that opens files.
+
+        Whatever else a checkpoint needs is a keyword field with a default,
+        which is what `to_json` records and the registry rebuilds from.
+        """
 
     @abstractmethod
-    def tokenize(self, data: Sequence) -> Any:
+    def tokenize(self, data: Sequence[Raw]) -> Any:
         """Raw data to the host arrays `encode` reads, one row per item."""
 
     @abstractmethod
-    def encode(self, params, tokens) -> Any:
+    def encode(self, params: Variables, tokens) -> Any:
         """Tokens to the conditioning value, on device, under `params`."""
 
     def captions(self, tokens) -> tuple[str, ...]:
@@ -58,7 +67,7 @@ class ConditionEncoder(ABC):
 
 @encoders("clip_text")
 @dataclass(frozen=True, eq=False)
-class CLIPText(ConditionEncoder):
+class CLIPText(ConditionEncoder[str]):
     """The CLIP text tower, vendored in `dew.nn.text_encoders`, with the
     checkpoint's tokenizer.
 
@@ -88,8 +97,8 @@ class CLIPText(ConditionEncoder):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    dtype=dtype, revision=revision)
 
-    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(texts), padding="max_length",
+    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(data), padding="max_length",
                                 max_length=self.tokenizer.model_max_length,
                                 truncation=True, return_tensors="np")
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
@@ -98,6 +107,9 @@ class CLIPText(ConditionEncoder):
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
         hidden = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+        # The tower's own output type, which also rules out apply's
+        # mutable-collections pair; no collection was asked for.
+        assert isinstance(hidden, CLIPTowerOutput)
         return TextContext(hidden=hidden.last_hidden_state, mask=mask)
 
     def captions(self, tokens) -> tuple[str, ...]:
@@ -111,7 +123,7 @@ class CLIPText(ConditionEncoder):
 
 @encoders("audio")
 @dataclass(frozen=True, eq=False)
-class Audio(ConditionEncoder):
+class Audio(ConditionEncoder[Any]):
     """Audio conditioning through a Hugging Face feature extractor and a pure
     `apply(params, features) -> [B, L, D]` over whatever keys the extractor
     emits (`input_values` for wav2vec2/HuBERT, `input_features` for
@@ -139,8 +151,8 @@ class Audio(ConditionEncoder):
             "construct Audio with its apply and params and "
             "AutoFeatureExtractor.from_pretrained(checkpoint) as the extractor")
 
-    def tokenize(self, audio: Sequence) -> dict[str, np.ndarray]:
-        return dict(self.extractor(audio, sampling_rate=self.sampling_rate,
+    def tokenize(self, data: Sequence[Any]) -> dict[str, np.ndarray]:
+        return dict(self.extractor(data, sampling_rate=self.sampling_rate,
                                    padding=True, return_tensors="np"))
 
     def encode(self, params, tokens) -> jax.Array:
@@ -151,7 +163,7 @@ class Audio(ConditionEncoder):
 
 @encoders("t5")
 @dataclass(frozen=True, eq=False)
-class T5Text(ConditionEncoder):
+class T5Text(ConditionEncoder[str]):
     """The T5 encoder tower, vendored in `dew.nn.text_encoders`, with the
     checkpoint's tokenizer.
 
@@ -183,8 +195,8 @@ class T5Text(ConditionEncoder):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    max_length=max_length, dtype=dtype, revision=revision)
 
-    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.max_length,
+    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(data), padding="max_length", max_length=self.max_length,
                                 truncation=True, return_tensors="np")
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
@@ -192,6 +204,7 @@ class T5Text(ConditionEncoder):
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
         hidden = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+        assert not isinstance(hidden, tuple)  # no mutable collections were asked for
         return TextContext(hidden=hidden, mask=mask)
 
     def captions(self, tokens) -> tuple[str, ...]:
@@ -206,7 +219,7 @@ class T5Text(ConditionEncoder):
 
 @encoders("char_table")
 @dataclass(frozen=True, eq=False)
-class CharTable(ConditionEncoder):
+class CharTable(ConditionEncoder[str]):
     """Text as a table lookup: each character is an id and each id a fixed
     random vector. It costs nothing and downloads nothing, so it is the text
     encoder of tests, benchmarks and smoke runs, and it has the shape of a
@@ -214,7 +227,7 @@ class CharTable(ConditionEncoder):
     takes this one unchanged.
     """
 
-    params: dict
+    params: Variables
     tokens: int = 8
     features: int = 16
     vocab: int = 130
@@ -227,11 +240,11 @@ class CharTable(ConditionEncoder):
         return cls(params={"table": jnp.asarray(table, resolve_dtype(dtype) or jnp.float32)},
                    tokens=tokens, features=features, vocab=vocab)
 
-    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
         # id 0 is padding, 1 is the start token, characters follow.
-        ids = np.zeros((len(texts), self.tokens), np.int32)
-        mask = np.zeros((len(texts), self.tokens), np.int32)
-        for row, text in enumerate(texts):
+        ids = np.zeros((len(data), self.tokens), np.int32)
+        mask = np.zeros((len(data), self.tokens), np.int32)
+        for row, text in enumerate(data):
             codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1
