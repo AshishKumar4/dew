@@ -5,7 +5,7 @@ the visible context, in latent space. Three moving parts:
 
   - the context encoder sees only the context tokens and is trained;
   - the target encoder sees the whole image and is not: it is the EMA of the
-    context encoder, so it lives in the trainer's ema_params rather than in a
+    context encoder, so it lives in the trainer's EMA copy rather than in a
     parameter subtree of its own, and its branch is stop_gradient'd;
   - the predictor maps context embeddings plus target positions to the target
     representations.
@@ -22,17 +22,23 @@ step so that collapse is visible in the training curves rather than at the end
 of a probe run.
 """
 
+from __future__ import annotations
+
+import functools
 from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 import optax
 
-from dew.objectives.base import Objective, EMASpec
+from dew.artifacts import Representations
+from dew.inputs import Field, InputSpec, unit_range
+from dew.objectives.base import Aux, EMASpec, Objective, Step, under
 from .masking import MultiBlockMask
 
 CONTEXT_ENCODER = "context_encoder"
 PREDICTOR = "predictor"
+LABEL_KEY = "label"
 
 
 def representation_health(z) -> Dict[str, jax.Array]:
@@ -71,40 +77,45 @@ def normalize_targets(x, epsilon: float = 1e-6):
 
 
 class JepaObjective(Objective):
-    """Joint-embedding prediction over images (B,H,W,C) or video (B,T,H,W,C)."""
+    """Joint-embedding prediction over images (B,H,W,C) or video (B,T,H,W,C).
 
-    tag = "jepa"
+    Evaluation returns the pooled target-encoder embeddings of a batch with
+    its labels, which the probe metrics score.
+    """
+
+    artifact = Representations
 
     def __init__(
         self,
         encoder,
         predictor,
         mask: MultiBlockMask,
-        sample_data_key: str,
-        sample_data_shape: Tuple[int, ...],
+        sample: Field,
         momentum: Tuple[float, float] = (0.996, 1.0),
         momentum_steps: int = 100_000,
+        label_key: str = LABEL_KEY,
     ):
         self.encoder = encoder
         self.predictor = predictor
         self.mask = mask
-        self.sample_data_key = sample_data_key
-        self.sample_data_shape = tuple(sample_data_shape)
-        self.is_video = len(self.sample_data_shape) == 4
+        self.sample = sample
+        self.label_key = label_key
+        self.is_video = len(sample.shape) == 4
+        self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
             decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps),
-            path=("params", CONTEXT_ENCODER),
+            select=under("params", CONTEXT_ENCODER),
         )
 
-    def init_params(self, rng):
-        encoder_rng, predictor_rng = jax.random.split(rng)
-        sample = jnp.ones((1, *self.sample_data_shape))
+    def init(self, key):
+        encoder_key, predictor_key = jax.random.split(key)
+        sample = jnp.ones((1, *self.sample.shape))
         context_idx = jnp.arange(self.mask.num_context, dtype=jnp.int32)[None]
         target_idx = jnp.arange(self.mask.block_area, dtype=jnp.int32)[None]
 
-        encoder = self.encoder.init(encoder_rng, sample, context_idx)
+        encoder = self.encoder.init(encoder_key, sample, context_idx)
         context = self.encoder.apply(encoder, sample, context_idx)
-        predictor = self.predictor.init(predictor_rng, context, context_idx, target_idx)
+        predictor = self.predictor.init(predictor_key, context, context_idx, target_idx)
         return {"params": {CONTEXT_ENCODER: encoder["params"],
                            PREDICTOR: predictor["params"]}}
 
@@ -112,15 +123,15 @@ class JepaObjective(Objective):
         return self.encoder.apply({"params": encoder_params}, data, token_idx,
                                   train=train, rngs=rngs)
 
-    def loss(self, params, ema_params, batch, rng, step):
-        data = (jnp.asarray(batch[self.sample_data_key], dtype=jnp.float32) - 127.5) / 127.5
+    def loss(self, params, batch, step: Step):
+        data = unit_range(batch[self.sample.key])
         batch_size = data.shape[0]
-        mask_rng, dropout_rng = jax.random.split(rng)
-        context_idx, target_idx = self.mask.sample(mask_rng, batch_size)
+        mask_key, dropout_key = jax.random.split(step.key)
+        context_idx, target_idx = self.mask.sample(mask_key, batch_size)
         num_targets = self.mask.num_targets
 
         # Target branch: the whole view through the EMA encoder, no gradient
-        full = normalize_targets(self.encode(ema_params["params"][CONTEXT_ENCODER], data))
+        full = normalize_targets(self.encode(step.ema["params"][CONTEXT_ENCODER], data))
         # [B, (T,) S, F] -> [B, M, (T,) n_tgt, F]
         frame_axis = (1,) if self.is_video else ()
         gather_idx = target_idx.reshape(batch_size, num_targets, *frame_axis, -1, 1)
@@ -129,7 +140,7 @@ class JepaObjective(Objective):
 
         context = self.encode(
             params["params"][CONTEXT_ENCODER], data, context_idx,
-            train=True, rngs={"dropout": dropout_rng})
+            train=True, rngs={"dropout": dropout_key})
 
         # Each target block is predicted from the same context: fold the block
         # axis into the batch so one predictor call covers all M of them
@@ -139,20 +150,23 @@ class JepaObjective(Objective):
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0),
             target_idx.reshape(batch_size * num_targets, -1),
-            train=True, rngs={"dropout": dropout_rng},
+            train=True, rngs={"dropout": dropout_key},
         ).reshape(targets.shape)
 
         loss = jnp.mean(
             (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
-        return loss, representation_health(pooled)
+        return loss, Aux(representation_health(pooled))
 
-    def make_validation_step(self, **_):
-        """Frozen target-encoder embeddings, which the probes score."""
-        def embed(val_state, batch):
-            data = (jnp.asarray(batch[self.sample_data_key], dtype=jnp.float32) - 127.5) / 127.5
-            features = self.encode(
-                val_state.ema_params["params"][CONTEXT_ENCODER], data)
+    def evaluate(self, params, batch, step: Step):
+        """The frozen target encoder's pooled embeddings, with the batch labels."""
+        features = self._embed(step.ema["params"][CONTEXT_ENCODER], batch[self.sample.key])
+        return Representations(features=features, labels=jnp.asarray(batch[self.label_key]))
+
+    @functools.cached_property
+    def _embed(self):
+        def embed(encoder_params, pixels):
+            features = self.encode(encoder_params, unit_range(pixels))
             return jnp.mean(features, axis=tuple(range(1, features.ndim - 1)))
 
-        return embed
+        return jax.jit(embed)

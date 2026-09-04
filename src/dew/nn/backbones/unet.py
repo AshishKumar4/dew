@@ -37,7 +37,10 @@ class Unet(nn.Module):
         # print("embedding features", self.emb_features)
         temb = FourierEmbedding(features=self.emb_features)(temb)
         temb = TimeProjection(features=self.emb_features)(temb)
-        
+
+        # Cross-attention reads the whole sequence; the mask weights the
+        # pooling the DiT family does and has no place in it here.
+        textcontext = textcontext.hidden
         _, TS, TC = textcontext.shape
         
         # print("time embedding", temb.shape)

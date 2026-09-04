@@ -1,7 +1,10 @@
-from .common import EvaluationMetric
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from dew.inputs import unit_range
+from dew.registry import metrics
+from .common import ImageMetric
 
 
 # The FID InceptionV3 is ~90MB of weights; one copy is enough for every metric
@@ -52,8 +55,9 @@ def _gaussian_stats(activations):
     return activations.mean(axis=0), np.cov(activations, rowvar=False)
 
 
-def get_fid_metric():
-    """FID between the generated batch and the real batch, lower is better.
+@metrics("fid")
+def fid(field: str = "image") -> ImageMetric:
+    """FID between the sampled images and the batch's, lower is better.
 
     Per-batch FID is noisy at typical validation batch sizes and is only
     meaningful as a relative trend across checkpoints, not as a headline number
@@ -68,10 +72,9 @@ def get_fid_metric():
         features = model.apply(params, resized, train=False)
         return features.reshape(features.shape[0], -1)
 
-    def fid_metric(generated: jnp.ndarray, batch):
-        original = (jnp.asarray(batch['image'], dtype=jnp.float32) - 127.5) / 127.5
-        mu_gen, sigma_gen = _gaussian_stats(activations(generated))
-        mu_real, sigma_real = _gaussian_stats(activations(original))
+    def measure(artifact, batch):
+        mu_gen, sigma_gen = _gaussian_stats(activations(artifact.images))
+        mu_real, sigma_real = _gaussian_stats(activations(unit_range(batch[field])))
         return frechet_distance(mu_gen, sigma_gen, mu_real, sigma_real)
 
-    return EvaluationMetric(function=fid_metric, name='fid')
+    return ImageMetric(name="fid", measure=measure)

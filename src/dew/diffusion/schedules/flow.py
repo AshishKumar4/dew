@@ -1,9 +1,9 @@
 import math
+
 import jax
 import jax.numpy as jnp
-from dew.random_state import RandomMarkovState
+
 from .continuous import ContinuousNoiseScheduler
-from .common import reshape_rates
 
 
 def compute_resolution_shift(sequence_length, base_seq_len=256, max_seq_len=4096,
@@ -27,30 +27,31 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
     SD3, which concentrates training on the middle of the trajectory where the
     velocity is hardest to predict.
     """
-    def __init__(self, shift: float = 1.0, logit_mean: float = 0.0, logit_std: float = 1.0,
-                 dtype=jnp.float32, clip_min=-1.0, clip_max=1.0, min_snr_gamma=None, prediction_transform=None):
-        super().__init__(dtype=dtype, clip_min=clip_min, clip_max=clip_max,
-                         min_snr_gamma=min_snr_gamma, prediction_transform=prediction_transform)
+
+    def __init__(self, shift: float = 1.0, logit_mean: float = 0.0, logit_std: float = 1.0):
         self.shift = shift
         self.logit_mean = logit_mean
         self.logit_std = logit_std
 
-    def shift_timesteps(self, steps) -> jnp.ndarray:
-        return self.shift * steps / (1 + (self.shift - 1) * steps)
+    def shift_timesteps(self, t) -> jax.Array:
+        return self.shift * t / (1 + (self.shift - 1) * t)
 
-    def generate_timesteps(self, batch_size, state: RandomMarkovState) -> tuple[jnp.ndarray, RandomMarkovState]:
-        state, rng = state.get_random_key()
-        normal = jax.random.normal(rng, (batch_size,), dtype=self.dtype)
-        return jax.nn.sigmoid(normal * self.logit_std + self.logit_mean), state
+    def sample_t(self, key, n):
+        normal = jax.random.normal(key, (n,), dtype=jnp.float32)
+        return jax.nn.sigmoid(normal * self.logit_std + self.logit_mean)
 
-    def get_rates(self, steps, shape=(-1, 1, 1, 1)) -> tuple[jnp.ndarray, jnp.ndarray]:
-        t = self.shift_timesteps(jnp.asarray(steps, dtype=self.dtype))
-        return reshape_rates((1 - t, t), shape=shape)
+    def rates(self, t):
+        t = self.shift_timesteps(jnp.asarray(t, jnp.float32))
+        return 1 - t, t
 
-    def get_schedule_weights(self, steps, shape=(-1, 1, 1, 1)) -> jnp.ndarray:
-        return jnp.ones_like(jnp.asarray(steps, dtype=self.dtype)).reshape(shape)
+    def weight(self, t):
+        return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
-    def transform_inputs(self, x, steps) -> tuple[jnp.ndarray, jnp.ndarray]:
-        # The Fourier time embedding is tuned for discrete-style timesteps, so
-        # the [0, 1] flow time is rescaled into that range
-        return x, self.shift_timesteps(jnp.asarray(steps, dtype=self.dtype)) * 1000
+    def model_time(self, t):
+        # The flow models were trained on the shifted time times 1000, so that
+        # is what a trained one reads. SimpleDiT's embedder is EDM's random
+        # Fourier features (blocks.FourierEmbedding), which take an input of
+        # order one and do not ask for the DiT sinusoidal range; the factor
+        # stays because changing it changes what every trained flow model is
+        # conditioned on.
+        return self.shift_timesteps(jnp.asarray(t, jnp.float32)) * 1000

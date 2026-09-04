@@ -11,6 +11,7 @@ import einops
 import functools
 import math
 from .blocks import kernel_init
+from .sharding import logical_axes
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -224,6 +225,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     raise ValueError(f"Unknown attention implementation: {implementation}")
 
 
+@logical_axes({
+    ("to_q",): ("embed", "heads", "head_dim"),
+    ("to_k",): ("embed", "heads", "head_dim"),
+    ("to_v",): ("embed", "heads", "head_dim"),
+    ("to_out_0",): ("heads", "head_dim", "embed"),
+})
 class NormalAttention(nn.Module):
     """
     Simple implementation of the normal attention.
@@ -340,6 +347,7 @@ class FlaxGEGLU(nn.Module):
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
         return hidden_linear * nn.gelu(hidden_gelu)
     
+@logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FlaxFeedForward(nn.Module):
     r"""
     Flax module that encapsulates two Linear layers separated by a non-linearity. It is the counterpart of PyTorch's

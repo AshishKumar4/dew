@@ -23,8 +23,19 @@ from ..dit import (
 from ..attention import scaled_dot_product_attention
 from ..vit import RotaryEmbedding, AdaLNParams, apply_rotary_embedding
 from dew.registry import models
+from ..sharding import logical_axes
 
 
+@logical_axes({
+    **{(f"{stream}_to_{which}",): ("embed", "heads", "head_dim")
+       for stream in ("img", "txt") for which in ("q", "k", "v")},
+    ("img_out",): ("heads", "head_dim", "embed"),
+    ("txt_out",): ("heads", "head_dim", "embed"),
+    ("img_mlp", "layers_0"): ("embed", "mlp"),
+    ("img_mlp", "layers_2"): ("mlp", "embed"),
+    ("txt_mlp", "layers_0"): ("embed", "mlp"),
+    ("txt_mlp", "layers_2"): ("mlp", "embed"),
+})
 class MMDiTBlock(nn.Module):
     """Dual-stream MM-DiT block: per-modality weights, joint attention.
 
@@ -136,6 +147,7 @@ class MMDiTBlock(nn.Module):
 
 
 @models("simple_mmdit")
+@logical_axes({}, heuristic=(("txt_embed",),))
 class SimpleMMDiT(nn.Module):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
     output_channels: int = 3
@@ -205,7 +217,7 @@ class SimpleMMDiT(nn.Module):
         B, H, W, C = x.shape
 
         img, inv_idx = self.embed(x)
-        txt = self.txt_embed(textcontext)
+        txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = neutralized_rope_freqs(self.rope, img.shape[1], self.scan_order)
 
@@ -215,6 +227,7 @@ class SimpleMMDiT(nn.Module):
         return self.output(img, inv_idx, H, W, conditioning=cond_emb)
 
 
+@logical_axes({}, heuristic=(("projection",),))
 class PatchMerging(nn.Module):
     """
     Merges a group of patches into a single patch with increased feature dimensions.
@@ -263,6 +276,7 @@ class PatchMerging(nn.Module):
 
         return merged, new_H, new_W
 
+@logical_axes({}, heuristic=(("projection",),))
 class PatchExpanding(nn.Module):
     """
     Expands patches to increase spatial resolution.
@@ -312,6 +326,7 @@ class PatchExpanding(nn.Module):
 
 
 @models("hierarchical_mmdit")
+@logical_axes({}, heuristic=(("cond_proj_stage*",), ("txt_embed_stage*",), ("fusion_*",)))
 class HierarchicalMMDiT(nn.Module):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.
@@ -441,7 +456,7 @@ class HierarchicalMMDiT(nn.Module):
         img, _ = self.embed(x)
         cond_base = self.conditioning(temb, textcontext)
         conds = [proj(cond_base) for proj in self.cond_projs]
-        txts = [embed(textcontext) for embed in self.txt_embeds]
+        txts = [embed(textcontext.hidden) for embed in self.txt_embeds]
 
         # --- Encoder path ---
         H_P, W_P = H // self.base_patch_size, W // self.base_patch_size
