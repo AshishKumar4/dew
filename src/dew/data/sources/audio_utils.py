@@ -98,7 +98,7 @@ def read_audio_ffmpeg(
         # Always clean up the temporary file
         try:
             os.unlink(tmp_path)
-        except:
+        except OSError:
             pass
 
 

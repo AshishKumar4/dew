@@ -274,6 +274,41 @@ def test_the_fetch_pool_starts_its_workers_without_forking(monkeypatch):
     assert all(DROPPED_SAMPLE in entry for entry in reported)
 
 
+def test_the_fetch_pool_covers_the_rows_past_an_even_split(monkeypatch):
+    """Thirteen rows over two workers: an even split holds twelve, so the
+    thirteenth row needs a shard of its own. A row no shard holds is a row no
+    run ever trains on, however long the stream runs. The drop markers carry
+    their urls, so two passes have to show every row."""
+    monkeypatch.setattr(os, "fork", _refuse_to_fork)
+    rows = POOL_ROWS + 1
+    data_queue = online_loader.ResourceManager(max_queue_size=64).get_data_queue()
+    producer_failure = []
+
+    def produce():
+        try:
+            online_loader.parallel_media_loader(
+                _StubDataset(rows, passes=2), data_queue=data_queue, num_workers=2,
+                num_threads=2, timeout=1, retries=0, image_shape=(64, 64),
+                min_image_shape=(32, 32))
+        except BaseException as error:
+            producer_failure.append(error)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    reported = []
+    deadline = time.monotonic() + 120
+    while len(reported) < 2 * rows and time.monotonic() < deadline:
+        try:
+            reported.append(data_queue.get(timeout=0.5))
+        except queue.Empty:
+            assert not producer_failure, producer_failure[0]
+
+    assert len(reported) == 2 * rows
+    assert all(DROPPED_SAMPLE in entry for entry in reported)
+    seen = {entry[DROPPED_SAMPLE] for entry in reported}
+    assert seen == {f"https://example.invalid/{i}.jpg" for i in range(rows)}
+
+
 def test_a_fetched_image_reaches_the_queue_as_a_sample(tmp_path, monkeypatch):
     """What a worker does with one url, run here rather than in a worker, which
     holds no copy of a patched fetch. Of that path only the request header
