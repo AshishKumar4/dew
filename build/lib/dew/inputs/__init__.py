@@ -24,7 +24,7 @@ from dew import registry
 from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text
 
 
-def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
+def unit_range(pixels) -> jax.Array:
     """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
 
