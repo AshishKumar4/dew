@@ -119,7 +119,7 @@ def cudnn_supports(query, key) -> Optional[str]:
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
-                                 causal=False, sliding_window=None, mask=None):
+                                 causal=False, sliding_window=None, mask=None, bias=None):
     """The one attention kernel path for every attention module.
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
@@ -152,6 +152,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     kernels take causality and the window as flags rather than a materialized
     mask, which is where their memory win comes from; the TPU kernel has no
     mask argument, so an explicit mask rides in there as an additive bias.
+    `bias` is an additive float array broadcastable to [B, H, Q, K], added to
+    the logits on every path; T5's relative position table travels in it.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -165,7 +167,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
             mask = structural if mask is None else jnp.logical_and(mask, structural)
         return nn.dot_product_attention(
-            query, key, value, mask=mask, dtype=dtype, broadcast_dropout=False,
+            query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
@@ -198,7 +200,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
         return jax.nn.dot_product_attention(
-            query, key, value, mask=mask, is_causal=causal,
+            query, key, value, bias=bias, mask=mask, is_causal=causal,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation=implementation)
     if implementation == 'tpu':
@@ -210,16 +212,20 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         q = jnp.moveaxis(query, -2, -3)
         k = jnp.moveaxis(key, -2, -3)
         v = jnp.moveaxis(value, -2, -3)
-        bias = None
+        combined = None
+        if bias is not None:
+            combined = jnp.broadcast_to(bias.astype(q.dtype),
+                                        (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
         if mask is not None or sliding_window is not None:
             if sliding_window is not None:
                 band = causal_attention_mask(
                     jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
                 mask = band if mask is None else jnp.logical_and(mask, band)
-            bias = jnp.broadcast_to(
+            seated = jnp.broadcast_to(
                 jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
                 (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
-        out = flash_attention(q, k, v, ab=bias, causal=causal,
+            combined = seated if combined is None else combined + seated
+        out = flash_attention(q, k, v, ab=combined, causal=causal,
                               sm_scale=1.0 / math.sqrt(query.shape[-1]))
         return jnp.moveaxis(out, -3, -2)
     raise ValueError(f"Unknown attention implementation: {implementation}")
