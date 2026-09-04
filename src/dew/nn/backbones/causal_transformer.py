@@ -57,18 +57,23 @@ class RMSNorm(nn.Module):
     epsilon: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
+    with_scale: bool = True
     dtype: Optional[Dtype] = None
 
     @nn.compact
     def __call__(self, x):
+        dtype = self.dtype if self.dtype is not None else x.dtype
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        if not self.with_scale:
+            # A pure normalization with no learned weight, as Gemma 4 norms
+            # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
+            return y.astype(dtype)
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32)
-        dtype = self.dtype if self.dtype is not None else x.dtype
         weight = (1.0 + scale) if self.scale_offset else scale
-        y = x.astype(jnp.float32)
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
@@ -133,6 +138,11 @@ class CausalSelfAttention(nn.Module):
     causal=False is full attention over the sequence, which a masked
     diffusion model reads the whole corrupted sequence with; there is no
     cache to decode against then, so decode=True raises.
+
+    kv_shared marks a layer that owns no K/V projections (Gemma 3n/4 style
+    cross-layer KV sharing): it reads the keys, values and their positions
+    that the designated earlier layer of the same layer type stashed in
+    `kv_store`, post rope and post norm, and keeps no cache of its own.
     """
     emb_features: int
     num_heads: int
@@ -142,9 +152,12 @@ class CausalSelfAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     qk_norm: bool = True
+    v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
+    kv_shared: bool = False
+    kv_store_key: Optional[str] = None
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
@@ -157,26 +170,52 @@ class CausalSelfAttention(nn.Module):
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
         self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
-        self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-        self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
+        # A sharing layer reads another layer's keys and values, so it owns
+        # no projections or key norm of its own, exactly as the reference
+        # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
+        if not self.kv_shared:
+            self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
+            self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.qk_norm:
             norm = functools.partial(
                 RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype)
             self.q_norm = norm(name='q_norm')
-            self.k_norm = norm(name='k_norm')
+            if not self.kv_shared:
+                self.k_norm = norm(name='k_norm')
+        if self.v_norm and not self.kv_shared:
+            # Gemma 4 norms the values with a scale-free RMSNorm before they
+            # are cached or shared (modeling_gemma4.py, Gemma4TextAttention).
+            # The attribute cannot share the field's name, and it holds no
+            # parameters either way.
+            self.values_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
+                                       dtype=self.dtype, name='v_norm')
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None):
+                 positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
         query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
-        key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
-        value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
+        if self.kv_shared:
+            # The provider ran earlier in the same forward pass and stashed
+            # its post-norm, post-rope keys and values with their positions,
+            # so there is nothing to project, norm, rotate or cache here.
+            if kv_store is None or self.kv_store_key not in kv_store:
+                raise ValueError(
+                    f"layer shares K/V under {self.kv_store_key!r} but no provider "
+                    "stashed them; the model has to pass one kv_store dict down "
+                    "its layer stack")
+            key, value, positions = kv_store[self.kv_store_key]
+        else:
+            key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
+            value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
+            if self.qk_norm:
+                key = self.k_norm(key)
+            if self.v_norm:
+                value = self.values_norm(value)
         if self.qk_norm:
             query = self.q_norm(query)
-            key = self.k_norm(key)
 
         # The cache slot carries position while decoding, so the rotation and
         # the mask both read it instead of the row index of the token. A
@@ -186,30 +225,42 @@ class CausalSelfAttention(nn.Module):
         if decode:
             if not self.causal:
                 raise ValueError("full attention has no KV cache to decode against")
-            positions, append = open_kv_cache(self, key, self.max_seq_len)
-        elif positions is None:
+            if self.kv_shared:
+                kv_len = key.shape[-3]
+            else:
+                positions, append = open_kv_cache(self, key, self.max_seq_len)
+        elif positions is None and not self.kv_shared:
             positions = jnp.arange(S)
-        else:
+        elif not self.kv_shared:
             positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-        # query carries the ratio to the scale the checkpoint asks for. The
-        # reference hands its scaling to the attention call as a float
-        # (modeling_gemma3.py:318, 376), so the ratio rides the rotary's fp32
-        # arithmetic rather than being rounded to the activation dtype first.
+        # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
             query, freqs_cos, freqs_sin,
             scale=(None if self.attention_scale is None
                    else self.attention_scale * math.sqrt(self.head_dim)))
-        key = apply_rotary(key, freqs_cos, freqs_sin)
-
+        if not self.kv_shared:
+            key = apply_rotary(key, freqs_cos, freqs_sin)
+            if kv_store is not None and self.kv_store_key is not None:
+                # Post-norm, post-rope, the same tensors the reference hands
+                # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
+                kv_store[self.kv_store_key] = (key, value, positions)
         causal, mask = self.causal, None
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
-        if append is not None:
+        if self.kv_shared and decode:
+            # No cache of its own: the provider's stashed keys carry the full
+            # history, so the mask reads them the way the provider's own
+            # decode mask does.
+            mask = causal_attention_mask(positions, kv_len, self.sliding_window)
+            causal = False
+        elif append is not None:
             key, value = append(key, value)
             mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
             causal = False
+            if kv_store is not None and self.kv_store_key is not None:
+                kv_store[self.kv_store_key] = (key, value, positions)
         elif segment_ids is not None:
             # Attention stays inside each packed document: the segment ids
             # make the mask block-diagonal, padding (segment 0) sees nothing,
@@ -277,6 +328,10 @@ class GatedMLP(nn.Module):
         return self.down_proj(gate * self.up_proj(x))
 
 
+@logical_axes({
+    ("per_layer_input_gate",): ("embed", "mlp"),
+    ("per_layer_projection",): ("mlp", "embed"),
+})
 class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
@@ -290,6 +345,11 @@ class DecoderBlock(nn.Module):
     sublayer rather than on its input; the pre-norms keep their names and their
     places, so a checkpoint without them loads into the same tree minus two
     leaves per layer.
+
+    kv_store threads one dict down the layer stack so a KV-sharing mixer
+    reads its provider's keys and values; a mixer without a kv_store keyword
+    fails loudly when a run shares. per_layer_input is the layer's input
+    signal for the per-layer residual, None when the model has none.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -298,6 +358,7 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     sandwich_norms: bool = False
+    per_layer_input_dim: int = 0
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -313,29 +374,52 @@ class DecoderBlock(nn.Module):
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
         self.mlp = self.feedforward(name='mlp')
+        if self.per_layer_input_dim:
+            dense = functools.partial(
+                nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            self.per_layer_input_gate = dense(self.per_layer_input_dim,
+                                              name='per_layer_input_gate')
+            self.per_layer_projection = dense(self.emb_features,
+                                              name='per_layer_projection')
+            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, train: bool = False, decode: bool = False,
-                 positions=None, segment_ids=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 per_layer_input=None):
         mixed = self.self_attn(self.input_layernorm(x), decode=decode,
-                               positions=positions, segment_ids=segment_ids)
+                               positions=positions, segment_ids=segment_ids,
+                               **({} if kv_store is None else {"kv_store": kv_store}))
         if self.sandwich_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
         hidden = self.mlp(self.post_attention_layernorm(x))
         if self.sandwich_norms:
             hidden = self.mlp_output_norm(hidden)
-        return x + self.dropout(hidden, deterministic=not train)
+        x = x + self.dropout(hidden, deterministic=not train)
+        if self.per_layer_input_dim and per_layer_input is not None:
+            # Gemma 3n/4's per-layer residual (modeling_gemma4.py,
+            # Gemma4TextDecoderLayer): the layer's own gate over x, activated
+            # like its feed-forward, multiplied by the layer's input signal,
+            # projected back and normed.
+            gated = self.per_layer_input_gate(x)
+            gated = nn.silu(gated) if self._gate_activation == 'swiglu' else nn.gelu(gated)
+            projected = self.per_layer_projection(gated * per_layer_input)
+            x = x + self.post_per_layer_input_norm(projected)
+        return x
 
-
+    @property
+    def _gate_activation(self) -> str:
+        return getattr(self.mlp, 'activation', 'swiglu')
 @models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
     ("lm_head",): ("embed", "vocab"),
+    ("embed_tokens_per_layer",): ("vocab", None),
+    ("per_layer_model_projection",): ("embed", "mlp"),
 })
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
-
     The defaults are a from-scratch training recipe (multi-head attention,
     swiglu, tied embeddings, no softcap); the fields that differ between the
     open decoders are all here, so a Qwen3 or Gemma3 config is a field
@@ -358,10 +442,18 @@ class CausalTransformer(nn.Module):
     which is Mixtral. A dense layer keeps the leaves it always had.
     expert_bias adds DeepSeek's balancing bias to every router, kept in the
     `moe` collection; the LM objective's balance_rate is what moves it.
-
     causal=False turns every layer into full attention with no cache, the
     encoder a masked diffusion language model denoises with; the parameter
-    tree is the same either way.
+
+    per_layer_input_dim turns on Gemma 3n/4 style per-layer input embeddings:
+    an extra table of per_layer_input_vocab by layers times dim rows, read
+    per layer and added to that layer's input through its own gate. 0 is a
+    plain decoder and leaves the tree unchanged.
+
+    num_kv_shared_layers makes the trailing layers of that count reuse the
+    keys and values of the last earlier layer of their own type instead of
+    projecting their own (Gemma 3n/4 cross-layer KV sharing). 0 is a plain
+    decoder and leaves the tree unchanged.
     """
     vocab_size: int
     emb_features: int = 512
@@ -382,6 +474,7 @@ class CausalTransformer(nn.Module):
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
     qk_norm: bool = True
+    v_norm: bool = False                      # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -398,6 +491,9 @@ class CausalTransformer(nn.Module):
     moe_layers: Optional[Tuple[int, ...]] = None  # the sparse layers by index
     expert_bias: bool = False                # DeepSeek's aux-loss-free balancing bias
     causal: bool = True                      # False: full attention, no cache
+    per_layer_input_dim: int = 0             # Gemma 3n/4 per-layer inputs; 0 disables
+    per_layer_input_vocab: Optional[int] = None  # None: vocab_size
+    num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -439,6 +535,37 @@ class CausalTransformer(nn.Module):
                          if (index + 1) % self.moe_every == 0)
         return tuple(range(self.num_layers))
 
+    @property
+    def kv_sharing(self) -> dict:
+        """Sharing layer index to the provider it reads, both of one layer type.
+
+        The trailing num_kv_shared_layers layers own no K/V and read the last
+        non-sharing layer of their own type (modeling_gemma4.py,
+        Gemma4TextAttention). Empty unless sharing is on.
+        """
+        if not self.num_kv_shared_layers:
+            return {}
+        first = self.num_layers - self.num_kv_shared_layers
+        if first <= 0:
+            raise ValueError(
+                f"num_kv_shared_layers ({self.num_kv_shared_layers}) has to leave "
+                f"a provider: it must be between 1 and num_layers - 1 "
+                f"({self.num_layers - 1})")
+        types = self.per_layer_types
+        providers = {}
+        for index in range(first, self.num_layers):
+            earlier = [j for j in range(first) if types[j] == types[index]]
+            if not earlier:
+                raise ValueError(
+                    f"layer {index} shares K/V but no earlier {types[index]} layer "
+                    "exists to provide them")
+            providers[index] = earlier[-1]
+        return providers
+
+    @property
+    def per_layer_vocab(self) -> int:
+        return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
+
     def setup(self):
         head_dim = self.features_per_head
         if head_dim % 2:
@@ -477,10 +604,29 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"moe_layers {outside} are outside the {self.num_layers} layers "
                 "of this model")
+        sharing = self.kv_sharing
+        ple = self.per_layer_input_dim
+        if ple < 0:
+            raise ValueError(f"per_layer_input_dim must be non-negative, got {ple}")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
             dtype=self.dtype, name='embed_tokens')
+        if ple:
+            # The packed table every layer reads its own slice of
+            # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
+            # hidden_size_per_layer_input slice per layer.
+            self.embed_tokens_per_layer = nn.Embed(
+                num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
+                dtype=self.dtype, name='embed_tokens_per_layer')
+            self.per_layer_model_projection = nn.Dense(
+                self.num_layers * ple, use_bias=False,
+                dtype=self.dtype, precision=self.precision,
+                name='per_layer_model_projection')
+            self.per_layer_projection_norm = RMSNorm(
+                epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype,
+                name='per_layer_projection_norm')
         self.layers = [
             DecoderBlock(
                 mixer=functools.partial(
@@ -496,9 +642,12 @@ class CausalTransformer(nn.Module):
                                 and self.rope_local_theta is not None
                                 else self.rope_theta),
                     qk_norm=self.qk_norm,
+                    v_norm=self.v_norm,
                     norm_eps=self.norm_eps,
                     scale_offset=self.scale_offset,
                     scale_after_cast=self.scale_after_cast,
+                    kv_shared=index in sharing,
+                    kv_store_key=layer_type,
                     sliding_window=(self.sliding_window
                                     if layer_type == 'sliding_attention' else None),
                     attention_bias=self.attention_bias,
@@ -507,7 +656,6 @@ class CausalTransformer(nn.Module):
                     precision=self.precision,
                     attention_impl=self.attention_impl,
                     force_fp32_for_softmax=self.force_fp32_for_softmax),
-                emb_features=self.emb_features,
                 feedforward=(
                     functools.partial(
                         SparseMLP,
@@ -525,12 +673,13 @@ class CausalTransformer(nn.Module):
                         hidden_features=self.hidden_features,
                         out_features=self.emb_features,
                         activation=self.mlp,
-                        dtype=self.dtype,
                         precision=self.precision)),
+                emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
+                per_layer_input_dim=ple,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
                 precision=self.precision,
@@ -584,10 +733,37 @@ class CausalTransformer(nn.Module):
             scaled = x * jnp.asarray(math.sqrt(self.emb_features),
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
-        for layer in self.layers:
+        ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        kv_store = {} if self.num_kv_shared_layers else None
+        for index, layer in enumerate(self.layers):
             x = layer(x, train=train, decode=decode,
-                      positions=positions, segment_ids=segment_ids)
+                      positions=positions, segment_ids=segment_ids,
+                      kv_store=kv_store,
+                      per_layer_input=None if ple is None else ple[:, :, index, :])
         return self.norm(x)
+
+    def per_layer_inputs(self, tokens, inputs_embeds):
+        """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
+
+        The token-identity component is the packed table's row for each
+        token, scaled like the main embedding; the context component is the
+        input embeddings projected down, scaled and normed. Their sum over
+        sqrt(2) is what each layer's gate multiplies in
+        (modeling_gemma4.py, get_per_layer_inputs/project_per_layer_inputs).
+        """
+        ple = self.per_layer_input_dim
+        table = self.embed_tokens_per_layer(tokens).reshape(
+            *tokens.shape, self.num_layers, ple)
+        # The reference scales by sqrt(P) cast to the table's weight dtype
+        # (modeling_gemma4.py, Gemma4TextScaledWordEmbedding), not to the
+        # activation dtype.
+        table = table * jnp.asarray(
+            math.sqrt(ple), self.embed_tokens_per_layer.embedding.dtype)
+        context = self.per_layer_model_projection(inputs_embeds)
+        context = context * jnp.asarray(self.emb_features ** -0.5, context.dtype)
+        context = self.per_layer_projection_norm(
+            context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
+        return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in fp32, as the forward multiplies it.

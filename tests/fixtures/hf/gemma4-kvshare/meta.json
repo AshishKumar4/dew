@@ -1,0 +1,6 @@
+{
+  "note": "Tiny Gemma4TextConfig with standard rope on both layer types (Dew has no partial rotary), uniform head_dim 8 (Dew keeps one), no logit cap, silu MLP. Full-model parity is fully live on both branches: the values norm is scale-free RMSNorm with no checkpoint weight, implemented in Dew.",
+  "seed": 1,
+  "torch": "2.14.0+cpu",
+  "transformers": "5.16.1"
+}
