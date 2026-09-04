@@ -21,7 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.dit import TextContext
-from dew.nn.text_encoders import DEFAULT_MODEL, CLIPTextModel, CLIPTextTransformer
+from dew.nn.text_encoders import (
+    DEFAULT_MODEL, DEFAULT_T5_MODEL, CLIPTextModel, CLIPTextTransformer,
+    T5EncoderModel, T5EncoderTransformer,
+)
 from dew.registry import dtype_name, encoders, resolve_dtype
 
 
@@ -141,5 +144,55 @@ class Audio(ConditionEncoder):
     def to_json(self) -> dict:
         return {"checkpoint": self.checkpoint, "sampling_rate": self.sampling_rate}
 
+@encoders("t5")
+@dataclass(frozen=True, eq=False)
+class T5Text(ConditionEncoder):
+    """The T5 encoder tower, vendored in `dew.nn.text_encoders`, with the
+    checkpoint's tokenizer.
 
-__all__ = ["ConditionEncoder", "CLIPText", "Audio"]
+    The text half of an SD3.5/Flux-class run: T5-XXL's last hidden states are
+    what their MMDiT conditions on. `tokenize` pads every prompt to
+    `max_length` and returns the ids with the attention mask; `encode`
+    returns the last hidden state with that mask as a `TextContext`.
+    """
+
+    checkpoint: str
+    transformer: T5EncoderTransformer
+    params: Any
+    tokenizer: Any
+    max_length: int = 256
+    dtype: Optional[Any] = None
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = DEFAULT_T5_MODEL, *, dtype=None,
+                        revision: Optional[str] = None,
+                        max_length: int = 256) -> "T5Text":
+        from transformers import AutoTokenizer
+
+        dtype = resolve_dtype(dtype)
+        model = T5EncoderModel.from_pretrained(checkpoint, dtype=dtype, revision=revision)
+        return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
+                   tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
+                   max_length=max_length, dtype=dtype)
+
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.max_length,
+                                truncation=True, return_tensors="np")
+        return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
+                "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
+
+    def encode(self, params, tokens) -> TextContext:
+        mask = jnp.asarray(tokens["attention_mask"])
+        hidden = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+        return TextContext(hidden=hidden, mask=mask)
+
+    def captions(self, tokens) -> tuple[str, ...]:
+        return tuple(self.tokenizer.batch_decode(
+            np.asarray(tokens["input_ids"]), skip_special_tokens=True))
+
+    def to_json(self) -> dict:
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
+                "max_length": self.max_length}
+
+
+__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "Audio"]
