@@ -7,6 +7,7 @@ channels after per-channel SSIM. No scipy/skimage dependency.
 import jax
 import jax.numpy as jnp
 
+from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.registry import metrics
 from .common import ImageMetric, frames
@@ -96,10 +97,11 @@ def structural_similarity(
 
 
 @metrics("ssim")
-def ssim(data_range: float = 2.0, field: str = "image") -> ImageMetric:
+def ssim(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid) -> ImageMetric:
     """Mean SSIM between the sampled frames and the batch's, higher is
-    better, on the same [-1, 1] scale as `psnr`."""
+    better, on the same [-1, 1] scale as `psnr`. `reads` names the artifact
+    type the trainer hands this metric; a video run passes `VideoGrid`."""
     def measure(artifact, batch):
         return structural_similarity(frames(artifact), unit_range(batch[field]), data_range)
 
-    return ImageMetric(name="ssim", measure=measure)
+    return ImageMetric(name="ssim", measure=measure, reads=reads)

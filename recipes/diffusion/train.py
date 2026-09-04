@@ -24,7 +24,7 @@ import tyro
 
 import dew.io
 from dew.objectives.diffusion import DiffusionRunConfig
-from dew.registry import datasets, metrics, presets
+from dew.registry import datasets, presets
 from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
                           build_optimizer, prepare_process, run_timestamp)
 
@@ -33,11 +33,6 @@ os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 DEFAULT_EXPERIMENT_NAME = ("dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/"
                            "schd-{preset}/arch-{architecture}/lr-{learning_rate}")
-
-
-def build_eval_metrics(names: list[str]) -> list:
-    """Validation metrics; each pulls its own weights on construction."""
-    return [metrics[name]() for name in names]
 
 
 def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -> dict:
@@ -123,7 +118,7 @@ def main(config: DiffusionRunConfig) -> TrainState:
         log_every=config.trainer.log_every,
         eval_every=config.trainer.eval_every or data.steps_per_epoch,
         checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
-        metrics=build_eval_metrics(config.val_metrics),
+        metrics=config.build_eval_metrics(),
     )
     if tracker is not None:
         dew.io.publish(checkpoints.path(checkpoints.latest), artifact_name(name), tracker=tracker)
