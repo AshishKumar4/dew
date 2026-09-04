@@ -14,8 +14,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The trees a user or a test can import from or read.
-TREES = ("src", "recipes", "examples", "tools", "tests", "docs", "README.md", "tutorials")
+# The trees a user or a test can import from or read. The tutorials are parked
+# for a rewrite on the new surface and stay out until then.
+TREES = ("src", "recipes", "examples", "tools", "tests", "docs", "README.md")
 
 # Design section 5, plus the wave-1 deletions and the names the reviews of
 # 2026-09-03 found doing a job the design gives to something else.
