@@ -1,46 +1,65 @@
-# Mostly derived from
+# The FID feature extractor, whose modules are derived from
 # https://github.com/matthias-wright/jax-fid
 
-import jax
+import hashlib
+import pickle
+
 import flax
+import jax
 import numpy as np
-from tqdm import tqdm
-import requests
-import os
-import tempfile
 
 
-def download(url, ckpt_dir=None):
-    name = url[url.rfind('/') + 1 : url.rfind('?')]
-    if ckpt_dir is None:
-        ckpt_dir = tempfile.gettempdir()
-    ckpt_dir = os.path.join(ckpt_dir, 'jax_fid')
-    ckpt_file = os.path.join(ckpt_dir, name)
-    if not os.path.exists(ckpt_file):
-        print(f'Downloading: \"{url[:url.rfind("?")]}\" to {ckpt_file}')
-        if not os.path.exists(ckpt_dir): 
-            os.makedirs(ckpt_dir)
+def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
+    """The path to `filename` of `repo` at `revision`, once its bytes hash to
+    `digest`.
 
-        response = requests.get(url, stream=True)
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        progress_bar = tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
-        
-        # first create temp file, in case the download fails
-        ckpt_file_temp = os.path.join(ckpt_dir, name + '.temp')
-        with open(ckpt_file_temp, 'wb') as file:
-            for data in response.iter_content(chunk_size=1024):
-                progress_bar.update(len(data))
-                file.write(data)
-        progress_bar.close()
-        
-        if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-            print('An error occured while downloading, please try again.')
-            if os.path.exists(ckpt_file_temp):
-                os.remove(ckpt_file_temp)
-        else:
-            # if download was successful, rename the temp file
-            os.rename(ckpt_file_temp, ckpt_file)
-    return ckpt_file
+    The weights used to come from a consumer file-sharing link with no
+    checksum, which a released package then unpickled: whoever held that link
+    chose what ran. A Hub repo pins a revision, and the digest is checked here
+    as well, so the bytes are what this code was written against whatever the
+    transport did.
+    """
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(repo, filename, revision=revision)
+    with open(path, 'rb') as handle:
+        found = hashlib.file_digest(handle, 'sha256').hexdigest()
+    if found != digest:
+        raise ValueError(
+            f"{repo}/{filename} at {revision} hashes to {found}, not the {digest} "
+            "this code was written against")
+    return path
+
+
+# What a pickle of numpy arrays needs to rebuild them, and nothing else. The
+# FID weights were written under numpy 1, where these lived under
+# `numpy.core`; numpy 2 keeps that path alive only as a shim that warns on
+# every attribute read, so a legacy name is resolved at its current home
+# instead. Anything outside this set is refused rather than imported, so a
+# downloaded pickle cannot run code.
+_ARRAY_GLOBALS = {
+    ('numpy', 'dtype'),
+    ('numpy', 'ndarray'),
+    ('numpy._core.multiarray', '_reconstruct'),
+    ('numpy._core.numeric', '_frombuffer'),
+}
+
+
+class _ArrayUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        current = ('numpy._core.' + module[len('numpy.core.'):]
+                   if module.startswith('numpy.core.') else module)
+        if (current, name) not in _ARRAY_GLOBALS:
+            raise pickle.UnpicklingError(
+                f"the weights file asks for {module}.{name}, which is not one of the "
+                "numpy array constructors this loader allows")
+        return super().find_class(current, name)
+
+
+def load_arrays(path):
+    """The nested dict of arrays in a numpy-only pickle at `path`."""
+    with open(path, 'rb') as handle:
+        return _ArrayUnpickler(handle).load()
 
 
 def get(dictionary, key):

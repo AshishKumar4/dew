@@ -12,14 +12,13 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 
-from dew.artifacts import ImageGrid, VideoGrid
+from dew.artifacts import ImageGrid, VideoGrid, host
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -60,7 +59,6 @@ class DiffusionObjective(Objective):
         *,
         autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
-        loss_fn: Callable = optax.l2_loss,
         ema_decay: float = 0.999,
         sampler=DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
@@ -73,7 +71,6 @@ class DiffusionObjective(Objective):
         self.inputs = inputs
         self.autoencoder = autoencoder
         self.unconditional_prob = unconditional_prob
-        self.loss_fn = loss_fn
         self.sampler = sampler
         self.guidance = guidance
         self.steps = steps
@@ -113,13 +110,25 @@ class DiffusionObjective(Objective):
         conditions = self.encode(encoders, self.unconditional_tokens)
         variables = self.model.init(
             key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
-        return {**variables, "encoders": encoders}
+        state = {**variables, "encoders": encoders}
+        if self.autoencoder is not None:
+            # The frozen weights are state, like the encoders': an argument to
+            # the compiled step that the layout places, not a constant baked
+            # into it.
+            state["autoencoder"] = self.autoencoder.params
+        return state
+
+    def trainable(self, params) -> dict:
+        """The model's own collections: what is left once the frozen towers
+        are taken out."""
+        return {name: value for name, value in params.items()
+                if name not in ("encoders", "autoencoder")}
 
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            data = self.autoencoder.encode(data, encode_key)
+            data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
         count = data.shape[0]
 
         # Conditioning dropout: a row drawn for the unconditional branch reads
@@ -140,19 +149,19 @@ class DiffusionObjective(Objective):
         rates = broadcast_rates(schedule, t, data)
         noisy, c_in, target = self.process.prediction.forward_diffusion(data, noise, rates)
 
-        variables = {name: value for name, value in params.items() if name != "encoders"}
+        variables = self.trainable(params)
         preds = self.model.apply(
             variables, noisy * c_in, schedule.model_time(t), **conditions,
             train=True, rngs={"dropout": dropout_key})
         preds = self.process.prediction.pred_transform(noisy, preds, rates)
-        losses = self.loss_fn(preds, target)
+        losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
         return jnp.mean(losses * weights), Aux(metrics={})
 
     def _sample_impl(self, params, tokens, key, *, count: int):
         given = self.encode(params["encoders"], tokens)
         null = self.encode(params["encoders"], self.unconditional_tokens)
-        variables = {name: value for name, value in params.items() if name != "encoders"}
+        variables = self.trainable(params)
         denoise = self.process.denoiser(
             self.model, variables, given, None if self.guidance is None else null)
         noise_key, sample_key = jax.random.split(key)
@@ -160,20 +169,28 @@ class DiffusionObjective(Objective):
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
                          guidance=self.guidance, key=sample_key)
         if self.autoencoder is not None:
-            samples = self.autoencoder.decode(samples)
+            samples = self.autoencoder.decode(params["autoencoder"], samples)
         return jnp.clip(samples, -1.0, 1.0)
 
     def evaluate(self, params, batch, step: Step):
         """`VALIDATION_SAMPLES` samples from the batch's conditions, with the
-        averaged weights when the run keeps them, seeded by the step's key."""
+        averaged weights when the run keeps them, seeded by the step's key.
+
+        The captions are decoded on the host, so the tokens come home first:
+        on a pool the batch is a global array this process holds one shard of,
+        and the gather is a collective every process makes here.
+        """
         params = params if step.ema is None else step.ema
         count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
         tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
                   for keyword, condition in self.inputs.conditions.items()}
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
-            captions = condition.encoder.captions(jax.tree.map(np.asarray, tokens[keyword]))
+            captions = condition.encoder.captions(host(tokens[keyword]))
             if captions:
                 break
         samples = self._sample(params, tokens, step.key, count=count)
+        # An Objective may produce no artifact; this one always produces a
+        # grid, chosen from the sample field's rank in __init__.
+        assert self.artifact is not None
         return self.artifact(samples, captions)

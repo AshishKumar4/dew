@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import numpy as np
+from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, VideoGrid
 
@@ -40,11 +41,13 @@ class ImageMetric:
     averaged over the validation pass."""
 
     name: str
-    measure: Callable[[Any, Any], float]
+    measure: Callable[[Any, Any], ArrayLike]
+    """A scalar per batch, which a metric computes on device and `__call__`
+    brings to a float."""
     reads: type = ImageGrid
 
     def __call__(self, artifact, batch) -> float:
-        return float(self.measure(artifact, batch))
+        return float(np.asarray(self.measure(artifact, batch)))
 
     def reduce(self, values: Sequence[float]) -> float:
         return float(np.mean(values))

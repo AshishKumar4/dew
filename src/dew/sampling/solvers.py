@@ -1,6 +1,6 @@
 """One reverse step each, from t to t_next, given the model's denoising at t.
 
-A solver is a value: what it needs between steps travels in its `State`,
+A solver is a value: what it needs between steps travels in its state,
 which `init` builds from x_T and `step` threads through `sample`'s scan. The
 rates of the sampling schedule come from `process`; a solver that needs
 another evaluation of the model (Heun's corrector, RK4's stages) calls
@@ -11,7 +11,7 @@ schedule whose alpha is not one.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -22,14 +22,24 @@ from dew.diffusion.schedules import GeneralizedNoiseScheduler
 from dew.diffusion.transforms import broadcast_rates
 from dew.registry import samplers
 
+StateT = TypeVar("StateT", covariant=True)
 
-class Solver(Protocol):
-    State: type
 
-    def init(self, x) -> State: ...
+class Solver(Protocol[StateT]):
+    """A step of a sampler, and whatever it carries between steps.
 
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise) -> tuple[jax.Array, State]:
+    `StateT` is that carried value: nothing for a one-step solver, the
+    previous model output for a multi-step one. It is a type parameter rather
+    than an attribute so a solver's own state type is checked at its call
+    sites.
+    """
+
+    def init(self, x) -> StateT: ...
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process,
+             denoise) -> tuple[jax.Array, StateT]:
         """`x` at `t_next` from `x` at `t` and the model's `(denoised, eps)` at `t`."""
+        ...
 
 
 def _rates(process: Process, t, t_next, x):

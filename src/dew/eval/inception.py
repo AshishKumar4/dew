@@ -8,10 +8,16 @@ import jax.numpy as jnp
 import flax
 from flax.linen.module import merge_param
 import flax.linen as nn
-from typing import Callable, Iterable, Optional, Tuple, Union, Any
-import functools
-import pickle
+from typing import Callable, Optional, Sequence, Tuple, Union, Any
 from . import utils
+
+# The FID feature extractor's weights: the jax-fid pickle, mirrored on the Hub
+# so a revision and a digest can be pinned. The bytes are byte-identical to
+# what this metric has always used, so no reported FID moves.
+FID_WEIGHTS_REPO = 'hayden-donnelly/inception-v3-fid'
+FID_WEIGHTS_FILE = 'inception_v3_fid.pickle'
+FID_WEIGHTS_REVISION = 'ccb3ff416ff491ae7fd964c5e7c01d12ab7c48bf'
+FID_WEIGHTS_DIGEST = '4e030efa5bccac3222d975f658d1884f9e00fab24f2812082884539220b90d77'
 
 PRNGKey = Any
 Array = Any
@@ -39,13 +45,17 @@ class InceptionV3(nn.Module):
     pretrained: bool=False
     transform_input: bool=False
     aux_logits: bool=False
-    ckpt_path: str='https://www.dropbox.com/s/xt6zvlvt22dcwck/inception_v3_weights_fid.pickle?dl=1'
+    ckpt_repo: str=FID_WEIGHTS_REPO
+    ckpt_file: str=FID_WEIGHTS_FILE
+    ckpt_revision: str=FID_WEIGHTS_REVISION
+    ckpt_digest: str=FID_WEIGHTS_DIGEST
     dtype: str='float32'
 
     def setup(self):
         if self.pretrained:
-            ckpt_file = utils.download(self.ckpt_path)
-            self.params_dict = pickle.load(open(ckpt_file, 'rb'))
+            path = utils.fetch(self.ckpt_repo, self.ckpt_file,
+                               self.ckpt_revision, self.ckpt_digest)
+            self.params_dict = utils.load_arrays(path)
             self.num_classes_ = 1000
         else:
             self.params_dict = None
@@ -125,7 +135,7 @@ class InceptionV3(nn.Module):
         if not self.include_head:
             return x
         x = nn.Dropout(rate=0.5)(x, deterministic=not train, rng=rng)
-        x = jnp.reshape(x, newshape=(x.shape[0], -1))
+        x = jnp.reshape(x, (x.shape[0], -1))
         x = Dense(features=self.num_classes_,
                   params_dict=utils.get(self.params_dict, 'fc'),
                   dtype=self.dtype)(x)
@@ -144,41 +154,43 @@ class InceptionV3(nn.Module):
 
 class Dense(nn.Module):
     features: int
-    kernel_init: functools.partial=nn.initializers.lecun_normal()
-    bias_init: functools.partial=nn.initializers.zeros
-    params_dict: dict=None
+    kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
+    bias_init: nn.initializers.Initializer=nn.initializers.zeros
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x):
+        params = self.params_dict
         x = nn.Dense(features=self.features,
-                     kernel_init=self.kernel_init if self.params_dict is None else lambda *_ : jnp.array(self.params_dict['kernel']),
-                     bias_init=self.bias_init if self.params_dict is None else lambda *_ : jnp.array(self.params_dict['bias']))(x)
+                     kernel_init=self.kernel_init if params is None else lambda *_ : jnp.array(params['kernel']),
+                     bias_init=self.bias_init if params is None else lambda *_ : jnp.array(params['bias']))(x)
         return x
 
 
 class BasicConv2d(nn.Module):
     out_channels: int
-    kernel_size: Union[int, Iterable[int]]=(3, 3)
-    strides: Optional[Iterable[int]]=(1, 1)
-    padding: Union[str, Iterable[Tuple[int, int]]]='valid'
+    kernel_size: Union[int, Sequence[int]]=(3, 3)
+    strides: Optional[Sequence[int]]=(1, 1)
+    padding: Union[str, Sequence[Tuple[int, int]]]='valid'
     use_bias: bool=False
-    kernel_init: functools.partial=nn.initializers.lecun_normal()
-    bias_init: functools.partial=nn.initializers.zeros
-    params_dict: dict=None
+    kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
+    bias_init: nn.initializers.Initializer=nn.initializers.zeros
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
+        params = self.params_dict
         x = nn.Conv(features=self.out_channels,
                     kernel_size=self.kernel_size,
                     strides=self.strides,
                     padding=self.padding,
                     use_bias=self.use_bias,
-                    kernel_init=self.kernel_init if self.params_dict is None else lambda *_ : jnp.array(self.params_dict['conv']['kernel']),
-                    bias_init=self.bias_init if self.params_dict is None else lambda *_ : jnp.array(self.params_dict['conv']['bias']),
+                    kernel_init=self.kernel_init if params is None else lambda *_ : jnp.array(params['conv']['kernel']),
+                    bias_init=self.bias_init if params is None else lambda *_ : jnp.array(params['conv']['bias']),
                     dtype=self.dtype)(x)
-        if self.params_dict is None:
+        if params is None:
             x = BatchNorm(epsilon=0.001,
                           momentum=0.1,
                           use_running_average=not train,
@@ -186,10 +198,10 @@ class BasicConv2d(nn.Module):
         else:
             x = BatchNorm(epsilon=0.001,
                           momentum=0.1,
-                          bias_init=lambda *_ : jnp.array(self.params_dict['bn']['bias']),
-                          scale_init=lambda *_ : jnp.array(self.params_dict['bn']['scale']),
-                          mean_init=lambda *_ : jnp.array(self.params_dict['bn']['mean']),
-                          var_init=lambda *_ : jnp.array(self.params_dict['bn']['var']),
+                          bias_init=lambda *_ : jnp.array(params['bn']['bias']),
+                          scale_init=lambda *_ : jnp.array(params['bn']['scale']),
+                          mean_init=lambda *_ : jnp.array(params['bn']['mean']),
+                          var_init=lambda *_ : jnp.array(params['bn']['var']),
                           use_running_average=not train,
                           dtype=self.dtype)(x)
         x = jax.nn.relu(x)
@@ -198,7 +210,7 @@ class BasicConv2d(nn.Module):
 
 class InceptionA(nn.Module):
     pool_features: int
-    params_dict: dict=None
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -243,7 +255,7 @@ class InceptionA(nn.Module):
 
 
 class InceptionB(nn.Module):
-    params_dict: dict=None
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -277,7 +289,7 @@ class InceptionB(nn.Module):
 
 class InceptionC(nn.Module):
     channels_7x7: int
-    params_dict: dict=None
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -338,7 +350,7 @@ class InceptionC(nn.Module):
 
 
 class InceptionD(nn.Module):
-    params_dict: dict=None
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -381,7 +393,7 @@ class InceptionD(nn.Module):
 
 class InceptionE(nn.Module):
     pooling: Callable
-    params_dict: dict=None
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -440,9 +452,9 @@ class InceptionE(nn.Module):
 
 class InceptionAux(nn.Module):
     num_classes: int
-    kernel_init: functools.partial=nn.initializers.lecun_normal()
-    bias_init: functools.partial=nn.initializers.zeros
-    params_dict: dict=None
+    kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
+    bias_init: nn.initializers.Initializer=nn.initializers.zeros
+    params_dict: Optional[dict]=None
     dtype: str='float32'
 
     @nn.compact
@@ -457,7 +469,7 @@ class InceptionAux(nn.Module):
                         params_dict=utils.get(self.params_dict, 'conv1'),
                         dtype=self.dtype)(x, train)
         x = jnp.mean(x, axis=(1, 2))
-        x = jnp.reshape(x, newshape=(x.shape[0], -1))
+        x = jnp.reshape(x, (x.shape[0], -1))
         x = Dense(features=self.num_classes,
                   params_dict=utils.get(self.params_dict, 'fc'),
                   dtype=self.dtype)(x)
@@ -625,7 +637,7 @@ def pool(inputs, init, reduce_fn, window_shape, strides, padding):
     return y
 
 
-def avg_pool(inputs, window_shape, strides=None, padding='VALID'):
+def avg_pool(inputs, window_shape, strides=None, padding: Union[str, Sequence[Tuple[int, int]]]='VALID'):
     """
     Pools the input by taking the average over a window.
 

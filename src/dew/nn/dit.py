@@ -210,7 +210,7 @@ class PatchSequenceOutput(nn.Module):
                           H_P=H // self.patch_size, W_P=W // self.patch_size)
 
 
-def remat_block(block_cls, enabled: bool, policy='dots'):
+def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
     """Optionally rematerialize a block class.
 
     Recomputing a block during the backward pass trades extra compute for a
@@ -250,7 +250,7 @@ class ModulatedBlock(nn.Module):
     """
     features: int
     num_heads: int
-    rope_emb: RotaryEmbedding = None
+    rope_emb: Optional[RotaryEmbedding] = None
     mixer: str = 'attention'
     modulated: bool = True
     mlp_ratio: int = 4

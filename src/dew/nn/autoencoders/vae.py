@@ -15,7 +15,7 @@ import math
 import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import flax.linen as nn
 import jax
@@ -106,10 +106,10 @@ class FlaxResnetBlock2D(nn.Module):
     """
 
     in_channels: int
-    out_channels: int = None
+    out_channels: Optional[int] = None
     dropout: float = 0.0
     groups: int = 32
-    use_nin_shortcut: bool = None
+    use_nin_shortcut: Optional[bool] = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -180,7 +180,7 @@ class FlaxAttentionBlock(nn.Module):
     """
 
     channels: int
-    num_head_channels: int = None
+    num_head_channels: Optional[int] = None
     num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
@@ -373,7 +373,7 @@ class FlaxUNetMidBlock2D(nn.Module):
     dropout: float = 0.0
     num_layers: int = 1
     resnet_groups: int = 32
-    num_attention_heads: int = 1
+    num_attention_heads: Optional[int] = 1
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -459,8 +459,8 @@ class FlaxEncoder(nn.Module):
 
     in_channels: int = 3
     out_channels: int = 3
-    down_block_types: Tuple[str] = ("DownEncoderBlock2D",)
-    block_out_channels: Tuple[int] = (64,)
+    down_block_types: Sequence[str] = ("DownEncoderBlock2D",)
+    block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
     act_fn: str = "silu"
@@ -572,8 +572,8 @@ class FlaxDecoder(nn.Module):
 
     in_channels: int = 3
     out_channels: int = 3
-    up_block_types: Tuple[str] = ("UpDecoderBlock2D",)
-    block_out_channels: int = (64,)
+    up_block_types: Sequence[str] = ("UpDecoderBlock2D",)
+    block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
     act_fn: str = "silu"
@@ -712,6 +712,11 @@ def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
     return params
 
 
+# The SD1-era flax weights live on their own branches, so these name a layout
+# rather than a revision anyone pinned.
+FLAX_REVISIONS = ("bf16", "flax")
+
+
 def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     """A pretrained AutoencoderKL's config and params, from a local directory
     or the Hub.
@@ -722,6 +727,11 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
     reads by name, so the newer latent spaces load through the same seam.
     Returns a dict with `config` (dict) and `params` (nested param tree).
+
+    `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
+    the torch path then reads the repo's default branch. Any other revision is
+    a pin: the torch path reads exactly it and raises rather than falling back
+    to the default branch, so a rerun cannot quietly read other weights.
     """
     from flax.serialization import msgpack_restore
 
@@ -735,16 +745,18 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
     candidates = [
-        {"revision": revision, "subfolder": "vae"},
-        {"revision": "flax", "subfolder": "vae"},
-        {"revision": revision},
-        {},
+        (revision, "vae"),
+        ("flax", "vae"),
+        (revision, None),
+        (None, None),
     ]
     last_error = None
-    for candidate in candidates:
+    for candidate_revision, subfolder in candidates:
         try:
-            config_path = hf_hub_download(modelname, "config.json", **candidate)
-            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack", **candidate)
+            config_path = hf_hub_download(modelname, "config.json",
+                                          revision=candidate_revision, subfolder=subfolder)
+            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
+                                           revision=candidate_revision, subfolder=subfolder)
             with open(config_path) as f:
                 config = json.load(f)
             with open(weights_path, "rb") as f:
@@ -752,10 +764,15 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             last_error = e
 
-    for candidate in ({"subfolder": "vae"}, {}):
+    pinned = revision not in FLAX_REVISIONS
+    torch_candidates = ([(revision, "vae"), (revision, None)]
+                        if pinned else [(None, "vae"), (None, None)])
+    for candidate_revision, subfolder in torch_candidates:
         try:
-            config_path = hf_hub_download(modelname, "config.json", **candidate)
-            hf_hub_download(modelname, "diffusion_pytorch_model.safetensors", **candidate)
+            config_path = hf_hub_download(modelname, "config.json",
+                                          revision=candidate_revision, subfolder=subfolder)
+            hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
+                            revision=candidate_revision, subfolder=subfolder)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             last_error = e
             continue
@@ -765,8 +782,10 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         return {"config": config, "params": _read_vae_weights(directory)}
 
     raise FileNotFoundError(
-        f"no VAE weights in {modelname}: neither flax "
-        "diffusion_flax_model.msgpack nor torch diffusion_pytorch_model.safetensors"
+        f"no VAE weights in {modelname}"
+        + (f" at revision {revision!r}" if pinned else "")
+        + ": neither flax diffusion_flax_model.msgpack nor torch "
+        "diffusion_pytorch_model.safetensors"
     ) from last_error
 
 
@@ -777,7 +796,10 @@ def _read_vae_weights(directory: Path) -> dict:
     msgpack = directory / "diffusion_flax_model.msgpack"
     if msgpack.exists():
         with open(msgpack, "rb") as handle:
-            return msgpack_restore(handle.read())
+            restored = msgpack_restore(handle.read())
+        if not isinstance(restored, dict):
+            raise ValueError(f"{msgpack} does not hold a param tree")
+        return restored
     safetensors = directory / "diffusion_pytorch_model.safetensors"
     if not safetensors.exists():
         raise FileNotFoundError(

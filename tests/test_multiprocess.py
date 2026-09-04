@@ -619,3 +619,60 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
     assert third["step"] == STEPS
     assert third["dataset_state"] == whole_run["dataset_state"]
     assert_same_parameters(dumped_params(tmp_path / "third.json"), whole_run["params"])
+
+# --------------------------------------------------------------------------
+# Validation and artifacts in a pool
+# --------------------------------------------------------------------------
+
+@pytest.mark.distributed
+def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
+    """The default diffusion validation, in the topology it used to die in.
+
+    Every rank holds one shard of the sampled grid and of the batch the metric
+    reads, and numpy cannot read a shard at all: `evaluate` decoded captions
+    off the batch's tokens with np.asarray and the clip metric read the
+    artifact the same way, so the pass raised on every rank at once. The
+    artifacts and the batch come home through one collective every rank makes,
+    so the score is over the whole global batch and both ranks agree on it.
+    """
+    reports = run_pool("validate", tmp_path, 2, fsdp_size=2, steps=1)
+
+    assert [report["process_count"] for report in reports] == [2, 2]
+    assert [report["step"] for report in reports] == [1, 1]
+    # The tracker draws on process zero only, and what it drew is the whole
+    # grid, not this rank's quarter of it.
+    drawn, rest = reports[0]["drawn"], reports[1]["drawn"]
+    assert rest == []
+    assert [entry["type"] for entry in drawn] == ["ImageGrid"]
+    assert drawn[0]["shape"][0] == 4
+    assert drawn[0]["captions"] == worker.PROMPTS[:4]
+    score = reports[0]["scores"]["val/clip_similarity"]
+    assert np.isfinite(score)
+    # A metric that reads the whole field sees the global batch, not the rows
+    # this rank happens to hold.
+    assert reports[0]["scores"]["val/global_mean"] == pytest.approx(
+        float(worker.global_images().mean()), rel=1e-6)
+
+    single = run_worker("validate", tmp_path / "single.json", steps=1)
+    assert single["scores"]["val/clip_similarity"] == pytest.approx(
+        score, rel=PARITY["rtol"], abs=PARITY["atol"])
+
+
+@pytest.mark.distributed
+def test_a_pool_draws_a_jepa_artifact(tmp_path):
+    """A tracker attached to a real pool run gets a complete artifact.
+
+    The render path transfers with numpy on process zero, so a representation
+    still sharded across the pool would raise there, and a renderer that
+    gathered it from that one process would wedge the pool in a collective the
+    others never enter. What process zero draws covers the global batch.
+    """
+    reports = run_pool("tracked", tmp_path, 2, fsdp_size=2, steps=1)
+
+    assert [report["step"] for report in reports] == [1, 1]
+    assert reports[1]["drawn"] == []
+    drawn = reports[0]["drawn"]
+    assert [entry["type"] for entry in drawn] == ["Representations"]
+    assert drawn[0]["rendered"] is True
+    assert drawn[0]["features"][0] == worker.BATCH
+    assert drawn[0]["std"] > 0.0

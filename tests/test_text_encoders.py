@@ -137,6 +137,37 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
                           np.asarray(encoder.encode(encoder.params, tokens).hidden))
 
 
+def test_a_pinned_revision_reaches_the_tokenizer_and_the_record(monkeypatch):
+    """A pin has to survive the whole way round: the tokenizer used to load
+    from the default branch while the weights honoured the pin, and `to_json`
+    dropped the pin entirely, so an `InputSpec` rebuilt from a run's record
+    read whatever the branch held that day."""
+    from transformers import AutoTokenizer
+
+    seen = []
+    original = AutoTokenizer.from_pretrained
+
+    def capture(name, **fields):
+        seen.append(fields.get("revision"))
+        return original(name, **{k: v for k, v in fields.items() if k != "revision"})
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", capture)
+    encoder = CLIPText.from_pretrained(str(TINY), revision="refs/pr/1")
+
+    assert seen == ["refs/pr/1"]
+    assert encoder.to_json() == {"checkpoint": str(TINY), "dtype": None,
+                                 "revision": "refs/pr/1"}
+
+    spec = InputSpec(Field("image", (8, 8, 3)), {"textcontext": Condition(encoder)})
+    rebuilt = InputSpec.from_json(spec.to_json()).conditions["textcontext"].encoder
+    assert rebuilt.revision == "refs/pr/1"
+    assert seen == ["refs/pr/1", "refs/pr/1"]
+
+    # An unpinned encoder records no revision, so a record stays as small as
+    # what the run actually chose.
+    assert "revision" not in CLIPText.from_pretrained(str(TINY)).to_json()
+
+
 def test_padding_is_masked_where_the_reference_masks_it():
     """A padded slot must reach no real token. Right padding plus causality
     leaves the real rows alone whatever the padding holds, and the mask is what

@@ -11,8 +11,9 @@ probe is a separate offline job.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +22,25 @@ import optax
 
 from dew.artifacts import Representations
 from dew.registry import metrics
+
+ProbeParams: TypeAlias = dict[str, jax.Array]
+"""The linear probe's weight matrix under "w" and its bias under "b"."""
+
+
+def _probe_params(tree: optax.Params) -> ProbeParams:
+    """The probe's two arrays out of the tree optax gives back.
+
+    optax declares every parameter tree as an arbitrary pytree, so the arrays
+    that go into the optimizer have to be recognised again on the way out.
+    """
+    if not isinstance(tree, Mapping):
+        raise TypeError(f"probe parameters are a mapping, not {type(tree).__name__}")
+    params: ProbeParams = {}
+    for name, leaf in tree.items():
+        if not isinstance(name, str) or not isinstance(leaf, jax.Array):
+            raise TypeError("probe parameters are arrays held under string names")
+        params[name] = leaf
+    return params
 
 
 def _split(embeddings, labels):
@@ -37,19 +57,19 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
 
-    params = {"w": jnp.zeros((embeddings.shape[-1], num_classes)),
-              "b": jnp.zeros((num_classes,))}
+    params: ProbeParams = {"w": jnp.zeros((embeddings.shape[-1], num_classes)),
+                           "b": jnp.zeros((num_classes,))}
     optimizer = optax.adamw(learning_rate, weight_decay=weight_decay)
 
-    def objective(p):
+    def objective(p: ProbeParams):
         logits = fit_x @ p["w"] + p["b"]
         return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, fit_y))
 
-    def step(carry, _):
+    def step(carry: tuple[ProbeParams, optax.OptState], _: None):
         p, opt_state = carry
         grads = jax.grad(objective)(p)
         updates, opt_state = optimizer.update(grads, opt_state, p)
-        return (optax.apply_updates(p, updates), opt_state), None
+        return (_probe_params(optax.apply_updates(p, updates)), opt_state), None
 
     (params, _), _ = jax.lax.scan(step, (params, optimizer.init(params)), None, length=steps)
     predicted = jnp.argmax(test_x @ params["w"] + params["b"], axis=-1)

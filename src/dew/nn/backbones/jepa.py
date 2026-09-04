@@ -272,7 +272,8 @@ class JepaPredictor(nn.Module):
                                 precision=self.precision, name="proj_in")
         self.mask_token = self.param(
             "mask_token", nn.initializers.normal(0.02), (1, 1, self.predictor_features))
-        stack_kwargs = dict(
+        stack = FactorizedTokenStack if self.factorized else TokenStack
+        self.stack = stack(
             features=self.predictor_features, num_layers=self.num_layers,
             num_heads=self.num_heads, mlp_ratio=self.mlp_ratio,
             ssm_attention_ratio=self.ssm_attention_ratio,
@@ -282,8 +283,6 @@ class JepaPredictor(nn.Module):
             norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
             attention_impl=self.attention_impl,
         )
-        self.stack = (FactorizedTokenStack(**stack_kwargs) if self.factorized
-                      else TokenStack(**stack_kwargs))
         self.norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
         self.proj_out = nn.Dense(features=self.emb_features, dtype=self.dtype,
                                  precision=self.precision, name="proj_out")
