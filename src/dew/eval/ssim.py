@@ -8,9 +8,8 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
-from dew.inputs import unit_range
 from dew.registry import metrics
-from .common import ImageMetric, frames
+from .common import ImageMetric, frames, paired
 from .psnr import _as_frame_batch
 
 # Standard SSIM constants for the 11x11/sigma-1.5 gaussian window
@@ -102,6 +101,7 @@ def ssim(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid)
     better, on the same [-1, 1] scale as `psnr`. `reads` names the artifact
     type the trainer hands this metric; a video run passes `VideoGrid`."""
     def measure(artifact, batch):
-        return structural_similarity(frames(artifact), unit_range(batch[field]), data_range)
+        samples, targets = paired(artifact, batch, field)
+        return structural_similarity(samples, targets, data_range)
 
     return ImageMetric(name="ssim", measure=measure, reads=reads)

@@ -87,7 +87,8 @@ class Registry(Mapping[str, T], Generic[T]):
         it would build something other than what was asked for. Fields arrive
         from JSON as often as from code, so a `dtype` given as a string is
         resolved here, at the one boundary where a logged config becomes an
-        object.
+        object, wherever it sits: the UNets keep per-stage attention settings
+        in nested dicts and those carry a dtype of their own.
         """
         member = self[name]
         if dataclasses.is_dataclass(member):
@@ -97,8 +98,7 @@ class Registry(Mapping[str, T], Generic[T]):
                 raise ValueError(
                     f"{self.kind} {name!r} ({_describe(member)}) has no field for "
                     f"{unknown}; its fields are {sorted(declared)}")
-            if "dtype" in fields:
-                fields["dtype"] = resolve_dtype(fields["dtype"])
+            fields = _resolve_dtypes(fields)
         return member(**fields)
 
     @property
@@ -112,6 +112,16 @@ class Registry(Mapping[str, T], Generic[T]):
 
 def _describe(member: Any) -> str:
     return getattr(member, "__name__", repr(member))
+
+
+def _resolve_dtypes(value: Any) -> Any:
+    """`value` with every `dtype` entry resolved, through dicts and sequences."""
+    if isinstance(value, Mapping):
+        return {key: resolve_dtype(item) if key == "dtype" else _resolve_dtypes(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_resolve_dtypes(item) for item in value)
+    return value
 
 
 _DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
@@ -171,3 +181,8 @@ datasets: Registry[type] = Registry("dataset")
 encoders: Registry[type] = Registry("encoder")
 metrics: Registry[Callable[..., Any]] = Registry("metric")
 objectives: Registry[type] = Registry("objective")
+
+__all__ = [
+    "Registry", "models", "presets", "samplers", "datasets", "encoders", "metrics", "objectives",
+    "resolve_dtype", "dtype_name", "with_precision",
+]

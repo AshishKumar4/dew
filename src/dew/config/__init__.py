@@ -25,7 +25,8 @@ from typing import Annotated, Any, Literal, Mapping, Optional, Self
 
 import tyro
 
-import dew.data
+import dew.data  # noqa: F401  registers the datasets a config names
+import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.registry import datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir

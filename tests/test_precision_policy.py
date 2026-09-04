@@ -1,19 +1,20 @@
 """The run's precision policy: one dtype knob, one attention knob.
 
 `--model.dtype` and `--model.attention-impl` are the only way in;
-`apply_precision_policy` writes them into the model config that gets built and
-logged, and the attention kernel refuses the knobs a fused kernel cannot
-honor instead of dropping them silently.
+`with_precision` writes them into the model config that gets built and logged,
+`Registry.build` resolves the names back into dtypes, and the attention kernel
+refuses the knobs a fused kernel cannot honor instead of dropping them
+silently.
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
 
+from dew import models
 from dew.nn.attention import scaled_dot_product_attention
-from dew.registry import (
-    MODEL_REGISTRY, apply_precision_policy, build_model, map_config_strings,
-)
+from dew.nn.dit import TextContext
+from dew.registry import dtype_name, resolve_dtype, with_precision
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -120,18 +121,20 @@ def test_auto_on_gpu_rejects_float32_inputs(monkeypatch):
 
 def test_policy_reaches_nested_unet_attention_configs():
     """The unet keeps its attention settings in nested dicts that do not
-    inherit the model dtype, so the policy has to write into them too."""
-    applied = apply_precision_policy(
+    inherit the model dtype, so the policy has to write into them too, and the
+    build has to resolve the dtype it wrote."""
+    fields = with_precision(
         'unet', {"attention_configs": [None, {"heads": 8}], "precision": "default"},
         dtype="bfloat16", attention_impl="auto")
 
-    assert applied["dtype"] == "bfloat16"
-    assert applied["attention_impl"] == "auto"
-    assert applied["precision"] == "default"
-    assert applied["attention_configs"] == [
+    assert fields["dtype"] == "bfloat16"
+    assert fields["attention_impl"] == "auto"
+    assert fields["precision"] == "default"
+    assert fields["attention_configs"] == [
         None, {"heads": 8, "dtype": "bfloat16", "force_fp32_for_softmax": True}]
 
-    model = build_model('unet', applied)
+    model = models.build('unet', **fields)
+    assert model.dtype is jnp.bfloat16
     assert model.attention_configs[1]["dtype"] is jnp.bfloat16
     assert model.attention_configs[1]["force_fp32_for_softmax"] is True
 
@@ -139,38 +142,31 @@ def test_policy_reaches_nested_unet_attention_configs():
 def test_policy_fills_in_the_stages_the_config_left_at_the_default():
     """A config that never mentions attention_configs still gets bf16
     attention: the unet's own default stages compute in fp32."""
-    applied = apply_precision_policy('unet', {}, dtype="bfloat16",
-                                     attention_impl="reference")
-    assert [stage["dtype"] for stage in applied["attention_configs"]] == \
-        ["bfloat16"] * len(MODEL_REGISTRY['unet'].attention_configs)
+    fields = with_precision('unet', {}, dtype="bfloat16", attention_impl="reference")
+    assert [stage["dtype"] for stage in fields["attention_configs"]] == \
+        ["bfloat16"] * len(models['unet'].attention_configs)
 
 
 def test_policy_spells_the_reference_kernel_as_none():
-    applied = apply_precision_policy('simple_dit', {}, dtype="float32",
-                                     attention_impl="reference")
-    assert applied == {"dtype": "float32", "attention_impl": None}
-    assert build_model('simple_dit', applied).attention_impl is None
+    fields = with_precision('simple_dit', {}, dtype="float32", attention_impl="reference")
+    assert fields == {"dtype": "float32", "attention_impl": None}
+    assert models.build('simple_dit', **fields).attention_impl is None
 
 
 @pytest.mark.parametrize("key,value", [("dtype", "bfloat16"), ("attention_impl", "xla")])
 def test_policy_rejects_a_second_path_for_the_same_knob(key, value):
     with pytest.raises(ValueError, match="--model.dtype"):
-        apply_precision_policy('simple_dit', {key: value}, dtype="bfloat16",
-                               attention_impl="auto")
-
-
-def test_policy_survives_architecture_suffixes():
-    applied = apply_precision_policy('simple_dit+hilbert', {}, dtype="bfloat16",
-                                     attention_impl="auto")
-    assert applied["dtype"] == "bfloat16"
+        with_precision('simple_dit', {key: value}, dtype="bfloat16",
+                       attention_impl="auto")
 
 
 def test_logged_policy_values_round_trip_through_the_registry():
-    """The policy writes strings so the wandb config stays a record; the
+    """The policy writes strings so a logged config stays a record; the
     registry maps them back on the way in."""
-    mapped = map_config_strings({"dtype": "bfloat16", "attention_impl": "auto"})
-    assert mapped["dtype"] is jnp.bfloat16
-    assert mapped["attention_impl"] == "auto"
+    assert resolve_dtype("bfloat16") is jnp.bfloat16
+    assert dtype_name(jnp.bfloat16) == "bfloat16"
+    with pytest.raises(ValueError, match="not one of"):
+        resolve_dtype("float8")
 
 
 TINY = {"emb_features": 32, "precision": "default"}
@@ -194,7 +190,6 @@ PER_ARCH = {
     "jepa_video_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
     "jepa_predictor": {"num_layers": 1, "num_heads": 2, "grid": (4, 4), "predictor_features": 16},
     "causal_transformer": LM,
-    "moe": {**LM, "num_experts": 4, "top_k": 2},
 }
 RES, FRAMES = 16, 2
 
@@ -203,12 +198,12 @@ def tiny_inputs(architecture, rng):
     """What each architecture's __call__ takes, at the smallest useful size."""
     image = jax.random.normal(rng, (1, RES, RES, 3))
     video = jax.random.normal(rng, (1, FRAMES, RES, RES, 3))
-    text = jnp.ones((1, 7, 768))
+    text = TextContext(jnp.ones((1, 7, 768)), jnp.ones((1, 7), bool))
     if architecture in ("unet_3d", "video_dit"):
         return video, jnp.ones((1,)), text
     if architecture == "jepa_encoder":
         return (image,)
-    if architecture in ("causal_transformer", "moe"):
+    if architecture == "causal_transformer":
         return (jnp.zeros((1, 8), jnp.int32),)
     if architecture == "jepa_video_encoder":
         return (video,)
@@ -218,15 +213,15 @@ def tiny_inputs(architecture, rng):
     return image, jnp.ones((1,)), text
 
 
-@pytest.mark.parametrize("architecture", sorted(MODEL_REGISTRY))
+@pytest.mark.parametrize("architecture", sorted(models))
 def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng):
     """bf16 is a compute dtype: every param leaf stays float32 so checkpoints
     and the optimizer state are unchanged. The unets and the jepa models hand
     back bf16; the DiT family casts its final projection to fp32 on purpose."""
-    config = apply_precision_policy(
+    fields = with_precision(
         architecture, {**TINY, **PER_ARCH[architecture]},
         dtype="bfloat16", attention_impl="auto")
-    model = build_model(architecture, config)
+    model = models.build(architecture, **fields)
     assert model.dtype is jnp.bfloat16
     assert model.attention_impl == 'auto'
 

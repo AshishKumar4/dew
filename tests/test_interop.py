@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.nn.dit import TextContext
 from dew.interop import (
     hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params,
 )
@@ -30,7 +31,8 @@ safetensors_numpy = pytest.importorskip("safetensors.numpy")
 def params(rng):
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
     x = jax.random.normal(rng, (1, 8, 8, 3))
-    return model.init(rng, x, jnp.ones((1,)), jnp.ones((1, 77, 768)))
+    return model.init(rng, x, jnp.ones((1,)),
+                      TextContext(jnp.ones((1, 77, 768)), jnp.ones((1, 77), bool)))
 
 
 def flat_names(tree):

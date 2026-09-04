@@ -7,9 +7,8 @@ to (B*T, H, W, C) and every frame scores independently.
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
-from dew.inputs import unit_range
 from dew.registry import metrics
-from .common import ImageMetric, frames
+from .common import ImageMetric, frames, paired
 
 
 def _as_frame_batch(images: jnp.ndarray) -> tuple[jnp.ndarray, bool]:
@@ -61,6 +60,7 @@ def psnr(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid)
     trainer hands this metric; a video run passes `VideoGrid`.
     """
     def measure(artifact, batch):
-        return peak_signal_noise_ratio(frames(artifact), unit_range(batch[field]), data_range)
+        samples, targets = paired(artifact, batch, field)
+        return peak_signal_noise_ratio(samples, targets, data_range)
 
     return ImageMetric(name="psnr", measure=measure, reads=reads)

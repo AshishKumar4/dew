@@ -2,7 +2,7 @@
 """Time the real training step, one architecture at a time.
 
 tools/benchmark_data.py answers "is the loader the bottleneck". This answers
-the other half: what a step of ObjectiveTrainer costs for a given
+the other half: what a step of the Trainer costs for a given
 architecture, batch size and fsdp width. The step measured here is the one the
 trainer compiles for a real run (same objective, same sharding, same donated
 state), so a number from this tool is a number from training, not from a
@@ -43,15 +43,16 @@ import numpy as np
 import optax
 import tyro
 
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
-from dew.inputs.encoders import ConditioningEncoder
+from dew.diffusion import presets
+from dew.inputs import CharTable, Condition, Field, InputSpec
+from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew.registry import MODEL_REGISTRY, apply_precision_policy, build_model
+from dew import models  # naming a registry fills it
+from dew.registry import with_precision
 from dew.telemetry.devices import apply_xla_flags
-from dew.telemetry.instrumentation import compiled_flops
-from dew.training import ObjectiveTrainer
+from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
 JsonCases = Annotated[
@@ -66,34 +67,15 @@ JsonCases = Annotated[
 ]
 """A list of case dicts, written as one JSON string on the command line."""
 
-# Stand-in for the CLIP-L/14 context: a benchmark of the model should not spend
-# its first minute downloading a text encoder, and the step cost only depends
-# on the context's shape.
+# The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
+# of the model should not spend its first minute downloading a text tower, and
+# the step cost depends only on the context's shape.
 TEXT_TOKENS = 77
 TEXT_FEATURES = 768
 
 
-@dataclass
-class StubTextEncoder(ConditioningEncoder):
-    """Pretokenized text of a fixed width, embedded by broadcast."""
-
-    @property
-    def key(self):
-        return "text"
-
-    def tokenize(self, data):
-        return np.zeros((len(data), TEXT_TOKENS), np.int32)
-
-    def encode_from_tokens(self, tokens):
-        embedded = jnp.asarray(tokens, jnp.float32)[..., None] / TEXT_TOKENS
-        return jnp.broadcast_to(embedded, (*embedded.shape[:2], TEXT_FEATURES))
-
-    def serialize(self):
-        return {}
-
-    @staticmethod
-    def deserialize(serialized_config):
-        raise NotImplementedError("benchmark-only encoder")
+def text_condition() -> Condition:
+    return Condition(CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES))
 
 
 @dataclass(frozen=True)
@@ -137,7 +119,8 @@ class Case:
 
     @property
     def label(self) -> str:
-        return (f"{self.architecture} b{self.batch_size} fsdp{self.fsdp_size} "
+        experts = f" x{self.config['num_experts']}experts" if self.config.get("num_experts") else ""
+        return (f"{self.architecture}{experts} b{self.batch_size} fsdp{self.fsdp_size} "
                 f"expert{self.expert_size}")
 
 
@@ -199,7 +182,7 @@ def small_cases(dtype: str) -> list[Case]:
              batch_size=16, seq_len=512),
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
-        Case("moe", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
+        Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
                      "num_heads": 12, "mlp_ratio": 4, "max_seq_len": 512,
                      "num_experts": 8, "top_k": 2, "moe_every": 2},
              batch_size=16, seq_len=512),
@@ -208,11 +191,11 @@ def small_cases(dtype: str) -> list[Case]:
     # jepa_predictor has no step of its own: it is built through the registry
     # inside the two JEPA cases above.
     covered = {case.architecture for case in cases} | {"jepa_predictor"}
-    missing = set(MODEL_REGISTRY) - covered
+    missing = set(models) - covered
     if missing:
         raise ValueError(
             f"--preset small does not cover {sorted(missing)}; add a case for every "
-            "architecture in dew.registry.MODEL_REGISTRY")
+            "architecture in dew.registry.models")
     return cases
 
 
@@ -247,7 +230,6 @@ class BenchmarkConfig:
     """Documents per row for the language-model cases; the others are left
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
-    checkpoint_dir: str = "/tmp/dew-benchmark-step"
     json_out: Optional[str] = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
@@ -291,73 +273,40 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
     return [apply(case) for case in cases]
 
 
-def text_condition() -> ConditionalInputConfig:
-    return ConditionalInputConfig(
-        encoder=StubTextEncoder(model=None, tokenizer=None),
-        conditioning_data_key="text",
-        pretokenized=True,
-        unconditional_input="",
-        model_key_override="textcontext",
-    )
+def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
+    """The trainer a recipe would build for this case, minus the tracker and the
+    checkpoints.
 
-
-def build_trainer(case: Case, checkpoint_dir: str,
-                  attention_impl: str = 'auto') -> ObjectiveTrainer:
-    """The trainer a recipe would build for this case, minus wandb and data.
-
-    The model goes through the same precision policy the recipes use, so the
+    The model goes through the same precision function the recipes use, so the
     dtype and the attention kernel land in the nested unet attention configs
     too, and a row of this table is a row a real run would produce.
     """
     def built(architecture: str, config: dict):
-        return build_model(architecture, apply_precision_policy(
+        return models.build(architecture, **with_precision(
             architecture, config, dtype=case.dtype, attention_impl=attention_impl))
 
     model = built(case.architecture, case.config)
     sample_key = "video" if case.frames else "image"
-    optimizer = optax.adam(1e-4)
-    common = dict(
-        model=model,
-        optimizer=optimizer,
-        rngs=jax.random.PRNGKey(0),
-        name=f"bench-{case.architecture}",
-        wandb_config=None,
-        distributed_training=True,
-        fsdp_size=case.fsdp_size,
-        expert_size=case.expert_size,
-        fsdp_min_param_size=case.fsdp_min_param_size,
-        checkpoint_base_path=checkpoint_dir,
-    )
 
     if case.is_lm:
-        objective = LMObjective(model, case.seq_len, vocab_size=case.config["vocab_size"])
-        return ObjectiveTrainer(input_config=None, objective=objective, **common)
-
-    if case.is_jepa:
+        objective = LMObjective(model, case.seq_len)
+    elif case.is_jepa:
         patch = case.config.get("patch_size", 16)
         grid = (case.image_size // patch, case.image_size // patch)
-        predictor_config = {**case.predictor, "grid": grid}
         objective = JepaObjective(
-            model, built("jepa_predictor", predictor_config),
+            model, built("jepa_predictor", {**case.predictor, "grid": grid}),
             multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
-            sample_key, case.sample_shape,
-        )
-        input_config = DiffusionInputConfig(
-            sample_data_key=sample_key, sample_data_shape=case.sample_shape, conditions=[])
-        return ObjectiveTrainer(input_config=input_config, objective=objective, **common)
+            sample=Field(sample_key, case.sample_shape))
+    else:
+        inputs = InputSpec(Field(sample_key, case.sample_shape),
+                           {"textcontext": text_condition()})
+        objective = DiffusionObjective(model, presets.EDM()(), inputs)
 
-    train_schedule, _, transform = get_diffusion_preset("edm")
-    input_config = DiffusionInputConfig(
-        sample_data_key=sample_key,
-        sample_data_shape=case.sample_shape,
-        conditions=[text_condition()],
-    )
-    return ObjectiveTrainer(
-        input_config=input_config,
-        noise_schedule=train_schedule,
-        model_output_transform=transform,
-        **common,
-    )
+    return Trainer(
+        objective, optax.adam(1e-4), key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=case.fsdp_size, expert=case.expert_size),
+        layout=Layout(min_shard=case.fsdp_min_param_size),
+        checkpoints=None, tracker=None)
 
 
 def batches(case: Case):
@@ -383,7 +332,7 @@ def batches(case: Case):
         batch = {sample_key: rng.integers(
             0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)}
         if not case.is_jepa:
-            batch["text"] = np.ones((case.batch_size, TEXT_TOKENS), np.int32)
+            batch["text"] = text_condition().encoder.tokenize(["a flower"] * case.batch_size)
     while True:
         yield batch
 
@@ -411,25 +360,25 @@ def parameter_count(params) -> int:
 def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     """Warm up, then time the compiled step over a fixed number of steps."""
     peak_before = device_peak_bytes()
-    trainer = build_trainer(case, config.checkpoint_dir, config.attention_impl)
-    trainer.global_batch_size = case.batch_size
+    trainer = build_trainer(case, config.attention_impl)
 
-    train_step = trainer._define_train_step(batch_size=case.batch_size)
     source = DevicePrefetchIterator(batches(case), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
+    abstract = jax.eval_shape(trainer.initial_state)
+    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+    scale = None
 
     compile_start = time.perf_counter()
-    compiled = trainer._compiled_step(train_step, state, rng, next(source))
+    compiled = trainer.compile(state, next(source))
     compile_seconds = time.perf_counter() - compile_start
 
     loss = None
     for _ in range(max(config.warmup, 1)):
-        state, loss, _, rng, is_finite = compiled(state, rng, next(source))
+        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
     loss.block_until_ready()
 
     start = time.perf_counter()
     for _ in range(config.steps):
-        state, loss, _, rng, is_finite = compiled(state, rng, next(source))
+        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
     loss.block_until_ready()
     elapsed = time.perf_counter() - start
 
@@ -441,13 +390,14 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     synced = []
     for _ in range(config.steps):
         step_start = time.perf_counter()
-        state, loss, _, rng, is_finite = compiled(state, rng, next(source))
+        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
         loss.block_until_ready()
         synced.append((time.perf_counter() - step_start) * 1e3)
     p10, p50, p90 = np.percentile(synced, [10, 50, 90])
 
     flops = compiled_flops(compiled)
-    throughput = trainer._throughput_metrics(elapsed, config.steps)
+    step_time = elapsed / config.steps
+    utilization = model_flops_utilization(flops, step_time)
     peak = device_peak_bytes()
     row = {
         "architecture": case.architecture,
@@ -459,7 +409,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "dtype": case.dtype,
         "attention_impl": config.attention_impl,
         "xla_flags": config.xla_flags,
-        "devices": trainer.mesh.devices.size,
+        "devices": trainer.device_mesh.devices.size,
         "device_kind": jax.devices()[0].device_kind,
         "params": parameter_count(state.params),
         "measured_steps": config.steps,
@@ -468,9 +418,9 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "p10_ms": round(float(p10), 3),
         "p50_ms": round(float(p50), 3),
         "p90_ms": round(float(p90), 3),
-        "samples_per_sec": round(throughput["train/samples_per_sec"], 2),
+        "samples_per_sec": round(case.batch_size / step_time, 2),
         "flops_per_step": flops,
-        "utilization": throughput.get("train/mfu"),
+        "utilization": utilization,
         "peak_device_bytes": peak,
         "case_peak_delta_bytes": (
             None if peak_before is None else max(0, peak - peak_before)),
@@ -545,7 +495,6 @@ def write_json(rows: list[dict], path: str):
 
 def main(config: BenchmarkConfig):
     apply_xla_flags(config.xla_flags)
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
     print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
     print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
           f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")

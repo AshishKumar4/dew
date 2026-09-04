@@ -40,7 +40,7 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
     prompt = jax.random.randint(rng, (3, 5), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    generated = generate(model, params, prompt, 6, rng=jax.random.PRNGKey(1),
+    generated = generate(model, params, prompt, 6, key=jax.random.PRNGKey(1),
                          temperature=0)
     assert generated.shape == (3, 11)
     assert generated.dtype == jnp.int32
@@ -48,7 +48,7 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 6))
     # greedy ignores the rng, so two calls cannot disagree
     assert jnp.array_equal(
-        generated, generate(model, params, prompt, 6, rng=jax.random.PRNGKey(7),
+        generated, generate(model, params, prompt, 6, key=jax.random.PRNGKey(7),
                             temperature=0))
 
 
@@ -61,7 +61,7 @@ def test_layer_types_from_json_can_generate(rng):
     params = model.init(rng, prompt)
 
     generated = generate(
-        model, params, prompt, 2, rng=jax.random.PRNGKey(1), temperature=0)
+        model, params, prompt, 2, key=jax.random.PRNGKey(1), temperature=0)
 
     assert jnp.array_equal(generated, argmax_walk(model, params, prompt, 2))
 
@@ -71,16 +71,16 @@ def test_sampling_stays_in_the_vocab_and_reacts_to_the_rng(rng):
     prompt = jax.random.randint(rng, (4, 4), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    sampled = generate(model, params, prompt, 8, rng=jax.random.PRNGKey(0),
+    sampled = generate(model, params, prompt, 8, key=jax.random.PRNGKey(0),
                        temperature=1.0)
     assert sampled.shape == (4, 12)
     assert jnp.all((sampled >= 0) & (sampled < VOCAB))
 
-    other = generate(model, params, prompt, 8, rng=jax.random.PRNGKey(1),
+    other = generate(model, params, prompt, 8, key=jax.random.PRNGKey(1),
                      temperature=1.0)
     assert not jnp.array_equal(sampled, other)
 
-    warm = generate(model, params, prompt, 8, rng=jax.random.PRNGKey(0),
+    warm = generate(model, params, prompt, 8, key=jax.random.PRNGKey(0),
                     temperature=1.0)
     assert jnp.array_equal(sampled, warm)
 
@@ -90,12 +90,12 @@ def test_top_k_restricts_the_choice_and_top_one_is_greedy(rng):
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model.init(rng, prompt)
 
-    greedy = generate(model, params, prompt, 5, rng=jax.random.PRNGKey(2), temperature=0)
+    greedy = generate(model, params, prompt, 5, key=jax.random.PRNGKey(2), temperature=0)
     assert jnp.array_equal(
-        greedy, generate(model, params, prompt, 5, rng=jax.random.PRNGKey(3),
+        greedy, generate(model, params, prompt, 5, key=jax.random.PRNGKey(3),
                          temperature=1.0, top_k=1))
 
-    sampled = generate(model, params, prompt, 5, rng=jax.random.PRNGKey(4),
+    sampled = generate(model, params, prompt, 5, key=jax.random.PRNGKey(4),
                        temperature=0.8, top_k=5)
     assert jnp.all((sampled >= 0) & (sampled < VOCAB))
     # every sampled token has to be inside the top 5 of its own step
@@ -113,8 +113,8 @@ def test_a_single_new_token_and_none_at_all(rng):
     params = model.init(rng, prompt)
 
     assert jnp.array_equal(prompt, generate(model, params, prompt, 0,
-                                            rng=jax.random.PRNGKey(0)))
-    one = generate(model, params, prompt, 1, rng=jax.random.PRNGKey(0), temperature=0)
+                                            key=jax.random.PRNGKey(0)))
+    one = generate(model, params, prompt, 1, key=jax.random.PRNGKey(0), temperature=0)
     assert one.shape == (2, 5)
     assert jnp.array_equal(one, argmax_walk(model, params, prompt, 1))
 
@@ -124,7 +124,7 @@ def test_generation_longer_than_the_cache_is_refused(rng):
     prompt = jax.random.randint(rng, (1, 6), 0, VOCAB)
     params = model.init(rng, prompt)
     with pytest.raises(ValueError, match="max_seq_len"):
-        generate(model, params, prompt, 4, rng=jax.random.PRNGKey(0))
+        generate(model, params, prompt, 4, key=jax.random.PRNGKey(0))
 
 
 def copy_batch(rng, size):
@@ -166,6 +166,6 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
     assert copy_region > 0.9
 
     prompt = held_out[:, :PAYLOAD + 1]
-    generated = generate(model, params, prompt, PAYLOAD, rng=jax.random.PRNGKey(1),
+    generated = generate(model, params, prompt, PAYLOAD, key=jax.random.PRNGKey(1),
                          temperature=0)
     assert jnp.array_equal(generated[:, PAYLOAD + 1:], held_out[:, :PAYLOAD])
