@@ -1,38 +1,40 @@
 """Train a diffusion model over images or latents.
 
-    python recipes/diffusion/train.py --data.dataset oxford_flowers102 \
-        --data.image-size 128 --data.batch-size 32 --trainer.epochs 2000 \
-        --model.architecture simple_dit \
+    python recipes/diffusion/train.py --data.image-size 128 --trainer.batch-size 32 \
+        --trainer.epochs 2000 --model.architecture simple_dit \
         --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
 
+The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),
+and so are the preset (`preset:flow --preset.shift 3.0`) and the sampler.
 Architecture kwargs go through --model.config as one JSON object, straight to
-the registry, so the wandb config is exactly what built the model.
+the registry, so the manifest is exactly what built the model.
 """
 
+import dataclasses
 import hashlib
 import json
 import os
 import re
-import warnings
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
 import jax
-import tqdm
 import tyro
 
-from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
-from dew.data.dataloaders import load_data
-from dew.inputs import ConditionalInputConfig, DiffusionInputConfig
-from dew.inputs.processors import defaultTextEncodeModel
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.registry import apply_precision_policy, build_model, canonicalize_architecture
-from dew.sampling.euler import EulerAncestralSampler
-from dew.training import ObjectiveTrainer, build_optimizer, prepare_process
-from dew.training.distributed import DEFAULT_MIN_SHARD_SIZE
-from dew.training.runtime import run_timestamp
+import dew.diffusion.presets
+import dew.io
+import dew.sampling
+from dew.config import JsonDict, ModelConfig, RunConfig
+from dew.data import ImageDataset, OnlineImages, VideoDataset
+from dew.inputs import CLIPText, Condition, Field, InputSpec
+from dew.interop.manifest import Manifest
+from dew.objectives.diffusion import DiffusionObjective
+from dew.registry import datasets, metrics, models, presets, samplers
+from dew.sampling import CFG
+from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
+                          build_optimizer, prepare_process, run_timestamp)
 
-warnings.filterwarnings("ignore")
+# HF tokenizers fork a thread pool; grain's workers fork the process.
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 ATTENTION = {
@@ -48,9 +50,7 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 DEFAULT_EXPERIMENT_NAME = ("dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/"
-                           "schd-{noise_schedule}/arch-{architecture}/lr-{learning_rate}")
-
-DEFAULT_BEST_TRACKER_METRIC = "val/clip_similarity"
+                           "schd-{preset}/arch-{architecture}/lr-{learning_rate}")
 
 
 @dataclass(frozen=True)
@@ -59,165 +59,126 @@ class DiffusionRunConfig(RunConfig):
 
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    noise_schedule: Literal['cosine', 'karras', 'edm', 'flow', 'flow_matching'] = 'edm'
-    min_snr_gamma: Optional[float] = None
-    """min-SNR-gamma loss weighting (Hang et al. 2023); 5.0 is the paper value,
-    unset keeps the schedule's own weighting."""
-    flow_shift: float = 1.0
-    """Resolution shift for the flow matching schedule, see
-    dew.diffusion.schedules.flow.compute_resolution_shift."""
+    preset: presets.union = field(default_factory=presets.EDM)
+    """The convention the model is trained and sampled with."""
+    sampler: samplers.union = field(default_factory=samplers.EulerAncestral)
+    """The solver validation samples with."""
+    guidance: float = 3.0
+    """Classifier-free guidance scale for validation samples; 0 samples the
+    conditional prediction alone."""
+    sampling_steps: int = 200
+    unconditional_prob: float = 0.12
+    """Fraction of training examples whose condition is dropped."""
+    ema_decay: float = 0.999
+    text_encoder: str = "openai/clip-vit-large-patch14"
     autoencoder: Optional[Literal['stable_diffusion']] = None
     autoencoder_opts: JsonDict = field(
         default_factory=lambda: {"modelname": "pcuenq/sd-vae-ft-mse-flax"})
     val_metrics: list[Literal['clip', 'clip_score', 'fid']] = field(
         default_factory=lambda: ['clip'])
-    validation_prompts: Optional[str] = None
-    """Text file of captions, one per line, sampled from at validation instead
-    of the dataset's own val split."""
-    dataset_test: bool = False
-    """Pull 2000 batches through the pipeline before training, for benchmarking."""
+
+
+def sample_field(config: DiffusionRunConfig) -> Field:
+    """The batch field the model generates, at the resolution the data comes in."""
+    spec = config.data
+    if isinstance(spec, (ImageDataset, OnlineImages)):
+        return Field("image", (spec.image_size, spec.image_size, 3))
+    if isinstance(spec, VideoDataset):
+        return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
+    raise ValueError(
+        f"the diffusion recipe trains on image or video datasets, not "
+        f"{datasets.name_of(type(spec))}")
 
 
 def load_autoencoder(config: DiffusionRunConfig):
-    """The VAE for latent diffusion, with the shape it hands the model."""
+    """The VAE for latent diffusion, or None."""
     if config.autoencoder is None:
-        return None, 3, config.data.image_size
-    print("Using Stable Diffusion Autoencoder for Latent Diffusion Modeling")
+        return None
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-    autoencoder = StableDiffusionVAE(**config.autoencoder_opts)
-    return (autoencoder, autoencoder.latent_channels,
-            config.data.image_size // autoencoder.downscale_factor)
+    return StableDiffusionVAE(**config.autoencoder_opts)
 
 
-def model_kwargs(config: DiffusionRunConfig, channels: int, sample_size: int):
-    """Canonical architecture name and the kwargs the registry builds it from."""
-    architecture, suffix_flags = canonicalize_architecture(config.model.architecture)
-    kwargs = apply_precision_policy(
-        architecture, {**config.model.config, **suffix_flags},
-        dtype=config.model.dtype, attention_impl=config.model.attention_impl)
-    if kwargs.get('use_hilbert') and kwargs.get('use_zigzag'):
-        raise ValueError("use_hilbert and use_zigzag are mutually exclusive")
-    if architecture == 'diffusers_unet_simple':
-        kwargs.update(sample_size=sample_size, in_channels=channels, out_channels=channels)
+def model_fields(config: DiffusionRunConfig, sample: Field, autoencoder) -> dict:
+    """The fields the registry builds the model from: the run's precision
+    settings and the channels the model denoises, over --model.config."""
+    fields = config.model.fields()
+    if autoencoder is None:
+        channels, size = sample.shape[-1], sample.shape[-2]
     else:
-        kwargs['output_channels'] = channels
-    return architecture, kwargs
+        channels = autoencoder.latent_channels
+        size = sample.shape[-2] // autoencoder.downscale_factor
+    if config.model.architecture == 'diffusers_unet_simple':
+        fields.update(sample_size=size, in_channels=channels, out_channels=channels)
+    else:
+        fields['output_channels'] = channels
+    return fields
 
 
-def build_input_config(config: DiffusionRunConfig) -> DiffusionInputConfig:
-    """Images conditioned on pretokenized text, encoded by the default CLIP."""
-    return DiffusionInputConfig(
-        sample_data_key='image',
-        sample_data_shape=(config.data.image_size, config.data.image_size, 3),
-        conditions=[
-            ConditionalInputConfig(
-                encoder=defaultTextEncodeModel(),
-                conditioning_data_key='text',
-                pretokenized=True,
-                unconditional_input="",
-                model_key_override="textcontext",
-            )
-        ],
-    )
+def build_inputs(config: DiffusionRunConfig) -> InputSpec:
+    """Images conditioned on the batch's pretokenized text through CLIP."""
+    return InputSpec(
+        sample=sample_field(config),
+        conditions={"textcontext": Condition(CLIPText.from_pretrained(config.text_encoder))})
 
 
 def build_eval_metrics(names: list[str]) -> list:
-    """Validation metrics, imported lazily since each pulls its own weights."""
-    metrics = []
-    if 'clip' in names:
-        from dew.eval.images import get_clip_metric
-        print("Using legacy CLIP distance metric (val/clip_similarity) for validation")
-        metrics.append(get_clip_metric())
-    if 'clip_score' in names:
-        from dew.eval.images import get_clip_score_metric
-        print("Using CLIPScore (val/clip_score, higher is better) for validation")
-        metrics.append(get_clip_score_metric())
-    if 'fid' in names:
-        from dew.eval.fid import get_fid_metric
-        print("Using per-batch FID (val/fid) for validation")
-        metrics.append(get_fid_metric())
-    return metrics
+    """Validation metrics; each pulls its own weights on construction."""
+    return [metrics[name]() for name in names]
 
 
-def validation_prompt_batches(path: str, encoder, batch_size: int, steps: int):
-    """Validation batches of captions read from a file, and how many there are.
-
-    A fixed prompt list keeps the sampled grids comparable across runs, which a
-    shuffled val split does not, and it is the only validation a caption-less
-    dataset can offer a text-conditioned model.
-    """
-    with open(path) as handle:
-        prompts = [line.strip() for line in handle if line.strip()]
-    if not prompts:
-        raise ValueError(f"No prompts in {path}")
-
-    def get_val_dataset():
-        for step in range(steps):
-            start = step * batch_size
-            batch = [prompts[(start + i) % len(prompts)] for i in range(batch_size)]
-            # dict(): the tokenizer's own mapping is one pytree leaf, so the
-            # batch would never reach the devices field by field
-            yield {"text": dict(encoder.tokenize(batch))}
-
-    return get_val_dataset, len(prompts)
-
-
-def run_summary(config: DiffusionRunConfig, model_config: dict, arguments_hash: str) -> dict:
-    """Flat view of the run, for the wandb config and the experiment name."""
+def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -> dict:
+    """Flat view of the run, for the experiment name."""
+    sample = sample_field(config)
     return {
-        **model_config,
+        **fields,
         "architecture": config.model.architecture,
-        "dataset": config.data.dataset,
-        "image_size": config.data.image_size,
-        "batch_size": config.data.batch_size,
-        "noise_schedule": config.noise_schedule,
+        "dataset": datasets.name_of(type(config.data)),
+        "image_size": sample.shape[-2],
+        "batch_size": config.trainer.batch_size,
+        "preset": presets.name_of(type(config.preset)),
         "learning_rate": config.optim.learning_rate,
-        "epochs": config.trainer.epochs,
         "arguments_hash": arguments_hash,
         "date": run_timestamp(),
     }
 
 
-def experiment_name(config: DiffusionRunConfig, summary: dict, latent: bool) -> str:
+def experiment_name(config: DiffusionRunConfig, summary: dict) -> str:
     """The configured name, or one built from the fields that shape the run."""
     name = config.trainer.name or DEFAULT_EXPERIMENT_NAME
     if not re.search(r"\{.+?\}", name):
         return name
 
     name = name + "/arguments_hash-{arguments_hash}/date-{date}"
-    if latent:
+    if config.autoencoder is not None:
         name = f"LDM-{name}"
     if 'hybrid_dit' in config.model.architecture:
         name = f"SSM-{name}"
-    if summary.get('use_hilbert'):
-        name = f"Hilbert-{name}"
+    if summary.get('scan_order', 'raster') != 'raster':
+        name = f"{summary['scan_order'].capitalize()}-{name}"
     return name.format(**summary)
 
 
-def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
-    prepare_process(config.data.augmentation_mode, config.trainer.wandb_offline,
-                    config.trainer.multi_host, config.trainer.xla_flags)
+def main(config: DiffusionRunConfig) -> TrainState:
+    prepare_process(config.trainer.wandb_offline, config.trainer.multi_host,
+                    config.trainer.xla_flags, config.trainer.compilation_cache_dir)
     print(f"Local devices: {jax.local_devices()}")
 
-    data = load_data(config.data)
+    data = config.data.load(batch=config.trainer.batch_size)
+    steps = config.trainer.total_steps(data)
 
-    if config.dataset_test:
-        dataset = iter(data['train']())
-        for _ in tqdm.tqdm(range(2000)):
-            next(dataset)
-
-    datalen = data['train_len']
-    batches = datalen // config.data.batch_size
-    steps_per_epoch = config.trainer.steps_per_epoch or batches
-
-    autoencoder, channels, sample_size = load_autoencoder(config)
-    architecture, model_config = model_kwargs(config, channels, sample_size)
-    model = build_model(architecture, model_config)
-
-    input_config = build_input_config(config)
-    eval_metrics = build_eval_metrics(config.val_metrics)
-    train_schedule, sampling_schedule, prediction_transform = get_diffusion_preset(
-        config.noise_schedule, shift=config.flow_shift, min_snr_gamma=config.min_snr_gamma,
+    autoencoder = load_autoencoder(config)
+    inputs = build_inputs(config)
+    fields = model_fields(config, inputs.sample, autoencoder)
+    model = models.build(config.model.architecture, **fields)
+    process = config.preset()
+    objective = DiffusionObjective(
+        model, process, inputs,
+        autoencoder=autoencoder,
+        unconditional_prob=config.unconditional_prob,
+        ema_decay=config.ema_decay,
+        sampler=config.sampler,
+        guidance=CFG(config.guidance) if config.guidance else None,
+        steps=config.sampling_steps,
     )
 
     run_config = config.to_dict()
@@ -225,97 +186,61 @@ def main(config: DiffusionRunConfig) -> ObjectiveTrainer:
     # experiment
     arguments_hash = hashlib.sha256(
         json.dumps(run_config, sort_keys=True).encode()).hexdigest()[:16]
-    summary = run_summary(config, model_config, arguments_hash)
-    name = experiment_name(config, summary, latent=autoencoder is not None)
+    summary = run_summary(config, fields, arguments_hash)
+    name = experiment_name(config, summary)
     print("Experiment_Name:", name)
+    directory = os.path.join(config.trainer.checkpoint_dir, name)
 
-    checkpoint_dir = config.trainer.checkpoint_dir
-    if config.trainer.checkpoint_fs == 'gcs':
-        checkpoint_dir = f"gs://{checkpoint_dir}"
-
-    wandb_config: Optional[dict[str, Any]] = None
+    tracker = None
     if config.trainer.wandb_project is not None:
-        wandb_config = {
-            "project": config.trainer.wandb_project,
-            "entity": config.trainer.wandb_entity,
-            "name": name,
-            "config": {
-                "model": model_config,
-                "architecture": architecture,
-                "dataset": {
-                    "name": config.data.dataset,
-                    "length": datalen,
-                    "batches": batches,
-                },
-                "learning_rate": config.optim.learning_rate,
-                "batch_size": config.data.batch_size,
-                "epochs": config.trainer.epochs,
-                "input_shapes": input_config.get_input_shapes(autoencoder=autoencoder),
-                "input_config": input_config.serialize(),
-                "arguments": summary,
-                "run_config": run_config,
-                "autoencoder": config.autoencoder,
-                "autoencoder_opts": json.dumps(config.autoencoder_opts),
-                "arguments_hash": arguments_hash,
-            },
-        }
-        if config.trainer.resume_last_run is not None:
-            wandb_config['id'] = config.trainer.resume_last_run
+        tracker = WandbTracker(
+            config.trainer.wandb_project, name, entity=config.trainer.wandb_entity,
+            offline=config.trainer.wandb_offline,
+            config={"run_config": run_config, "model": fields, "arguments": summary,
+                    "dataset": {"name": summary["dataset"], "records": data.records,
+                                "steps_per_epoch": data.steps_per_epoch},
+                    "steps": steps})
 
-    trainer = ObjectiveTrainer(
-        model,
-        optimizer=build_optimizer(config.optim, steps_per_epoch),
-        input_config=input_config,
-        noise_schedule=train_schedule,
-        rngs=jax.random.PRNGKey(4),
-        name=name,
-        model_output_transform=prediction_transform,
-        load_from_checkpoint=config.trainer.load_from_checkpoint,
-        checkpoint_step=config.trainer.checkpoint_step,
-        wandb_config=wandb_config,
-        distributed_training=config.trainer.distributed_training,
-        checkpoint_base_path=checkpoint_dir,
-        autoencoder=autoencoder,
-        use_dynamic_scale=config.optim.use_dynamic_scale,
-        native_resolution=config.data.image_size,
-        max_checkpoints_to_keep=config.trainer.max_checkpoints_to_keep,
-        eval_metrics=eval_metrics,
-        best_tracker_metric=config.trainer.best_tracker_metric or DEFAULT_BEST_TRACKER_METRIC,
-        ema_decay=config.trainer.ema_decay,
-        grad_accum_steps=config.optim.grad_accum_steps,
-        fsdp_size=config.trainer.fsdp_size,
-        expert_size=config.trainer.expert_size,
-        fsdp_min_param_size=config.trainer.fsdp_min_param_size or DEFAULT_MIN_SHARD_SIZE,
-        logical_axis_rules=config.trainer.logical_axis_rules,
-        sharding_tolerance=config.trainer.sharding_tolerance,
-        compilation_cache_dir=config.trainer.compilation_cache_dir,
-        profile_steps=config.trainer.profile_steps,
+    Manifest(
+        config=run_config,
+        model={"name": config.model.architecture, "fields": fields},
+        inputs=inputs.to_json(),
+        preset={"name": summary["preset"], "fields": dataclasses.asdict(config.preset)},
+        autoencoder=(None if config.autoencoder is None
+                     else {"name": config.autoencoder, "fields": dict(config.autoencoder_opts)}),
+    ).write(directory)
+
+    checkpoints = Checkpoints(directory, keep=config.trainer.keep)
+    trainer = Trainer(
+        objective, build_optimizer(config.optim, steps),
+        key=jax.random.key(config.trainer.seed),
+        mesh=config.trainer.mesh,
+        layout=config.trainer.layout,
+        accumulation=config.trainer.accumulation,
+        dynamic_scale=config.trainer.dynamic_scale,
+        checkpoints=checkpoints,
+        tracker=tracker,
+        profile=(Profile(os.path.join(directory, "profile"), config.trainer.profile_steps)
+                 if config.trainer.profile_steps else None),
+    )
+    print(f"Training on {summary['dataset']} for {steps} steps "
+          f"({data.steps_per_epoch} steps per epoch)")
+    state = trainer.fit(
+        data, steps=steps,
         log_every=config.trainer.log_every,
+        eval_every=config.trainer.eval_every or data.steps_per_epoch,
+        checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
+        metrics=build_eval_metrics(config.val_metrics),
     )
+    if tracker is not None:
+        dew.io.publish(checkpoints.path(checkpoints.latest), artifact_name(name), tracker=tracker)
+    return state
 
-    if trainer.distributed_training:
-        print("Distributed Training enabled")
-    print(f"Training on {config.data.dataset} dataset with {steps_per_epoch} steps per epoch")
 
-    if config.validation_prompts is not None:
-        data['val'], data['val_len'] = validation_prompt_batches(
-            config.validation_prompts,
-            input_config.conditions[0].encoder,
-            data['local_batch_size'],
-            config.data.val_steps_per_epoch,
-        )
-
-    trainer.fit(
-        data,
-        training_steps_per_epoch=steps_per_epoch,
-        epochs=config.trainer.epochs,
-        sampler_class=EulerAncestralSampler,
-        sampling_noise_schedule=sampling_schedule,
-        val_steps_per_epoch=config.data.val_steps_per_epoch,
-        checkpoint_every_steps=config.trainer.checkpoint_every_steps,
-    )
-    return trainer
+def artifact_name(name: str) -> str:
+    """The run name as a W&B artifact name, which allows no slashes."""
+    return re.sub(r"[^\w.-]", "-", name)
 
 
 if __name__ == '__main__':
-    main(tyro.cli(DiffusionRunConfig))
+    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[DiffusionRunConfig]))
