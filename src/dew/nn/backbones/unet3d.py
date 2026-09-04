@@ -84,14 +84,13 @@ class UNet3D(nn.Module):
     norm_groups:int=8
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
-    named_norms: bool = False
     attention_impl: Optional[str] = None
     temporal_heads: int = 8
 
     def setup(self):
         if self.norm_groups > 0:
             norm = partial(nn.GroupNorm, self.norm_groups)
-            self.conv_out_norm = norm(name="GroupNorm_0") if self.named_norms else norm()
+            self.conv_out_norm = norm()
         else:
             norm = partial(nn.RMSNorm, 1e-5)
             self.conv_out_norm = norm()
@@ -136,7 +135,6 @@ class UNet3D(nn.Module):
                     norm_groups=self.norm_groups,
                     dtype=self.dtype,
                     precision=self.precision,
-                    named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:
                     x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
@@ -183,7 +181,6 @@ class UNet3D(nn.Module):
                 norm_groups=self.norm_groups,
                 dtype=self.dtype,
                 precision=self.precision,
-                named_norms=self.named_norms
             )(x, temb)
             if middle_attention is not None and j == self.num_middle_res_blocks - 1:
                 x = TransformerBlock(heads=middle_attention.heads, dtype=middle_attention.dtype, attention_impl=self.attention_impl,
@@ -215,7 +212,6 @@ class UNet3D(nn.Module):
                 norm_groups=self.norm_groups,
                 dtype=self.dtype,
                 precision=self.precision,
-                named_norms=self.named_norms
             )(x, temb)
 
         # Upscaling Blocks
@@ -233,7 +229,6 @@ class UNet3D(nn.Module):
                     norm_groups=self.norm_groups,
                     dtype=self.dtype,
                     precision=self.precision,
-                    named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:
                     x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
@@ -286,7 +281,6 @@ class UNet3D(nn.Module):
             norm_groups=self.norm_groups,
             dtype=self.dtype,
             precision=self.precision,
-            named_norms=self.named_norms
         )(x, temb)
 
         x = self.conv_out_norm(x)
