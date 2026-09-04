@@ -423,3 +423,28 @@ Status: `open`, `done` with the commit, or `held` with the reason. Type: `fix`, 
 | T33 | design | wave 3 | `dew.diffusion.discrete`: `MaskingSchedule`, `DiscreteProcess`, unmasking solver, `presets.MDLM` | a masked diffusion LM trains on the LM data path with no trainer change |
 | T34 | design | wave 2 | `Trainer(step=...)` escape hatch | a GAN-style alternating step runs on the same checkpoints and tracker |
 | T35 | docs | open, workhorse | `tests/test_architectures.py:290` docstring (done in the docs commit) and `tests/test_parallelism.py:855` pattern note | docstrings describe the raising loop |
+
+## 10. Values, not field bags
+
+Measured on the tree that landed: 53 constructors take more than eight fields, `CausalTransformer` takes 42, `CausalSelfAttention` 22, and five of `Router`'s routing options, each already pinned against transformers, could not be named from a config at all. Wide flat constructors are how that happens: a family's convention arrives as three or four booleans, an off switch arrives as a zero, and the same knob is declared again at every level it passes through.
+
+The rule, and it applies to every module and every config in the tree:
+
+1. Fields become one value when they are set together, mean nothing apart, and name one thing that model families vary. Four booleans that all come from one family's choice are one value; two unrelated switches are two fields.
+2. A feature that is off by default is `Value | None`. That replaces a `0`, an empty tuple or an empty string standing in for "off", and it makes a dependent knob impossible to set without the thing it depends on.
+3. Nothing says one thing twice. Where one field derives from another, keep the primitive one and delete the convenience.
+4. Every value stays a dict. `dew.registry.from_record` builds a declared value from a record at the build boundary, so `attention={"heads": 8}` from the command line and `attention=Attention(heads=8)` from code agree, mappings and tuples of values are walked, and a run record round-trips without a second serialiser.
+
+What stays flat: a model's identity (`vocab_size`, `emb_features`, `num_layers`, `num_heads`, `num_kv_heads`), the precision policy the run writes (`dtype`, `precision`, `attention_impl`, `force_fp32_for_softmax`), and any switch that answers to nothing else.
+
+| value | replaces | where |
+|---|---|---|
+|`Attention`: heads, kv_heads, head_dim, bias, scale, qk_norm, v_norm, partial_rotary|the same eight fields on every backbone that attends, and their forwarding into the attention modules|`dew.nn.attention`, adopted by every backbone|
+|`Norms`: eps, scale_offset, after_cast, sandwich|`norm_eps`, `scale_offset`, `scale_after_cast`, `sandwich_norms`|`dew.nn`, adopted by the decoders|
+|`LayerKind`: window, rope_theta, head_dim|`sliding_window`, `rope_local_theta`, `global_head_dim`, whose names carry the local and global convention instead of the pattern doing it|`CausalTransformer`, keyed by the names in its layer pattern|
+|`Mixture`: experts, top_k, layers, every, score_function, scaling, groups, groups_per_token, bias|`num_experts` (with its `0` for dense), `top_k`, `moe_every`, `moe_layers`, `expert_bias`, and reaches the routing options nothing could name|`CausalTransformer`|
+|`Loading`: workers, threads, read_buffer, worker_buffer|the same four grain knobs declared on three unrelated dataset bases|`dew.data`, shared by every spec|
+|`Wandb`: project, entity, offline|`wandb_project`, `wandb_entity`, `wandb_offline`, and the rule that an unset project means no tracker|`TrainerConfig`|
+|`Checkpointing`: directory, every, keep|`checkpoint_dir`, `checkpoint_every`, `keep`|`TrainerConfig`|
+
+Derived fields deleted with them: `mlp_ratio` beside `mlp_features` (families state the intermediate size, and the ratio only restates it), `per_layer_input_dim`'s zero, and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values.

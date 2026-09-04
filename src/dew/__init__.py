@@ -56,15 +56,7 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(_EXPORTS) + ["__version__"]
+    return list(__all__)
 
 
-__all__ = [
-    "__version__",
-    *_REGISTRIES,
-    "Trainer", "TrainState", "Step", "Aux", "EMASpec", "MeshSpec", "Layout",
-    "Checkpoints", "Tracker", "WandbTracker",
-    "Objective", "Dataset", "Process", "InputSpec", "Field", "Condition",
-    "sample", "CFG",
-    "ImageGrid", "VideoGrid", "TextSamples", "Representations", "TokenScores",
-]
+__all__ = ["__version__", *sorted(_EXPORTS)]

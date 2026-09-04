@@ -14,6 +14,8 @@ imports none of them.
 from __future__ import annotations
 
 import dataclasses
+import types
+import typing
 from collections.abc import Iterator, Mapping
 from typing import Any, Callable, Generic, TypeVar, Union
 
@@ -85,10 +87,10 @@ class Registry(Mapping[str, T], Generic[T]):
 
         A field the member has no declaration for is an error, since dropping
         it would build something other than what was asked for. Fields arrive
-        from JSON as often as from code, so a `dtype` given as a string is
-        resolved here, at the one boundary where a logged config becomes an
-        object, wherever it sits: the UNets keep per-stage attention settings
-        in nested dicts and those carry a dtype of their own.
+        from JSON as often as from code, so a field whose declared type is a
+        value builds from a record here, at the one boundary where a logged
+        config becomes an object: `models.build("m", attention={"heads": 8})`
+        and `models.build("m", attention=Attention(heads=8))` agree.
         """
         member = self[name]
         if dataclasses.is_dataclass(member):
@@ -98,7 +100,8 @@ class Registry(Mapping[str, T], Generic[T]):
                 raise ValueError(
                     f"{self.kind} {name!r} ({_describe(member)}) has no field for "
                     f"{unknown}; its fields are {sorted(declared)}")
-            fields = _resolve_dtypes(fields)
+            fields = {key: _field_value(member, key, value)
+                      for key, value in fields.items()}
         return member(**fields)
 
     @property
@@ -114,14 +117,74 @@ def _describe(member: Any) -> str:
     return getattr(member, "__name__", repr(member))
 
 
-def _resolve_dtypes(value: Any) -> Any:
-    """`value` with every `dtype` entry resolved, through dicts and sequences."""
+def _declared_type(member: Any, field: str) -> Any:
+    """The annotation of `member`'s `field`, or None when it cannot be read."""
+    try:
+        hints = typing.get_type_hints(member)
+    except Exception:  # a forward reference to something not importable here
+        return None
+    return hints.get(field)
+
+
+def _value_type(annotation: Any) -> Any:
+    """The value class `annotation` asks for, looking through Optional only.
+
+    A container of values is not itself a value, so `Mapping[str, LayerKind]`
+    answers None and its entries are walked instead.
+    """
+    if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
+        return annotation
+    if typing.get_origin(annotation) not in (Union, types.UnionType):
+        return None
+    for argument in typing.get_args(annotation):
+        if dataclasses.is_dataclass(argument) and isinstance(argument, type):
+            return argument
+    return None
+
+
+def _entry_type(annotation: Any) -> Any:
+    """What one entry of an annotated container holds."""
+    arguments = [a for a in typing.get_args(annotation) if a is not Ellipsis]
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        arguments = [a for a in arguments if a is not type(None)]
+        return _entry_type(arguments[0]) if len(arguments) == 1 else None
+    return arguments[-1] if arguments else None
+
+
+def from_record(annotation: Any, value: Any) -> Any:
+    """`value` as its annotation asks for it: a record becomes the value it
+    describes, and anything already built is left alone.
+
+    Containers are walked, so a mapping of records and a tuple of records
+    build their values too, which is what keeps a model config a dict from
+    the command line all the way to the module.
+    """
     if isinstance(value, Mapping):
-        return {key: resolve_dtype(item) if key == "dtype" else _resolve_dtypes(item)
-                for key, item in value.items()}
+        held = _value_type(annotation)
+        if held is None:
+            # A record with no value class behind it, such as one of the unets'
+            # per-stage attention settings: entries are walked and the dtype
+            # rule below still applies by name.
+            return {key: resolve_dtype(item) if key == "dtype"
+                    else from_record(_entry_type(annotation), item)
+                    for key, item in value.items()}
+        declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
+        unknown = sorted(set(value) - set(declared))
+        if unknown:
+            raise ValueError(f"{_describe(held)} has no field for {unknown}; its "
+                             f"fields are {declared}")
+        return held(**{key: _field_value(held, key, item)
+                       for key, item in value.items()})
     if isinstance(value, (list, tuple)):
-        return type(value)(_resolve_dtypes(item) for item in value)
+        return type(value)(from_record(_entry_type(annotation), item) for item in value)
     return value
+
+
+def _field_value(member: Any, field: str, value: Any) -> Any:
+    """One field on its way into `member`: a dtype by name, a value from a record."""
+    if field == "dtype":
+        return resolve_dtype(value)
+    return from_record(_declared_type(member, field), value)
 
 
 _DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}

@@ -9,7 +9,7 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew` | `__version__`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `Trainer`, `TrainState`, `Step`, `Aux`, `EMASpec`, `MeshSpec`, `Layout`, `Checkpoints`, `Tracker`, `WandbTracker`, `Objective`, `Dataset`, `Process`, `InputSpec`, `Field`, `Condition`, `sample`, `CFG`, `ImageGrid`, `VideoGrid`, `TextSamples`, `Representations`, `TokenScores` |
+| `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
 | `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `resolve_dtype`, `dtype_name`, `with_precision` |
 | `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid` |
 | `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig` |
