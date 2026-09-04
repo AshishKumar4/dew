@@ -174,7 +174,7 @@ def architecture(theme: str) -> None:
     d.cell(X0 + (W - GAP) * 0.62 + GAP, y, (W - GAP) * 0.38, H, "dew.interop", "safetensors, Hugging Face layout")
     y += ROW
     d.layer_label(y, H, "training")
-    d.cell(X0, y, W, H, "dew.training", "ObjectiveTrainer: mesh, jit, EMA, accumulation, checkpoints, logging")
+    d.cell(X0, y, W, H, "dew.training", "Trainer: mesh, compiled step, EMA, accumulation, checkpoints, tracker")
     y += ROW
     d.layer_label(y, H, "objectives")
     d.cell(X0, y, third, H, "dew.objectives", "Diffusion, JEPA, language models; the plug-in", accent=True)
@@ -221,13 +221,13 @@ def training_loop(theme: str) -> None:
     d.path(f"M {lx} {y + h / 2} L {lx + 34} {y + h / 2} L {lx + 34} {y + h + 26} L {x + w / 2} {y + h + 26} L {x + w / 2} {y + h + 4}")
     d.label(x + w / 2 + 12, y + h + 22, "every step")
     by = y + h + 70
-    d.cell(24, by, 356, h, "validation", "objective.make_validation_step, then the metrics")
+    d.cell(24, by, 356, h, "validation", "objective.evaluate, then the metrics")
     d.cell(410, by, 356, h, "checkpoint", "state, EMA, optimizer, rng, iterator position")
     d.cell(796, by, 380, h, "best tracking", "lowest validation loss kept alongside the latest")
     d.arrow(200, by - 30, 200, by - 2, dashed=True)
     d.arrow(588, by - 30, 588, by - 2, dashed=True)
-    d.label(214, by - 10, "epoch end")
-    d.label(602, by - 10, "epoch end, or every checkpoint_every_steps")
+    d.label(214, by - 10, "every eval_every")
+    d.label(602, by - 10, "every checkpoint_every, and at the end")
     d.arrow(766, by + h / 2, 794, by + h / 2)
     d.label(24, by + h + 30, "The compiled step is one XLA program: the loss from the objective, the gradient, the optimizer update and the EMA update. It is compiled once per run.")
     d.render(f"training-loop-{theme}.svg")
@@ -263,12 +263,12 @@ def mesh(theme: str) -> None:
 
 def seam(theme: str) -> None:
     d = Diagram(1200, 330, theme)
-    d.cell(24, 24, 460, 68, "ObjectiveTrainer", "mesh, compiled step, optimizer, EMA, checkpoints, logging")
-    d.cell(716, 24, 460, 68, "Objective", "init_params, loss, make_validation_step, log_validation_artifacts", accent=True)
-    calls = [("at start", "init_params(rng)", "parameter tree, any number of modules"),
-             ("every step", "loss(params, ema_params, batch, rng, step)", "scalar loss and a dict of metrics"),
-             ("each epoch", "make_validation_step()(val_state, batch)", "artifacts: samples, embeddings, text"),
-             ("each epoch", "log_validation_artifacts(wandb, artifacts, step)", "what the artifacts look like in the run")]
+    d.cell(24, 24, 460, 68, "Trainer", "mesh, compiled step, optimizer, EMA, checkpoints, tracker")
+    d.cell(716, 24, 460, 68, "Objective", "inputs, ema, init, loss, evaluate", accent=True)
+    calls = [("at start", "init(key)", "variables tree, any number of modules"),
+             ("every step", "loss(params, batch, step)", "scalar loss and an Aux of metrics"),
+             ("every eval_every", "evaluate(params, batch, step)", "typed artifacts: images, text, token scores"),
+             ("every eval_every", "metric.reduce(scored)", "one val/<name> per metric")]
     y = 118
     for when, call, gives in calls:
         d.label(24, y + 5, when)

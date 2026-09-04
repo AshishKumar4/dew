@@ -6,7 +6,7 @@ The pieces live in `dew.training.distributed`.
 
 ## The mesh
 
-`build_mesh(fsdp_size, expert_size, devices=None)` returns a `(data, expert, fsdp)` mesh of shape `(device_count // (fsdp_size * expert_size), expert_size, fsdp_size)`. Parameters shard over `fsdp`, an MoE layer's expert dimension shards over `expert`, and both replicate over `data`, so `fsdp_size=1, expert_size=1` is plain data parallelism and needs no separate branch. A product that does not divide the device count is an error rather than a silent reshape.
+`build_mesh(MeshSpec(fsdp, expert), devices=None)` returns a `(data, expert, fsdp)` mesh of shape `(device_count // (fsdp * expert), expert, fsdp)`. Parameters shard over `fsdp`, an MoE layer's expert dimension shards over `expert`, and both replicate over `data`, so `fsdp_size=1, expert_size=1` is plain data parallelism and needs no separate branch. A product that does not divide the device count is an error rather than a silent reshape.
 
 The expert dimension gets an axis of its own rather than competing for `fsdp` because it is the one dimension no dense model has. Splitting eight experts four ways leaves every expert whole, where splitting a width costs a collective on every matmul.
 
@@ -85,7 +85,7 @@ A dimension the assigned mesh axes do not divide evenly cannot be split, so its 
 
 ## Which parameters shard
 
-`parameter_spec(shape, fsdp_size, min_shard_size)` picks the largest axis that divides evenly by `fsdp_size` and shards it. Anything smaller than `min_shard_size` elements (`DEFAULT_MIN_SHARD_SIZE`, 65536) stays replicated: below that a parameter costs more in collectives than it saves in memory.
+A module declares what its dimensions mean with `@logical_axes({...})`, and `Layout(rules, min_shard, tolerance)` merges every declaration in the tree into shardings; a parameter no module declared falls back to `parameter_spec(shape, fsdp, min_shard)`, which picks the largest axis that divides evenly by `fsdp` and shards it. Anything smaller than `min_shard_size` elements (`DEFAULT_MIN_SHARD_SIZE`, 65536) stays replicated: below that a parameter costs more in collectives than it saves in memory.
 
 `state_sharding_tree` maps sharding over the whole train state, not just the params, declared and undeclared alike. Optimizer moments and the EMA copy carry the same axes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
 

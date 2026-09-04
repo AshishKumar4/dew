@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.nn.dit import TextContext
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT, HierarchicalMMDiT
 from dew.nn.backbones.uvit import SimpleUDiT
@@ -33,7 +34,7 @@ BUILDERS = {
 
 def image_inputs(rng):
     return (jax.random.normal(rng, (2, RES, RES, 3)), jnp.ones((2,)),
-            jnp.ones((2, 77, 768), jnp.float32))
+            TextContext(jnp.ones((2, 77, 768), jnp.float32), jnp.ones((2, 77), bool)))
 
 
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
@@ -68,7 +69,8 @@ def test_remat_preserves_outputs_and_gradients(rng, arch):
 def test_video_dit_remat_matches():
     rng = jax.random.PRNGKey(0)
     x = jax.random.normal(rng, (1, 3, 16, 16, 3))
-    temb, ctx = jnp.ones((1,)), jnp.ones((1, 77, 768), jnp.float32)
+    temb = jnp.ones((1,))
+    ctx = TextContext(jnp.ones((1, 77, 768), jnp.float32), jnp.ones((1, 77), bool))
     plain = VideoDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
     remat = VideoDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1,
                      remat=True)

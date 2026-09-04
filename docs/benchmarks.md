@@ -1,7 +1,7 @@
 # Step benchmarks
 
 What one training step costs, per architecture, measured through
-`ObjectiveTrainer`'s own compiled step rather than a hand-written forward
+the `Trainer`'s own compiled step rather than a hand-written forward
 pass. Reproduce with `tools/benchmark_step.py`; the loader is measured
 separately by `tools/benchmark_data.py`.
 
@@ -20,7 +20,7 @@ python tools/benchmark_step.py --preset small --architectures unet --json-out be
 
 Run 2026-09-02, jax 0.11.1 / jaxlib 0.11.1 (CUDA), flax 0.12.9, optax 0.2.8,
 driver 595.84, RTX 4080 16 GiB, dew at `6b0f119`. Every model in bf16
-(`dtype=bfloat16`), single device, `fsdp_size=1`, adam, 2 warmup steps, 100
+(`dtype=bfloat16`), single device, `MeshSpec(fsdp=1)`, adam, 2 warmup steps, 100
 steps per architecture. One invocation per architecture (`--architectures
 unet` and so on), so each row's peak memory is its own; `ms/step` times the
 loop the way a run dispatches it, and `p10 / p50 / p90 ms` come from a second
@@ -143,5 +143,5 @@ starves the image models: an image run whose `train/mfu` looks low should be
 checked here first.
 
 These two points are not the loader's ceiling. `benchmark_data.py` defaults to
-16 read threads, where `DataConfig` uses 32 workers and 140 read threads, and
+16 read threads, where the dataset specs default to 32 workers and 64 read threads, and
 Oxford Flowers is 8189 small records rather than a sharded 12M-record set.

@@ -33,25 +33,21 @@ The [models](#models), the [diffusion maths](#schedules-and-prediction-transform
 Dew is the successor to [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). It is a personal research project, not a product. Expect sharp edges, and please [report](https://github.com/AshishKumar4/dew/issues) the ones you find.
 
 ```python
+# runs elsewhere: downloads Oxford Flowers and trains for real
 import jax, optax
-from dew.data.dataloaders import get_dataset_grain
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.inputs import DiffusionInputConfig
-from dew.registry import build_model
-from dew.training import ObjectiveTrainer
+import dew
+from dew import Checkpoints, Field, InputSpec, MeshSpec, Trainer, models, presets
+from dew.data import OxfordFlowers
+from dew.objectives.diffusion import DiffusionObjective
 
-data = get_dataset_grain("oxford_flowers102", batch_size=32, image_scale=64)
-train_schedule, sample_schedule, transform = get_diffusion_preset("edm")
-model = build_model("simple_dit", dict(emb_features=256, num_layers=6, num_heads=4, patch_size=4))
+data = OxfordFlowers(image_size=64).load(batch=32)
+model = models.SimpleDiT(emb_features=256, num_layers=6, num_heads=4, patch_size=4, dtype="bfloat16")
+objective = DiffusionObjective(model, presets.EDM()(), InputSpec(Field("image", (64, 64, 3))))
 
-trainer = ObjectiveTrainer(
-    model, optax.adamw(3e-4),
-    input_config=DiffusionInputConfig(sample_data_key="image", sample_data_shape=(64, 64, 3), conditions=[]),
-    noise_schedule=train_schedule, model_output_transform=transform,
-    rngs=jax.random.PRNGKey(0), name="flowers",
-)
-state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 32, epochs=50)
-# state.params, state.ema_params and state.opt_state, sharded over every device; checkpoints under ./checkpoints/flowers
+trainer = Trainer(objective, optax.adamw(3e-4), key=jax.random.key(0),
+                  mesh=MeshSpec(fsdp=1), checkpoints=Checkpoints("runs/flowers"))
+state = trainer.fit(data, steps=50 * data.steps_per_epoch)
+# state.params, state.ema and state.opt_state, sharded over every device; checkpoints under runs/flowers
 ```
 
 <div align="center">
@@ -84,62 +80,67 @@ state = trainer.fit(data, training_steps_per_epoch=data["train_len"] // 32, epoc
 
 ### Schedules and prediction transforms
 
-A diffusion model is defined by three choices: the noise schedule for training, the noise schedule for sampling, and the prediction transform, which says what the network outputs. Use `get_diffusion_preset` to get a matched set:
+A diffusion model is defined by three choices: the noise schedule for training, the noise schedule for sampling, and the prediction transform, which says what the network outputs. A `Process` holds the three, and a preset is a dataclass that builds one; its fields are what a run records, so a run's process can always be rebuilt:
 
 ```python
-from dew.diffusion.transforms import get_diffusion_preset
+from dew import presets
 
-train_schedule, sample_schedule, transform = get_diffusion_preset("edm")    # EDM training, Karras sampling
-train_schedule, sample_schedule, transform = get_diffusion_preset("flow")   # rectified flow, as in Stable Diffusion 3
-train_schedule, sample_schedule, transform = get_diffusion_preset("cosine", min_snr_gamma=5.0)
+process = presets.EDM()()                          # EDM training, Karras sampling
+process = presets.Flow(shift=3.0)()                # rectified flow, as in Stable Diffusion 3
+process = presets.Cosine(min_snr_gamma=5.0)()
+process = presets.build("edm", sigma_data=0.5)()   # by name, for a config; an unknown field raises
 ```
 
-The parts are available on their own. `dew.diffusion.schedules` has the linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules. `dew.diffusion.transforms` has the epsilon, x0, v, flow and Karras transforms. Every schedule is tested against the invariants of its paper: monotone SNR, exact forward and inverse diffusion, variance preservation. See [docs/api.md](docs/api.md#diffusion) for the list.
+The parts are available on their own. `dew.diffusion.schedules` has the linear, cosine, exp, sqrt, Karras VE, EDM and flow matching schedules; a schedule is a value with `rates`, `sample_t`, `weight` and `model_time`, and holds no random state. `dew.diffusion.transforms` has the epsilon, x0, v, flow and Karras transforms. `dew.diffusion.discrete` has the masking schedule, process and unmasking solver a masked diffusion language model trains and samples with. Every schedule is tested against the invariants of its paper: monotone SNR, exact forward and inverse diffusion, variance preservation. See [docs/api.md](docs/api.md#diffusion) for the list.
 
 ### Conditioning
 
-`DiffusionInputConfig` describes the sample and its conditions. A condition pairs an encoder with the batch key it reads:
+`InputSpec` describes the sample and its conditions. A condition pairs an encoder with the batch field it reads, under the keyword the model takes it as:
 
 ```python
-from dew.inputs import DiffusionInputConfig, ConditionalInputConfig
-from dew.inputs.encoders import CLIPTextEncoder
+# runs elsewhere: downloads the CLIP text tower
+from dew import Condition, Field, InputSpec
+from dew.inputs import CLIPText
 
-text = CLIPTextEncoder.from_modelname("openai/clip-vit-large-patch14")
-inputs = DiffusionInputConfig(
-    sample_data_key="image", sample_data_shape=(128, 128, 3),
-    conditions=[ConditionalInputConfig(encoder=text)],
-)
+text = CLIPText.from_pretrained("openai/clip-vit-large-patch14")
+inputs = InputSpec(sample=Field("image", (128, 128, 3)),
+                   conditions={"textcontext": Condition(text, field="text", unconditional="")})
 ```
 
-The trainer drops the conditions on 12% of each batch (`unconditional_prob`), so the model also learns the unconditional distribution that classifier-free guidance needs. `dew.inputs.encoders` ships a CLIP text encoder and a Hugging Face audio encoder; a new one implements `tokenize` and `encode_from_tokens`. The CLIP encoder is dew's own port of the text tower, in [`dew/nn/text_encoders.py`](src/dew/nn/text_encoders.py), and it reads the checkpoint's safetensors itself, since transformers 5 removed the Flax classes it used to load. Pass `autoencoder=StableDiffusionVAE()` to the trainer to train in the latent space of the Stable Diffusion VAE instead of pixels, or `SimpleAutoEncoder` to train your own.
+The objective drops the conditions on 12% of each batch (`unconditional_prob`), so the model also learns the unconditional distribution that classifier-free guidance needs. An encoder tokenizes on the host and encodes on device as a pure function of its own parameters, which the trainer places like any other, so a frozen text tower is an argument of the compiled step and never a constant baked into it. `dew.inputs` ships `CLIPText`, `CharTable` (a table lookup that costs nothing, for tests and benchmarks) and an `Audio` encoder that says what it needs before it can load a tower; a new one implements `tokenize`, `encode` and `to_json` and registers with `@encoders(name)`. The CLIP encoder is dew's own port of the text tower, in [`dew/nn/text_encoders.py`](src/dew/nn/text_encoders.py), and it reads the checkpoint's safetensors itself, since transformers 5 removed the Flax classes it used to load. Pass `autoencoder=StableDiffusionVAE()` to the objective to train in the latent space of the Stable Diffusion VAE instead of pixels, or `SimpleAutoEncoder` to train your own.
 
 ### Sampling
 
-A sampler takes the model, the sampling schedule, the transform and the input config. Guidance belongs to the sampler; `guidance_start` and `guidance_stop` limit it to an interval of the trajectory:
+Sampling is one function. `process.denoiser` turns the model and its parameters into a denoiser, a solver takes one step of the trajectory, and `sample` runs the steps in one `lax.scan`. Guidance wraps the denoiser; `CFG(scale, interval)` limits it to a part of the trajectory:
 
 ```python
-from dew.sampling import EulerAncestralSampler
+import jax
+from dew import CFG, sample
+from dew.sampling import Heun
 
-sampler = EulerAncestralSampler(model, sample_schedule, transform, inputs,
-                                guidance_scale=4.0, guidance_start=0.1, guidance_stop=0.9)
-images = sampler.generate_samples(params=state.ema_params, num_samples=4, resolution=128,
-                                  diffusion_steps=50, conditioning=["a water lily", "a rose"])
-# images.shape == (4, 128, 128, 3), values in [-1, 1]
+weights = {**state.params, **state.ema}                 # the EMA weights, with the frozen encoders beside them
+encode = lambda prompts: {"textcontext": text.encode(weights["encoders"]["textcontext"], text.tokenize(prompts))}
+denoise = process.denoiser(model, weights, encode(["a water lily", "a rose"]), unconditional=encode(["", ""]))
+x_T = process.noise(jax.random.key(1), (2, *inputs.sample.shape))
+images = sample(denoise, x_T, steps=8, solver=Heun(), guidance=CFG(4.0, interval=(0.1, 0.9)), key=jax.random.key(2))
+assert images.shape == (2, *inputs.sample.shape)   # values in [-1, 1]
 ```
 
-`DDPMSampler`, `DDIMSampler`, `EulerSampler`, `EulerAncestralSampler`, `HeunSampler`, `RK4Sampler` and `MultiStepDPM` all take the same arguments. Video models pass `sequence_length` as well and get `[B, T, H, W, C]` back. Each sampler is tested to converge on an analytic denoiser.
+`TextToImage` does the encoding and the decoding for you, from a live model or from a run directory (`TextToImage.from_run("runs/flowers")`), and the solvers `ddpm`, `ddim`, `euler`, `euler_ancestral`, `heun`, `rk4` and `multistep_dpm` are registered in `samplers`. Each is tested to converge on an analytic denoiser, and the two that integrate in sigma refuse a variance-preserving schedule rather than integrating it wrong. There is no default seed anywhere in sampling: every call takes a `key`.
 
 ### Models
 
-`build_model` constructs any registered architecture from its name and a dict of keyword arguments:
+Every architecture is a Flax module registered under a name. The registry is a mapping, an attribute view and a strict builder over one table, so `models["simple_dit"]`, `models.SimpleDiT` and the class are the same object, and a field the model does not have raises instead of being dropped:
 
 ```python
-from dew.registry import build_model
+import dew
+from dew import models
 
-unet = build_model("unet", dict(emb_features=256, feature_depths=[64, 128, 256, 512]))
-dit = build_model("simple_dit+hilbert", dict(emb_features=512, num_layers=12, num_heads=8, patch_size=2))
-mmdit = build_model("simple_mmdit", dict(emb_features=512, num_layers=12, num_heads=8, patch_size=2,
-                                         dtype="bfloat16", attention_impl="auto"))
+unet = models.Unet(emb_features=256, feature_depths=[64, 128, 256, 512])
+dit = models.SimpleDiT(emb_features=512, num_layers=12, num_heads=8, patch_size=2, scan_order="hilbert")
+mmdit = models.build("simple_mmdit", emb_features=512, num_layers=12, num_heads=8, patch_size=2,
+                     dtype="bfloat16", attention_impl="auto")
+assert models["simple_dit"] is models.SimpleDiT
 ```
 
 | Architecture | What it is |
@@ -152,29 +153,24 @@ mmdit = build_model("simple_mmdit", dict(emb_features=512, num_layers=12, num_he
 | `jepa_encoder`, `jepa_video_encoder`, `jepa_predictor` | The ViTs the JEPA objective trains |
 | `causal_transformer` | The decoder for language models, in the Hugging Face layout |
 
-The `+hilbert` and `+zigzag` suffixes change the order in which patches enter a transformer. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads on a TPU. `dew.nn` holds the pieces they are made of: attention (one module over the reference, XLA, cuDNN and TPU kernels), blocks, the DiT and ViT stacks, the S5 mixer, the scan orders, and the autoencoders. See [docs/benchmarks.md](docs/benchmarks.md) for what each architecture costs per step.
+`scan_order` (`raster`, `hilbert` or `zigzag`) is the order in which patches enter a transformer. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads on a TPU. `dew.nn` holds the pieces they are made of: attention (one module over the reference, XLA, cuDNN and TPU kernels), blocks, the DiT and ViT stacks, the S5 mixer, the scan orders, and the autoencoders. See [docs/benchmarks.md](docs/benchmarks.md) for what each architecture costs per step.
 
 ## JEPA
 
 `JepaObjective` trains an I-JEPA or V-JEPA encoder. The predictor reads the encoder's embeddings of the visible patches and predicts the embeddings of masked target blocks; the targets come from a target encoder that is an EMA of the context encoder. The objective logs the representation standard deviation and off-diagonal covariance on every step, which is how a collapsing run shows itself.
 
 ```python
+import jax, optax
+from dew import Checkpoints, Field, Trainer, metrics, models
 from dew.objectives.jepa import JepaObjective, multi_block_mask
-from dew.objectives.jepa.probes import get_linear_probe_metric, get_knn_probe_metric
 
-encoder = build_model("jepa_encoder", dict(patch_size=16, emb_features=384, num_layers=12, num_heads=6))
-predictor = build_model("jepa_predictor", dict(grid=(14, 14), emb_features=384, predictor_features=192,
-                                                num_layers=6, num_heads=6))
-objective = JepaObjective(encoder, predictor, mask=multi_block_mask((14, 14)),
-                          sample_data_key="image", sample_data_shape=(224, 224, 3))
+encoder = models.JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
+predictor = models.JepaPredictor(grid=(4, 4), emb_features=32, predictor_features=16, num_layers=1, num_heads=2)
+objective = JepaObjective(encoder, predictor, mask=multi_block_mask((4, 4), num_targets=1, scale=(0.2, 0.3)), sample=Field("image", (16, 16, 3)))
 
-trainer = ObjectiveTrainer(
-    encoder, optax.adamw(1e-3), objective=objective,
-    input_config=DiffusionInputConfig(sample_data_key="image", sample_data_shape=(224, 224, 3), conditions=[]),
-    eval_metrics=[get_linear_probe_metric(102), get_knn_probe_metric(102)],
-    rngs=jax.random.PRNGKey(0), name="ijepa-flowers",
-)
-# validation logs val/linear_probe_accuracy and val/knn_probe_accuracy, from classifiers fit on the frozen embeddings
+trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), checkpoints=Checkpoints("runs/ijepa"))
+state = trainer.fit(data, steps=steps, metrics=(metrics.linear_probe(5), metrics.knn_probe(5)))
+# validation logs val/linear_probe and val/knn_probe, from classifiers fit on the frozen embeddings
 ```
 
 `multi_block_mask` resolves the I-JEPA mask geometry (number of targets, scale and aspect ranges) for a patch grid. `jepa_video_encoder` and a `factorized=True` predictor do the same for video. See [docs/concepts/objectives.md](docs/concepts/objectives.md) for more.
@@ -184,21 +180,22 @@ trainer = ObjectiveTrainer(
 `CausalTransformer` is a decoder with the parts current open models use: RMSNorm, grouped-query attention, rotary positions, a gated MLP, q/k normalisation, and optional sliding-window layers, embedding scaling and logit softcapping. Its parameter tree follows the Hugging Face decoder layout. Qwen and Gemma checkpoint translators and parity tests are in progress; a checkpoint is not supported until those tests pass. `LMObjective` is next-token cross entropy in fp32; at validation it reports perplexity and generates text.
 
 ```python
-from dew.data.dataloaders import get_token_dataset_grain
-from dew.objectives.lm import LMObjective
-from dew.sampling.text import generate
+# runs elsewhere: reads a tokenized corpus from disk and trains for real
+import jax, optax
+from dew import Checkpoints, Trainer, metrics, models
+from dew.data import TokenWindows
+from dew.objectives.lm import LMObjective, Samples
+from dew.sampling import generate
 
-data = get_token_dataset_grain("data/shakespeare/train.bin", "data/shakespeare/val.bin",
-                               batch_size=64, seq_len=256)
-model = build_model("causal_transformer", dict(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
-                                              max_seq_len=512, dtype="bfloat16", attention_impl="auto"))
-trainer = ObjectiveTrainer(model, optax.adamw(1e-3), objective=LMObjective(model, seq_len=256, vocab_size=256),
-                           input_config=None, rngs=jax.random.PRNGKey(0), name="shakespeare")
-state = trainer.fit(data, training_steps_per_epoch=300, epochs=4)
-# val/perplexity 391 -> 4.6 over the four epochs, on an RTX 4080
+data = TokenWindows(path="data/shakespeare", seq_len=256).load(batch=64)
+model = models.CausalTransformer(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
+                                 max_seq_len=512, dtype="bfloat16", attention_impl="auto")
+objective = LMObjective(model, seq_len=256, samples=Samples(prompt=list(b"ROMEO:"), max_new_tokens=300))
+trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), checkpoints=Checkpoints("runs/shakespeare"))
+state = trainer.fit(data, steps=1200, metrics=(metrics.perplexity(),))
+# val/perplexity 391 -> 4.6 over 1200 steps, on an RTX 4080
 
-tokens = generate(model, state.ema_params, prompt, max_new_tokens=300,
-                  rng=jax.random.PRNGKey(0), temperature=0.8, top_k=40)
+tokens = generate(model, state.ema, prompt, max_new_tokens=300, key=jax.random.key(0), temperature=0.8, top_k=40)
 # prompt is int32 [1, 6] for b"ROMEO:"; tokens.shape == (1, 306)
 ```
 
@@ -206,7 +203,7 @@ tokens = generate(model, state.ema_params, prompt, max_new_tokens=300,
 
 ## Objectives
 
-An objective has four methods. `init_params` builds the parameter tree, which can hold several modules. `loss` returns a scalar and a dict of metrics. `make_validation_step` returns the function that runs at the end of each epoch. `log_validation_artifacts` sends its output to Weights & Biases. `ema` says which part of the tree gets an exponential moving average, and `input_shapes` tells the trainer what a batch looks like.
+An objective has three methods and three attributes. `init(key)` builds the parameter tree, which can hold several modules. `loss(params, batch, step)` returns a scalar and an `Aux` of metrics, plus any non-parameter collections to write back. `evaluate(params, batch, step)` returns a typed artifact, an `ImageGrid`, `TextSamples`, `TokenScores` or `Representations`, which a metric scores and a tracker renders. `inputs` says what a batch looks like, `ema` which part of the tree gets an exponential moving average, and `step` carries the step number, the step's key and the EMA parameters. Nothing in an objective logs, opens a file or touches a tracker.
 
 <div align="center">
 <picture>
@@ -219,40 +216,36 @@ An objective has four methods. `init_params` builds the parameter tree, which ca
 
 ```python
 import jax.numpy as jnp, optax
-from dew.objectives import Objective, EMASpec
+from dew import Aux, EMASpec, Field, InputSpec, Objective, TokenScores
 
 class LMObjective(Objective):
-    tag = "lm"
-
-    def __init__(self, model, seq_len, *, vocab_size, ema_decay=0.999):
-        self.model, self.seq_len, self.vocab_size = model, seq_len, vocab_size
+    def __init__(self, model, seq_len, *, ema_decay=0.999):
+        self.model, self.seq_len = model, seq_len
+        self.inputs = InputSpec(Field("text", (seq_len + 1,)))
         self.ema = EMASpec(decay=lambda step: ema_decay)
 
-    @property
-    def input_shapes(self):
-        return {"tokens": ((self.seq_len,), jnp.int32)}
+    def init(self, key):
+        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
-    def init_params(self, rng):
-        return self.model.init(rng, jnp.zeros((1, self.seq_len), jnp.int32))
-
-    def loss(self, params, ema_params, batch, rng, step):
+    def loss(self, params, batch, step):
         tokens = batch["text"]
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
-        logits = self.model.apply(params, inputs, train=True,
-                                  rngs={"dropout": rng}).astype(jnp.float32)
-        ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
-        accuracy = (jnp.argmax(logits, axis=-1) == targets).mean()
-        return ce, {"ce": ce, "perplexity": jnp.exp(ce), "token_accuracy": accuracy}
+        logits = self.model.apply(params, inputs, train=True, rngs={"dropout": step.key}).astype(jnp.float32)
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return ce.mean(), Aux({"ce": ce.mean(), "token_accuracy": (jnp.argmax(logits, -1) == targets).mean()})
 
-    def make_validation_step(self, **kwargs):
-        return lambda val_state, batch: {"ce": self.loss(val_state.ema_params, None, batch, None, 0)[0]}
+    def evaluate(self, params, batch, step):
+        tokens = batch["text"]
+        logits = self.model.apply(step.ema, tokens[:, :-1]).astype(jnp.float32)
+        losses = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
+        return TokenScores(losses=losses, weights=jnp.ones_like(losses))
 ```
 
-The trainer compiles `loss` into one sharded step with the optimizer and the EMA update, and checkpoints the parameters, the EMA and the optimizer state. The metrics an objective returns appear in the run as `train/<name>`, so this one logs `train/ce`, `train/perplexity` and `train/token_accuracy`. The shipped class adds a `pad_id` mask, a check that a batch row carries `seq_len + 1` ids, and the sampled text it logs at validation. `DiffusionObjective` and `JepaObjective` are written the same way, and `EMASpec(path=...)` lets an objective average one subtree only, which is how JEPA keeps its target encoder. See [docs/concepts/objectives.md](docs/concepts/objectives.md) for more.
+The trainer compiles `loss` into one sharded step with the optimizer and the EMA update, and checkpoints the parameters, the EMA, the optimizer state, the key and the data position. The metrics an objective returns appear in the run as `train/<name>`, so this one logs `train/ce` and `train/token_accuracy`; `metrics.perplexity()` reads the `TokenScores` over a whole validation pass, weighted by target, so a batch of padding weighs nothing. The shipped class adds a `pad_id` mask, packed-document boundaries, the chunked fp32 head, and `TextSamples` when samples are configured. `DiffusionObjective` and `JepaObjective` are written the same way, and `EMASpec(select=...)` lets an objective average one subtree only, which is how JEPA keeps its target encoder. `Aux.variables` is how a mixture-of-experts objective moves its routing bias: the trainer writes those collections back into the tree. See [docs/concepts/objectives.md](docs/concepts/objectives.md) for more.
 
 ## Scaling
 
-The trainer places the run on a two-dimensional mesh named `(data, fsdp)`. The batch is split across all devices. With `fsdp_size=1` the parameters are replicated, which is data parallelism. With `fsdp_size=N` every parameter and optimizer moment above `fsdp_min_param_size` is split across `N` devices along its largest divisible axis. One compiled step serves both, with its shardings declared to XLA and its buffers donated, so no code changes between a laptop and a pod.
+The trainer places the run on a mesh named `(data, expert, fsdp)`; `MeshSpec(fsdp=, expert=)` sets two of the sizes and the data axis fills the rest. The batch is split across all devices. With `fsdp=1` the parameters are replicated, which is data parallelism. With `fsdp=N` every parameter and optimizer moment above the layout's `min_shard` is split across `N` devices along the axis its module declared with `@logical_axes`, or its largest divisible axis where nothing is declared, and a layout that leaves more than `tolerance` of the model replicated stops the run rather than training it. One compiled step serves both, with its shardings declared to XLA and its buffers donated, so no code changes between a laptop and a pod.
 
 <div align="center">
 <picture>
@@ -262,11 +255,12 @@ The trainer places the run on a two-dimensional mesh named `(data, fsdp)`. The b
 </div>
 
 ```python
-trainer = ObjectiveTrainer(model, optimizer, ..., fsdp_size=4, grad_accum_steps=2)
-# 8 devices: mesh (data=2, fsdp=4); every large parameter split four ways, the EMA and Adam moments with it
+from dew import MeshSpec, Trainer
+trainer = Trainer(objective, optimizer, key=key, mesh=MeshSpec(fsdp=1), accumulation=2)
+# 8 devices: mesh (data=2, expert=1, fsdp=4); every large parameter split four ways, the EMA and Adam moments with it
 ```
 
-On a TPU pod every host runs the same script. The recipes join the hosts into one JAX runtime from the cluster environment before the model is built, and stop with an error if they cannot. The data pipeline shards records by process, so each host reads its own part of the dataset; `--data.dataset-path` points at the GCS mount and `--trainer.checkpoint-fs gcs` writes checkpoints to a bucket. The `dew-tpu` command creates a slice, installs dew on every worker and starts a recipe on all of them; [docs/tpu.md](docs/tpu.md) is the walkthrough.
+On a TPU pod every host runs the same script. The recipes join the hosts into one JAX runtime from the cluster environment before the model is built, and stop with an error if they cannot. The data pipeline shards records by process, so each host reads its own part of the dataset; the dataset's `path` points at the GCS mount and a `gs://` checkpoint directory writes the shards to a bucket, which is the shared storage a resume across hosts needs. The `dew-tpu` command creates a slice, installs dew on every worker and starts a recipe on all of them; [docs/tpu.md](docs/tpu.md) is the walkthrough.
 
 <div align="center">
 <picture>
@@ -279,13 +273,14 @@ Models compute in bf16 with fp32 parameters by default, and attention runs on th
 
 | | Trainer argument | Recipe flag |
 |---|---|---|
-| FSDP degree | `fsdp_size=4` | `--trainer.fsdp-size 4` |
-| Smallest sharded parameter | `fsdp_min_param_size=2**16` | `--trainer.fsdp-min-param-size 65536` |
-| Gradient accumulation | `grad_accum_steps=2` | `--optim.grad-accum-steps 2` |
+| FSDP degree | `mesh=MeshSpec(fsdp=4)` | `--trainer.mesh.fsdp 4` |
+| Expert parallelism | `mesh=MeshSpec(expert=8)` | `--trainer.mesh.expert 8` |
+| Smallest sharded parameter | `layout=Layout(min_shard=2**16)` | `--trainer.layout.min-shard 65536` |
+| Gradient accumulation | `accumulation=2` | `--trainer.accumulation 2` |
 | Gradient clipping | `optax.clip_by_global_norm` in the chain | `--optim.clip-grads 1.0` |
-| Compute dtype | `build_model(..., dtype="bfloat16")` | `--model.dtype bfloat16` |
-| Attention kernel | `build_model(..., attention_impl="auto")` | `--model.attention-impl auto` |
-| fp16 loss scaling | `use_dynamic_scale=True` | `--optim.use-dynamic-scale` |
+| Compute dtype | `models.build(..., dtype="bfloat16")` | `--model.dtype bfloat16` |
+| Attention kernel | `models.build(..., attention_impl="auto")` | `--model.attention-impl auto` |
+| fp16 loss scaling | `dynamic_scale=True` | `--trainer.dynamic-scale` |
 | Process pool | `prepare_process(..., multi_host=True)` | `--trainer.multi-host True` |
 | Compilation cache | `compilation_cache_dir="~/.cache/dew/xla"` | on by default |
 
@@ -303,121 +298,126 @@ The data pipeline is built on [Grain](https://github.com/google/grain). A datase
 </div>
 
 ```python
-from dew.config import DataConfig
-from dew.data.dataloaders import load_data
+# runs elsewhere: downloads Oxford Flowers
+from dew.data import OxfordFlowers
 
-data = load_data(DataConfig(dataset="oxford_flowers102", batch_size=32, image_size=128, worker_count=8))
-batch = next(iter(data["train"]()))
+data = OxfordFlowers(image_size=128, worker_count=8).load(batch=32)
+batch = next(data.train())
 # batch["image"].shape == (32, 128, 128, 3), uint8; batch["text"] holds the tokenized captions
+# data.val() is the held-out records once, in a fixed order; data.steps_per_epoch is one pass over data.records
 ```
 
-| Source | Records | Registered in |
+| Source | Records | Specs |
 |---|---|---|
-| TFDS datasets | images with labels or captions | `datasetMap` |
-| ArrayRecord shards on a GCS mount | images with captions, at the scale of LAION and COYO | `datasetMap`, `mediaDatasetMap` |
-| Local video directories, VoxCeleb2 | video clips with audio | `mediaDatasetMap` |
-| Tokenized text (`train.bin`, `val.bin`) | windows of token ids | by directory, with `sequence_length` |
-| URL streams (LAION-style tables) | images or videos fetched while training | `onlineDatasetMap` |
+| TFDS datasets | images with labels or captions | `OxfordFlowers`, `HFImages` |
+| ArrayRecord shards on a GCS mount | images with captions, at the scale of LAION and COYO | `ArrayRecordImages` and the named shard sets |
+| Local video directories, VoxCeleb2 | video clips with audio | `LocalVideos`, `VoxCeleb2` |
+| Tokenized text (`train.bin`, `val.bin`) | windows of token ids, or packed documents | `TokenWindows`, `PackedTokens` |
+| URL streams (LAION-style tables) | images fetched while training | `OnlineImages`, `CombinedOnline` |
 
-`load_data` picks the loader from the registry and holds validation records out of the training set. A failed record is dropped and counted; nothing is ever replaced with zeros. The grain loaders return the same dict: `train` and `val` iterator factories, `train_len`, `val_len`, `local_batch_size` and `global_batch_size`; the media loaders add `media_type`, and the streaming loaders return a `train` factory with no `val` beside it. `tools/benchmark_data.py` measures a loader on its own. See [docs/concepts/data.md](docs/concepts/data.md) for more.
+A dataset is a frozen spec in the `datasets` registry; its fields are its knobs, and tyro turns them into the recipes' flags. `load` returns a `Dataset`: `train` and `val` iterator factories, the record count and the global batch, with the per-process batch computed in one place that refuses a batch the processes cannot split. Validation is the held-out records once, in canonical order, disjoint from training, the same on any number of workers and hosts, and every process agrees how many batches it holds before a pass starts. A failed record is dropped and counted; nothing is ever replaced with zeros. Augmentation is a field of the spec, not an environment variable. `tools/benchmark_data.py` measures a loader on its own. See [docs/concepts/data.md](docs/concepts/data.md) for more.
 
 ## Configuration
 
 A run is a `RunConfig` with four parts, and [tyro](https://github.com/brentyi/tyro) turns the tree into a command line: `--optim.learning-rate 1e-4` sets `config.optim.learning_rate`. The recipes subclass it to add their objective's knobs.
 
 ```python
-from dew.config import RunConfig, ModelConfig, DataConfig, OptimConfig, TrainerConfig
+from dew.config import RunConfig, ModelConfig, OptimConfig, TrainerConfig
+from dew.data import OxfordFlowers
 
 config = RunConfig(
     model=ModelConfig("simple_dit", dict(patch_size=4, emb_features=512, num_layers=12, num_heads=8),
                       dtype="bfloat16", attention_impl="auto"),
-    data=DataConfig(dataset="oxford_flowers102", batch_size=64, image_size=128, worker_count=16),
+    data=OxfordFlowers(image_size=128, worker_count=16),
     optim=OptimConfig(optimizer="adamw", learning_rate=2e-4, learning_rate_schedule="cosine",
                       learning_rate_warmup_steps=2000, weight_decay=0.01, clip_grads=1.0),
-    trainer=TrainerConfig(name="flowers-dit", epochs=500, fsdp_size=1, checkpoint_every_steps=2000,
+    trainer=TrainerConfig(name="flowers-dit", batch_size=64, epochs=500, checkpoint_every=2000,
                           wandb_project="dew"),
 )
-config.to_dict()        # the JSON the run logs; RunConfig.from_dict rebuilds it
+config.save("runs/flowers-dit")        # run.json, next to the checkpoints; RunConfig.load rebuilds it, and raises on a field it does not know
 ```
 
 | Part | Fields |
 |---|---|
-| `model` | `architecture`, `config` (the kwargs `build_model` receives), `dtype`, `attention_impl` |
-| `data` | `dataset`, `dataset_path`, `dataset_seed`, `batch_size`, `image_size`, `val_steps_per_epoch`, `loader`, `augmentation_mode`, `worker_count`, `read_thread_count`, `read_buffer_size`, `worker_buffer_size`, `sequence_length`, `tokenizer` |
-| `optim` | `optimizer` (adam, adamw, lamb, muon), `optimizer_opts`, `learning_rate`, `learning_rate_schedule`, `learning_rate_peak`, `learning_rate_end`, `learning_rate_warmup_steps`, `learning_rate_decay_epochs`, `weight_decay`, `clip_grads`, `grad_accum_steps`, `use_dynamic_scale` |
-| `trainer` | `name`, `epochs`, `steps_per_epoch`, `checkpoint_dir`, `checkpoint_fs`, `checkpoint_step`, `load_from_checkpoint`, `resume_last_run`, `max_checkpoints_to_keep`, `checkpoint_every_steps`, `distributed_training`, `multi_host`, `fsdp_size`, `fsdp_min_param_size`, `ema_decay`, `best_tracker_metric`, `profile_steps`, `compilation_cache_dir`, `log_every`, `wandb_project`, `wandb_entity`, `wandb_offline` |
+| `model` | `architecture`, `config` (the fields the registry builds the model from), `dtype`, `attention_impl` |
+| `data` | a dataset spec, chosen as a subcommand (`data:oxford-flowers --data.image-size 128`); its fields are the spec's |
+| `optim` | `optimizer` (adam, adamw, lamb, muon), `learning_rate`, `learning_rate_schedule`, `learning_rate_peak`, `learning_rate_end`, `learning_rate_warmup_steps`, `weight_decay`, `clip_grads` |
+| `trainer` | `name`, `seed`, `batch_size`, `epochs`, `steps`, `checkpoint_dir`, `keep`, `checkpoint_every`, `eval_every`, `log_every`, `mesh` (`fsdp`, `expert`), `layout` (`min_shard`, `tolerance`), `accumulation`, `dynamic_scale`, `multi_host`, `xla_flags`, `profile_steps`, `compilation_cache_dir`, `wandb_project`, `wandb_entity`, `wandb_offline` |
 
-The diffusion recipe adds `noise_schedule`, `min_snr_gamma`, `flow_shift`, `autoencoder`, `autoencoder_opts`, `val_metrics`, `validation_prompts` and `dataset_test`; the JEPA recipe adds `predictor`, `frames_per_sample`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes`, `probe_label_key` and `knn_k`; the language model recipe adds `sequence_length`, `tokenizer`, `sample_prompt` and `sample_tokens`. The defaults carry no machine paths and no personal accounts. `--help` on any recipe prints the whole tree with its defaults. See [docs/recipes.md](docs/recipes.md) for more.
+The diffusion recipe adds `preset` and `sampler` (each a subcommand over its registry: `preset:edm --preset.sigma-data 0.5`), `guidance`, `sampling_steps`, `unconditional_prob`, `ema_decay`, `text_encoder`, `autoencoder` and `val_metrics`; the JEPA recipe adds `predictor`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes` and `knn_k`; the language model recipe adds `tokenizer`, `ema_decay`, `sample_prompt`, `sample_tokens` and `pretrained`. The defaults carry no machine paths and no personal accounts. `--help` on any recipe prints the whole tree with its defaults. See [docs/recipes.md](docs/recipes.md) for more.
 
 ## Checkpoints and resume
 
-A checkpoint holds the train state (parameters, EMA parameters, optimizer state, step), the random state, the best loss so far, the epoch, and the position of the data iterator. The trainer writes one at the end of every epoch, every `checkpoint_every_steps` steps if set, and once more when `fit` returns. Writes are asynchronous with Orbax; sharded arrays go from the devices to disk without passing through one host.
+A checkpoint holds six things: `step`, `params`, `opt_state`, `ema`, the run `key`, and `position`, every process's place in its data stream. The trainer writes one every `checkpoint_every` steps and once more when `fit` returns. Writes are asynchronous with Orbax; sharded arrays go from the devices to disk without passing through one host, and a `gs://` directory goes to the bucket as it is.
 
-Retention is Orbax's job. The latest `max_checkpoints_to_keep` checkpoints stay, and so does the one with the lowest mean training loss of its epoch, whichever step it is.
+Retention is Orbax's job: the latest `keep` checkpoints stay.
 
 ```bash
-python recipes/diffusion/train.py ... --trainer.load-from-checkpoint ./checkpoints/flowers-dit          # latest step
-python recipes/diffusion/train.py ... --trainer.load-from-checkpoint ./checkpoints/flowers-dit --trainer.checkpoint-step 40000
-python recipes/diffusion/train.py ... --trainer.wandb-project dew --trainer.resume-last-run 3k9d2x1a  # from the run's artifact
+python recipes/diffusion/train.py ... --trainer.checkpoint-dir runs/flowers-dit   # resumes from the directory's latest checkpoint
 ```
 
-A resumed run continues from the next unseen batch. A run that would write into a directory that already holds checkpoints stops before it trains and says how to resume or where to write instead; nothing is deleted or overwritten. For inference:
+A run whose checkpoint directory already holds a checkpoint resumes from the latest one, and continues from the next unseen batch on every process; and a checkpoint written by two hosts refuses to resume on one, with the reason, rather than restoring the wrong position. nothing is deleted or overwritten. For inference:
 
 ```python
-from dew.sampling.loading import load_from_checkpoint
+# runs elsewhere: needs a run directory a recipe wrote
+from dew.sampling import TextToImage
 
-state = load_from_checkpoint("./checkpoints/flowers-dit", step="best")   # or "latest", or an int
+pipe = TextToImage.from_run("runs/flowers-dit")            # run.json plus the latest checkpoint, EMA weights
+images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, key=jax.random.key(0))
 ```
 
-Checkpoints from FlaxDiff load as they are, and `tools/convert_legacy_checkpoint.py` brings the ones from before the DiT consolidation up to date.
+The run directory is the whole record: `run.json` is the resolved config the recipe trained with, and `from_run` rebuilds the model, the process and the encoders from it through the same function the recipe used, so what samples is what trained.
 
 ## Logging and profiling
 
-With `--trainer.wandb-project` set, a run logs to Weights & Biases; without it, to the terminal. Every `log_every` steps: `train/loss`, `train/step_time_ms`, `train/samples_per_sec`, `train/mfu`, and every metric the objective returned as `train/<name>`. Every epoch: `train/avg_loss`, `train/best_loss`, `train/epoch_time`, each evaluation metric as `val/<name>`, and the objective's artifacts (`sample_i` and `video_sample_i` for diffusion, a `val/samples` table of generated text for language models). The config that ran is stored with the run, and when the run ranks among the project's best by `--trainer.best-tracker-metric` its newest checkpoint is pushed to the wandb model registry, which is what `DiffusionInferencePipeline.from_wandb_registry` loads.
+A `Tracker` receives scalars and artifacts; `WandbTracker` sends them to Weights & Biases and renders each artifact by its type, and no tracker means the terminal. Every `log_every` steps: `train/loss`, `train/step_time_ms`, `train/samples_per_sec`, `train/mfu`, and every metric the objective returned as `train/<name>`. Every `eval_every` steps: each metric as `val/<name>`, and the objective's artifacts drawn (an image grid, a table of generated text). Publishing is a recipe's step, not the trainer's: `dew.io.publish(directory, name, tracker=...)` uploads a checkpoint and its `run.json` to the model registry after `fit`.
 
 `train/mfu` is the step's FLOPs, counted off the compiled executable's optimized HLO, divided by the step time and by one device's dense peak; the table of peaks in `dew.telemetry.instrumentation` covers TPU v4 to v6e, A100, H100, H200 and the RTX 4080, and the metric is left out on hardware it does not know. `profile_steps=N` writes a profiler trace of `N` steps after a warmup to `<checkpoint dir>/profile`, for TensorBoard or Perfetto. The XLA compilation cache is on by default under `~/.cache/dew/xla`, so a restarted run compiles in seconds instead of minutes. A sustained non-finite loss stops the run.
 
 ## Extending Dew
 
-**A model.** Write a Flax module that takes `(x, temb, textcontext)` for diffusion or `(tokens)` for language models, and register it:
+**A model.** Write a Flax module that takes `(x, temb, **conditions)` for diffusion or `(tokens)` for language models, register it, and declare which of its dimensions mean what, so the layout can shard it:
 
 ```python
-from dew.registry import MODEL_REGISTRY
+import flax.linen as nn
+from dew import models
+from dew.nn.sharding import logical_axes
 
-MODEL_REGISTRY["my_dit"] = MyDiT          # build_model("my_dit", {...}) now works, recipes included
+@models("my_dit")
+@logical_axes({("mixer_in",): ("embed", "mlp"), ("mixer_out",): ("mlp", "embed")})
+class MyDiT(nn.Module):
+    ...
+# models.build("my_dit", ...) now works, recipes included; a declaration that disagrees with another module's for the same
+# path is refused, so a renamed layer cannot silently change how it shards
 ```
 
-**An objective.** A class with `init_params`, `loss`, `make_validation_step` and `log_validation_artifacts`, as in the [Objectives](#objectives) section. The trainer needs nothing else.
+**An objective.** A class with `init`, `loss` and `evaluate`, as in the [Objectives](#objectives) section, registered with `@objectives(name)`. The trainer needs nothing else.
 
-**A data source.** A `DataSource` returns a random-access source; a `DataAugmenter` returns a Grain transform; the registry pairs them:
+**A dataset.** A frozen dataclass whose `load(batch=)` returns a `Dataset`, registered with `@datasets(name)`; it appears as a recipe subcommand with its fields as flags.
 
-```python
-from dew.data.registry import datasetMap
+**A metric.** A function `(artifact, batch) -> value` behind `@metrics(name)`; it reads the artifact type it scores.
 
-datasetMap["my_dataset"] = {"source": MySource(), "augmenter": my_augmenter}
-```
+**A sampler.** A `Solver` with `init(x)` and `step(x, t, t_next, denoised, eps, state, key, process, denoise)`, registered with `@samplers(name)`. Guidance, conditioning and the loop are `sample`'s.
 
-**A metric.** `EvaluationMetric(function, name, higher_is_better)` where `function(artifacts, batch)` returns a float; pass it in `eval_metrics`.
+**A conditioning encoder.** Implement `tokenize`, `encode` and `to_json` on `ConditionEncoder` and register with `@encoders(name)`, so a run can rebuild it.
 
-**A sampler.** Subclass `DiffusionSampler` and implement `take_next_step`, which receives the current samples, the reconstructed clean samples and the predicted noise at one step and returns the next samples. Guidance, conditioning, the loop and video handling are inherited.
-
-**A conditioning encoder.** Implement `tokenize` and `encode_from_tokens` on `ConditioningEncoder`, and add it to `CONDITIONAL_ENCODERS_REGISTRY` so a logged config can rebuild it.
+**A preset.** A frozen dataclass callable to a `Process`, registered with `@presets(name)`; its fields are what `run.json` stores.
 
 ## Recipes and examples
 
 `recipes/diffusion/train.py`, `recipes/jepa/train.py` and `recipes/lm/train.py` are complete training programs over the config tree above:
 
 ```bash
-python recipes/diffusion/train.py --data.dataset oxford_flowers102 --data.image-size 128 \
+python recipes/diffusion/train.py data:oxford-flowers --data.image-size 128 \
     --model.architecture simple_dit \
     --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}' \
-    --trainer.epochs 2000 --trainer.wandb-project my-project
+    --trainer.epochs 2000 --trainer.wandb-project my-project preset:edm
 
-python recipes/jepa/train.py --data.dataset oxford_flowers102 --probe-classes 102 \
+python recipes/jepa/train.py data:oxford-flowers --probe-classes 102 \
     --model.config '{"patch_size": 16, "emb_features": 384}'
 
 python tools/tokenize_text.py --input shakespeare.txt --out data/shakespeare --tokenizer byte --val-fraction 0.02
-python recipes/lm/train.py --data.dataset data/shakespeare --sequence-length 256 \
+python recipes/lm/train.py data:token-windows --data.path data/shakespeare --data.seq-len 256 \
     --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}' --sample-prompt "ROMEO:"
 ```
 
@@ -427,18 +427,18 @@ The scripts in [`examples/`](examples/) go from a dataset to a trained model, sa
 * [`train_jepa.py`](examples/train_jepa.py): an I-JEPA encoder with linear and kNN probes, the encoder saved on its own.
 * [`train_lm.py`](examples/train_lm.py): a byte-level language model on a tokenized corpus, a sample written after training.
 
-The notebooks in [`tutorials/`](tutorials/) teach the library: [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it, [02](tutorials/02-train-a-diffusion-model.ipynb) trains a DiT through `ObjectiveTrainer`, [03](tutorials/03-text-to-image-with-guidance.ipynb) adds CLIP conditioning, classifier-free guidance and the SD-VAE latent option, and [04](tutorials/04-samplers-and-schedules.ipynb) compares the samplers on the trained checkpoint. See [docs/recipes.md](docs/recipes.md) for the full config tree.
+The notebooks in [`tutorials/`](tutorials/) teach the library: [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it, [02](tutorials/02-train-a-diffusion-model.ipynb) trains a DiT through the trainer, [03](tutorials/03-text-to-image-with-guidance.ipynb) adds CLIP conditioning, classifier-free guidance and the SD-VAE latent option, and [04](tutorials/04-samplers-and-schedules.ipynb) compares the samplers on the trained checkpoint. See [docs/recipes.md](docs/recipes.md) for the full config tree.
 
 ## Evaluation and export
 
-Validation runs at the end of every epoch: the objective produces artifacts (samples, embeddings or text) and `EvaluationMetric` objects score them.
+Validation runs every `eval_every` steps: the objective produces artifacts (samples, embeddings, token scores) and the metrics score them.
 
 ```python
-from dew.eval import get_clip_metric, get_fid_metric
+# runs elsewhere: the CLIP and Inception weights download
+from dew import metrics
 
-trainer = ObjectiveTrainer(model, optimizer, ..., eval_metrics=[get_clip_metric(), get_fid_metric()])
-trainer.fit(data, ..., sampler_class=EulerAncestralSampler, sampling_noise_schedule=sample_schedule)
-# logs val/clip_similarity and val/fid per epoch; per-batch FID tracks a run over time and is not FID-50k
+state = trainer.fit(data, steps=steps, eval_every=2000, metrics=(metrics.clip(), metrics.fid()))
+# logs val/clip and val/fid; per-batch FID tracks a run over time and is not FID-50k
 ```
 
 `dew.eval` has FID (with a vendored InceptionV3), CLIP score, PSNR, SSIM and perplexity. A trained model exports to the `model.safetensors` and `config.json` pair a Hugging Face style loader looks for. No leaf is renamed, transposed or cast, and the config is written as given, so anything that reads safetensors reads the tensors; loading an export as a transformers, vLLM or verl model is the per-family work in the [roadmap](#roadmap):
@@ -446,7 +446,7 @@ trainer.fit(data, ..., sampler_class=EulerAncestralSampler, sampling_noise_sched
 ```python
 from dew.interop import save_hf_layout
 
-save_hf_layout(state.ema_params, config=model_config, directory="export/flowers")
+save_hf_layout(state.ema["params"], config={"architecture": "simple_dit", **fields}, directory="export/flowers")
 # export/flowers/model.safetensors and export/flowers/config.json
 ```
 
@@ -456,11 +456,12 @@ See [docs/api.md](docs/api.md#evaluation-and-interop) for more.
 
 ## Testing and benchmarks
 
-The suite has two lanes. CI runs the CPU lane on every push to `main` and every pull request into it, with XLA asked for 8 host devices, so the FSDP, data parallel, checkpoint and resume tests run anywhere. The GPU lane runs the model, sampler, trainer and data files on an RTX 4080 before each merge.
+The suite has three lanes. The mesh lane runs the FSDP, data parallel, checkpoint and resume tests on eight simulated CPU devices, so they run anywhere; the GPU lane runs everything else on the accelerator in parallel workers; the distributed lane spawns real `jax.distributed` process pools. CI runs the mesh and distributed lanes on every push to `main` and every pull request into it; the GPU lane runs on an RTX 4080 before each merge.
 
 ```bash
-JAX_PLATFORMS=cpu pytest -m "not network" -q         # the CPU lane, about 20 minutes
-pytest tests/test_models.py tests/test_trainer.py -q  # any file on the local GPU
+JAX_PLATFORMS=cpu pytest -m "mesh and not distributed" -n 3 --dist loadfile -q      # the mesh lane, about 5 minutes
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false pytest -m "not mesh and not network" -n 4 --dist loadfile -q   # the GPU lane
+JAX_PLATFORMS=cpu pytest -m distributed -q                                            # real process pools, serial
 ```
 
 `tests/test_architectures.py` trains every registered architecture through `fit` on both an 8x1 data-parallel mesh and a 2x4 data-by-FSDP mesh, and fails if an architecture is added without a case. `tools/benchmark_step.py` measures the real training step per architecture:
@@ -496,7 +497,7 @@ Dew needs Python 3.11 or later. There is no release on PyPI yet; install from th
 | NVIDIA GPU | `pip install "dew-ml @ git+https://github.com/AshishKumar4/dew" "jax[cuda12]"` |
 | Google TPU | `pip install "dew-ml @ git+https://github.com/AshishKumar4/dew" "jax[tpu]"`    |
 
-Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors, as in `"dew-ml[tfds,metrics] @ git+https://github.com/AshishKumar4/dew"`. The package imports as `dew`. The first release will ship as `dew-ml`; the bare `dew` name on PyPI is an unused placeholder.
+Optional extras: `[tfds]` for TFDS datasets, `[av]` for video and audio, `[streaming]` for URL streaming, `[metrics]` for FID, `[interop]` for safetensors, as in `"dew-ml[tfds,metrics] @ git+https://github.com/AshishKumar4/dew"`. The package imports as `dew`. The first release will ship as `dew-ml`; the bare `dew` name on PyPI is an unused placeholder, and a PEP 541 request for it is the plan.
 
 To work on Dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md) first: it states the design rules, the reference-parity requirement for every port, and what a merge needs.
 
@@ -505,13 +506,6 @@ To work on Dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md) first: it states 
 git clone https://github.com/AshishKumar4/dew.git
 cd dew && pip install -e ".[test]"
 JAX_PLATFORMS=cpu pytest -m "not network" -q
-```
-
-`.gitmodules` pins the `tools/tpu` submodule over SSH, so `--recurse-submodules` needs a GitHub key. Over HTTPS, point it at the public URL first:
-
-```bash
-git config submodule.tpu-tools.url https://github.com/AshishKumar4/tpu-tools.git
-git submodule update --init
 ```
 
 ## Roadmap

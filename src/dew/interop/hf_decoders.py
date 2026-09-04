@@ -37,7 +37,7 @@ DEFAULT_MAX_SEQ_LEN = 8192
 # are the two the covered families use; anything else is refused by name.
 _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
 
-_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text')
+_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4', 'gemma4_text')
 _GEMMA = 'gemma3_text'
 
 _IGNORED_FIELDS = {
@@ -145,15 +145,57 @@ def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
 
     return ('full_attention',) * layers
 
+def _gemma4_rope(entries: Mapping[str, Any]) -> Tuple[float, Optional[float], Optional[float]]:
+    """(rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
+
+    The full layers may rotate a fraction of their head dims (proportional
+    partial rotary); the sliding layers rotate all of theirs. Anything but
+    those two shapes refuses with the entry named.
+    """
+    full = entries.get('full_attention') or {}
+    sliding = entries.get('sliding_attention') or {}
+    for kind, entry in (('sliding_attention', sliding),):
+        factor = entry.get('partial_rotary_factor')
+        if factor not in (None, 1, 1.0):
+            _refuse(f"rope_parameters.{kind} partial_rotary_factor {factor}",
+                    "partial rotary applies to the full layers only")
+        _rope_theta({**entry, 'rope_type': entry.get('rope_type', entry.get('type', 'default'))},
+                    f"rope_parameters.{kind}")
+    local = sliding.get('rope_theta', 10000.0)
+    kind, entry = 'full_attention', full
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    factor = entry.get('partial_rotary_factor')
+    if rope_type == 'proportional':
+        if factor is None:
+            _refuse("rope_parameters.full_attention",
+                    "proportional rope needs its partial_rotary_factor")
+        extra = sorted(set(entry) - {'rope_type', 'type', 'rope_theta',
+                                     'partial_rotary_factor', 'factor'})
+        if extra or entry.get('factor', 1.0) not in (1, 1.0):
+            _refuse("rope_parameters.full_attention scaling",
+                    "the backbone applies plain rotary positions at rope_theta")
+        partial = float(factor)
+        theta = float(entry.get('rope_theta', 1000000.0))
+    elif rope_type in ('default', 'none'):
+        if factor not in (None, 1, 1.0):
+            _refuse("rope_parameters.full_attention partial_rotary_factor",
+                    "partial rotary comes spelled proportional")
+        partial = None
+        theta = _rope_theta(entry, 'rope_parameters.full_attention') or 10000.0
+    else:
+        _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
+                "the backbone applies plain rotary positions at rope_theta")
+    local = float(local)
+    return theta, (None if local == theta else local), partial
+
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
 
     Accepts the text decoder families CausalTransformer can express: llama,
-    qwen3 and gemma3_text. Every field that changes what a forward pass
-    computes and has no dew counterpart raises, naming the field.
-    """
-    hf_config = dict(hf_config)
+    qwen3, gemma3_text and gemma4_text. Every field that changes what a
+    forward pass computes and has no dew counterpart raises, naming the
+    field."""
 
     model_type = hf_config.get('model_type')
     if model_type == 'qwen2':
@@ -163,9 +205,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse("model_type 'qwen2'",
                 "its q/k/v projections carry biases and o_proj does not, which "
                 "the one attention_bias flag cannot say")
-    if model_type not in ('llama', 'qwen3', 'gemma3_text'):
+    if model_type not in ('llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'):
         _refuse(f"model_type {model_type!r}",
-                "expected one of 'llama', 'qwen3', 'gemma3_text'")
+                "expected one of 'llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'")
 
     if hf_config.get('use_bidirectional_attention', False):
         _refuse("use_bidirectional_attention=True", "the backbone is causal")
@@ -191,7 +233,11 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse(f"hidden_act {activation!r}",
                 "the gated MLP supports 'swiglu' and 'geglu'")
 
-    rope_theta, rope_local_theta = _rope(hf_config, used)
+    if model_type in ('gemma4', 'gemma4_text'):
+        # Proportional partial rotary is a gemma4 shape with its own reader below.
+        rope_theta, rope_local_theta = 10000.0, None
+    else:
+        rope_theta, rope_local_theta = _rope(hf_config, used)
     layer_types = _layer_types(hf_config, used)
     sliding_window = hf_config.get('sliding_window')
     used.add('sliding_window')
@@ -220,15 +266,17 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
         # LlamaRMSNorm and Qwen3RMSNorm multiply the scale into the
         # activations after casting them (modeling_qwen3.py:61-64); Gemma3's
-        # norm scales in fp32 and casts the product (modeling_gemma3.py:147-150).
-        'scale_after_cast': model_type != _GEMMA,
+        # and Gemma4's norms scale in fp32 and cast the product
+        # (modeling_gemma3.py:147-150, modeling_gemma4.py:197-215).
+        'scale_after_cast': model_type in ('llama', 'qwen3'),
         'qk_norm': model_type in _QK_NORM_FAMILIES,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
-        # Gemma3TextConfig ties by default and the others do not, so a config
-        # that omits the field (gemma-3-1b-pt does) has to take its family's
-        # default rather than a single one here.
-        'tie_embeddings': bool(hf_config.get('tie_word_embeddings',
-                                             model_type == _GEMMA)),
+        # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
+        # others do not, so a config that omits the field (gemma-3-1b-pt
+        # does) has to take its family's default rather than a single one
+        # here.
+        'tie_embeddings': bool(hf_config.get(
+            'tie_word_embeddings', model_type in (_GEMMA, 'gemma4', 'gemma4_text'))),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
@@ -242,6 +290,62 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         softcap = hf_config.get('final_logit_softcapping')
         if softcap is not None:
             config['final_logit_softcap'] = float(softcap)
+    if model_type in ('gemma4', 'gemma4_text'):
+        if hf_config.get('attention_k_eq_v'):
+            _refuse("attention_k_eq_v=True",
+                    "the backbone always projects its own values")
+        if hf_config.get('enable_moe_block'):
+            _refuse("enable_moe_block=True",
+                    "the parallel MoE branch has no counterpart here")
+        used.update(('attention_k_eq_v', 'enable_moe_block'))
+        # Full layers may override the head dim and the sliding layers use
+        # hidden // heads; the two live side by side as head_dim and
+        # global_head_dim.
+        sliding_dim = hidden // heads
+        if hidden % heads:
+            _refuse(f"hidden_size {hidden}",
+                    f"it does not divide into {heads} heads")
+        full_dim = sliding_dim
+        entries = hf_config.get('per_layer_config') or {}
+        for entry in (entries.values() if isinstance(entries, Mapping) else entries):
+            if isinstance(entry, Mapping) and entry.get('head_dim') is not None:
+                full_dim = int(entry['head_dim'])
+        if hf_config.get('global_head_dim') is not None:
+            full_dim = int(hf_config['global_head_dim'])
+        used.update(('per_layer_config', 'global_head_dim',
+                     'num_global_key_value_heads'))
+        # Proportional rope rotates a fraction of the full layers' head dims
+        # and passes the rest through; sliding layers rotate all of theirs.
+        entries = hf_config.get('rope_parameters') or {}
+        rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
+        used.update(('rope_parameters', 'rope_theta'))
+        config.update(
+            sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
+            v_norm=True,
+            head_dim=sliding_dim,
+            global_head_dim=(None if full_dim == sliding_dim else full_dim),
+            rope_theta=rope_theta, rope_local_theta=rope_local_theta,
+            partial_rotary_factor=partial,
+            use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
+            num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
+            per_layer_input_dim=int(hf_config.get('hidden_size_per_layer_input', 0)),
+            per_layer_input_vocab=int(hf_config.get(
+                'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
+        )
+        used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
+                     'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
+                     'final_logit_softcapping'))
+        # attention_logit_cap is read by no text path: Gemma4TextAttention
+        # never passes it to its attention call (modeling_gemma4.py,
+        # Gemma4TextAttention.forward), so it changes nothing and maps to
+        # nothing. Only the audio attention applies one.
+        used.add('attention_logit_cap')
+        softcap = hf_config.get('final_logit_softcapping')
+        if softcap is not None:
+            config['final_logit_softcap'] = float(softcap)
+        # MoE sizing keys with the branch off: refused above when it is on.
+        used.update(('moe_intermediate_size', 'expert_intermediate_size',
+                     'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})
@@ -291,6 +395,12 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
         return ('norm', 'scale')
     if parts == ['model', 'embed_tokens', 'weight']:
         return ('embed_tokens', 'embedding')
+    if parts == ['model', 'embed_tokens_per_layer', 'weight']:
+        return ('embed_tokens_per_layer', 'embedding')
+    if parts == ['model', 'per_layer_model_projection', 'weight']:
+        return ('per_layer_model_projection', 'kernel')
+    if parts == ['model', 'per_layer_projection_norm', 'weight']:
+        return ('per_layer_projection_norm', 'scale')
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
 
@@ -305,6 +415,14 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
             if (module == 'self_attn' and sublayer in _HEAD_NORMS
                     and leaf == 'weight'):
                 return (layer, module, sublayer, 'scale')
+        # Gemma 4's per-layer residual: gate and projection are kernels, the
+        # post norm is a scale. The values norm carries no weight, so it maps
+        # nothing.
+        if len(parts) == 5 and leaf == 'weight':
+            if module in ('per_layer_input_gate', 'per_layer_projection'):
+                return (layer, module, 'kernel')
+            if module == 'post_per_layer_input_norm':
+                return (layer, module, 'scale')
         norms = _norm_names(bool(config.get('sandwich_norms')))
         if len(parts) == 5 and module in norms and leaf == 'weight':
             return (layer, norms[module], 'scale')
@@ -455,6 +573,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     if not isinstance(model, CausalTransformer):
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
+    if model.per_layer_input_dim or model.num_kv_shared_layers or model.v_norm:
+        raise ValueError(
+            "per-layer input embeddings, KV sharing and the values norm have "
+            "no counterpart in the llama, qwen3 and gemma3_text families this "
+            "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
+            "or v_norm set cannot be written back to the HF layout")
     params = variables.get('params', variables)
     config = _export_config(model)
 
