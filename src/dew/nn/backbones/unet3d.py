@@ -19,6 +19,7 @@ from functools import partial
 from ..blocks import ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
 from ..attention import TransformerBlock
 from ..vit import RotaryEmbedding, RoPEAttention
+from dew.registry import models
 
 
 class TemporalBlock(nn.Module):
@@ -63,6 +64,7 @@ class TemporalBlock(nn.Module):
         return x + h
 
 
+@models("unet_3d")
 class UNet3D(nn.Module):
     """Video UNet over (B, T, H, W, C): the 2D Unet forward per frame, with a
     TemporalBlock at every resolution level. Spatial param paths are

@@ -12,7 +12,7 @@ it was a text-modulated DiT, not an MM-DiT.
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Literal
 import einops
 from flax.typing import Dtype, PrecisionLike
 
@@ -22,6 +22,7 @@ from ..dit import (
 )
 from ..attention import scaled_dot_product_attention
 from ..vit import RotaryEmbedding, AdaLNParams, apply_rotary_embedding
+from dew.registry import models
 
 
 class MMDiTBlock(nn.Module):
@@ -134,6 +135,7 @@ class MMDiTBlock(nn.Module):
         return img, txt
 
 
+@models("simple_mmdit")
 class SimpleMMDiT(nn.Module):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
     output_channels: int = 3
@@ -150,14 +152,8 @@ class SimpleMMDiT(nn.Module):
     qk_norm: bool = False
     attention_impl: Optional[str] = None
     remat: bool = False
-    use_hilbert: bool = False
-    use_zigzag: bool = False
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
-    @property
-    def scan_order(self):
-        assert not (self.use_hilbert and self.use_zigzag), \
-            "use_hilbert and use_zigzag are mutually exclusive"
-        return 'hilbert' if self.use_hilbert else 'zigzag' if self.use_zigzag else 'raster'
 
     def setup(self):
         self.embed = PatchSequenceEmbed(
@@ -315,6 +311,7 @@ class PatchExpanding(nn.Module):
         return expanded, new_H, new_W
 
 
+@models("hierarchical_mmdit")
 class HierarchicalMMDiT(nn.Module):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.

@@ -14,7 +14,7 @@ carried entirely by the 2D sincos embedding that travels with each token.
 
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Literal
 from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
@@ -22,6 +22,7 @@ from ..dit import (
     identity_rope_freqs, scan_ordered_pos_embed,
 )
 from ..vit import RotaryEmbedding
+from dew.registry import models
 
 
 def gather_tokens(tokens, idx):
@@ -136,6 +137,7 @@ class FactorizedTokenStack(nn.Module):
         return tokens.reshape(B, T, N, F)
 
 
+@models("jepa_encoder")
 class JepaEncoder(nn.Module):
     """ViT over an image, optionally restricted to a subset of its patches."""
     patch_size: int = 16
@@ -153,14 +155,8 @@ class JepaEncoder(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: Optional[str] = None
-    use_hilbert: bool = False
-    use_zigzag: bool = False
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
-    @property
-    def scan_order(self):
-        assert not (self.use_hilbert and self.use_zigzag), \
-            "use_hilbert and use_zigzag are mutually exclusive"
-        return 'hilbert' if self.use_hilbert else 'zigzag' if self.use_zigzag else 'raster'
 
     def setup(self):
         self.embed = PatchSequenceEmbed(
@@ -189,6 +185,7 @@ class JepaEncoder(nn.Module):
         return self.norm(self.stack(tokens, train=train))
 
 
+@models("jepa_video_encoder")
 class JepaVideoEncoder(nn.Module):
     """Factorized spatial-temporal encoder over (B, T, H, W, C).
 
@@ -210,14 +207,8 @@ class JepaVideoEncoder(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: Optional[str] = None
-    use_hilbert: bool = False
-    use_zigzag: bool = False
+    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
-    @property
-    def scan_order(self):
-        assert not (self.use_hilbert and self.use_zigzag), \
-            "use_hilbert and use_zigzag are mutually exclusive"
-        return 'hilbert' if self.use_hilbert else 'zigzag' if self.use_zigzag else 'raster'
 
     def setup(self):
         self.embed = PatchSequenceEmbed(
@@ -248,6 +239,7 @@ class JepaVideoEncoder(nn.Module):
         return self.norm(self.stack(tokens, train=train))
 
 
+@models("jepa_predictor")
 class JepaPredictor(nn.Module):
     """Narrow transformer from context embeddings to target embeddings.
 

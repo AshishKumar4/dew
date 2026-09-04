@@ -7,7 +7,9 @@ import einops
 from ..blocks import kernel_init, ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
 from ..attention import TransformerBlock
 from functools import partial
+from dew.registry import models
 
+@models("unet")
 class Unet(nn.Module):
     output_channels:int=3
     emb_features:int=64*4

@@ -3,7 +3,7 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Callable, Any, Optional, Tuple
+from typing import Callable, Any, Optional, Tuple, Literal
 from .unet import FourierEmbedding, TimeProjection, ConvLayer, kernel_init
 from ..attention import TransformerBlock
 from dew.nn.backbones.unet import FourierEmbedding, TimeProjection, ConvLayer, kernel_init, ResidualBlock
@@ -13,8 +13,10 @@ from functools import partial
 from ..scan_orders import hilbert_indices, inverse_permutation, hilbert_patchify, hilbert_unpatchify
 from ..vit import unpatchify, PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams
 from ..dit import ModulatedBlock, remat_block
+from dew.registry import models
 
 
+@models("uvit")
 class UViT(nn.Module):
     output_channels: int = 3
     patch_size: int = 16
@@ -35,7 +37,7 @@ class UViT(nn.Module):
     norm_inputs: bool = False  # Passed to TransformerBlock
     explicitly_add_residual: bool = True  # Passed to TransformerBlock
     norm_epsilon: float = 1e-5  # Adjusted default
-    use_hilbert: bool = False  # Toggle Hilbert patch reorder
+    scan_order: Literal["raster", "hilbert"] = "raster"
 
     def setup(self):
         assert self.num_layers % 2 == 0, "num_layers must be even for U-Net structure"
@@ -53,7 +55,7 @@ class UViT(nn.Module):
             precision=self.precision,
             name="patch_embed"
         )
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             self.hilbert_proj = nn.Dense(
                 features=self.emb_features,
                 dtype=self.dtype,
@@ -177,7 +179,7 @@ class UViT(nn.Module):
         assert H % self.patch_size == 0 and W % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
         hilbert_inv_idx = None
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             # hilbert_patchify already returns the patches in hilbert order
             # along with the inverse permutation for the output path
             patches_raw, hilbert_inv_idx = hilbert_patchify(x, self.patch_size)
@@ -222,7 +224,7 @@ class UViT(nn.Module):
 
         x_patches_out = self.final_proj(x_patches_out)
 
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             assert hilbert_inv_idx is not None, "Hilbert inverse index missing"
             x_image = hilbert_unpatchify(
                 x_patches_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
@@ -245,6 +247,7 @@ class UViT(nn.Module):
 
 # --- Simple U-DiT ---
 
+@models("simple_udit")
 class SimpleUDiT(nn.Module):
     """
     A Simple U-Net Diffusion Transformer (U-DiT) implementation.
@@ -264,7 +267,7 @@ class SimpleUDiT(nn.Module):
     attention_impl: Optional[str] = None
     remat: bool = False
     norm_epsilon: float = 1e-5
-    use_hilbert: bool = False
+    scan_order: Literal["raster", "hilbert"] = "raster"
     norm_groups: int = 0
     activation: Callable = jax.nn.swish
 
@@ -279,7 +282,7 @@ class SimpleUDiT(nn.Module):
             precision=self.precision,
             name="patch_embed"
         )
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             self.hilbert_proj = nn.Dense(
                 features=self.emb_features,
                 dtype=self.dtype,
@@ -384,7 +387,7 @@ class SimpleUDiT(nn.Module):
         x = x.astype(self.dtype)
 
         hilbert_inv_idx = None
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             patches_raw, hilbert_inv_idx = hilbert_patchify(x, self.patch_size)
             x_seq = self.hilbert_proj(patches_raw)
         else:
@@ -416,7 +419,7 @@ class SimpleUDiT(nn.Module):
         x_out = self.final_norm(x_seq)
         x_out = self.final_proj(x_out)
 
-        if self.use_hilbert:
+        if self.scan_order == "hilbert":
             assert hilbert_inv_idx is not None, "Hilbert inverse index missing"
             x_image = hilbert_unpatchify(x_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
         else:

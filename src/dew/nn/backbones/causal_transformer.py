@@ -34,6 +34,7 @@ from ..attention import (
     causal_attention_mask, open_kv_cache, scaled_dot_product_attention,
 )
 from ..moe import SparseMLP
+from dew.registry import models
 
 
 LAYER_TYPES = ('full_attention', 'sliding_attention')
@@ -294,6 +295,7 @@ class DecoderBlock(nn.Module):
         return x + self.dropout(hidden, deterministic=not train)
 
 
+@models("causal_transformer")
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
