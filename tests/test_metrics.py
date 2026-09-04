@@ -399,6 +399,27 @@ def test_a_metric_refuses_a_batch_with_fewer_records_than_samples():
         registry["psnr"]()(ImageGrid(jnp.zeros((8, 32, 32, 3))),
                            {"image": jnp.zeros((4, 32, 32, 3), jnp.uint8)})
 
+
+def test_constructing_a_metric_opens_no_weights(monkeypatch):
+    """Building the metric is not the call that opens files: the Inception
+    and CLIP weights resolve on the first batch scored, so configuring a run
+    never pays for a download it might not use."""
+    import importlib
+
+    fid_module = importlib.import_module("dew.eval.fid")
+    images_module = importlib.import_module("dew.eval.images")
+
+    def refused(*args, **kwargs):
+        raise AssertionError("constructing a metric loaded weights")
+
+    monkeypatch.setattr(fid_module, "_get_inception", refused)
+    monkeypatch.setattr(images_module, "_get_clip", refused)
+
+    fid()
+    clip(modelname="never/downloaded")
+    clip_score(modelname="never/downloaded")
+
+
 ############################################################################################################
 # The FID weights
 ############################################################################################################
@@ -429,6 +450,24 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
         load_arrays(hostile)
 
 
+def test_a_wrong_digest_is_refused_before_anything_reads_the_file(tmp_path):
+    """The pin is a check over local bytes, so it is tested over local bytes:
+    a file whose hash is not the pinned one is refused, and the pinned file
+    passes through untouched."""
+    import hashlib
+
+    from dew.eval.utils import _check_digest
+
+    path = tmp_path / "weights.pickle"
+    path.write_bytes(b"not the weights")
+    digest = hashlib.sha256(b"not the weights").hexdigest()
+
+    assert _check_digest(str(path), "repo", "file", "revision", digest) == str(path)
+    with pytest.raises(ValueError, match="hashes to"):
+        _check_digest(str(path), "repo", "file", "revision", "0" * 64)
+
+
+@pytest.mark.network
 def test_the_weights_are_pinned_by_digest():
     """The weights came from a consumer file-sharing link with no checksum,
     which a released package unpickled, so whoever held the link chose what

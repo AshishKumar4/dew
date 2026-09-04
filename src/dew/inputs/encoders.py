@@ -48,7 +48,7 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """
 
     @abstractmethod
-    def tokenize(self, data: Sequence[Raw]) -> Any:
+    def tokenize(self, data: Sequence[Raw]) -> Mapping[str, np.ndarray]:
         """Raw data to the host arrays `encode` reads, one row per item."""
 
     @abstractmethod

@@ -63,9 +63,9 @@ def clip(modelname: str = "openai/clip-vit-large-patch14", field: str = "text") 
     were ranked by it as val/clip_similarity; `clip_score` is the standard
     number for a new run.
     """
-    model, processor = _get_clip(modelname)
 
     def measure(artifact, batch):
+        model, processor = _get_clip(modelname)
         return jnp.mean(1.0 - _clip_image_text_cosine(model, processor, artifact, batch, field))
 
     return ImageMetric(name="clip_similarity", measure=measure)
@@ -77,9 +77,9 @@ def clip_score(modelname: str = "openai/clip-vit-large-patch14",
     """Standard CLIPScore: 100 * max(cos(img, text), 0), higher is better.
     Typical T2I models score around 25-35 on natural prompts.
     """
-    model, processor = _get_clip(modelname)
 
     def measure(artifact, batch):
+        model, processor = _get_clip(modelname)
         cos = _clip_image_text_cosine(model, processor, artifact, batch, field)
         return jnp.mean(100.0 * jnp.maximum(cos, 0.0))
 
