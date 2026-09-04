@@ -57,18 +57,23 @@ class RMSNorm(nn.Module):
     epsilon: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
+    with_scale: bool = True
     dtype: Optional[Dtype] = None
 
     @nn.compact
     def __call__(self, x):
+        dtype = self.dtype if self.dtype is not None else x.dtype
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        if not self.with_scale:
+            # A pure normalization with no learned weight, as Gemma 4 norms
+            # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
+            return y.astype(dtype)
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32)
-        dtype = self.dtype if self.dtype is not None else x.dtype
         weight = (1.0 + scale) if self.scale_offset else scale
-        y = x.astype(jnp.float32)
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
@@ -147,6 +152,7 @@ class CausalSelfAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     qk_norm: bool = True
+    v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
@@ -178,6 +184,13 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = norm(name='q_norm')
             if not self.kv_shared:
                 self.k_norm = norm(name='k_norm')
+        if self.v_norm and not self.kv_shared:
+            # Gemma 4 norms the values with a scale-free RMSNorm before they
+            # are cached or shared (modeling_gemma4.py, Gemma4TextAttention).
+            # The attribute cannot share the field's name, and it holds no
+            # parameters either way.
+            self.values_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
+                                       dtype=self.dtype, name='v_norm')
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -199,6 +212,8 @@ class CausalSelfAttention(nn.Module):
             value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
             if self.qk_norm:
                 key = self.k_norm(key)
+            if self.v_norm:
+                value = self.values_norm(value)
         if self.qk_norm:
             query = self.q_norm(query)
 
@@ -459,6 +474,7 @@ class CausalTransformer(nn.Module):
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
     qk_norm: bool = True
+    v_norm: bool = False                      # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -626,6 +642,7 @@ class CausalTransformer(nn.Module):
                                 and self.rope_local_theta is not None
                                 else self.rope_theta),
                     qk_norm=self.qk_norm,
+                    v_norm=self.v_norm,
                     norm_eps=self.norm_eps,
                     scale_offset=self.scale_offset,
                     scale_after_cast=self.scale_after_cast,

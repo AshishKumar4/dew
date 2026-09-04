@@ -37,7 +37,7 @@ DEFAULT_MAX_SEQ_LEN = 8192
 # are the two the covered families use; anything else is refused by name.
 _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
 
-_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text')
+_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4', 'gemma4_text')
 _GEMMA = 'gemma3_text'
 
 _IGNORED_FIELDS = {
@@ -150,10 +150,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A decoder config dict into CausalTransformer kwargs.
 
     Accepts the text decoder families CausalTransformer can express: llama,
-    qwen3 and gemma3_text. Every field that changes what a forward pass
-    computes and has no dew counterpart raises, naming the field.
-    """
-    hf_config = dict(hf_config)
+    qwen3, gemma3_text and gemma4_text. Every field that changes what a
+    forward pass computes and has no dew counterpart raises, naming the
+    field."""
 
     model_type = hf_config.get('model_type')
     if model_type == 'qwen2':
@@ -163,9 +162,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse("model_type 'qwen2'",
                 "its q/k/v projections carry biases and o_proj does not, which "
                 "the one attention_bias flag cannot say")
-    if model_type not in ('llama', 'qwen3', 'gemma3_text'):
+    if model_type not in ('llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'):
         _refuse(f"model_type {model_type!r}",
-                "expected one of 'llama', 'qwen3', 'gemma3_text'")
+                "expected one of 'llama', 'qwen3', 'gemma3_text', 'gemma4', 'gemma4_text'")
 
     if hf_config.get('use_bidirectional_attention', False):
         _refuse("use_bidirectional_attention=True", "the backbone is causal")
@@ -220,15 +219,17 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
         # LlamaRMSNorm and Qwen3RMSNorm multiply the scale into the
         # activations after casting them (modeling_qwen3.py:61-64); Gemma3's
-        # norm scales in fp32 and casts the product (modeling_gemma3.py:147-150).
-        'scale_after_cast': model_type != _GEMMA,
+        # and Gemma4's norms scale in fp32 and cast the product
+        # (modeling_gemma3.py:147-150, modeling_gemma4.py:197-215).
+        'scale_after_cast': model_type in ('llama', 'qwen3'),
         'qk_norm': model_type in _QK_NORM_FAMILIES,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
-        # Gemma3TextConfig ties by default and the others do not, so a config
-        # that omits the field (gemma-3-1b-pt does) has to take its family's
-        # default rather than a single one here.
-        'tie_embeddings': bool(hf_config.get('tie_word_embeddings',
-                                             model_type == _GEMMA)),
+        # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
+        # others do not, so a config that omits the field (gemma-3-1b-pt
+        # does) has to take its family's default rather than a single one
+        # here.
+        'tie_embeddings': bool(hf_config.get(
+            'tie_word_embeddings', model_type in (_GEMMA, 'gemma4', 'gemma4_text'))),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
@@ -242,6 +243,59 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         softcap = hf_config.get('final_logit_softcapping')
         if softcap is not None:
             config['final_logit_softcap'] = float(softcap)
+    if model_type in ('gemma4', 'gemma4_text'):
+        if hf_config.get('attention_k_eq_v'):
+            _refuse("attention_k_eq_v=True",
+                    "the backbone always projects its own values")
+        if hf_config.get('enable_moe_block'):
+            _refuse("enable_moe_block=True",
+                    "the parallel MoE branch has no counterpart here")
+        if hf_config.get('use_double_wide_mlp'):
+            _refuse("use_double_wide_mlp=True",
+                    "the widened MLP on sharing layers has no counterpart here")
+        # The reference defaults the cap to 50.0, so only an explicit null
+        # means no softcap; Dew's kernels apply none.
+        if hf_config.get('attention_logit_cap', 50.0) is not None:
+            _refuse("attention_logit_cap",
+                    "the attention kernels apply no softcap to the logits")
+        used.update(('attention_k_eq_v', 'enable_moe_block', 'use_double_wide_mlp',
+                     'attention_logit_cap'))
+        # Full layers may override the head dim through per_layer_config;
+        # sliding layers use hidden // heads. Dew keeps one head_dim, so the
+        # two have to agree (they do not on gemma-4-E2B: 512 against 192).
+        sliding_dim = hidden // heads
+        full_dims = {sliding_dim}
+        entries = hf_config.get('per_layer_config') or {}
+        for entry in (entries.values() if isinstance(entries, Mapping) else entries):
+            if isinstance(entry, Mapping) and entry.get('head_dim') is not None:
+                full_dims.add(int(entry['head_dim']))
+        global_dim = hf_config.get('global_head_dim')
+        if global_dim is not None:
+            full_dims.add(int(global_dim))
+        if full_dims != {sliding_dim}:
+            _refuse(f"global_head_dim {sorted(full_dims)}",
+                    "every layer has to share hidden // heads: the backbone "
+                    "keeps one head_dim")
+        used.update(('per_layer_config', 'global_head_dim',
+                     'num_global_key_value_heads'))
+        config.update(
+            sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
+            v_norm=True,
+            num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
+            per_layer_input_dim=int(hf_config.get('hidden_size_per_layer_input', 0)),
+            per_layer_input_vocab=int(hf_config.get(
+                'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
+        )
+        used.update(('num_kv_shared_layers', 'hidden_size_per_layer_input',
+                     'vocab_size_per_layer_input', 'final_logit_softcapping'))
+        softcap = hf_config.get('final_logit_softcapping')
+        if softcap is not None:
+            config['final_logit_softcap'] = float(softcap)
+        used.update(('attention_k_eq_v', 'enable_moe_block', 'use_double_wide_mlp',
+                     'attention_logit_cap'))
+        # MoE sizing keys with the branch off: refused above when it is on.
+        used.update(('moe_intermediate_size', 'num_experts', 'top_k_experts',
+                     'chunk_size_feed_forward'))
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})
@@ -291,6 +345,12 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
         return ('norm', 'scale')
     if parts == ['model', 'embed_tokens', 'weight']:
         return ('embed_tokens', 'embedding')
+    if parts == ['model', 'embed_tokens_per_layer', 'weight']:
+        return ('embed_tokens_per_layer', 'embedding')
+    if parts == ['model', 'per_layer_model_projection', 'weight']:
+        return ('per_layer_model_projection', 'kernel')
+    if parts == ['model', 'per_layer_projection_norm', 'weight']:
+        return ('per_layer_projection_norm', 'scale')
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
 
@@ -305,6 +365,14 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
             if (module == 'self_attn' and sublayer in _HEAD_NORMS
                     and leaf == 'weight'):
                 return (layer, module, sublayer, 'scale')
+        # Gemma 4's per-layer residual: gate and projection are kernels, the
+        # post norm is a scale. The values norm carries no weight, so it maps
+        # nothing.
+        if len(parts) == 5 and leaf == 'weight':
+            if module in ('per_layer_input_gate', 'per_layer_projection'):
+                return (layer, module, 'kernel')
+            if module == 'post_per_layer_input_norm':
+                return (layer, module, 'scale')
         norms = _norm_names(bool(config.get('sandwich_norms')))
         if len(parts) == 5 and module in norms and leaf == 'weight':
             return (layer, norms[module], 'scale')
@@ -455,12 +523,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     if not isinstance(model, CausalTransformer):
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    if model.per_layer_input_dim or model.num_kv_shared_layers:
+    if model.per_layer_input_dim or model.num_kv_shared_layers or model.v_norm:
         raise ValueError(
-            "per-layer input embeddings and KV sharing have no counterpart in "
-            "the llama, qwen3 and gemma3_text families this exports, so a model "
-            "with per_layer_input_dim or num_kv_shared_layers set cannot be "
-            "written back to the HF layout")
+            "per-layer input embeddings, KV sharing and the values norm have "
+            "no counterpart in the llama, qwen3 and gemma3_text families this "
+            "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
+            "or v_norm set cannot be written back to the HF layout")
     params = variables.get('params', variables)
     config = _export_config(model)
 
