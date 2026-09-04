@@ -11,8 +11,10 @@ import jax.numpy as jnp
 import pytest
 import tyro
 
+import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.data import Dataset
 from dew.registry import Registry, datasets, models
 from dew.training import Layout, MeshSpec
 
@@ -187,3 +189,104 @@ def test_a_dtype_is_a_dtype_wherever_it_is_named():
 def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
     with pytest.raises(ValueError, match=r"Kind has no field for \['theta'\]"):
         shapes().build("shape", mix={"theta": 1e6})
+
+
+def _data(records=48, batch=8, resumable=True):
+    """A Dataset value with nothing behind it: the intervals only read its
+    record count, its batch and whether it can report a position."""
+    return Dataset(train=lambda: iter(()), val=None, records=records, batch=batch,
+                   resumable=resumable)
+
+
+def test_an_interval_is_steps_a_pass_or_never():
+    """The three answers a run needs from one field: a number of steps, one
+    pass over the data, and never."""
+    data = _data(records=48, batch=8)
+
+    assert TrainerConfig().checkpoint_interval(data) == 6, "epoch is the default"
+    assert TrainerConfig().eval_interval(data) == 6
+    assert TrainerConfig(checkpoint_every=100).checkpoint_interval(data) == 100
+    assert TrainerConfig(eval_every=100).eval_interval(data) == 100
+    assert TrainerConfig(checkpoint_every=None).checkpoint_interval(data) is None
+    assert TrainerConfig(eval_every=None).eval_interval(data) is None
+
+
+def test_a_pass_over_the_data_needs_a_record_count():
+    """A stream with no record count has no epoch, so "epoch" is refused by
+    name instead of silently becoming every step or never."""
+    streaming = _data(records=None)
+
+    with pytest.raises(ValueError, match="checkpoint-every epoch needs a dataset"):
+        TrainerConfig().checkpoint_interval(streaming)
+    with pytest.raises(ValueError, match="eval-every epoch needs a dataset"):
+        TrainerConfig().eval_interval(streaming)
+    assert TrainerConfig(checkpoint_every=None).checkpoint_interval(streaming) is None
+    assert TrainerConfig(checkpoint_every=5).checkpoint_interval(streaming) == 5
+
+
+def test_a_dataset_that_cannot_report_its_position_takes_no_checkpoints():
+    """The combination that used to be unreachable: an online stream keeps its
+    record count, so "epoch" resolves, and the checkpoint would then carry no
+    position. The refusal names the flag that makes the run possible."""
+    stream = _data(records=48, resumable=False)
+
+    with pytest.raises(ValueError, match=r"--trainer.checkpoint-every None"):
+        TrainerConfig().checkpoint_interval(stream)
+    with pytest.raises(ValueError, match="cannot report its read position"):
+        TrainerConfig(checkpoint_every=10).checkpoint_interval(stream)
+
+    assert TrainerConfig(checkpoint_every=None).checkpoint_interval(stream) is None
+    assert TrainerConfig(checkpoint_every=None).eval_interval(stream) == 6, (
+        "validation does not depend on a position")
+
+
+class _Bucket:
+    """The three calls a run record makes on a path, recorded, and backed by a
+    local directory: a real gs:// write needs credentials and a network, and
+    what is under test is that a URI is never taken apart with os.path."""
+
+    def __init__(self, uri, root, seen):
+        self.uri, self.root, self.seen = str(uri), root, seen
+
+    def __truediv__(self, name):
+        return _Bucket(f"{self.uri}/{name}", self.root, self.seen)
+
+    def _local(self):
+        return self.root / self.uri.replace("gs://", "")
+
+    def mkdir(self, parents=False, exist_ok=False):
+        self.seen.append(("mkdir", self.uri))
+        self._local().mkdir(parents=parents, exist_ok=exist_ok)
+
+    def write_text(self, text):
+        self.seen.append(("write", self.uri))
+        self._local().write_text(text)
+
+    def read_text(self):
+        self.seen.append(("read", self.uri))
+        return self._local().read_text()
+
+    def __str__(self):
+        return self.uri
+
+
+def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
+    """A gs:// checkpoint directory has no local form: os.makedirs used to make
+    a directory called `gs:` beside the run and the open then failed, after the
+    training had already succeeded."""
+    def refuse(*args, **kwargs):
+        raise AssertionError("a URI must not reach the local filesystem calls")
+
+    seen = []
+    monkeypatch.setattr(dew.config.epath, "Path",
+                        lambda uri: _Bucket(uri, tmp_path, seen))
+    monkeypatch.setattr(os, "makedirs", refuse)
+    config = RunConfig(trainer=TrainerConfig(batch_size=8, steps=6))
+
+    path = config.save("gs://dew-runs/flowers")
+
+    assert path == "gs://dew-runs/flowers/run.json"
+    assert seen == [("mkdir", "gs://dew-runs/flowers"),
+                    ("write", "gs://dew-runs/flowers/run.json")]
+    assert RunConfig.load("gs://dew-runs/flowers") == config
+    assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")
