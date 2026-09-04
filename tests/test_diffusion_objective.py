@@ -233,9 +233,9 @@ def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
 
     The values were captured from this implementation. The fingerprint of the
     inlined train step this objective was lifted out of (8.209761425852776)
-    does not carry over: that step chained one RandomMarkovState through the
-    schedule, the noise and the dropout and seeded itself from the trainer's
-    own derivation, while every draw here comes from the step's
+    does not carry over: that step chained one random state object through
+    the schedule, the noise and the dropout and seeded itself from the
+    trainer's own derivation, while every draw here comes from the step's
     fold_in(run_key, step) key split once (design decision 4), and the EDM
     weight is Eq. 8 of Karras et al. without the epsilon guard (T21). Any
     real change in what the objective computes moves these by orders of
