@@ -211,10 +211,10 @@ class LMObjective(Objective):
     def loss(self, params, batch, step: Step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
-        balancing = self.balance_rate is not None
+        rate = self.balance_rate
         losses, weights, correct, routing = self.token_scores(
             params, tokens, train=True, rngs={"dropout": step.key},
-            segment_ids=segment_ids, positions=positions, routing=balancing)
+            segment_ids=segment_ids, positions=positions, routing=rate is not None)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -222,12 +222,12 @@ class LMObjective(Objective):
         reported = {"ce": ce, "perplexity": jnp.exp(ce),
                     "token_accuracy": jnp.sum(correct * weights) / counted}
         variables = None
-        if balancing:
-            if "moe" not in params:
+        if rate is not None:
+            if "moe" not in params or routing is None:
                 raise ValueError(
                     "balance_rate moves the routers' balancing bias, so the model "
                     "needs a mixture with bias=True")
-            balanced, load = balance(params["moe"], routing, self.balance_rate)
+            balanced, load = balance(params["moe"], routing, rate)
             reported.update(load)
             variables = {"moe": balanced}
         return ce, Aux(reported, variables)

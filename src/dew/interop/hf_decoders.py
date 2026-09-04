@@ -20,7 +20,7 @@ than loading a model that silently computes something else.
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 
 import numpy as np
 
@@ -62,7 +62,7 @@ _IGNORED_FIELDS = {
 # cache_implementation 'hybrid', which describes transformers' KV cache).
 
 
-def _refuse(field: str, detail: str) -> None:
+def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
@@ -166,12 +166,12 @@ def _kinds(layer_types: Tuple[str, ...], window: Optional[int],
     """
     kinds: Dict[str, Dict[str, Any]] = {}
     if 'sliding_attention' in layer_types:
-        sliding = {'window': window}
+        sliding: Dict[str, Any] = {'window': window}
         if local_theta is not None:
             sliding['rope_theta'] = local_theta
         kinds['sliding_attention'] = sliding
     if 'full_attention' in layer_types:
-        full = {}
+        full: Dict[str, Any] = {}
         if full_theta is not None:
             full['rope_theta'] = full_theta
         if full_head_dim is not None:
@@ -663,7 +663,7 @@ def save_pretrained_decoder(model, variables, directory, *,
 
     os.makedirs(directory, exist_ok=True)
     save_hf_layout(hf_tensors, config, directory)
-    generation_config = {'do_sample': True, 'use_cache': True}
+    generation_config: Dict[str, Any] = {'do_sample': True, 'use_cache': True}
     if tokenizer_name is not None:
         generation_config['tokenizer_name'] = tokenizer_name
     with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
