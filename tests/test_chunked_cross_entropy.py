@@ -200,7 +200,14 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
 
 
 def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
-    """Both paths a tied head has: the trunk and the embedding table."""
+    """Both paths a tied head has: the trunk and the embedding table.
+
+    The model computes in bf16, and the gradient into the tied embedding is a
+    scatter-add of bf16 products, which a GPU runs as atomics in no fixed
+    order. Two correct paths can then differ by one bf16 ulp of the largest
+    entry (measured: 2**-9 on 0.44, in some processes and not others). The
+    bound is one bf16 ulp, 2**-8 relative, with a margin: a real divergence of
+    the two paths is orders above it."""
     model = small_model()
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
@@ -229,7 +236,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
         largest = jnp.abs(want).max()
         name = jax.tree_util.keystr(path)
         assert largest > 0, f"{name} has a zero gradient, so nothing is checked"
-        assert jnp.abs(have - want).max() <= 1e-4 * largest, name
+        assert jnp.abs(have - want).max() <= 1e-2 * largest, name
 
 
 # --- the chunk arithmetic itself -------------------------------------------
