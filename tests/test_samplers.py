@@ -164,9 +164,14 @@ def test_a_key_reproduces_a_trajectory():
     assert jnp.allclose(first, second, atol=1e-5)
 
 
-@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4()], ids=lambda s: type(s).__name__)
+@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4(), SimplifiedEuler(), EulerAncestral()],
+                         ids=lambda s: type(s).__name__)
 def test_sigma_integrators_reject_a_vp_schedule(solver):
-    """Both integrate dx/dsigma = eps, which only holds when alpha is 1."""
+    """Each integrates dx/dsigma = eps, which only holds when alpha is 1.
+
+    SimplifiedEuler and EulerAncestral used to step a VP schedule without
+    complaint, drifting the samples narrow (0.275 std for a 0.3 oracle on the
+    cosine schedule, inside the convergence tolerance so the drift was silent)."""
     process, model = vp_process()
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
         generate(process, model, solver)
