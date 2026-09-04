@@ -327,40 +327,37 @@ def restored_state(checkpoints):
 
 
 def mode_steps(args) -> dict:
-    """`--steps` more steps of the real compiled step, from the directory's state."""
-    recorder = LossRecorder()
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=recorder)
+    """`--steps` more steps of the executable fit runs, from the directory's state.
+
+    Driven step by step here rather than through fit so every process records
+    the losses it computed; fit reports them through the tracker on process 0
+    alone.
+    """
+    from dew.training.distributed import shard_batch
+
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored, _ = restored_state(trainer.checkpoints)
+    state, _, _ = trainer.place()
     rows = BATCH // args.processes
     images = global_images()[args.process_id * rows:(args.process_id + 1) * rows]
-
-    def stream():
-        while True:
-            yield {"image": images}
-
-    target = (restored or 0) + args.steps
-    state = trainer.fit(Data(stream), steps=target, log_every=1)
+    batch = shard_batch(trainer.batch_sharding, {"image": images})
+    compiled = trainer.compile(state, batch)
+    losses = []
+    for _ in range(args.steps):
+        state, _, loss, _, _ = compiled(state, None, batch)
+        losses.append(float(as_numpy(loss)))
+    if args.save and args.steps:
+        trainer.checkpoints.save(int(as_numpy(state.step)), state, None)
+        trainer.checkpoints.wait()
     dump_params(args.out.with_suffix(".npz"), state.params)
-    report = {
-        "losses": recorder.losses,
+    return {
+        "losses": losses,
         "step": int(as_numpy(state.step)),
         "restored_step": restored,
         "checkpoint_path": trainer.checkpoints.directory,
         "sharding": sharding_facts(state.params),
-        "mesh_shape": {"data": jax_device_count() // args.fsdp_size, "expert": 1,
-                       "fsdp": args.fsdp_size},
+        "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
     }
-    if not args.save:
-        # The directory is scratch for this mode unless the test wants the
-        # checkpoint; the final save is the trainer's, so it is removed here.
-        import shutil
-        shutil.rmtree(trainer.checkpoints.directory, ignore_errors=True)
-    return report
-
-
-def jax_device_count() -> int:
-    import jax
-    return jax.device_count()
 
 
 class Batches:
@@ -378,20 +375,8 @@ class Batches:
         return float(np.sum(values))
 
 
-class ScoreRecorder(LossRecorder):
-    def __init__(self):
-        super().__init__()
-        self.scores = []
-
-    def log(self, scalars, step):
-        super().log(scalars, step)
-        if "val/batches" in scalars:
-            self.scores.append(scalars["val/batches"])
-
-
 def mode_fit(args) -> dict:
-    recorder = ScoreRecorder()
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=recorder)
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer.checkpoints)
     rows = BATCH // args.processes
@@ -399,6 +384,9 @@ def mode_fit(args) -> dict:
     if args.block_after:
         loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
     val, available = None, None
+    scored = []
+    evaluate = trainer.objective.evaluate
+    trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
     if args.tokens:
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
@@ -412,7 +400,7 @@ def mode_fit(args) -> dict:
     state = trainer.fit(Data(lambda: loader, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every)
+                        checkpoint_every=args.save_every, metrics=(Batches(),))
     dump_params(args.out.with_suffix(".npz"), state.params)
     _, final_position = restored_state(trainer.checkpoints)
     return {
@@ -423,7 +411,7 @@ def mode_fit(args) -> dict:
         "written_steps": sorted(int(step) for step in trainer.checkpoints._open().all_steps()),
         "dataset_state": final_position,
         "val_available": available,
-        "val_batches": None if available is None else int(recorder.scores[-1]),
+        "val_batches": None if available is None else len(scored),
     }
 
 

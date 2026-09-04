@@ -275,7 +275,7 @@ def test_processes_read_disjoint_shards_that_cover_the_corpus(tmp_path):
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(records))
     for report in reports:
-        # The loader reports the whole corpus, which is what a run turns into
+        # The dataset reports the whole corpus, which is what a run turns into
         # steps per epoch, and batches the local slice of the global batch.
         assert report["train_len"] == records
         assert report["global_batch_size"] == worker.BATCH
@@ -319,8 +319,8 @@ def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
     strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each process
     used to bound its own pass with an islice: asked for 5, process 1 issued
     a fifth validation collective after process 0 had left the pass, and the
-    pool sat in it until the heartbeat killed both. The count is agreed
-    before the loop, so both score 4.
+    pool sat in it until the heartbeat killed both. Each batch is agreed
+    before it is scored, so both score 4.
     """
     seq_len, val_steps = 8, 5
     lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
@@ -353,8 +353,16 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=2, steps=steps,
                     name="pool", run_dir=tmp_path / "pool-run")
 
-    trainer = worker.build_trainer("single", tmp_path / "single-run", fsdp_size=2)
-    state, _, losses = worker.run_losses(trainer, steps, worker.global_images())
+    from dew.training.distributed import shard_batch
+
+    trainer = worker.build_trainer("single", tmp_path / "single-run", fsdp=2)
+    state, _, _ = trainer.place()
+    batch = shard_batch(trainer.batch_sharding, {"image": worker.global_images()})
+    compiled = trainer.compile(state, batch)
+    losses = []
+    for _ in range(steps):
+        state, _, loss, _, _ = compiled(state, None, batch)
+        losses.append(float(loss))
 
     assert len(pool[0]["losses"]) == steps
     assert np.isfinite(pool[0]["losses"]).all(), "the pool diverged"
@@ -388,7 +396,7 @@ def test_a_checkpoint_written_by_a_pool_restores_in_one_process(tmp_path):
     assert pool[0]["checkpoint_path"] == str(written)
 
     restored = run_worker("steps", tmp_path / "restored.json", fsdp_size=1, steps=0,
-                          load=written, name="restored", run_dir=tmp_path / "restored-run")
+                          save=True, name="pool", run_dir=tmp_path / "written")
     assert restored["restored_step"] == 4
     assert restored["sharding"]["specs"] == ["P()"], "a replicated run sharded something"
     assert largest_difference(dumped_params(tmp_path / "restored.json"),
@@ -407,8 +415,8 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     written = worker.checkpoint_dir(tmp_path / "written", "single")
     assert single["checkpoint_path"] == str(written)
 
-    pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=4, steps=0, load=written,
-                    name="pooled", run_dir=tmp_path / "pool-run")
+    pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=4, steps=0, save=True,
+                    name="single", run_dir=tmp_path / "written")
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
@@ -457,9 +465,8 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
     parameters.
     """
     resumed = run_pool("fit", tmp_path / "resumed", 2, name="pool",
-                       run_dir=tmp_path / "resumed-run", fsdp_size=2,
-                       steps=2 * POOL_STEPS, records=RECORDS,
-                       load=pool_checkpoint["checkpoints"])
+                       run_dir=pool_checkpoint["checkpoints"].parent, fsdp_size=2,
+                       steps=2 * POOL_STEPS, records=RECORDS)
     whole = run_pool("fit", tmp_path / "whole", 2, name="whole",
                      run_dir=tmp_path / "whole-run", fsdp_size=2,
                      steps=2 * POOL_STEPS, records=RECORDS)
@@ -483,35 +490,11 @@ def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_chec
     with both counts in the message.
     """
     refused = spawn("fit", tmp_path / "single.json", fsdp_size=1, steps=2 * POOL_STEPS,
-                    records=RECORDS, name="single", run_dir=tmp_path / "single-run",
-                    load=pool_checkpoint["checkpoints"])
+                    records=RECORDS, name="pool", run_dir=pool_checkpoint["checkpoints"].parent)
     log = refused.communicate(timeout=600)[0]
     assert refused.returncode != 0, "one process resumed a two-process position"
     assert "position for each of 2 processes and this run has 1 process" in log
     assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
-
-
-@pytest.mark.distributed
-def test_a_resumed_run_id_starts_every_process_where_process_zero_does(tmp_path, pool_checkpoint):
-    """resume_last_run is answered by wandb, which only process 0 opens.
-
-    Process 0 learned the step the run had reached and downloaded its model
-    artifact; every other process kept a start step of 0 and no checkpoint,
-    trained from scratch and issued its collectives on another schedule.
-    What process 0 resolves is broadcast, so every process starts at the
-    summary's step plus one from the artifact's weights, trains the one step
-    left, and lands on the same parameters.
-    """
-    summary_step = POOL_STEPS + 1
-    reports = run_pool("fit", tmp_path / "out", 2, name="resumed", run_dir=tmp_path / "run",
-                       fsdp_size=2, steps=summary_step + 2, records=RECORDS,
-                       resume_run_step=summary_step,
-                       artifact=pool_checkpoint["checkpoints"] / str(POOL_STEPS))
-    for report in reports:
-        assert report["restored_step"] == summary_step + 1
-        assert report["step"] == POOL_STEPS + 1
-    assert largest_difference(dumped_params(tmp_path / "out" / "process0.json"),
-                              dumped_params(tmp_path / "out" / "process1.json")) == 0.0
 
 
 # --------------------------------------------------------------------------
@@ -591,8 +574,7 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
     assert handed == BLOCK_AFTER, "the run did not get past its checkpoint"
     assert committed_steps(checkpoints) == [SAVE_EVERY], "the kill was not mid-epoch"
 
-    resumed = run_worker("fit", tmp_path / "resumed.json",
-                         **fit_flags(run_dir, load=checkpoints))
+    resumed = run_worker("fit", tmp_path / "resumed.json", **fit_flags(run_dir))
     position = resumed["restored_dataset_state"]
     assert position is not None, "the checkpoint carries no position for the data pipeline"
     assert resumed["restored_step"] == SAVE_EVERY
@@ -610,12 +592,9 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
 
 @pytest.mark.slow
 def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_path, whole_run):
-    """Resuming a resume has to work, and the guard has to hold in between.
-
-    A run restarted against its own populated directory without being asked
-    to resume refuses instead of overwriting it, which is the difference
-    between a preemption costing three steps and costing the run. Two kills
-    and two resumes still have to end where the run nobody killed ended.
+    """Resuming a resume has to work: a rerun into the run's own directory
+    continues from the last step that landed, so two kills and two resumes
+    still end where the run nobody killed ended.
     """
     run_dir = tmp_path / "run"
     checkpoints = worker.checkpoint_dir(run_dir, "preempt")
@@ -627,24 +606,16 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
                       committed(checkpoints, SAVE_EVERY))
     assert first.returncode == -signal.SIGKILL
 
-    clobber = spawn("fit", tmp_path / "clobber.json", **fit_flags(run_dir))
-    refusal = clobber.communicate(timeout=600)[0]
-    assert clobber.returncode != 0, "a fresh run took over a populated directory"
-    assert f"already holds checkpoints up to step {SAVE_EVERY}" in refusal
-    assert "Nothing has been deleted" in refusal
-    assert committed(checkpoints, SAVE_EVERY).exists(), "the refused run deleted the step"
-
     # The second window: three more steps, a checkpoint at six, killed again.
     second = spawn("fit", tmp_path / "second.json",
-                   **fit_flags(run_dir, load=checkpoints, block_after=SAVE_EVERY,
+                   **fit_flags(run_dir, block_after=SAVE_EVERY,
                                marker=tmp_path / "blocked-second"))
     kill_when_blocked(second, tmp_path / "blocked-second",
                       committed(checkpoints, 2 * SAVE_EVERY))
     assert second.returncode == -signal.SIGKILL
     assert committed_steps(checkpoints)[-1] == 2 * SAVE_EVERY, "the run was not killed mid-epoch"
 
-    third = run_worker("fit", tmp_path / "third.json",
-                       **fit_flags(run_dir, load=checkpoints))
+    third = run_worker("fit", tmp_path / "third.json", **fit_flags(run_dir))
     assert third["step"] == STEPS
     assert third["dataset_state"] == whole_run["dataset_state"]
     assert_same_parameters(dumped_params(tmp_path / "third.json"), whole_run["params"])
