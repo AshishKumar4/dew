@@ -107,10 +107,10 @@ def read_video_opencv(video_path):
         cap.release()
 
 def read_video_rsreader(video_path, fast=False):
-    """`video-reader-rs`, which is not in the `av` extra: its wheel links
-    libwebp's libsharpyuv and does not carry it, so it imports only where
-    that library is installed system-wide. Install it yourself if you want
-    it, and pass `reader="rsreader"`."""
+    """`video-reader-rs`, which is not in the `av` extra: its wheel carries
+    libsharpyuv but leaves a build-machine RUNPATH on libwebp, so the loader
+    never finds the bundled copy and reinstalling changes nothing. Use it
+    only with an install you have seen import, and pass `reader="rsreader"`."""
     from video_reader import PyVideoReader
     vr = PyVideoReader(video_path)
     return vr.decode_fast() if fast else vr.decode()
@@ -129,6 +129,23 @@ def read_av_decord(path: str, start: int = 0, end: int | None = None, ctx=None):
     audio, video = vr[start:end]
     return audio, video.asnumpy()
 
+def _decode_frame_window_pyav(path: str, start: int = 0, end: int | None = None) -> np.ndarray:
+    """Frames `[start, end)` of the first video stream as RGB uint8."""
+    import av
+    with av.open(path) as container:
+        video = container.streams.video
+        if not video:
+            raise ValueError(f"{path} has no video stream")
+        frames = []
+        for index, frame in enumerate(container.decode(video[0])):
+            if end is not None and index >= end:
+                break
+            if index >= start:
+                frames.append(frame.to_ndarray(format="rgb24"))
+    if not frames:
+        return np.zeros((0, 0, 0, 3), dtype=np.uint8)
+    return np.stack(frames)
+
 def read_av_improved(
     path: str,
     start: int = 0,
@@ -139,9 +156,10 @@ def read_av_improved(
 ) -> Tuple[Union[List, np.ndarray], np.ndarray]:
     """
     Read audio-video data with explicit cleanup and without memory leaks.
-    Uses PyVideoReader for video (which doesn't have memory leaks) and 
-    FFmpeg/moviepy for audio extraction.
-    
+    Frames come from PyAV, the default because the `dew-ml[av]` extra installs
+    it and its wheels import as shipped. Audio comes from FFmpeg/moviepy
+    extraction.
+
     Args:
         path: Path to the video file.
         start: Start frame index.
@@ -149,33 +167,31 @@ def read_av_improved(
         fps: Video frames per second (used for audio timing).
         target_sr: Target audio sample rate.
         audio_method: Method to extract audio ('ffmpeg' or 'moviepy').
-        
+
     Returns:
         Tuple of (audio_data, video_frames) where video_frames is a numpy array.
     """
-    from video_reader import PyVideoReader
     # Calculate time information for audio extraction
     start_time = start / fps if start > 0 else 0
     duration = None
     if end is not None:
         duration = (end - start) / fps
-    
-    # Get video frames using PyVideoReader; end=None means "to the end"
-    vr = PyVideoReader(path)
-    video = vr.decode(start_frame=start, end_frame=end)
-    
+
+    # The requested frame window; end=None means "to the end".
+    video = _decode_frame_window_pyav(path, start, end)
+
     # Get audio data using our custom audio utilities
     audio, _ = read_audio(
-        path, 
-        start_time=start_time, 
-        duration=duration, 
+        path,
+        start_time=start_time,
+        duration=duration,
         target_sr=target_sr,
         method=audio_method
     )
-    
+
     # Convert audio to list for API compatibility with original read_av
     audio_list = list(audio)
-    
+
     return audio_list, video
 
 def read_av_moviepy(
