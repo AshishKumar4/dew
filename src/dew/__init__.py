@@ -15,7 +15,22 @@ Objective classes, and a registry cannot share its name. It is
 """
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
+    from dew.artifacts import (
+        ImageGrid, Representations, TextSamples, TokenScores, VideoGrid,
+    )
+    from dew.data import Dataset
+    from dew.diffusion import Process
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.objectives import Objective
+    from dew.objectives.base import Aux, EMASpec, Step
+    from dew.registry import datasets, encoders, metrics, models, presets, samplers
+    from dew.sampling import CFG, sample
+    from dew.training import (
+        Checkpoints, Layout, MeshSpec, Tracker, Trainer, TrainState, WandbTracker,
+    )
 
 __version__ = "0.1.0"
 
@@ -59,4 +74,14 @@ def __dir__() -> list[str]:
     return list(__all__)
 
 
-__all__ = ["__version__", *sorted(_EXPORTS)]
+# Written out rather than derived from _EXPORTS so a type checker, an editor
+# and `from dew import *` can all read the public surface without running the
+# lazy lookup above. tests/test_api_surface.py holds the two in agreement.
+__all__ = [
+    "__version__",
+    "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Field",
+    "ImageGrid", "InputSpec", "Layout", "MeshSpec", "Objective", "Process",
+    "Representations", "Step", "TextSamples", "TokenScores", "Tracker",
+    "TrainState", "Trainer", "VideoGrid", "WandbTracker",
+    "datasets", "encoders", "metrics", "models", "presets", "sample", "samplers",
+]

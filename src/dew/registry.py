@@ -21,7 +21,7 @@ from typing import Any, Callable, Generic, TypeVar, Union
 
 import jax.numpy as jnp
 
-T = TypeVar("T")
+T = TypeVar("T", bound=Callable[..., Any])
 
 
 class Registry(Mapping[str, T], Generic[T]):
@@ -93,24 +93,29 @@ class Registry(Mapping[str, T], Generic[T]):
         and `models.build("m", attention=Attention(heads=8))` agree.
         """
         member = self[name]
-        if dataclasses.is_dataclass(member):
-            declared = {f.name for f in dataclasses.fields(member) if f.init}
-            unknown = sorted(set(fields) - declared)
-            if unknown:
-                raise ValueError(
-                    f"{self.kind} {name!r} ({_describe(member)}) has no field for "
-                    f"{unknown}; its fields are {sorted(declared)}")
-            fields = {key: _field_value(member, key, value)
-                      for key, value in fields.items()}
-        return member(**fields)
+        return member(**self._declared_fields(name, member, fields))
+
+    def _declared_fields(self, name: str, member: Any,
+                         fields: dict[str, Any]) -> dict[str, Any]:
+        """`fields` as the member declares them, or an error naming what it
+        has no field for. A member that is not a dataclass takes them as given."""
+        if not dataclasses.is_dataclass(member):
+            return fields
+        declared = {f.name for f in dataclasses.fields(member) if f.init}
+        unknown = sorted(set(fields) - declared)
+        if unknown:
+            raise ValueError(
+                f"{self.kind} {name!r} ({_describe(member)}) has no field for "
+                f"{unknown}; its fields are {sorted(declared)}")
+        return {key: _field_value(member, key, value) for key, value in fields.items()}
 
     @property
     def union(self) -> Any:
         """`Union[...]` of the members, for a tyro subcommand over the table."""
-        members = tuple(self._members.values())
+        members = list(self._members.values())
         if not members:
             raise ValueError(f"the {self.kind} registry is empty")
-        return Union[members] if len(members) > 1 else members[0]
+        return Union[tuple(members)] if len(members) > 1 else members[0]
 
 
 def _describe(member: Any) -> str:
