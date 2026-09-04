@@ -9,10 +9,16 @@ Model kwargs stay an opaque JSON dict. The registry already knows which
 architecture takes which fields, and mirroring them here would be a second
 place to keep in sync. A dataset is the registered spec itself, which tyro
 turns into a subcommand (`data:token-windows --data.path ...`).
+
+The resolved config is the run's spec. A recipe writes it to `run.json` next
+to the checkpoints with `save`, and `load` reads it back into the same class,
+so inference rebuilds a run from what training was built from. A field the
+class does not have, or one the file lacks, raises.
 """
 
 import dataclasses
 import json
+import os
 import typing
 from typing import Annotated, Any, Literal, Mapping, Optional, Self
 
@@ -35,6 +41,8 @@ JsonDict = Annotated[
     ),
 ]
 """A dict, written as a single JSON string on the command line."""
+
+RUN_FILE = "run.json"
 
 REGISTRIES = (registry.models, registry.presets, registry.samplers, registry.datasets,
               registry.encoders, registry.metrics, registry.objectives)
@@ -158,8 +166,14 @@ def _to_json(value):
 
 def _fields(cls, values):
     hints = typing.get_type_hints(cls)
-    return {f.name: _rebuild(hints[f.name], values[f.name])
-            for f in dataclasses.fields(cls) if f.name in values}
+    declared = [f.name for f in dataclasses.fields(cls) if f.init]
+    unknown = sorted(set(values) - set(declared))
+    missing = [name for name in declared if name not in values]
+    if unknown or missing:
+        raise ValueError(
+            f"{cls.__name__} does not match the record: unknown fields {unknown}, "
+            f"missing fields {missing}")
+    return {name: _rebuild(hints[name], values[name]) for name in declared}
 
 
 def _rebuild(annotation, value):
@@ -189,5 +203,20 @@ class RunConfig:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> Self:
-        """Inverse of `to_dict`, for subclasses too."""
+        """Inverse of `to_dict`, for subclasses too; an unknown or a missing
+        field raises."""
         return _rebuild(cls, values)
+
+    def save(self, directory: str) -> str:
+        """Write this config as `run.json` in `directory` and return the path."""
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, RUN_FILE)
+        with open(path, "w") as handle:
+            json.dump(self.to_dict(), handle, indent=2, sort_keys=True)
+        return path
+
+    @classmethod
+    def load(cls, directory: str) -> Self:
+        """The config a run in `directory` was built from, as this class."""
+        with open(os.path.join(directory, RUN_FILE)) as handle:
+            return cls.from_dict(json.load(handle))
