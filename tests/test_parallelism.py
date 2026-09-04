@@ -1,15 +1,12 @@
 """Sharding, FSDP and data-pipeline tests on a simulated 8-device CPU mesh.
 
-The parity tests are the safety net for the shard_map -> jit + NamedSharding
-migration: a partitioned run has to produce the same numbers as a single-device
-one, otherwise the collectives GSPMD derived are not the ones we meant.
+The parity tests are the safety net for the partitioned step: a run over eight
+devices, and over a sharded parameter tree, has to produce the numbers a plain
+single-device optax loop produces, otherwise the collectives GSPMD derived are
+not the ones we meant.
 """
 
 import json
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -22,20 +19,16 @@ pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.config import OptimConfig
-from dew.inputs import DiffusionInputConfig
-from dew.eval.common import EvaluationMetric
+from dew.artifacts import Representations
+from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.training import ObjectiveTrainer, SimpleTrainer
-from dew.training.optim import build_optimizer
-from dew.objectives.base import EMASpec, Objective
+from dew.objectives.base import Aux, EMASpec, Objective
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import (
-    DEFAULT_LOGICAL_AXIS_RULES, DevicePrefetchIterator,
-    assert_params_sufficiently_sharded, batch_sharding, build_mesh,
-    parameter_spec, shard_batch, state_sharding_tree,
+    DEFAULT_RULES, DevicePrefetchIterator, batch_sharding, parameter_spec, shard_batch,
 )
+from dew.training.optim import OPTIMIZER_MAP
 
 RES = 8
 BATCH = 8
@@ -44,42 +37,132 @@ BATCH = 8
 TINY = 256
 
 
-def make_trainer(tmp_path, name, distributed_training, fsdp_size=1,
-                 optimizer=None, **kwargs):
-    train_schedule, _, transform = get_diffusion_preset("edm")
-    return ObjectiveTrainer(
-        model=SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
-        optimizer=optax.adam(1e-3) if optimizer is None else optimizer,
-        noise_schedule=train_schedule,
-        model_output_transform=transform,
-        input_config=DiffusionInputConfig(
-            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
-        rngs=jax.random.PRNGKey(0),
-        name=name,
-        wandb_config=None,
-        distributed_training=distributed_training,
-        fsdp_size=fsdp_size,
-        checkpoint_base_path=str(tmp_path),
+class DeterministicObjective(Objective):
+    """Squared error against the input, straight through the real DiT.
+
+    No noise level, no dropout, no unconditional mask: the loss depends only
+    on the parameters and the batch. That is what makes two accumulation
+    regimes comparable, and two topologies: every micro-gradient in a window
+    is identical, which is exactly the "one big batch" an accumulated update
+    stands in for, so a k-accumulated run and a plain run must trace the same
+    parameters, and a partitioned run the same losses as a single-device one.
+    """
+
+    artifact = Representations
+
+    def __init__(self, decay=optax.constant_schedule(0.999), emb_features=32):
+        self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
+                               num_heads=2, mlp_ratio=1)
+        self.ema = EMASpec(decay=decay)
+
+    def init(self, key):
+        return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
+
+    def loss(self, params, batch, step):
+        data = unit_range(batch["image"])
+        preds = self.model.apply(params, data, jnp.zeros((data.shape[0],), jnp.float32))
+        return jnp.mean((preds - data) ** 2), Aux({})
+
+    def evaluate(self, params, batch, step):
+        """The EMA copy's reconstruction, pooled per example: reads the
+        sharded EMA parameters, which the training step alone never does."""
+        data = unit_range(batch["image"])
+        preds = self.model.apply(step.ema, data, jnp.zeros((data.shape[0],), jnp.float32))
+        return Representations(features=jnp.mean(preds, axis=(1, 2)),
+                               labels=jnp.zeros((data.shape[0],), jnp.int32))
+
+
+class Data:
+    def __init__(self, train, val=None, batch=BATCH, records=None):
+        self._train, self.val = train, val
+        self.batch, self.records = batch, records
+
+    def train(self):
+        return self._train()
+
+    @property
+    def steps_per_epoch(self):
+        return None if self.records is None else self.records // self.batch
+
+
+def images():
+    rng = np.random.default_rng(0)
+    return rng.integers(0, 256, size=(BATCH, RES, RES, 3)).astype(np.uint8)
+
+
+def batches():
+    batch = {"image": images()}
+    while True:
+        yield batch
+
+
+class RecordingTracker:
+    def __init__(self):
+        self.scalars = []
+        self.artifacts = []
+
+    def log(self, scalars, step):
+        self.scalars.append((step, dict(scalars)))
+
+    def artifact(self, value, step):
+        self.artifacts.append((step, value))
+
+    def losses(self):
+        return [s["train/loss"] for _, s in self.scalars if "train/loss" in s]
+
+
+def make_trainer(tmp_path=None, fsdp=1, optimizer=None, objective=None, tracker=None,
+                 **kwargs):
+    checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path), keep=4)
+    return Trainer(
+        DeterministicObjective() if objective is None else objective,
+        optax.adam(1e-3) if optimizer is None else optimizer,
+        key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp),
+        layout=Layout(min_shard=TINY),
+        checkpoints=checkpoints,
+        tracker=tracker,
         **kwargs,
     )
 
 
-def batches():
-    rng = np.random.default_rng(0)
-    images = rng.integers(0, 256, size=(BATCH, RES, RES, 3)).astype(np.float32)
-    while True:
-        yield {"image": images}
+def run_losses(steps, **kwargs):
+    """Per-step losses of a fit, as the tracker receives them."""
+    tracker = RecordingTracker()
+    make_trainer(tracker=tracker, **kwargs).fit(Data(batches), steps=steps, log_every=1)
+    return tracker.losses()
 
 
-def run_losses(trainer, steps):
-    """Per-step losses from the real compiled training step."""
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
+def reference_losses(trainer, steps):
+    """The same run as a plain optax loop on one device: the yardstick a
+    partitioned step has to reproduce."""
+    objective, optimizer = trainer.objective, trainer.optimizer
+    state = trainer.initial_state()
+    device = jax.devices()[0]
+    params = jax.device_put(state.params, device)
+    opt_state = jax.device_put(state.opt_state, device)
+
+    @jax.jit
+    def step(params, opt_state, batch, key):
+        info = type(state)(step=jnp.zeros((), jnp.int32), params=params, opt_state=opt_state,
+                           ema=None, key=key)
+        del info
+
+        def loss_fn(trainable):
+            from dew.objectives.base import Step
+            return objective.loss({**params, "params": trainable}, batch,
+                                  Step(step=jnp.zeros((), jnp.int32), key=key, ema=None))
+
+        (loss, _), grads = jax.value_and_grad(loss_fn, has_aux=True)(params["params"])
+        updates, opt_state = optimizer.update(grads, opt_state, params["params"])
+        return {**params, "params": optax.apply_updates(params["params"], updates)}, opt_state, loss
+
     losses = []
-    for _ in range(steps):
-        state, loss, _, rng, is_finite = train_step(state, rng, next(source))
-        assert bool(is_finite)
+    source = batches()
+    for index in range(steps):
+        batch = jax.device_put(next(source), device)
+        params, opt_state, loss = step(params, opt_state, batch,
+                                       jax.random.fold_in(state.key, index))
         losses.append(float(loss))
     return losses
 
@@ -107,15 +190,20 @@ def test_parameter_spec_falls_back_to_replication_when_indivisible():
 
 def declared_specs(variables, rules):
     """Parameter specs on a two-way fsdp mesh under one rule table."""
-    shardings = state_sharding_tree(
-        build_mesh(fsdp_size=2), variables, min_shard_size=1,
-        logical_axis_rules=rules)
+    shardings = Layout(rules=rules, min_shard=1).shardings(
+        build_mesh(MeshSpec(fsdp=2)), variables)
     return jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
 
+def dit_variables(**overrides):
+    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2,
+                      **overrides)
+    return jax.eval_shape(model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
+
+
 def test_causal_transformer_axes_land_on_the_dimensions_they_name():
-    """One rule at a time: the dimension that moves is the one the table names,
-    which is what a declared axis has to mean."""
+    """One rule at a time: the dimension that moves is the one the module
+    declares, which is what a declared axis has to mean."""
     model = CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
         num_kv_heads=1, mlp_ratio=2, max_seq_len=8, tie_embeddings=False)
@@ -153,10 +241,7 @@ def test_causal_transformer_axes_land_on_the_dimensions_they_name():
 
 def test_dit_axes_land_on_the_dimensions_they_name():
     """The same for the DiT stack, whose attention kernels carry three axes."""
-    model = SimpleDiT(
-        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
+    variables = dit_variables()
 
     heads = declared_specs(variables, {"heads": "fsdp"})["dit_block_0"]["attention"]
     assert heads["to_q"]["kernel"] == P(None, "fsdp")
@@ -189,15 +274,11 @@ def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
     variables = {"params": {"q_proj": {
         "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
     with pytest.raises(ValueError, match="q_proj"):
-        state_sharding_tree(build_mesh(fsdp_size=2), variables, min_shard_size=1)
+        Layout(min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)), variables)
 
 
 def test_rule_override_changes_only_declared_axes():
-    model = SimpleDiT(
-        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
-    abstract_variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
-    specs = declared_specs(abstract_variables, {"mlp": "fsdp"})
+    specs = declared_specs(dit_variables(), {"mlp": "fsdp"})
 
     assert specs["dit_block_0"]["mlp"]["layers_0"]["kernel"] == P(None, "fsdp")
     assert specs["dit_block_0"]["mlp"]["layers_2"]["kernel"] == P("fsdp")
@@ -205,30 +286,22 @@ def test_rule_override_changes_only_declared_axes():
     assert specs["embed"]["patch_embed"]["Conv_0"]["kernel"] == P()
 
 
-def test_default_logical_rules_keep_the_shape_heuristic():
-    model = SimpleDiT(
-        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
-    abstract_variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
-    shardings = state_sharding_tree(
-        build_mesh(fsdp_size=2), abstract_variables, min_shard_size=1,
-        logical_axis_rules=DEFAULT_LOGICAL_AXIS_RULES)
+def test_default_rules_keep_the_shape_heuristic_for_the_dit():
+    """The declared table reproduces the largest-divisible-axis choice on the
+    DiT's shapes, so declaring the model moved none of its leaves."""
+    variables = dit_variables()
+    shardings = Layout(rules=DEFAULT_RULES, min_shard=1).shardings(
+        build_mesh(MeshSpec(fsdp=2)), variables)
     expected = jax.tree.map(
-        lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1),
-        abstract_variables)
-    actual = jax.tree.map(lambda sharding: sharding.spec, shardings)
-    assert actual == expected
+        lambda leaf: parameter_spec(leaf.shape, fsdp_size=2, min_shard_size=1), variables)
+    assert jax.tree.map(lambda sharding: sharding.spec, shardings) == expected
 
 
 def test_rules_may_name_a_mesh_axis_this_mesh_does_not_have():
     """A table can carry the future tensor axis; today's mesh drops it."""
-    model = SimpleDiT(
-        patch_size=4, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=2)
-    abstract_variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)), None)
-    shardings = state_sharding_tree(
-        build_mesh(fsdp_size=2), abstract_variables, min_shard_size=1,
-        logical_axis_rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"})["params"]
+    shardings = Layout(rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"},
+                       min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)),
+                                              dit_variables())["params"]
 
     assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
             == P(None, "fsdp"))
@@ -243,24 +316,25 @@ class IndivisibleModel(nn.Module):
         return nn.Dense(15, use_bias=False, name="indivisible")(x)
 
 
-def make_indivisible_trainer(tmp_path, tolerance):
-    return SimpleTrainer(
-        model=IndivisibleModel(),
-        input_shapes={"x": (15,)},
-        optimizer=optax.adam(1e-3),
-        rngs=jax.random.key(0),
-        distributed_training=True,
-        fsdp_size=2,
-        fsdp_min_param_size=1,
-        sharding_tolerance=tolerance,
-        checkpoint_base_path=str(tmp_path),
-        name=f"indivisible-{tolerance}",
-    )
+class Indivisible(Objective):
+    ema = None
+
+    def init(self, key):
+        return IndivisibleModel().init(key, jnp.ones((1, 15)))
+
+    def loss(self, params, batch, step):
+        return jnp.sum(IndivisibleModel().apply(params, batch["image"][:, 0, 0, :]) ** 2), Aux({})
 
 
-def test_sharding_tolerance_names_the_largest_replicated_parameter(tmp_path):
+def build_indivisible(tolerance):
+    return Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
+                   mesh=MeshSpec(fsdp=2),
+                   layout=Layout(min_shard=1, tolerance=tolerance)).fit(Data(batches), steps=0)
+
+
+def test_sharding_tolerance_names_the_largest_replicated_parameter():
     with pytest.raises(ValueError) as error:
-        make_indivisible_trainer(tmp_path, tolerance=0.02)
+        build_indivisible(tolerance=0.02)
 
     message = str(error.value)
     assert "100.00%" in message and "2.00%" in message
@@ -268,24 +342,23 @@ def test_sharding_tolerance_names_the_largest_replicated_parameter(tmp_path):
     assert "(15, 15)" in message
 
 
-def test_sharding_tolerance_can_allow_intentional_replication(tmp_path):
-    trainer = make_indivisible_trainer(tmp_path, tolerance=1.0)
-    kernel = trainer.state.params["params"]["indivisible"]["kernel"]
-    assert kernel.sharding.spec == P()
+def test_sharding_tolerance_can_allow_intentional_replication():
+    state = build_indivisible(tolerance=1.0)
+    assert state.params["params"]["indivisible"]["kernel"].sharding.spec == P()
 
 
-def test_unset_sharding_tolerance_takes_the_library_default(tmp_path):
-    """A config that names no tolerance has to reach the same 2% the library
-    declares, without the config repeating the number."""
-    with pytest.raises(ValueError) as error:
-        make_indivisible_trainer(tmp_path, tolerance=None)
+def test_the_layout_default_tolerance_is_two_percent():
+    """A layout that names no tolerance carries the library's 2%, without
+    the config repeating the number."""
+    assert Layout().tolerance == 0.02
+    with pytest.raises(ValueError, match="2.00%"):
+        Trainer(Indivisible(), optax.adam(1e-3), key=jax.random.key(0),
+                mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1)).fit(Data(batches), steps=0)
 
-    assert "2.00%" in str(error.value)
 
-
-def test_sharding_tolerance_outside_zero_to_one_is_rejected(tmp_path):
+def test_sharding_tolerance_outside_zero_to_one_is_rejected():
     with pytest.raises(ValueError, match="between 0 and 1"):
-        make_indivisible_trainer(tmp_path, tolerance=1.5)
+        Layout(tolerance=1.5)
 
 
 @pytest.mark.parametrize("fsdp_size", [2, 4, 8])
@@ -300,21 +373,21 @@ def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
         num_kv_heads=1, mlp_ratio=2, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(fsdp_size=fsdp_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    layout = Layout(min_shard=TINY)
+    shardings = layout.shardings(mesh, variables)
 
     assert shardings["params"]["embed_tokens"]["embedding"].spec == P(None, "fsdp")
-    assert_params_sufficiently_sharded(
-        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+    layout.check(variables["params"], shardings["params"], mesh)
 
 
 def test_build_mesh_rejects_bad_fsdp_size():
     with pytest.raises(ValueError):
-        build_mesh(fsdp_size=3)
+        build_mesh(MeshSpec(fsdp=3))
 
 
 def test_build_mesh_axes():
-    mesh = build_mesh(fsdp_size=2)
+    mesh = build_mesh(MeshSpec(fsdp=2))
     assert mesh.shape['data'] == jax.device_count() // 2
     assert mesh.shape['fsdp'] == 2
 
@@ -324,7 +397,7 @@ def test_build_mesh_axes():
 # --------------------------------------------------------------------------
 
 def test_shard_batch_splits_across_all_devices():
-    mesh = build_mesh(fsdp_size=2)
+    mesh = build_mesh(MeshSpec(fsdp=2))
     batch = {"image": np.zeros((jax.device_count(), 4), np.float32)}
     sharded = shard_batch(batch_sharding(mesh), batch)["image"]
     assert len(sharded.addressable_shards) == jax.device_count()
@@ -382,26 +455,24 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     position as a dict where the DataLoader reports JSON bytes. A checkpoint
     holds bytes, so the position has to arrive as bytes and go back as a
     dict."""
-    from dew.data.dataloaders import get_packed_token_dataset_grain
+    from dew.data import PackedTokens
 
     documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
     (tmp_path / "train.bin").write_bytes(documents.tobytes())
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = get_packed_token_dataset_grain(
-        str(tmp_path / "train.bin"), str(tmp_path / "val.bin"),
-        batch_size=jax.device_count(), seq_len=8, seed=0, worker_count=0,
-        num_epochs=1, num_packing_bins=2)
+    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, worker_count=0,
+                        packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()
-    it = DevicePrefetchIterator(data["val"](), batch_sharding(mesh), depth=2)
+    it = DevicePrefetchIterator(data.train(), batch_sharding(mesh), depth=2)
     next(it)
     state = it.source_state
     expected = np.asarray(next(it)["text"])
     assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
 
-    resumed = DevicePrefetchIterator(data["val"](), batch_sharding(mesh), depth=2,
+    resumed = DevicePrefetchIterator(data.train(), batch_sharding(mesh), depth=2,
                                      source_state=state)
     assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
 
@@ -410,34 +481,32 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
 # Numerical parity
 # --------------------------------------------------------------------------
 
-def test_single_and_multi_device_losses_agree(tmp_path):
-    """Partitioning must not change the maths."""
+def test_the_partitioned_step_reproduces_a_single_device_loop():
+    """Partitioning over eight devices must not change the maths."""
     steps = 20
-    single = run_losses(make_trainer(tmp_path / "one", "one", distributed_training=False), steps)
-    multi = run_losses(make_trainer(tmp_path / "many", "many", distributed_training=True), steps)
+    trainer = make_trainer(optimizer=optax.sgd(0.5))
+    reference = reference_losses(trainer, steps)
     assert jax.device_count() > 1
-    np.testing.assert_allclose(single, multi, rtol=2e-4, atol=2e-5)
+    np.testing.assert_allclose(reference, run_losses(steps, optimizer=optax.sgd(0.5)),
+                               rtol=2e-4, atol=2e-5)
 
 
-def test_fsdp_losses_match_replicated(tmp_path):
+def test_fsdp_losses_match_replicated():
     """Sharding the parameters must not change the loss trajectory."""
     steps = 20
-    replicated = run_losses(
-        make_trainer(tmp_path / "dp", "dp", distributed_training=True, fsdp_size=1), steps)
-    fsdp = make_trainer(tmp_path / "fsdp", "fsdp", distributed_training=True,
-                        fsdp_size=2, fsdp_min_param_size=TINY)
-    assert any('fsdp' in str(x.sharding.spec) for x in jax.tree.leaves(fsdp.state.params))
-    np.testing.assert_allclose(replicated, run_losses(fsdp, steps), rtol=2e-4, atol=2e-5)
+    replicated = run_losses(steps, fsdp=1)
+    fsdp = run_losses(steps, fsdp=2)
+    assert np.isfinite(replicated).all()
+    np.testing.assert_allclose(replicated, fsdp, rtol=2e-4, atol=2e-5)
 
 
 # --------------------------------------------------------------------------
 # FSDP actually shards
 # --------------------------------------------------------------------------
 
-def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
-    trainer = make_trainer(tmp_path, "fsdp-shapes", distributed_training=True,
-                           fsdp_size=2, fsdp_min_param_size=TINY)
-    leaves = jax.tree.leaves(trainer.state.params)
+def test_fsdp_shards_parameters_and_optimizer_state():
+    state = make_trainer(fsdp=2).fit(Data(batches), steps=1, log_every=1)
+    leaves = jax.tree.leaves(state.params)
     sharded = [x for x in leaves if 'fsdp' in str(x.sharding.spec)]
     assert sharded, "no parameter was sharded over the fsdp axis"
 
@@ -445,7 +514,7 @@ def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
         local = param.addressable_shards[0].data
         assert local.size == param.size // 2, "shard is not half the global param"
         # Exactly the dimension the spec names is halved. Which dimension that
-        # is belongs to the rules table, not to this test.
+        # is belongs to the declarations, not to this test.
         split = [axis for axis, (whole, part) in enumerate(
             zip(param.shape, local.shape)) if whole != part]
         assert len(split) == 1, f"{param.shape} -> {local.shape}"
@@ -454,40 +523,34 @@ def test_fsdp_shards_parameters_and_optimizer_state(tmp_path):
 
     # Adam moments and the EMA copy must follow the params they track, without
     # the optimizer or the model ever describing a layout.
-    mu = trainer.state.opt_state[0].mu
-    param_specs = [x.sharding.spec for x in jax.tree.leaves(trainer.state.params)]
-    mu_specs = [x.sharding.spec for x in jax.tree.leaves(mu)]
-    assert param_specs == mu_specs
-
-    ema_specs = [x.sharding.spec for x in jax.tree.leaves(trainer.state.ema_params)]
-    assert param_specs == ema_specs
+    param_specs = [x.sharding.spec for x in jax.tree.leaves(state.params)]
+    assert param_specs == [x.sharding.spec for x in jax.tree.leaves(state.opt_state[0].mu)]
+    assert param_specs == [x.sharding.spec for x in jax.tree.leaves(state.ema)]
 
 
-def test_muon_masked_optimizer_state_shards_with_its_parameters(tmp_path):
+def test_muon_masked_optimizer_state_shards_with_its_parameters():
     """A masked optax transform leaves a MaskedNode where its group does not
     apply, and muon's adam branch is always masked, so the derivation has to
-    carry a leaf that is not an array at all. optax.contrib.muon is what the
-    'muon' optimizer entry builds."""
-    trainer = make_trainer(tmp_path, "muon", distributed_training=True,
-                           fsdp_size=2, fsdp_min_param_size=TINY,
-                           optimizer=optax.contrib.muon(1e-3))
+    carry a leaf that is not an array at all."""
+    state = make_trainer(fsdp=2, optimizer=optax.contrib.muon(1e-3)).fit(
+        Data(batches), steps=0)
 
     def is_placeholder(leaf):
         return isinstance(leaf, optax.MaskedNode)
 
     placeholders = [leaf for leaf in jax.tree.leaves(
-        trainer.state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
+        state.opt_state, is_leaf=is_placeholder) if is_placeholder(leaf)]
     assert placeholders, "muon left no masked placeholder for the derivation to carry"
 
-    kernel = trainer.state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
+    kernel = state.params["params"]["dit_block_0"]["mlp"]["layers_0"]["kernel"]
     assert kernel.sharding.spec == P(None, "fsdp")
-    moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(trainer.state.opt_state)}
+    moment_specs = {leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state)}
     assert kernel.sharding.spec in moment_specs
 
 
-def test_replicated_run_shards_nothing(tmp_path):
-    trainer = make_trainer(tmp_path, "dp-shapes", distributed_training=True, fsdp_size=1)
-    for leaf in jax.tree.leaves(trainer.state.params):
+def test_replicated_run_shards_nothing():
+    state = make_trainer(fsdp=1).fit(Data(batches), steps=0)
+    for leaf in jax.tree.leaves(state.params):
         assert leaf.sharding.spec == P()
 
 
@@ -496,204 +559,107 @@ def test_replicated_run_shards_nothing(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_sharded_checkpoint_roundtrips(tmp_path):
-    trainer = make_trainer(tmp_path, "ckpt", distributed_training=True,
-                           fsdp_size=2, fsdp_min_param_size=TINY)
-    grads = jax.tree.map(jnp.ones_like, trainer.state.params)
-    trainer.state = trainer.state.apply_gradients(grads=grads).apply_ema(0.99)
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
+    trained = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1, log_every=1)
+    restored = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1)
 
-    restored = make_trainer(tmp_path, "ckpt", distributed_training=True, fsdp_size=2,
-                            fsdp_min_param_size=TINY,
-                            load_from_checkpoint=trainer.checkpoint_path())
-    assert int(restored.state.step) == 1
-    for before, after in zip(jax.tree.leaves(trainer.state.params),
-                             jax.tree.leaves(restored.state.params)):
+    assert int(restored.step) == 1
+    for before, after in zip(jax.tree.leaves(trained.params),
+                             jax.tree.leaves(restored.params), strict=True):
         assert before.sharding.spec == after.sharding.spec
-        np.testing.assert_allclose(np.asarray(before), np.asarray(after))
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
-# The last commit before parameters carried logical axes. A checkpoint written
-# by that code has to keep restoring: unboxing before the save is what keeps
-# the leaf names and the on-disk layout out of the annotations' reach.
-PRE_LOGICAL_AXES_REV = "139d241"
+def test_checkpoint_restores_onto_a_different_mesh(tmp_path):
+    """A run saved with FSDP must be resumable on a replicated mesh."""
+    trained = make_trainer(tmp_path, fsdp=2).fit(Data(batches), steps=1, log_every=1)
+    restored = make_trainer(tmp_path, fsdp=1).fit(Data(batches), steps=1)
 
-PRE_LOGICAL_AXES_SAVE = '''
-"""Save a checkpoint with whatever dew is first on sys.path."""
-import sys
-
-import jax
-import numpy as np
-import optax
-
-import dew
-from dew.diffusion.transforms import get_diffusion_preset
-from dew.inputs import DiffusionInputConfig
-from dew.nn.backbones.dit import SimpleDiT
-from dew.training import ObjectiveTrainer
-
-run_dir, params_dump = sys.argv[1:]
-print(dew.__file__)
-schedule, _, transform = get_diffusion_preset("edm")
-trainer = ObjectiveTrainer(
-    model=SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                    mlp_ratio=1),
-    optimizer=optax.adam(1e-3),
-    noise_schedule=schedule,
-    model_output_transform=transform,
-    input_config=DiffusionInputConfig(
-        sample_data_key="image", sample_data_shape=(8, 8, 3), conditions=[]),
-    rngs=jax.random.PRNGKey(0),
-    name="pre-logical-axes",
-    wandb_config=None,
-    distributed_training=True,
-    fsdp_size=2,
-    fsdp_min_param_size=256,
-    checkpoint_base_path=run_dir,
-)
-# Off the initial values, so a restore that quietly re-initialised instead of
-# reading the file would show up as a mismatch rather than as a pass.
-trainer.state = trainer.state.replace(
-    params=jax.tree.map(lambda p: p + 0.25, trainer.state.params))
-trainer.save(epoch=0, step=3)
-trainer.wait_for_checkpoints()
-flat, _ = jax.tree_util.tree_flatten_with_path(trainer.state.params)
-np.savez(params_dump, **{jax.tree_util.keystr(path): np.asarray(value)
-                         for path, value in flat})
-'''
+    assert int(restored.step) == 1
+    for leaf in jax.tree.leaves(restored.params):
+        assert leaf.sharding.spec == P()
+    for before, after in zip(jax.tree.leaves(trained.params),
+                             jax.tree.leaves(restored.params), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
-def test_checkpoint_written_before_logical_axes_still_restores(tmp_path):
-    """Frozen checkpoint layout: the annotations must not reach the file."""
-    repository = Path(__file__).resolve().parents[1]
-    worktree = tmp_path / "pre-logical-axes-worktree"
-    subprocess.run(
-        ["git", "-C", str(repository), "worktree", "add", "--detach", "--quiet",
-         str(worktree), PRE_LOGICAL_AXES_REV],
-        check=True, capture_output=True, text=True)
-    try:
-        script = tmp_path / "save_pre_logical_axes.py"
-        script.write_text(PRE_LOGICAL_AXES_SAVE)
-        saved = subprocess.run(
-            [sys.executable, str(script), str(tmp_path / "run"),
-             str(tmp_path / "params.npz")],
-            check=True, capture_output=True, text=True, cwd=str(worktree),
-            env={**os.environ, "PYTHONPATH": str(worktree / "src"),
-                 "JAX_PLATFORMS": "cpu"})
-    finally:
-        subprocess.run(
-            ["git", "-C", str(repository), "worktree", "remove", "--force",
-             str(worktree)], capture_output=True, text=True)
+@pytest.mark.parametrize("written,restored", [(1, 8), (8, 1)])
+def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, restored):
+    """A run resumes on the hardware it gets, not the hardware it left.
 
-    # Without this the test could quietly compare this code against itself.
-    assert str(worktree) in saved.stdout, saved.stdout
-
-    written = np.load(tmp_path / "params.npz")
-    restored = make_trainer(
-        tmp_path, "pre-logical-axes", distributed_training=True, fsdp_size=2,
-        fsdp_min_param_size=TINY,
-        load_from_checkpoint=str(tmp_path / "run" / "pre-logical-axes"))
-    leaves = {
-        jax.tree_util.keystr(path): np.asarray(value)
-        for path, value in jax.tree_util.tree_flatten_with_path(
-            restored.state.params)[0]}
-
-    assert set(leaves) == set(written.files)
-    for name, value in leaves.items():
-        np.testing.assert_array_equal(value, written[name], err_msg=name)
-
-
-def test_gradient_accumulation_updates_only_on_the_boundary(tmp_path):
-    """MultiSteps must hold the params still until k micro-batches have run.
-
-    Also covers the accumulator surviving the sharding heuristic: its buffers
-    are param-shaped, so they pick up the param specs.
+    Both directions of the widest change the simulated mesh allows: every
+    parameter replicated, and every parameter split eight ways. A checkpoint
+    is bytes rather than arithmetic, so the values have to come back equal.
     """
-    accum = 3
-    trainer = make_trainer(tmp_path, "accum", distributed_training=True, fsdp_size=2,
-                           fsdp_min_param_size=TINY, grad_accum_steps=accum,
-                           optimizer=optax.MultiSteps(optax.sgd(0.5), every_k_schedule=accum))
+    trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
+    before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(trained.params)]
 
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
+    reopened = make_trainer(tmp_path, fsdp=restored).fit(Data(batches), steps=1)
+    assert int(reopened.step) == 1
+    leaves = jax.tree.leaves(reopened.params)
+    for saved, leaf in zip(before, leaves, strict=True):
+        np.testing.assert_array_equal(saved, np.asarray(leaf))
 
-    def snapshot(s):
-        return [np.asarray(x).copy() for x in jax.tree.leaves(s.params)]
-
-    reference = snapshot(state)
-    for micro in range(1, accum * 2 + 1):
-        state, _, _, rng, _ = train_step(state, rng, next(source))
-        moved = any(not np.array_equal(a, b) for a, b in zip(reference, snapshot(state)))
-        at_boundary = micro % accum == 0
-        assert moved == at_boundary, f"micro-step {micro}: moved={moved}"
-        if at_boundary:
-            reference = snapshot(state)
+    sharded = [leaf for leaf in leaves if 'fsdp' in str(leaf.sharding.spec)]
+    assert bool(sharded) == (restored > 1), "the restored layout is not this run's"
+    for leaf in sharded:
+        assert leaf.addressable_shards[0].data.size == leaf.size // restored
 
 
-class DeterministicObjective(Objective):
-    """Squared error against the input, straight through the real model.
-
-    No noise level, no dropout, no unconditional mask: the loss depends only
-    on the parameters and the batch. That is what makes two accumulation
-    regimes comparable - every micro-gradient in a window is identical, which
-    is exactly the "one big batch" an accumulated update stands in for, so a
-    k-accumulated run and a plain run must trace the same parameters.
-    """
-
-    tag = "deterministic"
-
-    def __init__(self, model, input_shapes, decay):
-        self.model = model
-        self.input_shapes = input_shapes
-        self.ema = EMASpec(decay=decay)
-
-    def init_params(self, rng):
-        return self.model.init(
-            rng, **{k: jnp.ones((1, *v)) for k, v in self.input_shapes.items()})
-
-    def loss(self, params, ema_params, batch, rng, step):
-        data = (jnp.asarray(batch["image"], jnp.float32) - 127.5) / 127.5
-        preds = self.model.apply(params, data, jnp.zeros((data.shape[0],), jnp.float32))
-        return jnp.mean((preds - data) ** 2), {}
-
-    def make_validation_step(self, **kwargs):
-        return lambda val_state, batch: None
+def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_path):
+    """A stream without get_state writes no position; a resume from that
+    checkpoint restores the state and reads the stream from its start."""
+    make_trainer(tmp_path).fit(Data(batches), steps=1, log_every=1)
+    _, position = Checkpoints(str(tmp_path)).restore()
+    assert position is None
+    resumed = make_trainer(tmp_path).fit(Data(batches), steps=2, log_every=1)
+    assert int(resumed.step) == 2
 
 
-def make_deterministic_trainer(tmp_path, name, grad_accum_steps, load=None):
-    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
-    input_config = DiffusionInputConfig(
-        sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[])
-    optimizer = optax.sgd(0.5)
-    if grad_accum_steps > 1:
-        optimizer = optax.MultiSteps(optimizer, every_k_schedule=grad_accum_steps)
-    return ObjectiveTrainer(
-        model=model,
-        optimizer=optimizer,
-        input_config=input_config,
+# --------------------------------------------------------------------------
+# Gradient accumulation and the EMA clock
+# --------------------------------------------------------------------------
+
+def make_accumulating(tmp_path=None, accumulation=1):
+    return make_trainer(
+        tmp_path, fsdp=2, optimizer=optax.sgd(0.5), accumulation=accumulation,
         # A ramp rather than a constant, so indexing the schedule by micro-step
         # instead of by update is visible in the result.
-        objective=DeterministicObjective(
-            model, input_config.get_input_shapes(),
-            optax.linear_schedule(0.9, 1.0, transition_steps=8)),
-        rngs=jax.random.PRNGKey(0),
-        name=name,
-        wandb_config=None,
-        distributed_training=True,
-        fsdp_size=2,
-        fsdp_min_param_size=TINY,
-        checkpoint_base_path=str(tmp_path),
-        grad_accum_steps=grad_accum_steps,
-        load_from_checkpoint=load,
-    )
+        objective=DeterministicObjective(optax.linear_schedule(0.9, 1.0, transition_steps=8)))
 
 
-def ema_snapshot(state):
-    return [np.asarray(x).copy() for x in jax.tree.leaves(state.ema_params)]
+def micro_steps(trainer, count, state=None):
+    """`count` micro-steps of the trainer's own step body, on the host."""
+    step = trainer._default_step()
+    state = trainer.initial_state() if state is None else state
+    source = batches()
+    for _ in range(count):
+        state, _, _, _ = step(state, None, next(source))
+    return state
 
 
-def test_ema_moves_only_on_accumulation_boundaries(tmp_path):
+def snapshot(tree):
+    return [np.asarray(x).copy() for x in jax.tree.leaves(tree)]
+
+
+def moved(before, after):
+    return any(not np.array_equal(a, b) for a, b in zip(before, after, strict=True))
+
+
+def test_gradient_accumulation_updates_only_on_the_boundary():
+    """MultiSteps must hold the params still until k micro-batches have run."""
+    accum = 3
+    trainer = make_accumulating(accumulation=accum)
+    state = trainer.initial_state()
+    reference = snapshot(state.params)
+    for micro in range(1, accum * 2 + 1):
+        state = micro_steps(trainer, 1, state)
+        at_boundary = micro % accum == 0
+        assert moved(reference, snapshot(state.params)) == at_boundary, f"micro-step {micro}"
+        if at_boundary:
+            reference = snapshot(state.params)
+
+
+def test_ema_moves_only_on_accumulation_boundaries():
     """The EMA has to run on the optimizer's clock, not the micro-batch's.
 
     Between boundaries MultiSteps holds the params still, so an average taken
@@ -701,54 +667,66 @@ def test_ema_moves_only_on_accumulation_boundaries(tmp_path):
     EMA k times as far per update.
     """
     accum = 4
-    trainer = make_deterministic_trainer(tmp_path, "ema-accum", accum)
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
-
-    reference = ema_snapshot(state)
+    trainer = make_accumulating(accumulation=accum)
+    state = trainer.initial_state()
+    reference = snapshot(state.ema)
     for micro in range(1, accum * 2 + 1):
-        state, _, _, rng, _ = train_step(state, rng, next(source))
-        moved = any(not np.array_equal(a, b)
-                    for a, b in zip(reference, ema_snapshot(state)))
+        state = micro_steps(trainer, 1, state)
         at_boundary = micro % accum == 0
-        assert moved == at_boundary, f"micro-step {micro}: ema moved={moved}"
+        assert moved(reference, snapshot(state.ema)) == at_boundary, f"micro-step {micro}"
         if at_boundary:
-            reference = ema_snapshot(state)
+            reference = snapshot(state.ema)
 
 
-def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts(tmp_path):
+def test_accumulated_ema_matches_a_plain_run_at_equal_update_counts():
     """k micro-batches of the same data must land where one big batch would,
-    EMA included - same params, same decay index, same average."""
+    EMA included: same params, same decay index, same average."""
     accum, updates = 4, 3
-
-    def run(name, k):
-        trainer = make_deterministic_trainer(tmp_path / name, name, k)
-        train_step = trainer._define_train_step(batch_size=BATCH)
-        source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-        state, rng = trainer.state, trainer.rngstate
-        for _ in range(updates * k):
-            state, _, _, rng, _ = train_step(state, rng, next(source))
-        return state
-
-    plain = run("plain", 1)
-    accumulated = run("accumulated", accum)
+    plain = micro_steps(make_accumulating(accumulation=1), updates)
+    accumulated = micro_steps(make_accumulating(accumulation=accum), updates * accum)
 
     # the comparison is only meaningful if the EMA left its starting point
-    assert any(not np.allclose(np.asarray(p), np.asarray(e))
-               for p, e in zip(jax.tree.leaves(plain.params),
-                               jax.tree.leaves(plain.ema_params)))
+    assert moved(snapshot(plain.params), snapshot(plain.ema))
     for a, b in zip(jax.tree.leaves(plain.params), jax.tree.leaves(accumulated.params)):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
-    for a, b in zip(jax.tree.leaves(plain.ema_params),
-                    jax.tree.leaves(accumulated.ema_params)):
+    for a, b in zip(jax.tree.leaves(plain.ema), jax.tree.leaves(accumulated.ema)):
         np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-7)
 
 
-def test_grad_accum_steps_must_be_positive(tmp_path):
-    with pytest.raises(ValueError):
-        make_deterministic_trainer(tmp_path, "bad-accum", 0)
+def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
+    """An accumulated run killed mid-window has to average like one run whole.
 
+    The checkpoint is taken one micro-batch into a window, so it carries the
+    half-filled accumulator, the MultiSteps counters and a step count that is
+    not a multiple of the window. The EMA decay is a ramp indexed by completed
+    updates, so a resume that took the micro-batch counter for the update
+    counter, or started either counter over, moves the average a different
+    distance from where the uninterrupted run put it.
+    """
+    accum, updates = 2, 3
+    total = accum * updates * 2
+    cut = accum * updates + 1
+
+    whole = make_accumulating(tmp_path / "whole", accum).fit(Data(batches), steps=total)
+    interrupted = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=cut)
+    assert int(np.asarray(interrupted.opt_state.mini_step)) == 1, "the cut is not mid-window"
+    resumed = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=total)
+
+    assert int(resumed.step) == int(whole.step) == total
+    assert moved(snapshot(whole.params), snapshot(whole.ema))
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
+                                   rtol=1e-6, atol=1e-7)
+    for expected, actual in zip(jax.tree.leaves(whole.ema),
+                                jax.tree.leaves(resumed.ema), strict=True):
+        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
+                                   rtol=1e-6, atol=1e-7)
+
+
+# --------------------------------------------------------------------------
+# Resuming a grain loader mid-epoch
+# --------------------------------------------------------------------------
 
 def grain_image_loader(num_records=256):
     """A checkpointable source that yields distinguishable image batches."""
@@ -756,155 +734,97 @@ def grain_image_loader(num_records=256):
 
     class ToImage(pygrain.MapTransform):
         def map(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.float32)}
+            return {"image": np.full((RES, RES, 3), index, np.uint8)}
 
-    return pygrain.DataLoader(
+    return iter(pygrain.DataLoader(
         data_source=pygrain.RangeDataSource(0, num_records, 1),
         sampler=pygrain.IndexSampler(num_records=num_records, shuffle=False, seed=0,
                                      num_epochs=4, shard_options=pygrain.NoSharding()),
         operations=[ToImage(), pygrain.Batch(BATCH, drop_remainder=True)],
         worker_count=0,
-    )
+    ))
 
 
-def test_resume_continues_mid_epoch(tmp_path):
+def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     """A resumed run must not replay the batches it already trained on."""
-    steps = 3
-    data = {"train": grain_image_loader, "train_len": BATCH * 64,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
+    data = Data(grain_image_loader, records=BATCH * 64)
+    make_trainer(tmp_path).fit(data, steps=3, log_every=1)
+    _, position = Checkpoints(str(tmp_path)).restore()
+    assert position is not None, "iterator position was never captured"
 
-    trainer = make_trainer(tmp_path, "resume", distributed_training=True)
-    trainer.fit(data, training_steps_per_epoch=steps, epochs=1, val_steps_per_epoch=0)
-    assert trainer.dataset_state is not None, "iterator position was never captured"
-    trainer.wait_for_checkpoints()
+    mesh = build_mesh()
+    resumed = DevicePrefetchIterator(grain_image_loader(), batch_sharding(mesh),
+                                     source_state=position)
+    fresh = DevicePrefetchIterator(grain_image_loader(), batch_sharding(mesh))
+    for _ in range(3):
+        next(fresh)
+    np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
+                                  np.asarray(next(fresh)["image"]))
 
-    resumed = make_trainer(tmp_path, "resume", distributed_training=True,
-                           load_from_checkpoint=trainer.checkpoint_path())
-    assert resumed.dataset_state == trainer.dataset_state
 
-    # The next batch after resuming is the one the first run would have seen next
-    reference = DevicePrefetchIterator(
-        iter(grain_image_loader()), trainer.batch_sharding,
-        source_state=trainer.dataset_state)
-    resumed_iter = DevicePrefetchIterator(
-        iter(grain_image_loader()), resumed.batch_sharding,
-        source_state=resumed.dataset_state)
-    np.testing.assert_array_equal(np.asarray(next(resumed_iter)["image"]),
-                                  np.asarray(next(reference)["image"]))
-
-    # and it is past the batches already consumed
-    fresh = DevicePrefetchIterator(iter(grain_image_loader()), resumed.batch_sharding)
-    first = np.asarray(next(fresh)["image"])
-    assert not np.array_equal(np.asarray(next(resumed_iter)["image"]), first)
-def test_fit_resumes_only_the_unfinished_part_of_an_epoch(tmp_path):
-    data = {"train": grain_image_loader, "train_len": BATCH * 64,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
-    trainer = make_trainer(tmp_path, "resume-partial", distributed_training=True)
-    source = DevicePrefetchIterator(data["train"](), trainer.batch_sharding)
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    _, current_step, state, rng_state = trainer.train_loop(
-        trainer.state, train_step, source, 2, 0, trainer.rngstate)
-    trainer.latest_step = current_step
-    trainer.state, trainer.rngstate = state, rng_state
-    trainer.save(epoch=0, step=current_step)
-    trainer.wait_for_checkpoints()
-
-    resumed = make_trainer(
-        tmp_path, "resume-partial", distributed_training=True,
-        load_from_checkpoint=trainer.checkpoint_path())
-    state = resumed.fit(
-        data, training_steps_per_epoch=6, epochs=1, val_steps_per_epoch=0)
-
+def test_fit_resumes_the_unfinished_part_of_a_run(tmp_path):
+    data = Data(grain_image_loader, records=BATCH * 64)
+    make_trainer(tmp_path).fit(data, steps=2, log_every=1)
+    state = make_trainer(tmp_path).fit(data, steps=6, log_every=1)
     assert int(state.step) == 6
-    assert resumed.latest_step == 6
-
-
-def test_load_tolerates_checkpoints_without_iterator_state(tmp_path):
-    """Checkpoints written before iterator tracking must still restore."""
-    trainer = make_trainer(tmp_path, "legacy", distributed_training=True)
-    assert trainer.dataset_state is None
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
-
-    restored = make_trainer(tmp_path, "legacy", distributed_training=True,
-                            load_from_checkpoint=trainer.checkpoint_path())
-    assert int(restored.state.step) == 0
-    assert restored.dataset_state is None
-
-
-def test_checkpoint_restores_onto_a_different_mesh(tmp_path):
-    """A run saved with FSDP must be resumable on a replicated mesh."""
-    trainer = make_trainer(tmp_path, "mesh", distributed_training=True,
-                           fsdp_size=2, fsdp_min_param_size=TINY)
-    grads = jax.tree.map(jnp.ones_like, trainer.state.params)
-    trainer.state = trainer.state.apply_gradients(grads=grads)
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
-
-    restored = make_trainer(tmp_path, "mesh", distributed_training=True, fsdp_size=1,
-                            load_from_checkpoint=trainer.checkpoint_path())
-    assert int(restored.state.step) == 1
-    for leaf in jax.tree.leaves(restored.state.params):
-        assert leaf.sharding.spec == P()
-    for before, after in zip(jax.tree.leaves(trainer.state.params),
-                             jax.tree.leaves(restored.state.params)):
-        np.testing.assert_allclose(np.asarray(before), np.asarray(after))
+    assert Checkpoints(str(tmp_path)).latest == 6
 
 
 # --------------------------------------------------------------------------
 # The whole run, on a real mesh
 # --------------------------------------------------------------------------
 
-def peak_to_peak_metric(seen):
-    """A real EvaluationMetric over the sampler's artifacts.
+class PeakToPeak:
+    """A real metric over the objective's artifacts.
 
     Deliberately not CLIP or FID: those download pretrained weights. What is
-    under test is the metric plumbing (artifacts in, score out, best tracked,
-    logged), which is identical whatever the score means.
+    under test is the metric plumbing (artifacts in, score out, logged),
+    which is identical whatever the score means.
     """
-    def peak_to_peak(generated, batch):
-        seen.append((np.asarray(generated).shape,
-                     None if batch is None else np.asarray(batch["image"]).shape))
-        return jnp.max(generated) - jnp.min(generated)
+    name = "sample_range"
+    reads = Representations
 
-    return EvaluationMetric(function=peak_to_peak, name="sample_range")
+    def __init__(self, seen):
+        self.seen = seen
+
+    def __call__(self, artifact, batch):
+        self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["image"]).shape))
+        return float(jnp.max(artifact.features) - jnp.min(artifact.features))
+
+    def reduce(self, values):
+        return float(np.mean(values))
+
+
+def val_stream():
+    source = batches()
+    for _ in range(2):
+        yield next(source)
 
 
 @pytest.mark.parametrize("fsdp_size", [1, 4])
 def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     """A full run on the simulated 8-device mesh: training, the validation
-    loop with its sampler, an evaluation metric, and the final checkpoint.
+    pass, a metric, the tracker, and the final checkpoint.
 
     Parametrized over pure data parallelism and a 2x4 data/fsdp mesh, because
-    validation samples from the *sharded* EMA parameters - a layout the
-    training step alone never exercises.
+    validation reads the *sharded* EMA parameters, a layout the training step
+    alone never exercises.
     """
     seen = []
-    trainer = make_trainer(tmp_path, f"e2e-fsdp{fsdp_size}", distributed_training=True,
-                           fsdp_size=fsdp_size, fsdp_min_param_size=TINY,
-                           eval_metrics=[peak_to_peak_metric(seen)])
-    assert trainer.mesh.shape["data"] == jax.device_count() // fsdp_size
-    assert trainer.mesh.shape["fsdp"] == fsdp_size
-    sharded = [x for x in jax.tree.leaves(trainer.state.ema_params)
-               if 'fsdp' in str(x.sharding.spec)]
-    assert bool(sharded) == (fsdp_size > 1)
-    # 200 sampler steps per validation batch is the production default and pure
-    # overhead here; the loop is what is under test, not the sample quality.
-    trainer.objective.diffusion_steps = 4
-
-    data = {"train": batches, "val": batches, "train_len": BATCH * 8,
-            "local_batch_size": BATCH, "global_batch_size": BATCH}
-    state = trainer.fit(data, training_steps_per_epoch=2, epochs=1, val_steps_per_epoch=1)
+    tracker = RecordingTracker()
+    trainer = make_trainer(tmp_path, fsdp=fsdp_size, tracker=tracker)
+    state = trainer.fit(Data(batches, val=val_stream), steps=2, log_every=1, eval_every=1,
+                        metrics=(PeakToPeak(seen),))
 
     assert int(state.step) == 2
-    # the sanity validation before training, then one after the epoch
-    assert seen == [((4, RES, RES, 3), (BATCH, RES, RES, 3))] * 2
-
-    score = trainer.best_val_metrics["val/sample_range"]
-    assert np.isfinite(score) and score > 0
-
-    trainer.wait_for_checkpoints()
-    assert trainer.checkpointer.latest_step() == 2
+    sharded = [x for x in jax.tree.leaves(state.ema) if 'fsdp' in str(x.sharding.spec)]
+    assert bool(sharded) == (fsdp_size > 1)
+    # A pass after step 1 and one at the end, two batches each.
+    assert seen == [((BATCH, 3), (BATCH, RES, RES, 3))] * 4
+    scores = [s["val/sample_range"] for _, s in tracker.scalars if "val/sample_range" in s]
+    assert len(scores) == 2 and all(np.isfinite(score) and score > 0 for score in scores)
+    assert [step for step, _ in tracker.artifacts] == [1, 2]
+    assert Checkpoints(str(tmp_path)).latest == 2
 
 
 # --------------------------------------------------------------------------
@@ -913,12 +833,10 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
 
 def muon_state_specs(variables, rules):
     """Params and the moments of both optimizer groups, on a two-way mesh."""
-    solver = build_optimizer(
-        OptimConfig(optimizer="muon", learning_rate=1e-3), steps_per_epoch=10)
+    solver = OPTIMIZER_MAP["muon"](1e-3)
     opt_state = jax.eval_shape(solver.init, variables)
-    shardings = state_sharding_tree(
-        build_mesh(fsdp_size=2), (variables, opt_state), min_shard_size=1,
-        logical_axis_rules=rules)
+    shardings = Layout(rules=rules, min_shard=1).shardings(
+        build_mesh(MeshSpec(fsdp=2)), (variables, opt_state))
     return jax.tree.map(lambda sharding: sharding.spec, shardings)
 
 
@@ -974,6 +892,8 @@ def test_muon_group_moments_take_the_spec_their_parameter_declared():
     assert len(embedding[1]) == 2 and embedding[0] == P()
     assert len(kernel[1]) == 1 and kernel[0] == P("fsdp")
 
+
+# --------------------------------------------------------------------------
 # Sharding invariants at every fsdp width
 # --------------------------------------------------------------------------
 
@@ -1009,20 +929,20 @@ def single_head_variables(num_heads=1):
 def test_a_single_head_model_shards_a_dimension_it_can_split(fsdp_size):
     """One head makes the heads dimension 1, which shards nothing.
 
-    The DiT's attention kernels are (embed, heads, head_dim) and the table
-    names all three, so the rules have to leave the single head alone and
-    shard a dimension that exists. Every model in the suite has two heads,
-    where a spec naming the heads axis happens to work.
+    The DiT's attention kernels are (embed, heads, head_dim) and the
+    declaration names all three, so the rules have to leave the single head
+    alone and shard a dimension that exists. Every model in the suite has two
+    heads, where a spec naming the heads axis happens to work.
     """
     variables = single_head_variables()
-    mesh = build_mesh(fsdp_size=fsdp_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    layout = Layout(min_shard=TINY)
+    shardings = layout.shardings(mesh, variables)
     attention = shardings["params"]["dit_block_0"]["attention"]
 
     assert attention["to_q"]["kernel"].spec == P("fsdp")
     assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
-    assert_params_sufficiently_sharded(
-        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+    layout.check(variables["params"], shardings["params"], mesh)
 
 
 class OneLongVector(nn.Module):
@@ -1040,19 +960,19 @@ class OneLongVector(nn.Module):
 def test_a_one_dimensional_parameter_shards_on_its_only_axis(fsdp_size):
     """A vector has one axis to give, and giving it is not optional.
 
-    Every declared parameter in the table is a matrix or a stack of them, so
-    a 1-D parameter falls to the shape heuristic. Leaving it replicated
-    because it has no second dimension would put the whole model on every
-    device and pass every other sharding test here.
+    Every declared parameter is a matrix or a stack of them, so a 1-D
+    parameter falls to the shape heuristic. Leaving it replicated because it
+    has no second dimension would put the whole model on every device and
+    pass every other sharding test here.
     """
     variables = jax.eval_shape(
         OneLongVector().init, jax.random.key(0), jnp.ones((1, 4)))
-    mesh = build_mesh(fsdp_size=fsdp_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    layout = Layout(min_shard=TINY)
+    shardings = layout.shardings(mesh, variables)
 
     assert shardings["params"]["scale"].spec == P("fsdp")
-    assert_params_sufficiently_sharded(
-        variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+    layout.check(variables["params"], shardings["params"], mesh)
 
 
 @pytest.mark.slow
@@ -1071,148 +991,17 @@ def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it
         mlp_ratio=2, max_seq_len=8)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    mesh = build_mesh(fsdp_size=fsdp_size)
-    shardings = state_sharding_tree(mesh, variables, min_shard_size=TINY)
+    mesh = build_mesh(MeshSpec(fsdp=fsdp_size))
+    layout = Layout(min_shard=TINY)
+    shardings = layout.shardings(mesh, variables)
 
     # Whatever the rules could not place, they left alone rather than named.
     assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
 
     if not replicated_fraction:
-        assert_params_sufficiently_sharded(
-            variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+        layout.check(variables["params"], shardings["params"], mesh)
         return
     with pytest.raises(ValueError) as error:
-        assert_params_sufficiently_sharded(
-            variables["params"], shardings["params"], mesh, min_shard_size=TINY)
+        layout.check(variables["params"], shardings["params"], mesh)
     reported = float(str(error.value).split("%")[0]) / 100
     assert abs(reported - replicated_fraction) < 0.01, str(error.value)
-
-
-# --------------------------------------------------------------------------
-# Restoring into a differently shaped run
-# --------------------------------------------------------------------------
-
-def optimizer_for(optimizer="adam", grad_accum_steps=1):
-    """The optimizer a run's config builds, which is what it resumes into."""
-    return build_optimizer(
-        OptimConfig(optimizer=optimizer, learning_rate=1e-3,
-                    grad_accum_steps=grad_accum_steps),
-        steps_per_epoch=1)
-
-
-@pytest.mark.parametrize("written,restored", [(1, 8), (8, 1)])
-def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, restored):
-    """A run resumes on the hardware it gets, not the hardware it left.
-
-    Both directions of the widest change the simulated mesh allows: every
-    parameter replicated, and every parameter split eight ways. A checkpoint
-    is bytes rather than arithmetic, so the values have to come back equal.
-    """
-    trainer = make_trainer(tmp_path, "range", distributed_training=True,
-                           fsdp_size=written, fsdp_min_param_size=TINY)
-    grads = jax.tree.map(jnp.ones_like, trainer.state.params)
-    trainer.state = trainer.state.apply_gradients(grads=grads)
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
-    before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(trainer.state.params)]
-
-    reopened = make_trainer(tmp_path, "range", distributed_training=True,
-                            fsdp_size=restored, fsdp_min_param_size=TINY,
-                            load_from_checkpoint=trainer.checkpoint_path())
-    assert int(reopened.state.step) == 1
-    leaves = jax.tree.leaves(reopened.state.params)
-    for saved, leaf in zip(before, leaves, strict=True):
-        np.testing.assert_array_equal(saved, np.asarray(leaf))
-
-    sharded = [leaf for leaf in leaves if 'fsdp' in str(leaf.sharding.spec)]
-    assert bool(sharded) == (restored > 1), "the restored layout is not this run's"
-    for leaf in sharded:
-        assert leaf.addressable_shards[0].data.size == leaf.size // restored
-
-
-@pytest.mark.parametrize("written,resumed", [
-    (dict(optimizer="adam"), dict(optimizer="muon")),
-    (dict(optimizer="adam", grad_accum_steps=2), dict(optimizer="adam")),
-], ids=["optimizer", "accumulation"])
-def test_a_checkpoint_the_run_cannot_hold_is_refused_with_what_to_do(
-        tmp_path, written, resumed):
-    """Swapping the solver or the accumulation has to be a message, not a crash.
-
-    The optimizer state is part of what a checkpoint carries, and MultiSteps
-    adds counters and an accumulator around it, so neither swap can be
-    restored. Orbax says so from inside its own tree walk, as a key path and a
-    pair of container types; the run has to say which part of the state does
-    not fit and what to do instead.
-    """
-    trainer = make_trainer(
-        tmp_path, "swap", distributed_training=True,
-        optimizer=optimizer_for(**written),
-        grad_accum_steps=written.get("grad_accum_steps", 1))
-    trainer.save(epoch=0, step=1)
-    trainer.wait_for_checkpoints()
-
-    with pytest.raises(ValueError) as error:
-        make_trainer(tmp_path, "swap", distributed_training=True,
-                     optimizer=optimizer_for(**resumed),
-                     grad_accum_steps=resumed.get("grad_accum_steps", 1),
-                     load_from_checkpoint=trainer.checkpoint_path())
-
-    message = str(error.value)
-    assert "does not fit this run's train state" in message
-    assert "opt_state" in message, "the message does not say which part"
-    assert "optimizer" in message and "gradient accumulation" in message
-    assert trainer.checkpoint_path() in message
-
-
-def run_micro_steps(trainer, micro_steps):
-    """`micro_steps` real steps, whatever the accumulation window is."""
-    train_step = trainer._define_train_step(batch_size=BATCH)
-    source = DevicePrefetchIterator(batches(), trainer.batch_sharding)
-    state, rng = trainer.state, trainer.rngstate
-    for _ in range(micro_steps):
-        state, _, _, rng, _ = train_step(state, rng, next(source))
-    return state, rng
-
-
-def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
-    """An accumulated run killed mid-window has to average like one run whole.
-
-    The checkpoint is taken one micro-batch into a window, so it carries the
-    half-filled accumulator, the MultiSteps counters and a step count that is
-    not a multiple of the window. The EMA decay is a ramp indexed by completed
-    updates, so a resume that took the micro-batch counter for the update
-    counter, or started either counter over, moves the average a different
-    distance from where the uninterrupted run put it.
-    """
-    accum, updates = 2, 3
-    total = accum * updates * 2
-    cut = accum * updates + 1
-
-    whole, _ = run_micro_steps(
-        make_deterministic_trainer(tmp_path / "whole", "whole", accum), total)
-
-    interrupted = make_deterministic_trainer(tmp_path / "split", "split", accum)
-    state, rng = run_micro_steps(interrupted, cut)
-    assert int(np.asarray(state.opt_state.mini_step)) == 1, "the cut is not mid-window"
-    interrupted.state, interrupted.rngstate = state, rng
-    interrupted.save(epoch=0, step=cut)
-    interrupted.wait_for_checkpoints()
-
-    resumed, _ = run_micro_steps(
-        make_deterministic_trainer(tmp_path / "split", "split", accum,
-                                   load=interrupted.checkpoint_path()),
-        total - cut)
-
-    assert int(resumed.step) == int(whole.step) == total
-    # The comparison only means something if the average left its start
-    assert any(not np.allclose(np.asarray(param), np.asarray(ema))
-               for param, ema in zip(jax.tree.leaves(whole.params),
-                                     jax.tree.leaves(whole.ema_params)))
-    for expected, actual in zip(jax.tree.leaves(whole.params),
-                                jax.tree.leaves(resumed.params), strict=True):
-        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
-                                   rtol=1e-6, atol=1e-7)
-    for expected, actual in zip(jax.tree.leaves(whole.ema_params),
-                                jax.tree.leaves(resumed.ema_params), strict=True):
-        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual),
-                                   rtol=1e-6, atol=1e-7)

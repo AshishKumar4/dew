@@ -8,6 +8,7 @@ import json
 import math
 import queue
 import threading
+from collections.abc import Mapping
 from typing import Iterator, Optional, TypeAlias
 
 import jax
@@ -151,7 +152,7 @@ class Layout:
     is the fraction of shardable parameter elements a layout may leave
     replicated before `check` refuses it.
     """
-    rules: LogicalAxisRules = DEFAULT_RULES
+    rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
 
@@ -159,10 +160,12 @@ class Layout:
         if not 0.0 <= self.tolerance <= 1.0:
             raise ValueError(
                 f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
-        # Rules arrive as lists from a JSON record; the table is tuples.
+        # Rules are written as a mapping or arrive as lists from a JSON
+        # record; the table is a tuple of pairs, in precedence order.
+        items = self.rules.items() if isinstance(self.rules, Mapping) else self.rules
         object.__setattr__(self, "rules", tuple(
             (name, axes if axes is None or isinstance(axes, str) else tuple(axes))
-            for name, axes in self.rules))
+            for name, axes in items))
 
     def _rules_for(self, mesh: Mesh) -> LogicalAxisRules:
         normalized = []
