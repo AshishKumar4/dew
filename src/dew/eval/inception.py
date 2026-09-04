@@ -9,7 +9,6 @@ import flax
 from flax.linen.module import merge_param
 import flax.linen as nn
 from typing import Callable, Optional, Sequence, Tuple, Union, Any
-import pickle
 from . import utils
 
 PRNGKey = Any
@@ -44,7 +43,7 @@ class InceptionV3(nn.Module):
     def setup(self):
         if self.pretrained:
             ckpt_file = utils.download(self.ckpt_path)
-            self.params_dict = pickle.load(open(ckpt_file, 'rb'))
+            self.params_dict = utils.load_arrays(ckpt_file)
             self.num_classes_ = 1000
         else:
             self.params_dict = None

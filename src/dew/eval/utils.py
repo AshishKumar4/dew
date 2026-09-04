@@ -5,6 +5,7 @@ import jax
 import flax
 import numpy as np
 from tqdm import tqdm
+import pickle
 import requests
 import os
 import tempfile
@@ -41,6 +42,37 @@ def download(url, ckpt_dir=None):
             # if download was successful, rename the temp file
             os.rename(ckpt_file_temp, ckpt_file)
     return ckpt_file
+
+
+# What a pickle of numpy arrays needs to rebuild them, and nothing else. The
+# FID weights were written under numpy 1, where these lived under
+# `numpy.core`; numpy 2 keeps that path alive only as a shim that warns on
+# every attribute read, so a legacy name is resolved at its current home
+# instead. Anything outside this set is refused rather than imported, so a
+# downloaded pickle cannot run code.
+_ARRAY_GLOBALS = {
+    ('numpy', 'dtype'),
+    ('numpy', 'ndarray'),
+    ('numpy._core.multiarray', '_reconstruct'),
+    ('numpy._core.numeric', '_frombuffer'),
+}
+
+
+class _ArrayUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        current = ('numpy._core.' + module[len('numpy.core.'):]
+                   if module.startswith('numpy.core.') else module)
+        if (current, name) not in _ARRAY_GLOBALS:
+            raise pickle.UnpicklingError(
+                f"the weights file asks for {module}.{name}, which is not one of the "
+                "numpy array constructors this loader allows")
+        return super().find_class(current, name)
+
+
+def load_arrays(path):
+    """The nested dict of arrays in a numpy-only pickle at `path`."""
+    with open(path, 'rb') as handle:
+        return _ArrayUnpickler(handle).load()
 
 
 def get(dictionary, key):
