@@ -24,10 +24,9 @@ from .objective import DiffusionObjective
 import dew.eval  # noqa: F401  registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
 
-ATTENTION = {
-    "heads": 8, "use_projection": False,
-    "use_self_and_cross": True, "only_pure_attention": True,
-}
+# Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
+# a stage that names one restates it.
+ATTENTION = {"heads": 8}
 
 # Architectures that run the text as a second stream through every block's
 # joint attention: with no text there is no sequence to project, so an
@@ -59,9 +58,16 @@ class TextCondition:
     max_length: Optional[int] = None
     """Tokens every prompt is padded to; None keeps the encoder's own
     default, which for CLIP is the checkpoint's context length."""
+    revision: Optional[str] = None
+    """The checkpoint's git revision. Both text loaders take one and the
+    autoencoder's spec has always named one; a text tower could not be
+    pinned from a run, so a moved branch changed what a rerun conditioned
+    on."""
 
     def build(self) -> Condition:
-        fields = {} if self.max_length is None else {"max_length": self.max_length}
+        fields = {name: value for name, value in
+                  (("max_length", self.max_length), ("revision", self.revision))
+                  if value is not None}
         return Condition(
             encoders[self.encoder].from_pretrained(self.checkpoint, dtype=self.dtype, **fields),
             field=self.field, unconditional=self.unconditional)
@@ -97,9 +103,10 @@ class DiffusionRunConfig(RunConfig):
     """The convention the model is trained and sampled with."""
     sampler: samplers.union = dataclasses.field(default_factory=samplers.EulerAncestral)
     """The solver validation samples with."""
-    guidance: float = 3.0
-    """Classifier-free guidance scale for validation samples; 0 samples the
-    conditional prediction alone."""
+    guidance: Optional[CFG] = dataclasses.field(default_factory=lambda: CFG(3.0))
+    """How validation samples are guided; None samples the conditional
+    prediction alone. It was a bare scale whose 0 stood for "off", which left
+    `CFG.interval`, the window guidance is applied in, unnameable from a run."""
     sampling_steps: int = 200
     unconditional_prob: float = 0.12
     """Fraction of training examples whose condition is dropped."""
@@ -158,7 +165,7 @@ class DiffusionRunConfig(RunConfig):
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
             sampler=self.sampler,
-            guidance=CFG(self.guidance) if self.guidance else None,
+            guidance=self.guidance,
             steps=self.sampling_steps,
         )
 

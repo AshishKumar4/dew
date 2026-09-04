@@ -13,11 +13,11 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from functools import partial
 
 from ..blocks import ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
-from ..attention import TransformerBlock
+from ..attention import Stage, TransformerBlock
 from ..vit import RotaryEmbedding, RoPEAttention
 from dew.registry import models
 from ..sharding import logical_axes
@@ -74,21 +74,23 @@ class UNet3D(nn.Module):
     output_channels:int=3
     emb_features:int=64*4
     feature_depths:list=(64, 128, 256, 512)
-    attention_configs:list=({"heads":8}, {"heads":8}, {"heads":8}, {"heads":8})
+    attention_configs: Sequence[Optional[Stage]] = (
+        Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
+    """Attention per resolution stage, one entry per feature depth; None is a
+    stage with no attention."""
     num_res_blocks:int=2
     num_middle_res_blocks:int=1
     activation:Callable = jax.nn.swish
     norm_groups:int=8
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
-    named_norms: bool = False
     attention_impl: Optional[str] = None
     temporal_heads: int = 8
 
     def setup(self):
         if self.norm_groups > 0:
             norm = partial(nn.GroupNorm, self.norm_groups)
-            self.conv_out_norm = norm(name="GroupNorm_0") if self.named_norms else norm()
+            self.conv_out_norm = norm()
         else:
             norm = partial(nn.RMSNorm, 1e-5)
             self.conv_out_norm = norm()
@@ -133,18 +135,19 @@ class UNet3D(nn.Module):
                     norm_groups=self.norm_groups,
                     dtype=self.dtype,
                     precision=self.precision,
-                    named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:
-                    x = TransformerBlock(heads=attention_config['heads'], dtype=attention_config.get('dtype', jnp.float32), attention_impl=self.attention_impl,
-                                        dim_head=dim_in // attention_config['heads'],
-                                        use_projection=attention_config.get("use_projection", False),
-                                        use_self_and_cross=attention_config.get("use_self_and_cross", True),
-                                        precision=attention_config.get("precision", self.precision),
-                                        only_pure_attention=attention_config.get("only_pure_attention", True),
-                                        force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
-                                        norm_inputs=attention_config.get("norm_inputs", True),
-                                        explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
+                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
+                                        dim_head=dim_in // attention_config.heads,
+                                        use_projection=attention_config.use_projection,
+                                        use_self_and_cross=attention_config.use_self_and_cross,
+                                        precision=attention_config.precision or self.precision,
+                                        only_pure_attention=attention_config.only_pure_attention,
+                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
+                                        norm_inputs=attention_config.norm_inputs,
+                                        explicitly_add_residual=attention_config.explicitly_add_residual,
+                                        use_linear_attention=attention_config.use_linear_attention,
+                                        norm_epsilon=attention_config.norm_epsilon,
                                         name=f"down_{i}_attention_{j}")(x, textcontext)
                 downs.append(x)
             x = TemporalBlock(
@@ -178,19 +181,19 @@ class UNet3D(nn.Module):
                 norm_groups=self.norm_groups,
                 dtype=self.dtype,
                 precision=self.precision,
-                named_norms=self.named_norms
             )(x, temb)
             if middle_attention is not None and j == self.num_middle_res_blocks - 1:
-                x = TransformerBlock(heads=middle_attention['heads'], dtype=middle_attention.get('dtype', jnp.float32), attention_impl=self.attention_impl,
-                                    dim_head=middle_dim_out // middle_attention['heads'],
-                                    use_linear_attention=False,
-                                    use_projection=middle_attention.get("use_projection", False),
+                x = TransformerBlock(heads=middle_attention.heads, dtype=middle_attention.dtype, attention_impl=self.attention_impl,
+                                    dim_head=middle_dim_out // middle_attention.heads,
+                                    use_projection=middle_attention.use_projection,
                                     use_self_and_cross=False,
-                                    precision=middle_attention.get("precision", self.precision),
-                                    only_pure_attention=middle_attention.get("only_pure_attention", True),
-                                    force_fp32_for_softmax=middle_attention.get("force_fp32_for_softmax", False),
-                                    norm_inputs=middle_attention.get("norm_inputs", True),
-                                    explicitly_add_residual=middle_attention.get("explicitly_add_residual", True),
+                                    precision=middle_attention.precision or self.precision,
+                                    only_pure_attention=middle_attention.only_pure_attention,
+                                    force_fp32_for_softmax=middle_attention.force_fp32_for_softmax,
+                                    norm_inputs=middle_attention.norm_inputs,
+                                    explicitly_add_residual=middle_attention.explicitly_add_residual,
+                                    use_linear_attention=middle_attention.use_linear_attention,
+                                    norm_epsilon=middle_attention.norm_epsilon,
                                     name=f"middle_attention_{j}")(x, textcontext)
             x = TemporalBlock(
                 features=x.shape[-1],
@@ -209,7 +212,6 @@ class UNet3D(nn.Module):
                 norm_groups=self.norm_groups,
                 dtype=self.dtype,
                 precision=self.precision,
-                named_norms=self.named_norms
             )(x, temb)
 
         # Upscaling Blocks
@@ -227,18 +229,19 @@ class UNet3D(nn.Module):
                     norm_groups=self.norm_groups,
                     dtype=self.dtype,
                     precision=self.precision,
-                    named_norms=self.named_norms
                 )(x, temb)
                 if attention_config is not None and j == self.num_res_blocks - 1:
-                    x = TransformerBlock(heads=attention_config['heads'], dtype=attention_config.get('dtype', jnp.float32), attention_impl=self.attention_impl,
-                                        dim_head=dim_out // attention_config['heads'],
-                                        use_projection=attention_config.get("use_projection", False),
-                                        use_self_and_cross=attention_config.get("use_self_and_cross", True),
-                                        precision=attention_config.get("precision", self.precision),
-                                        only_pure_attention=attention_config.get("only_pure_attention", True),
-                                        force_fp32_for_softmax=attention_config.get("force_fp32_for_softmax", False),
-                                        norm_inputs=attention_config.get("norm_inputs", True),
-                                        explicitly_add_residual=attention_config.get("explicitly_add_residual", True),
+                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
+                                        dim_head=dim_out // attention_config.heads,
+                                        use_projection=attention_config.use_projection,
+                                        use_self_and_cross=attention_config.use_self_and_cross,
+                                        precision=attention_config.precision or self.precision,
+                                        only_pure_attention=attention_config.only_pure_attention,
+                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
+                                        norm_inputs=attention_config.norm_inputs,
+                                        explicitly_add_residual=attention_config.explicitly_add_residual,
+                                        use_linear_attention=attention_config.use_linear_attention,
+                                        norm_epsilon=attention_config.norm_epsilon,
                                         name=f"up_{i}_attention_{j}")(x, textcontext)
             x = TemporalBlock(
                 features=x.shape[-1],
@@ -278,7 +281,6 @@ class UNet3D(nn.Module):
             norm_groups=self.norm_groups,
             dtype=self.dtype,
             precision=self.precision,
-            named_norms=self.named_norms
         )(x, temb)
 
         x = self.conv_out_norm(x)

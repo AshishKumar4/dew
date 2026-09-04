@@ -216,9 +216,14 @@ def with_precision(name: str, config: Mapping[str, Any], *,
     """A model config with the run's compute dtype and attention kernel in it.
 
     Params stay float32 whatever `dtype` says; it is the compute dtype. The
-    UNets keep per-stage attention settings in nested `attention_configs`,
-    which do not inherit the model dtype and default `force_fp32_for_softmax`
-    off, which no fused kernel can honour, so the knobs reach into them.
+    UNets keep per-stage attention settings in `attention_configs`, which do
+    not inherit the model dtype and default `force_fp32_for_softmax` off,
+    which no fused kernel can honour, so the knobs reach into them.
+
+    A stage arrives either way: as a record, whose `dtype` name `build`
+    resolves at the boundary with every other field, or as a built `Stage`,
+    which nothing resolves afterwards, so its dtype is resolved here. The two
+    agree once built, which `tests/test_models.py` asserts.
     """
     duplicate = sorted(set(config) & {"dtype", "attention_impl"})
     if duplicate:
@@ -233,6 +238,9 @@ def with_precision(name: str, config: Mapping[str, Any], *,
         fields["attention_configs"] = [
             None if stage is None
             else {**stage, "dtype": dtype, "force_fp32_for_softmax": True}
+            if isinstance(stage, Mapping)
+            else dataclasses.replace(stage, dtype=resolve_dtype(dtype),
+                                     force_fp32_for_softmax=True)
             for stage in config.get("attention_configs", stages.default)]
     return fields
 
