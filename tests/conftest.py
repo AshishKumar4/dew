@@ -17,6 +17,19 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.telemetry.instrumentation import (
+    default_compilation_cache_dir, enable_compilation_cache,
+)
+
+# The suite compiles the same kernels every run, on both lanes, in every xdist
+# worker. XLA's persistent cache is keyed by the executable, so a second run
+# reuses the first one's compilations. DEW_TEST_NO_CACHE=1 measures the cold
+# cost, which is what the numbers in docs/performance.md were taken with.
+if not os.environ.get("DEW_TEST_NO_CACHE"):
+    _cache = default_compilation_cache_dir()
+    if _cache:
+        enable_compilation_cache(_cache)
+
 
 @pytest.fixture
 def rng():

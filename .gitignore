@@ -31,3 +31,4 @@ NEWREPO.md
 .worktrees/
 tutorials/executed/
 samples/
+.pytest_cache/
