@@ -11,19 +11,22 @@ The last three tests are the mutations. Each drops or reverses one term in the
 module's real source, compiles it, and asserts that exactly one of the three
 checks goes red, which is the evidence that each term has a test behind it.
 
-Tolerances and the largest differences observed against verl, fp32 on CPU:
+Tolerances and the largest differences observed against verl, fp32:
 
-| quantity | tolerance | observed |
-| --- | --- | --- |
-| clipped loss | 1e-7 | 4.5e-08 |
-| clipped loss gradient | 1e-7 | 0.0 |
-| pg_clipfrac, pg_clipfrac_lower | 1e-7 | 0.0 |
-| ppo_kl | 1e-7 | 7.5e-09 |
-| GSPO loss | 1e-7 | 1.5e-08 |
-| GSPO loss gradient | 1e-7 | 0.0 |
-| k3 KL, its penalty and its gradient | 1e-7 | 0.0 |
-| token-mean aggregation | 1e-7 | 0.0 |
+| quantity | tolerance | observed on CPU | observed on an RTX 4080 |
+| --- | --- | --- | --- |
+| clipped loss | 1e-6 | 4.5e-08 | 4.5e-08 |
+| clipped loss gradient | 1e-6 | 0.0 | 0.0 |
+| pg_clipfrac, pg_clipfrac_lower | 1e-6 | 0.0 | 0.0 |
+| ppo_kl | 1e-6 | 7.5e-09 | 7.5e-09 |
+| GSPO loss | 1e-6 | 1.5e-08 | 1.5e-08 |
+| GSPO loss gradient | 1e-6 | 0.0 | 0.0 |
+| k3 KL, its penalty and its gradient | 1e-6 | 0.0 | 1.2e-07 |
+| token-mean aggregation | 1e-6 | 0.0 | 0.0 |
 
+The tolerance is ten fp32 ulps at 1.0. The earlier 1e-7 was one ulp, which
+the GPU's summation order crossed on the k3 KL (1.19e-07) with the code
+unchanged; a bound that tight asserts the CPU's rounding, not the maths.
 The k3 KL agrees with Tunix's JAX estimator to 0.0 as well. The two losses
 differ in the last fp32 digit because torch sums the token matrix in a
 different order.
@@ -44,7 +47,7 @@ from dew.rl import surrogate
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "surrogate.npz"
 GENERATOR = Path(__file__).resolve().parents[1] / "tools" / "parity_rl.py"
 REFERENCE = dict(np.load(FIXTURE))
-TOLERANCE = 1e-7
+TOLERANCE = 1e-6
 
 LOG_PROBS = jnp.asarray(REFERENCE["log_probs"])
 OLD_LOG_PROBS = jnp.asarray(REFERENCE["old_log_probs"])

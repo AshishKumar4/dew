@@ -192,20 +192,39 @@ def test_video_dit_forward(rng):
     assert jnp.all(jnp.isfinite(out))
 
 
+def open_the_gates(params, key, scale=0.5):
+    """A DiT at init is adaLN-Zero gated with a zero output head, so its
+    output barely depends on its input: adding 1.0 to a whole frame moves that
+    frame's own prediction by 5e-7. A test of information flow has to open the
+    gates and the head first, and only those. The head follows a LayerNorm,
+    whose output sums to zero over features, so its kernel is set to random
+    values rather than a constant, which would cancel to nothing."""
+    def open_(path, value):
+        name = jax.tree_util.keystr(path)
+        if "ada_proj" in name and "kernel" in name:
+            return value + scale
+        if "final_proj" in name and "kernel" in name:
+            return scale * jax.random.normal(key, value.shape, value.dtype)
+        return value
+    return jax.tree_util.tree_map_with_path(open_, params)
+
+
 def test_video_dit_temporal_mixing(rng):
     """Temporal blocks must actually mix across frames: perturbing frame 0
-    must change the prediction for frame 2."""
+    must change the prediction for frame 2, by an amount comparable to what
+    it does to frame 0 itself, which is a ratio no summation order moves."""
     from dew.nn.backbones.video_dit import VideoDiT
     model = VideoDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x = jax.random.normal(rng, (1, 3, 16, 16, 3))
     temb = jnp.ones((1,))
-    params = model.init(rng, x, temb, None)
-    params = jax.tree.map(lambda p: p + 0.02, params)
+    params = open_the_gates(model.init(rng, x, temb, None), rng)
 
     out_a = model.apply(params, x, temb, None)
-    x_perturbed = x.at[:, 0].add(1.0)
-    out_b = model.apply(params, x_perturbed, temb, None)
-    assert not jnp.allclose(out_a[:, 2], out_b[:, 2]), "no information flow across frames"
+    out_b = model.apply(params, x.at[:, 0].add(1.0), temb, None)
+    same_frame = jnp.max(jnp.abs(out_a[:, 0] - out_b[:, 0]))
+    other_frame = jnp.max(jnp.abs(out_a[:, 2] - out_b[:, 2]))
+    assert same_frame > 1e-2, "the perturbation did not reach the model"
+    assert other_frame > 1e-3 * same_frame, "no information flow across frames"
 
 
 def test_unet3d_inflation_reproduces_2d_unet(rng):
@@ -255,7 +274,9 @@ def test_unet3d_temporal_mixing_after_training_signal(rng):
 
     out_a = model.apply(params, x, temb, textcontext)
     out_b = model.apply(params, x.at[:, 0].add(1.0), temb, textcontext)
-    assert not jnp.allclose(out_a[:, 2], out_b[:, 2]), "no information flow across frames"
+    same_frame = jnp.max(jnp.abs(out_a[:, 0] - out_b[:, 0]))
+    other_frame = jnp.max(jnp.abs(out_a[:, 2] - out_b[:, 2]))
+    assert other_frame > 1e-3 * same_frame, "no information flow across frames"
 
 
 def test_non_symmetric_attention_configs_init(rng):
