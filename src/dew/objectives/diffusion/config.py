@@ -56,10 +56,15 @@ class TextCondition:
     """The batch field holding the tokenized text."""
     unconditional: str = ""
     """The prompt the unconditional branch is encoded from."""
+    max_length: Optional[int] = None
+    """Tokens every prompt is padded to; None keeps the encoder's own
+    default, which for CLIP is the checkpoint's context length."""
 
     def build(self) -> Condition:
-        return Condition(encoders[self.encoder].from_pretrained(self.checkpoint, dtype=self.dtype),
-                         field=self.field, unconditional=self.unconditional)
+        fields = {} if self.max_length is None else {"max_length": self.max_length}
+        return Condition(
+            encoders[self.encoder].from_pretrained(self.checkpoint, dtype=self.dtype, **fields),
+            field=self.field, unconditional=self.unconditional)
 
 
 @dataclasses.dataclass(frozen=True)

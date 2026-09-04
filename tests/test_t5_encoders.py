@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 
 import numpy as np
 import pytest
@@ -87,45 +88,37 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
                           np.asarray(encoder.encode(encoder.params, tokens).hidden))
 
 
-def test_an_encoder_without_relative_bias_fails_parity():
-    """The relative position table is load-bearing: zeroing it must move the
-    outputs past the tolerance, or the parity test above proves nothing."""
-    import jax.numpy as jnp
-
-    encoder = T5Text.from_pretrained(str(TINY))
-    expected = reference(TINY)
-    tokens = {"input_ids": expected["input_ids"],
-              "attention_mask": expected["attention_mask"]}
-    params = jax.tree.map(
-        lambda leaf: jnp.zeros_like(leaf)
-        if leaf.shape == encoder.params["params"]["layers_0"]["self_attn"]["rel_bias"]["embedding"].shape
-        else leaf,
-        encoder.params)
-    difference = largest_difference(
-        encoder.encode(params, tokens).hidden, expected["last_hidden_state"])
-    assert difference > TOLERANCE, f"zeroed relative bias still matches: {difference:.3e}"
-
-
-def test_an_encoder_without_its_gate_fails_parity():
-    """The gated feed-forward's second projection is load-bearing too."""
-    import jax
-    import jax.numpy as jnp
-
+@pytest.mark.parametrize("path", [
+    ("embed_tokens", "embedding"),
+    ("layers_0", "self_attn", "rel_bias", "embedding"),
+    ("layers_0", "self_attn", "q_proj", "kernel"),
+    ("layers_0", "self_attn", "out_proj", "kernel"),
+    ("layers_0", "attn_norm", "scale"),
+    ("layers_0", "mlp", "wi_0", "kernel"),
+    ("layers_0", "mlp", "wi_1", "kernel"),
+    ("layers_0", "mlp", "wo", "kernel"),
+    ("layers_1", "mlp_norm", "scale"),
+    ("final_layer_norm", "scale"),
+], ids=lambda path: ".".join(path))
+def test_every_translated_leaf_is_load_bearing(path):
+    """One mutation per module of the tower: zeroing any leaf the translator
+    places must move the outputs past the tolerance, or the parity test above
+    proves nothing about that module. The relative bias table, the gate and
+    both norms are each the one thing a name map gets wrong quietly."""
     encoder = T5Text.from_pretrained(str(TINY))
     expected = reference(TINY)
     tokens = {"input_ids": expected["input_ids"],
               "attention_mask": expected["attention_mask"]}
 
-    def zero_gate(tree):
-        leaves, treedef = jax.tree.flatten(tree)
-        return treedef.unflatten([
-            jnp.zeros_like(leaf) if leaf.ndim == 2 and leaf.shape[1] == 128 else leaf
-            for leaf in leaves])
+    broken = jax.tree.map(lambda leaf: leaf, encoder.params)
+    node = broken["params"]
+    for entry in path[:-1]:
+        node = node[entry]
+    node[path[-1]] = jnp.zeros_like(node[path[-1]])
 
     difference = largest_difference(
-        encoder.encode(zero_gate(encoder.params), tokens).hidden,
-        expected["last_hidden_state"])
-    assert difference > TOLERANCE, f"zeroed gate still matches: {difference:.3e}"
+        encoder.encode(broken, tokens).hidden, expected["last_hidden_state"])
+    assert difference > TOLERANCE, f"zeroed {'.'.join(path)} still matches: {difference:.3e}"
 
 
 @pytest.mark.network
