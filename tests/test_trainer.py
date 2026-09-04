@@ -269,7 +269,7 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trained = trainer.fit(Data(), steps=3, log_every=1)
 
     resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
-    state, shardings, position = resumed._place()
+    state, shardings, position = resumed.place()
 
     assert int(state.step) == 3, "the step counter was reset"
     for field in ("params", "opt_state", "ema"):
