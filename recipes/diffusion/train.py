@@ -123,7 +123,7 @@ def main(config: DiffusionRunConfig) -> TrainState:
         checkpoint_every=config.trainer.checkpoint_interval(data),
         metrics=config.build_eval_metrics(),
     )
-    if tracker is not None and jax.process_index() == 0:
+    if tracker is not None:
         dew.io.publish(checkpoints.path(checkpoints.latest), artifact_name(name), tracker=tracker)
     return state
 

@@ -268,7 +268,7 @@ def main(config: LmRunConfig) -> TrainState:
         metrics=(metrics.perplexity(),),
     )
     print(f"Training finished in {time.time() - start:.0f}s")
-    if tracker is not None and jax.process_index() == 0:
+    if tracker is not None:
         dew.io.publish(checkpoints.path(checkpoints.latest), re.sub(r"[^\w.-]", "-", name),
                        tracker=tracker)
     return state
