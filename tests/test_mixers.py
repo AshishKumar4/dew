@@ -150,3 +150,59 @@ def test_a_kind_without_a_build_is_refused_loudly():
             tiny(mixer=EmptyMixer()).init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
     finally:
         del mixers._members["test_empty"]
+
+
+def hybrid(**overrides):
+    """Two layer types: full_attention rides the model, linear names its own."""
+    return tiny(layer_types=("full_attention", "linear"), **overrides)
+
+
+def test_a_kind_names_its_own_mixer():
+    """One kind's layers build from its value, the other kind from the model's."""
+    from dew.nn.backbones.causal_transformer import CausalSelfAttention, LayerKind
+
+    model = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(scale=0.0))})
+    bound = model.bind(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
+
+    assert isinstance(bound.layers[0].self_attn, CausalSelfAttention)
+    assert isinstance(bound.layers[1].self_attn, ScaleMixerModule)
+    logits = model.apply(model.init(jax.random.key(0), jnp.ones((2, 8), jnp.int32)),
+                         jnp.ones((2, 8), jnp.int32))
+    assert logits.shape == (2, 8, VOCAB)
+
+
+def test_a_kind_mixer_beats_the_model_mixer():
+    """The kind's value wins where set; elsewhere the model's applies."""
+    from dew.nn.backbones.causal_transformer import CausalSelfAttention, LayerKind
+
+    model = hybrid(mixer=ScaleMixer(scale=0.0),
+                   kinds={"linear": LayerKind(mixer={"kind": "attention"})})
+    bound = model.bind(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
+
+    assert isinstance(bound.layers[0].self_attn, ScaleMixerModule)
+    assert isinstance(bound.layers[1].self_attn, CausalSelfAttention)
+
+
+def test_a_kind_record_coerces_like_the_model_record():
+    """LayerKind takes its mixer as a record from a config or a value."""
+    from dew.nn.backbones.causal_transformer import LayerKind
+
+    assert LayerKind(mixer={"kind": "test_scale", "scale": 3.0}).mixer == ScaleMixer(3.0)
+    assert LayerKind(mixer=ScaleMixer(3.0)).mixer == ScaleMixer(3.0)
+    assert LayerKind().mixer is None
+    with pytest.raises(ValueError, match="kind's mixer"):
+        LayerKind(mixer="test_scale")
+    with pytest.raises(KeyError, match="no mixer named 'nope'"):
+        LayerKind(mixer={"kind": "nope"})
+
+
+def test_models_build_takes_kind_mixer_records():
+    """The CLI path builds per-kind mixers through `models.build`."""
+    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
+                  mlp_features=64, max_seq_len=16,
+                  layer_types=("full_attention", "linear"),
+                  kinds={"linear": {"mixer": {"kind": "test_scale", "scale": 3.0}}})
+
+    model = models.build("causal_transformer", **config)
+    assert model.kind_of("linear").mixer == ScaleMixer(3.0)
+    assert model.kind_of("full_attention").mixer is None
