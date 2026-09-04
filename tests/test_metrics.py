@@ -293,7 +293,10 @@ def clip_fixture():
     return generated, batch, cosine
 
 
+# One fp32 cosine differs by ~1e-7 across devices; CLIPScore is a hundred
+# cosines, so its bound is the same relative one.
 CLIP_TOLERANCE = 1e-5
+CLIP_SCORE_TOLERANCE = 1e-3
 
 
 def test_clip_metric_scores_the_reference_cosine():
@@ -316,7 +319,8 @@ def test_clip_metric_scores_the_reference_cosine():
 def test_clip_score_metric_clamps_the_reference_cosine():
     """CLIPScore is 100 * max(cos, 0) averaged; the fixture holds one negative
     cosine (-0.072) among three positive ones, so the clamp does work here.
-    Observed 6.1e-06 off the reference against a tolerance of 1e-5."""
+    Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
+    against a tolerance of 1e-3 on a score of order 15."""
     metric = get_clip_score_metric(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_score' and metric.higher_is_better is True
     generated, batch, cosine = clip_fixture()
@@ -325,7 +329,7 @@ def test_clip_score_metric_clamps_the_reference_cosine():
     score = float(metric.function(generated, batch))
 
     expected = np.mean(100.0 * np.maximum(cosine, 0.0))
-    assert abs(score - expected) < CLIP_TOLERANCE, f"{score} against {expected}"
+    assert abs(score - expected) < CLIP_SCORE_TOLERANCE, f"{score} against {expected}"
     assert score != pytest.approx(np.mean(100.0 * cosine), abs=1e-3)
 
 

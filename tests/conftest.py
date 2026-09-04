@@ -4,13 +4,9 @@ import os
 # files on a GPU.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. Must be set before
-# jax initialises its backend. On a GPU, scatter-adds (a tied embedding's
-# gradient is one) run as atomics in no fixed order, and two correct paths
-# then differ by an ulp in some processes and not others; deterministic ops
-# make a parity test compare like with like.
+# jax initialises its backend.
 os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "")
-    + " --xla_force_host_platform_device_count=8 --xla_gpu_deterministic_ops=true"
+    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
 ).strip()
 # Parity tests assert fp32 against references computed in fp32. Ampere and
 # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
