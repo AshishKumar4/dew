@@ -22,15 +22,14 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 from termcolor import colored
 
-from dew.artifacts import host
 from dew.checkpoints import Checkpoints
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.training.distributed import (
-    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding, build_mesh,
+    DevicePrefetchIterator, Layout, MeshSpec, batch_sharding, build_mesh,
     minimum_across_processes, shard_batch,
 )
 from dew.training.state import TrainState
@@ -68,8 +67,7 @@ def _project(tree: Variables, like: Variables) -> Variables:
             for name, child in like.items()}
 
 
-def ema_update(ema: Variables, params: Variables,
-               decay: jax.typing.ArrayLike) -> Variables:
+def ema_update(ema: Variables, params: Variables, decay) -> Variables:
     """One EMA step over the selected leaves; `decay` is the schedule's value."""
     return jax.tree.map(lambda average, live: decay * average + (1 - decay) * live,
                         ema, _project(params, ema))
@@ -167,7 +165,7 @@ class Trainer:
         )
 
     @functools.cached_property
-    def device_mesh(self) -> Mesh:
+    def device_mesh(self):
         """The mesh `MeshSpec` describes over this process pool's devices,
         built on first use."""
         return build_mesh(self.mesh)
@@ -177,11 +175,11 @@ class Trainer:
         """How a global batch is placed: split over every device."""
         return batch_sharding(self.device_mesh)
 
-    def shardings(self, state: TrainState) -> Placement:
+    def shardings(self, state: TrainState):
         """The layout's placement of `state`, leaf for leaf."""
         return self.layout.shardings(self.device_mesh, state)
 
-    def place(self) -> tuple[TrainState, Placement, bytes | None]:
+    def place(self):
         """The state itself, fresh or restored, on the mesh, with its shardings
         and the data position a resume continues from."""
         abstract = jax.eval_shape(self.initial_state)
@@ -284,8 +282,7 @@ class Trainer:
 
         return step
 
-    def compile(self, state: TrainState, batch: Batch,
-                scale: dynamic_scale_lib.DynamicScale | None = None) -> jax.stages.Compiled:
+    def compile(self, state: TrainState, batch, scale=None):
         """The training step's executable, the one `fit` runs, compiled ahead
         of time over `state` and one global `batch`.
 
@@ -468,14 +465,6 @@ class Trainer:
         that left the pass while the others waited in its collectives would
         wedge the pool, so each batch is agreed before it is scored. A metric
         or a loader that raises takes the pass down with it.
-
-        An artifact and the batch beside it come home before they are scored or
-        drawn: a metric reads them with numpy and the tracker draws on process
-        zero, neither of which can touch a shard of a global array. The gathers
-        are collectives, so they happen here, on every process, and not inside
-        the one metric or the one process that consumes them. Scoring the whole
-        batch is also the only way the number means what it says: a process
-        scoring its own shard would log its slice of the split as the metric.
         """
         if data.val is None:
             return {}
@@ -490,23 +479,12 @@ class Trainer:
             batch = next(iterator, None)
             if not minimum_across_processes(int(batch is not None)):
                 break
-            if batch is None:
-                # Every process agreed one was available, so this cannot
-                # happen; leaving the loop here instead would strand the
-                # others in the next collective.
-                raise RuntimeError(
-                    "the validation pass agreed a batch was available and this "
-                    "process has none")
             batch = shard_batch(sharding, batch)
             produced = self.objective.evaluate(state.params, batch, info)
             produced = (() if produced is None
                         else produced if isinstance(produced, tuple) else (produced,))
-            produced = tuple(host(artifact) for artifact in produced)
-            if metrics:
-                # One gather for every metric, whatever fields they read.
-                home = host(batch)
-                for metric in metrics:
-                    values[metric.name].append(metric(_pick(produced, metric.reads), home))
+            for metric in metrics:
+                values[metric.name].append(metric(_pick(produced, metric.reads), batch))
             if scored == 0 and process_zero and self.tracker is not None:
                 for artifact in produced:
                     self.tracker.artifact(artifact, step)
