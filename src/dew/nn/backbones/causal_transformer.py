@@ -311,6 +311,12 @@ class GatedMLP(nn.Module):
         gate = self.gate_proj(x)
         gate = nn.silu(gate) if self.activation == 'swiglu' else nn.gelu(gate)
         return self.down_proj(gate * self.up_proj(x))
+
+
+@logical_axes({
+    ("per_layer_input_gate",): ("embed", "mlp"),
+    ("per_layer_projection",): ("mlp", "embed"),
+})
 class DecoderBlock(nn.Module):
     """Pre-norm decoder block: token mixer, then feed-forward, both residual.
 
@@ -324,6 +330,11 @@ class DecoderBlock(nn.Module):
     sublayer rather than on its input; the pre-norms keep their names and their
     places, so a checkpoint without them loads into the same tree minus two
     leaves per layer.
+
+    kv_store threads one dict down the layer stack so a KV-sharing mixer
+    reads its provider's keys and values; a mixer without a kv_store keyword
+    fails loudly when a run shares. per_layer_input is the layer's input
+    signal for the per-layer residual, None when the model has none.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
