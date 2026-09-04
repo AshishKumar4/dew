@@ -380,3 +380,21 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     assert metric(ImageGrid(1.2 * white), batch) == metric(ImageGrid(white), batch)
     assert metric(ImageGrid(-1.2 * white), batch) == metric(ImageGrid(-white), batch)
     assert metric(ImageGrid(white), batch) != metric(ImageGrid(-white), batch)
+
+
+def test_a_metric_pairs_its_samples_with_the_records_they_came_from():
+    """An objective samples a fixed few rows of the batch, so psnr and ssim
+    score four samples against a batch of eight rather than failing to
+    broadcast, which is what a diffusion run with --val-metrics psnr did."""
+    key = jax.random.key(0)
+    samples = jax.random.uniform(key, (4, 32, 32, 3), minval=-1.0, maxval=1.0)
+    batch = {"image": jax.random.randint(key, (8, 32, 32, 3), 0, 256, jnp.uint8)}
+    for name in ("psnr", "ssim"):
+        score = registry[name]()(ImageGrid(samples), batch)
+        assert np.isfinite(score)
+
+
+def test_a_metric_refuses_a_batch_with_fewer_records_than_samples():
+    with pytest.raises(ValueError, match="at least as many"):
+        registry["psnr"]()(ImageGrid(jnp.zeros((8, 32, 32, 3))),
+                           {"image": jnp.zeros((4, 32, 32, 3), jnp.uint8)})

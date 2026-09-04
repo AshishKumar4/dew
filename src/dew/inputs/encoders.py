@@ -158,11 +158,12 @@ class CharTable(ConditionEncoder):
     vocab: int = 130
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = 8,
-                        features: int = 16, vocab: int = 130, seed: int = 0):
-        table = np.random.RandomState(seed).normal(size=(vocab, features)).astype(np.float32)
-        return cls(params={"table": jnp.asarray(table)}, tokens=tokens,
-                   features=features, vocab=vocab)
+    def from_pretrained(cls, checkpoint: str = "char_table", *, dtype=None,
+                        tokens: int = 8, features: int = 16, vocab: int = 130,
+                        seed: int = 0):
+        table = np.random.RandomState(seed).normal(size=(vocab, features))
+        return cls(params={"table": jnp.asarray(table, resolve_dtype(dtype) or jnp.float32)},
+                   tokens=tokens, features=features, vocab=vocab)
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         # id 0 is padding, 1 is the start token, characters follow.
