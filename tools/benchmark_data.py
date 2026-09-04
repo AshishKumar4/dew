@@ -17,6 +17,7 @@ import os
 # Reading data needs no accelerator, and claiming one costs seconds of startup
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import itertools  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 from typing import Iterable, List  # noqa: E402
@@ -46,9 +47,11 @@ class Benchmark:
 def measure(batches: Iterable, steps: int, warmup: int) -> List[float]:
     """Wall time per batch after warmup, in seconds."""
     latencies = []
-    for index, _ in enumerate(batches):
-        if index >= warmup + steps:
-            break
+    # islice pulls exactly the batches that are timed: the loop never reads
+    # one batch past the last measured step.
+    taken = itertools.islice(batches, warmup + steps)
+    last = time.perf_counter()
+    for index, _ in enumerate(taken):
         now = time.perf_counter()
         if index >= warmup:
             latencies.append(now - last)
