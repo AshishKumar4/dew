@@ -30,7 +30,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.objectives` |  |
-| `dew.objectives.diffusion` | `DiffusionObjective`, `MaskedDiffusionObjective`, `VALIDATION_SAMPLES` |
+| `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |
 
