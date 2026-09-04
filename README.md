@@ -246,7 +246,7 @@ python recipes/diffusion/train.py data:oxford-flowers --data.image-size 128 \
     --trainer.epochs 2000 preset:edm
 ```
 
-The scripts in [`examples/`](examples/) go from a dataset to a trained model and exported weights. The notebooks in [`tutorials/`](tutorials/) teach the library; [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without it.
+The scripts in [`examples/`](examples/) go from a dataset to a trained model and exported weights. In [`tutorials/`](tutorials/), [01](tutorials/01-diffusion-from-scratch.ipynb) builds diffusion from scratch without the library. The other notebooks (02 to 08) are **WORK IN PROGRESS**: they were written against an earlier API and are being rewritten.
 
 ## Evaluation and export
 
