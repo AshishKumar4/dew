@@ -159,6 +159,10 @@ class Layout:
         if not 0.0 <= self.tolerance <= 1.0:
             raise ValueError(
                 f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
+        # Rules arrive as lists from a JSON record; the table is tuples.
+        object.__setattr__(self, "rules", tuple(
+            (name, axes if axes is None or isinstance(axes, str) else tuple(axes))
+            for name, axes in self.rules))
 
     def _rules_for(self, mesh: Mesh) -> LogicalAxisRules:
         normalized = []
