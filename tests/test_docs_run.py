@@ -12,9 +12,24 @@ reader's terminal.
 A block whose first line is `# runs elsewhere: <reason>` is compiled but not
 run; the reason is for the reader (a download, a run directory on disk, a
 process pool). A syntax error or a misspelled import in it still fails.
+
+The tutorials are notebooks, so they are checked rather than executed: every
+`dew` name a code cell imports has to exist, and every call of one of those
+names has to match its signature. That is what a markdown block gets for free
+by being run, and without it a notebook keeps naming a symbol the library
+deleted until a reader finds out.
+
+The eight tutorials on the pre-registry API are named in `PENDING` and their
+check is a strict xfail, so the marker erases itself: the first notebook
+ported to the built API fails as an unexpected pass until its name comes off
+the list, and a new notebook is checked from the day it is added.
 """
 
+import ast
+import importlib
+import inspect
 import itertools
+import json
 import os
 import re
 import sys
@@ -28,6 +43,20 @@ FILES = [ROOT / "README.md",
          *(x for x in sorted((ROOT / "docs").rglob("*.md"))
            if x.relative_to(ROOT).parts[1] not in ("design", "research"))]
 BLOCK = re.compile(r"```python\n(.*?)```", re.S)
+NOTEBOOKS = sorted((ROOT / "tutorials").glob("*.ipynb"))
+PENDING = (
+    # Written against the pre-registry API (ObjectiveTrainer, build_model, the
+    # sampler classes, the input configs) and parked for a rewrite, not a port.
+    # 01 is not here: it builds diffusion from scratch and names no dew symbol,
+    # so it is checked like any other notebook.
+    "02-train-a-diffusion-model.ipynb",
+    "03-text-to-image-with-guidance.ipynb",
+    "04-samplers-and-schedules.ipynb",
+    "05-train-a-language-model.ipynb",
+    "06-jepa-representation-learning.ipynb",
+    "07-scaling-on-many-devices.ipynb",
+    "08-load-a-pretrained-decoder.ipynb",
+)
 ELSEWHERE = re.compile(r"^\s*# runs elsewhere: \S")
 
 RES, TOKENS, BATCH = 16, 8, 8
@@ -107,3 +136,105 @@ def test_the_api_page_is_the_code():
         cwd=ROOT, capture_output=True, text=True,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "JAX_PLATFORMS": "cpu"})
     assert result.returncode == 0, result.stderr
+
+
+def notebook_source(path: Path) -> str:
+    """The notebook's code cells as one module, with the lines a kernel eats.
+
+    Magics and shell lines are not python, and a cell that ends in an
+    expression is fine: nothing here runs.
+    """
+    cells = json.loads(path.read_text())["cells"]
+    lines = []
+    for cell in cells:
+        if cell["cell_type"] != "code":
+            continue
+        for line in cell["source"]:
+            stripped = line.lstrip()
+            lines.append("" if stripped[:1] in ("%", "!", "?") else line.rstrip("\n"))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def dew_imports(tree) -> list[tuple[str, str, str, int]]:
+    """`(module, name, bound_as, line)` for every dew name a cell imports."""
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "dew":
+            for alias in node.names:
+                found.append((node.module, alias.name, alias.asname or alias.name, node.lineno))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "dew":
+                    found.append((alias.name, "", alias.asname or alias.name, node.lineno))
+    return found
+
+
+def resolved(module: str, name: str):
+    """What the import binds, or None when the library does not have it."""
+    try:
+        held = importlib.import_module(module)
+    except ImportError:
+        return None
+    if not name:
+        return held
+    if hasattr(held, name):
+        return getattr(held, name)
+    try:
+        return importlib.import_module(f"{module}.{name}")
+    except ImportError:
+        return None
+
+
+def keyword_errors(tree, bound: dict) -> list[str]:
+    """Calls of an imported dew symbol whose keywords it does not take."""
+    problems = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.keywords:
+            continue
+        target = node.func.id if isinstance(node.func, ast.Name) else None
+        held = bound.get(target)
+        if held is None or not (inspect.isclass(held) or inspect.isfunction(held)):
+            continue
+        try:
+            signature = inspect.signature(held)
+        except (TypeError, ValueError):
+            continue
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+            continue
+        unknown = sorted({keyword.arg for keyword in node.keywords
+                          if keyword.arg and keyword.arg not in signature.parameters})
+        if unknown:
+            problems.append(f"line {node.lineno}: {target}() takes no {unknown}")
+    return problems
+
+
+def notebook_cases():
+    """One case per tutorial; the parked ones as a strict xfail."""
+    for path in NOTEBOOKS:
+        marks = [pytest.mark.xfail(strict=True, reason="parked for a rewrite")] \
+            if path.name in PENDING else []
+        yield pytest.param(path, marks=marks, id=path.name)
+
+
+def test_the_parked_list_names_tutorials_that_exist():
+    """A renamed or deleted notebook cannot leave an entry behind that would
+    quietly excuse a file nobody has."""
+    assert set(PENDING) <= {path.name for path in NOTEBOOKS}
+
+
+@pytest.mark.parametrize("path", notebook_cases())
+def test_a_tutorial_names_symbols_the_library_has(path):
+    """A notebook is not executed here, so its imports and its call keywords
+    are checked instead: those are what rot when the API moves."""
+    tree = ast.parse(notebook_source(path), filename=str(path))
+    bound, missing = {}, []
+    for module, name, alias, line in dew_imports(tree):
+        held = resolved(module, name)
+        if held is None:
+            missing.append(f"line {line}: {module}.{name}" if name else f"line {line}: {module}")
+        else:
+            bound[alias] = held
+
+    problems = missing + keyword_errors(tree, bound)
+    assert not problems, f"{path.name} names what dew does not have:\n" + "\n".join(problems)
