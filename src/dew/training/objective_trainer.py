@@ -124,10 +124,9 @@ class ObjectiveTrainer(SimpleTrainer):
         self.grad_accum_steps = grad_accum_steps
 
         if native_resolution is None and input_config is not None:
-            sample_shape = input_config.sample_data_shape
-            native_resolution = sample_shape[-2]
-            if autoencoder is not None:
-                native_resolution = native_resolution * autoencoder.downscale_factor
+            # sample_data_shape is already pixels; get_input_shapes divides it
+            # by the autoencoder's factor for the model.
+            native_resolution = input_config.sample_data_shape[-2]
 
         if objective is None:
             objective = DiffusionObjective(

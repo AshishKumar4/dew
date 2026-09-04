@@ -442,6 +442,44 @@ def test_a_failing_validation_loader_fails_the_pass(tmp_path):
                                 UnreadableSplit, 1, 0)
 
 
+def test_a_latent_trainer_validates_at_the_input_resolution(tmp_path):
+    """sample_data_shape is the pixel shape and get_input_shapes divides it
+    by the autoencoder's factor for the model, so the default
+    native_resolution multiplied by that factor once more: a model trained on
+    4x4 latents of 8x8 images sampled 8x8 latents and decoded 16x16 images.
+    Every validation artifact has to come out at the data's 8x8."""
+    from dew.nn.autoencoders.simple import SimpleAutoEncoder
+
+    autoencoder = SimpleAutoEncoder(latent_channels=4, feature_depths=(8,),
+                                    key=jax.random.PRNGKey(1))
+    assert autoencoder.downscale_factor == 2
+    train_schedule, _, transform = get_diffusion_preset("edm")
+    seen = []
+    trainer = ObjectiveTrainer(
+        model=SimpleDiT(output_channels=4, patch_size=2, emb_features=16, num_layers=1,
+                        num_heads=2, mlp_ratio=1),
+        optimizer=optax.adam(1e-3),
+        noise_schedule=train_schedule,
+        model_output_transform=transform,
+        input_config=DiffusionInputConfig(
+            sample_data_key="image", sample_data_shape=(RES, RES, 3), conditions=[]),
+        autoencoder=autoencoder,
+        rngs=jax.random.PRNGKey(0),
+        name="latent",
+        wandb_config=None,
+        distributed_training=False,
+        checkpoint_base_path=str(tmp_path),
+        eval_metrics=[EvaluationMetric(
+            function=lambda artifacts, batch: seen.append(np.asarray(artifacts).shape) or 0.0,
+            name="shape")],
+    )
+    assert trainer.objective.native_resolution == RES
+    trainer.objective.diffusion_steps = 2
+    trainer.validation_loop(trainer.state, trainer._define_validation_step(),
+                            batch_iterator, 1, 0)
+    assert seen == [(4, RES, RES, 3)]
+
+
 def test_a_failing_validation_step_fails_the_base_pass(tmp_path):
     """SimpleTrainer runs its own loop, with the same duty."""
     trainer = SimpleTrainer(
