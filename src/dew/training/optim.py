@@ -105,7 +105,8 @@ def muon_weight_dimension_numbers(params):
                     "declared logical axes, so Muon cannot tell which of its axes "
                     "form the matrix. Declare it with @logical_axes on its module.")
             return optax.contrib.MuonDimensionNumbers()
-        if SELECTION_AXES & set(axes) or axes[-1] in BATCH_AXES:
+        named = {axis for axis in axes if axis is not None}
+        if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
             return None
         return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
     return jax.tree_util.tree_map_with_path(leaf, params)
