@@ -33,6 +33,8 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from .sharding import logical_axes
+
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3 and V4, GLM,
 # Kimi, LLaDA2).
@@ -150,6 +152,9 @@ class Router(nn.Module):
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
+        # The load each expert took, for the step that balances the bias:
+        # written only when a caller opens the 'router' collection.
+        self.sow('router', 'indices', indices)
         weights = jnp.take_along_axis(scores, indices, axis=-1)
         if self.normalize_weights:
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
@@ -292,6 +297,15 @@ class ExpertMLP(nn.Module):
         return combined.astype(expert_out.dtype)
 
 
+@logical_axes({
+    ("gate",): ("embed", "exp"),
+    # A sparse layer's experts are stacked on one leaf, so the expert
+    # dimension is named here and the longer path wins over the dense
+    # projection of the same name.
+    ("experts", "gate_proj"): ("exp", "embed", "mlp"),
+    ("experts", "up_proj"): ("exp", "embed", "mlp"),
+    ("experts", "down_proj"): ("exp", "mlp", "embed"),
+})
 class SparseMLP(nn.Module):
     """A router over `num_experts` gated MLPs, `top_k` of them per token.
 
@@ -305,12 +319,14 @@ class SparseMLP(nn.Module):
     out_features: int
     activation: str = 'swiglu'
     implementation: str = 'xla'
+    expert_bias: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
     def setup(self):
         self.gate = Router(num_experts=self.num_experts,
                            in_features=self.out_features, top_k=self.top_k,
+                           expert_bias=self.expert_bias,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
