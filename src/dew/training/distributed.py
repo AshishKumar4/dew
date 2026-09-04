@@ -16,7 +16,7 @@ import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
 from jax.experimental import multihost_utils
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.nn.sharding import LogicalAxes, declared_axes
 from dew.objectives.base import Batch, Variables
@@ -24,14 +24,19 @@ from dew.objectives.base import Batch, Variables
 DATA_AXIS = 'data'
 FSDP_AXIS = 'fsdp'
 EXPERT_AXIS = 'expert'
+TENSOR_AXIS = 'tensor'
+SEQUENCE_AXIS = 'sequence'
 
-# The two axes a parameter can be split over. A dimension named 'exp' takes
-# the expert axis, everything else takes fsdp.
-PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS)
+# The axes a parameter can be split over. A dimension named 'exp' takes the
+# expert axis, a width the rules redirect takes tensor, everything else
+# takes fsdp. The sequence axis never places parameters: it splits the
+# batch's sequence dimension, which no parameter has.
+PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 
-# Batches are split across every device, whichever axis it sits on; only
-# parameters distinguish the axes.
-BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS))
+# The batch's rows split across every axis but sequence, whichever they sit
+# on; the sequence dimension splits over the sequence axis. Only parameters
+# distinguish the axes further.
+BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS), SEQUENCE_AXIS)
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
 Placement: TypeAlias = Any
@@ -56,18 +61,21 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
     ("batch", None),
-    ("sequence", None),
+    ("sequence", SEQUENCE_AXIS),
     ("stage", None),
 )
 
 
 @dataclasses.dataclass(frozen=True)
 class MeshSpec:
-    """How many devices the parameter axes take; data parallelism fills the rest."""
+    """How many devices each sharding axis takes; data parallelism fills the rest."""
     fsdp: int = 1
     expert: int = 1
     """Devices the expert dimension of an MoE layer is split over."""
-
+    tensor: int = 1
+    """Devices a redirected width is split over; 1 keeps every width on fsdp."""
+    sequence: int = 1
+    """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     """One entry of a spec or a rule as the mesh axes it names."""
@@ -77,27 +85,32 @@ def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
 
 
 def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
-    """Three-axis device mesh: parameters shard over 'fsdp' and 'expert',
-    batches over all three.
+    """Five-axis device mesh: parameters shard over 'fsdp', 'expert' and
+    'tensor', batches over all five with their sequence dimension on 'sequence'.
 
     An MoE layer's expert dimension is the one dimension no dense model has,
     and splitting it is what expert parallelism is, so it gets its own axis
-    rather than competing with the model's widths for 'fsdp'. Sizes of 1
+    rather than competing with the model's widths for 'fsdp'. The tensor
+    axis is where a run's rules redirect a width when one card cannot hold
+    it; the sequence axis is where long sequences split. Sizes of 1
     degenerate to plain data parallelism, so the same code path serves every
     topology without a flag. Axes are Auto so GSPMD infers the collectives
     rather than us writing them by hand.
     """
     devices = list(devices) if devices is not None else jax.devices()
-    sharded = spec.fsdp * spec.expert
-    if spec.fsdp < 1 or spec.expert < 1 or len(devices) % sharded:
+    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence
+    if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
+            or spec.sequence < 1 or len(devices) % sharded):
         raise ValueError(
-            f"fsdp {spec.fsdp} times expert {spec.expert} must be a positive "
+            f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
+            f"{spec.tensor} times sequence {spec.sequence} must be a positive "
             f"divisor of device count {len(devices)}")
     return jax.make_mesh(
-        (len(devices) // sharded, spec.expert, spec.fsdp),
-        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS),
+        (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence),
+        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS),
         devices=devices,
-        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto),
+        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto, AxisType.Auto,
+                    AxisType.Auto),
     )
 
 
@@ -261,10 +274,39 @@ def batch_sharding(mesh: Mesh) -> NamedSharding:
     return NamedSharding(mesh, BATCH_SPEC)
 
 
+def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
+    """A sharding per leaf of `batch`, from the batch spec and the leaf's rank.
+
+    Rows always split over every axis but sequence. The second dimension
+    splits over the sequence axis when it divides evenly — token rows — and
+    stays replicated when it does not, the way `_mesh_spec` drops a name no
+    dimension can split: placement is opportunistic, values never change.
+    Shorter leaves split over the leading axes they have, so a per-row
+    vector still splits over rows and a scalar replicates.
+    """
+    spec = BATCH_SPEC
+    sequence_size = mesh.shape[SEQUENCE_AXIS]
+
+    def leaf_sharding(leaf):
+        array = np.asarray(leaf)
+        if array.ndim == 0:
+            return NamedSharding(mesh, P())
+        if array.ndim == 2 and array.shape[1] % sequence_size:
+            return NamedSharding(mesh, P(spec[0]))
+        entries = [spec[0]] + [spec[1] if index == 1 else None
+                               for index in range(1, array.ndim)]
+        return NamedSharding(mesh, P(*entries))
+
+    return jax.tree.map(leaf_sharding, batch)
+
+
 def shard_batch(sharding: NamedSharding, batch: Batch) -> Batch:
     """Assemble this process's slice of each array into a globally sharded one."""
+    placed = batch_shardings(sharding.mesh, batch)
     return jax.tree.map(
-        lambda x: jax.make_array_from_process_local_data(sharding, np.asarray(x)), batch)
+        lambda leaf, leaf_sharding: jax.make_array_from_process_local_data(
+            leaf_sharding, np.asarray(leaf)),
+        batch, placed)
 
 
 @runtime_checkable
