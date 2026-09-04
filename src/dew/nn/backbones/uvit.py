@@ -14,9 +14,11 @@ from ..scan_orders import hilbert_indices, inverse_permutation, hilbert_patchify
 from ..vit import unpatchify, PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams
 from ..dit import ModulatedBlock, remat_block, masked_mean
 from dew.registry import models
+from ..sharding import logical_axes
 
 
 @models("uvit")
+@logical_axes({}, heuristic=(("text_proj",), ("up_dense_*",), ("pos_encoding",), ("final_*conv*",)))
 class UViT(nn.Module):
     output_channels: int = 3
     patch_size: int = 16
@@ -248,6 +250,7 @@ class UViT(nn.Module):
 # --- Simple U-DiT ---
 
 @models("simple_udit")
+@logical_axes({}, heuristic=(("text_proj",), ("up_dense_*",)))
 class SimpleUDiT(nn.Module):
     """
     A Simple U-Net Diffusion Transformer (U-DiT) implementation.
