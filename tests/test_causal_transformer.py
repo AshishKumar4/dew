@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -24,7 +24,7 @@ SEQ = 12
 
 def tiny(**overrides):
     config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_ratio=2, max_seq_len=16)
+                  mlp_features=64, max_seq_len=16)
     return CausalTransformer(**{**config, **overrides})
 
 
@@ -277,7 +277,8 @@ def test_grouped_query_heads_match_repeated_kv_projections(rng):
 
 def test_sliding_attention_forgets_past_the_window(rng):
     """Two layers of a window of 3 see 5 tokens back, and nothing before that."""
-    model = tiny(layer_types=('sliding_attention',) * 2, sliding_window=3)
+    model = tiny(layer_types=('sliding_attention',) * 2,
+                 kinds={'sliding_attention': {'window': 3}})
     ids = tokens(rng)
     params = model.init(rng, ids)
     baseline = model.apply(params, ids)
@@ -290,7 +291,8 @@ def test_sliding_attention_forgets_past_the_window(rng):
 
 
 def test_sliding_attention_decode_matches_the_full_sequence(rng):
-    model = tiny(layer_types=('full_attention', 'sliding_attention'), sliding_window=4)
+    model = tiny(layer_types=('full_attention', 'sliding_attention'),
+                 kinds={'sliding_attention': {'window': 4}})
     ids = tokens(rng)
     params = model.init(rng, ids)
     full = model.apply(params, ids)
@@ -304,7 +306,8 @@ def test_gemma_flags_scale_the_embeddings_and_cap_the_logits(rng):
     cap = 5.0
     model = tiny(embedding_scale=True, scale_offset=True, mlp='geglu',
                  final_logit_softcap=cap, num_kv_heads=2, head_dim=16,
-                 rope_theta=1e6, rope_local_theta=1e4)
+                 rope_theta=1e6, layer_types=('sliding_attention',) * 2,
+                 kinds={'sliding_attention': {'window': 8, 'rope_theta': 1e4}})
     ids = tokens(rng)
     params = model.init(rng, ids)
     logits = model.apply(params, ids)
@@ -332,17 +335,18 @@ def test_gemma_zero_qk_norm_weights_are_identity(rng):
                         atol=1e-6)
 
 
-def test_local_rope_only_moves_the_sliding_layers(rng):
-    """rope_local_theta is Gemma3's second rope base: it must reach the sliding
-    layers and leave the full-attention ones alone."""
+def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
+    """A kind's own rope base is Gemma3's second one: it must reach the
+    layers the pattern names and leave the others alone."""
     ids = tokens(rng)
-    shared = dict(layer_types=('full_attention', 'sliding_attention'),
-                  sliding_window=4)
-    model = tiny(**shared)
+    pattern = ('full_attention', 'sliding_attention')
+    model = tiny(layer_types=pattern, kinds={'sliding_attention': {'window': 4}})
     params = model.init(rng, ids)
-    same_theta = tiny(**shared, rope_local_theta=10000.0)
+    same_theta = tiny(layer_types=pattern,
+                      kinds={'sliding_attention': {'window': 4, 'rope_theta': 10000.0}})
     assert jnp.allclose(model.apply(params, ids), same_theta.apply(params, ids))
-    other_theta = tiny(**shared, rope_local_theta=1e6)
+    other_theta = tiny(layer_types=pattern,
+                       kinds={'sliding_attention': {'window': 4, 'rope_theta': 1e6}})
     assert not jnp.allclose(model.apply(params, ids), other_theta.apply(params, ids))
 
 
@@ -657,7 +661,8 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
     """A packed row folds the window into the same mask, so a sliding layer
     still forgets past it: two layers of a window of 3 reach 5 tokens back
     inside the document, and the boundary stops the reach early."""
-    model = tiny(layer_types=('sliding_attention',) * 2, sliding_window=3)
+    model = tiny(layer_types=('sliding_attention',) * 2,
+                 kinds={'sliding_attention': {'window': 3}})
     ids, segment_ids, positions = packed_pair(rng)
     params = model.init(rng, ids)
     baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)

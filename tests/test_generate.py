@@ -21,7 +21,7 @@ SEPARATOR = 0
 
 def tiny(**overrides):
     config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_ratio=2, max_seq_len=16)
+                  mlp_features=64, max_seq_len=16)
     return CausalTransformer(**{**config, **overrides})
 
 
