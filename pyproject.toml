@@ -44,6 +44,12 @@ test = [
     "pytest",
     "pytest-xdist",
     "safetensors",
+    # Every decoder and MoE parity number is calibrated against this exact
+    # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
+    # tests cite its line numbers, and a resolve that moved it would compare
+    # dew against a different reference while the tolerances stayed. The
+    # library dependency stays unbounded; only the suite pins.
+    "transformers==5.16.1",
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
     # unbounded so the suite runs the release `pip install dew-ml[streaming]`
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.

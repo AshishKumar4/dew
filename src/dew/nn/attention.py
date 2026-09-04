@@ -218,11 +218,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         if bias is not None:
             combined = jnp.broadcast_to(bias.astype(q.dtype),
                                         (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
-        if mask is not None or sliding_window is not None:
-            if sliding_window is not None:
-                band = causal_attention_mask(
-                    jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
-                mask = band if mask is None else jnp.logical_and(mask, band)
+        if sliding_window is not None:
+            band = causal_attention_mask(
+                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+            mask = band if mask is None else jnp.logical_and(mask, band)
+        if mask is not None:
             seated = jnp.broadcast_to(
                 jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
                 (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
@@ -297,11 +297,11 @@ class NormalAttention(nn.Module):
         # x has shape [B, H, W, C]
         orig_x_shape = x.shape
         if len(x.shape) == 4:
-            B, H, W, C = x.shape
-            x = x.reshape((B, H*W, C))
+            x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
         context = x if context is None else context
         if len(context.shape) == 4:
-            context = context.reshape((B, H*W, C))
+            context = context.reshape(
+                (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
         query = self.query(x)
         key = self.key(context)
         value = self.value(context)
@@ -343,7 +343,7 @@ class FlaxGEGLU(nn.Module):
 
     dim: int
     dropout: float = 0.0
-    dtype: jnp.dtype = jnp.float32
+    dtype: Optional[Dtype] = jnp.float32
     precision: Any = jax.lax.Precision.DEFAULT
 
     def setup(self):
@@ -375,13 +375,13 @@ class FlaxFeedForward(nn.Module):
     """
 
     dim: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Optional[Dtype] = jnp.float32
     precision: Any = jax.lax.Precision.DEFAULT
 
     def setup(self):
         # The second linear layer needs to be called
         # net_2 for now to match the index of the Sequential layer
-        self.net_0 = FlaxGEGLU(self.dim, self.dtype, precision=self.precision)
+        self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision)
         self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):

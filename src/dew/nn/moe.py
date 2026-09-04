@@ -25,6 +25,7 @@ shards.
 """
 
 import functools
+import importlib
 from typing import Optional
 
 import jax
@@ -227,7 +228,9 @@ class ExpertLinear(nn.Module):
     def __call__(self, tokens, group_sizes):
         tokens, kernel = promote_dtype(tokens, self.kernel, dtype=self.dtype)
         if self.implementation == 'tokamax':
-            import tokamax
+            # tokamax is not a dependency (docs/concepts/moe.md), so it is
+            # resolved by name at the call rather than imported statically.
+            tokamax = importlib.import_module('tokamax')
             return tokamax.ragged_dot(
                 tokens, kernel, group_sizes, precision=self.precision,
                 preferred_element_type=tokens.dtype)

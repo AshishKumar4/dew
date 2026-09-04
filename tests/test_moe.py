@@ -13,6 +13,9 @@ the comparisons sort each token's slots by expert id first.
 """
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -746,3 +749,68 @@ def test_balancing_needs_a_router_with_a_bias():
     with pytest.raises(ValueError, match="bias=True"):
         trainer.objective.loss(params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
+
+
+def test_the_balancing_bias_is_one_replicated_value_across_every_shard():
+    """The bias is state every device reads, and its update counts tokens
+    over the whole global batch, not over a device's slice.
+
+    The step is `jax.jit` with in_shardings and out_shardings
+    (dew/training/trainer.py), so the histogram inside it runs on the global
+    array and the compiler inserts the reduction; this pins that. Every
+    addressable shard has to hold the same whole bias, and the bias a mesh
+    that splits the batch eight ways produces has to be the bias one device
+    produces from the same batch. A per-shard count would move the bias by a
+    per-shard direction and the shards would disagree.
+    """
+    steps = 3
+    state = moe_trainer(4, 2, bias=True).fit(Data(token_batches), steps=steps)
+    bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+
+    assert bias.sharding.spec == jax.sharding.PartitionSpec(), bias.sharding
+    assert len(bias.addressable_shards) == jax.device_count()
+    whole = np.asarray(jax.device_get(bias))
+    for shard in bias.addressable_shards:
+        assert np.array_equal(np.asarray(jax.device_get(shard.data)), whole)
+    assert np.any(whole != 0), "the bias never moved"
+    # Every step moved every expert by the rate, one way or the other.
+    np.testing.assert_allclose(np.abs(whole) / 0.01, np.round(np.abs(whole) / 0.01),
+                               atol=1e-4)
+    assert np.abs(whole).max() <= steps * 0.01 + 1e-6
+
+    single = single_device_bias(steps)
+    np.testing.assert_array_equal(whole, single)
+
+
+def single_device_bias(steps):
+    """The same run on one device, as the value the sharded run must match.
+
+    A fresh process is the only way to change the device count, so this
+    subprocess runs the same trainer at one device and prints the bias.
+    """
+    script = """
+import numpy as np, jax, optax
+from dew.registry import models
+import dew.nn.backbones
+from dew.objectives.lm import LMObjective
+from dew.training import Trainer, MeshSpec, Layout
+import test_moe as suite
+
+model = models.build("causal_transformer", **{
+    **suite.moe_config(),
+    "mixture": {**suite.moe_config()["mixture"], "bias": True}})
+trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
+                  optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
+state = trainer.fit(suite.Data(suite.token_batches), steps=%d)
+bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+print(",".join(repr(float(value)) for value in np.asarray(bias)))
+""" % steps
+    environment = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+                   "JAX_PLATFORMS": "cpu",
+                   "PYTHONPATH": os.pathsep.join(
+                       [str(Path(__file__).resolve().parent),
+                        str(Path(__file__).resolve().parents[1] / "src")])}
+    finished = subprocess.run([sys.executable, "-c", script], check=True,
+                              capture_output=True, text=True, env=environment)
+    return np.asarray([float(value) for value in finished.stdout.strip().splitlines()[-1].split(",")])
