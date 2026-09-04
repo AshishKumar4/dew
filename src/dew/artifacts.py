@@ -41,3 +41,20 @@ class Representations:
     for a probe to score."""
     features: jax.Array
     labels: jax.Array
+
+
+@struct.dataclass
+class TokenScores:
+    """Teacher-forced per-token losses `[N, L]` and the weight of each target,
+    1 where it counts and 0 where it is padding or a document's first token.
+    A perplexity is exp of the weighted mean over a whole pass, so a batch
+    with no counted target weighs nothing."""
+    losses: jax.Array
+    weights: jax.Array
+
+
+# `evaluate` returns one artifact or a tuple of them; a tracker renders each
+# by type and a metric picks the type it reads. An LM returns TokenScores
+# every pass and TextSamples when samples are configured.
+Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
+Artifacts = Artifact | tuple[Artifact, ...]
