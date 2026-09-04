@@ -173,6 +173,7 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
     assert jnp.array_equal(generated[:, PAYLOAD + 1:], held_out[:, :PAYLOAD])
 
 
+@pytest.mark.mesh
 def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
     """Where a decode lands is part of the contract: the tokens are read on
     the host, decoded to text and logged, so every device that reads a row
