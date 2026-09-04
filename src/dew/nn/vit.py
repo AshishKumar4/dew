@@ -60,6 +60,9 @@ def apply_rotary_embedding(
     elif x.ndim == 3:  # [B, S, D]
         cos_freqs = jnp.expand_dims(freqs_cos, axis=0)
         sin_freqs = jnp.expand_dims(freqs_sin, axis=0)
+    else:
+        raise ValueError(
+            f"rotary embedding takes [B, H, S, D] or [B, S, D] inputs, got rank {x.ndim}")
 
     # Duplicate cos and sin for the full dimension D
     # Shape becomes [..., S, D]
