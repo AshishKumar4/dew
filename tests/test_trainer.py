@@ -77,11 +77,9 @@ class Counting:
 class Data:
     """The `Dataset` contract the trainer reads: train, val, batch, records."""
 
-    def __init__(self, train=Counting, val=None, batch=BATCH, records=None,
-                 resumable=True):
+    def __init__(self, train=Counting, val=None, batch=BATCH, records=None):
         self._train, self._val = train, val
         self.batch, self.records = batch, records
-        self.resumable = resumable
 
     def train(self):
         return self._train()
@@ -243,16 +241,10 @@ def test_checkpoint_every_needs_a_stream_that_reports_its_position(tmp_path):
         make_trainer(tmp_path).fit(Data(endless), steps=2, checkpoint_every=1)
 
 
-def test_checkpoint_every_needs_a_dataset_that_says_it_can_resume(tmp_path):
-    """A dataset that answers False is refused before the stream is opened, so
-    a run cannot discover at the first interval that its resume would replay."""
-    with pytest.raises(ValueError, match="report its read position"):
-        make_trainer(tmp_path).fit(Data(resumable=False), steps=2, checkpoint_every=1)
-
-
-def test_checkpoint_every_without_checkpoints_is_refused():
-    """The trainer used to accept the pair and crash on the first save."""
-    with pytest.raises(ValueError, match="build it with checkpoints="):
+def test_checkpoint_every_without_a_checkpointer_is_refused():
+    """Asking for checkpoints from a trainer that has nowhere to write them
+    used to reach the first save and fail on None."""
+    with pytest.raises(ValueError, match="no checkpointer"):
         make_trainer().fit(Data(), steps=2, checkpoint_every=1)
 
 

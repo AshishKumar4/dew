@@ -191,11 +191,10 @@ def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
         shapes().build("shape", mix={"theta": 1e6})
 
 
-def _data(records=48, batch=8, resumable=True):
-    """A Dataset value with nothing behind it: the intervals only read its
-    record count, its batch and whether it can report a position."""
-    return Dataset(train=lambda: iter(()), val=None, records=records, batch=batch,
-                   resumable=resumable)
+def _data(records=48, batch=8):
+    """A Dataset value with nothing behind it: the intervals read only its
+    record count and its batch."""
+    return Dataset(train=lambda: iter(()), val=None, records=records, batch=batch)
 
 
 def test_an_interval_is_steps_a_pass_or_never():
@@ -222,22 +221,6 @@ def test_a_pass_over_the_data_needs_a_record_count():
         TrainerConfig().eval_interval(streaming)
     assert TrainerConfig(checkpoint_every=None).checkpoint_interval(streaming) is None
     assert TrainerConfig(checkpoint_every=5).checkpoint_interval(streaming) == 5
-
-
-def test_a_dataset_that_cannot_report_its_position_takes_no_checkpoints():
-    """The combination that used to be unreachable: an online stream keeps its
-    record count, so "epoch" resolves, and the checkpoint would then carry no
-    position. The refusal names the flag that makes the run possible."""
-    stream = _data(records=48, resumable=False)
-
-    with pytest.raises(ValueError, match=r"--trainer.checkpoint-every None"):
-        TrainerConfig().checkpoint_interval(stream)
-    with pytest.raises(ValueError, match="cannot report its read position"):
-        TrainerConfig(checkpoint_every=10).checkpoint_interval(stream)
-
-    assert TrainerConfig(checkpoint_every=None).checkpoint_interval(stream) is None
-    assert TrainerConfig(checkpoint_every=None).eval_interval(stream) == 6, (
-        "validation does not depend on a position")
 
 
 class _Bucket:

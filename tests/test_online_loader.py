@@ -24,7 +24,6 @@ import optax
 import PIL.Image
 import pytest
 
-from dew.config import TrainerConfig
 from dew.data import Loading, online_loader
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -446,13 +445,13 @@ def _run(data, *, steps, checkpoints=None, checkpoint_every=None):
                        checkpoint_every=checkpoint_every)
 
 
-def test_the_streaming_spec_says_it_cannot_report_a_position(monkeypatch, stop):
-    """The Dataset value carries the answer, so a run is refused before the
-    first step rather than after the first checkpoint interval."""
+def test_the_streaming_spec_cannot_report_a_position(monkeypatch, stop):
+    """The iterator is the single answer to whether a run can checkpoint: the
+    fetch stream carries no get_state, and `tokenized` does not invent one."""
     data = _online_spec(monkeypatch, 12, 1, stop).load(batch=4)
 
-    assert data.resumable is False
-    assert not hasattr(data.train(), "get_state")
+    stream = data.train()
+    assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
 
 
 def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch, stop):
@@ -470,15 +469,6 @@ def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, stop,
     """And the other half: the refusal is by name, before any training."""
     data = _online_spec(monkeypatch, 24, 6, stop).load(batch=8)
 
-    with pytest.raises(ValueError, match="report its read position"):
+    with pytest.raises(ValueError, match=r"checkpoint_every=None"):
         _run(data, steps=6, checkpoints=Checkpoints(str(tmp_path / "ckpt")),
              checkpoint_every=2)
-
-
-def test_the_streaming_spec_is_refused_by_the_run_config(monkeypatch, stop):
-    """What a recipe user sees: the flag that makes the run possible."""
-    data = _online_spec(monkeypatch, 12, 1, stop).load(batch=4)
-
-    with pytest.raises(ValueError, match=r"--trainer.checkpoint-every None"):
-        TrainerConfig().checkpoint_interval(data)
-    assert TrainerConfig(checkpoint_every=None).checkpoint_interval(data) is None
