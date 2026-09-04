@@ -42,9 +42,11 @@ class TextContext:
 
 def masked_mean(x, mask):
     """The mean of `x` `[B, L, D]` over L, counting only the rows `mask`
-    `[B, L]` marks; a padded row moves nothing."""
+    `[B, L]` marks; a padded row moves nothing, and a row with no real
+    tokens at all contributes zero."""
     weights = jnp.asarray(mask, x.dtype)[:, :, None]
-    return jnp.sum(x * weights, axis=1) / jnp.sum(weights, axis=1)
+    counted = jnp.sum(weights, axis=1)
+    return jnp.sum(x * weights, axis=1) / jnp.maximum(counted, 1)
 
 
 def scan_indices(scan_order: str, H_P: int, W_P: int):

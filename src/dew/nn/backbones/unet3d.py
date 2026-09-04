@@ -94,7 +94,7 @@ class UNet3D(nn.Module):
             self.conv_out_norm = norm()
 
     @nn.compact
-    def __call__(self, x, temb, textcontext, train: bool = False):
+    def __call__(self, x, temb, textcontext=None, train: bool = False):
         B, T, H, W, C = x.shape
         x = x.reshape(B * T, H, W, C)
         temb = jnp.repeat(temb, T, axis=0)
