@@ -109,7 +109,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class RoPEAttention(NormalAttention):
-    rope_emb: RotaryEmbedding = None
+    rope_emb: Optional[RotaryEmbedding] = None
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None):

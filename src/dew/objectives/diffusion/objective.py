@@ -190,4 +190,7 @@ class DiffusionObjective(Objective):
             if captions:
                 break
         samples = self._sample(params, tokens, step.key, count=count)
+        # An Objective may produce no artifact; this one always produces a
+        # grid, chosen from the sample field's rank in __init__.
+        assert self.artifact is not None
         return self.artifact(samples, captions)

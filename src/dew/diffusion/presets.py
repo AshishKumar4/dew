@@ -7,6 +7,7 @@ with, and a record that holds the preset's fields rebuilds it exactly.
 """
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import (
@@ -18,6 +19,14 @@ from dew.diffusion.transforms import (
     MinSNR, ScheduleWeighting, VPredictionTransform, Weighting,
 )
 from dew.registry import presets
+
+
+@runtime_checkable
+class Preset(Protocol):
+    """What every member of the `presets` registry is: a frozen dataclass of a
+    convention's numbers, callable to the `Process` it describes."""
+
+    def __call__(self) -> Process: ...
 
 
 def _weighting(min_snr_gamma: float | None) -> Weighting:
