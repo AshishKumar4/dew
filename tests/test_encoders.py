@@ -63,7 +63,7 @@ def test_audio_encoder_passes_extractor_keys_through(feature_key):
 def test_the_audio_loader_says_what_it_cannot_do():
     """transformers 5 removed FlaxAutoModel, and a torch model would fail on
     the numpy arrays tokenize produces. The loader refuses up front, names the
-    model, and says what would make it work; a manifest that names an audio
+    model, and says what would make it work; a run record that names an audio
     encoder takes the same path, so a logged config cannot half-build one."""
     with pytest.raises(NotImplementedError, match="vendor"):
         Audio.from_pretrained("facebook/wav2vec2-base-960h")

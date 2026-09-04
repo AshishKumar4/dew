@@ -19,6 +19,7 @@ class does not have, or one the file lacks, raises.
 import dataclasses
 import json
 import os
+import types
 import typing
 from typing import Annotated, Any, Literal, Mapping, Optional, Self
 
@@ -183,6 +184,11 @@ def _rebuild(annotation, value):
         return member(**_fields(member, value["fields"]))
     if dataclasses.is_dataclass(annotation):
         return annotation(**_fields(annotation, value))
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        inner = [m for m in typing.get_args(annotation) if m is not type(None)]
+        if value is None or len(inner) != 1:
+            return value
+        return _rebuild(inner[0], value)
     return value
 
 

@@ -1,81 +1,61 @@
 """Inference: a run directory through to a sample.
 
-A run writes its manifest next to its checkpoints; `TextToImage.from_run`
-rebuilds the model, the process, the inputs and the weights from those two
-things alone, and `from_pretrained` is the same on a pulled hub snapshot.
-Everything here drives the real pipeline from a checkpoint the trainer has
-just written.
+A run writes its resolved config as `run.json` next to its checkpoints;
+`TextToImage.from_run` builds the objective from it the way the recipe did
+and restores the weights, and `from_pretrained` is the same on a pulled hub
+snapshot. Everything here drives the real pipeline from a checkpoint the
+trainer has just written.
 """
 
 import dataclasses
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
 import dew.nn.backbones  # registers the models
-from dew.data import Dataset
+from dew.artifacts import VideoGrid
+from dew.config import ModelConfig, TrainerConfig
+from dew.data import Dataset, OxfordFlowers
+from dew.data.video import VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
-from dew.interop.manifest import Manifest
-from dew.nn.dit import TextContext
+from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionObjective
-from dew.registry import encoders, models, presets
+from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
+from dew.registry import presets, samplers
+from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 from dew.sampling import CFG, Heun, TextToImage
-from dew.sampling import pipelines
 from dew.training import Checkpoints, Trainer
 
 RES = 8
-TOKENS = 5
-FEATURES = 6
-VOCAB = 11
 MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-@encoders("stub_text")
-@dataclass(frozen=True, eq=False)
-class StubText(ConditionEncoder):
-    """A table lookup standing in for CLIP, rebuilt from its manifest fields
-    the way the real encoder is."""
-
-    checkpoint: str
-    params: dict
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, **fields):
-        seed = int(checkpoint.rsplit("-", 1)[-1])
-        return cls(checkpoint=checkpoint, params={"table": jnp.asarray(
-            np.random.RandomState(seed).normal(size=(VOCAB, FEATURES)).astype(np.float32))})
-
-    def tokenize(self, texts):
-        ids = np.zeros((len(texts), TOKENS), np.int32)
-        mask = np.zeros((len(texts), TOKENS), np.int32)
-        for row, text in enumerate(texts):
-            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-    def encode(self, params, tokens):
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint}
+def run_config(directory, preset=presets.EDM()):
+    """The resolved config of a tiny conditional DiT run in `directory`; the
+    text condition names the registered stub encoder."""
+    return DiffusionRunConfig(
+        model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
+        data=OxfordFlowers(image_size=RES),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
+        preset=preset, sampler=samplers.Euler(), sampling_steps=3,
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"))
 
 
-def make_run(directory, preset=presets.EDM(), seed=3):
-    """One training step of the tiny conditional DiT, its checkpoint and its
-    manifest in `directory`, as a recipe leaves them."""
-    inputs = InputSpec(Field("image", (RES, RES, 3)),
-                       {"textcontext": Condition(StubText.from_pretrained(f"stub-{seed}"))})
-    objective = DiffusionObjective(models.SimpleDiT(**MODEL), preset(), inputs)
-    encoder = inputs.conditions["textcontext"].encoder
+def make_run(directory, preset=presets.EDM()):
+    """Two training steps of the tiny conditional DiT, its checkpoint and its
+    `run.json` in `directory`, as the recipe leaves them: the objective is
+    the config's own build."""
+    config = run_config(directory, preset)
+    objective = config.build()
+    encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
                      (8, 1, RES, 3)).astype(np.uint8)
     batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
@@ -103,24 +83,19 @@ def make_run(directory, preset=presets.EDM(), seed=3):
     state = trainer.fit(Dataset(train=Stream, val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
-    Manifest(
-        config={"run": "test"},
-        model={"name": "simple_dit", "fields": MODEL},
-        inputs=inputs.to_json(),
-        preset={"name": presets.name_of(type(preset)), "fields": dataclasses.asdict(preset)},
-        autoencoder=None,
-    ).write(str(directory))
+    config.save(str(directory))
     return objective, state
 
 
 def test_pipeline_generates_from_a_run_directory(tmp_path):
-    """The whole offline path: the manifest and checkpoint a run wrote, the
+    """The whole offline path: the run.json and checkpoint a run wrote, the
     model, process, inputs and weights rebuilt from them, and a sample out."""
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     assert type(pipe.model).__name__ == "SimpleDiT" and pipe.model.emb_features == 16
+    assert pipe.model.output_channels == 3
     assert pipe.inputs.sample == Field("image", (RES, RES, 3))
-    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-3"
+    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
 
     images = pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0,
                   key=jax.random.PRNGKey(0))
@@ -144,14 +119,14 @@ def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
         np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
     assert not all(np.allclose(np.asarray(a), np.asarray(b)) for a, b in zip(
         jax.tree.leaves(pipe.params["params"]), jax.tree.leaves(live.params["params"])))
-    # the frozen encoder's table is the manifest's, not something re-drawn
+    # the frozen encoder's table is the run's, not something re-drawn
     np.testing.assert_array_equal(
         np.asarray(pipe.params["encoders"]["textcontext"]["table"]),
         np.asarray(objective.inputs.conditions["textcontext"].encoder.params["table"]))
 
 
 def test_from_run_rebuilds_the_training_process_exactly(tmp_path):
-    """The manifest holds the preset's fields, so inference samples with the
+    """run.json holds the preset's fields, so inference samples with the
     shift the run trained with and not the preset default."""
     make_run(tmp_path, preset=presets.Flow(shift=3.0, logit_mean=0.5))
     pipe = TextToImage.from_run(str(tmp_path))
@@ -166,7 +141,7 @@ def test_from_pretrained_is_from_run_on_the_pulled_snapshot(tmp_path, monkeypatc
     import dew.interop.hub as hub
     monkeypatch.setattr(hub, "pull_from_hub", lambda repo_id, revision=None: tmp_path)
     pipe = TextToImage.from_pretrained("user/flowers-dit")
-    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-3"
+    assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
 
 
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
@@ -186,7 +161,59 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
                           pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key))
 
 
-def test_an_autoencoder_without_a_loader_is_refused():
-    with pytest.raises(ValueError, match="simple_autoencoder"):
-        pipelines.load_autoencoder({"name": "simple_autoencoder", "fields": {}})
-    assert pipelines.load_autoencoder(None) is None
+def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
+    """A run.json from another objective, or with a knob this class lacks,
+    raises instead of building something other than what was trained."""
+    config = run_config(tmp_path)
+    record = config.to_dict()
+    record["sampler_steps"] = 3
+    with pytest.raises(ValueError, match="sampler_steps"):
+        DiffusionRunConfig.from_dict(record)
+    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
+
+
+def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
+    config = dataclasses.replace(run_config(tmp_path), text=None)
+    objective = DiffusionRunConfig.from_dict(config.to_dict()).build()
+    assert objective.inputs.conditions == {}
+    assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
+
+
+def test_build_eval_metrics_follows_the_sample_field(tmp_path):
+    """A video run scores its `VideoGrid` against its `video` field: the
+    factories read that grid there, and the image-only metrics are refused
+    by name instead of failing in the trainer."""
+    video = dataclasses.replace(run_config(tmp_path),
+                                data=VideoDataset(frame_size=8, frames=2),
+                                val_metrics=["psnr"])
+    (metric,) = video.build_eval_metrics()
+    assert metric.reads is VideoGrid
+    images = np.zeros((2, 2, 8, 8, 3), np.uint8)
+    assert np.isinf(metric(VideoGrid(unit_range(images)), {"video": images}))
+    with pytest.raises(ValueError, match="clip"):
+        dataclasses.replace(video, val_metrics=["clip"]).build_eval_metrics()
+
+
+def test_the_autoencoder_record_carries_its_revision(tmp_path):
+    """A run trained with a non-default VAE revision rebuilds from its
+    record; the revision used to fall out of the dataclass entirely."""
+    config = dataclasses.replace(
+        run_config(tmp_path),
+        autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
+    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
+
+
+def test_a_fresh_process_resolves_metrics_and_models_through_the_config():
+    """The recipe runs in a process that imports nothing else first: the
+    registries the config builds from fill on its import alone. `psnr` is
+    pure, so resolving it proves the point without downloading weights."""
+    root = Path(__file__).resolve().parents[1]
+    code = ("from dew.objectives.diffusion.config import DiffusionRunConfig;"
+            "from dew.registry import metrics, models;"
+            "print(metrics['psnr']().name, 'simple_dit' in models)")
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        env={"PYTHONPATH": str(root / "src"), "JAX_PLATFORMS": "cpu",
+             "PATH": os.environ.get("PATH", "")})
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == "psnr True"

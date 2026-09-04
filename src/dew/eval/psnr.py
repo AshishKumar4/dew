@@ -6,6 +6,7 @@ to (B*T, H, W, C) and every frame scores independently.
 
 import jax.numpy as jnp
 
+from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.registry import metrics
 from .common import ImageMetric, frames
@@ -50,15 +51,16 @@ def peak_signal_noise_ratio(
 
 
 @metrics("psnr")
-def psnr(data_range: float = 2.0, field: str = "image") -> ImageMetric:
+def psnr(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid) -> ImageMetric:
     """Mean PSNR in dB between the sampled frames and the batch's, higher is
     better.
 
     The artifact is in [-1, 1] and the batch holds uint8 pixels, which are
     put on the objective's scale, so both sides span the range that the
-    default data_range of 2.0 describes.
+    default data_range of 2.0 describes. `reads` names the artifact type the
+    trainer hands this metric; a video run passes `VideoGrid`.
     """
     def measure(artifact, batch):
         return peak_signal_noise_ratio(frames(artifact), unit_range(batch[field]), data_range)
 
-    return ImageMetric(name="psnr", measure=measure)
+    return ImageMetric(name="psnr", measure=measure, reads=reads)

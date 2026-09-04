@@ -39,6 +39,23 @@ def test_latent_normalization_defaults_to_the_identity(rng):
     assert jnp.allclose(autoencoder.decode(x), x)
 
 
+def test_the_vae_loader_receives_the_revision(monkeypatch):
+    """`StableDiffusionVAE(revision=...)` used to keep the revision for its
+    record while the loader always read the default, so a non-default run
+    could never rebuild."""
+    import dew.nn.autoencoders.sd_vae as sd_vae
+    seen = {}
+
+    def refuse(modelname, revision="bf16"):
+        seen["revision"] = revision
+        raise RuntimeError("no download in this test")
+
+    monkeypatch.setattr(sd_vae, "load_pretrained_vae", refuse)
+    with pytest.raises(RuntimeError, match="no download"):
+        sd_vae.StableDiffusionVAE(revision="flax")
+    assert seen["revision"] == "flax"
+
+
 @pytest.mark.parametrize("shape", [(2, 8, 8, 4), (2, 3, 8, 8, 4)])
 def test_latent_normalization_shifts_and_scales_roundtrip(rng, shape):
     """SD3-style shift+scale: latents come out centred and rescaled, and
