@@ -32,7 +32,7 @@ from dew.interop.hf_decoders import (
     load_pretrained_decoder, save_pretrained_decoder, translate_config,
     translate_weights,
 )
-from dew.registry import apply_precision_policy, build_model
+from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
@@ -63,7 +63,7 @@ def test_qwen3_config_translates_field_by_field():
         'num_kv_heads': 2, 'head_dim': 16, 'mlp': 'swiglu', 'mlp_features': 128,
         'max_seq_len': 64, 'rope_theta': 1e6, 'rope_local_theta': None,
         'layer_types': ('full_attention', 'full_attention'), 'sliding_window': None,
-        'norm_eps': 1e-6, 'qk_norm': True, 'attention_bias': False,
+        'norm_eps': 1e-6, 'scale_after_cast': True, 'qk_norm': True, 'attention_bias': False,
         'tie_embeddings': True,
     }
 
@@ -158,9 +158,9 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
 def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
     """Same paths, same shapes, same dtypes as a freshly initialised model."""
     config = translate_config(fixture_config(name))
-    built = apply_precision_policy('causal_transformer', dict(config),
+    built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
-    model = build_model('causal_transformer', built)
+    model = models.build('causal_transformer', **built)
     initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
 
     from dew.interop.hf_decoders import _load_shards
@@ -262,9 +262,9 @@ def biased_qwen3(rng):
     through the round-trip, so every bias gets its own draw.
     """
     config = {**translate_config(fixture_config("qwen3-tiny")), 'attention_bias': True}
-    built = apply_precision_policy('causal_transformer', dict(config),
+    built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
-    model = build_model('causal_transformer', built)
+    model = models.build('causal_transformer', **built)
     leaves, structure = jax.tree_util.tree_flatten_with_path(
         model.init(rng, jnp.zeros((1, 4), jnp.int32)))
     return model, jax.tree_util.tree_unflatten(structure, [
@@ -301,9 +301,9 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
 
     table = json.loads((REAL / "tensors.json").read_text())
     config = translate_config(json.loads((REAL / "config.json").read_text()))
-    built = apply_precision_policy('causal_transformer', dict(config),
+    built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
-    model = build_model('causal_transformer', built)
+    model = models.build('causal_transformer', **built)
 
     expected = {}
     for name, info in table['tensors'].items():

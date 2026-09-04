@@ -289,3 +289,19 @@ def test_the_fixture_holds_the_inputs_the_generator_names(generator):
         assert np.array_equal(fixture[name], expected), name
     assert fixture["gamma"] == np.float32(generator.GAMMA)
     assert fixture["lam"] == np.float32(generator.LAM)
+
+
+def test_gae_walks_a_reward_back_through_a_masked_hole():
+    """A masked step passes the running advantage through unchanged, so a
+    reward behind a hole in the mask still reaches the live step before it.
+    Every mask in the parity fixtures is a prefix of ones; this is the case
+    where dropping the passthrough term (`advantage = candidate * keep`)
+    survives them all and changes real answers: verl's own loop gives
+    [1, 1, 1] here, the mutant [0, 0, 1]."""
+    rewards = jnp.asarray([[0.0, 0.0, 1.0]])
+    values = jnp.zeros((1, 3))
+    mask = jnp.asarray([[1, 0, 1]])
+    advantages, returns = gae(rewards, values, mask, gamma=1.0, lam=1.0)
+    np.testing.assert_allclose(np.asarray(returns), [[1.0, 1.0, 1.0]], atol=1e-6)
+    # Whitening over two live steps of equal return leaves them equal.
+    assert float(advantages[0, 0]) == pytest.approx(float(advantages[0, 2]))
