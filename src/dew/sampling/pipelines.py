@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -64,7 +65,13 @@ class TextToImage:
         autoencoder = load_autoencoder(manifest.autoencoder)
         objective = DiffusionObjective(model, process, inputs, autoencoder=autoencoder)
 
-        abstract = jax.eval_shape(objective.init, jax.random.key(0))
+        # Only shapes are traced, so the key is abstract too. Inference runs
+        # on one process, so every leaf lands on the first device and the
+        # sampling jit moves it from there.
+        device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        abstract = jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=device),
+            jax.eval_shape(objective.init, jax.ShapeDtypeStruct((2,), jnp.uint32)))
         template = {"params": abstract}
         if ema:
             template["ema"] = select(abstract, objective.ema.select)
@@ -81,7 +88,7 @@ class TextToImage:
         `dew.interop.hub.push_to_hub` writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(pull_from_hub(repo_id), ema=ema)
+        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema)
 
     @property
     def latent_shape(self) -> tuple[int, ...]:

@@ -267,7 +267,6 @@ class LMObjective(Objective):
         return jax.jit(scored)
 
 
-@metrics("perplexity")
 class Perplexity:
     """exp of the cross entropy per counted target over a whole pass.
 
@@ -290,3 +289,8 @@ class Perplexity:
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))
+
+
+@metrics("perplexity")
+def perplexity() -> Perplexity:
+    return Perplexity()

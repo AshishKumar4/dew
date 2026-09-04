@@ -201,12 +201,12 @@ process = presets.EDM(sigma_data=0.5)()
 class Solver(Protocol):
     State: type                                              # () for one-step solvers; history for multistep
     def init(self, x) -> State: ...
-    def step(self, x, t, t_next, denoised, eps, state, key, process) -> tuple[Array, State]: ...
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise) -> tuple[Array, State]: ...
 
 samples = sample(denoise, x_T, steps, solver=samplers.Heun(), guidance=CFG(4.0, interval=(0.4, 0.6)), key=key)
 ```
 
-`sample` is one `lax.scan`. `denoise` is `process.denoiser(model, params, conditions)`; `CFG` wraps a denoiser. No tqdm, no default seed, no `self.history`, no ignored arguments in subclass signatures. A solver states which schedules it integrates (`e25bba9` added that guard to the two sigma integrators).
+`sample` is one `lax.scan`. `denoise` is `process.denoiser(model, params, conditions)`; `CFG` wraps a denoiser. No tqdm, no default seed, no `self.history`, no ignored arguments in subclass signatures. A solver states which schedules it integrates (`e25bba9` added that guard to the two sigma integrators). As built, `step` takes the denoiser as its last argument, which the first draft of this signature left out: Heun's corrector and RK4's stages evaluate the model again inside one step, and the one-evaluation solvers ignore it.
 
 ### 3.6 Inputs and conditioning
 

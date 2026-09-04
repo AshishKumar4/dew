@@ -20,7 +20,7 @@ from typing import Mapping
 import jax
 import jax.numpy as jnp
 
-from dew.registry import encoders
+from dew import registry
 from .encoders import Audio, CLIPText, ConditionEncoder
 
 
@@ -50,7 +50,7 @@ class Condition:
     unconditional: str | float = ""
 
     def to_json(self) -> dict:
-        return {"encoder": {"name": encoders.name_of(type(self.encoder)),
+        return {"encoder": {"name": registry.encoders.name_of(type(self.encoder)),
                             "fields": self.encoder.to_json()},
                 "field": self.field,
                 "unconditional": self.unconditional}
@@ -58,7 +58,7 @@ class Condition:
     @classmethod
     def from_json(cls, data: Mapping) -> "Condition":
         encoder = data["encoder"]
-        return cls(encoder=encoders[encoder["name"]].from_pretrained(**encoder["fields"]),
+        return cls(encoder=registry.encoders[encoder["name"]].from_pretrained(**encoder["fields"]),
                    field=data["field"], unconditional=data["unconditional"])
 
 

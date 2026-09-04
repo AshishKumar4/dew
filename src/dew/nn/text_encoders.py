@@ -1,10 +1,9 @@
 """The CLIP towers as linen modules, and their Hugging Face weights.
 
 transformers 5 removed every Flax class, `FlaxCLIPTextModel` and
-`FlaxCLIPModel` among them, so the loader `CLIPTextEncoder.from_modelname`
-reached for on `backend="jax"` does not exist any more and text conditioning
-could not run at all, and the CLIP metrics in `dew.eval.images` died the same
-way. This is the decision the Stable Diffusion VAE already took in
+`FlaxCLIPModel` among them, so the loader the text conditioning encoder
+reached for does not exist any more and text conditioning could not run at
+all, and the CLIP metrics in `dew.eval.images` died the same way. This is the decision the Stable Diffusion VAE already took in
 `dew/nn/autoencoders/vae.py` when diffusers dropped Flax: vendor the modules,
 keep the reference layout, read the weights ourselves.
 
@@ -552,9 +551,10 @@ def _read_config(directory: Path) -> Dict[str, Any]:
 class CLIPTextModel:
     """A CLIP text tower with its weights, callable the way the encoder calls it.
 
-    This is what `dew.inputs.encoders.CLIPTextEncoder` holds on the jax backend,
-    in the place `FlaxCLIPTextModel` used to take: call it with `input_ids` and
-    the tokenizer's `attention_mask`, read `last_hidden_state` off the result.
+    This is what `dew.inputs.encoders.CLIPText.from_pretrained` loads its
+    tower and weights from, in the place `FlaxCLIPTextModel` used to take:
+    call it with `input_ids` and the tokenizer's `attention_mask`, read
+    `last_hidden_state` off the result.
     """
 
     def __init__(self, transformer: CLIPTextTransformer, variables, config):
