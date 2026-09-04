@@ -30,9 +30,6 @@ dependencies = [
     "transformers",
     "huggingface_hub",
     "wandb",
-    # diffusers removed all Flax support upstream (huggingface/diffusers#14169);
-    # only needed for the diffusers_unet_simple architecture, the VAE is vendored
-    "diffusers>=0.29,<0.35",
 ]
 license = "MIT"
 
