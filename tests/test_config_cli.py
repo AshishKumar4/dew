@@ -14,7 +14,6 @@ import tyro
 
 from dew.config import ModelConfig, RunConfig
 from dew.data import Dataset, OxfordFlowers, PackedTokens, TokenWindows
-from dew.inputs import Condition, Field, InputSpec
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
 from test_diffusion_objective import RES, TOKENS, StubText
@@ -125,15 +124,14 @@ def _batches(batch):
     return lambda: _Batches(batch)
 
 
-def test_the_diffusion_entrypoint_runs_without_a_tracker_and_writes_its_manifest(tmp_path, monkeypatch):
+def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
     recipe = load_recipe("diffusion")
     batch = 8
     data = Dataset(train=_batches(batch), val=lambda: itertools.islice(_batches(batch)(), 1),
                    records=4 * batch, batch=batch)
     monkeypatch.setattr(OxfordFlowers, "load", lambda self, *, batch: data)
-    monkeypatch.setattr(recipe, "build_inputs", lambda config: InputSpec(
-        Field("image", (RES, RES, 3)), {"textcontext": Condition(StubText.from_pretrained("stub"))}))
     config = parse(recipe.DiffusionRunConfig, [
+        "--text.encoder", "stub_text", "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
@@ -145,10 +143,9 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_writes_its_manifest
     state = recipe.main(config)
 
     assert int(state.step) == 2
-    manifest = json.loads((tmp_path / "run" / "manifest.json").read_text())
-    assert manifest["preset"] == {"name": "edm", "fields": {
+    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == config
+    assert config.to_dict()["preset"] == {"name": "edm", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "P_mean": -0.4, "P_std": 1.0, "min_snr_gamma": None}}
-    assert manifest["model"]["fields"]["output_channels"] == 3
-    assert recipe.DiffusionRunConfig.from_dict(manifest["config"]) == config
+    assert config.model_fields(None)["output_channels"] == 3
     assert (tmp_path / "run" / "2").is_dir()

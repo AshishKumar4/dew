@@ -28,7 +28,6 @@ import tyro
 import dew.io
 from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
-from dew.interop.manifest import Manifest
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import datasets, metrics, models
 from dew.training import (Checkpoints, Profile, Trainer, TrainState, WandbTracker,
@@ -245,10 +244,8 @@ def main(config: LmRunConfig) -> TrainState:
                                 "tokens": meta.get('train_tokens')},
                     "steps": steps})
 
-    Manifest(config=run_config,
-             model={"name": config.model.architecture, "fields": fields}).write(directory)
-
     checkpoints = Checkpoints(directory, keep=config.trainer.keep)
+    config.save(checkpoints.directory)
     trainer = Trainer(
         objective, build_optimizer(config.optim, steps),
         key=jax.random.key(config.trainer.seed),
