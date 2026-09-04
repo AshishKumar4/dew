@@ -3,8 +3,9 @@
 A record is a video file and a caption; the transform reads `frames` frames
 from a random offset with the audio around them, resizes the frames and
 featurises the audio for the audio model. Records leave as
-`{"video": uint8 [frames, size, size, 3], "text": {...}, "audio": {...}}`,
-with the audio model's own feature keys next to the raw waveforms. The AV
+`{"video": uint8 [frames, size, size, 3], "caption": str, "audio": {...}}`,
+with the audio model's own feature keys next to the raw waveforms;
+`load(tokenize=)` is where a run's condition reads the captions. The AV
 readers and the audio processor are imported on use.
 """
 
@@ -19,8 +20,9 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, hold_out, local_batch, train_stream, validation_pass
-from .processors import AutoAudioProcessor, AutoTextTokenizer
+from .dataset import (CAPTION, Dataset, DatasetSpec, hold_out, local_batch, tokenized,
+                      train_stream, validation_pass)
+from .processors import AutoAudioProcessor
 
 
 def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
@@ -35,11 +37,10 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
 
 
 class AudioVideoTransform(pygrain.RandomMapTransform):
-    """One clip per record: frames, their audio, and the tokenized caption."""
+    """One clip per record: frames, their audio, and the record's caption."""
 
     def __init__(self, spec: "VideoDataset"):
         self.spec = spec
-        self.tokenize = AutoTextTokenizer(tensor_type="np")
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 
     def random_map(self, element, rng: np.random.Generator) -> dict[str, Any]:
@@ -56,16 +57,12 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
             import cv2
             frames = np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
                                for frame in frames])
-        tokens = self.tokenize(element["caption"])
         # Key names differ per audio model, so the processor's output passes
         # through untouched.
         features = self.audio(full_audio)
         return {
             "video": frames,
-            "text": {
-                "input_ids": tokens["input_ids"][0],
-                "attention_mask": tokens["attention_mask"][0],
-            },
+            CAPTION: element["caption"],
             "audio": {
                 **{key: value[0] for key, value in features.items()},
                 "full_audio": full_audio,
@@ -101,7 +98,7 @@ class VideoDataset(DatasetSpec):
         """One `{"video_path", "caption"}` record per clip, in a fixed order."""
         raise NotImplementedError
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize=None) -> Dataset:
         source = self.source()
         name = type(self).__name__
         records = len(source) if self.count is None else self.count
@@ -112,8 +109,9 @@ class VideoDataset(DatasetSpec):
                      read_threads=self.read_threads, read_buffer=self.read_buffer,
                      worker_buffer=self.worker_buffer)
         return Dataset(
-            train=train_stream(train, [AudioVideoTransform(self)], **knobs),
-            val=None if val is None else validation_pass(val, [AudioVideoTransform(self)], **knobs),
+            train=tokenized(train_stream(train, [AudioVideoTransform(self)], **knobs), tokenize),
+            val=None if val is None else tokenized(
+                validation_pass(val, [AudioVideoTransform(self)], **knobs), tokenize),
             records=len(train),
             batch=batch,
         )

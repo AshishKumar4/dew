@@ -14,6 +14,7 @@ import tyro
 
 from dew.config import ModelConfig, RunConfig
 from dew.data import Dataset, OxfordFlowers, PackedTokens, TokenWindows
+from dew.data.dataset import tokenized
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
 from test_diffusion_objective import RES, TOKENS, StubText
@@ -98,7 +99,11 @@ def test_steps_and_epochs_are_one_choice():
 
 
 class _Batches:
-    """Endless captioned noise batches that report a position, like grain's."""
+    """Endless captioned noise batches that report a position, like grain's.
+
+    The captions leave as text, the way a dataset writes them; what turns
+    them into tokens is the run's condition, through `tokenized`.
+    """
 
     def __init__(self, batch):
         self.batch, self.count = batch, 0
@@ -110,8 +115,7 @@ class _Batches:
         self.count += 1
         rng = np.random.RandomState(self.count)
         return {"image": rng.randint(0, 256, (self.batch, RES, RES, 3), np.uint8),
-                "text": {"input_ids": np.ones((self.batch, TOKENS), np.int32),
-                         "attention_mask": np.ones((self.batch, TOKENS), np.int32)}}
+                "caption": np.asarray(["a flower"] * self.batch)}
 
     def get_state(self):
         return json.dumps({"count": self.count}).encode()
@@ -127,9 +131,12 @@ def _batches(batch):
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
     recipe = load_recipe("diffusion")
     batch = 8
-    data = Dataset(train=_batches(batch), val=lambda: itertools.islice(_batches(batch)(), 1),
-                   records=4 * batch, batch=batch)
-    monkeypatch.setattr(OxfordFlowers, "load", lambda self, *, batch: data)
+    def load(self, *, batch, tokenize=None):
+        return Dataset(train=tokenized(_batches(batch), tokenize),
+                       val=tokenized(lambda: itertools.islice(_batches(batch)(), 1), tokenize),
+                       records=4 * batch, batch=batch)
+
+    monkeypatch.setattr(OxfordFlowers, "load", load)
     config = parse(recipe.DiffusionRunConfig, [
         "--text.encoder", "stub_text", "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
