@@ -54,16 +54,20 @@ class Dataset:
 
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
-    is int32 ids under "text". Grain-backed iterators carry `get_state` and
-    `set_state`, which is what a checkpoint records the run's position with;
-    a stream without them cannot resume mid-epoch, and the trainer refuses
-    to checkpoint one.
+    is int32 ids under "text".
+
+    `resumable` is the dataset's own answer to whether a checkpoint can
+    record the run's position: grain-backed iterators carry `get_state` and
+    `set_state`, a fetch-as-you-go stream carries neither. A run over a
+    dataset that answers False either never checkpoints or is refused, so
+    nobody discovers mid-run that a resume would replay the data.
     """
 
     train: Callable[[], Iterator[Batch]]
     val: Callable[[], Iterator[Batch]] | None
     records: int | None
     batch: int
+    resumable: bool = True
 
     @property
     def steps_per_epoch(self) -> int | None:

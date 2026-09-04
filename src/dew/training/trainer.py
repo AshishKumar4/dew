@@ -335,6 +335,16 @@ class Trainer:
         if current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
+        if checkpoint_every:
+            if self.checkpoints is None:
+                raise ValueError(
+                    "checkpoint_every asks for checkpoints and this trainer has "
+                    "none; build it with checkpoints=Checkpoints(directory)")
+            if not data.resumable:
+                raise ValueError(
+                    "checkpoint_every needs a dataset that can report its read "
+                    "position, and this one says it cannot; a checkpoint written "
+                    "without the data position would replay the data on resume")
         source = data.train()
         if checkpoint_every and not hasattr(source, "get_state"):
             raise ValueError(

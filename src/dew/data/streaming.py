@@ -57,7 +57,7 @@ class OnlineImages(DatasetSpec):
             )
 
         return Dataset(train=tokenized(stream, tokenize), val=None,
-                       records=len(rows), batch=batch)
+                       records=len(rows), batch=batch, resumable=False)
 
 
 @datasets("combined_online")

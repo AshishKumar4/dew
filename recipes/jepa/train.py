@@ -172,7 +172,8 @@ def main(config: JepaRunConfig) -> TrainState:
                     "steps": steps})
 
     checkpoints = Checkpoints(directory, keep=config.trainer.keep)
-    config.save(checkpoints.directory)
+    if jax.process_index() == 0:
+        config.save(checkpoints.directory)
     trainer = Trainer(
         objective, build_optimizer(config.optim, steps),
         key=jax.random.key(config.trainer.seed),
@@ -189,12 +190,12 @@ def main(config: JepaRunConfig) -> TrainState:
     state = trainer.fit(
         data, steps=steps,
         log_every=config.trainer.log_every,
-        eval_every=config.trainer.eval_every or data.steps_per_epoch,
-        checkpoint_every=config.trainer.checkpoint_every or data.steps_per_epoch,
+        eval_every=config.trainer.eval_interval(data),
+        checkpoint_every=config.trainer.checkpoint_interval(data),
         metrics=probes,
     )
     print(f"Training finished in {time.time() - start:.0f}s")
-    if tracker is not None:
+    if tracker is not None and jax.process_index() == 0:
         dew.io.publish(checkpoints.path(checkpoints.latest), re.sub(r"[^\w.-]", "-", name),
                        tracker=tracker)
     return state
