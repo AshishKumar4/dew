@@ -1,90 +1,34 @@
-"""Data layer for Dew: sources, augmenters and dataset loaders.
+"""Data for a run: dataset specs, the `Dataset` value they load, tokenizers.
 
-Importing this package is deliberately cheap. The data layer's heavy
-dependencies (HF `datasets`, opencv, torch, decord/pyav, tensorflow_datasets)
-are pulled in only when a name is actually used, so `import dew.data`
-works on hosts that have none of them installed - a training run that only
-needs the grain pipelines never pays for the streaming stack, and vice versa.
+A dataset is a frozen dataclass behind `@datasets(name)`, and `load(batch=)`
+turns it into a `Dataset` of batch iterators:
 
-Names below resolve on first access via PEP 562 module `__getattr__`; import a
-submodule directly (`from dew.data.dataloaders import get_dataset_grain`)
-when you want the dependency error eagerly.
+    data = datasets.OxfordFlowers(image_size=128).load(batch=32)
+    steps = epochs * data.steps_per_epoch
+
+Importing this package registers every dataset and costs none of the heavy
+dependencies: cv2, albumentations, tensorflow_datasets, HF `datasets`, the
+AV readers and `transformers` are imported by a spec on use, so a host that
+only needs the token loaders never pays for the image stack, and vice versa.
 """
 
-import importlib
+from .dataset import Batch, Dataset, DatasetSpec, local_batch
+from .images import (AestheticCoyo, CC3M, CC12M, Combined30M, CombinedAesthetic,
+                     CombinedMsml612, DiffusionDB, HFImages, ImageDataset, Laion2bAesthetic,
+                     Laion12mCoco, LaionaCoco, LaionaCocoCoyo, OxfordFlowers)
+from .processors import AutoAudioProcessor, AutoTextTokenizer
+from .sources.hf import HFDatasetSource
+from .sources.text import TokenDocumentSource, TokenFileSource
+from .streaming import CombinedOnline, OnlineImages
+from .text import ByteTokenizer, HFTokenizer
+from .tokens import PackedTokens, TokenWindows
+from .video import LocalVideos, VideoDataset, VoxCeleb2
 
-# Public name -> submodule that defines it.
-_EXPORTS = {
-    # dataloaders: grain (offline) and streaming (online) dataset factories
-    "generate_collate_fn": ".dataloaders",
-    "get_dataset_grain": ".dataloaders",
-    "get_dataset_online": ".dataloaders",
-    "get_media_dataset_grain": ".dataloaders",
-    "get_media_dataset_online": ".dataloaders",
-    # online_loader: the streaming stack (needs HF datasets)
-    "ResourceManager": ".online_loader",
-    "OnlineStreamingDataLoader": ".online_loader",
-    "MediaBatchIterator": ".online_loader",
-    "dataMapper": ".online_loader",
-    "fetch_single_image": ".online_loader",
-    "fetch_single_video": ".online_loader",
-    "default_image_processor": ".online_loader",
-    "default_video_processor": ".online_loader",
-    "default_feature_extractor": ".online_loader",
-    "map_image_sample": ".online_loader",
-    "map_video_sample": ".online_loader",
-    "map_batch": ".online_loader",
-    "parallel_media_loader": ".online_loader",
-    # source/augmenter seam
-    "DataSource": ".sources.base",
-    "DataAugmenter": ".sources.base",
-    "MediaDataset": ".sources.base",
-    # image sources
-    "ImageTFDSSource": ".sources.images",
-    "ImageTFDSAugmenter": ".sources.images",
-    "ImageGCSSource": ".sources.images",
-    "CombinedImageGCSSource": ".sources.images",
-    "ImageGCSAugmenter": ".sources.images",
-    "labelizer_oxford_flowers102": ".sources.images",
-    "labelizer_record_caption": ".sources.images",
-    "image_augmenter": ".sources.images",
-    "unpack_dict_of_byte_arrays": ".sources.images",
-    "PROMPT_TEMPLATES": ".sources.images",
-    "data_source_tfds": ".sources.images",
-    "data_source_gcs": ".sources.images",
-    "data_source_combined_gcs": ".sources.images",
-    "tfds_augmenters": ".sources.images",
-    "gcs_augmenters": ".sources.images",
-    "gcs_filters": ".sources.images",
-    # hub datasets: an Arrow-backed HF dataset read through grain
-    "HFDatasetSource": ".sources.hf",
-    # video / audio-video sources
-    "VideoTFDSSource": ".sources.videos",
-    "VideoLocalSource": ".sources.videos",
-    "AudioVideoAugmenter": ".sources.videos",
-    "gather_video_paths": ".sources.videos",
-    "gather_video_paths_iter": ".sources.videos",
-    "VoxCeleb2Source": ".sources.voxceleb2",
-    # text / language-model data
-    "get_token_dataset_grain": ".dataloaders",
-    "get_packed_token_dataset_grain": ".dataloaders",
-    "TokenFileSource": ".sources.text",
-    "TokenDocumentSource": ".sources.text",
-    "ByteTokenizer": ".text",
-    "HFTokenizer": ".text",
-}
-
-__all__ = sorted(_EXPORTS)
-
-
-def __getattr__(name: str):
-    module_name = _EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(importlib.import_module(module_name, __name__), name)
-    globals()[name] = value  # first access only; later lookups skip __getattr__
-    return value
-
-
-def __dir__():
-    return __all__
+__all__ = [
+    "AestheticCoyo", "AutoAudioProcessor", "AutoTextTokenizer", "Batch", "ByteTokenizer",
+    "CC12M", "CC3M", "Combined30M", "CombinedAesthetic", "CombinedMsml612", "CombinedOnline",
+    "Dataset", "DatasetSpec", "DiffusionDB", "HFDatasetSource", "HFImages", "HFTokenizer",
+    "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
+    "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "TokenDocumentSource",
+    "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "local_batch",
+]
