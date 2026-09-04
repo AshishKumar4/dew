@@ -188,9 +188,9 @@ Two fields deserve attention because Dew has no equivalent. `init_transform: che
 
 ### What Dew should do about it
 
-Not adopt. Kauldron requires Python 3.12 while Dew supports 3.11, it is a Copybara export with the API stability that implies, and its `Trainer` is a peer of `ObjectiveTrainer` rather than something to sit underneath it. Taking it would mean rewriting Dew's trainer as a Kauldron config, which is a different project.
+Not adopt. Kauldron requires Python 3.12 while Dew supports 3.11, it is a Copybara export with the API stability that implies, and its `Trainer` is a peer of Dew's rather than something to sit underneath it. Taking it would mean rewriting Dew's trainer as a Kauldron config, which is a different project.
 
-Borrow two specific things. The first is the flat, fully substitutable trainer: Dew's `ObjectiveTrainer` already takes the objective as a parameter, and the fields Kauldron exposes that Dew hard-codes are the checkpointer, the writer, the profiler and the eval suite. The second is `init_transform`: a named seam for initial-weight provenance is exactly what Dew needs now that it can load Hugging Face checkpoints, and it belongs next to the checkpointer rather than inside a recipe.
+Borrow two specific things. The first is the flat, fully substitutable trainer: Dew's `Trainer` already takes the objective as a parameter, and the fields Kauldron exposes that Dew hard-codes are the checkpointer, the writer, the profiler and the eval suite. The second is `init_transform`: a named seam for initial-weight provenance is exactly what Dew needs now that it can load Hugging Face checkpoints, and it belongs next to the checkpointer rather than inside a recipe.
 
 [skip] as a dependency, for the Python 3.12 floor and the export model.
 [borrow: reimplement the idea] the flat swappable-component trainer, and `init_transform` as a named weight-provenance seam. Seams: `dew.training.trainer`, `dew.training.objective_trainer`.

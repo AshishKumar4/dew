@@ -1,45 +1,67 @@
 """Dew: one registry, one objective, one trainer.
 
-Importing the package fills the registries, so `models["simple_dit"]`,
-`presets.EDM` and `datasets["oxford_flowers102"]` resolve after `import dew`
-with nothing else imported. That import opens no JAX backend and loads no
-optional dependency; encoders, decoders and datasets fetch what they need
-when they are built.
+Naming anything the package exports fills the registries, so `dew.models`,
+`dew.presets.EDM` and `dew.datasets["oxford_flowers102"]` resolve after
+`import dew` with nothing else imported. The fill happens on that first name
+rather than at import, so `import dew.training` stays inside the training
+layer and pulls in no modality, no encoder and no tracker backend, which is
+the layering rule tests/test_api_surface.py checks. Nothing here opens a JAX
+backend or loads an optional dependency; encoders, decoders and datasets
+fetch what they need when they are built.
+
+`objectives` is not exported: `dew.objectives` is the package holding the
+Objective classes, and a registry cannot share its name. It is
+`dew.registry.objectives`.
 """
+
+from importlib import import_module
+from typing import Any
 
 __version__ = "0.1.0"
 
-# `objectives` is not re-exported here: `dew.objectives` is the package that
-# holds the Objective classes, and a registry cannot share its name. It is
-# `dew.registry.objectives`.
-from dew.registry import datasets, encoders, metrics, models, presets, samplers  # noqa: E402
-
-# Each of these registers its members with the registries above as a side
-# effect of being imported; the names are re-exported for the API's nouns.
-import dew.nn.backbones  # noqa: E402,F401
-import dew.diffusion.presets  # noqa: E402,F401
-import dew.sampling.solvers  # noqa: E402,F401
-import dew.data  # noqa: E402,F401
-import dew.inputs  # noqa: E402,F401
-import dew.eval  # noqa: E402,F401
-import dew.objectives.lm  # noqa: E402,F401
-import dew.objectives.jepa  # noqa: E402,F401
-import dew.objectives.diffusion  # noqa: E402,F401
-
-from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid  # noqa: E402
-from dew.data import Dataset  # noqa: E402
-from dew.diffusion import Process  # noqa: E402
-from dew.inputs import Condition, Field, InputSpec  # noqa: E402
-from dew.objectives import Objective  # noqa: E402
-from dew.sampling import CFG, sample  # noqa: E402
-from dew.training import (  # noqa: E402
-    Aux, Checkpoints, EMASpec, Layout, MeshSpec, Step, Tracker, TrainState, Trainer,
-    WandbTracker,
+# Importing any of these registers its members with the registries.
+_REGISTERS = (
+    "dew.nn.backbones", "dew.diffusion.presets", "dew.sampling.solvers",
+    "dew.data", "dew.inputs", "dew.eval",
+    "dew.objectives.lm", "dew.objectives.jepa", "dew.objectives.diffusion",
 )
+
+_REGISTRIES = ("models", "presets", "samplers", "datasets", "encoders", "metrics")
+
+_EXPORTS = {
+    **{name: "dew.registry" for name in _REGISTRIES},
+    "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
+    "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
+    "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
+    "WandbTracker": "dew.training",
+    "Objective": "dew.objectives",
+    "Dataset": "dew.data",
+    "Process": "dew.diffusion",
+    "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
+    "sample": "dew.sampling", "CFG": "dew.sampling",
+    "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
+    "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
+    "TokenScores": "dew.artifacts",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in _REGISTRIES:
+        for register in _REGISTERS:
+            import_module(register)
+    return getattr(import_module(module), name)
+
+
+def __dir__() -> list[str]:
+    return sorted(_EXPORTS) + ["__version__"]
+
 
 __all__ = [
     "__version__",
-    "models", "presets", "samplers", "datasets", "encoders", "metrics",
+    *_REGISTRIES,
     "Trainer", "TrainState", "Step", "Aux", "EMASpec", "MeshSpec", "Layout",
     "Checkpoints", "Tracker", "WandbTracker",
     "Objective", "Dataset", "Process", "InputSpec", "Field", "Condition",
