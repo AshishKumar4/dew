@@ -12,12 +12,15 @@ straight from the HuggingFace Hub.
 
 import json
 import math
+import os
 from functools import partial
-from typing import Tuple
+from pathlib import Path
+from typing import Any, Mapping, Tuple
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 class FlaxUpsample2D(nn.Module):
     """
@@ -648,15 +651,86 @@ class FlaxDecoder(nn.Module):
 
 
 
-def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
-    """Load a pretrained Flax AutoencoderKL config and params from the HF Hub.
+_VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
 
-    Works with both full Stable Diffusion pipeline repos (VAE under the `vae`
-    subfolder, flax weights usually on the `flax`/`bf16` revisions) and
-    standalone VAE repos (files at the repo root).
+
+def _vae_path(torch_name: str, rank: int) -> Tuple[str, ...]:
+    """One diffusers AutoencoderKL tensor name into its path in the vendored
+    tree, `{"encoder": ..., "decoder": ..., "quant_conv": ...}`.
+
+    diffusers numbers its repeated children with a dot (`down_blocks.0`)
+    where linen names them with an underscore (`down_blocks_0`), calls the
+    mid-block attention's projections `to_q/to_k/to_v/to_out.0` where
+    `FlaxAttentionBlock` calls them `query/key/value/proj_attn`, and stores
+    every gain as `weight`: linen calls a norm's `scale` and a convolution's
+    or a dense's `kernel`, which the tensor's own rank tells apart.
+    """
+    parts = torch_name.split(".")
+    leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
+    parts = parts[:-1]
+    path = []
+    index = 0
+    while index < len(parts):
+        name = parts[index]
+        following = parts[index + 1] if index + 1 < len(parts) else None
+        if name == "to_out":
+            # to_out.0 is the projection; there is no second entry.
+            path.append("proj_attn")
+            index += 2
+            continue
+        if name in _VAE_ATTENTION:
+            path.append(_VAE_ATTENTION[name])
+            index += 1
+            continue
+        if following is not None and following.isdigit():
+            path.append(f"{name}_{following}")
+            index += 2
+            continue
+        path.append(name)
+        index += 1
+    return tuple(path + [leaf])
+
+
+def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
+    """diffusers AutoencoderKL tensors into the vendored modules' param tree.
+
+    Convolution kernels transpose from torch's [out, in, kh, kw] to linen's
+    [kh, kw, in, out] and dense kernels from [out, in] to [in, out]; norms and
+    biases keep their layout. Every tensor maps: an unknown name raises rather
+    than loading half an autoencoder.
+    """
+    params: dict = {}
+    for name, tensor in torch_tensors.items():
+        leaf = np.asarray(tensor, dtype=np.float32)
+        path = _vae_path(name, leaf.ndim)
+        if path[-1] == "kernel":
+            leaf = leaf.transpose(2, 3, 1, 0) if leaf.ndim == 4 else leaf.T
+        node = params
+        for entry in path[:-1]:
+            node = node.setdefault(entry, {})
+        node[path[-1]] = leaf
+    return params
+
+
+def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
+    """A pretrained AutoencoderKL's config and params, from a local directory
+    or the Hub.
+
+    Two weight layouts reach the same tree. The SD1-era repos ship flax
+    `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
+    `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
+    `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
+    reads by name, so the newer latent spaces load through the same seam.
     Returns a dict with `config` (dict) and `params` (nested param tree).
     """
     from flax.serialization import msgpack_restore
+
+    if os.path.isdir(modelname):
+        directory = Path(modelname)
+        with open(directory / "config.json") as handle:
+            config = json.load(handle)
+        return {"config": config, "params": _read_vae_weights(directory)}
+
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
@@ -671,16 +745,51 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         try:
             config_path = hf_hub_download(modelname, "config.json", **candidate)
             weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack", **candidate)
-            break
+            with open(config_path) as f:
+                config = json.load(f)
+            with open(weights_path, "rb") as f:
+                return {"config": config, "params": msgpack_restore(f.read())}
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             last_error = e
-    else:
-        raise FileNotFoundError(
-            f"No flax VAE weights (diffusion_flax_model.msgpack) found in {modelname}"
-        ) from last_error
 
-    with open(config_path) as f:
-        config = json.load(f)
-    with open(weights_path, "rb") as f:
-        params = msgpack_restore(f.read())
-    return {"config": config, "params": params}
+    for candidate in ({"subfolder": "vae"}, {}):
+        try:
+            config_path = hf_hub_download(modelname, "config.json", **candidate)
+            hf_hub_download(modelname, "diffusion_pytorch_model.safetensors", **candidate)
+        except (EntryNotFoundError, RevisionNotFoundError) as e:
+            last_error = e
+            continue
+        directory = Path(config_path).parent
+        with open(config_path) as handle:
+            config = json.load(handle)
+        return {"config": config, "params": _read_vae_weights(directory)}
+
+    raise FileNotFoundError(
+        f"no VAE weights in {modelname}: neither flax "
+        "diffusion_flax_model.msgpack nor torch diffusion_pytorch_model.safetensors"
+    ) from last_error
+
+
+def _read_vae_weights(directory: Path) -> dict:
+    """The params in `directory`, whichever of the two layouts it holds."""
+    from flax.serialization import msgpack_restore
+
+    msgpack = directory / "diffusion_flax_model.msgpack"
+    if msgpack.exists():
+        with open(msgpack, "rb") as handle:
+            return msgpack_restore(handle.read())
+    safetensors = directory / "diffusion_pytorch_model.safetensors"
+    if not safetensors.exists():
+        raise FileNotFoundError(
+            f"no VAE weights in {directory}: neither diffusion_flax_model.msgpack "
+            "nor diffusion_pytorch_model.safetensors")
+    from dew.interop import load_params
+
+    def flatten(tree, prefix=""):
+        flat = {}
+        for name, child in tree.items():
+            key = f"{prefix}.{name}" if prefix else name
+            flat.update(flatten(child, key) if isinstance(child, dict) else {key: child})
+        return flat
+
+    return translate_vae_weights(flatten(load_params(safetensors)))
