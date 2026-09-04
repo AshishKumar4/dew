@@ -394,3 +394,22 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
         HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                               **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
                                             jnp.ones((1,)))
+
+def test_a_stage_keeps_the_defaults_the_dict_read_had():
+    """No default moved in the cutover: `dtype` is float32 and not the model's,
+    which is why `with_precision` writes into every stage, and a stage that
+    names no `precision` takes the model's, as `.get("precision",
+    self.precision)` did."""
+    stage = Stage(heads=8)
+    assert stage.dtype is jnp.float32 and stage.precision is None
+    assert (stage.use_linear_attention, stage.use_projection, stage.use_self_and_cross,
+            stage.only_pure_attention, stage.force_fp32_for_softmax,
+            stage.norm_inputs, stage.explicitly_add_residual, stage.norm_epsilon) == \
+        (True, False, True, True, False, True, True, 1e-4)
+
+    model = Unet(emb_features=32, feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
+                 precision="highest", attention_configs=(None, Stage(heads=2)))
+    x = jnp.zeros((1, 16, 16, 3))
+    params = model.init(jax.random.PRNGKey(0), x, jnp.ones((1,)), text(batch=1, features=64))
+    assert jnp.all(jnp.isfinite(model.apply(params, x, jnp.ones((1,)),
+                                            text(batch=1, features=64))))

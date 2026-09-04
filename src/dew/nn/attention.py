@@ -459,15 +459,20 @@ class Stage:
     """One resolution stage's attention in a UNet, or `None` for a stage that
     has none.
 
-    Every field is a `TransformerBlock` dial, defaulted as the block defaults
-    it, so a stage names what it changes and nothing else. `dim_head` is not
-    here: the block's head width is the stage's channel count divided by
-    `heads`, which the unet knows and a config does not.
+    Every field is a `TransformerBlock` dial, defaulted exactly as the dict
+    read it replaced defaulted it, so a stage names what it changes and
+    nothing else and no default moved. `dim_head` is not here: the block's
+    head width is the stage's channel count divided by `heads`, which the
+    unet knows and a config does not.
 
     It replaces a dict read with `.get`, which accepted a misspelled dial and
     quietly left it at its default; `dew.registry.from_record` builds one from
     a record at the build boundary, so a stage still arrives as
     `{"heads": 8}` from a command line or a run record.
+
+    `dtype` is float32 and not the model's, which is what `with_precision`
+    exists to write into every stage. `precision` is the one field whose None
+    means "the model's", as the dict read's default did.
     """
 
     heads: int
@@ -479,7 +484,7 @@ class Stage:
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
-    dtype: Optional[Dtype] = None
+    dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = None
 
 
