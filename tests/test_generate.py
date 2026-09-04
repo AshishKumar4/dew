@@ -52,10 +52,12 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
                             temperature=0))
 
 
-def test_layer_types_from_json_can_generate(rng):
+def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
+    """A run record hands the pattern as a list and each kind as a record,
+    which is what a config parses to."""
     model = tiny(
         layer_types=["full_attention", "sliding_attention"],
-        sliding_window=4,
+        kinds={"sliding_attention": {"window": 4}},
     )
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model.init(rng, prompt)
