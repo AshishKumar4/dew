@@ -53,6 +53,18 @@ def occurrences(name: str) -> list[str]:
     result = subprocess.run(
         ["git", "grep", "-n", "-F", "--", name, "--", *TREES],
         cwd=ROOT, capture_output=True, text=True)
+    lines = [line for line in result.stdout.splitlines()
+             if line.split(":", 1)[0] not in RECORDS
+             and not re.search(r"\.(pyc|npz|safetensors|png)$", line.split(":", 1)[0])]
+    return lines
+
+
+@pytest.mark.parametrize("name", SUPERSEDED)
+def test_a_superseded_name_is_gone(name):
+    found = occurrences(name)
+    assert not found, f"{name!r} survives in {len(found)} place(s):\n" + "\n".join(found[:12])
+
+
 def test_training_imports_no_modality():
     """`dew.training` is the general trainer: it knows no diffusion, no input
     conventions, no sampler and no tracker backend (design rule 4 and the
