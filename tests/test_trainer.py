@@ -236,9 +236,16 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     assert set(trainer.checkpoints._open().all_steps()) == {2, 4, 6}
 
 
-def test_checkpoint_every_needs_a_stream_that_reports_its_position():
+def test_checkpoint_every_needs_a_stream_that_reports_its_position(tmp_path):
     with pytest.raises(ValueError, match="get_state"):
-        make_trainer().fit(Data(endless), steps=2, checkpoint_every=1)
+        make_trainer(tmp_path).fit(Data(endless), steps=2, checkpoint_every=1)
+
+
+def test_checkpoint_every_without_a_checkpointer_is_refused():
+    """Asking for checkpoints from a trainer that has nowhere to write them
+    used to reach the first save and fail on None."""
+    with pytest.raises(ValueError, match="no checkpointer"):
+        make_trainer().fit(Data(), steps=2, checkpoint_every=1)
 
 
 def test_fit_that_never_trains_checkpoints_step_zero(tmp_path):
