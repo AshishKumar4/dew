@@ -185,8 +185,7 @@ def _rebuild(annotation, value):
     if dataclasses.is_dataclass(annotation):
         return annotation(**_fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
-        # Optional[T]: None stays None, anything else is a T.
-        inner = [member for member in typing.get_args(annotation) if member is not type(None)]
+        inner = [m for m in typing.get_args(annotation) if m is not type(None)]
         if value is None or len(inner) != 1:
             return value
         return _rebuild(inner[0], value)
