@@ -25,6 +25,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
+from dew.artifacts import host
 from dew.checkpoints import Checkpoints
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
@@ -467,6 +468,14 @@ class Trainer:
         that left the pass while the others waited in its collectives would
         wedge the pool, so each batch is agreed before it is scored. A metric
         or a loader that raises takes the pass down with it.
+
+        An artifact and the batch beside it come home before they are scored or
+        drawn: a metric reads them with numpy and the tracker draws on process
+        zero, neither of which can touch a shard of a global array. The gathers
+        are collectives, so they happen here, on every process, and not inside
+        the one metric or the one process that consumes them. Scoring the whole
+        batch is also the only way the number means what it says: a process
+        scoring its own shard would log its slice of the split as the metric.
         """
         if data.val is None:
             return {}
@@ -492,8 +501,12 @@ class Trainer:
             produced = self.objective.evaluate(state.params, batch, info)
             produced = (() if produced is None
                         else produced if isinstance(produced, tuple) else (produced,))
-            for metric in metrics:
-                values[metric.name].append(metric(_pick(produced, metric.reads), batch))
+            produced = tuple(host(artifact) for artifact in produced)
+            if metrics:
+                # One gather for every metric, whatever fields they read.
+                home = host(batch)
+                for metric in metrics:
+                    values[metric.name].append(metric(_pick(produced, metric.reads), home))
             if scored == 0 and process_zero and self.tracker is not None:
                 for artifact in produced:
                     self.tracker.artifact(artifact, step)

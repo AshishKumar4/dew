@@ -24,9 +24,25 @@ class Tracker(Protocol):
     def artifact(self, value: Any, step: int) -> None: ...
 
 
+def _home(array) -> np.ndarray:
+    """`array` as numpy, refusing a shard of a global array.
+
+    A tracker draws on process zero alone, and completing a global array needs
+    every process, so an artifact arrives here already brought home by
+    `dew.artifacts.host`. Refusing names the missing call instead of hanging in
+    a collective one process entered by itself.
+    """
+    if not getattr(array, "is_fully_addressable", True):
+        raise ValueError(
+            "a tracker was handed a shard of a global array, which it cannot "
+            "complete from one process: bring the artifact home with "
+            "dew.artifacts.host on every process before drawing it")
+    return np.asarray(array)
+
+
 def _uint8(images) -> np.ndarray:
     """[-1, 1] floats as the bytes an image viewer reads."""
-    return np.clip((np.asarray(images, np.float32) + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    return np.clip((_home(images).astype(np.float32) + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
 
 @functools.singledispatch
@@ -58,7 +74,7 @@ def _(value: VideoGrid, step: int):
 def _(value: TextSamples, step: int):
     import wandb
 
-    texts = value.texts or tuple(str(row.tolist()) for row in np.asarray(value.tokens))
+    texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
     rows = [[index, value.prompt, text] for index, text in enumerate(texts)]
     return {"val/samples": wandb.Table(columns=["sample", "prompt", "text"], data=rows)}
 
@@ -71,7 +87,7 @@ def _(value: Representations, step: int):
     # representation, which goes to zero when the encoder stops telling
     # inputs apart.
     return {"val/representation_std": wandb.Histogram(
-        np.std(np.asarray(value.features, np.float32), axis=0))}
+        np.std(_home(value.features).astype(np.float32), axis=0))}
 
 
 class WandbTracker:

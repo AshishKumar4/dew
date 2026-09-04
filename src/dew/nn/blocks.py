@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import jax
 import numpy as np
 from flax import linen as nn
-from typing import Optional, Any, Callable, Sequence, Union
+from typing import Optional, Any, Callable, Mapping, Sequence, Union
 from flax.typing import Dtype, PrecisionLike
 from typing import Dict, Callable, Sequence, Any, Union
 import einops
@@ -23,7 +23,7 @@ class WeightStandardizedConv(nn.Module):
     apply weight standardization  https://arxiv.org/abs/1903.10520
     """
     features: int
-    kernel_size: Sequence[int] = 3
+    kernel_size: Union[int, Sequence[int]] = 3
     strides: Union[None, int, Sequence[int]] = 1
     padding: Any = 1
     dtype: Optional[Dtype] = None
@@ -31,7 +31,7 @@ class WeightStandardizedConv(nn.Module):
     param_dtype: Optional[Dtype] = None
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x) -> jax.Array:
         """
         Applies a weight standardized convolution to the inputs.
 
@@ -52,8 +52,14 @@ class WeightStandardizedConv(nn.Module):
             param_dtype = self.param_dtype,
             parent=None)
 
-        kernel_init = lambda  rng, x: conv.init(rng,x)['params']['kernel']
-        bias_init = lambda  rng, x: conv.init(rng,x)['params']['bias']
+        # `init` hands back a collection whose leaves are the conv's own
+        # parameters; reading them through a mapping of arrays keeps each one an
+        # array instead of another collection.
+        def conv_param(variables: Mapping[str, Mapping[str, jax.Array]], name: str) -> jax.Array:
+            return variables['params'][name]
+
+        kernel_init = lambda  rng, x: conv_param(conv.init(rng,x), 'kernel')
+        bias_init = lambda  rng, x: conv_param(conv.init(rng,x), 'bias')
 
         # standardize kernel
         kernel = self.param('kernel', kernel_init, x)
@@ -66,7 +72,9 @@ class WeightStandardizedConv(nn.Module):
 
         bias = self.param('bias',bias_init, x)
 
-        return(conv.apply({'params': {'kernel': standardized_kernel, 'bias': bias}},x))
+        # `apply` is typed as the output or an (output, variables) pair; mutable
+        # is off here, so it is the output array.
+        return jnp.asarray(conv.apply({'params': {'kernel': standardized_kernel, 'bias': bias}},x))
 
 class FourierEmbedding(nn.Module):
     features:int
@@ -175,7 +183,7 @@ class ConvLayer(nn.Module):
                 precision=self.precision
             )
 
-    def __call__(self, x):
+    def __call__(self, x) -> jax.Array:
         return self.conv(x)
 
 class Upsample(nn.Module):
@@ -241,7 +249,7 @@ class ResidualBlock(nn.Module):
     strides:tuple=(1, 1)
     padding:str="SAME"
     activation:Callable=jax.nn.swish
-    direction:str=None
+    direction:Optional[str]=None
     res:int=2
     norm_groups:int=8
     dtype: Optional[Dtype] = None
@@ -259,7 +267,8 @@ class ResidualBlock(nn.Module):
             self.norm2 = norm()
 
     @nn.compact
-    def __call__(self, x:jax.Array, temb:jax.Array, textemb:jax.Array=None, extra_features:jax.Array=None):
+    def __call__(self, x:jax.Array, temb:jax.Array, textemb:Optional[jax.Array]=None,
+                 extra_features:Optional[jax.Array]=None):
         residual = x
         out = self.norm1(x)
         # out = nn.RMSNorm()(x)
@@ -304,7 +313,7 @@ class ResidualBlock(nn.Module):
                 self.conv_type,
                 features=self.features,
                 kernel_size=(1, 1),
-                strides=1,
+                strides=(1, 1),
                 name="residual_conv",
                 dtype=self.dtype,
                 precision=self.precision

@@ -73,7 +73,7 @@ class UNet3D(nn.Module):
     identical to Unet, so 2D checkpoints inflate directly."""
     output_channels:int=3
     emb_features:int=64*4
-    feature_depths:list=(64, 128, 256, 512)
+    feature_depths: Sequence[int] = (64, 128, 256, 512)
     attention_configs: Sequence[Optional[Stage]] = (
         Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
     """Attention per resolution stage, one entry per feature depth; None is a

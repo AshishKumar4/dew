@@ -109,6 +109,42 @@ class LossRecorder:
         pass
 
 
+class ScoreRecorder(LossRecorder):
+    """Keeps the validation scores and the artifacts a pass produced."""
+
+    def __init__(self):
+        super().__init__()
+        self.scores: dict = {}
+        self.drawn: list = []
+
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        self.scores.update({name: float(value) for name, value in scalars.items()
+                            if name.startswith("val/")})
+
+    def artifact(self, value, step):
+        images = getattr(value, "images", None)
+        self.drawn.append({"type": type(value).__name__,
+                           "shape": [] if images is None else list(np.shape(images)),
+                           "captions": list(getattr(value, "captions", ()))})
+
+
+def jepa_objective():
+    """The smallest real JEPA: an encoder, a predictor and one target block."""
+    from dew.inputs import Field
+    from dew.nn.backbones.jepa import JepaPredictor
+    from dew.objectives.jepa import JepaEncoder, JepaObjective, multi_block_mask
+
+    patch = 2
+    grid = (RES // patch, RES // patch)
+    return JepaObjective(
+        JepaEncoder(patch_size=patch, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
+        JepaPredictor(grid=grid, emb_features=32, predictor_features=16,
+                      num_layers=1, num_heads=2, mlp_ratio=1),
+        multi_block_mask(grid, num_targets=1, scale=(0.2, 0.5)),
+        sample=Field("image", (RES, RES, 3)))
+
+
 class Data:
     def __init__(self, train, val=None, batch=BATCH, records=None):
         self._train, self.val, self.batch, self.records = train, val, batch, records
@@ -417,8 +453,126 @@ def mode_fit(args) -> dict:
     }
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the roof",
+           "bread and jam", "birds at dawn", "a short note", "the sun set"]
+
+
+class GlobalMean:
+    """A metric that reads a whole batch field with numpy.
+
+    Every shipped image metric pairs its rows with the artifact's, so it only
+    ever reads the leading rows, which come back replicated. A metric is
+    allowed to read the whole field, and on a pool that field is a shard of a
+    global array numpy cannot touch, so this is what pins the contract that
+    the trainer brings the batch home and the number covers the global batch.
+    """
+
+    name = "global_mean"
+
+    def __init__(self):
+        from dew.artifacts import ImageGrid
+
+        self.reads = ImageGrid
+
+    def __call__(self, artifact, batch) -> float:
+        return float(np.asarray(batch["image"], np.float64).mean())
+
+    def reduce(self, values) -> float:
+        return float(np.mean(values))
+
+
+def mode_validate(args) -> dict:
+    """A real diffusion validation pass in the pool, scored by the clip metric.
+
+    The artifact and the batch the metric reads are shards of global arrays on
+    every process here, which numpy cannot read at all, so this is the topology
+    a validation that gathers nothing dies in. CLIP and its tokenizer come from
+    the committed tiny fixture, so nothing downloads.
+    """
+    import jax
+    import optax
+    from dew.data import Dataset
+    from dew.diffusion import presets
+    from dew.eval import clip
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.training import Layout, MeshSpec, Trainer
+
+    tiny = str(FIXTURES / "clip" / "tiny")
+    encoder = CLIPText.from_pretrained(tiny)
+    rows = BATCH // args.processes
+    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    batch = {"image": global_images()[mine],
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+    objective = DiffusionObjective(
+        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
+        presets.Flow()(),
+        InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(encoder)}),
+        guidance=None, steps=2)
+    scored = ScoreRecorder()
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
+                      checkpoints=None, tracker=scored)
+    data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
+                   records=BATCH * args.steps, batch=BATCH)
+    state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
+                        metrics=(clip(modelname=tiny), GlobalMean()))
+    return {
+        "process_index": jax.process_index(),
+        "process_count": jax.process_count(),
+        "step": int(as_numpy(state.step)),
+        "scores": scored.scores,
+        "drawn": scored.drawn,
+    }
+
+
+def mode_tracked(args) -> dict:
+    """A JEPA run in the pool with a tracker attached.
+
+    The tracker draws on process zero, so its artifact has to arrive already
+    complete: a renderer that reached for a shard of a global array would take
+    this run down, and one that gathered from the one drawing process would
+    wedge the pool in a collective the others never enter.
+    """
+    import jax
+    import optax
+    from dew.data import Dataset
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.tracker import render
+
+    drawn: list = []
+
+    class Drawing(LossRecorder):
+        def artifact(self, value, step):
+            payload = render(value, step)
+            drawn.append({
+                "type": type(value).__name__,
+                "rendered": payload is not NotImplemented,
+                "features": [int(size) for size in np.shape(value.features)],
+                "std": float(np.std(np.asarray(value.features, np.float32))),
+            })
+
+    objective = jepa_objective()
+    rows = BATCH // args.processes
+    mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    batch = {"image": global_images()[mine],
+             "label": np.arange(BATCH, dtype=np.int32)[mine]}
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
+                      checkpoints=None, tracker=Drawing())
+    data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
+                   records=BATCH * args.steps, batch=BATCH)
+    state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps)
+    return {"process_index": jax.process_index(), "drawn": drawn,
+            "step": int(as_numpy(state.step))}
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
-         "steps": mode_steps, "fit": mode_fit}
+         "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
+         "tracked": mode_tracked}
 
 
 def parse_args(argv=None):

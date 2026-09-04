@@ -22,10 +22,10 @@ class IdentityAutoEncoder(AutoEncoder):
         self.latent_shift = latent_shift
         self.latent_scale = latent_scale
 
-    def encode_batch(self, x, key=None):
+    def encode_batch(self, params, x, key=None):
         return x
 
-    def decode_batch(self, z):
+    def decode_batch(self, params, z):
         return z
 
     def serialize(self):
@@ -35,8 +35,8 @@ class IdentityAutoEncoder(AutoEncoder):
 def test_latent_normalization_defaults_to_the_identity(rng):
     autoencoder = IdentityAutoEncoder()
     x = jax.random.normal(rng, (2, 8, 8, 4))
-    assert jnp.allclose(autoencoder.encode(x), x)
-    assert jnp.allclose(autoencoder.decode(x), x)
+    assert jnp.allclose(autoencoder.encode(autoencoder.params, x), x)
+    assert jnp.allclose(autoencoder.decode(autoencoder.params, x), x)
 
 
 def test_the_vae_loader_receives_the_revision(monkeypatch):
@@ -62,9 +62,9 @@ def test_latent_normalization_shifts_and_scales_roundtrip(rng, shape):
     decoding inverts it exactly, for images and for video."""
     autoencoder = IdentityAutoEncoder(latent_shift=0.25, latent_scale=4.0)
     x = jax.random.normal(rng, shape)
-    latent = autoencoder.encode(x)
+    latent = autoencoder.encode(autoencoder.params, x)
     assert jnp.allclose(latent, (x - 0.25) * 4.0, atol=1e-6)
-    assert jnp.allclose(autoencoder.decode(latent), x, atol=1e-5)
+    assert jnp.allclose(autoencoder.decode(autoencoder.params, latent), x, atol=1e-5)
 
 
 def test_latent_normalization_whitens_a_known_distribution(rng):
@@ -72,7 +72,7 @@ def test_latent_normalization_whitens_a_known_distribution(rng):
     unit variance instead of whatever the encoder happens to produce."""
     x = 3.0 + 5.0 * jax.random.normal(rng, (4096, 1, 1, 4))
     autoencoder = IdentityAutoEncoder(latent_shift=float(jnp.mean(x)), latent_scale=1.0 / float(jnp.std(x)))
-    latent = autoencoder.encode(x)
+    latent = autoencoder.encode(autoencoder.params, x)
     assert abs(float(jnp.mean(latent))) < 1e-4
     assert abs(float(jnp.std(latent)) - 1.0) < 1e-4
 
@@ -102,7 +102,7 @@ def test_vae_roundtrip_reconstructs(vae, rng):
     # A smooth image should survive the encode/decode roundtrip well
     ramp = jnp.linspace(-0.8, 0.8, 64)
     x = jnp.broadcast_to(ramp[None, :, None, None], (1, 64, 64, 3)).transpose(0, 2, 1, 3)
-    rec = vae.decode(vae.encode(x))
+    rec = vae.decode(vae.params, vae.encode(vae.params, x))
     mse = float(jnp.mean((rec - x) ** 2))
     psnr = 10 * np.log10(4.0 / mse)
     assert psnr > 20, f"reconstruction too poor: {psnr:.1f}dB"
