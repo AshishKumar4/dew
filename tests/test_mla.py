@@ -81,15 +81,13 @@ def block_variables(tensors: dict) -> dict:
     return {"params": tree["layers_0"]["self_attn"]}
 
 
-def check_output(name: str, settings: dict, tolerance: float) -> float:
-    """The fixture block's output through the dew mixer, largest difference."""
+def block_output(name: str, settings: dict) -> float:
+    """Largest difference between the dew mixer and the fixture block."""
     tensors = fixture(name)
     module = mla_module(settings)
     output = module.apply(block_variables(tensors),
                           jnp.asarray(tensors["hidden"]))
-    difference = float(np.max(np.abs(np.asarray(output) - tensors["output"])))
-    assert difference < tolerance, difference
-    return difference
+    return float(np.max(np.abs(np.asarray(output) - tensors["output"])))
 
 
 def test_yarn_matches_the_reference_derivation():
@@ -113,6 +111,8 @@ def test_yarn_matches_the_reference_derivation():
     # (0.1 * ln(40) + 1) ** 2.
     assert yarn_query_scale(yarn) == pytest.approx(
         (0.1 * math.log(40.0) + 1.0) ** 2, rel=1e-6)
+
+
 def decode_loop(module, variables, tokens):
     """Prefill plus one-token steps, the sampler's decode protocol."""
     state = module.init(jax.random.key(0), tokens[:, :1], decode=True)
@@ -132,6 +132,7 @@ SETTINGS = {"mla_v3": "v3", "mla_v3n": "v3n", "mla_v32": "v32"}
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
 def test_decode_matches_prefill(name):
+    """Tolerance 1e-5; observed 2.4e-6, 9.5e-7 and 1.9e-6."""
     settings = CONFIG[SETTINGS[name]]
     tensors = fixture(name)
     module = mla_module(settings)
@@ -143,19 +144,31 @@ def test_decode_matches_prefill(name):
 
 
 def test_mla_reproduces_the_v3_block():
-    """DeepseekV3Attention: q LoRA, compressed KV, interleaved YaRN rope."""
-    difference = check_output("mla_v3", CONFIG["v3"], 2e-5)
-    print(f"\nmla_v3 largest difference {difference:.3e}")
+    """DeepseekV3Attention: q LoRA, compressed KV, interleaved YaRN rope.
+
+    Tolerance 2e-5; observed 2.9e-6.
+    """
+    assert block_output("mla_v3", CONFIG["v3"]) < 2e-5
 
 
 def test_mla_reproduces_the_v3_block_without_the_query_lora():
-    """The plain-q_proj variant no released checkpoint uses, same reference."""
-    difference = check_output("mla_v3n", CONFIG["v3n"], 2e-5)
-    print(f"\nmla_v3n largest difference {difference:.3e}")
+    """The plain-q_proj variant no released checkpoint uses, same reference.
+
+    Tolerance 2e-5; observed 2.1e-6.
+    """
+    assert block_output("mla_v3n", CONFIG["v3n"]) < 2e-5
 
 
 def test_mla_reproduces_the_v32_block():
-    """DeepseekV32Attention: biased projections, indexer top-k mask fold."""
-    difference = check_output("mla_v32", CONFIG["v32"], 2e-5)
-    print(f"\nmla_v32 largest difference {difference:.3e}")
+    """DeepseekV32Attention: biased projections, indexer top-k mask fold.
+
+    Tolerance 2e-5; observed 1.9e-6. The dense mixer on the same weights
+    differs from the fixture by 3.4, so the fixture is the sparse block and
+    the parity covers the selection; a generator that lost the eager mask
+    fold again would fail here on the dense side.
+    """
+    assert block_output("mla_v32", CONFIG["v32"]) < 2e-5
+    dense = dict(CONFIG["v32"], index_topk=None, index_n_heads=None,
+                 index_head_dim=None)
+    assert block_output("mla_v32", dense) > 1.0
 

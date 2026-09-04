@@ -452,7 +452,11 @@ class MultiHeadLatentAttention(nn.Module):
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
             precision=self.precision)
         if self.q_lora_rank is None:
-            self.q_proj = dense(self.num_heads * qk_head_dim, name='q_proj')
+            # The reference's plain q_proj takes no bias, whatever
+            # attention_bias says; only the low-rank projections do.
+            self.q_proj = nn.Dense(
+                self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
+                precision=self.precision, name='q_proj')
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = RMSNorm(

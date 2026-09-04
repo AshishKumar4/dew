@@ -125,8 +125,10 @@ def block_weights(module: torch.nn.Module) -> dict:
     """Every parameter of the attention block as fp32 numpy, by torch name."""
     return {name: tensor.detach().to(torch.float32).numpy()
             for name, tensor in module.named_parameters()}
+
+
 def run_v3(directory: Path, settings: dict, seed: int, name: str) -> None:
-    config = DeepseekV3Config(**settings)
+    config = DeepseekV3Config(**settings, attn_implementation="eager")
     block = DeepseekV3Attention(config, layer_idx=0).to(torch.float32)
     scatter_weights(block, seed=seed)
     block.eval()
@@ -147,7 +149,14 @@ def run_v32(directory: Path) -> None:
     # at the top-4 boundary of some row, which torch.topk and jax.lax.top_k
     # break differently. Seed 19 holds a 0.11 minimum gap there, so the
     # output parity below is deterministic, not tie luck.
-    config = DeepseekV32Config(**V32)
+    #
+    # The attention implementation has to be named. A standalone config
+    # leaves it None, and DeepseekV32Attention folds the indexer's top-k
+    # into the mask only on the eager and sdpa paths; on any other it hands
+    # the indices to the kernel as a keyword, which the eager fallback then
+    # ignores. A fixture written that way is the dense block, and the sparse
+    # port differs from it by 3.4.
+    config = DeepseekV32Config(**V32, attn_implementation="eager")
     block = DeepseekV32Attention(config, layer_idx=0).to(torch.float32)
     scatter_weights(block, seed=19)
     block.eval()
