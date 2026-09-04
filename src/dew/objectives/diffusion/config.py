@@ -58,9 +58,16 @@ class TextCondition:
     max_length: Optional[int] = None
     """Tokens every prompt is padded to; None keeps the encoder's own
     default, which for CLIP is the checkpoint's context length."""
+    revision: Optional[str] = None
+    """The checkpoint's git revision. Both text loaders take one and the
+    autoencoder's spec has always named one; a text tower could not be
+    pinned from a run, so a moved branch changed what a rerun conditioned
+    on."""
 
     def build(self) -> Condition:
-        fields = {} if self.max_length is None else {"max_length": self.max_length}
+        fields = {name: value for name, value in
+                  (("max_length", self.max_length), ("revision", self.revision))
+                  if value is not None}
         return Condition(
             encoders[self.encoder].from_pretrained(self.checkpoint, dtype=self.dtype, **fields),
             field=self.field, unconditional=self.unconditional)

@@ -274,3 +274,33 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
     unguided = dataclasses.replace(config, guidance=None)
     assert unguided.build().guidance is None
     assert DiffusionRunConfig.from_dict(unguided.to_dict()).guidance is None
+
+def test_the_text_condition_pins_a_revision(tmp_path, monkeypatch):
+    """Both text loaders take a `revision` and the autoencoder's spec has
+    always named one, so a run could not pin its text tower: a moved branch
+    changed what a rerun conditioned on. The record carries it now, and only
+    when set, since an encoder that takes no revision must still build."""
+    from dew.registry import encoders as registry
+
+    seen = {}
+    original = registry["stub_text"].from_pretrained
+
+    @classmethod
+    def capture(cls, checkpoint, **fields):
+        seen.update(checkpoint=checkpoint, **fields)
+        return original(checkpoint, **{k: v for k, v in fields.items()
+                                      if k not in ("revision", "max_length")})
+
+    monkeypatch.setattr(registry["stub_text"], "from_pretrained", capture)
+
+    pinned = dataclasses.replace(
+        run_config(tmp_path),
+        text=TextCondition(encoder="stub_text", checkpoint="stub-clip", revision="refs/pr/1"))
+    assert DiffusionRunConfig.from_dict(pinned.to_dict()) == pinned
+    pinned.text.build()
+    assert seen["revision"] == "refs/pr/1"
+
+    seen.clear()
+    dataclasses.replace(pinned, text=TextCondition(encoder="stub_text",
+                                                   checkpoint="stub-clip")).text.build()
+    assert "revision" not in seen and "max_length" not in seen
