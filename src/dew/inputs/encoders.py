@@ -6,8 +6,8 @@ parameters are a leaf of the objective's tree, placed by the trainer's layout
 like any other, so a frozen tower's weights arrive at the compiled step as
 arguments and never as constants baked into it.
 
-An encoder is rebuilt from a run's record by `encoders[name].from_pretrained(
-**fields)`, where `fields` is what `to_json` wrote.
+An encoder is rebuilt from a run's record by `rebuild(name, fields)`, where
+`fields` is what `to_json` wrote.
 """
 
 from __future__ import annotations
@@ -63,6 +63,17 @@ class ConditionEncoder(ABC, Generic[Raw]):
     @abstractmethod
     def to_json(self) -> dict:
         """The keyword fields `from_pretrained` rebuilds this encoder from."""
+
+
+def rebuild(name: str, fields: Mapping[str, Any]) -> ConditionEncoder[Any]:
+    """The named encoder rebuilt from its JSON fields.
+
+    A run's record stores the registry name with the keyword fields `to_json`
+    wrote. This is the one place those fields are unpacked dynamically, so
+    each encoder's `from_pretrained` keeps its own concrete signature.
+    """
+    make: Callable[..., ConditionEncoder[Any]] = getattr(encoders[name], "from_pretrained")
+    return make(**fields)
 
 
 @encoders("clip_text")
@@ -143,7 +154,8 @@ class Audio(ConditionEncoder[Any]):
     sampling_rate: int
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", **fields):
+    def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *,
+                        sampling_rate: int = 16000):
         raise NotImplementedError(
             f"no loader can build {checkpoint!r}: transformers 5 ships no Flax audio "
             "models, and a torch model cannot take the numpy arrays tokenize produces. "
@@ -263,4 +275,4 @@ class CharTable(ConditionEncoder[str]):
                 "features": self.features, "vocab": self.vocab}
 
 
-__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "Audio", "CharTable"]
+__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "Audio", "CharTable", "rebuild"]
