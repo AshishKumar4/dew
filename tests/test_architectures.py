@@ -214,6 +214,11 @@ VARIANTS = [
                         "ssm_attention_ratio": "3:1", "use_2d_fusion": True}, label="fusion"),
     Case("uvit", {"patch_size": PATCH, "emb_features": 64, "num_layers": 4, "num_heads": 2,
                   "add_residualblock_output": True}, label="residual"),
+    # The Gemma 4 gaps leave the default tree untouched, so a case with them
+    # on carries their declarations: per-layer table, projection, gate and
+    # projection, with the second layer sharing the first's K/V.
+    Case("causal_transformer", {**LM, "per_layer_input_dim": 8,
+                                "num_kv_shared_layers": 1}, seq_len=SEQ_LEN, label="gemma4"),
 ]
 
 

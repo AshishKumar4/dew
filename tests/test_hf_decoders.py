@@ -16,6 +16,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
   5e-3, and the argmax of all 48 positions equal. The larger residue is 28
   layers of a real checkpoint accumulating fp32 rounding, not a different
   computation.
+- gemma4-ple  : max |logit difference| 4.9e-07, tolerance 1e-5
+- gemma4-kvshare: max |logit difference| 8.6e-07, tolerance 1e-5
+- gemma4-e2b  : max |logit difference| 1.4e-06, tolerance 1e-5. An E2B-shaped
+  tiny config with every Gemma 4 gap at once: partial rotary, mixed head
+  dims, double-wide MLP, KV sharing, per-layer inputs and the values norm.
+  The logit cap is absent because the text path never reads it.
 """
 
 import json
@@ -416,9 +422,10 @@ def gemma4_config(name):
 
 
 def test_gemma4_config_translates_field_by_field():
-    """The two new features are reachable from the config: a gemma4_text
-    config with standard rope, uniform head dim, silu MLP and no logit cap
-    translates without a caller setting anything by hand."""
+    """The new features are reachable from the config: a gemma4_text config
+    with standard rope, uniform head dim, silu MLP and no logit cap
+    translates without a caller setting anything by hand. The logit cap is
+    read by no text path, so it maps to nothing."""
     config = translate_config(gemma4_config("gemma4-ple"))
 
     assert config["num_kv_shared_layers"] == 0
@@ -429,6 +436,9 @@ def test_gemma4_config_translates_field_by_field():
     assert config["sandwich_norms"] and config["embedding_scale"]
     assert config["mlp"] == "swiglu" and config["tie_embeddings"]
     assert config["rope_theta"] == 10000.0 and config["rope_local_theta"] is None
+    assert config["partial_rotary_factor"] is None
+    assert config["global_head_dim"] is None
+    assert "attention_logit_cap" not in config
     assert config["layer_types"] == ("sliding_attention",) * 3 + ("full_attention",)
     assert config["head_dim"] == 8 and not config["scale_after_cast"]
 
@@ -437,12 +447,46 @@ def test_gemma4_config_translates_field_by_field():
     assert config["per_layer_input_dim"] == 0
 
 
+def test_the_e2b_shaped_config_translates_every_gap():
+    """The release shape: partial rotary, mixed head dims, a logit cap, the
+    double-wide MLP, sharing and per-layer inputs all translate; the cap
+    maps to nothing because the text path never reads it."""
+    config = translate_config(gemma4_config("gemma4-e2b"))
+
+    assert config["partial_rotary_factor"] == 0.25
+    assert (config["head_dim"], config["global_head_dim"]) == (16, 32)
+    assert "attention_logit_cap" not in config
+    assert config["use_double_wide_mlp"]
+    assert config["num_kv_shared_layers"] == 2
+    assert config["per_layer_input_dim"] == 8
+    assert config["v_norm"] and config["rope_theta"] == 1000000.0
+    assert config["rope_local_theta"] == 10000.0
+
+
+def test_the_real_e2b_config_translates():
+    """google/gemma-4-E2B's text_config translates field for field: partial
+    rotary 0.25, head dims 192 and 512, sharing 20 layers, per-layer inputs
+    of 256, the double-wide MLP, scale 1.0 and softcap 30."""
+    e2b = Path(
+        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
+        "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
+    if not e2b.exists():
+        pytest.skip("the E2B config is a local hub cache read, not a download")
+    config = translate_config(json.loads(e2b.read_text()).get("text_config"))
+
+    assert config["partial_rotary_factor"] == 0.25
+    assert (config["head_dim"], config["global_head_dim"]) == (192, 512)
+    assert config["num_kv_shared_layers"] == 20
+    assert config["per_layer_input_dim"] == 256
+    assert config["use_double_wide_mlp"]
+    assert config["attention_scale"] == 1.0
+    assert config["final_logit_softcap"] == 30.0
+    assert config["rope_theta"] == 1000000.0
+
+
 @pytest.mark.parametrize("field,value", [
     ("attention_k_eq_v", True),
     ("enable_moe_block", True),
-    ("use_double_wide_mlp", True),
-    ("attention_logit_cap", 50.0),
-    ("global_head_dim", 512),
     ("hidden_act", "gelu"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
@@ -454,28 +498,21 @@ def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
         translate_config(config)
 
 
-def test_proportional_rotary_is_refused():
-    config = gemma4_config("gemma4-ple")
-    config["rope_parameters"]["full_attention"]["rope_type"] = "proportional"
-    with pytest.raises(ValueError, match="rope_parameters.full_attention"):
+def test_proportional_rotary_without_its_factor_is_refused():
+    config = gemma4_config("gemma4-e2b")
+    del config["rope_parameters"]["full_attention"]["partial_rotary_factor"]
+    with pytest.raises(ValueError, match="partial_rotary_factor"):
         translate_config(config)
 
 
-def test_the_real_e2b_config_is_refused_naming_a_gap():
-    """google/gemma-4-E2B needs partial rotary, a wider global head dim, a
-    logit cap and the double-wide MLP, none of which the backbone expresses.
-    The refusal names the first gap hit, not the schema."""
-    e2b = Path(
-        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
-        "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
-    if not e2b.exists():
-        pytest.skip("the E2B config is a local hub cache read, not a download")
-    config = json.loads(e2b.read_text())
-    with pytest.raises(ValueError, match="proportional|global_head_dim|double_wide|logit_cap"):
-        translate_config(config.get("text_config", config))
+def test_partial_rotary_on_a_sliding_layer_is_refused():
+    config = gemma4_config("gemma4-e2b")
+    config["rope_parameters"]["sliding_attention"]["partial_rotary_factor"] = 0.5
+    with pytest.raises(ValueError, match="sliding_attention"):
+        translate_config(config)
 
 
-@pytest.mark.parametrize("name", GEMMA4)
+@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
@@ -483,22 +520,21 @@ def test_gemma4_checkpoints_load_through_the_translator(name):
     directory = FIXTURES / name
     model, variables, _ = fp32_decoder(directory)
     assert model.v_norm and model.attention_scale == 1.0
-    if name == "gemma4-kvshare":
-        assert set(model.kv_sharing) == {2, 3}
-        leaves = flat_tree(variables["params"])
-        assert "layers_2.self_attn.k_proj.kernel" not in leaves
-        assert "layers_0.self_attn.k_proj.kernel" in leaves
-    else:
-        assert model.per_layer_input_dim == 8
-        assert "embed_tokens_per_layer.embedding" in flat_tree(variables["params"])
+    leaves = flat_tree(variables["params"])
+    sharing = {"gemma4-ple": set(), "gemma4-kvshare": {2, 3}, "gemma4-e2b": {4, 5}}[name]
+    assert set(model.kv_sharing) == sharing
+    for index in sharing:
+        assert f"layers_{index}.self_attn.k_proj.kernel" not in leaves
+    assert "layers_0.self_attn.k_proj.kernel" in leaves
+    if model.per_layer_input_dim:
+        assert "embed_tokens_per_layer.embedding" in leaves
 
 
-@pytest.mark.parametrize("name", GEMMA4)
+@pytest.mark.parametrize("name", GEMMA4 + ("gemma4-e2b",))
 def test_gemma4_logits_match_the_reference_implementation(name):
-    """Full-model parity, fully live on both branches: the values norm is a
-    scale-free RMSNorm with no checkpoint weight, implemented, not worked
-    around. Largest observed max |logit difference| on CPU: gemma4-ple
-    4.9e-07, gemma4-kvshare 4.4e-07."""
+    """Full-model parity, fully live on both branches. Largest observed max
+    |logit difference| on CPU: gemma4-ple 4.9e-07, gemma4-kvshare 8.6e-07,
+    gemma4-e2b 1.4e-06."""
     directory = FIXTURES / name
     model, variables, _ = fp32_decoder(directory)
     ids = np.load(directory / "input_ids.npy")
@@ -577,7 +613,7 @@ def test_new_leaves_are_declared_or_heuristic(rng):
 def test_a_sharing_model_decodes_like_it_prefills(rng):
     """The decode path of sharing: prefill writes the provider's cache, each
     single-token step reads it, and the tokens match a full forward."""
-    config = translate_config(gemma4_config("gemma4-kvshare"))
+    config = translate_config(gemma4_config("gemma4-e2b"))
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", {**config, "max_seq_len": 16},
         dtype="float32", attention_impl="xla"))
