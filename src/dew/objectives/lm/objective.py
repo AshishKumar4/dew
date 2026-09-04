@@ -14,19 +14,30 @@ and the reason. Padding is excluded only when the run names the pad id,
 because packed token files have no padding and masking out a real id would
 quietly drop those tokens from the average.
 
-Validation reports the teacher-forced cross entropy, which the perplexity
-metric scores, and the text the model writes from a fixed prompt, which is the
-only part of a training curve a human can read.
+Evaluation returns the teacher-forced per-token scores, which `perplexity`
+reduces over a whole pass with the token counts, and, when asked for, the text
+the model writes from a fixed prompt, which is the only part of a training
+curve a human can read.
 """
 
-from typing import Any, Callable, Dict, Optional
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
-from dew.objectives.base import EMASpec, Objective, shape_and_dtype
+from dew.artifacts import TextSamples, TokenScores
+from dew.inputs import Field, InputSpec
+from dew.nn.moe import calculate_load_balance_updates
+from dew.objectives.base import Aux, EMASpec, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.registry import metrics
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -45,69 +56,113 @@ def prompt_batch(prompt) -> jax.Array:
     return jnp.asarray(ids, jnp.int32)
 
 
-def validation_params(val_state):
-    """The EMA copy when the trainer keeps one, the live params otherwise."""
-    ema_params = getattr(val_state, "ema_params", None)
-    return val_state.params if ema_params is None else ema_params
+@dataclass(frozen=True)
+class Samples:
+    """The text an evaluation writes: `prompt` ids (one, or several of equal
+    length), how many tokens to add, the sampling knobs, and the `decode`
+    that turns ids back into a string."""
+    prompt: Sequence[int] | Sequence[Sequence[int]]
+    max_new_tokens: int
+    temperature: float = 1.0
+    top_k: Optional[int] = None
+    decode: Callable[[list[int]], str] = lambda ids: str(ids)
+
+
+def _packing(batch):
+    """A packed batch's `segment_ids` and `positions`, None on a plain one."""
+    segment_ids = batch.get("text_segment_ids")
+    positions = batch.get("text_positions")
+    return (None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32),
+            None if positions is None else jnp.asarray(positions, jnp.int32))
+
+
+def balance(moe: Variables, routing: Variables, rate: float
+            ) -> tuple[Variables, dict[str, jax.Array]]:
+    """The `moe` collection with every router's bias moved against its load,
+    and the load itself.
+
+    `routing` is what the routers sowed under the `router` collection, the
+    top-k expert indices at the module path the bias lives under. DeepSeek's
+    update (arXiv 2408.15664) raises the bias of an expert below the average
+    load and lowers it above, by `rate` a step. The load is reported as the
+    busiest and the idlest expert's share of the routed tokens, averaged over
+    the sparse layers; both read 1 / num_experts for an even router.
+    """
+    heaviest, lightest = [], []
+
+    def update(path, bias):
+        sown = routing
+        for entry in path[:-1]:
+            sown = sown[entry.key]
+        (indices,) = sown["indices"]
+        share = jnp.bincount(indices.ravel(), length=bias.shape[0]) / indices.size
+        heaviest.append(share.max())
+        lightest.append(share.min())
+        return bias + calculate_load_balance_updates(indices, bias.shape[0], rate)
+
+    balanced = jax.tree_util.tree_map_with_path(update, moe)
+    return balanced, {"moe/max_load": jnp.mean(jnp.stack(heaviest)),
+                      "moe/min_load": jnp.mean(jnp.stack(lightest))}
 
 
 class LMObjective(Objective):
-    """Shifted cross entropy, with generated text as its validation artifact."""
+    """Shifted cross entropy; evaluation scores tokens and writes text."""
 
-    tag = "lm"
+    artifact = TokenScores
 
     def __init__(
         self,
         model,
         seq_len: int,
         *,
-        vocab_size: int,
         ema_decay: float = 0.999,
         pad_id: Optional[int] = None,
         head_chunks: int = 4,
-        samples: Optional[Dict[str, Any]] = None,
-        pretrained: Optional[Dict[str, Any]] = None,
+        samples: Optional[Samples] = None,
+        pretrained: Optional[Variables] = None,
+        balance_rate: Optional[float] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
         in; four is the measured best on one RTX 4080 at vocabulary 50,304,
         see docs/research/lm-head.md.
 
-        `samples` configures the text logged at validation: a `prompt` of
-        int32 ids (one, or several of equal length), `max_new_tokens`, a
-        `temperature` (0 is greedy), an optional `top_k`, and the `decode`
-        that turns ids back into a string. Unset logs no text.
-
         `pretrained` is a variables dict to start from instead of a fresh
         init, as dew.interop.hf_decoders.load_pretrained_decoder returns for a
         Hugging Face checkpoint. The trainer takes its whole initial state
-        from init_params, so this is where continued pretraining begins."""
+        from `init`, so this is where continued pretraining begins.
+
+        `balance_rate` moves each sparse layer's routing bias against its
+        load by this much every step (DeepSeek's aux-loss-free balancing);
+        the model has to keep that bias, `expert_bias=True` on the
+        CausalTransformer. Unset leaves the bias where it is."""
         self.model = model
         self.seq_len = seq_len
-        self.vocab_size = vocab_size
         self.pad_id = pad_id
         self.head_chunks = head_chunks
         self.samples = samples
         self.pretrained = pretrained
-        self.ema = EMASpec(decay=lambda step: ema_decay)
+        self.balance_rate = balance_rate
+        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
+        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        if samples is not None:
+            self._prompt = prompt_batch(samples.prompt)
 
-    @property
-    def input_shapes(self) -> Dict[str, Any]:
-        """One int32 token sequence, which is all the model is fed."""
-        return {"tokens": ((self.seq_len,), jnp.int32)}
-
-    def init_params(self, rng):
+    def init(self, key):
         if self.pretrained is not None:
             if "params" not in self.pretrained:
                 raise ValueError(
                     "pretrained is the variables dict ({'params': ...}) that "
                     "load_pretrained_decoder and model.init return")
             return self.pretrained
-        shape, dtype = shape_and_dtype(self.input_shapes["tokens"])
-        return self.model.init(rng, jnp.zeros((1, *shape), dtype))
+        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
-    def shifted_cross_entropy(self, params, tokens, train: bool = False, rngs=None,
-                              segment_ids=None, positions=None):
-        """Next-token cross entropy over a `[B, seq_len + 1]` batch, and its telemetry.
+    def token_scores(self, params, tokens, train: bool = False, rngs=None,
+                     segment_ids=None, positions=None, routing: bool = False):
+        """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
+
+        Returns the `[B, seq_len]` losses, the weight of each target (1 where
+        it counts), whether each prediction was right, and what the routers
+        sowed when `routing` asked for it.
 
         A packed batch carries `segment_ids` for the same rows: the last token
         of a document does not predict the first of the next one, so that
@@ -127,15 +182,18 @@ class LMObjective(Objective):
         if segment_ids is not None:
             packing["segment_ids"] = segment_ids[:, :-1]
         hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method=type(self.model).hidden_states, **packing)
+                                  method=type(self.model).hidden_states,
+                                  mutable=["router"] if routing else False, **packing)
+        sown = None
+        if routing:
+            hidden, sown = hidden
+            sown = sown.get("router", {})
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
         losses, predicted = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        correct = (predicted == targets).astype(losses.dtype)
-
         weights = (jnp.ones_like(losses) if self.pad_id is None
                    else (targets != self.pad_id).astype(losses.dtype))
         if segment_ids is not None:
@@ -146,72 +204,89 @@ class LMObjective(Objective):
             weights = weights * (
                 (segment_ids[:, 1:] == segment_ids[:, :-1])
                 & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
+        correct = (predicted == targets).astype(losses.dtype)
+        return losses, weights, correct, sown
+
+    def loss(self, params, batch, step: Step):
+        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        segment_ids, positions = _packing(batch)
+        balancing = self.balance_rate is not None
+        losses, weights, correct, routing = self.token_scores(
+            params, tokens, train=True, rngs={"dropout": step.key},
+            segment_ids=segment_ids, positions=positions, routing=balancing)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
         ce = jnp.sum(losses * weights) / counted
-        return ce, {
-            "ce": ce,
-            "perplexity": jnp.exp(ce),
-            "token_accuracy": jnp.sum(correct * weights) / counted,
-        }
+        reported = {"ce": ce, "perplexity": jnp.exp(ce),
+                    "token_accuracy": jnp.sum(correct * weights) / counted}
+        variables = None
+        if balancing:
+            if "moe" not in params:
+                raise ValueError(
+                    "balance_rate moves the routers' balancing bias, so the model "
+                    "needs sparse layers with expert_bias=True")
+            balanced, load = balance(params["moe"], routing, self.balance_rate)
+            reported.update(load)
+            variables = {"moe": balanced}
+        return ce, Aux(reported, variables)
 
-    def loss(self, params, ema_params, batch, rng, step):
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-        segment_ids = batch.get("text_segment_ids")
-        segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
-        positions = batch.get("text_positions")
-        positions = None if positions is None else jnp.asarray(positions, jnp.int32)
-        return self.shifted_cross_entropy(params, tokens, train=True, rngs={"dropout": rng},
-                                          segment_ids=segment_ids, positions=positions)
-
-    def make_validation_step(self, **kwargs) -> Callable[[Any, Any], Dict[str, Any]]:
-        """Teacher-forced cross entropy, plus the sampled text when asked for.
+    def evaluate(self, params, batch, step: Step):
+        """Teacher-forced token scores, plus the sampled text when asked for.
 
         Both read the EMA copy, so the perplexity and the samples describe the
         same weights.
         """
-        samples = self.samples
-        if samples is not None:
-            prompt = prompt_batch(samples["prompt"])
-            max_new_tokens = int(samples["max_new_tokens"])
-            temperature = float(samples.get("temperature", 1.0))
-            top_k = samples.get("top_k")
-            # Deferred: a run that logs no text pulls in no sampler.
-            from dew.sampling.text import generate
+        params = params if step.ema is None else step.ema
+        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        segment_ids, positions = _packing(batch)
+        losses, weights = self._scored(params, tokens, segment_ids, positions)
+        scores = TokenScores(losses=losses, weights=weights)
+        if self.samples is None:
+            return scores
+        # Deferred: a run that writes no text pulls in no sampler.
+        from dew.sampling.text import generate
 
-        teacher_forced_ce = jax.jit(
-            lambda params, tokens, segment_ids=None, positions=None:
-                self.shifted_cross_entropy(params, tokens,
-                                           segment_ids=segment_ids, positions=positions)[0])
+        generated = generate(
+            self.model, params, self._prompt, self.samples.max_new_tokens,
+            key=step.key, temperature=self.samples.temperature, top_k=self.samples.top_k)
+        decode = self.samples.decode
+        return scores, TextSamples(
+            tokens=generated,
+            prompt=decode(np.asarray(self._prompt)[0].tolist()),
+            texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
 
-        def validate(val_state, batch):
-            params = validation_params(val_state)
-            tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-            segment_ids = batch.get("text_segment_ids")
-            segment_ids = None if segment_ids is None else jnp.asarray(segment_ids, jnp.int32)
-            positions = batch.get("text_positions")
-            positions = None if positions is None else jnp.asarray(positions, jnp.int32)
-            artifacts = {"ce": teacher_forced_ce(params, tokens, segment_ids, positions)}
-            if samples is not None:
-                artifacts["tokens"] = generate(
-                    self.model, params, prompt, max_new_tokens,
-                    # Folded so successive validations write different text
-                    # from the same prompt.
-                    rng=jax.random.fold_in(val_state.rngs, val_state.step),
-                    temperature=temperature, top_k=top_k,
-                )
-            return artifacts
+    @functools.cached_property
+    def _scored(self):
+        """The teacher-forced scores, compiled once per objective."""
+        def scored(params, tokens, segment_ids, positions):
+            losses, weights, _, _ = self.token_scores(
+                params, tokens, segment_ids=segment_ids, positions=positions)
+            return losses, weights
 
-        return validate
+        return jax.jit(scored)
 
-    def log_validation_artifacts(self, wandb, artifacts, step: int):
-        tokens = artifacts.get("tokens")
-        if tokens is None:
-            return
 
-        from wandb import Table
-        decode = self.samples.get("decode", lambda ids: str(ids))
-        rows = [[index, decode(row.tolist())]
-                for index, row in enumerate(np.asarray(tokens))]
-        wandb.log({"val/samples": Table(columns=["sample", "text"], data=rows)}, step=step)
+@metrics("perplexity")
+class Perplexity:
+    """exp of the cross entropy per counted target over a whole pass.
+
+    Every batch weighs by its own count of counted targets, so a packed or
+    padded pass whose batches differ in size is scored per token, and a batch
+    with no counted target contributes nothing rather than a zero.
+    """
+
+    name = "perplexity"
+    reads = TokenScores
+
+    def __call__(self, scores: TokenScores, batch) -> tuple[float, float]:
+        weights = jnp.asarray(scores.weights, jnp.float32)
+        return (float(jnp.sum(jnp.asarray(scores.losses, jnp.float32) * weights)),
+                float(jnp.sum(weights)))
+
+    def reduce(self, values: Sequence[tuple[float, float]]) -> float:
+        total = sum(loss for loss, _ in values)
+        count = sum(count for _, count in values)
+        if count == 0:
+            raise ValueError("no counted target in the validation pass")
+        return float(np.exp(total / count))
