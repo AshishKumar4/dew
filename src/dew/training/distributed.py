@@ -19,6 +19,7 @@ from jax.experimental import multihost_utils
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.nn.sharding import LogicalAxes, declared_axes
+from dew.objectives.base import Batch, Variables
 
 DATA_AXIS = 'data'
 FSDP_AXIS = 'fsdp'
@@ -33,6 +34,11 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS)
 BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS))
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
+Placement: TypeAlias = Any
+"""A pytree shaped like what it places, with a `NamedSharding` at every leaf.
+Python has no way to say "this tree's structure with those leaves", so the
+name carries what the annotation cannot."""
+
 LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
 
 # Rule order is precedence when two logical dimensions target the one fsdp axis.
@@ -181,7 +187,7 @@ class Layout:
                 (logical_axis, axes[0] if len(axes) == 1 else axes or None))
         return tuple(normalized)
 
-    def shardings(self, mesh: Mesh, tree):
+    def shardings(self, mesh: Mesh, tree: Any) -> Placement:
         """A NamedSharding per leaf of `tree`, from the declared parameter axes.
 
         A leaf whose path no module declares takes the largest-divisible-axis
@@ -206,7 +212,7 @@ class Layout:
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
 
-    def check(self, params, shardings, mesh: Mesh) -> None:
+    def check(self, params: Variables, shardings: Placement, mesh: Mesh) -> None:
         """Reject a layout that left too much of the model replicated.
 
         MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
@@ -255,7 +261,7 @@ def batch_sharding(mesh: Mesh) -> NamedSharding:
     return NamedSharding(mesh, BATCH_SPEC)
 
 
-def shard_batch(sharding: NamedSharding, batch):
+def shard_batch(sharding: NamedSharding, batch: Batch) -> Batch:
     """Assemble this process's slice of each array into a globally sharded one."""
     return jax.tree.map(
         lambda x: jax.make_array_from_process_local_data(sharding, np.asarray(x)), batch)

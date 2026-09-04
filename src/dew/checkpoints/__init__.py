@@ -114,7 +114,7 @@ class Checkpoints:
     def path(self, step: int) -> str:
         return str(epath.Path(self.directory) / str(step))
 
-    def save(self, step: int, state, position: bytes | None,
+    def save(self, step: int, state: Any, position: bytes | None,
              metrics: Mapping[str, float] | None = None) -> None:
         """Write `state` under `step`, asynchronously.
 
