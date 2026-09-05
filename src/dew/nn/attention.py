@@ -37,9 +37,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
 
     query_positions are absolute: jnp.arange(T) for a plain forward pass, and
     the cache slots the queries occupy when decoding against a KV cache, where
-    a query's row index is no longer its position. sliding_window=w narrows the
-    mask to the w most recent keys (the query itself plus the w-1 before it),
-    which is what a sliding attention layer means.
+    a query's row index and its position differ. sliding_window=w narrows the
+    mask to the w most recent keys (the query itself plus the w-1 before it).
     """
     q_pos = jnp.asarray(query_positions)[:, None]
     k_pos = jnp.arange(kv_len)[None, :]
@@ -280,7 +279,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     it, and a padded key is hidden by the kernel's own padding mask
     (key_value_seq_lengths), so every real query attends to exactly the keys
     it had. The arithmetic on the real rows is the fused kernel's, in fp32
-    like the xla path's, which is what tests/test_kernels.py pins.
+    like the xla path's; tests/test_kernels.py pins the equality.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     q_pad, kv_pad = q_len % 2, kv_len % 2
@@ -360,8 +359,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     change with the implementation, so checkpoints are interchangeable across
     hardware:
 
-    - None: flax reference attention (einsum + softmax). The only path that
-      reads dtype, precision and force_fp32_for_softmax; the portable default.
+    - None: flax reference attention (einsum + softmax), the portable default
+      and the only path that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
       inputs, a head dimension that is a multiple of 8 and at most 128, no
       softcap), 'xla' anywhere else. Resolved per trace, so a config logged
@@ -697,16 +696,15 @@ class Stage:
     """One resolution stage's attention in a UNet, or `None` for a stage that
     has none.
 
-    Every field is a `TransformerBlock` dial, so a stage names what it changes
-    and nothing else. `dim_head` is not here: the block's head width is the
+    Every field is a `TransformerBlock` dial. The block's head width is the
     stage's channel count divided by `heads`, which the unet knows and a
-    config does not. `dew.registry.from_record` builds one from a record at
+    config does not, so there is no `dim_head` field. `dew.registry.from_record` builds one from a record at
     the build boundary, so a stage still arrives as `{"heads": 8}` from a
     command line or a run record, and a misspelled field raises there.
 
-    `dtype` is float32 and not the model's, which is what `with_precision`
-    exists to write into every stage. `precision` is the one field whose None
-    means "the model's".
+    `dtype` defaults to float32; `with_precision` writes the model's dtype
+    into every stage. `precision` is the one field whose None means "the
+    model's".
     """
 
     heads: int

@@ -9,8 +9,8 @@ keyed by the trailing module path, outermost dimension first:
 A parameter takes the trailing names its rank can hold, so a kernel takes all
 of them and its bias the output ones. The declarations of every decorated
 module merge into one table the `Layout` reads when it places a train state
-and Muon reads when it picks a parameter's matrix axes, which is what keeps
-the models plain Flax modules whose init returns arrays. The optimizer's
+and Muon reads when it picks a parameter's matrix axes. The models stay
+plain Flax modules whose init returns arrays. The optimizer's
 moments and the EMA copy have paths ending in their parameter's, so one
 declaration reaches them as well.
 
@@ -52,8 +52,7 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
         names = [name for name in axes if name is not None]
         repeated = sorted({name for name in names if names.count(name) > 1})
         if repeated:
-            # The rules hand a mesh axis to a logical name once per array, so
-            # a second dimension of the same name could never be placed.
+            # The rules hand a mesh axis to a logical name once per array.
             raise ValueError(
                 f"{'/'.join(suffix)} is declared {axes}, which names "
                 f"{', '.join(repeated)} twice; a kernel whose two sides share a "
