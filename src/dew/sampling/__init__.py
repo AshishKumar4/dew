@@ -1,7 +1,7 @@
 """Sampling: the reverse process for diffusion, decoding for language models."""
 
 from .solvers import (
-    Solver, DDPM, DDIM, Euler, SimplifiedEuler, EulerAncestral, Heun, RK4, MultiStepDPM,
+    Solver, DDPM, DDIM, Euler, EulerAncestral, Heun, RK4, MultiStepDPM,
 )
 from .guidance import CFG
 from .sample import sample
@@ -13,7 +13,6 @@ __all__ = [
     "DDPM",
     "DDIM",
     "Euler",
-    "SimplifiedEuler",
     "EulerAncestral",
     "Heun",
     "RK4",

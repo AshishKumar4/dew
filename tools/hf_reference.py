@@ -15,11 +15,16 @@ Set up the venv and run it:
     /tmp/hfref/bin/python tools/hf_reference.py
 
 What lands in tests/fixtures/hf:
-
-- qwen3-tiny/, gemma3-tiny/ and llama-tiny/: a random-weight checkpoint in the HF layout
+- qwen3-tiny/, gemma3-tiny/, llama-tiny/, deepseek-v3-tiny/ and
+  deepseek-v32-tiny/: a random-weight checkpoint in the HF layout
   (config.json + model.safetensors), the 2 x 12 token ids it was run on, and
   the fp32 logits of the reference model in eval mode with eager attention.
-  Small enough to live in git.
+  Small enough to live in git. The DeepSeek pair is one dense layer over one
+  MoE layer (`first_k_dense_replace` 1) with a shared expert, the released
+  YaRN spelling, q and kv LoRA, and, on V3.2, the sparse indexer; their
+  routers' balancing bias is scattered too, since a checkpoint carries it
+  and a fixture at its zeros would not tell a load that reads it from one
+  that drops it.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
@@ -39,8 +44,15 @@ import numpy as np
 import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig,
-    LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM,
+    AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
+    Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
+    Qwen3Config, Qwen3ForCausalLM,
+)
+from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
+    DeepseekV32Config,
+)
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
+    DeepseekV32ForCausalLM,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -98,19 +110,72 @@ def tiny_gemma3() -> Gemma3ForCausalLM:
     return Gemma3ForCausalLM(config)
 
 
-def scatter_weights(model: torch.nn.Module) -> None:
+# The released rope spelling on both DeepSeek checkpoints: `rope_scaling`
+# with `type` yarn, factor 40 off 4096 base positions, mscale on every dim.
+DEEPSEEK_YARN = {
+    "type": "yarn", "factor": 40.0, "beta_fast": 32, "beta_slow": 1,
+    "mscale": 1.0, "mscale_all_dim": 1.0,
+    "original_max_position_embeddings": 4096,
+}
+# n_group 4 over 8 experts with topk_group 2 reaches four experts, which is
+# the top_k, so the group limit decides the choice rather than its order.
+DEEPSEEK_TINY = dict(
+    vocab_size=256, hidden_size=32, intermediate_size=48,
+    moe_intermediate_size=16, num_hidden_layers=2, num_attention_heads=4,
+    num_key_value_heads=4, n_shared_experts=1, n_routed_experts=8,
+    routed_scaling_factor=2.5, q_lora_rank=8, kv_lora_rank=8,
+    qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, n_group=4,
+    topk_group=2, num_experts_per_tok=4, first_k_dense_replace=1,
+    norm_topk_prob=True, hidden_act="silu", max_position_embeddings=64,
+    rms_norm_eps=1e-6, tie_word_embeddings=False, rope_theta=10000.0,
+    rope_scaling=dict(DEEPSEEK_YARN), attention_bias=False)
+
+
+def tiny_deepseek_v3() -> DeepseekV3ForCausalLM:
+    config = DeepseekV3Config(**DEEPSEEK_TINY, rope_interleave=True)
+    torch.manual_seed(0)
+    return DeepseekV3ForCausalLM(config)
+
+
+# The v32 fixture's weights come from this seed rather than the family's
+# 1234. The indexer scores a key at zero whenever every head's query-key
+# agreement is negative (the relu), and torch.topk and jax.lax.top_k break
+# an exact tie at the top-k boundary differently, so a fixture with a tie
+# on any row compares two selections rather than two implementations. At
+# two heads a quarter of the keys score zero and no seed in 3000 clears
+# every row by more than 3.6e-3; at eight heads seed 202 keeps the fourth
+# and fifth scores of every row of both layers at least 0.0217 apart.
+DEEPSEEK_V32_SEED = 202
+
+
+def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
+    """The V3 shape with the sparse indexer: eight heads of width 16 over
+    the rope width of 8, keeping four of the twelve keys."""
+    config = DeepseekV32Config(
+        **DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16)
+    torch.manual_seed(0)
+    return DeepseekV32ForCausalLM(config)
+
+
+def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
     A freshly constructed model leaves the RMSNorm scales at their identity
     value, and a fixture whose norms are all ones or all zeros would pass a
     parity test that had the (1 + w) offset backwards.
     """
-    generator = torch.Generator().manual_seed(1234)
+    generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, tensor in model.named_parameters():
             noise = torch.randn(tensor.shape, generator=generator) * 0.05
             tensor.copy_(tensor + noise if "norm" in name or "layernorm" in name
                          else noise * 4.0)
+        # DeepSeek's balancing bias is a buffer the checkpoint carries, and
+        # the reference selects on it: nonzero, or the load path that reads
+        # it would agree with one that drops it.
+        for name, tensor in model.named_buffers():
+            if name.endswith("e_score_correction_bias"):
+                tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
 def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
@@ -121,10 +186,10 @@ def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).numpy()
 
 
-def write_tiny(name: str, model: torch.nn.Module) -> None:
+def write_tiny(name: str, model: torch.nn.Module, seed: int = 1234) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    scatter_weights(model)
+    scatter_weights(model, seed)
     model = model.to(torch.float32)
     model.save_pretrained(directory, safe_serialization=True)
 
@@ -205,6 +270,8 @@ def main() -> None:
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
     write_tiny("llama-tiny", tiny_llama())
+    write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
+    write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)

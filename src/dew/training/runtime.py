@@ -1,8 +1,9 @@
 """Process setup every recipe runs before it builds anything.
 
 rlimits, the XLA flags, the compilation cache, the JAX distributed pool and
-the wandb env var are the same in every recipe: library wiring, not recipe
-behavior. The recipes call this once at the top of main().
+the env vars wandb and the tokenizers read are the same in every recipe:
+library wiring, not recipe behavior. The recipes call this once at the top of
+main().
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ def prepare_process(wandb: Wandb | None = None,
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
+    # HF tokenizers fork a thread pool; grain's workers fork the process.
+    os.environ['TOKENIZERS_PARALLELISM'] = "false"
     apply_xla_flags(xla_flags)
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)

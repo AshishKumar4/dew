@@ -20,7 +20,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import itertools  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
-from typing import Iterable, List  # noqa: E402
+from typing import TYPE_CHECKING, Iterable, List  # noqa: E402
 
 import tyro  # noqa: E402
 from absl import flags  # noqa: E402
@@ -28,13 +28,20 @@ from absl import flags  # noqa: E402
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-from dew.data import OxfordFlowers  # noqa: E402
+from dew.data import DatasetSpec, OxfordFlowers  # noqa: E402
 from dew import datasets  # noqa: E402  naming a registry fills it
+
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, a Union of the registered specs, and
+    # a type checker cannot read a variable in a type expression.
+    AnySpec = DatasetSpec
+else:
+    AnySpec = datasets.union
 
 
 @dataclass(frozen=True)
 class Benchmark:
-    data: datasets.union = field(default_factory=OxfordFlowers)
+    data: AnySpec = field(default_factory=OxfordFlowers)
     """Which dataset, with its own fields as flags."""
     batch: int = 32
     """Global batch size."""

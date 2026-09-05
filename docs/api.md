@@ -22,7 +22,7 @@ The public modules and the names each exports. This page is written by
 | `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `broadcast_from_process_zero`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers` |
 | `dew.training.runtime` | `prepare_process`, `run_timestamp` |
-| `dew.telemetry.instrumentation` | `compiled_flops`, `default_compilation_cache_dir`, `enable_compilation_cache`, `hlo_flops`, `model_flops_utilization`, `step_flops` |
+| `dew.telemetry.instrumentation` | `compiled_flops`, `default_compilation_cache_dir`, `enable_compilation_cache`, `hlo_flops`, `model_flops_utilization`, `peak_flops`, `step_flops` |
 | `dew.io` | `publish` |
 
 ## Objectives
@@ -48,8 +48,8 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
-| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
+| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
 | `dew.sampling.text` | `generate` |
 
 ## Models
@@ -67,7 +67,7 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `Audio`, `CharTable`, `rebuild`, `unit_range` |
+| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `CharTable`, `rebuild`, `unit_range` |
 | `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Checkpointable`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
 
 ## Evaluation and interop

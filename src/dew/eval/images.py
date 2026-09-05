@@ -7,6 +7,8 @@ what the reference computes for the same pixels and tokens;
 `tests/test_metrics.py` states the tolerance and the difference observed.
 """
 
+import functools
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -14,20 +16,15 @@ from dew.registry import metrics
 from .common import ImageMetric
 
 
-# Cache the CLIP model so multiple metrics share one copy of the weights
-# instead of loading CLIP-L/14 into HBM once per metric (~600MB each).
-_clip_cache: dict = {}
-
-
+@functools.lru_cache(maxsize=None)
 def _get_clip(modelname: str):
-    """Cached (model, processor) pair for the given CLIP modelname."""
-    if modelname not in _clip_cache:
-        from transformers import CLIPImageProcessorPil
-        from dew.nn.text_encoders import CLIPModel
-        print(f"[metrics] Loading CLIP model '{modelname}' (cached for reuse)...")
-        _clip_cache[modelname] = (CLIPModel.from_pretrained(modelname),
-                                  CLIPImageProcessorPil.from_pretrained(modelname))
-    return _clip_cache[modelname]
+    """The vendored CLIP towers and the checkpoint's image processor, loaded
+    once per model name: CLIP-L/14 is about 600 MB in HBM, and every metric
+    built from this module shares the copy."""
+    from transformers import CLIPImageProcessorPil
+    from dew.nn.text_encoders import CLIPModel
+    print(f"[metrics] Loading CLIP model '{modelname}' (cached for reuse)...")
+    return CLIPModel.from_pretrained(modelname), CLIPImageProcessorPil.from_pretrained(modelname)
 
 
 def _clip_image_text_cosine(model, processor, artifact, batch, field):

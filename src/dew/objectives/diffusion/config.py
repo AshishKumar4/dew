@@ -77,10 +77,8 @@ class TextCondition:
     """Tokens every prompt is padded to; None keeps the encoder's own
     default, which for CLIP is the checkpoint's context length."""
     revision: Optional[str] = None
-    """The checkpoint's git revision. Both text loaders take one and the
-    autoencoder's spec has always named one; a text tower could not be
-    pinned from a run, so a moved branch changed what a rerun conditioned
-    on."""
+    """The checkpoint's git revision, so a rerun conditions on the weights
+    the run named and not on whatever the branch has moved to."""
 
     def build(self) -> Condition:
         fields = {name: value for name, value in
@@ -123,9 +121,8 @@ class DiffusionRunConfig(RunConfig):
     sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
     """The solver validation samples with."""
     guidance: Optional[CFG] = dataclasses.field(default_factory=lambda: CFG(3.0))
-    """How validation samples are guided; None samples the conditional
-    prediction alone. It was a bare scale whose 0 stood for "off", which left
-    `CFG.interval`, the window guidance is applied in, unnameable from a run."""
+    """How validation samples are guided, scale and interval; None samples
+    the conditional prediction alone."""
     sampling_steps: int = 200
     unconditional_prob: float = 0.12
     """Fraction of training examples whose condition is dropped."""

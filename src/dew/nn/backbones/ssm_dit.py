@@ -1,19 +1,17 @@
 """
 Hybrid SSM-attention DiT: interleaves linear-time S5 blocks with attention
-blocks in a configurable ratio. The S5 layers themselves live in s5.py; the
-block and the patchify/conditioning/output machinery live in dit_common.py.
+blocks in a configurable ratio. The S5 layers live in ssm.py; the block and
+the patchify/conditioning/output machinery live in dit.py.
 """
 
-import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional, Sequence, Literal
 from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
     PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    ModulatedBlock, remat_block, neutralized_rope_freqs, build_block_pattern,
+    ModulatedBlock, remat_block, rope_for_scan, build_block_pattern,
 )
-from ..vit import RotaryEmbedding
 from dew.registry import models
 
 
@@ -70,10 +68,6 @@ class HybridSSMAttentionDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
         )
-        self.rope = RotaryEmbedding(
-            dim=self.emb_features // self.num_heads,
-            max_seq_len=4096, dtype=self.dtype)
-
         pattern = build_block_pattern(
             self.num_layers, self.ssm_attention_ratio, self.block_pattern)
         blocks = []
@@ -82,7 +76,6 @@ class HybridSSMAttentionDiT(nn.Module):
                 blocks.append(remat_block(ModulatedBlock, self.remat, policy=None)(
                     features=self.emb_features,
                     num_heads=self.num_heads,
-                    rope_emb=self.rope,
                     mixer='ssm',
                     mlp_ratio=self.mlp_ratio,
                     dropout_rate=self.dropout_rate,
@@ -99,7 +92,6 @@ class HybridSSMAttentionDiT(nn.Module):
                 blocks.append(remat_block(ModulatedBlock, self.remat)(
                     features=self.emb_features,
                     num_heads=self.num_heads,
-                    rope_emb=self.rope,
                     mixer='attention',
                     mlp_ratio=self.mlp_ratio,
                     dropout_rate=self.dropout_rate,
@@ -126,7 +118,8 @@ class HybridSSMAttentionDiT(nn.Module):
         B, H, W, C = x.shape
         x_seq, inv_idx = self.embed(x)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = neutralized_rope_freqs(self.rope, x_seq.shape[1], self.scan_order)
+        freqs_cis = rope_for_scan(x_seq.shape[1], self.emb_features // self.num_heads,
+                                  self.scan_order)
 
         for block in self.blocks:
             x_seq = block(x_seq, cond_emb, freqs_cis, train)

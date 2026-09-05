@@ -13,7 +13,7 @@ import jax
 import pytest
 
 import dew.io
-from dew.config import RUN_FILE
+from dew.checkpoints import RUN_FILE
 
 
 class Artifact:

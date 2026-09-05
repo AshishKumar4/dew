@@ -234,3 +234,29 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
     np.testing.assert_allclose(np.abs(balanced) / 0.01,
                                np.round(np.abs(balanced) / 0.01), atol=1e-4)
     assert np.all(run("unbalanced") == 0)
+
+
+def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
+    """--mtp-weight reaches the objective: with the term on, a prediction
+    depth's fused projection ends two steps somewhere else than the same run
+    without it, whose depth sees no gradient; and the flag on a model
+    without depths is refused by name."""
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    deep = ('{"emb_features": 16, "num_layers": 1, "num_heads": 2, '
+            '"num_nextn_predict_layers": 1}')
+
+    def run(name, *extra, model_config=deep):
+        config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig],
+                          args=recipe_args(tokens, "--trainer.steps", "2",
+                                           "--sample-tokens", "0",
+                                           "--trainer.name", name, *extra,
+                                           model_config=model_config))
+        state = recipe.main(config)
+        return np.asarray(state.params["params"]["mtp_0"]["eh_proj"]["kernel"])
+
+    assert np.any(run("mtp", "--mtp-weight", "0.3") != run("plain")), \
+        "the term never reached the depth"
+    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
+        run("dense", "--mtp-weight", "0.3",
+            model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}')

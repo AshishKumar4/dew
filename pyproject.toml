@@ -52,8 +52,9 @@ test = [
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.
     "datasets",
 ]
-# AV/video sources and readers (lazy imports in dew.data)
-av = ["opencv-python", "decord", "moviepy", "av", "pillow"]
+# The video specs: moviepy reads the clips and brings ffmpeg, cv2 resizes
+# the frames (lazy imports in dew.data)
+av = ["opencv-python", "moviepy"]
 # FID (scipy sqrtm) and Inception weight download
 metrics = ["scipy", "requests"]
 # Online URL-streaming loader (HF datasets-backed)
@@ -119,11 +120,9 @@ filterwarnings = [
     # speaks. Counted 44 of them in the grain worker tests.
     'ignore:ResourceTracker called reentrantly:UserWarning:multiprocessing\.resource_tracker',
     'ignore:resource_tracker:UserWarning:multiprocessing\.resource_tracker',
-    # moviepy's audio reader leaves its ffmpeg pipe open until garbage
-    # collection and sets .shape on an array the way NumPy 2.5 deprecated.
-    # Both are inside moviepy, scoped to it so the same warning from dew's
-    # own code still fails the run.
-    'ignore::ResourceWarning:moviepy\.audio\.io\.readers',
+    # moviepy's video reader sets .shape on an array the way NumPy 2.5
+    # deprecated. Scoped to it so the same warning from dew's own code still
+    # fails the run.
     'ignore:Setting the shape on a NumPy array:DeprecationWarning:moviepy\.video\.io\.ffmpeg_reader',
 ]
 

@@ -1,10 +1,12 @@
-"""End-to-end sampler tests against an analytic oracle denoiser.
+"""Sampler tests against an analytic oracle denoiser.
 
 For gaussian data x0 ~ N(0, s^2 I), the optimal denoiser has a closed form:
 E[x0 | x_t] = alpha * s^2 / (alpha^2 s^2 + sigma^2) * x_t. A solver
 integrating the reverse process with this oracle must produce samples with
-mean 0 and std s. This catches integrator bugs, step-domain bugs, and
-shape bugs in one place, with no training involved.
+mean 0 and std s, and on a variance exploding schedule the probability flow
+ODE it integrates, dx/dsigma = x sigma / (s^2 + sigma^2), has the closed
+form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2),
+which is what each solver's order of accuracy is measured against.
 """
 
 import jax
@@ -17,10 +19,7 @@ from dew.diffusion import (
     FlowMatchPredictionTransform, KarrasPredictionTransform, KarrasVENoiseScheduler, Process,
     broadcast_rates, expand,
 )
-from dew.registry import samplers
-from dew.sampling import (
-    CFG, DDIM, DDPM, Euler, EulerAncestral, Heun, MultiStepDPM, RK4, SimplifiedEuler, sample,
-)
+from dew.sampling import CFG, DDIM, DDPM, Euler, EulerAncestral, Heun, MultiStepDPM, RK4, sample
 
 DATA_STD = 0.3
 
@@ -90,11 +89,70 @@ def test_vp_sampler_converges(solver):
 
 
 @pytest.mark.parametrize(
-    "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), SimplifiedEuler()],
+    "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), RK4()],
     ids=lambda s: type(s).__name__)
 def test_karras_sampler_converges(solver):
     process, model = karras_process()
     assert_gaussian_stats(generate(process, model, solver))
+
+
+def integrate(process, solver, x_T, steps):
+    """`sample`'s walk over the grid without the final denoise, so what comes
+    back is the solver's x at the grid's last sigma."""
+    _, model = karras_process()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    times = process.times(steps)
+    x, state = x_T, solver.init(x_T)
+    for i in range(steps - 1):
+        t = jnp.full((x.shape[0],), times[i])
+        t_next = jnp.full((x.shape[0],), times[i + 1])
+        denoised, eps = denoise(x, t)
+        x, state = solver.step(x, t, t_next, denoised, eps, state,
+                               jax.random.fold_in(jax.random.PRNGKey(0), i), process, denoise)
+    return x, process.schedule.sigmas(times[-1])
+
+
+def test_solvers_integrate_the_flow_ode_at_their_order():
+    """Twenty rho-spaced steps from sigma 80 down, against the ODE's closed
+    form: RK4 (fourth order) lands within 2e-3, Heun (second) within 8e-2 and
+    Euler (first) within 2e-1 of the solution's scale, and each is closer than
+    the next; the multistep integrator beats Euler. Observed 8.3e-4, 5.1e-2,
+    1.5e-1 and 6.9e-2. A dropped stage weight or a halved average moves an
+    integrator out of its bracket."""
+    process, _ = karras_process()
+    x_T = jax.random.normal(jax.random.PRNGKey(0), (64, 4)) * 80.0
+
+    def error(solver):
+        x, sigma = integrate(process, solver, x_T, steps=20)
+        exact = x_T * jnp.sqrt(DATA_STD**2 + sigma**2) / jnp.sqrt(DATA_STD**2 + 80.0**2)
+        return float(jnp.max(jnp.abs(x - exact)) / jnp.max(jnp.abs(exact)))
+
+    euler, heun, rk4, multistep = error(Euler()), error(Heun()), error(RK4()), error(MultiStepDPM())
+    assert rk4 < 2e-3 and heun < 8e-2 and euler < 2e-1, (euler, heun, rk4)
+    assert rk4 < heun < euler
+    assert multistep < euler
+
+
+def test_euler_ancestral_is_k_diffusions_ancestral_step():
+    """k-diffusion's `get_ancestral_step` at eta 1: sigma_up^2 = sigma_s^2
+    (sigma_t^2 - sigma_s^2) / sigma_t^2, sigma_down^2 = sigma_s^2 - sigma_up^2,
+    and the update is x + (x - x_0) / sigma_t (sigma_down - sigma_t) plus
+    sigma_up of the key's noise."""
+    process, _ = karras_process()
+    key = jax.random.PRNGKey(5)
+    x = jax.random.normal(jax.random.fold_in(key, 1), (4, 8, 8, 3)) * 10.0
+    x_0 = jax.random.normal(jax.random.fold_in(key, 2), (4, 8, 8, 3))
+    t, t_next = jnp.full((4,), 0.6), jnp.full((4,), 0.4)
+    (_, sigma_t), (_, sigma_s) = (broadcast_rates(process.schedule, when, x) for when in (t, t_next))
+    eps = (x - x_0) / sigma_t
+
+    sigma_up = jnp.sqrt(sigma_s**2 * (sigma_t**2 - sigma_s**2) / sigma_t**2)
+    sigma_down = jnp.sqrt(sigma_s**2 - sigma_up**2)
+    expected = x + eps * (sigma_down - sigma_t) + jax.random.normal(key, x.shape) * sigma_up
+
+    stepped, _ = EulerAncestral().step(x, t, t_next, x_0, eps, (), key, process, None)
+    assert jnp.allclose(stepped, expected, atol=1e-5)
 
 
 def test_sampling_starts_from_sigma_max():
@@ -106,11 +164,11 @@ def test_sampling_starts_from_sigma_max():
 
 
 @pytest.mark.parametrize("solver", [DDIM(), Euler()], ids=lambda s: type(s).__name__)
-def test_video_samples(solver):
+def test_video_samples_converge(solver):
+    """The frame axis is one more sample axis: the rates broadcast over it and
+    the statistics come out the same as for images."""
     process, model = karras_process()
-    samples = generate(process, model, solver, steps=50, count=2, shape=(3, 8, 8, 3))
-    assert samples.shape == (2, 3, 8, 8, 3)
-    assert jnp.all(jnp.isfinite(samples))
+    assert_gaussian_stats(generate(process, model, solver, steps=50, count=64, shape=(3, 8, 8, 3)))
 
 
 def test_ddpm_sampler_converges_at_every_step():
@@ -149,39 +207,25 @@ def test_ddim_eta_converges():
     assert_gaussian_stats(generate(process, model, DDIM(eta=0.5)))
 
 
-def test_rk4_sampler_runs():
-    process, model = karras_process()
-    samples = generate(process, model, RK4(), steps=20)
-    assert jnp.all(jnp.isfinite(samples))
-
-
 def test_a_key_reproduces_a_trajectory():
-    """Nothing lives on a solver between calls: the same key gives the same
-    samples, which is what a multistep history kept on the object broke."""
+    """Nothing lives on a solver between calls: a multistep solver's history
+    travels in its state, so the same key gives the same samples twice."""
     process, model = karras_process()
     first = generate(process, model, MultiStepDPM())
     second = generate(process, model, MultiStepDPM())
     assert jnp.allclose(first, second, atol=1e-5)
 
 
-@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4(), SimplifiedEuler(), EulerAncestral()],
+@pytest.mark.parametrize("solver", [MultiStepDPM(), RK4(), EulerAncestral()],
                          ids=lambda s: type(s).__name__)
 def test_sigma_integrators_reject_a_vp_schedule(solver):
-    """Each integrates dx/dsigma = eps, which only holds when alpha is 1.
-
-    SimplifiedEuler and EulerAncestral used to step a VP schedule without
-    complaint, drifting the samples narrow (0.275 std for a 0.3 oracle on the
-    cosine schedule, inside the convergence tolerance so the drift was silent)."""
+    """Each integrates dx/dsigma = eps, which only holds when alpha is 1. On a
+    VP schedule the step would run and drift the samples narrow (0.275 std for
+    a 0.3 oracle on the cosine schedule, inside the convergence tolerance), so
+    the schedule is refused by type."""
     process, model = vp_process()
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
         generate(process, model, solver)
-
-
-def test_every_solver_is_registered():
-    assert {type(s).__name__ for s in (DDPM(), DDIM(), Euler(), SimplifiedEuler(),
-                                       EulerAncestral(), Heun(), RK4(), MultiStepDPM())} \
-        <= {member.__name__ for member in samplers.values()}
-    assert samplers["heun"] is Heun and samplers.Heun is Heun
 
 
 class ConstantVelocity(nn.Module):
