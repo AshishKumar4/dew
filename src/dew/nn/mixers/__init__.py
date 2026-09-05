@@ -65,6 +65,7 @@ class MixerContext:
     attention_bias: bool = False
     o_proj_bias: Optional[bool] = None
     attention_scale: Optional[float] = None
+    attn_logit_softcap: Optional[float] = None
     partial_rotary_factor: Optional[float] = None
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
@@ -140,6 +141,7 @@ class AttentionMixer(MixerBase):
             attention_bias=ctx.attention_bias,
             o_proj_bias=ctx.o_proj_bias,
             attention_scale=ctx.attention_scale,
+            attn_logit_softcap=ctx.attn_logit_softcap,
             output_gate=ctx.output_gate,
             dtype=ctx.dtype,
             precision=ctx.precision,

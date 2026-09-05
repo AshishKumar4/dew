@@ -46,8 +46,11 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 DEFAULT_MAX_SEQ_LEN = 8192
 
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
-# are the two the covered families use; anything else is refused by name.
-_ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
+# are the three the covered families use; anything else is refused by name.
+# 'gelu' is torch's erf gelu (ACT2FN['gelu']), which Gemma's released config
+# names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
+_ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
+_HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
@@ -454,7 +457,7 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     mapped = _ACTIVATIONS.get(activation)
     if mapped is None:
         _refuse(f"hidden_act {activation!r}",
-                "the gated MLP supports 'swiglu' and 'geglu'")
+                f"the gated MLP supports {sorted(_ACTIVATIONS)}")
 
     rope_theta, rope_local_theta = (_rope(hf_config, used) if rope is None else rope)
     layer_types = _specified_layer_types(hf_config, used, layer_types)
@@ -536,17 +539,55 @@ def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
                         layer_types=_qwen_layer_types(hf_config, used))
 
 
-def _gemma3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
-    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
-                          tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
+def _gemma_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Gemma 1: (1 + w) norms scaled in fp32, sqrt(d)-scaled embeddings, a
+    tied head, and no norms beyond the two pre-norms (modeling_gemma.py:77,
+    :374). Its released config names hidden_act 'gelu', which the reference
+    computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu'])."""
+    config = _base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True)
+    config.update(scale_offset=True, embedding_scale=True)
+    return config
+
+
+def _gemma_softcaps(hf_config: Mapping[str, Any], used: set[str],
+                    config: Dict[str, Any]) -> None:
+    """query_pre_attn_scalar, the two softcaps and the sandwich norms Gemma 2
+    introduced and Gemma 3 kept. Gemma 3 reads attn_logit_softcapping into
+    its attention and never passes it on (modeling_gemma3.py:334, :370-379),
+    so there it changes nothing; Gemma 2 applies it (modeling_gemma2.py:282)
+    and its entry maps it below."""
     config.update(scale_offset=True, embedding_scale=True, sandwich_norms=True)
-    used.update(('query_pre_attn_scalar', 'final_logit_softcapping'))
+    used.update(('query_pre_attn_scalar', 'final_logit_softcapping',
+                 'attn_logit_softcapping'))
     scalar = hf_config.get('query_pre_attn_scalar')
     if scalar is not None:
         config['attention_scale'] = float(scalar) ** -0.5
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
         config['final_logit_softcap'] = float(softcap)
+
+
+def _gemma2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Gemma 2: Gemma 3's block without the q/k norms, alternating sliding
+    and full layers at one rope base, and the tanh softcap on the attention
+    logits (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206)."""
+    layers = int(hf_config['num_hidden_layers'])
+    layer_types = _specified_layer_types(hf_config, used, tuple(
+        'sliding_attention' if (index + 1) % 2 else 'full_attention'
+        for index in range(layers)))
+    config = _base_config(hf_config, used, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=layer_types)
+    _gemma_softcaps(hf_config, used, config)
+    softcap = hf_config.get('attn_logit_softcapping')
+    if softcap is not None:
+        config['attn_logit_softcap'] = float(softcap)
+    return config
+
+
+def _gemma3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
+    _gemma_softcaps(hf_config, used, config)
     return config
 
 
@@ -801,14 +842,10 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
 
     if hf_config.get('use_bidirectional_attention', False):
         _refuse("use_bidirectional_attention=True", "the backbone is causal")
-    if hf_config.get('attn_logit_softcapping') is not None:
-        _refuse("attn_logit_softcapping",
-                "the attention kernels apply no softcap to the logits")
     if hf_config.get('mlp_bias'):
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
-    used = {'model_type', 'use_bidirectional_attention', 'attn_logit_softcapping',
-            'mlp_bias', 'num_hidden_layers'}
+    used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
 
     config = _FAMILIES[model_type].translate_config(hf_config, used)
 
@@ -1227,17 +1264,24 @@ def _export_config(model) -> Dict[str, Any]:
         'rms_norm_eps': model.norm_eps,
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
-        'hidden_act': 'silu' if model.mlp == 'swiglu' else 'gelu_pytorch_tanh',
+        'hidden_act': _HF_ACTIVATIONS[model.mlp],
         'use_cache': True,
     }
+    # A dial only one family's reference reads cannot ride in another
+    # family's config: Qwen2 alone splits the o_proj bias from the others,
+    # and Gemma 2 alone applies the attention softcap (Gemma 3 reads the
+    # field and never passes it on), so a checkpoint written under a family
+    # that would drop the dial is refused naming it.
     if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
-        # Only Qwen2's reference derives this split from the class itself;
-        # every other family reads one config flag for all four projections.
         if family.export_model_type != 'qwen2':
             raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "family's reference builds, so the model cannot be written as "
                 f"{family.export_model_type}")
+    if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
+        raise ValueError(
+            "attn_logit_softcap is applied by the gemma2 reference alone, so "
+            f"the model cannot be written as {family.export_model_type}")
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
@@ -1293,13 +1337,17 @@ def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
 
 def _gemma3_export(model: CausalTransformer) -> dict[str, object]:
     return {
-        'hidden_activation': 'gelu_pytorch_tanh',
+        'hidden_activation': _HF_ACTIVATIONS[model.mlp],
         'query_pre_attn_scalar': (None if model.attention_scale is None
                                  else round(1.0 / model.attention_scale ** 2)),
         'final_logit_softcapping': model.final_logit_softcap,
         'attn_logit_softcapping': None,
         'use_bidirectional_attention': False,
     }
+
+
+def _gemma2_export(model: CausalTransformer) -> dict[str, object]:
+    return {**_gemma3_export(model), 'attn_logit_softcapping': model.attn_logit_softcap}
 
 
 def _qwen3_export(model: CausalTransformer) -> dict[str, object]:
@@ -1373,8 +1421,15 @@ _FAMILY_ENTRIES = (
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),
                   'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True),
-    DecoderFamily((_GEMMA,), _gemma3_config, lambda fields: bool(fields['sandwich_norms']),
+    DecoderFamily((_GEMMA,), _gemma3_config,
+                  lambda fields: bool(fields['sandwich_norms'] and fields['qk_norm']),
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
+    DecoderFamily(('gemma2',), _gemma2_config,
+                  lambda fields: bool(fields['sandwich_norms']),
+                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True),
+    DecoderFamily(('gemma',), _gemma_config,
+                  lambda fields: bool(fields['embedding_scale']),
+                  'gemma', 'GemmaForCausalLM', lambda model: {}),
     DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields['qk_norm']),
                   'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
     DecoderFamily(('qwen2',), _qwen2_config,

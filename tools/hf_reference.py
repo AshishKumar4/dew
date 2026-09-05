@@ -45,7 +45,8 @@ import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
+    Gemma2Config, Gemma2ForCausalLM, Gemma3ForCausalLM, Gemma3TextConfig,
+    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
 )
@@ -126,6 +127,33 @@ def tiny_mistral() -> MistralForCausalLM:
         sliding_window=4, max_position_embeddings=64, rope_theta=10000.0))
     torch.manual_seed(0)
     return MistralForCausalLM(config)
+
+
+def tiny_gemma() -> GemmaForCausalLM:
+    """Gemma 1 at toy width, with hidden_act 'gelu' as the released config
+    spells it: transformers 5.16.1 computes that as the erf gelu
+    (modeling_gemma.py:93), which is 1.7e-03 away from the tanh form on
+    these weights, so the fixture tells the two apart."""
+    config = GemmaConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=16, intermediate_size=128, vocab_size=256,
+        hidden_act="gelu", max_position_embeddings=64))
+    torch.manual_seed(0)
+    return GemmaForCausalLM(config)
+
+
+def tiny_gemma2() -> Gemma2ForCausalLM:
+    """The Gemma 3 shape without q/k norms, alternating sliding and full
+    layers, and an attention softcap of 5: at the release's 50 the cap moves
+    these logits by 1.9e-02, at 5 by 1.5, so a load that dropped the cap
+    fails the parity by a wide margin instead of a narrow one."""
+    config = Gemma2Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=32, intermediate_size=128, vocab_size=256,
+        query_pre_attn_scalar=16, sliding_window=4, final_logit_softcapping=30.0,
+        attn_logit_softcapping=5.0, max_position_embeddings=64, rope_theta=1e4))
+    torch.manual_seed(0)
+    return Gemma2ForCausalLM(config)
 
 
 def tiny_gemma3() -> Gemma3ForCausalLM:
@@ -276,29 +304,24 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
-def write_gemma3_config(directory: Path) -> None:
-    """The real Gemma 3 1B text config, from a mirror of the gated repo.
-
-    google/gemma-3-1b-pt answers 401 without an accepted licence, and the
-    translation still has to be tested against a real Gemma config rather
-    than only the tiny fixture, so this takes the mirror's copy and drops the
-    marker key the mirror adds.
-    """
-    directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(GEMMA_MIRROR, "config.json")).read_text())
-    config.pop("unsloth_fixed", None)
-    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    print(f"{directory / 'config.json'}: {GEMMA_MIRROR}, "
-          f"{config['num_hidden_layers']} layers, {len(config)} fields")
-
-
 def write_released_config(name: str, repo: str) -> None:
-    """Download only the released config, never checkpoint weights."""
+    """The real config.json of a released checkpoint, and the repo it came
+    from in source.json. Only the config is downloaded, never the weights.
+
+    Google's Gemma repos answer 401 without an accepted licence, so those
+    come from unsloth's mirrors, which carry the identical config plus
+    marker keys of their own (unsloth_fixed, unsloth_version); the markers
+    are dropped so the fixture is the released config and nothing else.
+    """
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    source = Path(hf_hub_download(repo, "config.json"))
-    (directory / "config.json").write_text(source.read_text())
+    config = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
+    for key in [key for key in config if key.startswith("unsloth")]:
+        del config[key]
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+    print(f"{directory / 'config.json'}: {repo}, "
+          f"{config['num_hidden_layers']} layers, {len(config)} fields")
 
 
 def main() -> None:
@@ -310,6 +333,8 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
+    write_tiny("gemma-tiny", tiny_gemma())
+    write_tiny("gemma2-tiny", tiny_gemma2())
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
@@ -326,7 +351,9 @@ def main() -> None:
     if not args.skip_real:
         write_real_reference(real)
 
-    write_gemma3_config(FIXTURES / "gemma3-1b")
+    write_released_config("gemma3-1b", GEMMA_MIRROR)
+    write_released_config("gemma-2b", "unsloth/gemma-2b")
+    write_released_config("gemma-2-2b", "unsloth/gemma-2-2b")
 
 
 if __name__ == "__main__":
