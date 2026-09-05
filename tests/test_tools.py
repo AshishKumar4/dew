@@ -61,7 +61,7 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
     committed = FIXTURES / "moe"
     assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
         (committed / "config.json").read_text())
-    for name in ("mixtral.npz", "deepseek.npz"):
+    for name in ("mixtral.npz", "deepseek.npz", "deepseek_v4.npz"):
         assert_same_arrays(tmp_path / name, committed / name)
 
 

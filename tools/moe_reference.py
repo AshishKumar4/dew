@@ -53,7 +53,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4TopKRouter,
 )
 from transformers.models.mixtral.configuration_mixtral import MixtralConfig
-from transformers.models.mixtral.modeling_mixtral import MixtralExperts, MixtralSparseMoeBlock
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "moe"
 
@@ -87,6 +87,19 @@ class DeepseekFields(TypedDict):
     hidden_act: str
 
 
+class DeepseekV4Fields(TypedDict):
+    """The `DeepseekV4Config` fields the router and experts are built from, as config.json lists them."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_local_experts: int
+    num_experts_per_tok: int
+    scoring_func: str
+    swiglu_limit: float
+    routed_scaling_factor: float
+    hidden_act: str
+
+
 MIXTRAL: MixtralFields = {
     "hidden_size": HIDDEN, "intermediate_size": EXPERT_HIDDEN, "num_local_experts": 8,
     "num_experts_per_tok": 2, "hidden_act": "silu", "router_jitter_noise": 0.0}
@@ -102,10 +115,10 @@ DEEPSEEK: DeepseekFields = {
 # V4 sizes its experts by intermediate_size. A limit of 1.0 against weights
 # of scale 0.5 over 16 inputs clamps most gate and up values, which is what
 # makes the clamp observable at this size.
-DEEPSEEK_V4 = dict(
-    hidden_size=HIDDEN, intermediate_size=EXPERT_HIDDEN, num_local_experts=8,
-    num_experts_per_tok=4, scoring_func="sqrtsoftplus", swiglu_limit=1.0,
-    routed_scaling_factor=2.5, hidden_act="silu")
+DEEPSEEK_V4: DeepseekV4Fields = {
+    "hidden_size": HIDDEN, "intermediate_size": EXPERT_HIDDEN, "num_local_experts": 8,
+    "num_experts_per_tok": 4, "scoring_func": "sqrtsoftplus", "swiglu_limit": 1.0,
+    "routed_scaling_factor": 2.5, "hidden_act": "silu"}
 
 
 def hidden_states() -> torch.Tensor:
@@ -125,11 +138,12 @@ def scatter_weights(module: torch.nn.Module, seed: int) -> None:
             tensor.copy_(torch.randn(tensor.shape, generator=generator) * 0.5)
 
 
-def expert_tensors(experts: MixtralExperts) -> dict[str, np.ndarray]:
+def expert_tensors(experts: torch.nn.Module) -> dict[str, np.ndarray]:
     """The fused expert parameters back in their per-expert checkpoint names.
 
-    `MixtralExperts` sits behind a class decorator that hides its attributes
-    from a checker, so the two parameters are read by name.
+    Every experts module here (Mixtral, DeepSeek V3 and V4) sits behind a
+    class decorator that hides its attributes from a checker, so the two
+    parameters are read by name.
     """
     gate_up = experts.get_parameter("gate_up_proj").detach().to(torch.float32).numpy()
     down = experts.get_parameter("down_proj").detach().to(torch.float32).numpy()
@@ -194,7 +208,19 @@ def write_deepseek(directory: Path) -> None:
 
 
 def write_deepseek_v4(directory: Path) -> None:
-    config = DeepseekV4Config(**DEEPSEEK_V4)
+    # The modeling code reads the experts' width and count under the names
+    # config.json carries, `intermediate_size` and `num_local_experts`; the
+    # typed constructor declares them as `moe_intermediate_size` and
+    # `n_routed_experts` and maps the aliases onto them.
+    config = DeepseekV4Config(
+        hidden_size=DEEPSEEK_V4["hidden_size"],
+        moe_intermediate_size=DEEPSEEK_V4["intermediate_size"],
+        n_routed_experts=DEEPSEEK_V4["num_local_experts"],
+        num_experts_per_tok=DEEPSEEK_V4["num_experts_per_tok"],
+        scoring_func=DEEPSEEK_V4["scoring_func"],
+        swiglu_limit=DEEPSEEK_V4["swiglu_limit"],
+        routed_scaling_factor=DEEPSEEK_V4["routed_scaling_factor"],
+        hidden_act=DEEPSEEK_V4["hidden_act"])
     router = DeepseekV4TopKRouter(config)
     experts = DeepseekV4Experts(config)
     scatter_weights(router, seed=23)
@@ -210,7 +236,7 @@ def write_deepseek_v4(directory: Path) -> None:
         output = experts(states.reshape(-1, HIDDEN), indices, weights)
         # The clamp has to be doing something for the fixture to test it.
         gate_up = torch.nn.functional.linear(
-            states.reshape(-1, HIDDEN), experts.gate_up_proj[0])
+            states.reshape(-1, HIDDEN), experts.get_parameter("gate_up_proj")[0])
         clipped = float((gate_up.abs() > DEEPSEEK_V4["swiglu_limit"]).float().mean())
     arrays = {
         "hidden": states.to(torch.float32).numpy(),
