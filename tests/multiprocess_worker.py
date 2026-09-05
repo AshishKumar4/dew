@@ -84,7 +84,8 @@ def make_objective():
     return Reconstruction()
 
 
-def build_trainer(name, checkpoint_base, fsdp=1, tracker=None):
+def build_trainer(name, checkpoint_base, fsdp=1, tracker=None, local_dir=None,
+                  local_every=None):
     """The trainer a recipe would build, at the smallest size that still shards."""
     import jax
     import optax
@@ -93,7 +94,8 @@ def build_trainer(name, checkpoint_base, fsdp=1, tracker=None):
     return Trainer(
         make_objective(), optax.adam(1e-3), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
-        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4),
+        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4,
+                                local_directory=local_dir, local_every=local_every),
         tracker=tracker)
 
 
@@ -356,12 +358,17 @@ def mode_packed(args) -> dict:
     }
 
 
-def restored_state(checkpoints):
-    """The step and this process's data position a run directory holds."""
-    if checkpoints.latest is None:
+def restored_state(trainer):
+    """The step and this process's data position the trainer would resume
+    from, restored the way `fit` restores: onto the mesh, which is the one
+    way a local checkpoint can be read on a pool."""
+    import jax
+
+    assert trainer.checkpoints is not None
+    if trainer.checkpoints.latest is None:
         return None, None
-    _, position = checkpoints.restore()
-    return checkpoints.latest, None if position is None else position.decode()
+    state, _, position = trainer.place()
+    return int(jax.device_get(state.step)), None if position is None else position.decode()
 
 
 def mode_steps(args) -> dict:
@@ -374,7 +381,9 @@ def mode_steps(args) -> dict:
     from dew.training.distributed import shard_batch
 
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
-    restored, _ = restored_state(trainer.checkpoints)
+    checkpoints = trainer.checkpoints
+    assert checkpoints is not None
+    restored = checkpoints.latest
     state, _, _ = trainer.place()
     rows = BATCH // args.processes
     images = global_images()[args.process_id * rows:(args.process_id + 1) * rows]
@@ -385,14 +394,14 @@ def mode_steps(args) -> dict:
         state, _, loss, _, _ = compiled(state, None, batch)
         losses.append(float(as_numpy(loss)))
     if args.save and args.steps:
-        trainer.checkpoints.save(int(as_numpy(state.step)), state, None)
-        trainer.checkpoints.wait()
+        checkpoints.save(int(as_numpy(state.step)), state, None)
+        checkpoints.wait()
     dump_params(args.out.with_suffix(".npz"), state.params)
     return {
         "losses": losses,
         "step": int(as_numpy(state.step)),
         "restored_step": restored,
-        "checkpoint_path": trainer.checkpoints.directory,
+        "checkpoint_path": checkpoints.directory,
         "sharding": sharding_facts(state.params),
         "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
     }
@@ -414,9 +423,12 @@ class Batches:
 
 
 def mode_fit(args) -> dict:
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
+                            local_dir=args.local_dir, local_every=args.local_every)
+    checkpoints = trainer.checkpoints
+    assert checkpoints is not None
     # Where the checkpoint on disk left this run, read before fit trains past it.
-    restored_step, restored = restored_state(trainer.checkpoints)
+    restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
     loader = indexed_loader(args.records, rows)
     if args.block_after:
@@ -440,13 +452,17 @@ def mode_fit(args) -> dict:
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(Batches(),))
     dump_params(args.out.with_suffix(".npz"), state.params)
-    _, final_position = restored_state(trainer.checkpoints)
+    _, final_position = restored_state(trainer)
     return {
         "step": int(as_numpy(state.step)),
         "restored_step": restored_step,
         "restored_dataset_state": restored,
-        "checkpoint_path": trainer.checkpoints.directory,
-        "written_steps": sorted(int(step) for step in trainer.checkpoints._open().all_steps()),
+        "restored_from": None if restored_step is None else checkpoints.source(restored_step),
+        "checkpoint_path": checkpoints.directory,
+        "written_steps": sorted(int(step) for step in checkpoints._open().all_steps()),
+        "local_path": None if args.local_dir is None else checkpoints.local_path,
+        "local_steps": None if args.local_dir is None else sorted(
+            int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
         "val_available": available,
         "val_batches": None if available is None else len(scored),
@@ -588,6 +604,8 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
+    parser.add_argument("--local-dir", help="every process's local checkpoint directory")
+    parser.add_argument("--local-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
     parser.add_argument("--val-steps", type=int, default=0,
                         help="validation batches per pass, over the packed split of --tokens")

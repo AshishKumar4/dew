@@ -199,7 +199,7 @@ class Trainer:
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
         state, position = checkpoints.restore(template, resume)
-        print(f"Resumed from step {resume} in {checkpoints.directory}")
+        print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
     # ------------------------------------------------------------------
@@ -354,7 +354,8 @@ class Trainer:
         the validation split is scored: the objective's artifacts go to the
         tracker and to `metrics`, whose reductions are logged as `val/<name>`.
         Every `checkpoint_every` steps, and at the end, the state and the data
-        position are written.
+        position are written; every `checkpoints.local_every` steps they are
+        written to the local directory as well.
         """
         mesh = self.device_mesh
         process_zero = jax.process_index() == 0
@@ -368,8 +369,9 @@ class Trainer:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
+        local_every = None if checkpoints is None else checkpoints.local_every
         source = data.train()
-        if checkpoint_every and not isinstance(source, Checkpointable):
+        if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
             raise ValueError(
                 f"checkpoint_every needs a training stream with get_state and "
                 f"set_state, and {type(source).__name__} lacks one; a checkpoint "
@@ -450,6 +452,9 @@ class Trainer:
                                  {"loss": float(interval_loss / interval_steps)})
                 last_saved = current
                 interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
+            if (local_every and checkpoints is not None
+                    and current % local_every == 0 and current < steps):
+                checkpoints.save_local(current, state, position)
 
         if tracing and profile is not None:
             # The window outlived the run, and a trace left running takes the
