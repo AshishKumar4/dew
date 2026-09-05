@@ -486,7 +486,9 @@ class DecoderBlock(nn.Module):
         return getattr(self.mlp, 'activation', 'swiglu')
 
 @logical_axes({
-    ("eh_proj",): ("embed", "embed"),
+    # The input is two embed-width vectors concatenated, which no single name
+    # describes and the rules must not split twice; the output side shards.
+    ("eh_proj",): (None, "embed"),
 })
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
