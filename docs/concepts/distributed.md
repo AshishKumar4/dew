@@ -103,7 +103,7 @@ Restoring builds a template from the freshly initialised state, so shapes, dtype
 
 ## Throughput
 
-`dew.telemetry.instrumentation` measures rather than estimates. `compiled_flops(compiled)` counts the matmuls and convolutions in the compiled step's optimised HLO from their own shapes, including the cuBLAS, cuDNN convolution and fused-attention custom calls a GPU backend hands them to. `model_flops_utilization(flops, step_time)` turns that into a fraction of one device's dense bf16 peak from a table covering TPU v4 to v6e, A100, H100, H200 and the RTX 4080; hardware not in the table reports nothing. The trainer logs `train/samples_per_sec` and `train/mfu` on the logging cadence.
+`dew.telemetry.instrumentation` measures rather than estimates. `compiled_flops(compiled)` counts the matmuls and convolutions in the compiled step's optimised HLO from their own shapes, including the cuBLAS, cuDNN convolution and fused-attention custom calls a GPU backend hands them to. `model_flops_utilization(flops, step_time)` turns that into a fraction of one device's dense bf16 peak from a table covering TPU v2 to v6e, A100, H100, H200 and the RTX 4080, matched on the start of the device kind so `NVIDIA H100 80GB HBM3` finds the H100 row; hardware not in the table reports nothing. The trainer logs `train/samples_per_sec` and `train/mfu` on the logging cadence.
 
 The XLA compilation cache is on by default under `~/.cache/dew/xla` (`--trainer.compilation-cache-dir None` turns it off). On a DiT-B it takes the time to the first step from 55 s to 5 s.
 

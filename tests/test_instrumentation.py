@@ -217,6 +217,25 @@ def test_mfu_uses_the_per_device_flop_count(monkeypatch):
     assert instrumentation.model_flops_utilization(50.0, 2.0) == pytest.approx(0.25)
 
 
+@pytest.mark.parametrize("device_kind,peak", [
+    ("NVIDIA H100 80GB HBM3", 989e12),
+    ("NVIDIA H100 PCIe", 756e12),
+    ("NVIDIA A100-SXM4-80GB", 312e12),
+    ("NVIDIA GeForce RTX 4080", 97.5e12),
+    ("TPU v5 lite", 197e12),
+    ("TPU v5", 459e12),
+    ("TPU7x", None),
+])
+def test_the_peak_table_resolves_the_names_devices_report(device_kind, peak):
+    """`device_kind` is the CUDA device name or the TPU generation string,
+    never the bare model: an exact lookup found no H100 or A100 at all, and
+    the PCIe H100 has to resolve to its own figure rather than the SXM's,
+    whose name it also starts with. Hardware the table does not name is
+    None, so the run logs no utilisation rather than a made-up one."""
+    from dew.telemetry.instrumentation import peak_flops
+    assert peak_flops(device_kind) == peak
+
+
 def test_compiled_flops_is_per_device_under_spmd():
     devices = jax.devices()
     mesh = jax.make_mesh((len(devices),), ("data",), devices=devices)
