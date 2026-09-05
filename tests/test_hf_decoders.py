@@ -2289,3 +2289,88 @@ def test_gemma3n_export_is_refused_by_name(tmp_path):
     model, variables, _ = fp32_decoder(GEMMA3N)
     with pytest.raises(ValueError, match="v_norm"):
         save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+def test_the_released_llada_config_translates_field_by_field():
+    """GSAI-ML/LLaDA-8B-Base reads as a 32-layer Llama geometry with full
+    attention on every layer, plain rope at theta 500000 and the mask id the
+    objective corrupts with."""
+    config = translate_config(fixture_config("llada-8b"))
+    assert (config['vocab_size'], config['emb_features'], config['num_layers']) == (126464, 4096, 32)
+    assert (config['num_heads'], config['num_kv_heads'], config['head_dim']) == (32, 32, 128)
+    assert (config['mlp_features'], config['mlp'], config['rope_theta']) == (12288, 'swiglu', 500000.0)
+    assert config['layer_types'] == ('full_attention',) * 32
+    assert config['causal'] is False and config['mask_token_id'] == 126336
+    assert config['tie_embeddings'] is False and not config['attention_bias']
+
+
+def test_the_released_dream_config_translates_field_by_field():
+    """Dream-org/Dream-v0-Base-7B reads as a 28-layer Qwen2.5 geometry with
+    the q/k/v biases over a bias-free o_proj, full attention on every layer
+    and the mask id the objective corrupts with."""
+    config = translate_config(fixture_config("dream-7b"))
+    assert (config['vocab_size'], config['emb_features'], config['num_layers']) == (152064, 3584, 28)
+    assert (config['num_heads'], config['num_kv_heads'], config['head_dim']) == (28, 4, 128)
+    assert (config['mlp_features'], config['rope_theta']) == (18944, 1000000.0)
+    assert config['layer_types'] == ('full_attention',) * 28
+    assert config['causal'] is False and config['mask_token_id'] == 151666
+    assert config['attention_bias'] and config['o_proj_bias'] is False
+
+
+def test_llada_without_its_mask_token_is_refused():
+    """The mask id is what the objective corrupts with, so a config without
+    one raises naming it. Training against id zero would learn the wrong token."""
+    config = fixture_config("llada-8b")
+    del config['mask_token_id']
+    with pytest.raises(ValueError, match="mask_token_id"):
+        translate_config(config)
+
+
+def test_dream_with_mrope_is_refused():
+    """Dream ships use_mrope false. A true value would rotate positions the
+    backbone has no grid for, so it names the field."""
+    config = {**fixture_config("dream-7b"), 'use_mrope': True}
+    with pytest.raises(ValueError, match="use_mrope"):
+        translate_config(config)
+
+
+def test_llada_renames_its_tensors_onto_the_shared_map():
+    """The checkpoint spells its tensors OLMo-style, so each name lands on the
+    llama-layout path with the same transpose rule and no second table. A
+    name outside that spelling names itself."""
+    config = translate_config(fixture_config("llada-8b"))
+    tensors = {
+        'model.transformer.wte.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.attn_norm.weight': np.ones((4,), np.float32),
+        'model.transformer.blocks.0.q_proj.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.k_proj.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.v_proj.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.attn_out.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.ff_norm.weight': np.ones((4,), np.float32),
+        'model.transformer.blocks.0.ff_proj.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.up_proj.weight': np.ones((4, 4), np.float32),
+        'model.transformer.blocks.0.ff_out.weight': np.ones((4, 4), np.float32),
+        'model.transformer.ln_f.weight': np.ones((4,), np.float32),
+        'model.transformer.ff_out.weight': np.ones((4, 4), np.float32),
+    }
+    variables = translate_weights(tensors, config)['params']
+    assert variables['embed_tokens']['embedding'].shape == (4, 4)
+    assert variables['layers_0']['self_attn']['q_proj']['kernel'].shape == (4, 4)
+    assert variables['layers_0']['mlp']['gate_proj']['kernel'].shape == (4, 4)
+    assert variables['layers_0']['mlp']['up_proj']['kernel'].shape == (4, 4)
+    assert variables['layers_0']['mlp']['down_proj']['kernel'].shape == (4, 4)
+    assert variables['layers_0']['input_layernorm']['scale'].shape == (4,)
+    assert variables['norm']['scale'].shape == (4,)
+    with pytest.raises(ValueError, match="unknown tensor name"):
+        translate_weights({'model.transformer.blocks.0.rotary_emb.inv_freq': np.ones((2,))}, config)
+
+
+def test_diffusion_gemma_text_reuses_the_gemma4_map_in_decoder_mode():
+    """The same weights with the diffusion model_type translate as the Gemma 4
+    text decoder does, except the record reads decoder mode. The encoder
+    cache, the canvas and the self-conditioning loop are not landed here."""
+    gemma4 = translate_config(fixture_config("gemma4-ple"))
+    diffusion = translate_config({**fixture_config("gemma4-ple"),
+                                  'model_type': 'diffusion_gemma_text'})
+    assert diffusion['causal'] is False
+    assert {key: value for key, value in diffusion.items() if key != 'causal'} == gemma4

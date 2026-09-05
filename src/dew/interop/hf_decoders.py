@@ -15,7 +15,11 @@ mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
 gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3_5_text
 (the hybrid of gated delta net layers and gated full-attention layers, whose
 linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
-glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32.
+glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32,
+llada and Dream (bidirectional masked-diffusion decoders with a mask token,
+Dream on the qwen2 tensor layout, LLaDA on OLMo-style names remapped onto it)
+and diffusion_gemma_text (DiffusionGemma's text weights on the Gemma 4 map in
+decoder mode; the block-diffusion sampler is not landed here).
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek loads
 through the MLA mixer with DeepSeek's MoE sizing, and its released
@@ -681,6 +685,219 @@ def _mistral_config(hf_config, used):
         'full_attention' if window is None else 'sliding_attention',) * layers)
 
 
+def _llada_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """LLaDA-8B: a Llama-shaped decoder with full attention and a mask token.
+
+    GSAI-ML/LLaDA-8B-Base (model_type 'llada', architectures ['LLaDAModelLM'])
+    computes a Llama block (RMSNorm pre-norms, rotate-half rope, SwiGLU) with
+    no causal mask anywhere (modeling_llada.py, LLaDAModel bidirectional bias,
+    LLaDALlamaBlock is_causal=False) and trains masked diffusion on the id in
+    mask_token_id. The checkpoint names its tensors OLMo-style
+    (model.transformer.blocks.N.{attn_norm,q_proj,k_proj,v_proj,attn_out,
+    ff_norm,ff_proj,up_proj,ff_out}, wte, ln_f, ff_out for the head), so the
+    weight path renames them onto the llama layout and the shared map reads
+    them from there. Config aliases (d_model, n_layers, n_heads, n_kv_heads,
+    mlp_hidden_size, embedding_size, max_sequence_length) read beside the
+    standard spellings. Dropout, init and kernel flags describe training or
+    the kernel, not the eval forward, and read as used where the release
+    leaves them; anything that would change the eval computation refuses.
+    """
+    hidden = hf_config.get('hidden_size', hf_config.get('d_model'))
+    layers = hf_config.get('num_hidden_layers', hf_config.get('n_layers',
+                           hf_config.get('num_layers')))
+    heads = hf_config.get('num_attention_heads', hf_config.get('n_heads'))
+    kv_heads = hf_config.get('num_key_value_heads', hf_config.get('n_kv_heads'))
+    intermediate = hf_config.get('intermediate_size', hf_config.get('mlp_hidden_size'))
+    vocab = hf_config.get('vocab_size', hf_config.get('embedding_size'))
+    if hidden is None or layers is None or heads is None or intermediate is None or vocab is None:
+        _refuse('llada geometry',
+                'd_model/hidden_size, n_layers/num_hidden_layers, n_heads/num_attention_heads, '
+                'mlp_hidden_size/intermediate_size and embedding_size/vocab_size are required')
+    kv_heads = heads if kv_heads is None else kv_heads
+    head_dim = hf_config.get('head_dim')
+    head_dim = int(head_dim) if head_dim is not None else int(hidden) // int(heads)
+    max_pos = hf_config.get('max_position_embeddings',
+                            hf_config.get('max_sequence_length', DEFAULT_MAX_SEQ_LEN))
+    std: Dict[str, Any] = {
+        'hidden_size': int(hidden), 'num_attention_heads': int(heads),
+        'num_key_value_heads': int(kv_heads), 'head_dim': head_dim,
+        'intermediate_size': int(intermediate), 'vocab_size': int(vocab),
+        'num_hidden_layers': int(layers),
+        'max_position_embeddings': min(int(max_pos), DEFAULT_MAX_SEQ_LEN),
+        'rms_norm_eps': float(hf_config.get('rms_norm_eps', hf_config.get('norm_eps', 1e-6))),
+        'rope_theta': float(hf_config.get('rope_theta', 500000.0)),
+        'attention_bias': bool(hf_config.get('attention_bias', hf_config.get('include_bias',
+                              hf_config.get('include_qkv_bias', False)))),
+        'tie_word_embeddings': bool(hf_config.get('tie_word_embeddings',
+                                    hf_config.get('weight_tying', False))),
+        'hidden_act': hf_config.get('hidden_act', hf_config.get('hidden_activation',
+                      hf_config.get('activation_type', 'silu'))),
+    }
+    inner: set[str] = set()
+    config = _base_config(std, inner, layer_types=('full_attention',) * int(layers),
+                          rope=_Ropes(std['rope_theta']))
+    for key in ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_layers',
+                'num_attention_heads', 'n_heads', 'num_key_value_heads', 'n_kv_heads',
+                'head_dim', 'intermediate_size', 'mlp_hidden_size', 'vocab_size',
+                'embedding_size', 'max_position_embeddings', 'max_sequence_length',
+                'rms_norm_eps', 'norm_eps', 'rope_theta', 'attention_bias', 'include_bias',
+                'include_qkv_bias', 'tie_word_embeddings', 'weight_tying', 'hidden_act',
+                'hidden_activation', 'activation_type'):
+        if key in hf_config:
+            used.add(key)
+    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
+    if mask is None:
+        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
+    used.update(('mask_token_id', 'mask_id'))
+    if std['attention_bias']:
+        _refuse('include_bias/include_qkv_bias', 'the released checkpoint carries no biases')
+    if std['hidden_act'] != 'silu':
+        _refuse(f"activation_type {std['hidden_act']!r}", 'LLaDA-8B computes SwiGLU')
+    if hf_config.get('rope') is False:
+        _refuse('rope=False', 'the released checkpoint rotates every layer')
+    used.add('rope')
+    if (hf_config.get('rope_parameters') is not None or hf_config.get('rope_scaling') is not None
+            or hf_config.get('rope_local_base_freq') is not None):
+        _refuse('rope_parameters/rope_scaling', 'LLaDA-8B carries plain rope at rope_theta')
+    used.update(('rope_parameters', 'rope_scaling', 'rope_local_base_freq'))
+    stated = hf_config.get('layer_types')
+    if stated is not None and tuple(stated) != ('full_attention',) * int(layers):
+        _refuse(f'layer_types {list(stated)!r}', 'LLaDA-8B attends every layer fully')
+    if stated is not None:
+        used.add('layer_types')
+    if hf_config.get('sliding_window') is not None:
+        _refuse('sliding_window', 'LLaDA-8B windows no layer')
+    used.add('sliding_window')
+    if hf_config.get('attention_layer_norm'):
+        _refuse('attention_layer_norm', 'the dense checkpoint norms no queries or keys')
+    used.update(('attention_layer_norm', 'attention_layer_norm_with_affine'))
+    if hf_config.get('bias_for_layer_norm'):
+        _refuse('bias_for_layer_norm', 'the RMS norms carry no bias')
+    used.add('bias_for_layer_norm')
+    if hf_config.get('layer_norm_type', 'rms') != 'rms':
+        _refuse(f"layer_norm_type {hf_config.get('layer_norm_type')!r}", 'the norms are RMS')
+    used.add('layer_norm_type')
+    if not hf_config.get('layer_norm_with_affine', True):
+        _refuse('layer_norm_with_affine=False', 'the released norms scale')
+    used.add('layer_norm_with_affine')
+    if hf_config.get('input_emb_norm'):
+        _refuse('input_emb_norm', 'the embeddings enter the first block unnormed')
+    used.add('input_emb_norm')
+    if hf_config.get('block_type', 'llama') != 'llama':
+        _refuse(f"block_type {hf_config.get('block_type')!r}", 'this entry is the llama block')
+    used.add('block_type')
+    if int(hf_config.get('block_group_size', 1)) != 1:
+        _refuse('block_group_size', 'the released stack groups no blocks')
+    used.add('block_group_size')
+    if hf_config.get('alibi'):
+        _refuse('alibi', 'the attention carries no alibi slopes')
+    used.update(('alibi', 'alibi_bias_max'))
+    if hf_config.get('scale_logits'):
+        _refuse('scale_logits', 'the head writes raw logits')
+    used.add('scale_logits')
+    if not hf_config.get('rope_full_precision', True):
+        _refuse('rope_full_precision=False', 'the parity fixture runs the rope in fp32')
+    used.add('rope_full_precision')
+    if hf_config.get('multi_query_attention') not in (None, False):
+        _refuse('multi_query_attention', 'the head counts come from n_heads/n_kv_heads')
+    used.add('multi_query_attention')
+    used.update(('embedding_dropout', 'residual_dropout', 'flash_attention', 'precision',
+                 'init_device', 'init_fn', 'init_std', 'init_cutoff_factor', 'mlp_ratio',
+                 'eos_token_id', 'pad_token_id'))
+    embedding = hf_config.get('embedding_size')
+    if embedding is not None and int(embedding) != int(vocab):
+        _refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
+    config.update(causal=False, mask_token_id=int(mask))
+    return config
+
+
+def _dream_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Dream-v0: a Qwen2-shaped decoder with full attention and a mask token.
+
+    Dream-org/Dream-v0-Base-7B (model_type 'Dream', architectures ['DreamModel'])
+    is a 28-layer Qwen2.5-7B geometry (3584 wide, 28 heads, 4 kv heads) whose
+    attention hard-codes is_causal=False over biased q/k/v and a bias-free
+    o_proj (modeling_dream.py, DreamAttention/DreamSdpaAttention) and whose
+    MLP is bias-free SwiGLU. Tensor names are the qwen2 layout, so the shared
+    map reads them with no new table. use_mrope=False is the only Dream-only
+    flag and changes nothing at that value.
+    """
+    if hf_config.get('use_mrope'):
+        _refuse('use_mrope=True', 'the backbone rotates plain positions')
+    used.add('use_mrope')
+    config = _qwen2_config(hf_config, used)
+    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
+    if mask is None:
+        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
+    used.update(('mask_token_id', 'mask_id'))
+    config.update(causal=False, mask_token_id=int(mask))
+    return config
+
+
+def _diffusion_gemma_text_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """DiffusionGemma's text weights: the Gemma 4 block in decoder mode.
+
+    google/diffusiongemma-26B-A4B-it (model_type 'diffusion_gemma_text') is the
+    Gemma 4 text geometry with canvas denoising around it: a causal encoder
+    over the prompt filling a KV cache, then a bidirectional decoder over the
+    canvas attending to that cache, with a self-conditioning MLP folding the
+    previous step's logits into the input embeddings
+    (TF/models/diffusion_gemma/modeling_diffusion_gemma.py:281, :383, :790-823,
+    :1326-1440). The tree is the same either way (causal changes the mask, not
+    the parameters), so this entry translates the weights onto the Gemma 4 map
+    with no new table and marks the record decoder-mode (causal=False). The
+    encoder cache, the canvas positions and the self-conditioning loop need a
+    block-diffusion Process and objective that are not landed here; the report
+    names them.
+    """
+    config = _gemma4_config(hf_config, used)
+    config.update(causal=False)
+    return config
+
+
+def _llada_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    """LLaDA's OLMo-style names onto the shared llama-layout map.
+
+    The computation matches (pre-norm RMS, rotate-half rope, SwiGLU, untied
+    head), only the names differ, so each name is respelled and _dew_path does
+    the rest. No second table.
+    """
+    renamed = name
+    if renamed == 'model.transformer.wte.weight':
+        renamed = 'model.embed_tokens.weight'
+    elif renamed == 'model.transformer.ln_f.weight':
+        renamed = 'model.norm.weight'
+    elif renamed == 'model.transformer.ff_out.weight':
+        renamed = 'lm_head.weight'
+    else:
+        parts = renamed.split('.')
+        if (len(parts) == 6 and parts[:3] == ['model', 'transformer', 'blocks']
+                and parts[3].isdigit()):
+            tail = {'attn_norm': 'input_layernorm', 'attn_out': 'self_attn.o_proj',
+                    'ff_norm': 'post_attention_layernorm', 'ff_proj': 'mlp.gate_proj',
+                    'up_proj': 'mlp.up_proj', 'ff_out': 'mlp.down_proj',
+                    'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
+                    'v_proj': 'self_attn.v_proj'}.get(parts[4])
+            if tail is None or parts[5] != 'weight':
+                raise ValueError(f'unknown tensor name {name!r}')
+            renamed = f'model.layers.{parts[3]}.{tail}.weight'
+        else:
+            raise ValueError(f'unknown tensor name {name!r}')
+    return _dew_path(renamed, config)
+
+
+def _llada_export(model: CausalTransformer) -> dict[str, object]:
+    return {'mask_token_id': getattr(model, 'mask_token_id', None)}
+
+
+def _dream_export(model: CausalTransformer) -> dict[str, object]:
+    return {'mask_token_id': getattr(model, 'mask_token_id', None)}
+
+
+def _diffusion_gemma_export(model: CausalTransformer) -> dict[str, object]:
+    return {'use_bidirectional_attention': 'all'}
+
+
 def _qwen2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
@@ -1156,10 +1373,15 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
 
     # Gemma 4 spells the flag 'vision' for its image tokens alone, and the
     # text decoder is causal (configuration_gemma4.py, only 'all' clears
-    # is_causal). True and 'all' change what the decoder computes.
+    # is_causal). True and 'all' change what the decoder computes. The masked
+    # diffusion families are bidirectional by construction (LLaDA's
+    # bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's
+    # decoder), so their own translators own the direction and this check
+    # leaves them alone.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if bidirectional and bidirectional != 'vision':
-        _refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
+    if model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text'):
+        if bidirectional and bidirectional != 'vision':
+            _refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     if hf_config.get('mlp_bias'):
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
@@ -2059,6 +2281,30 @@ def _every_layer_windowed(fields: Mapping[str, Any]) -> bool:
 
 
 _FAMILY_ENTRIES = (
+    DecoderFamily(('diffusion_gemma_text',), _diffusion_gemma_text_config,
+                  lambda fields: bool(fields.get('causal') is False
+                                      and (fields.get('v_norm')
+                                           or fields.get('per_layer_input_dim')
+                                           or fields.get('num_kv_shared_layers'))),
+                  'diffusion_gemma_text', 'DiffusionGemmaForBlockDiffusion',
+                  _diffusion_gemma_export, sandwich_norms=True,
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare),
+    DecoderFamily(('dream', 'Dream'), _dream_config,
+                  lambda fields: bool(fields.get('causal') is False
+                                      and fields.get('attention_bias')
+                                      and fields.get('o_proj_bias') is False),
+                  'dream', 'DreamModel', _dream_export),
+    DecoderFamily(('llada',), _llada_config,
+                  lambda fields: bool(fields.get('causal') is False
+                                      and not fields.get('attention_bias')
+                                      and fields.get('mixture') is None
+                                      and not (fields.get('v_norm')
+                                               or fields.get('per_layer_input_dim')
+                                               or fields.get('num_kv_shared_layers'))
+                                      and not fields.get('output_gate')
+                                      and not fields.get('qk_norm')),
+                  'llada', 'LLaDAModelLM', _llada_export,
+                  weight_path=_llada_path),
     DecoderFamily(('gpt_oss',), _gpt_oss_config,
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
