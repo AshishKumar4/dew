@@ -26,8 +26,8 @@ Apache-2.0, which is why this file carries their notice.
 Where the two references disagree, this file follows verl, whose functions
 tools/parity_rl.py can call directly and tests/test_rl_surrogate.py compares
 against. Both disagreements are written where they happen. Tunix's surrogate
-lives behind a model forward inside `grpo_loss_fn`, so it is a reading
-reference here and not a callable one.
+lives behind a model forward inside `grpo_loss_fn`. It is a reading
+reference; the callable checks run against verl.
 
 Everything here is array math on `[B, T]` arrays. A policy forward, a
 reference forward and a reward all happen outside.
@@ -47,8 +47,8 @@ policy that has drifted."""
 
 SEQUENCE_RATIO_CLAMP = 10.0
 """Upper bound on the sequence-level log ratio, verl's and Tunix's. Only the
-upper side, because a vanishing ratio is harmless and an exploding one is
-not."""
+upper side is clamped, since only an exploding ratio threatens what is
+exponentiated."""
 
 KL_DIFF_CLAMP = 20.0
 KL_CLAMP = 10.0
@@ -62,10 +62,9 @@ def token_mean(x: jax.Array, mask: jax.Array) -> jax.Array:
 
     verl's `agg_loss(loss_agg_mode="token-mean")` and Tunix's
     `aggregate_loss("token-mean")`. The denominator is the exact token count,
-    with none of `masked_mean`'s 1e-8, because a loss that is 1e-8 off scales
-    the gradient by the same factor. Both references keep the two reductions
-    separate for that reason. A batch with no unmasked token divides by zero,
-    which is a loud nan rather than a step on nothing.
+    without `masked_mean`'s 1e-8. A loss that is 1e-8 off scales the gradient
+    by the same factor, so both references keep the two reductions separate.
+    A batch with no unmasked token divides by zero and surfaces as a nan.
     """
     weights = mask.astype(x.dtype)
     return jnp.sum(jnp.where(weights != 0, x, 0) * weights) / jnp.sum(weights)
@@ -89,13 +88,13 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
     the masked mean of the token log ratios (arXiv:2507.18071, equation 6).
     Written as `logp - sg(logp) + sg(mean)` the value of every token in a
     sequence is that one mean, while the derivative with respect to each token's
-    log-probability stays that token's own. Dropping either stop-gradient
-    leaves the value untouched and changes every gradient, which is why the
-    test that defends this asserts gradients.
+    log-probability is that token's own. Dropping either stop-gradient leaves
+    the value untouched and changes every gradient. The test pins the
+    gradients for that reason.
 
-    Tunix clamps the token log ratios to +-20 before pooling them and this does
-    not, because verl's `compute_policy_loss_gspo` pools the raw difference.
-    The clamp at 10 on the result bounds what is exponentiated either way.
+    Tunix clamps the token log ratios to +-20 before pooling them. This pools
+    the raw difference, as verl's `compute_policy_loss_gspo` does. The clamp
+    at 10 on the result bounds what is exponentiated either way.
     """
     log_probs = jnp.asarray(log_probs, jnp.float32)
     log_ratio = log_probs - jnp.asarray(old_log_probs, jnp.float32)
@@ -114,8 +113,8 @@ def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Arr
 
     `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))` per token, and for a
     negative advantage the dual clip caps the term at `-A * dual_clip`
-    (arXiv:1912.09729), which is what stops one token's ratio from dominating a
-    step. `advantages` is `[B]`, one per completion, or `[B, T]` when a run
+    (arXiv:1912.09729). Without the cap one token's ratio can dominate a step.
+    `advantages` is `[B]`, one per completion, or `[B, T]` when a run
     scores tokens, the shape branch Tunix's `grpo_loss_fn` carries; a `[B]`
     column broadcasts over the sequence.
 
@@ -161,7 +160,7 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     verl's `kl_penalty_forward("k3")` clamps `d` to +-20 before the exponential
     and the estimate to +-10 after it, and this follows verl. Without the
     second clamp one drifted token contributes `exp(20)` to the penalty and
-    owns the step.
+    dominates the step.
 
     Aggregate it the way the policy loss is aggregated, `token_mean(kl, mask)`,
     and add `beta` times that.
