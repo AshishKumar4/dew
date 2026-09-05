@@ -547,7 +547,7 @@ def mode_tracked(args) -> dict:
 
     class Drawing(LossRecorder):
         def artifact(self, value, step):
-            payload = render(value, step)
+            payload = render(value)
             drawn.append({
                 "type": type(value).__name__,
                 "rendered": payload is not NotImplemented,
