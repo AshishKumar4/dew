@@ -311,8 +311,9 @@ def test_default_rules_keep_the_shape_heuristic_for_the_dit():
     assert jax.tree.map(lambda sharding: sharding.spec, shardings) == expected
 
 
-def test_rules_may_name_a_mesh_axis_this_mesh_does_not_have():
-    """A table can carry the future tensor axis; today's mesh drops it."""
+def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
+    """Every mesh has the tensor axis; at size 1 a rule onto it is dropped
+    from the spec and the width falls to the next axis the rule names."""
     shardings = Layout(rules={"mlp": ["tensor", "fsdp"], "heads": "tensor"},
                        min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)),
                                               dit_variables())["params"]
@@ -320,6 +321,15 @@ def test_rules_may_name_a_mesh_axis_this_mesh_does_not_have():
     assert (shardings["dit_block_0"]["mlp"]["layers_0"]["kernel"].spec
             == P(None, "fsdp"))
     assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
+
+
+@pytest.mark.parametrize("axis", ["sequence", "data", "fspd"])
+def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused(axis):
+    """The data and sequence axes split the batch: a parameter placed on
+    either would be gathered on every use. A misspelt axis is refused the
+    same way, at construction, rather than as a KeyError inside placement."""
+    with pytest.raises(ValueError, match=axis):
+        Layout(rules={"embed": axis})
 
 
 class IndivisibleModel(nn.Module):
