@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -49,15 +49,6 @@ class AutoEncoder(ABC):
     @abstractmethod
     def latent_channels(self) -> int:
         """c, the channels of a latent."""
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """The name a config refers to this autoencoder by."""
-
-    @abstractmethod
-    def serialize(self) -> Dict[str, Any]:
-        """The configuration that rebuilds this autoencoder."""
 
     def encode(self, params, x: jnp.ndarray,
                key: Optional[jax.Array] = None) -> jnp.ndarray:

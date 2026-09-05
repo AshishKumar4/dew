@@ -120,13 +120,3 @@ class StableDiffusionVAE(AutoEncoder):
     def latent_channels(self) -> int:
         return self._latent_channels
 
-    @property
-    def name(self) -> str:
-        return "stable_diffusion"
-
-    def serialize(self):
-        return {
-            "modelname": self.modelname,
-            "revision": self.revision,
-            "dtype": str(self.dtype),
-        }

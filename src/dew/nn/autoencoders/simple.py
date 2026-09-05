@@ -192,18 +192,3 @@ class SimpleAutoEncoder(AutoEncoder):
     def latent_channels(self) -> int:
         return self._latent_channels
 
-    @property
-    def name(self) -> str:
-        return "simple_autoencoder"
-
-    def serialize(self) -> dict:
-        """Config only, matching StableDiffusionVAE: weights live in a checkpoint."""
-        return {
-            "name": self.name,
-            "latent_channels": self._latent_channels,
-            "feature_depths": list(self.feature_depths),
-            "out_channels": self.out_channels,
-            "dtype": str(self.dtype),
-            "latent_shift": self.latent_shift,
-            "latent_scale": self.latent_scale,
-        }
