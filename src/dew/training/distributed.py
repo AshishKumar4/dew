@@ -90,7 +90,7 @@ class MeshSpec:
     """Microbatches a step feeds through the stages, a multiple of `stage`; None
     is one per stage, the smallest schedule. A stage runs one microbatch while
     the next runs the one before it, so more microbatches shrink the idle
-    time at either end of the step and cost nothing but the loop's length."""
+    time at either end of the step and make each iteration's matmuls smaller."""
 
     def __post_init__(self):
         if self.stage < 1:
