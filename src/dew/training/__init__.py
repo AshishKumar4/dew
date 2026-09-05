@@ -1,6 +1,6 @@
 """The trainer and what it is built from.
 
-`dew.training` knows no modality: it imports nothing from `dew.diffusion`,
+`dew.training` knows no modality. It imports nothing from `dew.diffusion`,
 `dew.inputs` or `dew.sampling`, and wandb only when a `WandbTracker` logs.
 """
 
