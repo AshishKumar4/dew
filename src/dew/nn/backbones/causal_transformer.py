@@ -791,21 +791,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                          segment_ids=segment_ids, kv_store=store,
                          per_layer_input=per_layer_input), None
 
-        group = block(first, group_name(first, count))
-        # A scan carries one dtype. Under a bf16 policy the plain loop's
-        # first layer returns the residual stream in fp32 (its feed-forward
-        # runs in fp32) and the layers after it keep fp32, so the carry
-        # enters in the dtype one layer returns; at fp32 nothing changes.
-        first_input = None if inputs is None else inputs[:, :, 0, :]
-        assert group.scope is not None
-        output = jax.eval_shape(lambda: group.apply(
-            jax.tree.map(lambda leaf: leaf[0], group.variables), x, mutable=True,
-            rngs={name: rng.as_jax_rng() for name, rng in group.scope.rngs.items()},
-            train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            kv_store=store, per_layer_input=first_input)[0])
         scanned = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
                           in_axes=2, length=count)
-        x, _ = scanned(group, x.astype(jnp.result_type(x.dtype, output.dtype)), inputs)
+        x, _ = scanned(block(first, group_name(first, count)), x, inputs)
     return x
 
 
@@ -1659,7 +1647,9 @@ class CausalTransformer(nn.Module):
         the one it creates whatever the model is asked to do afterwards.
         With `scan_layers`, or a stage axis above one on the mesh in context,
         the stack runs under `StackView`: the same leaves, stacked along the
-        loops' axes while the loops run and unstacked on the way out.
+        loops' axes while the loops run and unstacked on the way out. The
+        loops carry the residual stream in one dtype, so it enters them in
+        the dtype it settles in (`residual_dtype`).
         """
         stages = pipeline_stages()
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
@@ -1691,9 +1681,36 @@ class CausalTransformer(nn.Module):
                 # What enters the loop is read on every iteration; what the
                 # loop creates (the routers' sowing) comes out per iteration.
                 broadcast=tuple(name for name, tree in self.variables.items() if tree))
+        x = x.astype(self.residual_dtype(
+            x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            per_layer_input=per_layer_input))
         run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input)
+
+    def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
+                       per_layer_input) -> jnp.dtype:
+        """The dtype the residual stream settles in: `x`'s promoted with what
+        the first layer returns for it.
+
+        A scan carries one dtype from its first iteration to its last, and
+        every pipeline stage takes the dtype the stage before it returns.
+        Under a bf16 policy the dense feed-forward returns fp32, so the
+        plain loop's stream is fp32 from the first layer on and the loops
+        take it in fp32 from the start; at fp32 nothing changes. The layer
+        runs abstractly, in a scope of its own, so it writes no cache and
+        sows nothing here, and its RNG streams take placeholder keys, since
+        a shape needs a key of each name and no value.
+        """
+        layer, scope = self.layers[0], self.layers[0].scope
+        assert scope is not None
+        rngs = {name: jax.random.key(0) for name in scope.rngs}
+        output = jax.eval_shape(lambda: layer.apply(
+            layer.variables, x, mutable=True, rngs=rngs,
+            train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            kv_store={} if self.num_kv_shared_layers else None,
+            per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :])[0])
+        return jnp.result_type(x.dtype, output.dtype)
 
     def stage_layers(self, stages: int) -> int:
         """Layers per stage when the stack splits into `stages`, or why it cannot.
@@ -1764,9 +1781,7 @@ class CausalTransformer(nn.Module):
         batch_axis = 1 if self.altup is not None else 0
         micro = functools.partial(_microbatched, count=count)
         x = micro(x, batch_axis)
-        positions = None if positions is None else jnp.asarray(positions)
-        segment_ids = None if segment_ids is None else jnp.asarray(segment_ids)
-        per_row = [micro(value, 0) if value is not None and value.ndim > 1 else value
+        per_row = [None if value is None else micro(jnp.asarray(value), 0)
                    for value in (positions, segment_ids)]
         inputs = None if per_layer_input is None else micro(per_layer_input, 0)
         slots = count // stages
@@ -1791,7 +1806,7 @@ class CausalTransformer(nn.Module):
 
         def gather(values, ids):
             """Each stage's microbatch out of `[microbatches, ...]` values."""
-            if values is None or values.ndim == 1:
+            if values is None:
                 return values
             return _on_stage_axis(jax.vmap(
                 lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
