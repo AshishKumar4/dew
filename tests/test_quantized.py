@@ -139,7 +139,10 @@ def test_the_config_names_the_block_for_fp8_and_nothing_for_the_rest():
 
 
 @pytest.mark.parametrize("field, value", [("fmt", "e5m2"), ("weight_block_size", None),
-                                          ("weight_block_size", [1, 128])])
+                                          ("weight_block_size", [1, 128]),
+                                          ("weight_block_size", [128.0, 128.0]),
+                                          ("weight_block_size", [True, True]),
+                                          ("weight_block_size", [0, 0])])
 def test_an_fp8_config_outside_deepseeks_format_is_refused(field, value):
     with pytest.raises(ValueError, match="square blocks and nothing else"):
         fp8_block({"quantization_config": {**DEEPSEEK_V3, field: value}})

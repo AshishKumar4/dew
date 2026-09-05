@@ -44,12 +44,14 @@ def fp8_block(hf_config: Mapping[str, Any]) -> int | None:
     if quantization is None or quantization.get('quant_method') != 'fp8':
         return None
     fmt, block = quantization.get('fmt'), quantization.get('weight_block_size')
-    if fmt != 'e4m3' or not isinstance(block, list) or len(block) != 2 or block[0] != block[1]:
+    if (fmt != 'e4m3' or not isinstance(block, list) or len(block) != 2
+            or any(type(side) is not int or side < 1 for side in block)
+            or block[0] != block[1]):
         raise ValueError(
             f"quantization_config names fp8 with fmt {fmt!r} and weight_block_size "
             f"{block!r}; this loader dequantizes DeepSeek's e4m3 weights in square "
             f"blocks and nothing else")
-    return int(block[0])
+    return block[0]
 
 
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
