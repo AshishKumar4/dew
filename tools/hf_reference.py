@@ -47,7 +47,7 @@ from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
-    MixtralConfig, MixtralForCausalLM,
+    MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -95,6 +95,18 @@ def tiny_llama() -> LlamaForCausalLM:
         rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return LlamaForCausalLM(config)
+
+
+def tiny_qwen2() -> Qwen2ForCausalLM:
+    """Biased q/k/v projections with a bias-free o_proj, and a sliding window
+    from the second layer on (use_sliding_window with max_window_layers)."""
+    config = Qwen2Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=128, vocab_size=256,
+        use_sliding_window=True, sliding_window=4, max_window_layers=1,
+        max_position_embeddings=64, rope_theta=1e6, tie_word_embeddings=True))
+    torch.manual_seed(0)
+    return Qwen2ForCausalLM(config)
 
 
 def tiny_mixtral() -> MixtralForCausalLM:
@@ -301,6 +313,8 @@ def main() -> None:
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
+    write_tiny("qwen2-tiny", tiny_qwen2())
+    write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
     write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())

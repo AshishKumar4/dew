@@ -8,13 +8,13 @@ load_pretrained_decoder returns a (model, variables, config) triple that a
 forward pass takes straight away, config being the dew config the model was
 built from.
 
-The families covered are the ones CausalTransformer can express: llama, qwen3,
-gemma3_text, gemma4_text, qwen3_5_text (the hybrid of gated delta net
-layers and gated full-attention layers, whose linear_attn layers land on the
-gated_delta_net mixer kind), deepseek_v3 and deepseek_v32. qwen2 is refused
-rather than half-loaded, since its q/k/v biases without an o_proj bias have
-no counterpart in the backbone's one attention_bias flag, and a multimodal
-wrapper config is refused rather than loading its text half. DeepSeek loads
+Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
+model_type: the config translation, the tensor path rule and the export
+vocabulary. Entries cover llama, mistral, mixtral, qwen2, qwen3, gemma3_text,
+gemma4_text, qwen3_5_text (the hybrid of gated delta net layers and gated
+full-attention layers, whose linear_attn layers land on the gated_delta_net
+mixer kind), deepseek_v3 and deepseek_v32. A multimodal wrapper config is
+refused rather than loading its text half. DeepSeek loads
 through the MLA mixer with DeepSeek's MoE sizing, and its released
 checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
 translation builds the base model the weights describe. A config field that
@@ -23,6 +23,7 @@ ValueError naming it, rather than loading a model that silently computes
 something else.
 """
 
+import dataclasses
 import json
 import os
 from dataclasses import dataclass
@@ -32,8 +33,8 @@ from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 import numpy as np
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mixers import AttentionMixer
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
 from dew.registry import models, with_precision
 
@@ -522,6 +523,14 @@ def _mistral_config(hf_config, used):
         'full_attention' if window is None else 'sliding_attention',) * layers)
 
 
+def _qwen2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    # Qwen2Attention biases q, k and v and builds o_proj without one
+    # (modeling_qwen2.py:189-192), whatever the config says.
+    config = _base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used))
+    config.update(attention_bias=True, o_proj_bias=False)
+    return config
+
+
 def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     return _base_config(hf_config, used, qk_norm=True,
                         layer_types=_qwen_layer_types(hf_config, used))
@@ -773,13 +782,6 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """Translate one registered family, refusing computation with no counterpart."""
 
     model_type = hf_config.get('model_type')
-    if model_type == 'qwen2':
-        # Qwen2 biases q/k/v and leaves o_proj bias-free (modeling_qwen2.py
-        # 189-192), and CausalSelfAttention has one attention_bias flag for
-        # all four projections, so its checkpoints cannot load unchanged.
-        _refuse("model_type 'qwen2'",
-                "its q/k/v projections carry biases and o_proj does not, which "
-                "the one attention_bias flag cannot say")
     if model_type in _WRAPPERS or (model_type not in _FAMILIES
                                    and 'text_config' in hf_config):
         # google/gemma-4-E2B is one of these: the decoder is real and its
@@ -1024,7 +1026,7 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     # params is always a collection, mapped tensors or not: a checkpoint
     # whose every tensor maps to nothing is an empty tree, not no tree.
     variables: Dict[str, Any] = {'params': {}}
-    family = _family_for_model(models.build('causal_transformer', **dict(config)))
+    family = _family_for_config(config)
     for name, tensor in hf_tensors.items():
         path = family.weight_path(name, config)
         if path is None:
@@ -1137,10 +1139,10 @@ def save_pretrained_decoder(model, variables, directory, *,
 
     The inverse of load_pretrained_decoder: the same field map, run backwards,
     so a round-trip through dew hands transformers a checkpoint it accepts and
-    a load hands back bitwise-equal parameters. model_type is gemma3_text when
-    the sandwich norms are on, qwen3 when the q/k norms are, llama otherwise.
-    All three references build q/k/v/o with bias=config.attention_bias, so the
-    flag exports as it stands.
+    a load hands back bitwise-equal parameters. The family entry whose
+    predicate matches the model names the model_type, so a model with the
+    sandwich norms writes gemma3_text, one with q/k norms qwen3, one with
+    biased q/k/v over a bias-free o_proj qwen2, and a plain stack llama.
     """
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -1150,7 +1152,7 @@ def save_pretrained_decoder(model, variables, directory, *,
     if model.per_layer_input_dim or model.num_kv_shared_layers or model.v_norm:
         raise ValueError(
             "per-layer input embeddings, KV sharing and the values norm have "
-            "no counterpart in the llama, qwen3 and gemma3_text families this "
+            "no counterpart in the dense families this "
             "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
             "or v_norm set cannot be written back to the HF layout")
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
@@ -1159,7 +1161,7 @@ def save_pretrained_decoder(model, variables, directory, *,
                    for mixer in mixers)):
         raise ValueError(
             "the attention output gate, a partial rotary and a mixer other than "
-            "attention have no counterpart in the llama, qwen3 and gemma3_text "
+            "attention have no counterpart in the dense "
             "families this exports, so a model with output_gate, "
             "partial_rotary_factor or a linear-attention kind set cannot be "
             "written back to the HF layout")
@@ -1228,6 +1230,14 @@ def _export_config(model) -> Dict[str, Any]:
         'hidden_act': 'silu' if model.mlp == 'swiglu' else 'gelu_pytorch_tanh',
         'use_cache': True,
     }
+    if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
+        # Only Qwen2's reference derives this split from the class itself;
+        # every other family reads one config flag for all four projections.
+        if family.export_model_type != 'qwen2':
+            raise ValueError(
+                "o_proj_bias differs from attention_bias, which only the qwen2 "
+                "family's reference builds, so the model cannot be written as "
+                f"{family.export_model_type}")
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
@@ -1315,15 +1325,17 @@ def _mixtral_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str
 class DecoderFamily:
     """One family's config, tensor paths and export vocabulary.
 
-    Dew configs describe computation without a checkpoint provenance tag.
-    matches identifies the same computation when weights arrive with a Dew
-    config or a caller exports a model built directly from the registry.
-    More specific layouts precede the dense decoder in the table.
+    A dew config carries no provenance tag, so `matches` reads the fields
+    the backbone would be built from and names the family whose reference
+    computes them; the same fields come from a built model at export and
+    from a config dict at weight translation. Entries are ordered from the
+    most specific layout to the plain dense decoder, and the first match
+    wins.
     """
 
     model_types: tuple[str, ...]
     translate_config: Callable[[Mapping[str, object], set[str]], dict[str, object]]
-    matches: Callable[[CausalTransformer], bool]
+    matches: Callable[[Mapping[str, Any]], bool]
     export_model_type: str
     architecture: str
     export_fields: Callable[[CausalTransformer], dict[str, object]]
@@ -1332,38 +1344,74 @@ class DecoderFamily:
     sandwich_norms: bool = False
 
 
+def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
+    mixer = fields['mixer']
+    return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
+
+
+def _every_layer_windowed(fields: Mapping[str, Any]) -> bool:
+    kinds = fields['kinds'] or {}
+    windows = {name: (kind.window if isinstance(kind, LayerKind) else kind.get('window'))
+               for name, kind in kinds.items()}
+    return all(windows.get(layer) is not None
+               for layer in fields['layer_types'] or ('full_attention',))
+
+
 _FAMILY_ENTRIES = (
     DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
-                  lambda model: isinstance(model.mixer, MLAMixer) and model.mixer.index_topk is not None,
+                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
+                                  and mixer.index_topk is not None),
                   'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
-                  lambda model: isinstance(model.mixer, MLAMixer),
+                  lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
     DecoderFamily((_QWEN35,), _qwen35_config,
-                  lambda model: model.output_gate or 'linear_attention' in model.per_layer_types,
+                  lambda fields: bool(fields['output_gate']
+                                      or 'linear_attention' in (fields['layer_types'] or ())),
                   _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}),
     DecoderFamily(('gemma4_text',), _gemma4_config,
-                  lambda model: bool(model.v_norm or model.per_layer_input_dim or model.num_kv_shared_layers),
+                  lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
+                                      or fields['num_kv_shared_layers']),
                   'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True),
-    DecoderFamily((_GEMMA,), _gemma3_config, lambda model: model.sandwich_norms,
+    DecoderFamily((_GEMMA,), _gemma3_config, lambda fields: bool(fields['sandwich_norms']),
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
-    DecoderFamily(('qwen3',), _qwen3_config, lambda model: model.qk_norm,
+    DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields['qk_norm']),
                   'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
-    DecoderFamily(('mixtral',), _mixtral_config, lambda model: model.mixture is not None,
+    DecoderFamily(('qwen2',), _qwen2_config,
+                  lambda fields: bool(fields['attention_bias'] and fields['o_proj_bias'] is False),
+                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export),
+    DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields['mixture'] is not None,
                   'mixtral', 'MixtralForCausalLM', lambda model: {},
                   weight_path=_mixtral_path),
-    DecoderFamily(('mistral',), _mistral_config,
-                  lambda model: all(model.kind_of(kind).window is not None
-                                    for kind in model.per_layer_types),
+    DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
                   'mistral', 'MistralForCausalLM', lambda model: {}),
-    DecoderFamily(('llama',), _base_config, lambda model: True,
+    DecoderFamily(('llama',), _base_config, lambda fields: True,
                   'llama', 'LlamaForCausalLM', lambda model: {}),
 )
 _FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
 
+# What the backbone takes for a field a config leaves unset, so a partial
+# config (a layer's worth of tensors in a test) selects its family the way
+# the built model would.
+_BACKBONE_DEFAULTS = {
+    field.name: (field.default if field.default_factory is dataclasses.MISSING
+                 else field.default_factory())
+    for field in dataclasses.fields(CausalTransformer)
+    if field.default is not dataclasses.MISSING
+    or field.default_factory is not dataclasses.MISSING}
+
+
+def _family_of(fields: Mapping[str, Any]) -> DecoderFamily:
+    return next(family for family in _FAMILY_ENTRIES if family.matches(fields))
+
+
+def _family_for_config(config: Mapping[str, Any]) -> DecoderFamily:
+    return _family_of({**_BACKBONE_DEFAULTS, **config})
+
 
 def _family_for_model(model: CausalTransformer) -> DecoderFamily:
-    return next(family for family in _FAMILY_ENTRIES if family.matches(model))
+    return _family_of({field.name: getattr(model, field.name)
+                       for field in dataclasses.fields(model)})
 
 
 def _check_tree(variables: Mapping[str, Any], model) -> None:
