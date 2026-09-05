@@ -12,7 +12,7 @@ from jax.sharding import PartitionSpec as P
 from flax.linen.dtypes import promote_dtype
 import functools
 import math
-from .sharding import SEQUENCE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -356,8 +356,9 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     context, with the keys and values gathered whole once.
 
     The batch rows of every activation stay split over the mesh's other
-    axes but tensor, which holds a width and never a row; the heads are left
-    to GSPMD, so a width the rules put on the tensor axis stays there. A
+    axes but tensor and stage, which hold a width and a pipeline stage and
+    never a row; the heads are left to GSPMD, so a width the rules put on
+    the tensor axis stays there. A
     causal call, a windowed one and a masked one reorder the queries with
     `stripe` so each shard holds equal causal work, carry the queries'
     positions into the mask (`causal_attention_mask` reads positions, which
@@ -368,7 +369,8 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     causal flag, since causality by row index no longer holds.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    rows = tuple(axis for axis in mesh.axis_names if axis not in (TENSOR_AXIS, SEQUENCE_AXIS))
+    rows = tuple(axis for axis in mesh.axis_names
+                 if axis not in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS))
     split = P(rows or None, SEQUENCE_AXIS, P.UNCONSTRAINED, P.UNCONSTRAINED)
     whole = P(rows or None, None, P.UNCONSTRAINED, P.UNCONSTRAINED)
     constrain = jax.lax.with_sharding_constraint
