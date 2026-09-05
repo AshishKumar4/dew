@@ -1,5 +1,6 @@
 """RunConfig: the typed record of a run, its round trip, and what it builds."""
 
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +33,17 @@ def test_to_dict_and_from_dict_round_trip_a_run():
                               "fields": dataclasses.asdict(config.data)}
     assert record["trainer"]["layout"]["rules"] == [["mlp", "fsdp"]]
     assert RunConfig.from_dict(record) == config
+
+
+def test_a_tuple_field_comes_back_a_tuple_from_a_record():
+    """JSON has no tuple, so a record holds a list where the class declares
+    one. The class gets its tuple back: with a list in its place the loaded
+    config compares unequal to the saved one and its spec is unhashable."""
+    config = RunConfig(data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1))
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+
+    assert loaded.data.shards == ("arrayrecord2/cc12m",)
+    assert loaded == config
 
 
 def test_a_record_with_an_unknown_or_a_missing_field_is_refused():
@@ -157,6 +169,8 @@ class Shape:
     width: int = 8
     mix: Optional[Kind] = None
     kinds: Mapping[str, Kind] = dataclasses.field(default_factory=dict)
+    layers: tuple[Kind, ...] = ()
+    size: tuple[int, int] = (1, 1)
     stages: tuple = ()
     dtype: Any = None
 
@@ -176,6 +190,14 @@ def test_a_record_builds_the_value_its_field_declares():
     assert built.mix == Kind(rope_theta=1e6)
     assert built.kinds == {"sliding": Kind(window=512)}
     assert shapes().build("shape", mix=Kind(window=1)).mix == Kind(window=1)
+    built = shapes().build("shape", size=[4, 8], layers=[{"window": 2}, {}])
+    assert built.size == (4, 8)
+    assert built.layers == (Kind(window=2), Kind())
+
+
+def test_a_record_with_the_wrong_number_of_entries_for_a_tuple_is_refused():
+    with pytest.raises(ValueError, match="2 entries"):
+        shapes().build("shape", size=[4])
 
 
 def test_a_dtype_is_a_dtype_wherever_it_is_named():
