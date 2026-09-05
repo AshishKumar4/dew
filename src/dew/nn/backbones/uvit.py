@@ -6,7 +6,7 @@ from flax.typing import Dtype, PrecisionLike
 from functools import partial
 
 from ..attention import TransformerBlock, rotary_freqs
-from ..blocks import FourierEmbedding, TimeProjection, ConvLayer
+from ..blocks import FourierEmbedding, TimeProjection
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from ..dit import ROPE_THETA, PatchEmbedding, ModulatedBlock, remat_block, masked_mean
 from dew.registry import models
@@ -146,25 +146,16 @@ class UViT(nn.Module):
         )
 
         if self.add_residualblock_output:
-            self.final_conv1 = ConvLayer(
-                "conv",
+            self.final_conv1 = nn.Conv(
                 features=64, kernel_size=(3, 3), strides=(1, 1),
                 dtype=self.dtype, precision=self.precision, name="final_conv1"
             )
             self.final_norm_conv = self.norm_factory(
                 name="final_norm_conv")
-            self.final_conv2 = ConvLayer(
-                "conv",
+            self.final_conv2 = nn.Conv(
                 features=self.output_channels, kernel_size=(3, 3), strides=(1, 1),
                 dtype=jnp.float32,
                 precision=self.precision, name="final_conv2"
-            )
-        else:
-            self.final_conv_direct = ConvLayer(
-                "conv",
-                features=self.output_channels, kernel_size=(1, 1), strides=(1, 1),
-                dtype=jnp.float32,
-                precision=self.precision, name="final_conv_direct"
             )
 
     @nn.compact
