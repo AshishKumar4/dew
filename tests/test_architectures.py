@@ -196,6 +196,17 @@ CASES = [
                     "groups": 4, "groups_per_token": 2, "bias": True,
                     "expert_features": 16, "shared_features": 16},
     }, seq_len=SEQ_LEN, label="mla"),
+    # DeepSeek V2 Lite's stack at toy width: the mla mixer without the query
+    # LoRA, and a routed layer under softmax group-limited routing scored by
+    # the best expert, unnormalised, with a shared expert and no bias.
+    Case("causal_transformer", {
+        **LM, "head_dim": 16,
+        "mixer": {"kind": "mla", "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                  "qk_rope_head_dim": 8, "v_head_dim": 8},
+        "mixture": {"experts": 8, "top_k": 4, "layers": (1,), "score_function": "softmax",
+                    "norm_topk_prob": False, "groups": 4, "groups_per_token": 2,
+                    "group_score": "max", "expert_features": 16, "shared_features": 32},
+    }, seq_len=SEQ_LEN, label="deepseek_v2"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,

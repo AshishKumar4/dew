@@ -1340,3 +1340,104 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
                                      - np.take_along_axis(theirs, top_ids, axis=-1))))
     assert difference < 5e-2, f"max |top-32 logit difference| {difference:.3e}"
 
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V2 and Kimi K2: the V2 router under MLA, and V3 under Kimi's name
+# --------------------------------------------------------------------------
+
+DEEPSEEK_V2 = FIXTURES / "deepseek-v2-tiny"
+
+
+def test_deepseek_v2_config_translates_field_by_field():
+    """The tiny V2: MLA without the query LoRA, YaRN with the 0.707 mscales,
+    a dense first layer over a softmax router under group_limited_greedy
+    that never renormalises, and two shared experts of width 16."""
+    config = translate_config(fixture_config("deepseek-v2-tiny"))
+
+    assert config["mixer"]["kind"] == "mla" and config["mixer"]["q_lora_rank"] is None
+    assert config["mixer"]["yarn"]["mscale"] == 0.707
+    assert config["mixture"] == {
+        "experts": 8, "top_k": 4, "layers": (1,), "scaling": 2.5, "shared_features": 32,
+        "expert_features": 16, "score_function": "softmax", "norm_topk_prob": False,
+        "groups": 4, "groups_per_token": 2, "group_score": "max"}
+    assert config["head_dim"] == 16 and config["scale_after_cast"]
+
+
+def test_the_real_deepseek_v2_lite_config_translates():
+    """deepseek-ai/DeepSeek-V2-Lite: 27 layers with one dense, 64 experts
+    with 6 per token under greedy selection, two shared experts of 1408,
+    kv_lora_rank 512 with no query LoRA, YaRN factor 40 at mscale 0.707."""
+    config = translate_config(fixture_config("deepseek-v2-lite"))
+
+    assert config["num_layers"] == 27 and config["mixture"]["layers"] == tuple(range(1, 27))
+    assert config["mixture"]["experts"] == 64 and config["mixture"]["top_k"] == 6
+    assert config["mixture"]["shared_features"] == 2816
+    assert config["mixture"]["groups"] == 1 and config["mixture"]["group_score"] == "max"
+    assert config["mixture"]["norm_topk_prob"] is False
+    assert config["mixer"]["kv_lora_rank"] == 512 and config["mixer"]["q_lora_rank"] is None
+    assert config["mixer"]["yarn"]["factor"] == 40.0
+    assert config["mixer"]["yarn"]["mscale_all_dim"] == 0.707
+    assert config["vocab_size"] == 102400 and config["head_dim"] == 192
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("norm_topk_prob", True, "norm_topk_prob=True"),
+    ("topk_method", "noaux_tc", "topk_method 'noaux_tc'"),
+    ("scoring_func", "sigmoid", "scoring_func 'sigmoid'"),
+])
+def test_a_deepseek_v2_field_the_reference_does_not_run_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("deepseek-v2-tiny"), field: value})
+
+
+def test_deepseek_v2_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
+    with identical argmax."""
+    model, variables, _ = fp32_decoder(DEEPSEEK_V2)
+    ids = np.load(DEEPSEEK_V2 / "input_ids.npy")
+    reference = np.load(DEEPSEEK_V2 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    assert "moe" not in variables, "V2 keeps no balancing bias"
+
+
+def test_the_real_kimi_k2_config_translates():
+    """moonshotai/Kimi-K2-Instruct is DeepSeek V3's computation: 61 layers
+    with one dense, 384 sigmoid-scored experts with 8 per token in one
+    group, scaled by 2.827, one shared expert, MLA with the 1536 query LoRA,
+    YaRN factor 32 at theta 50000, under a 163840-token vocabulary."""
+    config = translate_config(fixture_config("kimi-k2"))
+
+    assert config["vocab_size"] == 163840 and config["num_layers"] == 61
+    assert config["mixture"]["experts"] == 384 and config["mixture"]["top_k"] == 8
+    assert config["mixture"]["scaling"] == 2.827 and config["mixture"]["bias"]
+    assert config["mixture"]["groups"] == 1 and config["mixture"]["shared_features"] == 2048
+    assert config["mixer"]["q_lora_rank"] == 1536
+    assert config["mixer"]["yarn"]["factor"] == 32.0 and config["rope_theta"] == 50000.0
+
+
+def test_a_kimi_k2_checkpoint_loads_as_the_deepseek_v3_it_is(tmp_path):
+    """The V3 tiny fixture under Kimi's model_type and Kimi's extra fields
+    reaches the same logits, and exports back under deepseek_v3."""
+    directory = tmp_path / "kimi"
+    directory.mkdir()
+    for path in (FIXTURES / "deepseek-v3-tiny").iterdir():
+        if path.name != "config.json":
+            (directory / path.name).write_bytes(path.read_bytes())
+    (directory / "config.json").write_text(json.dumps({
+        **fixture_config("deepseek-v3-tiny"), "model_type": "kimi_k2",
+        "aux_loss_alpha": 0.001, "seq_aux": True, "num_nextn_predict_layers": 0}))
+
+    model, variables, _ = fp32_decoder(directory)
+    reference = np.load(FIXTURES / "deepseek-v3-tiny" / "logits.npy")
+    ids = np.load(FIXTURES / "deepseek-v3-tiny" / "input_ids.npy")
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    assert float(np.max(np.abs(logits - reference))) < 1e-4
+    from dew.interop.hf_decoders import _export_config
+    assert _export_config(model)["model_type"] == "deepseek_v3"
+

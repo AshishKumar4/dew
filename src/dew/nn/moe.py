@@ -56,6 +56,27 @@ GROUPED_MATMULS = ('xla', 'tokamax')
 WEIGHT_SUM_EPSILON = 1e-20
 
 
+def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
+    """DeepSeek V2's expert-level balance loss (arXiv 2405.04434, section 2.1.4).
+
+    `scores` are a layer's softmax affinities, `[B, S, E]`, and `indices`
+    its choices, `[B, S, K]`. The released `MoEGate` computes f_i as the
+    fraction of routed slots expert i took, times E, and P_i as its mean
+    score; `seq_aux` takes both per sequence and averages the sequences,
+    which is what every released V2 config sets. The result is already
+    scaled by `alpha`, the config's aux_loss_alpha, and one term per
+    sparse layer adds to the loss.
+    """
+    batch, length, experts = scores.shape
+    top_k = indices.shape[-1]
+    chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
+    if seq_aux:
+        load = jnp.sum(chosen, axis=(1, 2)) / (length * top_k / experts)
+        return jnp.mean(jnp.sum(load * jnp.mean(scores, axis=1), axis=1)) * alpha
+    load = jnp.mean(chosen.reshape(-1, experts), axis=0) * experts
+    return jnp.sum(jnp.mean(scores.reshape(-1, experts), axis=0) * load) * alpha
+
+
 def calculate_load_balance_updates(top_k_indices, num_experts, rate):
     """
     Computes a bias adjustment update based on expert load.
@@ -99,7 +120,13 @@ class Router(nn.Module):
 
     `expert_groups` above one is DeepSeek's node limit: experts are cut into
     that many groups, each group is scored by its two best experts, and a token
-    may only choose inside the best `groups_per_token` of them.
+    may only choose inside the best `groups_per_token` of them. `group_score`
+    names the group's score: 'top2' is V3's sum of its two best experts
+    (`noaux_tc`), 'max' is V2's best expert alone (`group_limited_greedy`,
+    modeling_deepseek_v2.py `DeepseekV2TopkRouter`).
+
+    `normalize_weights` divides a token's selected weights by their sum,
+    the reference's `norm_topk_prob`; V2's released configs set it false.
     """
     num_experts: int
     in_features: int
@@ -109,10 +136,14 @@ class Router(nn.Module):
     routed_scaling_factor: float = 1.0
     expert_groups: int = 1
     groups_per_token: int = 1
+    group_score: str = 'top2'
     expert_bias: bool = False
     precision: PrecisionLike = None
 
     def setup(self):
+        if self.group_score not in ('top2', 'max'):
+            raise ValueError(
+                f"group_score must be 'top2' or 'max', got {self.group_score!r}")
         if self.score_function not in SCORE_FUNCTIONS:
             raise ValueError(
                 f"score_function must be one of {list(SCORE_FUNCTIONS)}, got "
@@ -129,13 +160,15 @@ class Router(nn.Module):
             raise ValueError(
                 f"groups_per_token must be between 1 and expert_groups "
                 f"({self.expert_groups}), got {self.groups_per_token}")
-        if self.expert_groups > 1:
+        if self.expert_groups > 1 and self.group_score == 'top2':
             per_group = self.num_experts // self.expert_groups
             if per_group < 2:
                 raise ValueError(
                     "group scores are the sum of a group's two best experts, so "
                     f"a group needs at least two: {self.num_experts} experts in "
                     f"{self.expert_groups} groups leaves {per_group}")
+        if self.expert_groups > 1:
+            per_group = self.num_experts // self.expert_groups
             if self.groups_per_token * per_group < self.top_k:
                 raise ValueError(
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
@@ -163,6 +196,8 @@ class Router(nn.Module):
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
             self.sow('router', 'indices', indices)
+            # The V2 balance loss reads the scores beside the choices.
+            self.sow('router', 'scores', scores)
         weights = jnp.take_along_axis(scores, indices, axis=-1)
         if self.normalize_weights:
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
@@ -189,8 +224,12 @@ class Router(nn.Module):
         """
         per_group = self.num_experts // self.expert_groups
         grouped = selection.reshape(*selection.shape[:-1], self.expert_groups, per_group)
-        best_two, _ = jax.lax.top_k(grouped, 2)
-        _, groups = jax.lax.top_k(jnp.sum(best_two, axis=-1), self.groups_per_token)
+        if self.group_score == 'max':
+            group_scores = jnp.max(grouped, axis=-1)
+        else:
+            best_two, _ = jax.lax.top_k(grouped, 2)
+            group_scores = jnp.sum(best_two, axis=-1)
+        _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.float32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
@@ -354,9 +393,11 @@ class SparseMLP(nn.Module):
     activation: str = 'swiglu'
     implementation: str = 'xla'
     score_function: str = 'softmax'
+    normalize_weights: bool = True
     routed_scaling_factor: float = 1.0
     expert_groups: int = 1
     groups_per_token: int = 1
+    group_score: str = 'top2'
     expert_bias: bool = False
     swiglu_limit: Optional[float] = None
     shared: Optional[Callable[..., nn.Module]] = None
@@ -367,9 +408,11 @@ class SparseMLP(nn.Module):
         self.gate = Router(num_experts=self.num_experts,
                            in_features=self.out_features, top_k=self.top_k,
                            score_function=self.score_function,
+                           normalize_weights=self.normalize_weights,
                            routed_scaling_factor=self.routed_scaling_factor,
                            expert_groups=self.expert_groups,
                            groups_per_token=self.groups_per_token,
+                           group_score=self.group_score,
                            expert_bias=self.expert_bias,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(

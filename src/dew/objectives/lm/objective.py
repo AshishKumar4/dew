@@ -23,7 +23,7 @@ curve a human can read.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -34,7 +34,7 @@ import optax
 
 from dew.artifacts import TextSamples, TokenScores
 from dew.inputs import Field, InputSpec
-from dew.nn.moe import calculate_load_balance_updates
+from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
 from dew.objectives.base import Aux, EMASpec, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
@@ -105,6 +105,24 @@ def balance(moe: Variables, routing: Variables, rate: float
                       "moe/min_load": jnp.mean(jnp.stack(lightest))}
 
 
+def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
+    """Every router's sown (scores, indices), in the tree's key order."""
+    found: list[tuple[jax.Array, jax.Array]] = []
+
+    def visit(node) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if "scores" in node and "indices" in node:
+            (scores,), (indices,) = node["scores"], node["indices"]
+            found.append((scores, indices))
+            return
+        for key in sorted(node):
+            visit(node[key])
+
+    visit(routing)
+    return found
+
+
 @objectives("lm")
 class LMObjective(Objective):
     """Shifted cross entropy; evaluation scores tokens and writes text."""
@@ -122,6 +140,8 @@ class LMObjective(Objective):
         samples: Optional[Samples] = None,
         pretrained: Optional[Variables] = None,
         balance_rate: Optional[float] = None,
+        aux_loss_alpha: Optional[float] = None,
+        seq_aux: bool = True,
         mtp_weight: Optional[float] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
@@ -138,7 +158,13 @@ class LMObjective(Objective):
         the model has to keep that bias, `bias=True` on the
         CausalTransformer's mixture. Unset leaves the bias where it is.
 
-        `mtp_weight` is DeepSeek's lambda on the multi-token-prediction term
+        `aux_loss_alpha` adds DeepSeek V2's expert-level balance loss
+        (`dew.nn.moe.deepseek_v2_aux_loss`) of every sparse layer, scaled by
+        this much, with `seq_aux` choosing its per-sequence form; the
+        released V2 configs carry both under these names. Unset adds
+        nothing.
+
+        `mtp_weight`
         (arXiv 2412.19437, eq. 24): the training loss adds that times the
         mean over the model's prediction depths of each depth's cross
         entropy, so the model needs `num_nextn_predict_layers` above zero.
@@ -150,6 +176,12 @@ class LMObjective(Objective):
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
+        if aux_loss_alpha is not None and aux_loss_alpha <= 0:
+            raise ValueError(
+                f"aux_loss_alpha scales the balance loss, so it is positive, "
+                f"got {aux_loss_alpha}; None adds no balance loss")
+        self.aux_loss_alpha = aux_loss_alpha
+        self.seq_aux = seq_aux
         if mtp_weight is not None:
             depths = getattr(model, "num_nextn_predict_layers", 0)
             if depths < 1:
@@ -255,9 +287,11 @@ class LMObjective(Objective):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
+        alpha = self.aux_loss_alpha
         losses, weights, correct, routing, depths = self.token_scores(
             params, tokens, train=True, rngs={"dropout": step.key},
-            segment_ids=segment_ids, positions=positions, routing=rate is not None,
+            segment_ids=segment_ids, positions=positions,
+            routing=rate is not None or alpha is not None,
             depths=self.mtp_weight is not None)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
@@ -275,6 +309,16 @@ class LMObjective(Objective):
                 for depth_losses, depth_weights in depths]))
             reported["mtp_ce"] = mtp
             loss = ce + self.mtp_weight * mtp
+        if alpha is not None:
+            if not routing:
+                raise ValueError(
+                    "aux_loss_alpha scales the routers' balance loss, so the "
+                    "model needs a mixture")
+            balance_loss = jnp.sum(jnp.stack([
+                deepseek_v2_aux_loss(scores, indices, alpha, self.seq_aux)
+                for scores, indices in _router_scores(routing)]))
+            reported["aux_loss"] = balance_loss
+            loss = loss + balance_loss
         variables = None
         if rate is not None:
             if "moe" not in params or routing is None:
