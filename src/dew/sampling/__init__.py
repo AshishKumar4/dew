@@ -1,4 +1,4 @@
-"""Sampling: the reverse process for diffusion, decoding for language models."""
+"""The reverse process for diffusion, and decoding for language models."""
 
 from .solvers import (
     Solver, DDPM, DDIM, Euler, EulerAncestral, Heun, RK4, MultiStepDPM,
