@@ -85,14 +85,14 @@ def test_byte_tokenizer_is_utf8_bytes_with_a_256_vocab():
     assert tok.vocab_size == 256
     assert tok.encode("A") == [0x41]
     assert tok.encode("é") == [0xC3, 0xA9]  # two utf-8 bytes, not one id
-    assert isinstance(tok.eos_id, int)
+    assert tok.eos_id == 255
 
 
 def test_byte_tokenizer_decode_tolerates_junk_bytes():
     # Generated ids will land on invalid utf-8 sequences; the model still
     # needs text out of them, not an exception.
     tok = ByteTokenizer()
-    assert isinstance(tok.decode([0xFF, 0xFE, 0x41]), str)
+    assert tok.decode([0xFF, 0xFE, 0x41]) == chr(0xFFFD) * 2 + "A"
 
 
 # ---------------------------------------------------------------------------------

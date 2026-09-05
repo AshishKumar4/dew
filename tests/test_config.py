@@ -78,6 +78,12 @@ def test_the_model_config_builds_with_the_run_precision():
     assert isinstance(model, models["causal_transformer"])
     assert model.dtype is jnp.bfloat16 and model.attention_impl == "xla"
     assert config.fields()["dtype"] == "bfloat16"
+    import jax
+    ids = jnp.zeros((1, 4), jnp.int32)
+    params = model.init(jax.random.key(0), ids)
+    logits = model.apply(params, ids)
+    assert logits.dtype == jnp.float32
+    assert jnp.all(jnp.isfinite(logits))
 
 
 def test_a_model_config_that_names_the_precision_twice_is_refused():

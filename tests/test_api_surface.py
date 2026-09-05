@@ -85,7 +85,11 @@ def test_the_export_list_and_the_lazy_table_hold_the_same_names():
     """__all__ is written out so tools can read the public surface without
     running the lazy lookup, and this is what keeps the two from drifting."""
     import dew
+    from importlib import import_module
 
     assert set(dew.__all__) - {"__version__"} == set(dew._EXPORTS)
     for name in dew.__all__:
-        assert getattr(dew, name) is not None
+        if name == "__version__":
+            assert dew.__version__ == "0.1.0"
+        else:
+            assert getattr(dew, name) is getattr(import_module(dew._EXPORTS[name]), name)
