@@ -9,29 +9,35 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import Any, Iterator, Optional, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Iterator, Optional, TypeAlias
 
 import jax
 import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
 from jax.experimental import multihost_utils
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
+from dew.data.dataset import Checkpointable
 from dew.nn.sharding import LogicalAxes, declared_axes
 from dew.objectives.base import Batch, Variables
 
 DATA_AXIS = 'data'
 FSDP_AXIS = 'fsdp'
 EXPERT_AXIS = 'expert'
+TENSOR_AXIS = 'tensor'
+SEQUENCE_AXIS = 'sequence'
 
-# The two axes a parameter can be split over. A dimension named 'exp' takes
-# the expert axis, everything else takes fsdp.
-PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS)
+# The axes a parameter can be split over. A dimension named 'exp' takes the
+# expert axis, a width the rules redirect takes tensor, everything else
+# takes fsdp. The sequence axis never places parameters: it splits the
+# batch's sequence dimension, which no parameter has.
+PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 
-# Batches are split across every device, whichever axis it sits on; only
-# parameters distinguish the axes.
-BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS))
+# The batch's rows split across every axis but sequence, whichever they sit
+# on; the sequence dimension splits over the sequence axis. Only parameters
+# distinguish the axes further.
+BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS), SEQUENCE_AXIS)
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
 Placement: TypeAlias = Any
@@ -56,18 +62,21 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
     ("batch", None),
-    ("sequence", None),
+    ("sequence", SEQUENCE_AXIS),
     ("stage", None),
 )
 
 
 @dataclasses.dataclass(frozen=True)
 class MeshSpec:
-    """How many devices the parameter axes take; data parallelism fills the rest."""
+    """How many devices each sharding axis takes; data parallelism fills the rest."""
     fsdp: int = 1
     expert: int = 1
     """Devices the expert dimension of an MoE layer is split over."""
-
+    tensor: int = 1
+    """Devices a redirected width is split over; 1 keeps every width on fsdp."""
+    sequence: int = 1
+    """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     """One entry of a spec or a rule as the mesh axes it names."""
@@ -77,27 +86,32 @@ def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
 
 
 def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
-    """Three-axis device mesh: parameters shard over 'fsdp' and 'expert',
-    batches over all three.
+    """Five-axis device mesh: parameters shard over 'fsdp', 'expert' and
+    'tensor', batches over all five with their sequence dimension on 'sequence'.
 
     An MoE layer's expert dimension is the one dimension no dense model has,
     and splitting it is what expert parallelism is, so it gets its own axis
-    rather than competing with the model's widths for 'fsdp'. Sizes of 1
+    rather than competing with the model's widths for 'fsdp'. The tensor
+    axis is where a run's rules redirect a width when one card cannot hold
+    it; the sequence axis is where long sequences split. Sizes of 1
     degenerate to plain data parallelism, so the same code path serves every
     topology without a flag. Axes are Auto so GSPMD infers the collectives
     rather than us writing them by hand.
     """
     devices = list(devices) if devices is not None else jax.devices()
-    sharded = spec.fsdp * spec.expert
-    if spec.fsdp < 1 or spec.expert < 1 or len(devices) % sharded:
+    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence
+    if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
+            or spec.sequence < 1 or len(devices) % sharded):
         raise ValueError(
-            f"fsdp {spec.fsdp} times expert {spec.expert} must be a positive "
+            f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
+            f"{spec.tensor} times sequence {spec.sequence} must be a positive "
             f"divisor of device count {len(devices)}")
     return jax.make_mesh(
-        (len(devices) // sharded, spec.expert, spec.fsdp),
-        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS),
+        (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence),
+        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS),
         devices=devices,
-        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto),
+        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto, AxisType.Auto,
+                    AxisType.Auto),
     )
 
 
@@ -257,27 +271,39 @@ class Layout:
             f"Largest replicated parameters:\n{details}")
 
 
-def batch_sharding(mesh: Mesh) -> NamedSharding:
-    return NamedSharding(mesh, BATCH_SPEC)
+def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
+    """A sharding per leaf of `batch`, from the batch spec and the leaf's shape.
+
+    Rows split over every axis but sequence. A leaf of rank 2 or 3 is a
+    sequence per row (token ids, segment ids, positions, encoded tokens), and
+    its second dimension splits over the sequence axis when the axis divides
+    it; otherwise that dimension stays whole, the way `_mesh_spec` drops a
+    name no dimension can split. An image or a video is not a sequence, so
+    only its rows split. Placement is all this decides: values never change,
+    and until a model constrains its attention to the axis, the sequence
+    splits here and gathers there. Only the shape is read, so a leaf that is
+    already a global array costs no transfer.
+    """
+    rows, sequence = BATCH_SPEC
+    sequence_size = mesh.shape[SEQUENCE_AXIS]
+
+    def leaf_sharding(leaf):
+        shape = np.shape(leaf)
+        if not shape:
+            return NamedSharding(mesh, P())
+        split_sequence = len(shape) in (2, 3) and shape[1] % sequence_size == 0
+        rest = [sequence if split_sequence else None] + [None] * (len(shape) - 2)
+        return NamedSharding(mesh, P(rows, *rest[:len(shape) - 1]))
+
+    return jax.tree.map(leaf_sharding, batch)
 
 
-def shard_batch(sharding: NamedSharding, batch: Batch) -> Batch:
+def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's slice of each array into a globally sharded one."""
     return jax.tree.map(
-        lambda x: jax.make_array_from_process_local_data(sharding, np.asarray(x)), batch)
-
-
-@runtime_checkable
-class Checkpointable(Protocol):
-    """A data stream that can say where it stopped and be put back there.
-
-    grain's iterators satisfy this; a plain iterator does not, which is what
-    `fit` refuses when a run asks for checkpoints.
-    """
-
-    def get_state(self) -> Any: ...
-
-    def set_state(self, state: Any) -> None: ...
+        lambda leaf, sharding: jax.make_array_from_process_local_data(
+            sharding, np.asarray(leaf)),
+        batch, batch_shardings(mesh, batch))
 
 
 class DevicePrefetchIterator:
@@ -287,10 +313,10 @@ class DevicePrefetchIterator:
     the loop only starts moving batch N+1 after step N has been dispatched.
     """
 
-    def __init__(self, iterator: Iterator, sharding: NamedSharding, depth: int = 2,
+    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
                  source_state: Optional[bytes] = None):
         self._iterator = iter(iterator)
-        self._sharding = sharding
+        self._mesh = mesh
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._terminal: Optional[BaseException] = None
         self._source = self._iterator if isinstance(self._iterator, Checkpointable) else None
@@ -323,7 +349,7 @@ class DevicePrefetchIterator:
                 batch = next(self._iterator)
                 state = (self._position_as_bytes(self._source.get_state())
                          if self._source is not None else None)
-                self._queue.put((shard_batch(self._sharding, batch), state))
+                self._queue.put((shard_batch(self._mesh, batch), state))
         except StopIteration:
             self._queue.put(StopIteration())
         except BaseException as error:  # surfaced on the consumer's thread

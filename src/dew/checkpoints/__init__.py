@@ -159,7 +159,8 @@ class Checkpoints:
             item = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
             restore_args = jax.tree.map(
-                lambda leaf: ocp.ArrayRestoreArgs(sharding=getattr(leaf, 'sharding', None)),
+                lambda leaf: ocp.ArrayRestoreArgs(
+                    sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
                 item)
             if 'position' in stored:
                 # The table's shape depends on the process count and the

@@ -141,7 +141,9 @@ def _declared_type(member: Any, field: str) -> Any:
     """The annotation of `member`'s `field`, or None when it cannot be read."""
     try:
         hints = typing.get_type_hints(member)
-    except Exception:  # a forward reference to something not importable here
+    except NameError:
+        # An annotation naming something imported only under TYPE_CHECKING
+        # cannot be resolved here; such a field takes its value as given.
         return None
     return hints.get(field)
 

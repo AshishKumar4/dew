@@ -5,10 +5,12 @@ the wandb env var are the same in every recipe: library wiring, not recipe
 behavior. The recipes call this once at the top of main().
 """
 
+from __future__ import annotations
+
 import os
 import resource
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import jax
 from jax.experimental import multihost_utils
@@ -17,11 +19,14 @@ from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import enable_compilation_cache
 from dew.training.distributed import broadcast_from_process_zero
 
+if TYPE_CHECKING:
+    from dew.config import Wandb
 
-def prepare_process(wandb=None,
-                    multi_host: Optional[bool] = None,
-                    xla_flags: Optional[str] = None,
-                    compilation_cache_dir: Optional[str] = None):
+
+def prepare_process(wandb: Wandb | None = None,
+                    multi_host: bool | None = None,
+                    xla_flags: str | None = None,
+                    compilation_cache_dir: str | None = None) -> None:
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
