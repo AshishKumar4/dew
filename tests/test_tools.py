@@ -138,3 +138,44 @@ def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
     assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
                         committed / "diffusion_pytorch_model.safetensors")
     assert_same_arrays(written / "reference.npz", committed / "reference.npz")
+
+
+# ---------------------------------------------------------------------------
+# tools/optimizer_curve.py
+# ---------------------------------------------------------------------------
+
+def token_directory(tmp_path: Path) -> Path:
+    """A byte-tokenized corpus, written by the tool the curve reads from."""
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("".join(f"line {i}: the quick brown fox jumps over the lazy dog\n"
+                              for i in range(60)))
+    tokenize = load("tokenize_text")
+    out = tmp_path / "tokens"
+    tokenize.main(tokenize.TokenizeArgs(input=str(corpus), out=str(out),
+                                        tokenizer="byte", val_fraction=0.1))
+    return out
+
+
+def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
+    """The step-0 loss is computed before any update, so two arms at one seed
+    agree on it exactly, and only the solver separates them afterwards. An
+    arm that seeded its own init, or shuffled its own order, would differ at
+    step 0; two arms running the same solver would never separate."""
+    tool = load("optimizer_curve")
+    tokens = token_directory(tmp_path)
+    curves = {}
+    for solver in ("adamw", "muon-unsplit"):
+        out = tmp_path / f"{solver}.json"
+        tool.main(tool.Comparison(dataset=str(tokens), out=str(out), optimizer=solver,
+                                  steps=3, batch_size=8, sequence_length=8,
+                                  emb_features=16, num_layers=1, num_heads=2, seed=1))
+        curves[solver] = json.loads(out.read_text())
+
+    adamw, muon = curves["adamw"]["losses"], curves["muon-unsplit"]["losses"]
+    assert len(adamw) == len(muon) == 3
+    assert all(np.isfinite(adamw)) and all(np.isfinite(muon))
+    assert adamw[0] == muon[0]
+    assert adamw[1:] != muon[1:]
+    assert curves["adamw"]["tokens"] == 3 * 8 * 8
+    assert curves["adamw"]["corpus_tokens"] == json.loads(
+        (tokens / "meta.json").read_text())["train_tokens"]
