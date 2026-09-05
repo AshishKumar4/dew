@@ -67,8 +67,8 @@ def _gaussian_stats(activations):
 def _get_activations():
     """The jitted pool3 feature extractor, built on first use.
 
-    Building it loads the ~90MB weights, so it happens here rather than in
-    the factory. Constructing the metric opens nothing.
+    Building it loads the ~90MB weights, so it happens here, on first use.
+    Constructing the metric opens nothing.
     """
     model, params = _get_inception()
 

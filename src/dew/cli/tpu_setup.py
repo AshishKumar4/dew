@@ -190,8 +190,8 @@ def log_path(job: str, worker: int) -> str:
 def detached(command: str, job: str, worker: int, home_dir: str = "") -> str:
     """Start a command under nohup and return once it is running.
 
-    home_dir is a directory under the worker's home to run in, which is where
-    `sync` puts the working tree.
+    home_dir is a directory under the worker's home to run in; `sync` puts
+    the working tree there.
     """
     inner = wrap(f"cd {home_path(home_dir)} && {command}" if home_dir else command)
     log = log_path(job, worker)
