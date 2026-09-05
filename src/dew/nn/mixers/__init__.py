@@ -64,6 +64,8 @@ class MixerContext:
     sliding_window: Optional[int] = None
     attention_bias: bool = False
     attention_scale: Optional[float] = None
+    attention_sinks: bool = False
+    yarn: Optional[mla.YarnScaling] = None
     partial_rotary_factor: Optional[float] = None
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
@@ -138,6 +140,8 @@ class AttentionMixer(MixerBase):
             sliding_window=ctx.sliding_window,
             attention_bias=ctx.attention_bias,
             attention_scale=ctx.attention_scale,
+            attention_sinks=ctx.attention_sinks,
+            yarn=ctx.yarn,
             output_gate=ctx.output_gate,
             dtype=ctx.dtype,
             precision=ctx.precision,

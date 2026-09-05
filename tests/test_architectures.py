@@ -175,6 +175,15 @@ CASES = [
     # feed-forward go through the same run.
     Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
          seq_len=SEQ_LEN, label="moe"),
+    # GPT OSS at toy width: sink attention on both kinds, the fused biased
+    # experts on every layer, and YaRN over grouped-query heads.
+    Case("causal_transformer", {
+        **LM, "mlp": "swigluoai", "attention_sinks": True, "qk_norm": False,
+        "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4}},
+        "yarn": {"factor": 4.0, "original_max_position_embeddings": 8, "truncate": False},
+        "mixture": {"experts": 8, "top_k": 2},
+    }, seq_len=SEQ_LEN, label="gpt_oss"),
     # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
     # indexer on every layer, and the routed layer with the balancing bias,
     # the group limit and a shared expert.

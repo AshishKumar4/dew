@@ -48,6 +48,7 @@ from dew.interop.hf_decoders import (
     load_pretrained_decoder, save_pretrained_decoder, translate_config,
     translate_weights,
 )
+from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -1106,3 +1107,161 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     difference = float(jnp.abs(full[:, 3:] - incremental).max())
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+
+
+# --------------------------------------------------------------------------
+# GPT OSS: attention sinks, biased interleaved experts, YaRN over GQA
+# --------------------------------------------------------------------------
+
+GPT_OSS = FIXTURES / "gpt-oss-tiny"
+
+
+def test_gpt_oss_config_translates_field_by_field():
+    config = translate_config(fixture_config("gpt-oss-tiny"))
+
+    assert config["mlp"] == "swigluoai" and config["attention_sinks"]
+    assert config["layer_types"] == ("sliding_attention", "full_attention")
+    assert config["kinds"] == {"sliding_attention": {"window": 4}}
+    assert config["mixture"] == {"experts": 4, "top_k": 2}
+    assert config["yarn"]["factor"] == 4.0 and config["yarn"]["truncate"] is False
+    assert config["rope_theta"] == 150000.0 and config["attention_bias"]
+    assert not config["qk_norm"] and not config["scale_after_cast"]
+
+
+def test_the_real_gpt_oss_20b_config_translates():
+    """openai/gpt-oss-20b, released with MXFP4 experts: 24 alternating
+    layers, 64 query and 8 key/value heads of 64, 32 experts with 4 per
+    token, YaRN factor 32 over 4096 positions, and the sliding window 128."""
+    config = translate_config(fixture_config("gpt-oss-20b"))
+
+    assert config["num_layers"] == 24 and config["layer_types"][:2] == (
+        "sliding_attention", "full_attention")
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (64, 8, 64)
+    assert config["mixture"] == {"experts": 32, "top_k": 4}
+    assert config["kinds"] == {"sliding_attention": {"window": 128}}
+    assert config["yarn"]["factor"] == 32.0
+    assert config["yarn"]["original_max_position_embeddings"] == 4096
+    assert config["vocab_size"] == 201088 and config["max_seq_len"] == 8192
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("swiglu_limit", 3.0, "swiglu_limit"),
+    ("quantization_config", {"quant_method": "awq"}, "quantization_config"),
+    ("output_router_logits", True, "output_router_logits"),
+])
+def test_a_gpt_oss_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("gpt-oss-tiny"), field: value})
+
+
+def test_gpt_oss_logits_match_the_reference_implementation():
+    """fp32 parity through xla sink attention: tolerance 1e-4, observed
+    max |logit difference| 2.5e-06 with identical argmax."""
+    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
+                                                  attention_impl="xla")
+    ids = np.load(GPT_OSS / "input_ids.npy")
+    reference = np.load(GPT_OSS / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    flat = flat_tree(variables["params"])
+    assert flat["layers_0.self_attn.sinks"].shape == (4,)
+    assert flat["layers_1.mlp.experts.gate_up_proj_bias"].shape == (4, 128)
+
+
+def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
+    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
+                                                  attention_impl="xla")
+    export = tmp_path / "gpt-oss"
+    save_pretrained_decoder(model, variables, export)
+    again, reloaded, _ = load_pretrained_decoder(str(export), dtype="float32",
+                                                 attention_impl="xla")
+    assert again == model
+    for path, leaf in flat_tree(reloaded["params"]).items():
+        assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(variables["params"])[path])), path
+
+
+def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
+    """The released layout: uint8 blocks and scales in place of the expert
+    matrices. Loading them must give the logits of the fixture whose
+    experts are those exact bf16 values, so the packed checkpoint is
+    written from the fixture's own weights."""
+    from safetensors.numpy import load_file, save_file
+
+    tensors = load_file(str(GPT_OSS / "model.safetensors"))
+    packed = {}
+    for name, tensor in tensors.items():
+        if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
+            packed[name] = tensor
+            continue
+        rounded = jnp.asarray(tensor, jnp.bfloat16).astype(jnp.float32)
+        blocks, scales = quantize_mxfp4(np.asarray(rounded))
+        packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
+        tensors[name] = np.asarray(dequantize_mxfp4(jnp.asarray(blocks), jnp.asarray(scales))
+                                   .astype(jnp.float32))
+    directory = tmp_path / "packed"
+    directory.mkdir()
+    save_file(packed, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(
+        {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
+
+    model, variables, _ = load_pretrained_decoder(str(directory), dtype="float32",
+                                                  attention_impl="xla")
+    expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
+    for path, leaf in flat_tree(variables["params"]).items():
+        assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
+
+
+def quantize_mxfp4(matrix):
+    """[expert, input, output] fp32 into the released blocks and scales.
+
+    Every value is scaled to a representable E2M1 magnitude by a shared
+    power-of-two exponent per 32 inputs, which is what the test needs to
+    pin: the sign nibble order and the transpose back to the input axis.
+    """
+    values = np.ascontiguousarray(matrix.transpose(0, 2, 1))
+    groups = values.reshape(values.shape[0], values.shape[1], -1, 32)
+    magnitude = np.max(np.abs(groups), axis=-1, keepdims=True)
+    exponent = np.where(magnitude > 0, np.floor(np.log2(np.maximum(magnitude, 1e-30))) - 2, 0)
+    scaled = groups / np.exp2(exponent)
+    table = np.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)
+    codes = np.abs(scaled[..., None] - table).argmin(-1) + 8 * (scaled < 0)
+    blocks = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    return blocks, (exponent[..., 0] + 127).astype(np.uint8)
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
+                    reason="DEW_NETWORK_TESTS=1 downloads openai/gpt-oss-20b")
+def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
+    """Not yet run: the released MXFP4 checkpoint through the loader against
+    transformers' own dequantized bf16 forward at the same prompt. Tolerance
+    on the top-32 logits 5e-2 for bf16 accumulation over 24 layers; the
+    argmax must agree everywhere. Observed difference: not recorded until
+    the test runs on a machine with the download."""
+    import torch
+    from transformers import AutoTokenizer, GptOssForCausalLM
+
+    prompt = "The Cascade Range runs from northern California through Oregon"
+    ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
+        prompt, return_tensors="np")["input_ids"].astype(np.int32)
+    model, variables, _ = load_pretrained_decoder(
+        "openai/gpt-oss-20b", dtype="bfloat16", attention_impl="xla",
+        max_seq_len=int(ids.shape[1]))
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
+
+    reference = GptOssForCausalLM.from_pretrained("openai/gpt-oss-20b", dtype=torch.bfloat16)
+    reference.eval()
+    reference.set_attn_implementation("eager")
+    with torch.no_grad():
+        theirs = reference(input_ids=torch.from_numpy(ids.astype(np.int64))).logits[0].float().numpy()
+
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(theirs, axis=-1))
+    top_ids = np.argsort(-theirs, axis=-1)[:, :32]
+    difference = float(np.max(np.abs(np.take_along_axis(logits, top_ids, axis=-1)
+                                     - np.take_along_axis(theirs, top_ids, axis=-1))))
+    assert difference < 5e-2, f"max |top-32 logit difference| {difference:.3e}"
+

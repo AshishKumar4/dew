@@ -38,6 +38,8 @@ from ..attention import (
 )
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
+from ..gpt_oss import GptOssMLP
+from ..mla import YarnScaling, mla_rope_freqs
 from ..sharding import logical_axes
 from dew.registry import models
 
@@ -195,6 +197,8 @@ class CausalSelfAttention(nn.Module):
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    attention_sinks: bool = False
+    yarn: Optional[YarnScaling] = None
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
@@ -301,9 +305,15 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.arange(S)
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
-        freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.partial_rotary_type)
+        if self.yarn is None:
+            freqs_cos, freqs_sin = rotary_freqs(
+                positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+                partial_rotary_type=self.partial_rotary_type)
+        else:
+            if self.partial_rotary_factor is not None:
+                raise ValueError("yarn with partial_rotary_factor is not supported")
+            freqs_cos, freqs_sin = mla_rope_freqs(
+                positions, self.head_dim, self.rope_theta, self.yarn)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -362,7 +372,9 @@ class CausalSelfAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask)
+            sliding_window=window, mask=mask,
+            sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
+                   if self.attention_sinks else None))
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
@@ -636,6 +648,8 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    attention_sinks: bool = False
+    yarn: Optional[YarnScaling] = None
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
@@ -661,6 +675,8 @@ class CausalTransformer(nn.Module):
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, which is what a test or
         # a notebook writes.
+        if isinstance(self.yarn, Mapping):
+            object.__setattr__(self, 'yarn', YarnScaling(**self.yarn))
         if isinstance(self.mixture, Mapping):
             object.__setattr__(self, "mixture", Mixture(**self.mixture))
         if self.kinds is not None:
@@ -782,6 +798,8 @@ class CausalTransformer(nn.Module):
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
             attention_scale=self.attention_scale,
+            attention_sinks=self.attention_sinks,
+            yarn=self.yarn,
             output_gate=self.output_gate,
             dtype=self.dtype,
             precision=self.precision,
@@ -891,6 +909,14 @@ class CausalTransformer(nn.Module):
             shared=shared,
             dtype=self.dtype,
             precision=self.precision)
+        if self.mlp == 'swigluoai':
+            if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
+                raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+            routed = functools.partial(
+                GptOssMLP, hidden_size=self.emb_features,
+                intermediate_size=self.hidden_features,
+                num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
+                dtype=self.dtype, precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. The one dispatch stays build over
         # the layer's context.
