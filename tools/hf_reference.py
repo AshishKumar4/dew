@@ -15,24 +15,28 @@ Set up the venv and run it:
     /tmp/hfref/bin/python tools/hf_reference.py
 
 What lands in tests/fixtures/hf:
-- qwen3-tiny/, gemma3-tiny/, llama-tiny/, deepseek-v3-tiny/ and
-  deepseek-v32-tiny/: a random-weight checkpoint in the HF layout
-  (config.json + model.safetensors), the 2 x 12 token ids it was run on, and
-  the fp32 logits of the reference model in eval mode with eager attention.
-  Small enough to live in git. The DeepSeek pair is one dense layer over one
-  MoE layer (`first_k_dense_replace` 1) with a shared expert, the released
-  YaRN spelling, q and kv LoRA, and, on V3.2, the sparse indexer; their
-  routers' balancing bias is scattered too, since a checkpoint carries it
-  and a fixture at its zeros would not tell a load that reads it from one
-  that drops it.
+- <family>-tiny/ for qwen3, gemma, gemma2, gemma3, llama, llama31, mistral,
+  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3 and deepseek-v32: a
+  random-weight checkpoint in the HF layout (config.json +
+  model.safetensors), the 2 x 12 token ids it was run on, and the fp32
+  logits of the reference model in eval mode with eager attention. Small
+  enough to live in git. Each tiny config turns on what its family adds
+  (its docstring says which dial and why the size was chosen). The DeepSeek
+  pair is one dense layer over one MoE layer (`first_k_dense_replace` 1)
+  with a shared expert, the released YaRN spelling, q and kv LoRA, and, on
+  V3.2, the sparse indexer; their routers' balancing bias is scattered too,
+  since a checkpoint carries it and a fixture at its zeros would not tell a
+  load that reads it from one that drops it.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
   prompt and reference.npz the top 32 logits per position of the real
   weights in fp32, which the network test compares against.
-- gemma3-1b/: config.json only. google/gemma-3-1b-pt is gated and returns 401
-  without a token, so the config comes from a mirror of it, which is the same
-  file minus the mirror's own marker key.
+- One directory per released config the translation is tested on
+  (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b): config.json and the
+  repo it came from in source.json, no weights. Google's and Meta's gated
+  repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
 
 import argparse
