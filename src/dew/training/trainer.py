@@ -29,7 +29,7 @@ from dew.artifacts import host
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
-from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
+from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
     minimum_across_processes, shard_batch,
@@ -281,21 +281,23 @@ class Trainer:
         return step
 
     def compile(self, state: TrainState, batch: Batch,
-                scale: dynamic_scale_lib.DynamicScale | None = None) -> jax.stages.Compiled:
-        """The training step's executable, the one `fit` runs, compiled ahead
-        of time over `state` and one global `batch`.
+                scale: dynamic_scale_lib.DynamicScale | None = None) -> jax.stages.Wrapped:
+        """The training step `fit` runs, compiled ahead of time over `state`
+        and one global `batch`.
 
-        The executable takes `(state, scale, batch)` and returns `(state,
-        scale, loss, metrics, finite)`; `scale` is the `DynamicScale` of a
+        The step takes `(state, scale, batch)` and returns `(state, scale,
+        loss, metrics, finite)`; `scale` is the `DynamicScale` of a
         mixed-precision run and None otherwise. Its shardings are the layout's
         and it donates the state, so a benchmark that runs it measures the
         step a real run runs.
 
-        Calling a jitted function compiles it, and asking the compiler for its
-        cost analysis compiles it a second time: `lower(...).compile()` builds
-        an executable of its own that the jit cache knows nothing about. Running
-        the loop on that executable pays for one compilation and reads the FLOP
-        count off it.
+        What comes back is the jitted function, not the executable. Calling an
+        executable from Python re-checks every leaf's shape and sharding on
+        every call, about 4.5 us a leaf (0.4 ms a step for a 99-leaf state,
+        4.9 ms for 1067 leaves, one CPU core of an i9-12900K), while jit
+        dispatches through its C++ cache. The FLOP count still comes off the
+        ahead-of-time executable: jit lowers through the same cache, so the
+        first call finds that compilation instead of running its own.
         """
         body = self._step_body()
         shardings = self.shardings(state)
@@ -313,9 +315,8 @@ class Trainer:
                            replicated, replicated, replicated),
             donate_argnums=(0,),
         )
-        compiled = jitted.lower(state, scale, batch).compile()
-        self.flops_per_step = compiled_flops(compiled)
-        return compiled
+        self.flops_per_step = step_flops(jitted, state, scale, batch)
+        return jitted
 
     # ------------------------------------------------------------------
     # The loop
@@ -356,11 +357,11 @@ class Trainer:
                 f"(--trainer.checkpoint-every None)")
         train = DevicePrefetchIterator(source, mesh, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
-        compiled = None
-        # Rebound the moment the executable exists, so the first tick measures
-        # steps rather than the compile.
+        train_step = None
+        # Rebound once the step is compiled, so the first tick measures steps
+        # rather than the compile.
         last_log_time = time.time()
-        last_saved = current if self.checkpoints is not None and current else None
+        last_saved = current if checkpoints is not None and current else None
         interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
         steps_since_log = 0
         # Both counters live on device so the loop never blocks on a result.
@@ -376,17 +377,15 @@ class Trainer:
                   f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
         while current < steps:
             batch = next(train)
-            if compiled is None:
-                compiled = self.compile(state, batch, scale)
-                # The interval clock starts once the executable exists, so the
-                # first tick reports step time rather than compile time.
+            if train_step is None:
+                train_step = self.compile(state, batch, scale)
                 last_log_time = time.time()
-            if (self.profile is not None and not tracing and traced == 0
-                    and seen >= self.profile.warmup):
-                jax.profiler.start_trace(self.profile.directory)
+            if (profile is not None and not tracing and traced == 0
+                    and seen >= profile.warmup):
+                jax.profiler.start_trace(profile.directory)
                 tracing = True
 
-            state, scale, loss, aux, finite = compiled(state, scale, batch)
+            state, scale, loss, aux, finite = train_step(state, scale, batch)
             position = train.source_state
             current += 1
             seen += 1
@@ -414,7 +413,7 @@ class Trainer:
                                **{f"train/{k}": float(v) for k, v in aux.items()},
                                **self._throughput(now - last_log_time, steps_since_log,
                                                   data.batch)}
-                    print(f"step {current}: loss {float(loss):.4f}")
+                    print(f"step {current}: loss {scalars['train/loss']:.4f}")
                     if self.tracker is not None:
                         self.tracker.log(scalars, current)
                     last_log_time, steps_since_log = now, 0
