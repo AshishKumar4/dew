@@ -153,7 +153,7 @@ trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), checkpoin
 state = trainer.fit(data, steps=steps, metrics=(metrics.linear_probe(5), metrics.knn_probe(5)))
 ```
 
-Linear and kNN probes score the frozen embeddings at validation. The objective also logs the representation standard deviation each step, which is how a collapsing run shows itself.
+Linear and kNN probes score the frozen embeddings at validation. The objective logs the representation standard deviation each step; a collapsing run shows there first.
 
 ## Scaling
 
@@ -288,7 +288,7 @@ The goal is to train the way the large labs train and to run what they release, 
 
 **Systems.** Attention that shards the sequence over the sequence axis, and pipeline stages over the stage axis; int8 and FP8 training with fine-grained scaling, and MXFP4 and FP8 weight loading; the MuonClip optimizer; emergency checkpointing and goodput measurement; scan over layers for compile time at depth.
 
-**Post-training.** A clean story for SFT and reinforcement learning that fits the same objective-and-trainer seam, rather than a second framework beside it.
+**Post-training.** SFT and reinforcement learning as objectives on the same trainer.
 
 ## Acknowledgements
 

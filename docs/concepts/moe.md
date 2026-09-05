@@ -1,6 +1,6 @@
 # Mixture of experts
 
-A sparse layer replaces one feed-forward with many: a router scores every expert for a token, the token goes through the `top_k` best ones, and their outputs are summed with the router's weights. The parameter count grows with the expert count while the work per token stays at `top_k` experts, which is why the large open decoders from Mixtral to DeepSeek are built this way.
+A sparse layer replaces one feed-forward with many: a router scores every expert for a token, the token goes through the `top_k` best ones, and their outputs are summed with the router's weights. The parameter count grows with the expert count while the work per token stays at `top_k` experts.
 
 The modules live in `dew.nn.moe` and the mesh axis in `dew.training.distributed`.
 
@@ -30,7 +30,7 @@ The registry name is `moe`, which is `CausalTransformer` with a mixture set.
 
 ## The router
 
-`Router` computes its logits in fp32 whatever dtype the activations carry, which is where DeepSeek's router runs and what the frontier configs ask for. Then:
+`Router` computes its logits in fp32 whatever dtype the activations carry, as DeepSeek's router does. Then:
 
 | Field | Meaning | Mixtral, Qwen3.5 | DeepSeek V3, V4 |
 | --- | --- | --- | --- |
@@ -40,9 +40,9 @@ The registry name is `moe`, which is `CausalTransformer` with a mixture set.
 | `expert_groups`, `groups_per_token` | the node limit | 1, 1 | 8 groups, 4 kept |
 | `expert_bias` | a per-expert selection bias | no | yes |
 
-The node limit scores each group of experts by its two best members and lets a token choose only inside the best `groups_per_token` groups, which is what bounds how many nodes a token's experts are spread over.
+The node limit scores each group of experts by its two best members and lets a token choose only inside the best `groups_per_token` groups, bounding how many nodes a token's experts are spread over.
 
-`expert_bias` is DeepSeek's aux-loss-free balancing bias (arXiv 2408.15664). It lives in the `moe` variable collection as `e_score_correction_bias`, it is fp32, and it enters the selection only: the weights are gathered from the unbiased scores, so balancing changes which experts a token gets and never what they contribute. The router reads it and never writes it, which is where transformers keeps it (`nn.Buffer`) and how MaxText hands the update back to its caller. The update itself is a function:
+`expert_bias` is DeepSeek's aux-loss-free balancing bias (arXiv 2408.15664). It lives in the `moe` variable collection as `e_score_correction_bias`, it is fp32, and it enters the selection only: the weights are gathered from the unbiased scores, so balancing changes which experts a token gets and never what they contribute. The router reads it and never writes it; transformers keeps it as an `nn.Buffer` and MaxText hands the update back to its caller. The update itself is a function:
 
 ```python
 import jax.numpy as jnp
@@ -52,7 +52,7 @@ indices = jnp.asarray([[0, 3], [1, 3], [2, 3]], jnp.int32)
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
-It is `+rate` for every expert below the average load, `-rate` for every expert above it. `LMObjective(balance_rate=...)` applies it every step and hands the moved bias back to the trainer through `Aux.variables`, the one channel for a collection a step updates without a gradient; under the compiled step the load count is global, so the bias stays one replicated value on every shard. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices: `score_function`, `scaling`, `groups` and `groups_per_token`.
+It is `+rate` for every expert below the average load, `-rate` for every expert above it. `LMObjective(balance_rate=...)` applies it every step and hands the moved bias back to the trainer through `Aux.variables`, the channel for a collection a step updates without a gradient; under the compiled step the load count is global, so the bias stays one replicated value on every shard. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices: `score_function`, `scaling`, `groups` and `groups_per_token`.
 
 ## The grouped matmul
 

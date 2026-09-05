@@ -13,18 +13,18 @@ assert dew.datasets["oxford_flowers102"] is OxfordFlowers
 
 `Dataset.train()` opens an endless shuffled stream of global batches. `Dataset.val()` opens one pass over the held-out records in a fixed order that ends by itself, and is `None` when nothing is held out. `records` is the count behind the training stream, so `steps_per_epoch` is one pass over them, and `batch` is the global batch. Image and video fields are uint8 in `[0, 255]`; tokenized text is the `{"input_ids", "attention_mask"}` dict an encoder's `tokenize` produces, under `"text"`; a token window is int32 ids under `"text"`. An objective converts pixels to `[-1, 1]` itself through `dew.inputs.unit_range`, so the dataset stays what the reader decoded.
 
-The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.loading.workers 16`. A new dataset is a dataclass behind `@datasets(name)`; it appears on the command line with nothing else written.
+The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.loading.workers 16`. A new dataset is a dataclass behind `@datasets(name)` and appears on the command line as a subcommand.
 
 ## What every spec shares
 
 `dew.data.dataset` holds the plumbing the image, video and token specs have in common:
 
-- `local_batch(batch)` is the one place the per-process batch is computed, and it refuses a global batch the processes cannot split evenly, since a remainder would train on fewer records a step than the run says.
-- `hold_out(source, records, held_out)` slices the head of a source off as the validation split and gives training the rest, so the two are disjoint by construction and FID and CLIP are never measured on records the model trained on.
+- `local_batch(batch)` computes the per-process batch and raises on a global batch the processes cannot split evenly.
+- `hold_out(source, records, held_out)` slices the head of a source off as the validation split and gives training the rest, so the two are disjoint.
 - `train_stream` builds grain's shuffled, sharded, repeated stream over the training slice, with the transformations applied after `to_iter_dataset` so they run in the workers.
 - `validation_pass` reads the held-out slice once in canonical order, sharded by process, and applies the random map before the per-process slice, so a record's augmentation is keyed by its global index and is the same on one host or eight.
 
-Every process holds the same number of validation batches; the trainer confirms that before a pass and scores the minimum, so an uneven split cannot leave one host waiting in a collective.
+Before a validation pass the processes agree on the batch count and every process scores that many.
 
 ## Determinism
 
@@ -46,7 +46,7 @@ Decoding, resizing and augmentation draw their randomness from the record's own 
 
 ## Resuming mid-epoch
 
-Grain iterators report their position through `get_state()`, and the prefetch iterator carries the position of the batch it last handed out. The trainer writes every process's position into the checkpoint's `position` entry and hands each process its own back on resume, so a resumed job continues where it stopped on every host rather than replaying the epoch from the top. A checkpoint written by two processes refuses to resume on one, with the reason, since a position is where one process's shard stopped and cannot be translated. A stream without `get_state` cannot record a position, and the trainer refuses to checkpoint one.
+Grain iterators report their position through `get_state()`, and the prefetch iterator carries the position of the batch it last handed out. The trainer writes every process's position into the checkpoint's `position` entry and hands each process its own back on resume, so a resumed job continues where it stopped on every host. A checkpoint written by two processes raises when one process resumes it, since a position belongs to one process's shard. A stream without `get_state` cannot record a position, and `fit` raises if asked to checkpoint one.
 
 ## Measuring it
 
