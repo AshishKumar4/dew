@@ -226,12 +226,15 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     return jnp.moveaxis(out, 0, 1).astype(dtype), state.astype(dtype)
 
 
+# The projected width of the keys, values and the gate is the delta net's own
+# ("linear"); the output projection is the width every mixer projects back
+# into the model, which the table already calls "attention".
 @logical_axes({
     ("in_proj_qkv",): ("embed", "linear"),
     ("in_proj_z",): ("embed", "linear"),
     ("in_proj_b",): ("embed", "kv"),
     ("in_proj_a",): ("embed", "kv"),
-    ("out_proj",): ("linear", "embed"),
+    ("out_proj",): ("attention", "embed"),
 }, heuristic=(("conv1d",),))
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
