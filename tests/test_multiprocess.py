@@ -629,10 +629,12 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
 # --------------------------------------------------------------------------
 
 # A pool run with a local checkpoint every two steps beside the persistent
-# one every three, killed after eight: the newest persistent step is six and
-# the newest local one is eight, on every process.
+# one every three. Local step eight is the last local write of a full run
+# (nine is the final persistent save) and the kill point of the preempted
+# run, so both cases look for it.
 LOCAL_EVERY = 2
-LOCAL_KILL_AFTER = 8
+LAST_LOCAL_STEP = 8
+LOCAL_KILL_AFTER = LAST_LOCAL_STEP
 
 
 def local_flags(directory: Path, **flags) -> dict:
@@ -697,8 +699,8 @@ def test_every_process_writes_its_own_local_checkpoint_every_n_steps(tmp_path):
         assert report["step"] == STEPS
         assert report["local_path"] == str(directory / "local" / f"process{index}")
         # Steps 2, 4, 6 and 8 were written; one is kept.
-        assert report["local_steps"] == [LOCAL_KILL_AFTER]
-        assert local_committed(directory, index, LOCAL_KILL_AFTER).exists()
+        assert report["local_steps"] == [LAST_LOCAL_STEP]
+        assert local_committed(directory, index, LAST_LOCAL_STEP).exists()
         assert report["written_steps"] == [SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
     assert committed_steps(worker.checkpoint_dir(directory / "run", "local")) == [
         SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
