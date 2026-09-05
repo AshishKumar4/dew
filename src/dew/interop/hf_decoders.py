@@ -24,7 +24,7 @@ something else.
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 import numpy as np
 
@@ -506,11 +506,12 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         'layer_types': layer_types,
         'kinds': _kinds(layer_types, sliding_window, rope_local_theta, None, None),
         'norm_eps': float(hf_config.get('rms_norm_eps', 1e-6)),
-        # LlamaRMSNorm and Qwen3RMSNorm multiply the scale into the
-        # activations after casting them (modeling_qwen3.py:61-64); Gemma3's
-        # and Gemma4's norms scale in fp32 and cast the product
-        # (modeling_gemma3.py:147-150, modeling_gemma4.py:197-215).
-        'scale_after_cast': model_type in ('llama', 'qwen3'),
+        # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
+        # into the activations after casting them (modeling_qwen3.py:61-64,
+        # modeling_deepseek_v3.py:47-52); Gemma3's and Gemma4's norms scale in
+        # fp32 and cast the product (modeling_gemma3.py:147-150,
+        # modeling_gemma4.py:197-215).
+        'scale_after_cast': model_type in ('llama', 'qwen3') + _DEEPSEEK,
         'qk_norm': model_type in _QK_NORM_FAMILIES,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
@@ -661,10 +662,11 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
             }
             used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
         # The released checkpoints ship no mtp.* weights (91991 tensors on
-        # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP), so the field
-        # builds the base model the weights describe. Weight translation
-        # refuses mtp.* tensors loudly, so a checkpoint that ships them
-        # cannot drop them silently.
+        # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP) and
+        # transformers builds no MTP module, so the field describes nothing
+        # the weights hold and the base model is what loads. Weight
+        # translation refuses mtp.* tensors loudly, so a checkpoint that
+        # ships them cannot drop them silently.
         # The fp8 scales name the stored dtype, not the computation: dew
         # loads the dequantized weights, and the reader names an unreadable
         # dtype where it meets one. ep_size is a runtime parallel hint.
@@ -691,7 +693,6 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
                                    else index['index_head_dim']),
             },
             mixture=_deepseek_mixture(hf_config, layers, used),
-            num_nextn_predict_layers=0,
         )
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
@@ -739,14 +740,27 @@ def _norm_names(sandwich: bool) -> Dict[str, str]:
 
 
 def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
-    """One HF tensor name into its path in a CausalTransformer tree.
+    """One HF tensor name into its path in a CausalTransformer's variables.
 
-    None means the tensor has no place in the tree: the tied lm_head a
-    checkpoint carries as a copy of the embedding. A name the map cannot
-    explain at all raises, so an unfamiliar checkpoint fails here instead of
-    loading a model with half its weights.
+    The first name is the collection: `params` for a weight, `moe` for
+    DeepSeek's balancing bias, which is router state a training step moves
+    rather than a parameter, so it lands where `Router` keeps it. None means
+    the tensor has no place in the tree: the tied lm_head a checkpoint
+    carries as a copy of the embedding. A name the map cannot explain at
+    all raises, so an unfamiliar checkpoint fails here instead of loading a
+    model with half its weights.
     """
     parts = hf_name.split('.')
+    if (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and parts[3:] == ['mlp', 'gate', 'e_score_correction_bias']):
+        return ('moe', f'layers_{parts[2]}', 'mlp', 'gate', 'e_score_correction_bias')
+    path = _param_path(parts, config)
+    return None if path is None else ('params',) + path
+
+
+def _param_path(parts: List[str], config: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
+    """The params-tree path of a split HF tensor name, or None for the tied head."""
+    hf_name = '.'.join(parts)
     if parts == ['model', 'norm', 'weight']:
         return ('norm', 'scale')
     if parts == ['model', 'embed_tokens', 'weight']:
@@ -788,17 +802,17 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
             if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
                 return (layer, 'self_attn', 'indexer', sublayer,
                         'scale' if leaf == 'weight' else 'bias')
-        if (len(parts) == 8 and module == 'mlp'
-                and parts[4] in ('experts', 'shared_experts')):
+        if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
+                and parts[5].isdigit() and parts[6] in _MOE_SHARED
+                and leaf == 'weight'):
             # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
-            # tensor per expert, stacked by _stack_experts below; and the
-            # dense shared experts beside them.
-            group, index, projection = parts[4], parts[5], parts[6]
-            if projection in _MOE_SHARED and leaf == 'weight':
-                if group == 'shared_experts':
-                    return (layer, 'mlp', group, projection, 'kernel')
-                if group == 'experts' and index.isdigit():
-                    return (layer, 'mlp', group, index, projection, 'kernel')
+            # tensor per expert, stacked by _stack_experts below.
+            return (layer, 'mlp', 'experts', parts[5], parts[6], 'kernel')
+        if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
+                and parts[5] in _MOE_SHARED and leaf == 'weight'):
+            # The dense shared experts beside them, one MLP however many the
+            # config counts.
+            return (layer, 'mlp', 'shared_experts', parts[5], 'kernel')
         # Gemma 4's per-layer residual: gate and projection are kernels, the
         # post norm is a scale. The values norm carries no weight, so it maps
         # nothing.
@@ -851,7 +865,7 @@ def _stack_experts(params: Dict[str, Any]) -> None:
 
 def translate_weights(hf_tensors: Mapping[str, np.ndarray],
                       config: Mapping[str, Any]) -> Dict[str, Any]:
-    """HF-named tensors into a CausalTransformer params tree, in fp32.
+    """HF-named tensors into a CausalTransformer variables dict, in fp32.
 
     Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
     `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
@@ -864,7 +878,8 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     matrix would otherwise load as a model that computes something else.
     DeepSeek's routed experts arrive one tensor per expert and stack onto
     an expert dimension here; its dense shared experts, MLA projections
-    and indexer map by pattern like everything else.
+    and indexer map by pattern like everything else, and its routers'
+    balancing bias lands in the `moe` collection beside `params`.
     """
     tied_head = hf_tensors.get('lm_head.weight')
     if config['tie_embeddings'] and tied_head is not None:
@@ -874,7 +889,7 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
                 "tie_word_embeddings is set but lm_head.weight is not the "
                 "embedding it claims to copy")
 
-    params: Dict[str, Any] = {}
+    variables: Dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = _dew_path(name, config)
         if path is None:
@@ -882,12 +897,12 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
         leaf = np.asarray(tensor, np.float32)
         if path[-1] == 'kernel':
             leaf = np.ascontiguousarray(leaf.T)
-        node = params
+        node = variables
         for key in path[:-1]:
             node = node.setdefault(key, {})
         node[path[-1]] = leaf
-    _stack_experts(params)
-    return {'params': params}
+    _stack_experts(variables['params'])
+    return variables
 
 
 _DTYPES = {'F32': np.float32, 'F16': np.float16}
@@ -972,13 +987,13 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
         config['max_seq_len'] = int(max_seq_len)
 
     tensors = _load_shards(directory)
-    params = translate_weights(tensors, config)['params']
+    variables = translate_weights(tensors, config)
 
     built = with_precision('causal_transformer', config,
                            dtype=dtype, attention_impl=attention_impl)
     model = models.build('causal_transformer', **built)
-    _check_tree(params, model)
-    return model, {'params': params}, built
+    _check_tree(variables, model)
+    return model, variables, built
 
 
 def save_pretrained_decoder(model, variables, directory, *,
@@ -1142,9 +1157,11 @@ def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
     raise ValueError(f"unknown parameter path {dew_name!r}")
 
 
-def _check_tree(params: Mapping[str, Any], model) -> None:
-    """Refuse a tree the model would not accept, naming what is off.
+def _check_tree(variables: Mapping[str, Any], model) -> None:
+    """Refuse variables the model would not accept, naming what is off.
 
+    Every collection init returns is held to account, so a routed model
+    whose checkpoint lacks the balancing bias fails here too.
     jax.eval_shape builds the template without allocating it, so checking a
     0.6B checkpoint costs shapes rather than a second copy of the weights.
     """
@@ -1153,9 +1170,8 @@ def _check_tree(params: Mapping[str, Any], model) -> None:
 
     template = jax.eval_shape(
         lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
-    expected = {name: leaf.shape
-                for name, leaf in _flatten(template["params"]).items()}
-    loaded = _flatten(params)
+    expected = {name: leaf.shape for name, leaf in _flatten(template).items()}
+    loaded = _flatten(variables)
 
     missing = sorted(set(expected) - set(loaded))
     unexpected = sorted(set(loaded) - set(expected))
