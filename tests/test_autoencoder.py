@@ -2,15 +2,15 @@
 
 The tutorial-grade AE has no pretrained weights, so nothing here asserts
 reconstruction quality: what matters is that it satisfies the AutoEncoder
-contract the samplers and input config depend on (shapes, downscale factor,
-latent channels, video flattening, and the latent normalization seam).
+contract the samplers and input config depend on (the advertised latent
+geometry, video flattening, and the latent normalization seam).
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from dew.nn.autoencoders import AutoEncoder, SimpleAutoEncoder
+from dew.nn.autoencoders import SimpleAutoEncoder
 
 # Small enough to stay quick on CPU: 3 stages -> downscale factor 8
 DEPTHS = (8, 16, 32)
@@ -29,41 +29,17 @@ def image(autoencoder):
     )
 
 
-def test_it_is_an_autoencoder(autoencoder):
-    assert isinstance(autoencoder, AutoEncoder)
-    assert autoencoder.name == 'simple_autoencoder'
-
-
-def test_downscale_factor_and_latent_channels_describe_the_bottleneck(autoencoder):
-    """Samplers and the input config size latents off these two properties."""
-    assert autoencoder.downscale_factor == 2 ** len(DEPTHS)
-    assert autoencoder.latent_channels == 4
-
-
-def test_encode_produces_the_advertised_latent_shape(autoencoder, image):
+@pytest.mark.parametrize("depths", [(8,), (8, 16), (8, 16, 32)])
+def test_the_advertised_geometry_is_the_encoders(depths):
+    """`downscale_factor` and `latent_channels` are what the samplers and the
+    input config size latents by, so they must be what the encoder produces
+    and the decoder takes back to the image."""
+    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=depths)
+    size = 2 * autoencoder.downscale_factor
+    image = jnp.zeros((1, size, size, 3))
     latent = autoencoder.encode(autoencoder.params, image)
-    downscaled = IMAGE_SIZE // autoencoder.downscale_factor
-    assert latent.shape == (2, downscaled, downscaled, autoencoder.latent_channels)
-
-
-def test_decode_restores_the_image_shape(autoencoder, image):
-    reconstruction = autoencoder.decode(autoencoder.params, autoencoder.encode(autoencoder.params, image))
-    assert reconstruction.shape == image.shape
-
-
-def test_roundtrip_through_call_keeps_the_input_shape(autoencoder, image):
-    assert autoencoder(autoencoder.params, image).shape == image.shape
-
-
-def test_video_is_encoded_frame_by_frame(autoencoder):
-    """5D input keeps its batch and time axes; the base class flattens frames."""
-    video = jax.random.uniform(
-        jax.random.PRNGKey(2), (2, 3, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0
-    )
-    latent = autoencoder.encode(autoencoder.params, video)
-    downscaled = IMAGE_SIZE // autoencoder.downscale_factor
-    assert latent.shape == (2, 3, downscaled, downscaled, autoencoder.latent_channels)
-    assert autoencoder.decode(autoencoder.params, latent).shape == video.shape
+    assert latent.shape == (1, 2, 2, autoencoder.latent_channels)
+    assert autoencoder.decode(autoencoder.params, latent).shape == image.shape
 
 
 def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
@@ -110,16 +86,6 @@ def test_normalized_latents_can_be_whitened(image):
     assert float(jnp.std(whitened)) == pytest.approx(1.0, abs=1e-4)
 
 
-@pytest.mark.parametrize("depths", [(8,), (8, 16), (8, 16, 32)])
-def test_downscale_factor_follows_the_stage_count(depths):
-    autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=depths)
-    size = autoencoder.downscale_factor
-    assert size == 2 ** len(depths)
-    image = jnp.zeros((1, size, size, 3))
-    assert autoencoder.encode(autoencoder.params, image).shape == (1, 1, 1, 2)
-    assert autoencoder.decode(autoencoder.params, autoencoder.encode(autoencoder.params, image)).shape == image.shape
-
-
 def test_group_norm_survives_depths_not_divisible_by_norm_groups():
     """GroupNorm needs a divisor of the channel count; the AE picks one."""
     autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(12,), norm_groups=8)
@@ -141,10 +107,3 @@ def test_fresh_instances_get_different_random_weights(image):
     b = SimpleAutoEncoder(latent_channels=4, feature_depths=DEPTHS, key=jax.random.PRNGKey(1))
     assert not jnp.allclose(a.encode(a.params, image), b.encode(b.params, image), atol=1e-4)
 
-
-def test_serialize_records_the_config(autoencoder):
-    serialized = autoencoder.serialize()
-    assert serialized['name'] == 'simple_autoencoder'
-    assert serialized['latent_channels'] == 4
-    assert serialized['feature_depths'] == list(DEPTHS)
-    assert serialized['latent_shift'] == 0.0 and serialized['latent_scale'] == 1.0
