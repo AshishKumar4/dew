@@ -12,7 +12,7 @@ Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
 model_type: the config translation, the tensor path rule and the export
 vocabulary. Entries cover llama (Llama 2, 3 and 3.1's rope_scaling),
 mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
-gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3_5_text
+gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3_5_text
 (the hybrid of gated delta net layers and gated full-attention layers, whose
 linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
 glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32.
@@ -32,11 +32,12 @@ import os
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple, Union
 
 import numpy as np
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
 from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.llama4 import Llama4Mixer
@@ -563,6 +564,16 @@ def _qwen35_rope(hf_config: Mapping[str, Any]) -> Tuple[float, float]:
 
 
 
+def _mlp_features(intermediate_size: Any) -> Union[int, Tuple[int, ...]]:
+    """One width, or Gemma 3n's list of one per layer (configuration_gemma3n.py
+    expands an int to a list, so a config it wrote carries the list either
+    way); a list of one value is that value."""
+    if isinstance(intermediate_size, (list, tuple)):
+        widths = tuple(int(width) for width in intermediate_size)
+        return widths[0] if len(set(widths)) == 1 else widths
+    return int(intermediate_size)
+
+
 def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
                  layer_types: Optional[Tuple[str, ...]] = None,
                  rope: Optional[_Ropes] = None,
@@ -606,7 +617,7 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
         'num_kv_heads': heads if kv_heads is None else int(kv_heads),
         'head_dim': head_dim,
         'mlp': mapped,
-        'mlp_features': int(hf_config['intermediate_size']),
+        'mlp_features': _mlp_features(hf_config['intermediate_size']),
         'max_seq_len': min(int(hf_config.get('max_position_embeddings',
                                              DEFAULT_MAX_SEQ_LEN)),
                            DEFAULT_MAX_SEQ_LEN),
@@ -797,6 +808,97 @@ def _gemma3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
     return config
+
+
+def _gemma3n_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Gemma 3n (E2B, E4B): AltUp's stack of residual copies, the LAuReL
+    block, gaussian top-k sparsity on the first layers, one feed-forward
+    width per layer, per-layer inputs and KV sharing over the last layers."""
+    if hf_config.get('layer_types') is not None:
+        layer_types = _specified_layer_types(hf_config, used)
+    else:
+        # Gemma3nTextConfig fills every fifth layer full.
+        layer_types = tuple('full_attention' if (index + 1) % 5 == 0 else 'sliding_attention'
+                            for index in range(int(hf_config['num_hidden_layers'])))
+    # Gemma3nTextConfig folds a flat rope_scaling into the full layers'
+    # entry (convert_rope_params_to_dict) and defaults the bases to 1e6 for
+    # the full layers and 1e4 for the sliding ones, spelled rope_theta and
+    # rope_local_base_freq by the released config and nested by one
+    # transformers wrote.
+    nested = hf_config.get('rope_parameters')
+    scaling = hf_config.get('rope_scaling')
+    if isinstance(nested, Mapping) and 'rope_theta' not in nested and isinstance(scaling, Mapping):
+        full = nested.get('full_attention') or {}
+        hf_config = {**hf_config, 'rope_scaling': None,
+                     'rope_parameters': {**nested, 'full_attention': {**full, **scaling}}}
+    ropes = _rope(hf_config, used)
+    if not isinstance(nested, Mapping) and 'rope_theta' not in hf_config:
+        ropes = dataclasses.replace(ropes, theta=1000000.0)
+    if ropes.local_theta is None and not (
+            isinstance(nested, Mapping) and (nested.get('sliding_attention') or {}).get('rope_theta')
+            or hf_config.get('rope_local_base_freq') is not None):
+        ropes = dataclasses.replace(ropes, local_theta=None if ropes.theta == 10000.0 else 10000.0)
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=layer_types, rope=ropes)
+    layers = config['num_layers']
+    sparsity = hf_config.get('activation_sparsity_pattern')
+    if sparsity is None:
+        # The reference's default: the first ten layers at 0.95 when there
+        # are more than ten, else none (configuration_gemma3n.py).
+        sparse = 10 if layers > 10 else 0
+        sparsity = [0.95] * sparse + [0.0] * (layers - sparse)
+    if not isinstance(sparsity, (list, tuple)) or len(sparsity) != layers:
+        _refuse(f"activation_sparsity_pattern {sparsity!r}",
+                f"the reference takes one fraction per layer of {layers}")
+    used.update(('activation_sparsity_pattern', 'laurel_rank', 'altup_num_inputs',
+                 'altup_active_idx', 'altup_coef_clip', 'altup_correct_scale',
+                 'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
+                 'num_kv_shared_layers', 'final_logit_softcapping'))
+    clip = hf_config.get('altup_coef_clip', 120.0)
+    # AltUp's own checks name the reference's fields, so a config out of
+    # their range is refused here rather than at build.
+    altup = AltUp(num_inputs=int(hf_config.get('altup_num_inputs', 4)),
+                  active_idx=int(hf_config.get('altup_active_idx', 0)),
+                  coef_clip=None if clip is None else float(clip),
+                  correct_scale=bool(hf_config.get('altup_correct_scale', True)))
+    config.update(
+        sandwich_norms=True, embedding_scale=True, attention_scale=1.0, v_norm=True,
+        activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
+        laurel_rank=int(hf_config.get('laurel_rank', 64)),
+        altup=dataclasses.asdict(altup),
+        per_layer_input_dim=int(hf_config.get('hidden_size_per_layer_input', 256)),
+        per_layer_input_vocab=int(hf_config.get('vocab_size_per_layer_input', 262144)),
+        num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 15)),
+        final_logit_softcap=float(hf_config.get('final_logit_softcapping', 30.0)),
+    )
+    return config
+
+
+def _gemma3n_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    """The AltUp and LAuReL leaves beside a Gemma 4 style layer.
+
+    The copies' projections are indexed modules (altup_projections.{i}), which
+    land as altup_projections_{i} the way the layers do; the coefficient maps
+    are Linears, so they transpose like any kernel.
+    """
+    parts = name.split('.')
+    if len(parts) == 4 and parts[0] == 'model' and parts[2].isdigit() and parts[3] == 'weight' \
+            and parts[1] in ('altup_projections', 'altup_unembed_projections'):
+        return ('params', f'{parts[1]}_{parts[2]}', 'kernel')
+    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() \
+            and parts[3] in ('altup', 'laurel'):
+        layer = ('params', f'layers_{parts[2]}', parts[3])
+        tail = parts[4:]
+        if tail == ['correct_output_scale']:
+            return (*layer, 'correct_output_scale')
+        if len(tail) == 2 and tail[1] == 'weight':
+            if tail[0] in ('router_norm', 'post_laurel_norm'):
+                return (*layer, tail[0], 'scale')
+            if tail[0] in ('correction_coefs', 'prediction_coefs', 'modality_router',
+                           'linear_left', 'linear_right'):
+                return (*layer, tail[0], 'kernel')
+        raise ValueError(f"unknown tensor name {name!r}")
+    return _dew_path(name, config)
 
 
 def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
@@ -1999,6 +2101,10 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('olmo3',), _olmo3_config,
                   lambda fields: not fields['pre_norms'],
                   'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),
+    DecoderFamily(('gemma3n_text',), _gemma3n_config,
+                  lambda fields: fields['altup'] is not None,
+                  'gemma3n_text', 'Gemma3nForCausalLM', _gemma3_export, sandwich_norms=True,
+                  weight_path=_gemma3n_path),
     DecoderFamily(('gemma4_text',), _gemma4_config,
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),
