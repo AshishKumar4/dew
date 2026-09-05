@@ -17,16 +17,11 @@ from flax import linen as nn
 from flax.linen import spmd
 from jax.experimental import multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
-
 from dew.data.dataset import Checkpointable
-from dew.nn.sharding import LogicalAxes, declared_axes
+from dew.nn.sharding import (
+    DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, TENSOR_AXIS, LogicalAxes, declared_axes,
+)
 from dew.objectives.base import Batch, Variables
-
-DATA_AXIS = 'data'
-FSDP_AXIS = 'fsdp'
-EXPERT_AXIS = 'expert'
-TENSOR_AXIS = 'tensor'
-SEQUENCE_AXIS = 'sequence'
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
 # expert axis, a width the rules redirect takes tensor, everything else

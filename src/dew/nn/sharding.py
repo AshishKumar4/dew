@@ -36,11 +36,33 @@ import jax
 LogicalAxes: TypeAlias = tuple[str | None, ...]
 Suffix: TypeAlias = tuple[str, ...]
 
+DATA_AXIS = 'data'
+EXPERT_AXIS = 'expert'
+FSDP_AXIS = 'fsdp'
+TENSOR_AXIS = 'tensor'
+SEQUENCE_AXIS = 'sequence'
+"""The axes of the mesh `dew.training.build_mesh` builds. They are named here
+because the attention seam reads two of them off the mesh in context: the
+sequence axis it splits its queries over, and the tensor axis, which holds
+a width and never a row."""
+
 DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
 
 HEURISTIC: set[Suffix] = set()
 """Runs of name patterns whose parameters take the shape heuristic on purpose."""
+
+
+def sequence_shards() -> int:
+    """How many ways the mesh in context splits the sequence axis, 1 with no
+    mesh or no such axis.
+
+    The trainer runs its compiled step under `jax.set_mesh`, which is what
+    puts the mesh in context while the step traces; a model called outside
+    it sees whole sequences.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    return 1 if mesh.empty else mesh.shape.get(SEQUENCE_AXIS, 1)
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,

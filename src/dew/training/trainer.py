@@ -47,6 +47,13 @@ StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
 the loss and the objective's report out."""
 
+CompiledStep = Callable[
+    [TrainState, dynamic_scale_lib.DynamicScale | None, Batch],
+    tuple[TrainState, dynamic_scale_lib.DynamicScale | None, jax.Array,
+          Mapping[str, jax.Array], jax.Array]]
+"""What `Trainer.compile` returns: `(state, scale, batch)` in, `(state, scale,
+loss, metrics, finite)` out."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Profile:
@@ -281,7 +288,7 @@ class Trainer:
         return step
 
     def compile(self, state: TrainState, batch: Batch,
-                scale: dynamic_scale_lib.DynamicScale | None = None) -> jax.stages.Wrapped:
+                scale: dynamic_scale_lib.DynamicScale | None = None) -> CompiledStep:
         """The training step `fit` runs, compiled ahead of time over `state`
         and one global `batch`.
 
@@ -291,17 +298,25 @@ class Trainer:
         and it donates the state, so a benchmark that runs it measures the
         step a real run runs.
 
-        What comes back is the jitted function, not the executable. Calling an
-        executable from Python re-checks every leaf's shape and sharding on
-        every call, about 4.5 us a leaf (0.4 ms a step for a 99-leaf state,
-        4.9 ms for 1067 leaves, one CPU core of an i9-12900K), while jit
-        dispatches through its C++ cache. The FLOP count still comes off the
-        ahead-of-time executable: jit lowers through the same cache, so the
-        first call finds that compilation instead of running its own.
+        What comes back calls the jitted function, not the executable.
+        Calling an executable from Python re-checks every leaf's shape and
+        sharding on every call, about 4.5 us a leaf (0.4 ms a step for a
+        99-leaf state, 4.9 ms for 1067 leaves, one CPU core of an i9-12900K),
+        while jit dispatches through its C++ cache. The FLOP count still comes
+        off the ahead-of-time executable: jit lowers through the same cache,
+        so the first call finds that compilation instead of running its own.
+
+        Every call runs under `jax.set_mesh`, which puts the mesh in context
+        while the step traces: the attention seam reads the sequence axis off
+        it (`dew.nn.sharding.sequence_shards`), and the context is part of
+        jit's cache key, so a call outside it would trace and compile the
+        step a second time. Entering it costs nothing measurable beside the
+        dispatch (32 us either way on the CPU above).
         """
         body = self._step_body()
+        mesh = self.device_mesh
         shardings = self.shardings(state)
-        replicated = NamedSharding(self.device_mesh, P())
+        replicated = NamedSharding(mesh, P())
 
         def step(state, scale, batch):
             state, scale, loss, aux = body(state, scale, batch)
@@ -310,13 +325,19 @@ class Trainer:
         jitted = jax.jit(
             step,
             in_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
-                          batch_shardings(self.device_mesh, batch)),
+                          batch_shardings(mesh, batch)),
             out_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
                            replicated, replicated, replicated),
             donate_argnums=(0,),
         )
-        self.flops_per_step = step_flops(jitted, state, scale, batch)
-        return jitted
+        with jax.set_mesh(mesh):
+            self.flops_per_step = step_flops(jitted, state, scale, batch)
+
+        def run(state, scale, batch):
+            with jax.set_mesh(mesh):
+                return jitted(state, scale, batch)
+
+        return run
 
     # ------------------------------------------------------------------
     # The loop
