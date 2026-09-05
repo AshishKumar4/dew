@@ -42,6 +42,49 @@ tail shows up.
 | jepa_video_encoder | 8x64x64x3 |     4 |  16,143,360 |    18.3 | 20.1 / 20.3 / 22.9 |     218.2 |      758.1 | 42.4% |     1.28 |      20.5 |
 | causal_transformer | 512 tokens |    16 |  66,950,784 |    83.0 | 83.7 / 83.8 / 84.0 |     192.7 |     3406.4 | 42.1% |     5.81 |      10.1 |
 
+### Rerun 2026-09-05
+
+```
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.8 \
+    python tools/benchmark_step.py --preset small --architectures <arch> --json-out <arch>.json
+```
+
+Same card, driver and library versions, dew at `9886c20` (the tree before
+the cudnn padding of `3b67135`; the `simple_mmdit`, `hierarchical_mmdit`
+and `unet` rows after it are in `docs/performance.md`), the host otherwise
+idle, one process per architecture, 2 warmup and 100 measured steps. The
+parameter counts grew by 99,840 since the last table because the condition
+encoder's table (`CharTable`, 130 by 768) now lives in the state tree rather
+than in the executable's constants. Last week's ms/step is in the second
+column for the four architectures that were rerun.
+
+| architecture       | 09-02 ms/step | ms/step | p10 / p50 / p90 ms | samples/s | GFLOP/step |  util | peak GiB | compile s |
+|--------------------|--------------:|--------:|--------------------|----------:|-----------:|------:|---------:|----------:|
+| simple_dit         |           7.9 |    7.02 |  7.5 / 7.6 / 7.9   |    2278.3 |      292.9 | 42.8% |     0.83 |       8.0 |
+| hierarchical_mmdit |          32.7 |   33.95 | 37.3 / 37.6 / 39.3 |     471.2 |      737.4 | 22.3% |     3.50 |      50.4 |
+| video_dit          |          17.3 |   17.06 | 18.5 / 18.9 / 20.3 |     234.5 |      760.0 | 45.7% |     1.41 |      13.0 |
+| causal_transformer |          83.0 |   88.78 | 89.5 / 89.7 / 89.9 |     180.2 |     3406.4 | 39.4% |     4.51 |       9.5 |
+
+The decoder is 7% slower than last week. Two things moved. The chunked
+vocabulary head that shipped after that table costs 1.9 ms at its default
+of four chunks against the full-vocabulary pass, measured in the same tree
+with `--cases` naming `head_chunks` (1: 87.02 ms, 5.67 GiB; 2: 88.39 ms,
+4.85 GiB; 4: 88.90 ms, 4.51 GiB; 8: 89.67 ms, 4.41 GiB; 50 steps each), so
+the default trades 2.2% of the step for 1.2 GiB. The other 3.8 ms are in
+the decoder itself: `6b0f119` rerun today on the same card reads 83.26 ms,
+and the tree at `9886c20` with one head chunk reads 87.02. That difference
+belongs to the decoder's changes between the two commits and is reported
+to the architecture lane, not measured further here.
+
+The MoE `causal_transformer` case of the preset (8 experts, top-2 on every
+second layer) does not run under `XLA_PYTHON_CLIENT_PREALLOCATE=false`: its
+step asks for one 4.5 GiB buffer and the BFC allocator, growing on demand
+into a 12.8 GiB budget, cannot place it (`RESOURCE_EXHAUSTED ... 4.47GiB`).
+The same tree runs with the default preallocation. `6b0f119`'s
+full-vocabulary decoder fails the same way (4.80 GiB), so a benchmark of a
+step with one buffer over about 4.5 GiB needs the default preallocation on
+this card.
+
 `jepa_predictor` has no step of its own: it is built through the registry and
 trained inside the two JEPA rows. The `causal_transformer` row is GPT-2
 small's width at three layers with a 50k vocabulary; its FLOPs are dominated
