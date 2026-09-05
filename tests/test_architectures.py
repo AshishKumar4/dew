@@ -215,12 +215,11 @@ def test_every_registry_architecture_is_trained_here():
     assert COVERED == set(models)
 
 
-def model_variables(case: Case, concrete: bool = False):
-    """The case's variables as shapes, or as arrays when `concrete` (the
-    hilbert scan builds its permutation on the host and does not trace)."""
+def model_variables(case: Case):
+    """The case's variables as shapes."""
     model = models.build(case.architecture, **case.config)
     rng = jax.random.key(0)
-    init = model.init if concrete else (lambda *args: jax.eval_shape(model.init, *args))
+    init = lambda *args: jax.eval_shape(model.init, *args)
     if case.is_lm:
         return init(rng, jnp.ones((1, case.seq_len), jnp.int32))
     sample = jnp.ones((1, *case.sample_shape), jnp.float32)
@@ -290,7 +289,7 @@ def every_leaf():
     for case in CASES:
         yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
     for case in VARIANTS:
-        yield from jax.tree_util.tree_flatten_with_path(model_variables(case, concrete=True))[0]
+        yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
     model = models.build("jepa_predictor", **PREDICTOR)
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, MASK.num_context, 32)),

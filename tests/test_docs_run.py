@@ -107,8 +107,24 @@ def tiny_world(tmp_path):
     )
 
 
+@pytest.fixture
+def registries_restored():
+    """A snippet that registers a model (README's `@models("my_dit")`) must
+    not leave it behind for the tests that share this worker: the sweep over
+    every registered model would then meet a class no case covers."""
+    from dew import registry
+
+    tables = [registry.models, registry.presets, registry.samplers, registry.datasets,
+              registry.encoders, registry.metrics, registry.objectives]
+    before = [dict(table._members) for table in tables]
+    yield
+    for table, members in zip(tables, before):
+        table._members.clear()
+        table._members.update(members)
+
+
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
-def test_the_documented_code_runs(path, tmp_path, monkeypatch):
+def test_the_documented_code_runs(path, tmp_path, monkeypatch, registries_restored):
     found = blocks(path)
     if not found:
         pytest.skip("no python blocks")

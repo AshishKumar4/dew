@@ -92,8 +92,9 @@ class DiscreteProcess:
         is one point."""
         return jnp.full(shape, self.mask_id, jnp.int32)
 
-    def denoiser(self, model, params, conditions: dict[str, Any] | None = None,
-                 unconditional=None) -> DiscreteDenoiser:
+    def denoiser(self, model: nn.Module, params: Variables,
+                 conditions: dict[str, Any] | None = None,
+                 unconditional: dict[str, Any] | None = None) -> DiscreteDenoiser:
         if conditions or unconditional is not None:
             raise ValueError("the masked diffusion LM takes no conditions")
         return DiscreteDenoiser(self, model, params)
@@ -111,11 +112,12 @@ class DiscreteDenoiser:
     """
 
     process: DiscreteProcess
-    model: Any
+    model: nn.Module
     params: Variables
 
     def __call__(self, x_t, t):
         logits = self.model.apply(self.params, x_t)
+        assert not isinstance(logits, tuple)  # no mutable collections were asked for
         logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = x_t == self.process.mask_id
@@ -130,8 +132,6 @@ class Unmask:
     with probability (alpha(s) - alpha(t)) / (1 - alpha(t)), with a token drawn
     from the model's categorical; the rest stay masked. Integrates a
     `DiscreteProcess`."""
-
-    State = tuple
 
     def init(self, x) -> tuple:
         return ()

@@ -113,7 +113,8 @@ class FlowMatchPredictionTransform(PredictionTransform):
 
 class KarrasPredictionTransform(PredictionTransform):
     """The EDM preconditioning (Karras et al. 2022, Table 1): the model sees
-    c_in x_t and its raw output F is read as x_0 = c_skip x_t + c_out F."""
+    c_in x_t and its raw output F is read as x_0 = c_skip x_t + c_out F. Every
+    denominator is at least sigma_data, so none needs a guard."""
 
     def __init__(self, sigma_data: float = 0.5) -> None:
         self.sigma_data = sigma_data
@@ -122,15 +123,15 @@ class KarrasPredictionTransform(PredictionTransform):
         signal_rate, noise_rate = rates
         return preds, (x_t - preds * signal_rate) / noise_rate
 
-    def pred_transform(self, x_t, preds, rates, epsilon=1e-8):
+    def pred_transform(self, x_t, preds, rates):
         _, sigma = rates
-        c_out = sigma * self.sigma_data / (jnp.sqrt(self.sigma_data ** 2 + sigma ** 2) + epsilon)
-        c_skip = self.sigma_data ** 2 / (self.sigma_data ** 2 + sigma ** 2 + epsilon)
+        c_out = sigma * self.sigma_data / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
+        c_skip = self.sigma_data ** 2 / (self.sigma_data ** 2 + sigma ** 2)
         return c_out * preds + c_skip * x_t
 
-    def get_input_scale(self, rates, epsilon=1e-8):
+    def get_input_scale(self, rates):
         _, sigma = rates
-        return 1 / (jnp.sqrt(self.sigma_data ** 2 + sigma ** 2) + epsilon)
+        return 1 / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
 
     def target_error_scale(self, snr):
         # x_0 error is c_out times the raw error, and alpha = 1 here so
