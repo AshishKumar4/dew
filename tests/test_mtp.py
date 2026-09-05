@@ -1,11 +1,11 @@
-"""Multi-token-prediction depths: tree, head sharing, and the init pattern.
+"""Multi-token-prediction depths: tree and head sharing.
 
 `num_nextn_predict_layers` stacks MTP depths after the final norm; 0 leaves
 the tree unchanged. A depth reads the previous hidden states and the token
-embeddings and scores one token further out through the shared head. Flax
-initializes the setups a call reaches, so the depths need a both-paths init
-(the pattern in `both_paths`); a main-only init leaves them out, and the
-first test pins that the depths are really there afterwards.
+embeddings and scores one token further out through the shared head. A plain
+init holds every depth: Flax creates parameters where a call reaches them,
+and the forward reaches the depths while initializing, so no caller has to
+know a second init method.
 """
 
 import jax
@@ -24,9 +24,8 @@ def tiny(**overrides):
 
 
 def both_paths(model, key, ids):
-    """One variables tree holding the main path and every MTP depth."""
-    return model.init(key, ids, method=lambda m, x: (
-        m(x), m.mtp_logits(m.hidden_states(x), x)))
+    """The variables tree a plain init builds, main path and every depth."""
+    return model.init(key, ids)
 
 
 def test_no_depths_leaves_the_tree_unchanged():

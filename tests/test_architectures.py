@@ -18,6 +18,7 @@ every declared name is carried by some parameter.
 
 import fnmatch
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Optional
 
 import jax
@@ -219,11 +220,43 @@ VARIANTS = [
     # projection, with the second layer sharing the first's K/V.
     Case("causal_transformer", {**LM, "per_layer_input_dim": 8,
                                 "num_kv_shared_layers": 1}, seq_len=SEQ_LEN, label="gemma4"),
+    # A multi-token-prediction depth adds its projection and block beside the
+    # backbone, so the declarations behind them are checked here.
+    Case("causal_transformer", {**LM, "num_nextn_predict_layers": 1}, seq_len=SEQ_LEN, label="mtp"),
 ]
 
 
+def frozen_towers():
+    """The condition encoders' towers, from the committed tiny configs: they
+    are placed on the mesh beside the model, so their declarations are
+    checked like a model's."""
+    import json
+
+    from dew.nn.text_encoders import (
+        CLIP, CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer,
+        translate_clip_config, translate_t5_config,
+    )
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    clip_config = translate_clip_config(
+        json.loads((fixtures / "clip" / "tiny" / "config.json").read_text()))
+    clip = CLIP(text_model=CLIPTextTransformer(**clip_config["text"]),
+                vision_model=CLIPVisionTransformer(**clip_config["vision"]),
+                projection_dim=clip_config["projection_dim"])
+    vision = clip_config["vision"]
+    pixels = jnp.zeros((1, vision["num_channels"], vision["image_size"], vision["image_size"]))
+    yield clip, (pixels, jnp.ones((1, 4), jnp.int32))
+    t5_config = translate_t5_config(
+        json.loads((fixtures / "t5" / "tiny" / "config.json").read_text()))
+    tokens = (jnp.ones((1, 4), jnp.int32),)
+    yield T5EncoderTransformer(**t5_config), tokens
+    # The tiny fixture is gated-gelu; the relu feed-forward declares a module
+    # of its own, so a tower with it is walked too.
+    yield T5EncoderTransformer(**{**t5_config, "feed_forward_proj": "relu"}), tokens
+
+
 def every_leaf():
-    """Every parameter leaf of every case and variant, the predictor included."""
+    """Every parameter leaf of every case and variant, the predictor and the
+    frozen towers included."""
     for case in CASES:
         yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
     for case in VARIANTS:
@@ -234,6 +267,9 @@ def every_leaf():
         jnp.arange(MASK.num_context, dtype=jnp.int32)[None],
         jnp.arange(MASK.block_area, dtype=jnp.int32)[None])
     yield from jax.tree_util.tree_flatten_with_path(variables)[0]
+    for tower, inputs in frozen_towers():
+        variables = jax.eval_shape(tower.init, jax.random.key(0), *inputs)
+        yield from jax.tree_util.tree_flatten_with_path(variables)[0]
 
 
 def test_every_matrix_parameter_is_declared_or_listed_as_heuristic():
@@ -373,7 +409,7 @@ def run_case(case: Case, tmp_path, fsdp):
                         metrics=(Spread(seen, artifact),))
 
     assert dict(trainer.device_mesh.shape) == {"data": jax.device_count() // fsdp, "expert": 1,
-                                               "fsdp": fsdp}
+                                               "fsdp": fsdp, "tensor": 1, "sequence": 1}
     assert int(state.step) == 2
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == 2 and all(np.isfinite(loss) for loss in losses), losses
