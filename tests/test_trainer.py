@@ -625,9 +625,9 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
     tracker = RecordingTracker()
     make_trainer(tracker=tracker).fit(Data(endless), steps=4, log_every=2)
 
-    steps = [step for step, _ in tracker.scalars]
-    assert steps == [2, 4]
-    for _, scalars in tracker.scalars:
+    ticks = [(step, scalars) for step, scalars in tracker.scalars if "train/loss" in scalars]
+    assert [step for step, _ in ticks] == [2, 4]
+    for _, scalars in ticks:
         assert scalars["train/probe"] == 1.0
         assert np.isfinite(scalars["train/loss"])
         assert scalars["train/step_time_ms"] > 0
@@ -635,16 +635,22 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
 
 
 class ManualClock:
+    """Both clocks the trainer reads, advanced by hand."""
+
     def __init__(self):
         self.now = 0.0
 
     def time(self):
         return self.now
 
+    def perf_counter(self):
+        return self.now
+
 
 def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     """Every interval, the first one included, reports the time its steps
-    took, so the compile never lands in train/step_time_ms."""
+    took, so the compile never lands in train/step_time_ms; the goodput
+    numbers at the end count the compile as the time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
@@ -664,7 +670,64 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     trainer.fit(Data(endless), steps=3, log_every=1)
 
-    assert [s["train/step_time_ms"] for _, s in tracker.scalars] == pytest.approx([1000.0] * 3)
+    ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
+    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
+    # The compile (100) and the first step (1) make the time to the first
+    # step; the two steps after it are the 2 of 103 seconds spent in steps.
+    goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
+    assert [step for step, _ in goodput] == [3]
+    assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(101.0)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 103)
+
+
+def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkeypatch, tmp_path):
+    """Four steps of one second each, a compile of ten, an evaluation of
+    five at step two and at the end, a checkpoint write of two at step two
+    and at the end: the first step lands at 11, the other three steps are
+    the 3 seconds in steps of the 28 the fit took."""
+    clock = ManualClock()
+    monkeypatch.setattr(trainer_module, "time", clock)
+    tracker = RecordingTracker()
+    trainer = make_trainer(tmp_path, tracker=tracker)
+    compile_step, evaluate, save = trainer.compile, trainer._evaluate, trainer.checkpoints.save
+
+    def compile_then_time_each_step(*args):
+        executable = compile_step(*args)
+        clock.now += 10.0
+
+        def timed(*step_args):
+            outputs = executable(*step_args)
+            clock.now += 1.0
+            return outputs
+        return timed
+
+    def slow_evaluate(*args):
+        clock.now += 5.0
+        return evaluate(*args)
+
+    def slow_save(*args):
+        clock.now += 2.0
+        return save(*args)
+
+    monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
+    monkeypatch.setattr(trainer, "_evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
+    trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2)
+
+    goodput = [s for _, s in tracker.scalars if "goodput/step_fraction" in s]
+    assert len(goodput) == 1
+    assert goodput[0]["goodput/time_to_first_step_s"] == pytest.approx(11.0)
+    assert goodput[0]["goodput/step_fraction"] == pytest.approx(3 / 28)
+
+
+def test_goodput_arithmetic():
+    """The fraction is what is left of the wall time after the first step
+    and the time outside steps; a fit that ran no step has no first step and
+    no time in steps."""
+    assert trainer_module.goodput(10.0, 2.0, 3.0) == {
+        "goodput/time_to_first_step_s": 2.0, "goodput/step_fraction": 0.5}
+    assert trainer_module.goodput(10.0, None, 4.0) == {"goodput/step_fraction": 0.0}
+    assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
 
 
 def test_only_process_zero_logs_and_every_process_validates(monkeypatch):
@@ -933,7 +996,7 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     # step 1 moved the discriminator half way to the generator.
     assert float(state.params["params"]["gen"]["g"]) == pytest.approx(0.5)
     assert float(state.params["params"]["disc"]["d"]) == pytest.approx(0.25)
-    assert [s["train/player"] for _, s in tracker.scalars] == [0.0, 1.0]
+    assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
     resumed = trainer().fit(Data(), steps=4, log_every=1)
     assert float(resumed.params["params"]["gen"]["g"]) == pytest.approx(0.75)
