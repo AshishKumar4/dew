@@ -244,6 +244,15 @@ def test_attention_bias_adds_the_qkvo_biases(rng):
     attention = model.init(rng, tokens(rng))['params']['layers_0']['self_attn']
     assert all('bias' in attention[proj]
                for proj in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
+
+
+def test_o_proj_bias_false_leaves_only_the_qkv_biases(rng):
+    """Qwen2Attention builds q, k and v with bias=True and o_proj with
+    bias=False (modeling_qwen2.py:189-192), which the split dial names."""
+    model = tiny(attention_bias=True, o_proj_bias=False)
+    attention = model.init(rng, tokens(rng))['params']['layers_0']['self_attn']
+    assert all('bias' in attention[proj] for proj in ('q_proj', 'k_proj', 'v_proj'))
+    assert 'bias' not in attention['o_proj']
     assert 'bias' not in model.init(
         rng, tokens(rng))['params']['layers_0']['mlp']['gate_proj']
 

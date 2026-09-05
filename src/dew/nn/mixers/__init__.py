@@ -63,6 +63,7 @@ class MixerContext:
     kv_store_key: Optional[str] = None
     sliding_window: Optional[int] = None
     attention_bias: bool = False
+    o_proj_bias: Optional[bool] = None
     attention_scale: Optional[float] = None
     partial_rotary_factor: Optional[float] = None
     partial_rotary_type: str = 'proportional'
@@ -137,6 +138,7 @@ class AttentionMixer(MixerBase):
             kv_store_key=ctx.kv_store_key,
             sliding_window=ctx.sliding_window,
             attention_bias=ctx.attention_bias,
+            o_proj_bias=ctx.o_proj_bias,
             attention_scale=ctx.attention_scale,
             output_gate=ctx.output_gate,
             dtype=ctx.dtype,
