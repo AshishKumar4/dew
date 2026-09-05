@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 from flax.typing import Dtype, PrecisionLike
+from flax.linen.dtypes import promote_dtype
 import functools
 import math
 from .sharding import logical_axes
@@ -249,18 +250,49 @@ CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 CUDNN_MAX_HEAD_DIM = 128
 
 
-def cudnn_runs(query) -> bool:
+def cudnn_runs(query, softcap=None) -> bool:
     """Whether cudnn's fused kernel takes this query: a gpu backend, one of its
-    two dtypes, and a head dimension it tiles. 'auto' asks this; an explicit
-    'cudnn' refuses by name instead."""
+    two dtypes, a head dimension it tiles, and no logit softcap, which no
+    fused kernel applies. 'auto' asks this; an explicit 'cudnn' refuses by
+    name instead."""
     head_dim = query.shape[-1]
     return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
-            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM)
+            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
+            and softcap is None)
+
+
+def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
+                         force_fp32_for_softmax=True, mask=None, bias=None):
+    """Attention with Gemma 2's tanh softcap on the logits, in plain XLA ops.
+
+    The reference scales the logits, squashes them into (-softcap, softcap)
+    as `softcap * tanh(logits / softcap)`, adds the mask and takes the softmax
+    in fp32 (modeling_gemma2.py:192-208). No fused kernel has that tanh, so
+    this is flax's reference attention with the cap between the scaling and
+    the mask; heads arrive already repeated and the mask already structural,
+    as the reference path prepares them.
+    """
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    dtype = query.dtype
+    logits = jnp.einsum('...qhd,...khd->...hqk',
+                        query / jnp.sqrt(query.shape[-1]).astype(dtype), key,
+                        precision=precision)
+    logits = jnp.tanh(logits / softcap) * softcap
+    if bias is not None:
+        logits = logits + bias
+    if mask is not None:
+        logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
+    if force_fp32_for_softmax and dtype != jnp.float32:
+        weights = jax.nn.softmax(logits.astype(jnp.float32))
+    else:
+        weights = jax.nn.softmax(logits).astype(dtype)
+    return jnp.einsum('...hqk,...khd->...qhd', weights, value, precision=precision)
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
-                                 causal=False, sliding_window=None, mask=None, bias=None):
+                                 causal=False, sliding_window=None, mask=None, bias=None,
+                                 softcap=None):
     """The one attention kernel path for every attention module.
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
@@ -272,9 +304,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
-      inputs, a head dimension that is a multiple of 8 and at most 128), 'xla'
-      anywhere else. Resolved per trace, so a config logged as 'auto' still
-      runs on the next machine.
+      inputs, a head dimension that is a multiple of 8 and at most 128, no
+      softcap), 'xla' anywhere else. Resolved per trace, so a config logged
+      as 'auto' still runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -296,11 +328,27 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     mask argument, so an explicit mask rides in there as an additive bias.
     `bias` is an additive float array broadcastable to [B, H, Q, K], added to
     the logits on every path; T5's relative position table travels in it.
+
+    `softcap` is Gemma 2's tanh on the scaled logits before the mask and the
+    softmax. No fused kernel applies it, so a softcapped call runs
+    `softcapped_attention` under both the reference and the xla
+    implementation, honouring dtype, precision and force_fp32_for_softmax the
+    way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
+    refuse it by name rather than dropping the cap.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
 
-    if implementation is None:
+    if implementation == 'auto':
+        implementation = 'cudnn' if cudnn_runs(query, softcap) else 'xla'
+    if softcap is not None and implementation in ('cudnn', 'tpu'):
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot apply an "
+            f"attention logit softcap of {softcap}: the fused kernel has no tanh "
+            "between its scaling and its softmax. Use attention_impl 'xla' or "
+            "the reference implementation (attention_impl 'reference').")
+
+    if implementation is None or softcap is not None:
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -308,13 +356,14 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             structural = causal_attention_mask(
                 jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
             mask = structural if mask is None else jnp.logical_and(mask, structural)
+        if softcap is not None:
+            return softcapped_attention(
+                query, key, value, softcap, dtype=dtype, precision=precision,
+                force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
         return nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
-
-    if implementation == 'auto':
-        implementation = 'cudnn' if cudnn_runs(query) else 'xla'
 
     requested = {str(getattr(p, 'name', p)).upper()
                  for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
