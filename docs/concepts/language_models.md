@@ -105,8 +105,14 @@ save_pretrained_decoder(model, variables, "out/qwen3-tuned", tokenizer_name="Qwe
 
 | Family | `model_type` | Loads |
 |---|---|---|
-| Llama 3 | `llama` | dense GQA decoders |
+| Llama 2, 3, 3.1 | `llama` | dense GQA decoders; 3.1's `rope_scaling` on the rotary table |
+| Mistral | `mistral` | Llama with a sliding window on every layer |
+| Mixtral | `mixtral` | the routed mixture with the softmax router |
+| Qwen 2 | `qwen2` | q, k and v biases over a bias-free `o_proj` |
 | Qwen 3 | `qwen3` | dense; q/k norms, sliding layers |
+| Qwen3-MoE | `qwen3_moe` | the mixture with `norm_topk_prob`, `decoder_sparse_step` and `mlp_only_layers` |
+| Gemma 1, 2 | `gemma`, `gemma2` | exact GeGLU; Gemma 2 adds the attention logit softcap (runs on the xla kernel), alternating windows and post norms |
+| OLMo 3 | `olmo3` | post-norm block, q/k norms over the whole projection; its full-layer YaRN is refused by name |
 | Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and are refused by name |
 | Gemma 4 | `gemma4_text` | the text decoder: per-layer inputs, KV sharing, partial rotary, logit softcap |
 | Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and are refused by name |
