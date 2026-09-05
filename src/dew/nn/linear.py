@@ -1,12 +1,11 @@
 """Gated DeltaNet: the linear-attention mixer of the Qwen3.5 family.
 
 The delta rule keeps an outer-product memory `S = sum_t k_t v_t^T` and
-corrects it toward the value each new key predicts, rather than only
-accumulating onto it the way attention accumulates its keys. Two gates make
-it trainable at scale: a decay `g` that shrinks the memory before each
-write (Mamba's selectivity, spelled as a log-space cumulative product in
-the chunked form) and a beta that scales how far one write moves the memory
-toward its own value.
+corrects it toward the value each new key predicts, where attention only
+accumulates its keys. Two gates make it trainable at scale: a decay `g`
+that shrinks the memory before each write (Mamba's selectivity, spelled as
+a log-space cumulative product in the chunked form) and a beta that scales
+how far one write moves the memory toward its own value.
 
 dew computes the same chunked formulation transformers 5.16.1 computes
 (`modeling_qwen3_next.py:374-453`, identical in qwen3_5 and qwen4_exp):
@@ -253,8 +252,8 @@ class GatedDeltaNet(nn.Module):
     allocated at the batch the first decode-mode call sees, the way
     open_kv_cache allocates its slots. Prefill and decode share one code
     path, and the conv state crosses the boundary between them because a
-    continuation must see the last K-1 real columns rather than the zeros a
-    fresh sequence pads with.
+    continuation must see the last K-1 real columns, not the zeros a fresh
+    sequence pads with.
 
     Parameter names are the checkpoint's, so a translation only moves
     weights: `conv1d/weight` is the depthwise taps `[D, 1, K]`, and

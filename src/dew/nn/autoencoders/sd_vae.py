@@ -19,8 +19,7 @@ class StableDiffusionVAE(AutoEncoder):
     latent space, so the same class carries SD1's four channels and the
     sixteen of SD3.5 and Flux; those newer configs also set `use_quant_conv`
     and `use_post_quant_conv` false, and then there are no such layers to
-    apply. `params` overrides the loaded weights, which is how a test mutates
-    one.
+    apply. `params` overrides the loaded weights.
     """
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
