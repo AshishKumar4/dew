@@ -291,9 +291,9 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
         shape = np.shape(leaf)
         if not shape:
             return NamedSharding(mesh, P())
-        split_sequence = len(shape) in (2, 3) and shape[1] % sequence_size == 0
-        rest = [sequence if split_sequence else None] + [None] * (len(shape) - 2)
-        return NamedSharding(mesh, P(rows, *rest[:len(shape) - 1]))
+        if len(shape) in (2, 3) and shape[1] % sequence_size == 0:
+            return NamedSharding(mesh, P(rows, sequence))
+        return NamedSharding(mesh, P(rows))
 
     return jax.tree.map(leaf_sharding, batch)
 
