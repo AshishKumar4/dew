@@ -235,26 +235,38 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
         lambda a, b: float(jnp.max(jnp.abs(a - b))), moe, scanned_moe))) < 1e-6
 
 
-def test_a_scanned_stack_under_a_bf16_policy_scores_the_same_tokens():
+TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=4,
+            num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+
+
+def tiny(**overrides):
+    return models.build("causal_transformer", **{**TINY, **overrides})
+
+
+def bf16(**overrides):
+    return models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla"))
+
+
+def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     """Under a bf16 compute policy the plain loop's first layer returns the
-    residual stream in fp32 and the scan carries it in fp32 from the start,
-    so the first residual sum is rounded once less; the logits move by
-    3.0e-02 on values of order 4 (observed on CPU) and the argmax not at
-    all. The fp32 tests above hold the two paths to fp32 tolerance."""
-    fields = dict(vocab_size=VOCAB, emb_features=32, num_layers=6, num_heads=4,
-                  num_kv_heads=2, mlp_features=64, max_seq_len=16)
-
-    def build(**overrides):
-        return models.build("causal_transformer", **with_precision(
-            "causal_transformer", {**fields, **overrides}, dtype="bfloat16",
-            attention_impl="xla"))
-
-    plain, scanned = build(), build(scan_layers=True)
+    residual stream in fp32 and the scan takes it in fp32 from the start,
+    so the first residual sum is rounded once less. Against the same
+    weights at fp32 the scanned logits sit as far off as the plain loop's:
+    observed on CPU 5.2e-02 against 5.0e-02 on logits of order 4, and
+    3.1e-02 between the two. The fp32 tests above hold the two paths to
+    fp32 tolerance."""
+    plain, scanned = bf16(), bf16(scan_layers=True)
+    exact = tiny(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
     variables = plain.init(jax.random.key(0), ids)
     logits, scanned_logits = plain.apply(variables, ids), scanned.apply(variables, ids)
+    reference = exact.apply(variables, ids)
 
-    assert jnp.array_equal(logits.argmax(-1), scanned_logits.argmax(-1))
+    plain_distance = float(jnp.max(jnp.abs(logits - reference)))
+    scanned_distance = float(jnp.max(jnp.abs(scanned_logits - reference)))
+    assert scanned_distance < 1e-1 and scanned_distance < 1.25 * plain_distance, (
+        plain_distance, scanned_distance)
     assert float(jnp.max(jnp.abs(logits - scanned_logits))) < 1e-1
 
 
@@ -276,13 +288,6 @@ def test_the_runs_are_read_off_the_specs():
 # --------------------------------------------------------------------------
 
 mesh_lane = pytest.mark.mesh
-
-
-def tiny(**overrides):
-    fields = dict(vocab_size=VOCAB, emb_features=32, num_layers=4, num_heads=4,
-                  num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
-    fields.update(overrides)
-    return models.build("causal_transformer", **fields)
 
 
 def routed(**overrides):
@@ -358,6 +363,24 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
+
+
+@mesh_lane
+def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
+    """The stages hand the residual stream on in the dtype it settles in, so
+    a bf16 policy pipelines as it scans: the loss within bf16 rounding of
+    the plain loop's and every gradient finite. Observed loss difference on
+    CPU: 3.4e-04 on a loss of order 5."""
+    model = bf16()
+    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    batch = token_batch()
+
+    loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
+    piped, _, piped_grads = loss_and_grads(
+        LMObjective(model, SEQ_LEN), MeshSpec(fsdp=2, stage=2, microbatches=4), variables, batch)
+
+    assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
+    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
 
 
 @mesh_lane
