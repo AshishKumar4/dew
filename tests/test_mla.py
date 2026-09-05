@@ -5,7 +5,8 @@ blocks with and without the query LoRA (YaRN rope at the released
 spelling, interleaved pairs), a tiny DeepseekV32Attention with its DSA
 indexer and biased projections, and the YaRN derivation standalone.
 Everything runs at fp32 on CPU, and each parity test states its tolerance
-and the largest difference observed.
+and the largest difference observed. The last section trains the V3.2
+stack, mixer and routed experts together, on the simulated mesh.
 """
 
 import json
@@ -15,7 +16,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
+from jax.sharding import PartitionSpec as P
 
 from dew.interop.hf_decoders import _yarn_record, translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -29,6 +32,8 @@ from dew.nn.mla import (
     yarn_inv_freq,
     yarn_query_scale,
 )
+from dew.objectives.lm import LMObjective
+from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
@@ -277,3 +282,88 @@ def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
     with pytest.raises(ValueError, match="rope_theta .* disagree"):
         mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
 
+
+# --------------------------------------------------------------------------
+# The stack on the mesh
+# --------------------------------------------------------------------------
+
+TINY_SHARD = 256
+"""The architecture sweep's threshold: these models hold thousands of
+parameters, orders below the production shard threshold."""
+
+
+def deepseek_stack() -> CausalTransformer:
+    """DeepSeek V3.2 at toy width: the sparse mla mixer on both layers, the
+    second layer routed with the balancing bias, the group limit and a
+    shared expert; the architecture sweep trains the same case."""
+    return CausalTransformer(
+        vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+        head_dim=16, mlp_features=64, max_seq_len=16,
+        mixer={"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+               "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
+               "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16},
+        mixture={"experts": 8, "top_k": 2, "layers": (1,),
+                 "score_function": "sigmoid", "groups": 4, "groups_per_token": 2,
+                 "bias": True, "expert_features": 16, "shared_features": 16})
+
+
+class RecordingTracker:
+    def __init__(self):
+        self.scalars = []
+
+    def log(self, scalars, step):
+        self.scalars.append(dict(scalars))
+
+    def artifact(self, value, step):
+        pass
+
+
+def token_batches():
+    rng = np.random.default_rng(0)
+    while True:
+        yield {"text": rng.integers(0, 64, size=(8, 17)).astype(np.int32)}
+
+
+class Data:
+    train = staticmethod(token_batches)
+    val, batch, records, steps_per_epoch = None, 8, None, None
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("fsdp,expert", [(2, 1), (2, 2)])
+def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
+    """Two steps through the trainer on the simulated eight devices, with
+    the parameters two ways over fsdp and, in the second case, the experts
+    two ways over the expert axis as well. The loss is finite and falls, the
+    balancing bias moves, and the layout check passes: every rank two or
+    more parameter of the mixer, the indexer and the experts is placed by
+    its declaration, so nothing above the shard threshold stays replicated.
+    Expert parallelism alone leaves the mixer replicated by design, which
+    test_moe covers, so the expert case rides an fsdp axis."""
+    model = deepseek_stack()
+    tracker = RecordingTracker()
+    trainer = Trainer(
+        LMObjective(model, 16, balance_rate=0.01), optax.adam(1e-3),
+        key=jax.random.key(0), mesh=MeshSpec(fsdp=fsdp, expert=expert),
+        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
+
+    state = trainer.fit(Data(), steps=2, log_every=1)
+
+    assert dict(trainer.device_mesh.shape) == {
+        "data": 8 // (fsdp * expert), "expert": expert, "fsdp": fsdp,
+        "tensor": 1, "sequence": 1}
+    losses = [entry["train/loss"] for entry in tracker.scalars]
+    assert len(losses) == 2 and all(np.isfinite(losses)), losses
+    assert losses[1] < losses[0], losses
+    bias = state.params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]
+    assert np.any(np.asarray(bias) != 0), "the bias never moved"
+    attention = state.params["params"]["layers_0"]["self_attn"]
+    experts = state.params["params"]["layers_1"]["mlp"]["experts"]
+    assert attention["kv_b_proj"]["kernel"].sharding.spec == P(None, "fsdp")
+    assert attention["indexer"]["wq_b"]["kernel"].sharding.spec == P(None, "fsdp")
+    assert experts["gate_proj"]["kernel"].sharding.spec == P(
+        "expert" if expert > 1 else None, None, "fsdp")
+    abstract = jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32))
+    shardings = trainer.layout.shardings(trainer.device_mesh, abstract)
+    trainer.layout.check(abstract["params"], shardings["params"], trainer.device_mesh)
