@@ -285,8 +285,12 @@ def main(config: LmRunConfig) -> TrainState:
     )
     print(f"Training finished in {time.time() - start:.0f}s")
     if tracker is not None:
-        dew.io.publish(checkpoints.path(checkpoints.latest), re.sub(r"[^\w.-]", "-", name),
-                       tracker=tracker)
+        step = checkpoints.latest
+        if step is None:
+            raise RuntimeError(
+                f"fit returned with no checkpoint under {checkpoints.directory}; "
+                "a trainer with a checkpointer writes the step its run ends on")
+        dew.io.publish(checkpoints.path(step), re.sub(r"[^\w.-]", "-", name), tracker=tracker)
     return state
 
 
