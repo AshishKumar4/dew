@@ -175,6 +175,20 @@ CASES = [
     # feed-forward go through the same run.
     Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
          seq_len=SEQ_LEN, label="moe"),
+    # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
+    # one gated full-attention layer with the sliced partial rotary. The
+    # delta net's projections are wide enough to cross the shard threshold,
+    # so its declarations and its heuristic conv taps are what the layout
+    # places here.
+    Case("causal_transformer", {
+        **LM, "num_layers": 4, "head_dim": 8, "output_gate": True,
+        "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
+        "layer_types": ("linear_attention",) * 3 + ("full_attention",),
+        "kinds": {"linear_attention": {"mixer": {
+            "kind": "gated_delta_net", "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
+        seq_len=SEQ_LEN, label="qwen35"),
 ]
 
 # jepa_predictor has no training step of its own: it is built through the

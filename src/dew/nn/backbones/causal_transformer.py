@@ -176,7 +176,9 @@ class CausalSelfAttention(nn.Module):
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
+    partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
@@ -185,7 +187,11 @@ class CausalSelfAttention(nn.Module):
     def setup(self):
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
+        # The gate doubles the query projection: the reference chunks its
+        # output in half, one half the query and the other the gate the
+        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
+        self.q_proj = dense(
+            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, exactly as the reference
         # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
@@ -209,7 +215,14 @@ class CausalSelfAttention(nn.Module):
                                        dtype=self.dtype, name='v_norm')
 
     def _rot_dim(self) -> int | None:
-        """Head dims the rotary rotates, or None for all of them."""
+        """Head dims the rotary rotates, or None for all of them.
+
+        `partial_rotary_type` says what the fraction means: 'proportional'
+        rotates the first rot_dim dims of a head_dim-wide rope and passes the
+        rest at frequency zero (Gemma 4), 'default' builds a rot_dim-wide rope
+        and leaves the rest unrotated (Qwen3.5); `rotary_freqs` names the
+        reference lines. Both rotate `int(head_dim * factor)` dims.
+        """
         factor = self.partial_rotary_factor
         if factor is None:
             return None
@@ -224,7 +237,16 @@ class CausalSelfAttention(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
-        query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
+        projected = self.q_proj(x)
+        gate = None
+        if self.output_gate:
+            # The reference views the doubled output as [.., heads, 2*head_dim]
+            # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
+            query, gate = jnp.split(
+                projected.reshape(B, S, self.num_heads, 2 * self.head_dim),
+                2, axis=-1)
+        else:
+            query = projected.reshape(B, S, self.num_heads, self.head_dim)
         if self.kv_shared:
             # The provider ran earlier in the same forward pass and stashed
             # its post-norm, post-rope keys and values with their positions,
@@ -261,7 +283,8 @@ class CausalSelfAttention(nn.Module):
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim())
+            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+            partial_rotary_type=self.partial_rotary_type)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -321,6 +344,10 @@ class CausalSelfAttention(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask)
+        if gate is not None:
+            # The branch multiplies by the sigmoid of its gate, then projects
+            # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
+            attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 @logical_axes({
@@ -440,7 +467,9 @@ class DecoderBlock(nn.Module):
         return getattr(self.mlp, 'activation', 'swiglu')
 
 @logical_axes({
-    ("eh_proj",): ("embed", "embed"),
+    # The input is two embed-width vectors concatenated, which no single name
+    # describes and the rules must not split twice; the output side shards.
+    ("eh_proj",): (None, "embed"),
 })
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
@@ -535,8 +564,17 @@ class CausalTransformer(nn.Module):
     widens the sharing layers' MLP, needs it.
 
     partial_rotary_factor rotates that fraction of an unwindowed kind's head
-    dims and passes the rest through, which is Gemma 4's global layers; a
-    windowed kind rotates whole.
+    dims and passes the rest through; a windowed kind rotates whole.
+    partial_rotary_type names which published convention the fraction
+    follows, because the two rotate different angles: 'proportional' is
+    Gemma 4's global layers (a head_dim-wide rope cut short), 'default' is
+    Qwen3.5's (a rope of the rotated width alone). The lines of each are
+    cited on `dew.nn.attention.rotary_freqs`. Interleaved mRoPE
+    (Qwen3.5's mrope_section) is the same rotation for text: with one
+    position per token the three grids' angles are equal and the interleave
+    reads the same value from each, so text-only input reduces exactly to
+    this partial rope (difference 0.0 against the reference's
+    apply_interleaved_mrope) and the image-grid positions are not modelled.
 
     `mixer` names the per-layer token mixer as a value from the `mixers`
     registry, one frozen dataclass per kind carrying the reference's field
@@ -564,6 +602,7 @@ class CausalTransformer(nn.Module):
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
     partial_rotary_factor: Optional[float] = None  # None: every dim rotates
+    partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
     kinds: Optional[Mapping[str, LayerKind]] = None  # what each named kind does
     norm_eps: float = 1e-5
@@ -574,6 +613,7 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
     tie_embeddings: bool = True
@@ -719,12 +759,14 @@ class CausalTransformer(nn.Module):
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
             attention_scale=self.attention_scale,
+            output_gate=self.output_gate,
             dtype=self.dtype,
             precision=self.precision,
             attention_impl=self.attention_impl,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             partial_rotary_factor=(None if kind.window is not None
-                                   else self.partial_rotary_factor))
+                                   else self.partial_rotary_factor),
+            partial_rotary_type=self.partial_rotary_type)
 
     def setup(self):
         types = self.per_layer_types
@@ -753,6 +795,10 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "partial_rotary_factor must be within (0, 1], "
                 f"got {self.partial_rotary_factor}")
+        if self.partial_rotary_type not in ('proportional', 'default'):
+            raise ValueError(
+                "partial_rotary_type names the convention of a partial rotary, "
+                f"'proportional' or 'default', got {self.partial_rotary_type!r}")
         sparse = self.sparse_layers
         outside = sorted(index for index in sparse
                          if not 0 <= index < self.num_layers)

@@ -86,23 +86,41 @@ class RMSNorm(nn.Module):
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
-def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None):
-    """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
+def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
+                 partial_rotary_type: str = 'proportional'):
+    """cos/sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
     documents each restart at 0); the angle axes line up with the trailing
     [B, S] either way. Computed in fp32 so a token gets the same rotation
     whether it arrives in a prefill or comes back as a single decode step.
 
-    rot_dim narrows the rotation to the first rot_dim dimensions, the rest
-    keeping frequency zero (cosine one, sine zero, so the rotation is the
-    identity there). That is proportional partial rotary
-    (modeling_rope_utils.py, _compute_proportional_rope_parameters), whose
-    exponents run over the full head_dim with a zero tail.
+    rot_dim narrows the rotation to the first rot_dim dimensions, and
+    `partial_rotary_type` names which of the two published conventions
+    that is, because they rotate different angles:
+
+    - 'proportional' (Gemma 4, modeling_rope_utils.py
+      `_compute_proportional_rope_parameters`): the exponents run over the
+      full head_dim, `theta ** (2i / head_dim)` for the rot_dim // 2 rotated
+      pairs, and the rest keep frequency zero (cosine one, sine zero, so the
+      rotation is the identity there). The output is head_dim // 2 wide.
+    - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124
+      `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`): the
+      rope is a rot_dim-dimensional one, `theta ** (2i / rot_dim)`, and the
+      output is rot_dim // 2 wide; `apply_rotary` passes the trailing
+      dimensions through untouched, the reference's `q_rot, q_pass` split
+      (modeling_qwen3_5.py:581-591).
+
+    With rot_dim None both are the full rotation and the type is moot.
     """
+    if partial_rotary_type not in ('proportional', 'default'):
+        raise ValueError(
+            "partial_rotary_type names the convention of a partial rotary, "
+            f"'proportional' or 'default', got {partial_rotary_type!r}")
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / head_dim))
-    if rot_dim is not None:
+    divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor))
+    if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
         inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
     positions = jnp.asarray(positions, jnp.float32)
@@ -116,10 +134,12 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
 def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
     """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
 
-    The freqs are [S, D] for one sequence, or [B, S, D] when a packed batch
-    restarts positions per document. `scale` multiplies the rotated heads
-    inside the fp32 arithmetic, so a query's attention scale narrows once,
-    with the product.
+    The freqs are [S, pairs] for one sequence, or [B, S, pairs] when a packed
+    batch restarts positions per document. Freqs narrower than D // 2 rotate
+    the first 2 * pairs dimensions and pass the rest through, which is the
+    sliced partial rotary of `rotary_freqs(partial_rotary_type='default')`.
+    `scale` multiplies the whole head inside the fp32 arithmetic, so a
+    query's attention scale narrows once, with the product.
     """
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
@@ -130,9 +150,13 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
         cos = cos[None, :, None, :]
         sin = sin[None, :, None, :]
     fp32 = x.astype(jnp.float32)
+    rotated_dims = cos.shape[-1]
+    fp32, passed = fp32[..., :rotated_dims], fp32[..., rotated_dims:]
     x1, x2 = jnp.split(fp32, 2, axis=-1)
     rotated = jnp.concatenate([-x2, x1], axis=-1)
     out = fp32 * cos + rotated * sin
+    if passed.shape[-1]:
+        out = jnp.concatenate([out, passed], axis=-1)
     return (out if scale is None else out * scale).astype(x.dtype)
 
 

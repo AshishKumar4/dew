@@ -89,3 +89,19 @@ def test_no_depths_scores_nothing():
     hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
 
     assert model.apply(params, hidden, ids, method=CausalTransformer.mtp_logits) == []
+
+
+def test_a_depth_places_on_a_sharded_mesh():
+    """The fused projection's input is two embed widths concatenated, so it
+    cannot carry the embed name twice: flax refuses a repeated logical name,
+    and a declaration with it failed every MTP model on a mesh with fsdp above
+    one once the kernel crossed min_shard."""
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import build_mesh
+
+    model = tiny(num_nextn_predict_layers=1)
+    params = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    mesh = build_mesh(MeshSpec(fsdp=8))
+    placement = Layout(min_shard=1).shardings(mesh, params)
+
+    assert placement["params"]["mtp_0"]["eh_proj"]["kernel"].spec == jax.sharding.PartitionSpec(None, "fsdp")
