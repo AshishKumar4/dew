@@ -85,8 +85,61 @@ class RMSNorm(nn.Module):
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class RopeScaling:
+    """Llama 3.1's frequency ramp, under the reference's own names.
+
+    `_compute_llama3_parameters` (transformers modeling_rope_utils.py:580)
+    divides the inverse frequencies whose wavelength exceeds
+    original_max_position_embeddings / low_freq_factor by `factor`, leaves
+    those below original_max_position_embeddings / high_freq_factor alone,
+    and interpolates linearly in between on
+    (original_max_position_embeddings / wavelength - low_freq_factor)
+    / (high_freq_factor - low_freq_factor). `rope_type` is the record's
+    discriminator, and only 'llama3' is this ramp; YaRN is a mixer kind's
+    own value.
+    """
+
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: int
+    rope_type: str = 'llama3'
+
+    def __post_init__(self):
+        if self.rope_type != 'llama3':
+            raise ValueError(
+                f"rope_scaling applies the llama3 ramp, got rope_type {self.rope_type!r}")
+        if self.factor < 1.0:
+            raise ValueError(f"rope_scaling factor is at least 1, got {self.factor}")
+        if self.high_freq_factor <= self.low_freq_factor:
+            raise ValueError(
+                f"rope_scaling needs high_freq_factor above low_freq_factor, got "
+                f"{self.high_freq_factor} and {self.low_freq_factor}")
+        if self.original_max_position_embeddings < 1:
+            raise ValueError(
+                "rope_scaling original_max_position_embeddings is the pretraining "
+                f"context, got {self.original_max_position_embeddings}")
+
+    def apply(self, inv_freq):
+        """The scaled inverse frequencies, the reference's arithmetic in fp32."""
+        old_context_len = float(self.original_max_position_embeddings)
+        wavelen = 2 * math.pi / inv_freq
+        divided = jnp.where(wavelen > old_context_len / self.low_freq_factor,
+                            inv_freq / self.factor, inv_freq)
+        smooth = ((old_context_len / wavelen - self.low_freq_factor)
+                  / (self.high_freq_factor - self.low_freq_factor))
+        smoothed = (1 - smooth) * divided / self.factor + smooth * divided
+        medium = jnp.logical_and(wavelen >= old_context_len / self.high_freq_factor,
+                                 wavelen <= old_context_len / self.low_freq_factor)
+        return jnp.where(medium, smoothed, divided)
+
+
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
-                 partial_rotary_type: str = 'proportional'):
+                 partial_rotary_type: str = 'proportional',
+                 rope_scaling: Optional[RopeScaling] = None):
     """cos/sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
@@ -111,6 +164,9 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
       (modeling_qwen3_5.py:581-591).
 
     With rot_dim None both are the full rotation and the type is moot.
+    `rope_scaling` is Llama 3.1's ramp over the base frequencies, applied
+    before a proportional rope pads its zero-frequency tail, which is where
+    the reference applies it (`dim = head_dim * partial_rotary_factor`).
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -119,6 +175,8 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
     inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor))
+    if rope_scaling is not None:
+        inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
         inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
