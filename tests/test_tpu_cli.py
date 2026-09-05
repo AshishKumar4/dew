@@ -620,7 +620,7 @@ def test_a_repo_path_with_a_space_reaches_the_remote_shell_quoted(fake, monkeypa
     assert sorted(call[-1] for call in fake.rsync_calls()) == [
         "you@34.0.0.1:~/'my repo'/", "you@34.0.0.2:~/'my repo'/"]
     # The inner command is quoted again for bash -c, so read it back as a shell
-    # word instead of matching the escaped form.
+    # word; the escaped form is not the string to match.
     tokens = shlex.split(ssh_commands(fake.gcloud_calls())[0])
     assert "cd $HOME/'my repo' &&" in tokens[tokens.index("-c") + 1]
 
@@ -712,9 +712,9 @@ def test_zone_search_follows_the_configured_order_and_caches(fake):
 
 
 def test_a_cached_zone_that_stopped_answering_is_replaced(fake):
-    """A TPU recreated in another zone is found by the zone search, rather than
-    failing every command with 'not in Z. Pass --zone' until the cache file is
-    edited by hand."""
+    """A TPU recreated in another zone is found by the zone search and its
+    cache entry replaced; every command would otherwise fail with 'not in Z.
+    Pass --zone' until the cache file was edited by hand."""
     tpu_config.cache_zone("slice", "us-east1-d")
     fake.offer("slice", "europe-west4-a")
     assert run("describe", "slice") == 0
@@ -839,9 +839,9 @@ def test_the_first_failure_is_the_exit_code():
 
 
 def test_a_corrupt_zone_cache_is_named_rather_than_emptied(fake):
-    """A cache that fails to parse used to read as empty, so a typo in the
-    file silently sent every command back through the zone search. It is
-    refused by path with the remedy."""
+    """A cache that fails to parse raises a ValueError naming the file and
+    the remedy; read as empty, a typo in the file would send every command
+    back through the zone search."""
     config_dir().mkdir(parents=True, exist_ok=True)
     (config_dir() / "zones.json").write_text("{not json")
     with pytest.raises(ValueError, match="zones.json.*delete it"):

@@ -64,7 +64,7 @@ state = trainer.fit(data, steps=50 * data.steps_per_epoch)
 
 Each is a Flax module, registered under a name so a config file can build it: `models.build("simple_dit", patch_size=4, ...)`. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads unchanged on a TPU.
 
-Language model checkpoints load from Hugging Face and match the reference logits: Llama 2, 3 and 3.1, Mistral, Mixtral, Qwen 2, Qwen 3 and Qwen3-MoE, Qwen 3.5 (the gated delta net and full attention hybrid), Gemma 1, 2, 3 and the Gemma 4 text decoder, OLMo 3, and DeepSeek V3 and V3.2 (multi-head latent attention, the sparse indexer, shared experts and the balancing bias).
+Language model checkpoints load from Hugging Face and match the reference logits: Llama 2, 3, 3.1 and the Llama 4 text decoder (iRoPE with chunked local layers, input-scaled experts), Mistral, Mixtral, Qwen 2, Qwen 3 and Qwen3-MoE, Qwen 3.5 (the gated delta net and full attention hybrid), Gemma 1, 2, 3, Gemma 3n (AltUp, LAuReL, activation sparsity) and every Gemma 4 text size including the routed 26B-A4B, OLMo 3, gpt-oss (attention sinks, the clamped biased experts, MXFP4 weights unpacked on load), DeepSeek V2 and V2-Lite, DeepSeek V3 and V3.2 (multi-head latent attention, the sparse indexer, shared experts and the balancing bias), Kimi K2, and GLM 4.5 and 5 with their MTP depths.
 
 ## The parts
 
@@ -153,7 +153,7 @@ trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), checkpoin
 state = trainer.fit(data, steps=steps, metrics=(metrics.linear_probe(5), metrics.knn_probe(5)))
 ```
 
-Linear and kNN probes score the frozen embeddings at validation. The objective also logs the representation standard deviation each step, which is how a collapsing run shows itself.
+Linear and kNN probes score the frozen embeddings at validation. The objective logs the representation standard deviation each step; a collapsing run shows there first.
 
 ## Scaling
 
@@ -284,11 +284,11 @@ To work on dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The goal is to train the way the large labs train and to run what they release, on the same trainer.
 
-**Architecture parity.** Everything MaxText trains: DeepSeek V2 and Kimi K2 on the latent attention that landed, GLM 4.5 and 5, gpt-oss with its attention sinks and MXFP4 weights, Llama 4, the Gemma 4 mixture-of-experts sizes and Gemma 3n; then the vision towers of Gemma 4, Llama 4 and Qwen 3.5; diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
+**Architecture parity.** The decoder families MaxText trains all load; next are the released weights of the largest of them run end to end (gpt-oss-20b's MXFP4 checkpoint through the unpacker is the network-marked test written for it), then the vision towers of Gemma 4, Llama 4 and Qwen 3.5, and diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
 
 **Systems.** Attention that shards the sequence over the sequence axis, and pipeline stages over the stage axis; int8 and FP8 training with fine-grained scaling, and MXFP4 and FP8 weight loading; the MuonClip optimizer; emergency checkpointing and goodput measurement; scan over layers for compile time at depth.
 
-**Post-training.** A clean story for SFT and reinforcement learning that fits the same objective-and-trainer seam, rather than a second framework beside it.
+**Post-training.** SFT and reinforcement learning as objectives on the same trainer.
 
 ## Acknowledgements
 

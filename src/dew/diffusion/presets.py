@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class Preset(Protocol):
-    """What every member of the `presets` registry is: a frozen dataclass of a
+    """Every member of the `presets` registry is a frozen dataclass of a
     convention's numbers, callable to the `Process` it describes."""
 
     def __call__(self) -> Process | DiscreteProcess: ...

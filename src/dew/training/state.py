@@ -30,8 +30,8 @@ class TrainState:
     @property
     def averaged(self) -> Variables:
         """The variables tree with the averaged leaves in place of the live
-        ones: what samples, exports and validation read. An objective that
-        keeps no EMA has nothing to average, and asking is a mistake."""
+        ones. Samples, exports and validation read this. An objective that
+        keeps no EMA has nothing to average."""
         if self.ema is None:
             raise ValueError(
                 "the objective keeps no EMA, so there are no averaged weights; "

@@ -4,11 +4,11 @@ and the objective through the general trainer.
 The model here is a small causal stack that honors the backbone's contract
 (int32 ids in, float32 logits out, a `train` flag for dropout, the head split
 off behind `hidden_states` and `head_weight`) and `dew.sampling.text.generate`
-is recorded rather than run, so what is under test is the objective: that the
-loss is the cross entropy of the shifted sequence and nothing else, that
-padding is excluded only when a pad id is named, that a pass is scored per
-token, and that the trainer drives it on both a data-parallel and an FSDP
-mesh. The real sampler runs in test_lm_recipe.
+is recorded, not run, so what is under test is the objective: that the
+loss is the cross entropy of the shifted sequence, that padding is excluded
+only when a pad id is named, that a pass is scored per token, and that the
+trainer drives it on both a data-parallel and an FSDP mesh. The real
+sampler runs in test_lm_recipe.
 """
 
 from typing import Optional
@@ -34,7 +34,8 @@ SEQ = 16
 BATCH = 8
 STEPS = 200
 # The test model's parameters are far below the production shard threshold, so
-# lower it or "FSDP on" would silently mean "everything replicated".
+# the threshold is lowered; at the production value "FSDP on" would replicate
+# everything.
 TINY = 64
 
 
@@ -45,8 +46,7 @@ class TinyCausalLM(nn.Module):
     `[B, S, vocab]` out, `train` gating dropout, no path from a position to a
     later one, and the head split off behind `hidden_states` and
     `head_weight` so the loss can score a vocabulary slice at a time. The
-    head carries no bias, which is what makes `hidden @ head_weight` the
-    whole projection.
+    head carries no bias, so `hidden @ head_weight` is the whole projection.
     """
 
     vocab_size: int
@@ -272,8 +272,8 @@ def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
 
     The vocabulary here is 512 wide over 16 tokens, and the head is 32 wide,
     so a `[tokens, vocab]` tensor is unmistakable in the text. The
-    full-vocabulary loss below is compiled too: it is what makes this grep a
-    test rather than a string that happens not to appear.
+    full-vocabulary loss below is compiled too, and the grep has to find the
+    tensor in that text first.
     """
     from dew.nn.backbones.causal_transformer import CausalTransformer
 

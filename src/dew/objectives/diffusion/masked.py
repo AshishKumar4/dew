@@ -6,7 +6,7 @@ probability at a drawn time; the model, a `CausalTransformer` with
 tokens; the loss is the cross entropy at the masked positions weighted by the
 process's NELBO weight, averaged over every position of the batch, which is
 the continuous-time negative ELBO the paper trains. The cross entropy is the
-LM objective's chunked one, so the full logits tensor is never held.
+LM objective's chunked one, which holds one vocabulary slice of logits at a time.
 
 Evaluation unmasks a few rows from the fully masked state with the averaged
 weights, which is the text a reader can judge.

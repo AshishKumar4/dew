@@ -1,13 +1,13 @@
 """Dew: one registry, one objective, one trainer.
 
 Naming anything the package exports fills the registries, so `dew.models`,
-`dew.presets.EDM` and `dew.datasets["oxford_flowers102"]` resolve after
-`import dew` with nothing else imported. The fill happens on that first name
-rather than at import, so `import dew.training` stays inside the training
-layer and pulls in no modality, no encoder and no tracker backend, which is
-the layering rule tests/test_api_surface.py checks. Nothing here opens a JAX
-backend or loads an optional dependency; encoders, decoders and datasets
-fetch what they need when they are built.
+`dew.presets.EDM` and `dew.datasets["oxford_flowers102"]` resolve after a
+bare `import dew`. The fill happens on that first name, not at import, so
+`import dew.training` stays inside the training layer and pulls in no
+modality, no encoder and no tracker backend, which is the layering rule
+tests/test_api_surface.py checks. Nothing here opens a JAX backend or loads
+an optional dependency; encoders, decoders and datasets fetch what they
+need when they are built.
 
 `objectives` is not exported: `dew.objectives` is the package holding the
 Objective classes, and a registry cannot share its name. It is
@@ -74,8 +74,8 @@ def __dir__() -> list[str]:
     return list(__all__)
 
 
-# Written out rather than derived from _EXPORTS so a type checker, an editor
-# and `from dew import *` can all read the public surface without running the
+# Written out, not derived from _EXPORTS, so a type checker, an editor and
+# `from dew import *` can all read the public surface without running the
 # lazy lookup above. tests/test_api_surface.py holds the two in agreement.
 __all__ = [
     "__version__",

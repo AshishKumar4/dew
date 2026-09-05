@@ -22,7 +22,7 @@ The expert dimension has an axis of its own because it is the one dimension no d
 
 ## How a batch is placed
 
-`batch_shardings(mesh, batch)` gives one sharding per leaf. Rows split across every axis but sequence. A leaf of rank 2 or 3 is a sequence per row (token ids, segment ids, positions) and its second dimension splits over the sequence axis when the axis divides it; an image or a video keeps every dimension but its rows whole. `shard_batch(mesh, batch)` assembles this process's slice of each array into the global array with `jax.make_array_from_process_local_data`, which is what makes a multi-host run the same code as a single-host one.
+`batch_shardings(mesh, batch)` gives one sharding per leaf. Rows split across every axis but sequence. A leaf of rank 2 or 3 is a sequence per row (token ids, segment ids, positions) and its second dimension splits over the sequence axis when the axis divides it; an image or a video keeps every dimension but its rows whole. `shard_batch(mesh, batch)` assembles this process's slice of each array into the global array with `jax.make_array_from_process_local_data`, so a multi-host run and a single-host run share the code.
 
 ## The sequence axis
 
@@ -48,7 +48,7 @@ class MyAttention(nn.Module):
     ...
 ```
 
-A key is the tail of a module path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's. A parameter takes the trailing names its rank can hold, so the entry above names the query kernel's three dimensions and its bias's two. Two modules that declare the same path differently are refused at import. A module whose kernels have no honest name (a convolution's taps, a raw patch projection) lists them under `heuristic=` and takes the shape rule below.
+A key is the tail of a module path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's. A parameter takes the trailing names its rank can hold, so the entry above names the query kernel's three dimensions and its bias's two. Two modules that declare the same path differently are refused at import. A module whose kernels have no meaningful name (a convolution's taps, a raw patch projection) lists them under `heuristic=` and takes the shape rule below.
 
 | Axis | Meaning | Where it appears |
 | --- | --- | --- |
@@ -79,9 +79,9 @@ A key is the tail of a module path, so one entry covers every block that reuses 
 
 When two dimensions of one parameter both claim `fsdp`, the earlier row wins and the other dimension stays whole, which is flax's and MaxText's semantics. The order puts the larger dimension first for every shipped shape: `mlp` over `embed` in a feed-forward kernel, `vocab` over `embed` in an embedding table, `embed` over the narrower `heads` or `kv` in a projection. A dimension the assigned axis does not divide evenly is dropped and the axis passes to the next dimension that names it; GPT-2's 50257 vocabulary rows cannot split over any mesh, so its embedding shards on `embed`.
 
-`Layout(rules, min_shard, tolerance)` holds the table. `--trainer.layout.rules '{"heads": "tensor", "mlp": "tensor"}'` replaces rows, which is how a run moves its attention and feed-forward widths onto the tensor axis with no model edits. A name set to `null` leaves that dimension whole. Below `min_shard` elements (65536 by default) a parameter stays replicated, because below that a parameter costs more in collectives than it saves in memory.
+`Layout(rules, min_shard, tolerance)` holds the table. `--trainer.layout.rules '{"heads": "tensor", "mlp": "tensor"}'` replaces rows and moves the attention and feed-forward widths onto the tensor axis with no model edits. A name set to `null` leaves that dimension whole. Below `min_shard` elements (65536 by default) a parameter stays replicated, because below that a parameter costs more in collectives than it saves in memory.
 
-`Layout.shardings(mesh, state)` derives the placement of the whole train state in one pass: `declared_axes` reads the names off each leaf's path, the rules map them to mesh axes, and axes of size 1 drop out. Optimizer moments and the EMA copy pick up their parameter's spec without anyone describing the optimizer's layout. The trainer then builds the state straight into that layout with `jax.jit(initial_state, out_shardings=...)`, so a model too large for one device is never materialised on one.
+`Layout.shardings(mesh, state)` derives the placement of the whole train state in one pass: `declared_axes` reads the names off each leaf's path, the rules map them to mesh axes, and axes of size 1 drop out. Optimizer moments and the EMA copy pick up their parameter's spec. The trainer builds the state straight into that layout with `jax.jit(initial_state, out_shardings=...)`, and a model larger than one device is materialised sharded.
 
 ## Sharding tolerance
 
@@ -91,11 +91,11 @@ When two dimensions of one parameter both claim `fsdp`, the earlier row wins and
 
 The training step is jitted with explicit `in_shardings` (the state's layout, a replicated loss scale, the batch placement) and `out_shardings`, and donates the train state. The loss is a mean over the batch-sharded axis, so the gradient carries its own cross-device all-reduce; there is no `pmean` in the trainer. `Trainer.compile` returns a function that calls that jitted step under `jax.set_mesh`, which is what the benchmarks time: the mesh context is part of jit's cache key, and entering it costs nothing beside the dispatch.
 
-Loss health is watched on device. The interval's loss and a counter of consecutive non-finite losses ride along with the step in one dispatch and are read on the logging cadence, so the loop never synchronises to check them. A streak of `BAD_LOSS_STEPS` (5) stops the run.
+The interval's loss and a counter of consecutive non-finite losses ride along with the step on device, in one dispatch, and are read on the logging cadence. A streak of `BAD_LOSS_STEPS` (5) stops the run.
 
 ## Feeding the devices
 
-`DevicePrefetchIterator(iterator, mesh, depth=2)` runs the host-to-device transfer a few batches ahead of the loop on a background thread. It tracks the position of the batch it most recently handed out, not the one the thread has raced ahead to, which is what makes a mid-epoch resume land on the next unseen batch. An exception in the thread is raised on the consumer's side.
+`DevicePrefetchIterator(iterator, mesh, depth=2)` runs the host-to-device transfer a few batches ahead of the loop on a background thread. It records the position of the batch it most recently handed out, so a mid-epoch resume lands on the next unseen batch. An exception in the thread is raised on the consumer's side.
 
 A multi-process run joins the process pool before any of that. `prepare_process(multi_host=...)` calls `jax.distributed.initialize()`, which finds the coordinator from the environment on TPU pods and clusters; on a machine with no cluster environment the run continues on one process. `multi_host=True` requires the pool, `multi_host=False` never asks for it. Right after the join every process runs one collective while the processes are still together, so a process that missed the pool fails there and not minutes later inside the first step.
 
@@ -117,7 +117,7 @@ This is the semantics of Orbax's emergency checkpointing (`orbax.checkpoint.expe
 
 ## Throughput
 
-`dew.telemetry.instrumentation` measures rather than estimates. `compiled_flops(compiled)` counts the matmuls and convolutions in the compiled step's optimised HLO from their own shapes, including the cuBLAS, cuDNN convolution and fused-attention custom calls a GPU backend hands them to. `model_flops_utilization(flops, step_time)` turns that into a fraction of one device's dense bf16 peak from a table covering TPU v2 to v6e, A100, H100, H200 and the RTX 4080, matched on the start of the device kind so `NVIDIA H100 80GB HBM3` finds the H100 row; hardware not in the table reports nothing. The trainer logs `train/samples_per_sec` and `train/mfu` on the logging cadence.
+`compiled_flops(compiled)` in `dew.telemetry.instrumentation` counts the matmuls and convolutions in the compiled step's optimised HLO from their own shapes, including the cuBLAS, cuDNN convolution and fused-attention custom calls a GPU backend hands them to. `model_flops_utilization(flops, step_time)` turns that into a fraction of one device's dense bf16 peak from a table covering TPU v2 to v6e, A100, H100, H200 and the RTX 4080, matched on the start of the device kind so `NVIDIA H100 80GB HBM3` finds the H100 row; hardware not in the table reports nothing. The trainer logs `train/samples_per_sec` and `train/mfu` on the logging cadence.
 
 The XLA compilation cache is on by default under `~/.cache/dew/xla` (`--trainer.compilation-cache-dir None` turns it off). On a DiT-B it takes the time to the first step from 55 s to 5 s.
 

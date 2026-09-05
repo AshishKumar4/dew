@@ -9,7 +9,7 @@ exactly, including the tie that decides which of two equal logits wins.
 The mutation tests are the point of the file. Dropping the target term or one
 chunk of the vocabulary leaves a loss that still looks like a loss, so each
 one is fed through the real chunk loop and shown to fail the parity check.
-The tie rule has its own two tests, which is what a weaker comparison breaks.
+The tie rule has its own two tests; a looser comparison would pass either winner.
 """
 
 import jax

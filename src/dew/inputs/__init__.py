@@ -4,8 +4,8 @@
 the model's own keyword arguments, the conditions it is given. A `Condition`
 is an encoder, the batch field it reads and the raw datum that stands for
 "no condition", which classifier-free guidance and conditioning dropout
-substitute. Nothing here runs a model: the spec is a description, and the
-objective encodes.
+substitute. Nothing here runs a model; the spec is a description, and the
+objective does the encoding.
 
 Image and video batches arrive as uint8 pixels in [0, 255], the way the data
 workers write them; `unit_range` is the one conversion to the [-1, 1] range
@@ -89,9 +89,8 @@ class InputSpec:
     def tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]:
         """The batch fields this run's conditions read out of `captions`.
 
-        Empty for a run that conditions on nothing, which is how the
-        captions stop at the loader instead of riding a string array into a
-        device.
+        Empty for a run that conditions on nothing, so the captions stop at
+        the loader and no string array reaches a device.
         """
         return {condition.field: condition.encoder.tokenize(captions)
                 for condition in self.conditions.values()}
@@ -103,8 +102,8 @@ class InputSpec:
 
     @classmethod
     def from_json(cls, data: Mapping) -> "InputSpec":
-        """Rebuild the spec, loading each encoder's weights; the one place a
-        spec opens files."""
+        """Rebuild the spec, loading each encoder's weights. The spec's
+        other methods open no files."""
         sample = data["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
                    conditions={keyword: Condition.from_json(condition)

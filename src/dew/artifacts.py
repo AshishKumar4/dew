@@ -2,8 +2,8 @@
 
 An objective's `evaluate` returns one of these; a `Tracker` renders it by
 dispatching on the type; a metric is a function of it and the batch. The
-types carry arrays and nothing else, so they cross `jit` and say nothing
-about where they will be drawn.
+types carry only arrays, so they cross `jit` and say nothing about where
+they will be drawn.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def host(value: T) -> T:
     a pool the arrays are shards of a global array, which numpy cannot read at
     all, and the gather that completes them is a collective, so every process
     has to make the same call. That is why the trainer brings an artifact home
-    once for the whole pool instead of leaving it to a metric or a tracker,
-    which run on one process.
+    once for the whole pool before any metric or tracker, which run on one
+    process, sees it.
     """
     return jax.tree.map(_addressable, value)

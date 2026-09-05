@@ -33,8 +33,8 @@ class Loading:
 
     None of the four changes which records a run sees or what is in them, so
     a host tuning them for its disk leaves the batches identical. The shuffle
-    seed is not one of them for that reason: it decides the order records
-    arrive in and keys the per-record rng that augments and captions them.
+    seed is not one of them; it decides the order records arrive in and keys
+    the per-record rng that augments and captions them.
     """
 
     workers: int = 32
@@ -56,11 +56,11 @@ class Dataset:
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
-    Whether a run can checkpoint its position is the iterator's own answer:
-    grain-backed iterators carry `get_state` and `set_state`, a
-    fetch-as-you-go stream carries neither, and `tokenized` forwards the pair
-    rather than hiding it. A run over a stream without them trains with
-    `checkpoint_every=None` and is refused otherwise.
+    Whether a run can checkpoint its position depends on the iterator.
+    Grain-backed iterators carry `get_state` and `set_state` and a
+    fetch-as-you-go stream carries neither; `tokenized` forwards the pair.
+    A run over a stream without them trains with `checkpoint_every=None` and
+    is refused otherwise.
     """
 
     train: Callable[[], Iterator[Batch]]
@@ -85,10 +85,9 @@ class Dataset:
 class DatasetSpec(ABC):
     """What a dataset is and how it is read; a frozen dataclass per kind.
 
-    A dataset that captions its records takes `tokenize` as well: the
-    captions are the dataset's own product and which encoder reads them, at
-    which context length, belongs to the run's condition, not to the source
-    of the pictures.
+    A dataset that captions its records takes `tokenize` as well. The
+    captions are the dataset's own product, and the run's condition decides
+    which encoder reads them and at which context length.
     """
 
     @abstractmethod
@@ -105,8 +104,8 @@ conditions read it."""
 class Checkpointable(Protocol):
     """A data stream that can say where it stopped and be put back there.
 
-    grain's iterators satisfy this; a plain iterator does not, which is what
-    `Trainer.fit` refuses when a run asks for checkpoints.
+    Grain's iterators satisfy this. `Trainer.fit` refuses a run that asks for
+    checkpoints over a stream without them.
     """
 
     def get_state(self) -> Any: ...
@@ -115,7 +114,7 @@ class Checkpointable(Protocol):
 
 
 def _no_captions(captions: Sequence[str]) -> Mapping[str, Any]:
-    """What an unconditional run reads out of a batch's captions: nothing."""
+    """Nothing out of a batch's captions; an unconditional run passes this as `tokenize`."""
     return {}
 
 
@@ -132,15 +131,14 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     outside the grain workers, so no encoder's weights are pickled into
     them.
 
-    The captions never survive the stage: they are strings and a device
-    takes numbers. None reads nothing out of them, which is what an
-    unconditional run wants; a caller that wants the words keeps them with
-    a reader that hands them back.
+    The captions never survive the stage. They are strings and a device
+    takes numbers. Pass None for an unconditional run, or a reader that hands
+    the words back to keep them.
     """
     read = tokenize if tokenize is not None else _no_captions
 
     class Tokenizing:
-        """The stream's iterator with the caption stage on its end."""
+        """The stream's iterator with each batch's captions tokenized."""
 
         def __init__(self, source: Iterator[Batch]):
             self.source = source
@@ -156,9 +154,9 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
 
     class CheckpointableTokenizing(Tokenizing):
         """The same stage over a stream that can report and restore its
-        position, forwarding both, so the trainer's protocol check sees them.
-        A forwarding `__getattr__` would satisfy `hasattr` and not the
-        protocol, which reads attributes statically."""
+        position, forwarding both. The methods are explicit because the
+        protocol reads attributes statically, where a forwarding `__getattr__`
+        would only satisfy `hasattr`."""
 
         source: Checkpointable
 
@@ -178,12 +176,12 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
 
 
 def local_batch(batch: int) -> int:
-    """The share of a global batch each JAX process batches for itself.
+    """The share of a global batch each JAX process reads for itself.
 
     Every process batches its own shard and the run reports `batch` as the
     global batch, so a remainder would train on fewer records a step than
-    the run reports, and a batch below the process count would give every
-    process a batch of nothing.
+    the run reports, and a batch below the process count would leave some
+    process with no records.
     """
     processes = jax.process_count()
     if batch % processes:
@@ -197,8 +195,8 @@ class SourceSlice:
 
     Gives the train and validation loaders disjoint index ranges while
     sharding and epoch handling stay grain's, the sampler's on the train side
-    and the Dataset API's on the validation side. Plain attributes only:
-    grain pickles the source to its workers.
+    and the Dataset API's on the validation side. Attributes stay plain
+    because grain pickles the source to its workers.
     """
 
     def __init__(self, source: Any, start: int, stop: int):
@@ -208,11 +206,11 @@ class SourceSlice:
 
     def __repr__(self) -> str:
         # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses to restore a state whose repr no longer matches, so a resumed
-        # run needs a description that survives the process that wrote it. The
-        # wrapped source is named by type: an arrayrecord source's own repr is
-        # its address, and asking a hub source for its length would download
-        # the table. Which half of the split this is, and how long, is what the
+        # refuses to restore a state whose repr differs, so a resumed run needs
+        # a description that survives the process that wrote it. The wrapped
+        # source is named by type: an arrayrecord source's own repr is its
+        # address, and asking a hub source for its length would download the
+        # table. Which half of the split this is, and how long, is what the
         # index stream depends on.
         return (f"SourceSlice({type(self.source).__name__}, "
                 f"start={self.start}, length={self.length})")
@@ -273,20 +271,20 @@ def validation_pass(source: Any, transformations: Sequence[pygrain.Transformatio
                     loading: Loading) -> Callable[[], Iterator[Batch]]:
     """One pass over `source` in record order, batched in this process.
 
-    grain's DataLoader applies its operations inside the worker processes, so
-    each worker had to fill a whole batch out of its own slice of the split.
-    At the default eight workers a 512-record split gave batches of 64
-    records read four times over, and with the sampler unbounded the pass
-    never ended. Here the workers read and transform records and the batch is
-    formed behind them, which is what the packed loader does with its packer,
-    and it leaves the batches independent of worker_count.
+    Grain's DataLoader applies its operations inside the worker processes,
+    where each worker fills a whole batch out of its own slice of the split.
+    At the default eight workers a 512-record split becomes batches of 64
+    read four times over, and with the sampler unbounded the pass has no end.
+    Here the workers read and transform records and the batch is formed
+    behind them, as the packed loader does with its packer, which leaves the
+    batches independent of worker_count.
 
     Sharding is grain's slice convention, so process p of n reads records
-    p, p + n, ... of the split. The transforms are applied before that slice
-    because grain keys a record's rng by its index in the dataset the random
-    map sits on: applied after, record k was keyed by its position in the
-    slice, and the same seed augmented and captioned it differently on one
-    host than on a pod. A pass is whole batches only, because a part-full
+    p, p + n, ... of the split. The transforms are applied before that slice.
+    Grain keys a record's rng by its index in the dataset the random map sits
+    on, so applied after the slice, record k takes its key from its position
+    in the slice and the same seed augments and captions it differently on
+    one host than on a pod. A pass is whole batches only, because a part-full
     batch cannot be sharded over a device mesh.
     """
     def stream():

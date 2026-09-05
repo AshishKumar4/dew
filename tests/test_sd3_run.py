@@ -137,8 +137,8 @@ def test_one_trainer_step_and_a_sample(tmp_path):
 
 
 def test_the_frozen_text_tower_is_not_optimized(tmp_path):
-    """T5's weights ride in the tree as state, so the optimizer never sees
-    them and two steps leave them exactly as loaded."""
+    """T5's weights ride in the tree as state, outside the optimizer's view,
+    so two steps leave them as loaded."""
     config = run_config(tmp_path)
     objective = config.build()
     loaded = objective.inputs.conditions["textcontext"].encoder.params["params"]
@@ -156,10 +156,11 @@ def test_the_compiled_step_carries_no_frozen_weights_as_constants(tmp_path):
     """The T5 tower and the VAE reach the step as arguments the layout places,
     not as constants baked into it.
 
-    A frozen tower that a closure read off the objective became a
+    A frozen tower that a closure read off the objective would become a
     compile-time constant: replicated on every device, absent from the
-    checkpoint, and invisible to the layout. The whole VAE encoder used to sit
-    in this jaxpr as 52 constants shaped like its kernels.
+    checkpoint, and invisible to the layout. A closure over the VAE encoder
+    would land its 52 kernels here as constants, so the check reads the
+    jaxpr for constants shaped like the frozen kernels.
     """
     config = run_config(tmp_path)
     objective = config.build()

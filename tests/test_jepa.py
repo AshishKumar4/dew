@@ -387,7 +387,7 @@ def test_target_encoder_tracks_the_context_encoder(mask):
             jax.tree.leaves(initial["params"]["context_encoder"])))
     assert context_moved, "the target encoder never followed the context encoder"
 
-    # and it followed rather than jumped: still between where it started and now
+    # and it followed without jumping: still between where it started and now
     ema = jax.tree.leaves(state.ema["params"]["context_encoder"])
     live = jax.tree.leaves(state.params["params"]["context_encoder"])
     assert any(not np.allclose(a, b) for a, b in zip(ema, live)), "EMA is not lagging"
@@ -420,7 +420,7 @@ def test_jepa_trains_under_fsdp(mask):
         assert param.addressable_shards[0].data.size == param.size // 2
 
     # The target encoder is a second copy of the same subtree, so it must land
-    # on the mesh the same way rather than being gathered onto every device
+    # on the mesh the same way, not gathered onto every device
     encoder_specs = [p.sharding.spec for p in
                      jax.tree.leaves(state.params["params"]["context_encoder"])]
     assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]

@@ -119,8 +119,8 @@ def test_the_encoder_loads_and_encodes():
 
 def test_the_json_fields_rebuild_an_encoder_that_agrees():
     """A run's record stores the spec as JSON, and inference rebuilds the
-    encoder from it, so the round-trip has to come back as the same encoder
-    and not just the same fields."""
+    encoder from it, so the round-trip has to come back as the same encoder,
+    equal fields and equal outputs."""
     spec = InputSpec(Field("image", (8, 8, 3)),
                      {"textcontext": Condition(CLIPText.from_pretrained(str(TINY)))})
     data = spec.to_json()
@@ -138,10 +138,9 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
 
 
 def test_a_pinned_revision_reaches_the_tokenizer_and_the_record(monkeypatch):
-    """A pin has to survive the whole way round: the tokenizer used to load
-    from the default branch while the weights honoured the pin, and `to_json`
-    dropped the pin entirely, so an `InputSpec` rebuilt from a run's record
-    read whatever the branch held that day."""
+    """A pin has to survive the whole way round: the tokenizer loads from the
+    pinned revision along with the weights, and `to_json` keeps the pin, so
+    an `InputSpec` rebuilt from a run's record reads the same revision."""
     from transformers import AutoTokenizer
 
     seen = []
@@ -293,7 +292,7 @@ def test_vision_attention_reaches_every_patch():
 
 def test_pixel_values_of_another_size_are_refused():
     """A checkpoint's position table covers one grid of patches; the reference
-    refuses any other image size rather than interpolating on its own."""
+    raises on any other image size and interpolates nothing."""
     model = CLIPModel.from_pretrained(str(TINY))
 
     with pytest.raises(ValueError, match="3x8x8"):
@@ -351,8 +350,8 @@ def test_a_config_asking_for_another_activation_is_refused():
 def test_an_unfamiliar_tensor_name_is_refused():
     """Skipping a name nobody mapped is how a checkpoint loads with half its
     weights. The text tower's loader skips the vision tower and the projection
-    heads by name; the full model's loader maps them and skips only the
-    buffers and the logit scale."""
+    heads by their prefixes; the full model's loader maps them and skips only
+    the buffers and the logit scale. Any other name raises ValueError."""
     with pytest.raises(ValueError, match="text_model.encoder.layers.0.self_attn.qkv"):
         translate_weights({"text_model.encoder.layers.0.self_attn.qkv.weight":
                            np.zeros((3, 2), np.float32)})

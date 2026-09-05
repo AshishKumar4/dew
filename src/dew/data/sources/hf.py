@@ -2,10 +2,10 @@
 
 An Arrow-backed `datasets.Dataset` answers `len()` and integer indexing, which
 is the whole of grain's random-access protocol, so the wrapper here is thin. It
-adds the three things grain needs and a `Dataset` does not do on its own: the
-`datasets` import happens on the first record rather than at import time, rows
-come back as plain dicts of arrays and scalars, and the Arrow table stays out
-of the pickle that reaches the worker processes.
+adds the three things grain needs: the `datasets` import happens on the first
+record, not at import time; rows come back as plain dicts of arrays and
+scalars; and the Arrow table stays out of the pickle that reaches the worker
+processes.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _hf_datasets():
     """The HF `datasets` module, imported on use.
 
     At module scope it would make importing the data layer require the
-    streaming extra, which only reading a dataset actually needs.
+    streaming extra, which only reading a dataset needs.
     """
     try:
         import datasets
@@ -41,7 +41,7 @@ def _plain_value(value: Any) -> Any:
 
     `datasets` decodes an image column into a PIL image and every transform in
     the data layer is numpy and cv2. PIL images carry the array interface, so
-    they convert here; strings, numbers and lists already are what they say.
+    they convert here; strings, numbers and lists pass through.
     """
     return np.asarray(value) if hasattr(value, "__array_interface__") else value
 
@@ -51,9 +51,9 @@ class HFDatasetSource:
 
     Either hand over a loaded dataset or name a hub dataset and split, which
     `load_dataset` resolves on the first record. The table never travels in
-    the source's pickle: a named dataset reloads by name and split inside the
-    worker, and a dataset handed over in memory is written out once and
-    reopened from there, the way TokenFileSource reopens its memmap.
+    the source's pickle. A named dataset reloads from its name and split
+    inside the worker, and a dataset handed over in memory is written out
+    once and reopened from there, the way TokenFileSource reopens its memmap.
     """
 
     def __init__(self, name: Optional[str] = None, split: str = "train", dataset=None):
@@ -70,18 +70,17 @@ class HFDatasetSource:
 
     def __repr__(self) -> str:
         # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses a state whose repr no longer matches, so this names the
-        # dataset rather than an address, and without touching the table.
+        # refuses a state whose repr differs, so this names the dataset, not
+        # an address, and without touching the table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"cache={self._cache_path!r})")
 
     def _table(self):
         """The dataset, loaded once on first access.
 
-        grain reads a source from several threads at a time, and two threads
-        that both find no table start two loads of it. The second one raced
-        the first inside `datasets`, so the load happens under the lock and
-        the fast path only reads the attribute.
+        Grain reads a source from several threads at a time, and two threads
+        that both find no table would start two loads of it. The load happens
+        under the lock and the fast path only reads the attribute.
         """
         if self._dataset is None:
             with self._lock:
@@ -111,10 +110,10 @@ class HFDatasetSource:
 
     def __getstate__(self) -> Dict[str, Any]:
         # grain pickles the source into every worker process, so the table
-        # must not be part of it: a copy per worker of a dataset that is
-        # already on disk. A named dataset reloads from the hub cache on the
-        # other side; a dataset that only exists in memory has nowhere to
-        # reload from yet, so it is written out here, once.
+        # must not be part of it. That would be a copy per worker of a dataset
+        # that is already on disk. A named dataset reloads from the hub cache
+        # on the other side; a dataset that only exists in memory has nowhere
+        # to reload from yet, so it is written out here, once.
         if self._dataset is not None and self.name is None and self._cache_path is None:
             self._cache_path = tempfile.mkdtemp(prefix="dew-hf-dataset-")
             self._dataset.save_to_disk(self._cache_path)

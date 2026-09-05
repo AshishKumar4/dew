@@ -101,8 +101,8 @@ def test_byte_tokenizer_decode_tolerates_junk_bytes():
 
 @pytest.mark.network
 def test_hf_tokenizer_encodes_and_decodes():
-    """Loads gpt2 from the hub or its cache; a broken HFTokenizer used to be
-    skipped here along with a missing network."""
+    """Loads gpt2 from the hub or its cache. Marked network, so a suite run
+    with `-m "not network"` deselects it; a broken HFTokenizer fails it."""
     from dew.data import HFTokenizer
 
     tok = HFTokenizer("gpt2")
@@ -254,10 +254,10 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
 
 @pytest.mark.parametrize("worker_count", [0, 2])
 def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_count):
-    """Validation read val.bin through a sampler carrying the training
-    stream's unbounded epoch count, and grain's DataLoader batches inside each
-    worker, so a pass never ended and its batches repeated windows the worker
-    had already read.
+    """A validation pass reads every window of val.bin once and ends. The
+    sampler carries its own epoch count, not the training stream's unbounded
+    one, and grain's DataLoader batches inside each worker, so the windows a
+    worker has read do not come round again.
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 13 * seq_len, dtype=np.int64)  # 12 windows
@@ -486,7 +486,7 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     np.testing.assert_array_equal(batch["text_segment_ids"], [
         [1, 1, 1, 1, 2, 2, 2, 2, 2],
         [1, 1, 1, 1, 1, 1, 0, 0, 0]])
-    # Positions restart at 0 inside every document, which is what RoPE reads.
+    # Positions restart at 0 inside every document; RoPE reads them.
     np.testing.assert_array_equal(batch["text_positions"], [
         [0, 1, 2, 3, 0, 1, 2, 3, 4],
         [0, 1, 2, 3, 4, 5, 0, 0, 0]])
@@ -560,9 +560,9 @@ def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
 
 
 def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
-    """The training stream's repeat once applied to the documents packed for
-    validation as well, so a run never finished a validation pass and scored
-    some documents several times over."""
+    """The documents packed for validation are read once, without the
+    training stream's repeat, so the pass finishes and scores each document
+    once."""
     documents = [[i, i + 1] for i in range(10, 30, 2)]
     _document_dir(tmp_path, documents)
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)

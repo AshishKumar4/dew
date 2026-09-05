@@ -1,12 +1,12 @@
 """Frozen-encoder probes, as metrics the validation loop can run.
 
-A JEPA run has no samples to look at, so representation quality is the only
-signal that the training curve cannot give you. Both probes score the pooled
-embeddings the objective's evaluation produces against the batch labels,
-fitting on the first half of the batch and scoring on the second, cheap enough
-to run at every evaluation and honest, since nothing is scored on data it was
-fit on. They measure trend, not absolute transfer accuracy; a full-dataset
-probe is a separate offline job.
+A JEPA run has no samples to look at, so representation quality is what the
+training curve cannot show. Both probes score the pooled embeddings the
+objective's evaluation produces against the batch labels, fitting on the
+first half of the batch and scoring on the second. That is cheap enough to
+run at every evaluation, and nothing is scored on data it was fit on. They
+track the trend across training. A full-dataset probe is a separate offline
+job.
 """
 
 from __future__ import annotations

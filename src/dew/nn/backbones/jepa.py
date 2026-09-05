@@ -3,7 +3,7 @@
 A JEPA encoder is the DiT sandwich without the diffusion parts: patchify with
 the 2D sincos signal, run unmodulated ModulatedBlocks over the tokens, norm.
 There is no timestep to condition on, so the blocks run in their unmodulated
-(plain pre-norm) mode, and the mixer is still pluggable - mixer patterns with
+(plain pre-norm) mode, and the mixer is still pluggable; mixer patterns with
 'ssm' give a linear-time S5 encoder.
 
 Position never comes from RoPE here. Both the encoder and the predictor work

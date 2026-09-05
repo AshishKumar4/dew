@@ -1,8 +1,7 @@
 """Mixture of experts: the router, and the experts as one grouped matmul.
 
 Patterned on MaxText's `RoutedMoE` (`maxtext src/maxtext/layers/moe.py:419`,
-Apache 2.0), which is 3731 lines of NNX reading about forty fields off a config
-object. What ports is the math: top-k selection (`:751` `get_topk`), DeepSeek's
+Apache 2.0). The math ported is top-k selection (`:751` `get_topk`), DeepSeek's
 group-limited routing, which selects on the biased scores and gates on the
 unbiased ones (`:881-908` `deepseek_routing`), its weight scaling
 (`:835-841`), the aux-loss-free bias update (`:238-261`, lifted below), and the
@@ -56,6 +55,27 @@ GROUPED_MATMULS = ('xla', 'tokamax')
 WEIGHT_SUM_EPSILON = 1e-20
 
 
+def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
+    """DeepSeek V2's expert-level balance loss (arXiv 2405.04434, section 2.1.4).
+
+    `scores` are a layer's softmax affinities, `[B, S, E]`, and `indices`
+    its choices, `[B, S, K]`. The released `MoEGate` computes f_i as the
+    fraction of routed slots expert i took, times E, and P_i as its mean
+    score; `seq_aux` takes both per sequence and averages the sequences,
+    as every released V2 config sets. The result is already
+    scaled by `alpha`, the config's aux_loss_alpha, and one term per
+    sparse layer adds to the loss.
+    """
+    batch, length, experts = scores.shape
+    top_k = indices.shape[-1]
+    chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
+    if seq_aux:
+        load = jnp.sum(chosen, axis=(1, 2)) / (length * top_k / experts)
+        return jnp.mean(jnp.sum(load * jnp.mean(scores, axis=1), axis=1)) * alpha
+    load = jnp.mean(chosen.reshape(-1, experts), axis=0) * experts
+    return jnp.sum(jnp.mean(scores.reshape(-1, experts), axis=0) * load) * alpha
+
+
 def calculate_load_balance_updates(top_k_indices, num_experts, rate):
     """
     Computes a bias adjustment update based on expert load.
@@ -83,23 +103,28 @@ class Router(nn.Module):
     """Which experts a token goes to, and with what weight: `[..., k]` of each.
 
     The gate projection runs in fp32 whatever dtype the activations carry,
-    which is where DeepSeek's router runs
-    (`modeling_deepseek_v3.py:146`) and what every frontier config asks for.
+    as DeepSeek's router does (`modeling_deepseek_v3.py:146`).
 
     `expert_bias` is DeepSeek's aux-loss-free balancing bias
     (`e_score_correction_bias`, arXiv 2408.15664), kept in fp32 in the `moe`
-    collection. It enters the selection and nothing else: a token's weights are
-    gathered from the unbiased scores, so moving the bias changes which experts
-    a token uses without changing what they contribute. Nothing here writes it,
-    which is also true of the reference: transformers holds it in an
-    `nn.Buffer` and MaxText hands the update back to its caller
-    (`layers/moe.py:965-972`). `calculate_load_balance_updates` is that update,
-    and a step that applies it owns the write. Gradients cannot reach the bias
-    either, since it feeds `jax.lax.top_k`'s integer indices and nothing else.
+    collection. It enters the selection only: a token's weights are gathered
+    from the unbiased scores, so moving the bias changes which experts a token
+    uses without changing what they contribute. Nothing here writes it;
+    transformers holds it in an `nn.Buffer` and MaxText hands the update back
+    to its caller (`layers/moe.py:965-972`). `calculate_load_balance_updates`
+    is that update, and the step that applies it owns the write. Gradients
+    cannot reach the bias either, since it feeds only `jax.lax.top_k`'s
+    integer indices.
 
     `expert_groups` above one is DeepSeek's node limit: experts are cut into
     that many groups, each group is scored by its two best experts, and a token
-    may only choose inside the best `groups_per_token` of them.
+    may only choose inside the best `groups_per_token` of them. `group_score`
+    names the group's score: 'top2' is V3's sum of its two best experts
+    (`noaux_tc`), 'max' is V2's best expert alone (`group_limited_greedy`,
+    modeling_deepseek_v2.py `DeepseekV2TopkRouter`).
+
+    `normalize_weights` divides a token's selected weights by their sum,
+    the reference's `norm_topk_prob`; V2's released configs set it false.
     """
     num_experts: int
     in_features: int
@@ -109,10 +134,14 @@ class Router(nn.Module):
     routed_scaling_factor: float = 1.0
     expert_groups: int = 1
     groups_per_token: int = 1
+    group_score: str = 'top2'
     expert_bias: bool = False
     precision: PrecisionLike = None
 
     def setup(self):
+        if self.group_score not in ('top2', 'max'):
+            raise ValueError(
+                f"group_score must be 'top2' or 'max', got {self.group_score!r}")
         if self.score_function not in SCORE_FUNCTIONS:
             raise ValueError(
                 f"score_function must be one of {list(SCORE_FUNCTIONS)}, got "
@@ -129,21 +158,23 @@ class Router(nn.Module):
             raise ValueError(
                 f"groups_per_token must be between 1 and expert_groups "
                 f"({self.expert_groups}), got {self.groups_per_token}")
-        if self.expert_groups > 1:
+        if self.expert_groups > 1 and self.group_score == 'top2':
             per_group = self.num_experts // self.expert_groups
             if per_group < 2:
                 raise ValueError(
                     "group scores are the sum of a group's two best experts, so "
                     f"a group needs at least two: {self.num_experts} experts in "
                     f"{self.expert_groups} groups leaves {per_group}")
+        if self.expert_groups > 1:
+            per_group = self.num_experts // self.expert_groups
             if self.groups_per_token * per_group < self.top_k:
                 raise ValueError(
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
-        # The kernel is the router's own parameter rather than a nested
-        # nn.Dense, so the leaf is `gate/kernel` where a Hugging Face sparse
-        # layer keeps `gate.weight`.
+        # The kernel is the router's own parameter, not a nested nn.Dense, so
+        # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
+        # `gate.weight`.
         self.kernel = self.param(
             'kernel', nn.initializers.lecun_normal(),
             (self.in_features, self.num_experts), jnp.float32)
@@ -163,6 +194,8 @@ class Router(nn.Module):
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
             self.sow('router', 'indices', indices)
+            # The V2 balance loss reads the scores beside the choices.
+            self.sow('router', 'scores', scores)
         weights = jnp.take_along_axis(scores, indices, axis=-1)
         if self.normalize_weights:
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
@@ -189,8 +222,12 @@ class Router(nn.Module):
         """
         per_group = self.num_experts // self.expert_groups
         grouped = selection.reshape(*selection.shape[:-1], self.expert_groups, per_group)
-        best_two, _ = jax.lax.top_k(grouped, 2)
-        _, groups = jax.lax.top_k(jnp.sum(best_two, axis=-1), self.groups_per_token)
+        if self.group_score == 'max':
+            group_scores = jnp.max(grouped, axis=-1)
+        else:
+            best_two, _ = jax.lax.top_k(grouped, 2)
+            group_scores = jnp.sum(best_two, axis=-1)
+        _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.float32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
@@ -201,14 +238,13 @@ class ExpertLinear(nn.Module):
     already sorted by expert.
 
     `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on, which is what both grouped matmuls take.
+    1, and so on, the form both grouped matmuls take.
     `implementation` picks between them, the seam
     `dew.nn.attention.scaled_dot_product_attention` has:
 
     - 'xla': `jax.lax.ragged_dot`, which lowers on every backend.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`). tokamax is not a dependency of
-      Dew, so its import is inside the branch that needs it.
+      kernels (`maxtext layers/moe.py:1633`).
     """
     num_experts: int
     in_features: int
@@ -222,9 +258,8 @@ class ExpertLinear(nn.Module):
             raise ValueError(
                 f"implementation must be one of {list(GROUPED_MATMULS)}, got "
                 f"{self.implementation!r}")
-        # fan_in per expert, not over the stack: with the expert dimension as a
-        # batch axis every expert initialises exactly like the matching
-        # nn.Dense of a dense MLP.
+        # With the expert dimension as a batch axis, fan_in is per expert and
+        # every expert initialises like the matching nn.Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
             nn.initializers.variance_scaling(
@@ -236,7 +271,7 @@ class ExpertLinear(nn.Module):
         tokens, kernel = promote_dtype(tokens, self.kernel, dtype=self.dtype)
         if self.implementation == 'tokamax':
             # tokamax is not a dependency (docs/concepts/moe.md), so it is
-            # resolved by name at the call rather than imported statically.
+            # imported at the call.
             tokamax = importlib.import_module('tokamax')
             return tokamax.ragged_dot(
                 tokens, kernel, group_sizes, precision=self.precision,
@@ -253,7 +288,7 @@ class ExpertMLP(nn.Module):
     Tokens are gathered into expert order, the three projections run as grouped
     matmuls over that order, and the results go back to token order and are
     summed with their router weights (`maxtext layers/moe.py:940` `permute` and
-    `:1101` `unpermute`). The gather reads token rows directly rather than a
+    `:1101` `unpermute`). The gather reads token rows directly, without a
     `top_k`-fold copy of them, which is MaxText's `moe_use_direct_token_gather`.
 
     The sum over a token's experts runs in fp32, because that is the dtype the
@@ -264,6 +299,12 @@ class ExpertMLP(nn.Module):
     (`modeling_deepseek_v4.py`, `DeepseekV4Experts._apply_gate`): the gate is
     capped at the limit from above and the up projection on both sides, which
     bounds what one expert can add. None is the plain gated MLP.
+
+    `scale_inputs` is Llama 4's placement of the routing weight: each
+    token's input to an expert is multiplied by its weight and the expert
+    outputs are summed unweighted (`modeling_llama4.py`,
+    `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
+    weighted sum of outputs because the gate is not linear.
     """
     num_experts: int
     hidden_features: int
@@ -271,6 +312,7 @@ class ExpertMLP(nn.Module):
     activation: str = 'swiglu'
     implementation: str = 'xla'
     swiglu_limit: Optional[float] = None
+    scale_inputs: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -306,6 +348,8 @@ class ExpertMLP(nn.Module):
         order = jnp.argsort(experts)
         group_sizes = jnp.bincount(experts, length=self.num_experts)
         grouped = tokens[order // top_k]
+        if self.scale_inputs:
+            grouped = grouped * weights.reshape(-1)[order][:, None].astype(grouped.dtype)
 
         gate = self.gate_proj(grouped, group_sizes)
         up = self.up_proj(grouped, group_sizes)
@@ -319,6 +363,8 @@ class ExpertMLP(nn.Module):
         expert_out = self.down_proj(gate * up, group_sizes)
 
         per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
+        if self.scale_inputs:
+            return jnp.sum(per_slot.astype(jnp.float32), axis=-2).astype(expert_out.dtype)
         combined = jnp.einsum(
             '...ke,...k->...e', per_slot.astype(jnp.float32),
             weights.astype(jnp.float32), precision=self.precision)
@@ -361,8 +407,10 @@ class SparseMLP(nn.Module):
     routed_scaling_factor: float = 1.0
     expert_groups: int = 1
     groups_per_token: int = 1
+    group_score: str = 'top2'
     expert_bias: bool = False
     swiglu_limit: Optional[float] = None
+    scale_inputs: bool = False
     shared: Optional[Callable[..., nn.Module]] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -375,12 +423,14 @@ class SparseMLP(nn.Module):
                            routed_scaling_factor=self.routed_scaling_factor,
                            expert_groups=self.expert_groups,
                            groups_per_token=self.groups_per_token,
+                           group_score=self.group_score,
                            expert_bias=self.expert_bias,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
             implementation=self.implementation, swiglu_limit=self.swiglu_limit,
+            scale_inputs=self.scale_inputs,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.shared is not None:
             self.shared_experts = self.shared(name='shared_experts')

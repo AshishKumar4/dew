@@ -19,11 +19,8 @@ class AutoEncoder(ABC):
     1/std so the diffusion model sees roughly unit-variance, zero-mean inputs.
 
     The weights are an argument, as a `ConditionEncoder`'s are: `params` holds
-    what a run loaded, and every call takes the tree to use. An autoencoder
-    that closed over its own weights baked them into whatever step called it,
-    where they were a compile-time constant, replicated on every device and
-    absent from the checkpoint, instead of state the layout places and the
-    trainer carries.
+    what a run loaded, and every call takes the tree to use, so the layout
+    places the weights and the checkpoint carries them.
     """
 
     latent_shift: float = 0.0

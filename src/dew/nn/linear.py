@@ -1,12 +1,11 @@
 """Gated DeltaNet: the linear-attention mixer of the Qwen3.5 family.
 
 The delta rule keeps an outer-product memory `S = sum_t k_t v_t^T` and
-corrects it toward the value each new key predicts, rather than only
-accumulating onto it the way attention accumulates its keys. Two gates make
-it trainable at scale: a decay `g` that shrinks the memory before each
-write (Mamba's selectivity, spelled as a log-space cumulative product in
-the chunked form) and a beta that scales how far one write moves the memory
-toward its own value.
+corrects it toward the value each new key predicts, where attention only
+accumulates its keys. Two gates make it trainable at scale: a decay `g`
+that shrinks the memory before each write (Mamba's selectivity, spelled as
+a log-space cumulative product in the chunked form) and a beta that scales
+how far one write moves the memory toward its own value.
 
 dew computes the same chunked formulation transformers 5.16.1 computes
 (`modeling_qwen3_next.py:374-453`, identical in qwen3_5 and qwen4_exp):
@@ -25,9 +24,8 @@ The recurrent form (one token at a time) is what a decode step runs
     o_t <- S q_t
 
 Both forms live here because a model decodes with the second and trains
-with the first; the parallel-scored test in tests/test_linear_attention.py
-holds them to the same numbers, which is what catches a wrong recurrent
-state.
+with the first; tests/test_linear_attention.py holds them to the same
+numbers.
 
 The short mixer is the depthwise causal conv1d the reference applies to the
 projected qkv before the rule (`modeling_qwen3_next.py:325-365`): kernel 4,
@@ -105,10 +103,9 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
 
     The reference's sequential correction (`for i in range(1, chunk_size)`)
     is the forward substitution that inverts `I - A` for a strictly lower
-    triangular A, so `looped + I` is `I + A + A^2 + ...`, which terminates
-    at C-1 powers because A is nilpotent. The series is summed by doubling
-    (`S <- S + A^(2^k) S; A <- A^2`), log2(C) matmuls instead of C row
-    updates; see the comment where it happens for the verification.
+    triangular A. Here the series `I + A + A^2 + ...` is summed by doubling,
+    log2(C) matmuls instead of C row updates; the comment at the loop has
+    the verification.
     """
     dtype = query.dtype
     query, key, value, g, beta = (
@@ -253,15 +250,15 @@ class GatedDeltaNet(nn.Module):
     The decode state is two leaves in the flax `cache` collection:
     `recurrent_state` [B, H, Dk, Dv] and `conv_state` [B, D, K-1], both
     allocated at the batch the first decode-mode call sees, the way
-    open_kv_cache allocates its slots. Decode is one code path with
-    prefill: the conv state crosses the prefill/decode boundary because a
-    continuation must see the last K-1 real columns rather than the zeros a
-    fresh sequence pads with.
+    open_kv_cache allocates its slots. Prefill and decode share one code
+    path, and the conv state crosses the boundary between them because a
+    continuation must see the last K-1 real columns, not the zeros a fresh
+    sequence pads with.
 
-    Parameter names are the checkpoint's, so translation moves weights and
-    does not synthesise them: `conv1d/weight` is the depthwise taps
-    `[D, 1, K]`, and `A_log`/`dt_bias` are the `[Hv]` leaves the reference
-    materialises as parameters.
+    Parameter names are the checkpoint's, so a translation only moves
+    weights: `conv1d/weight` is the depthwise taps `[D, 1, K]`, and
+    `A_log`/`dt_bias` are the `[Hv]` leaves the reference materialises as
+    parameters.
     """
 
     emb_features: int
@@ -418,14 +415,12 @@ class GatedDeltaNet(nn.Module):
 class DepthwiseConv1d(nn.Module):
     """The conv's taps as a raw parameter, in the checkpoint's [D, 1, K] layout.
 
-    A raw parameter rather than flax's Conv, because the checkpoint stores
-    `conv1d.weight` exactly this way and nothing else about flax's conv
-    (its [K, D, 1] kernel order, its channel-last input) matches the
-    reference's [B, D, S] depthwise conv1d call. The leaf keeps the
-    checkpoint's name, `weight`, because `kernel` is what a translation
-    transposes as a Linear's [out, in]; the caller reads `weight[:, 0, :]`
-    for the [D, K] taps. The depthwise taps have no matrix axis worth a
-    name, so they take the shape heuristic.
+    The checkpoint stores `conv1d.weight` this way, and flax's Conv matches
+    neither its [K, D, 1] kernel order nor the reference's channel-major
+    [B, D, S] input. The leaf keeps the checkpoint's name, `weight`, because
+    a translation transposes a `kernel` as a Linear's [out, in]; the caller
+    reads `weight[:, 0, :]` for the [D, K] taps. The taps have no matrix
+    axis worth a name, so they take the shape heuristic.
     """
 
     features: int
@@ -441,8 +436,8 @@ class RMSNormGated(nn.Module):
     """The reference's Qwen3NextRMSNormGated: RMSNorm in fp32, then the
     gate, then the cast back (modeling_qwen3_next.py:57-74). The gate is
     silu in the qwen3_5/qwen3_next references and sigmoid where qwen4_exp's
-    output_gate_type says so; the caller picks, because the activation is
-    a config field there, not a property of the norm.
+    output_gate_type says so; the caller picks, since the reference makes
+    the activation a config field.
     """
 
     epsilon: float = 1e-6

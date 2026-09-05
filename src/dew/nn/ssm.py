@@ -11,8 +11,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from .sharding import logical_axes
 
-# --- S5 SSM Layer ---
-
 def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
     """HiPPO-diag init: A_real_n = -(n + 0.5), stored as log of the negative."""
     state_dim = shape[0]
@@ -98,7 +96,6 @@ class S5Layer(nn.Module):
         )
         dt = jnp.exp(log_dt)  # [state_dim]
 
-        # Construct complex A and discretize
         A_real = -jnp.exp(log_A_real)  # negative real part for stability
         A_diag = A_real + 1j * A_imag  # [state_dim]
 
@@ -110,7 +107,6 @@ class S5Layer(nn.Module):
 
         C_complex = C_re + 1j * C_im
 
-        # --- Parallel Scan ---
         # x_k = A_bar * x_{k-1} + B_bar @ u_k via associative scan with
         # (a1, b1) * (a2, b2) = (a1 * a2, a2 * b1 + b2)
         u_float = u.astype(jnp.float32)
@@ -134,10 +130,8 @@ class S5Layer(nn.Module):
         y_complex = jnp.einsum('fn,bsn->bsf', C_complex, x_states)  # [B, S, F]
         y = y_complex.real
 
-        # skip connection
         y = y + D[None, None, :] * u_float  # [B, S, F]
 
-        # cast back to input dtype
         if self.dtype is not None:
             y = y.astype(self.dtype)
         else:
@@ -145,8 +139,6 @@ class S5Layer(nn.Module):
 
         return y
 
-
-# --- Bidirectional S5 ---
 
 @logical_axes({}, heuristic=(("s5_*",), ("out_proj",)))
 class BidirectionalS5Layer(nn.Module):
@@ -173,7 +165,6 @@ class BidirectionalS5Layer(nn.Module):
             name="s5_forward"
         )(u)
 
-        # backward scan: reverse input, scan, reverse output
         u_rev = jnp.flip(u, axis=1)
         y_bwd_rev = S5Layer(
             features=self.features,
@@ -197,8 +188,6 @@ class BidirectionalS5Layer(nn.Module):
 
         return y
 
-
-# --- 2D state fusion (Spatial-Mamba style) ---
 
 class SpatialFusionConv(nn.Module):
     """Multi-dilation depthwise 2D convs summed as a residual over the SSM output grid.

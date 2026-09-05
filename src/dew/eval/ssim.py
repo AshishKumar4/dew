@@ -1,6 +1,6 @@
 """SSIM in pure jax (Wang et al. 2004), batched over images and video.
 
-Standard parameters: 11x11 gaussian window, sigma 1.5, means taken over
+Standard parameters, 11x11 gaussian window, sigma 1.5, means taken over
 channels after per-channel SSIM. No scipy/skimage dependency;
 `tests/test_metrics.py` states the tolerance against the filtered equations
 and the difference observed.
@@ -78,8 +78,8 @@ def structural_similarity(
     per-frame scores. Identical inputs give 1.0.
     """
     pred, targ = frame_batch(predictions), frame_batch(targets)
-    # vmap over frames then channels: each (H, W) plane is scored independently,
-    # giving (N, C) which collapses to one score per frame
+    # vmap over frames then channels. Each (H, W) plane is scored independently,
+    # giving (N, C), which collapses to one score per frame.
     per_channel = jax.vmap(
         jax.vmap(_ssim_single_channel, in_axes=(2, 2, None)),
         in_axes=(0, 0, None),

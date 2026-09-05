@@ -53,8 +53,8 @@ def unpack_dict_of_byte_arrays(packed_data):
 def decode_image(encoded: bytes) -> np.ndarray:
     """An encoded image as RGB uint8 at its native size.
 
-    cv2 decodes to BGR(A) and hands back None for a half-written file, which
-    the colour conversion turns into an error rather than a black record.
+    cv2 decodes to BGR(A) and hands back None for a half-written file. The
+    colour conversion turns that None into an error.
     """
     import cv2
     image = cv2.imdecode(np.asarray(bytearray(encoded), dtype="uint8"), cv2.IMREAD_UNCHANGED)
@@ -99,8 +99,8 @@ def augment_image(augments, image, rng: np.random.Generator):
     index), so every record gets the same augmentation regardless of how many
     workers, threads or processes produced the batch. albumentations keeps the
     generators a call draws from on the pipeline itself, so a pipeline shared
-    between grain's prefetch threads had one record's seed applied to another
-    record's pixels; each thread seeds and runs a copy of its own. numpy's
+    between grain's prefetch threads would apply one record's seed to another
+    record's pixels. Each thread seeds and runs a copy of its own. numpy's
     global RNG is never touched from inside data-loading workers.
     """
     copies = getattr(_thread_pipelines, "copies", None)
@@ -143,7 +143,7 @@ def record_caption(element) -> str:
 
 
 class ImageTransform(pygrain.RandomMapTransform):
-    """Resize, augment and caption one record; the record's rng seeds both."""
+    """Resize, augment and caption one record, seeded by the record's own rng."""
 
     def __init__(self, spec: "ImageDataset"):
         self.spec = spec
@@ -166,8 +166,8 @@ class ImageDataset(DatasetSpec):
     `val_batches` batches of records are held out of the head of the source,
     in canonical order, as the validation split, so FID and CLIP are never
     measured on records the model trained on; None or 0 holds nothing out.
-    `count` uses that many records from the head of the source, and is what
-    a source that reports no length needs set.
+    `count` takes that many records from the head of the source. A source
+    that reports no length needs it set.
     """
 
     image_size: int = 128
@@ -178,8 +178,8 @@ class ImageDataset(DatasetSpec):
     loading: Loading = Loading()
 
     def source(self) -> Any:
-        """Random access over the records: `__getitem__`, and `__len__` unless
-        `count` says how many there are."""
+        """Random access over the records (`__getitem__`, and `__len__` unless
+        `count` says how many there are)."""
         raise NotImplementedError
 
     def record(self, element, rng: np.random.Generator) -> tuple[np.ndarray, str, int | None]:
@@ -228,8 +228,8 @@ class OxfordFlowers(ImageDataset):
 
     def record(self, element, rng):
         label = int(element["label"])
-        # The template comes from the record's rng, like the augmentation: a
-        # module-global random.choice made a record's caption depend on how
+        # The template comes from the record's rng, like the augmentation.
+        # A module-global random.choice would key a record's caption to how
         # many workers and processes produced the batch.
         template = PROMPT_TEMPLATES[int(rng.integers(len(PROMPT_TEMPLATES)))]
         return element["image"], template.format(class_names(self.labels)[label]), label

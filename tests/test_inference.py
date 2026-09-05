@@ -162,7 +162,7 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
     """A run.json from another objective, or with a knob this class lacks,
-    raises instead of building something other than what was trained."""
+    raises a ValueError naming the field, and no model is built from it."""
     config = run_config(tmp_path)
     record = config.to_dict()
     record["sampler_steps"] = 3
@@ -205,8 +205,8 @@ def test_an_unconditional_default_model_takes_a_step():
 def test_joint_stream_models_refuse_an_unconditional_run():
     """SimpleMMDiT and HierarchicalMMDiT run the text as a second stream
     through every block's joint attention, so with no text there is no
-    sequence to project; the run is refused by name instead of failing in
-    the first attention softmax over an empty slice."""
+    sequence to project; `build` raises a ValueError naming the architecture
+    before the first attention softmax over an empty slice."""
     from dew.config import ModelConfig
 
     base = DiffusionRunConfig(text=None)
@@ -230,8 +230,8 @@ def test_a_discrete_preset_is_refused_by_the_gaussian_objective():
 
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: the
-    factories read that grid there, and the image-only metrics are refused
-    by name instead of failing in the trainer."""
+    factories read that grid there, and an image-only metric raises a
+    ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
                                 data=VideoDataset(frame_size=8, frames=2),
                                 val_metrics=["psnr"])
@@ -245,7 +245,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
 
 def test_the_autoencoder_record_carries_its_revision(tmp_path):
     """A run trained with a non-default VAE revision rebuilds from its
-    record; the revision used to fall out of the dataclass entirely."""
+    record with that revision."""
     config = dataclasses.replace(
         run_config(tmp_path),
         autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
@@ -253,9 +253,9 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
 
 
 def test_a_fresh_process_resolves_metrics_and_models_through_the_config():
-    """The recipe runs in a process that imports nothing else first: the
-    registries the config builds from fill on its import alone. `psnr` is
-    pure, so resolving it proves the point without downloading weights."""
+    """The recipe runs in a fresh process: the registries the config builds
+    from fill on its import alone. `psnr` is pure, so resolving it proves the
+    point without downloading weights."""
     root = Path(__file__).resolve().parents[1]
     code = ("from dew.objectives.diffusion.config import DiffusionRunConfig;"
             "from dew.registry import metrics, models;"

@@ -1,7 +1,7 @@
-"""Host-side tokenizers and feature extractors: raw text and audio into the
-arrays a batch carries. They run inside grain's workers, so the device only
-sees ready tensors. `transformers` is imported on construction, not on
-import."""
+"""Host-side tokenizers and feature extractors, turning raw text and audio
+into the arrays a batch carries. They run inside grain's workers, so the
+device only sees ready tensors. `transformers` is imported on construction,
+not on import."""
 
 
 class AutoTextTokenizer:

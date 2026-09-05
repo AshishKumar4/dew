@@ -3,10 +3,10 @@ Shared machinery for the DiT family.
 
 Every DiT-style model here is the same sandwich: patchify in some scan order,
 add a 2D sincos position signal, run adaLN-Zero modulated blocks over the
-token sequence, and unpatchify back. The only real differences between the
-models are the token mixer inside the block (attention or S5 SSM) and how the
-blocks are arranged (plain stack, U-shaped skips, hybrid patterns). This
-module owns the sandwich; the model files just arrange blocks.
+token sequence, and unpatchify back. The models differ in the token mixer
+inside the block (attention or S5 SSM) and in how the blocks are arranged
+(plain stack, U-shaped skips, hybrid patterns). This module owns the
+sandwich; the model files arrange blocks.
 """
 
 import inspect
@@ -39,7 +39,7 @@ ROPE_THETA = 10000.0
 class TextContext:
     """Encoded text a model conditions on: `hidden` `[B, L, D]` from the text
     tower and `mask` `[B, L]`, ones on the real tokens and zeros on the padding,
-    which is what any pooling over L weights by."""
+    which any pooling over L weights by."""
     hidden: jax.Array
     mask: jax.Array
 
@@ -64,7 +64,7 @@ def scan_indices(scan_order: str, H_P: int, W_P: int):
 
 def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
     """2D sincos position embedding permuted into the scan order, so token i of
-    the sequence carries the signal for the 2D position it actually came from."""
+    the sequence carries the signal for the 2D position it came from."""
     pos_embed = build_2d_sincos_pos_embed(emb_dim, H_P, W_P)
     idx = scan_indices(scan_order, H_P, W_P)
     return pos_embed if idx is None else pos_embed[idx]
@@ -136,8 +136,8 @@ class AdaLNParams(nn.Module):
 class PatchSequenceEmbed(nn.Module):
     """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
 
-    Returns (tokens, inv_idx) - inv_idx restores row-major order on the way
-    out and is None for raster.
+    Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
+    way out and is None for raster.
     """
     patch_size: int
     emb_features: int
@@ -249,7 +249,7 @@ class PatchSequenceOutput(nn.Module):
 
         x_out = nn.Dense(
             features=self.patch_size * self.patch_size * self.output_channels,
-            dtype=jnp.float32,  # fp32 output head - the loss is computed in fp32
+            dtype=jnp.float32,  # the loss is computed in fp32
             precision=self.precision,
             kernel_init=nn.initializers.zeros,
             name="final_proj",
@@ -264,7 +264,7 @@ def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
     """Optionally rematerialize a block class.
 
     Recomputing a block during the backward pass trades extra compute for a
-    large drop in activation memory, which is what caps trainable model size.
+    large drop in activation memory, which caps trainable model size.
     The default policy keeps the big matmul outputs so the recompute stays
     cheap. Blocks carrying complex intermediates (the S5 mixer) must pass
     policy=None: saving a residual goes through jax.lax.reduce_precision,
@@ -295,7 +295,7 @@ class ModulatedBlock(nn.Module):
     Spatial-Mamba style 2D state fusion, and ignores freqs_cis.
 
     modulated=False drops the adaLN-Zero conditioning path entirely, leaving a
-    plain pre-norm residual block with learned affine norms - the ViT block a
+    plain pre-norm residual block with learned affine norms, the ViT block a
     JEPA encoder needs, where there is no timestep to condition on.
     """
     features: int
@@ -398,12 +398,11 @@ class ModulatedBlock(nn.Module):
             )
         else:
             assert conditioning is None, "an unmodulated block takes no conditioning"
-            # Identity modulation - the block body below collapses to a plain
-            # pre-norm residual block without branching on the mode
+            # Identity modulation, so the block body below collapses to a
+            # plain pre-norm residual block without branching on the mode
             scale_mlp = shift_mlp = scale_attn = shift_attn = 0.0
             gate_mlp = gate_attn = 1.0
 
-        # --- Mixer path (attention or SSM) ---
         residual = x
         x_modulated = self.norm1(x) * (1 + scale_attn) + shift_attn
         if self.mixer == 'attention':
@@ -419,7 +418,6 @@ class ModulatedBlock(nn.Module):
         else:
             x = residual + mixer_output
 
-        # --- MLP path ---
         residual = x
         x_mlp_modulated = self.norm2(x) * (1 + scale_mlp) + shift_mlp
         mlp_output = self.mlp(x_mlp_modulated)

@@ -62,7 +62,7 @@ objective = LMObjective(model, seq_len=256, samples=Samples(
     max_new_tokens=128, temperature=0.8, decode=tokenizer.decode))
 ```
 
-`loss` multiplies the final hidden states by the head matrix one vocabulary slice at a time and returns the mean cross entropy in float32, so the full `[tokens, vocab]` logits tensor is never built; `head_chunks` (default 4, the measured best at vocabulary 50k on an RTX 4080) is how many slices. Float32 is deliberate: a bfloat16 logsumexp over a large vocabulary moves the loss and the gradient with it. The model exposes `hidden_states(...)` and `head_weight(params)` for this; `CausalTransformer` does.
+`loss` multiplies the final hidden states by the head matrix one vocabulary slice at a time and returns the mean cross entropy in float32, without building the full `[tokens, vocab]` logits tensor; `head_chunks` (default 4) is how many slices. A bfloat16 logsumexp over a large vocabulary moves the loss and the gradient, so the head runs in float32. The model exposes `hidden_states(...)` and `head_weight(params)` for this; `CausalTransformer` does.
 
 `pad_id` excludes padded targets from the mean and defaults to `None`, because a fixed-window token file has no padding. A packed batch needs no pad id; its segment ids say which slots are padding.
 
@@ -99,7 +99,7 @@ logits = model.apply(variables, tokens)              # [B, S, 151936] fp32
 save_pretrained_decoder(model, variables, "out/qwen3-tuned", tokenizer_name="Qwen/Qwen3-0.6B")
 ```
 
-`load_pretrained_decoder(name_or_dir, *, dtype="bfloat16", attention_impl="auto", max_seq_len=None, revision=None)` takes a hub repo id or a local directory. It downloads the safetensors and JSON only, reads the weights without torch, and builds the model through `models.build`, so `dtype` is the compute dtype and the parameters stay float32. The third return is the dew config the model was built from, which is what a run logs.
+`load_pretrained_decoder(name_or_dir, *, dtype="bfloat16", attention_impl="auto", max_seq_len=None, revision=None)` takes a hub repo id or a local directory. It downloads the safetensors and JSON only, reads the weights without torch, and builds the model through `models.build`; `dtype` is the compute dtype and the parameters stay float32. The third return is the dew config the model was built from, the one a run logs.
 
 A checkpoint quantized the way DeepSeek V3 and V3.2 ship, every linear an F8_E4M3 weight with an F32 `weight_scale_inv` of one scale per 128 x 128 block (the config's `quantization_config` names `fp8`, `e4m3` and `weight_block_size [128, 128]`), loads dequantized: the reader widens each fp8 weight to float32 exactly and `dew.interop.dequantize_checkpoint` multiplies it by its block scales, the formula of DeepSeek's `weight_dequant` (inference/kernel.py), one float32 multiply per element with the partial last block a shape like `[576, 7168]` leaves. `dequantize_fp8_blocks(weight, scale_inv, block)` is that arithmetic on one tensor, and tests/test_quantized.py holds it to the reference bit for bit, on random blocks and on the real `kv_a_proj_with_mqa` pair of DeepSeek-V3 (network-marked). A checkpoint quantized another way (GPT-OSS's MXFP4) is its own reader's business and passes this one untouched.
 
@@ -114,13 +114,19 @@ A checkpoint quantized the way DeepSeek V3 and V3.2 ship, every linear an F8_E4M
 | Qwen 3 | `qwen3` | dense; q/k norms, sliding layers |
 | Qwen3-MoE | `qwen3_moe` | the mixture with `norm_topk_prob`, `decoder_sparse_step` and `mlp_only_layers` |
 | Gemma 1, 2 | `gemma`, `gemma2` | exact GeGLU; Gemma 2 adds the attention logit softcap (runs on the xla kernel), alternating windows and post norms |
-| OLMo 3 | `olmo3` | post-norm block, q/k norms over the whole projection; its full-layer YaRN is refused by name |
-| Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and are refused by name |
-| Gemma 4 | `gemma4_text` | the text decoder: per-layer inputs, KV sharing, partial rotary, logit softcap |
-| Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and are refused by name |
+| OLMo 3 | `olmo3` | post-norm block, q/k norms over the whole projection; the released config's full-layer YaRN raises a `ValueError` |
+| Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and raise |
+| Gemma 3n | `gemma3n_text` | E2B and E4B: AltUp's copies of the residual stream (`altup_num_inputs`, `altup_active_idx`, `altup_coef_clip`, `altup_correct_scale`), the LAuReL block (`laurel_rank`), gaussian top-k activation sparsity (`activation_sparsity_pattern`), one feed-forward width per layer, per-layer inputs and KV sharing; the released repos are multimodal wrappers whose `text_config` alone translates |
+| Gemma 4 | `gemma4_text` | the text decoder of every size: per-layer inputs, KV sharing, partial rotary, logit softcap, the global layers' own head dim and key/value count, and for the 26B-A4B the routed experts summed beside each layer's dense MLP (`enable_moe_block`), the global layers reading their values off the keys (`attention_k_eq_v`) and the per-layer output scalar |
+| Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and raise |
+| GPT OSS | `gpt_oss` | alternating sliding and full layers with a learned attention sink per head, YaRN over grouped-query heads, the biased router and the clamped interleaved experts with their bias vectors; MXFP4 blocks and scales unpack to bf16 on load (`dew.nn.gpt_oss.dequantize_mxfp4`) |
+| DeepSeek V2, V2-Lite | `deepseek_v2`, `deepseek_v2_lite` | MLA with V2's dims and no indexer, the softmax router under `greedy` or `group_limited_greedy` without renormalisation, the expert-level balance loss (`aux_loss_alpha`, `seq_aux`) on `LMObjective` |
 | DeepSeek V3, V3.2 | `deepseek_v3`, `deepseek_v32` | multi-head latent attention with YaRN, the V3.2 sparse indexer, the sigmoid router with grouping, scaling and the balancing bias, shared experts; `num_nextn_predict_layers` reads as 0 because the released repos ship no MTP weights |
+| Kimi K2 | `kimi_k2` | DeepSeek V3's computation under its own model_type and tokenizer; what it computes exports as `deepseek_v3` |
+| GLM 4.5, GLM 5 | `glm4_moe` | biased q/k/v over a bias-free o_proj, a half rotary, DeepSeek V3's router with the shared experts and dense first layers, and the MTP depths the checkpoint ships (`num_nextn_predict_layers`), each composed as the serving engines run it |
+| Llama 4 (text) | `llama4_text` | iRoPE: chunked rotated local layers around global layers with no rope and temperature scaling, every interleaved layer routed with a shared expert and the routing weight on the expert input; the released repos are multimodal wrappers whose `text_config` alone translates |
 
-A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. The families still to come are in the README roadmap.
+A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`use_bidirectional_attention` other than Gemma 4's vision-only spelling, a `mlp_bias`, an activation other than silu or tanh-gelu, a `rope_scaling` the family's reference does not read, DeepSeek V2's `norm_topk_prob` or a `scoring_func` other than softmax, GPT OSS's `router_jitter_noise` or a quantization other than MXFP4, Llama 4's `layer_types` disagreeing with `no_rope_layers`). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`, `llama4`) is refused as a wrapper; its `text_config` is what translates. The families still to come are in the README roadmap.
 
 Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 

@@ -5,8 +5,8 @@ A dataset directory is `train.bin`, `val.bin` and `meta.json` as written by
 
 `TokenFileSource` reads a record as a contiguous window of `seq_len + 1` ids
 starting at `i * seq_len`, so record i's last token is record i+1's first and
-the model sees every transition exactly once. No decoding, no randomness: the
-shuffle lives in the sampler.
+the model sees every transition exactly once. There is no decoding and no
+randomness here; the shuffle lives in the sampler.
 
 `TokenDocumentSource` reads a record as one document: the span from after the
 previous eos id through its own. It exists for the packed pipeline, which
@@ -32,7 +32,7 @@ class TokenFileSource:
 
     The dtype comes from the sibling `meta.json` when present (the tokenize
     tool records it there), else uint16, the nanoGPT default. The memmap is
-    never loaded into memory: a worker reads only the window it is asked for.
+    never loaded into memory. A worker reads only the window it is asked for.
     """
 
     def __init__(self, path: str, seq_len: int):
@@ -59,16 +59,16 @@ class TokenFileSource:
 
     def __repr__(self) -> str:
         # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses a state whose repr no longer matches, so a resumed run needs
-        # this to describe the file rather than an address in this process.
+        # refuses a state whose repr differs, so a resumed run needs this to
+        # describe the file, not an address in this process.
         return f"TokenFileSource(path={self.path!r}, seq_len={self.seq_len})"
 
     def __len__(self) -> int:
         return (len(self._tokens) - 1) // self.seq_len
 
     def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
-        # A memmap slice past its end silently yields an empty array, so the
-        # bounds are checked here rather than left to numpy.
+        # A memmap slice past its end yields an empty array instead of an error,
+        # so the bounds are checked here.
         if not 0 <= index < len(self):
             raise IndexError(index)
         start = index * self.seq_len
@@ -92,9 +92,9 @@ class TokenDocumentSource:
 
     A document is the span from after the previous `eos_id` through its own,
     so the eos tokens are the record separators. The tail after the last eos
-    is a document too, and a split with no eos at all is one document: a
+    is a document too, and a split with no eos at all is one document. A
     train/val split cuts the stream wherever the token fraction falls, and
-    --pack closes input files rather than that cut, so the head of the stream
+    --pack closes input files instead of that cut, so the head of the stream
     can carry no boundary while the tokens are still a document.
 
     The dtype and `eos_id` come from the sibling `meta.json` (the tokenize

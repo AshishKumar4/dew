@@ -24,7 +24,7 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Mapping, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple, Union
 
 import flax.core
 import jax
@@ -38,6 +38,10 @@ from ..attention import (
 )
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
+from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
+from ..gemma4_moe import Gemma4Experts
+from ..gpt_oss import GptOssMLP
+from ..mla import YarnScaling, mla_rope_freqs
 from ..sharding import logical_axes
 from dew.registry import models
 
@@ -61,6 +65,9 @@ class LayerKind:
 
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
+    num_kv_heads: Optional[int] = None
+    """This kind's key/value head count; None takes the model's. Gemma 4's
+    global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
     rope_scaling: Optional[RopeScaling] = None
     """This kind's llama3 ramp or its record; None rides the model's."""
@@ -93,6 +100,7 @@ class ResolvedKind:
     """
 
     window: Optional[int]
+    num_kv_heads: int
     rope_theta: float
     rope_scaling: Optional[RopeScaling]
     head_dim: int
@@ -112,8 +120,17 @@ class Mixture:
     The routing options are `Router`'s: `score_function` softmax, sigmoid or
     sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
     token's selected weights by their sum, `scaling` on the routed output,
-    `groups` with `groups_per_token` for DeepSeek's node limit, and `bias`
-    for its aux-loss-free balancing bias.
+    `groups` with `groups_per_token` for DeepSeek's node limit, `group_score`
+    for how a group is scored ('top2' is V3's, 'max' is V2's), `bias`
+    for V3's aux-loss-free balancing bias, and `scale_inputs` for Llama 4's
+    weight on the expert input rather than its output.
+
+    `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
+    beside the dense feed-forward on the same residual and the two are
+    summed after a norm each, under `Gemma4TextRouter`, which softmaxes,
+    keeps the renormalised top k and scales each choice per expert; the
+    routing dials above belong to the replacing routers and are refused
+    with it.
 
     `expert_features` is the routed experts' width, None for the model's
     `mlp_features`; DeepSeek sizes its experts apart from its dense layers
@@ -133,7 +150,10 @@ class Mixture:
     scaling: float = 1.0
     groups: int = 1
     groups_per_token: int = 1
+    group_score: str = 'top2'
     bias: bool = False
+    scale_inputs: bool = False
+    parallel: bool = False
     expert_features: Optional[int] = None
     shared_features: int = 0
 
@@ -158,6 +178,14 @@ class Mixture:
             raise ValueError(
                 f"shared_features is the shared branch's width, got "
                 f"{self.shared_features}; 0 is a layer without one")
+        if self.parallel and (
+                self.score_function != 'softmax' or not self.norm_topk_prob
+                or self.scaling != 1.0 or self.groups != 1 or self.bias
+                or self.scale_inputs or self.shared_features):
+            raise ValueError(
+                "a parallel mixture routes with Gemma 4's router, which has no "
+                "score function, scaling, groups, balancing bias, input scaling "
+                "or shared branch to set")
 
 
 @logical_axes({
@@ -205,7 +233,10 @@ class CausalSelfAttention(nn.Module):
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: Optional[bool] = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    attention_sinks: bool = False
+    yarn: Optional[YarnScaling] = None
     attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
+    k_eq_v: bool = False  # Gemma 4's global layers project no values: the raw keys, values-normed
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
@@ -227,7 +258,8 @@ class CausalSelfAttention(nn.Module):
         # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.kv_shared:
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-            self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
+            if not self.k_eq_v:
+                self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
         if self.qk_norm:
@@ -300,10 +332,13 @@ class CausalSelfAttention(nn.Module):
             key, value, positions = kv_store[self.kv_store_key]
         else:
             key = self.k_proj(x)
+            # attention_k_eq_v reads the values off the key projection before
+            # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
+            value = (key if self.k_eq_v else self.v_proj(x)).reshape(
+                B, S, self.num_kv_heads, self.head_dim)
             if whole:
                 key = self.k_norm(key)
             key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
-            value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
             if self.qk_norm and not whole:
                 key = self.k_norm(key)
             if self.v_norm:
@@ -326,9 +361,17 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.arange(S)
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
-        freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
+        if self.yarn is None:
+            freqs_cos, freqs_sin = rotary_freqs(
+                positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
+        else:
+            if self.partial_rotary_factor is not None or self.rope_scaling is not None:
+                raise ValueError(
+                    "yarn rotates whole heads at its own frequencies, so it takes "
+                    "neither partial_rotary_factor nor rope_scaling")
+            freqs_cos, freqs_sin = mla_rope_freqs(
+                positions, self.head_dim, self.rope_theta, self.yarn)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -387,7 +430,10 @@ class CausalSelfAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask, softcap=self.attn_logit_softcap)
+            sliding_window=window, mask=mask,
+            sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
+                   if self.attention_sinks else None),
+            softcap=self.attn_logit_softcap)
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
@@ -413,10 +459,14 @@ class GatedMLP(nn.Module):
     the erf form (HF's gelu, which Gemma's released config names).
 
     Bias-free, like the gated MLP of every open decoder this loads.
+
+    activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
+    nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
     """
     hidden_features: int
     out_features: int
     activation: str = 'swiglu'
+    activation_sparsity: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -424,6 +474,10 @@ class GatedMLP(nn.Module):
         if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
                 f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
+        if not 0 <= self.activation_sparsity < 1:
+            raise ValueError(
+                f"activation_sparsity is the fraction of gate activations dropped, "
+                f"within [0, 1), got {self.activation_sparsity}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.gate_proj = dense(self.hidden_features, name='gate_proj')
@@ -432,6 +486,8 @@ class GatedMLP(nn.Module):
 
     def __call__(self, x):
         gate = self.gate_proj(x)
+        if self.activation_sparsity:
+            gate = gaussian_topk(gate, self.activation_sparsity)
         gate = _gated_activation(self.activation, gate)
         return self.down_proj(gate * self.up_proj(x))
 
@@ -461,6 +517,14 @@ class DecoderBlock(nn.Module):
     reads its provider's keys and values; a mixer without a kv_store keyword
     fails loudly when a run shares. per_layer_input is the layer's input
     signal for the per-layer residual, None when the model has none.
+
+    altup makes the block take and return Gemma 3n's stack of residual
+    copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
+    active prediction, corrects every copy by what it computed, and adds the
+    per-layer residual to the copies past the first rather than to its own
+    output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
+    adds the LAuReL block over the attention's normed input, averaged with
+    the attention residual over sqrt(2).
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -471,6 +535,12 @@ class DecoderBlock(nn.Module):
     sandwich_norms: bool = False
     pre_norms: bool = True
     per_layer_input_dim: int = 0
+    parallel: Optional[Callable[..., nn.Module]] = None
+    """A branch summed with the feed-forward's output before its output norm,
+    called with the residual and that output (Gemma 4's routed experts)."""
+    layer_scalar: bool = False  # Gemma 4 multiplies each layer's output by a learned scalar
+    altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
+    laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -488,6 +558,12 @@ class DecoderBlock(nn.Module):
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
         self.mlp = self.feedforward(name='mlp')
+        if self.parallel is not None:
+            self.moe = self.parallel(name='moe')
+        if self.layer_scalar:
+            # The reference's layer_scalar buffer, a checkpoint leaf of one
+            # value, which the released Gemma 4 checkpoints carry.
+            self.output_scalar = self.param('layer_scalar', nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
@@ -496,31 +572,73 @@ class DecoderBlock(nn.Module):
             self.per_layer_projection = dense(self.emb_features,
                                               name='per_layer_projection')
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
+        if self.altup is not None:
+            if not self.pre_norms or self.parallel is not None or self.layer_scalar:
+                raise ValueError(
+                    "altup runs Gemma 3n's block, which has its pre-norms and "
+                    "neither a parallel branch nor a layer scalar")
+            self.altup_layer = AltUpLayer(
+                spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
+                dtype=self.dtype, precision=self.precision, name='altup')
+        if self.laurel_rank is not None:
+            if self.laurel_rank < 1 or not self.pre_norms:
+                raise ValueError(
+                    f"laurel_rank is the width of the learned augmented residual "
+                    f"over the attention's normed input, got {self.laurel_rank} "
+                    f"with pre_norms={self.pre_norms}")
+            self.laurel = LaurelBlock(
+                rank=self.laurel_rank, emb_features=self.emb_features,
+                norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
+                name='laurel')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  per_layer_input=None):
-        mixed = self.self_attn(self.input_layernorm(x) if self.pre_norms else x,
+        altup = self.altup
+        predictions = None if altup is None else self.altup_layer.predict(x, train=train)
+        if altup is not None and predictions is not None:
+            x = predictions[altup.active_idx]
+        normed = self.input_layernorm(x) if self.pre_norms else x
+        mixed = self.self_attn(normed,
                                decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}))
         if self.sandwich_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
+        if self.laurel_rank is not None:
+            x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
         hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
+        if self.parallel is not None:
+            hidden = self.moe(x, hidden)
         if self.sandwich_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
+        if altup is not None and predictions is not None:
+            corrected = self.altup_layer.correct(predictions, x, train=train)
+            if self.per_layer_input_dim and per_layer_input is not None:
+                first = corrected[altup.active_idx]
+                if altup.correct_scale:
+                    first = self.altup_layer.scale_corrected_output(first)
+                # The per-layer residual lands on the copies past the first,
+                # the active one left as corrected.
+                corrected = corrected.at[1:].add(self._per_layer_residual(first, per_layer_input))
+            return corrected
         if self.per_layer_input_dim and per_layer_input is not None:
-            # Gemma 3n/4's per-layer residual (modeling_gemma4.py,
-            # Gemma4TextDecoderLayer): the layer's own gate over x, activated
-            # like its feed-forward, multiplied by the layer's input signal,
-            # projected back and normed.
-            gated = self.per_layer_input_gate(x)
-            gated = _gated_activation(self._gate_activation, gated)
-            projected = self.per_layer_projection(gated * per_layer_input)
-            x = x + self.post_per_layer_input_norm(projected)
+            x = x + self._per_layer_residual(x, per_layer_input)
+        if self.layer_scalar:
+            x = x * self.output_scalar.astype(x.dtype)
         return x
+
+    def _per_layer_residual(self, x, per_layer_input):
+        """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
+        Gemma4TextDecoderLayer): the layer's own gate over x, activated like
+        its feed-forward, multiplied by the layer's input signal, projected
+        back and normed."""
+        gated = self.per_layer_input_gate(x)
+        gated = _gated_activation(self._gate_activation, gated)
+        projected = self.per_layer_projection(gated * per_layer_input)
+        return self.post_per_layer_input_norm(projected)
 
     @property
     def _gate_activation(self) -> str:
@@ -534,12 +652,15 @@ class DecoderBlock(nn.Module):
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
 
-    The depth reads the previous hidden states through `enorm` and the token
-    embeddings through `hnorm`, projects the concatenated pair back to the
-    model width, and runs one decoder block over it
-    (modeling_deepseek_v3.py, DeepseekV3MultiTokenPredictor). `block` is a
-    plain forward block: multi-token prediction is a training-time
-    auxiliary, so there is no decode path and no cache.
+    The depth norms the token embeddings with `enorm` and the previous
+    hidden states with `hnorm`, projects the pair concatenated in that
+    order back to the model width, and runs one decoder block over it. That
+    composition is what the released MTP weights were trained for, which
+    the engines that run them state (vLLM deepseek_mtp.py and
+    glm4_moe_mtp.py, SGLang's DeepseekV3ForCausalLMNextN); transformers
+    builds no depth. `block` is a plain forward block: multi-token
+    prediction is a training-time auxiliary, so there is no decode path and
+    no cache.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -577,7 +698,7 @@ class MTPBlock(nn.Module):
     def __call__(self, hidden, embeds, train: bool = False,
                  positions=None, segment_ids=None):
         fused = self.eh_proj(jnp.concatenate(
-            [self.enorm(hidden), self.hnorm(embeds)], axis=-1))
+            [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
         return self.final_norm(self.block(
             fused, train=train, positions=positions, segment_ids=segment_ids))
 
@@ -588,7 +709,11 @@ class MTPBlock(nn.Module):
     ("lm_head",): ("embed", "vocab"),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
-})
+    # AltUp's copies enter and leave through embed-by-embed projections, one
+    # per copy past the first, named by their index like the layers; a
+    # square kernel takes the shape heuristic the way the other indexed
+    # projections do.
+}, heuristic=(("altup_projections_*",), ("altup_unembed_projections_*",)))
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -627,6 +752,15 @@ class CausalTransformer(nn.Module):
     decoder and leaves the tree unchanged, and use_double_wide_mlp, which
     widens the sharing layers' MLP, needs it.
 
+    altup carries Gemma 3n's `altup_num_inputs` copies of the residual stream
+    (`dew.nn.gemma3n`): the embeddings and their projections enter the
+    layers as a stack, each block predicts the copies, runs on the active
+    one and corrects them all, and the copies come back through their own
+    projections to a mean the final norm reads. laurel_rank adds the LAuReL
+    block to every layer, activation_sparsity_pattern the gaussian top-k on
+    each layer's gate, and a tuple mlp_features gives each layer its own
+    feed-forward width. None and an int are a plain decoder.
+
     partial_rotary_factor rotates that fraction of an unwindowed kind's head
     dims and passes the rest through; a windowed kind rotates whole.
     partial_rotary_type names which published convention the fraction
@@ -664,7 +798,7 @@ class CausalTransformer(nn.Module):
     num_kv_heads: Optional[int] = None       # None: as many as the query heads
     head_dim: Optional[int] = None           # None: emb_features // num_heads
     mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
-    mlp_features: Optional[int] = None       # None: four times emb_features
+    mlp_features: Union[int, Tuple[int, ...], None] = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp, unless a kind states its own
@@ -680,9 +814,13 @@ class CausalTransformer(nn.Module):
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
+    attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
+    layer_scalar: bool = False               # Gemma 4 scales each layer's output by a learned scalar
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
     o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    attention_sinks: bool = False
+    yarn: Optional[YarnScaling] = None
     attn_logit_softcap: Optional[float] = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -701,14 +839,26 @@ class CausalTransformer(nn.Module):
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
+    altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
+    laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
+    activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
 
     def __post_init__(self):
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        if isinstance(self.mlp_features, (tuple, list)):
+            object.__setattr__(self, "mlp_features", tuple(int(width) for width in self.mlp_features))
+        if self.activation_sparsity_pattern is not None:
+            object.__setattr__(self, "activation_sparsity_pattern",
+                               tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
+        if isinstance(self.altup, Mapping):
+            object.__setattr__(self, "altup", AltUp(**self.altup))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, which is what a test or
         # a notebook writes.
+        if isinstance(self.yarn, Mapping):
+            object.__setattr__(self, 'yarn', YarnScaling(**self.yarn))
         if isinstance(self.mixture, Mapping):
             object.__setattr__(self, "mixture", Mixture(**self.mixture))
         if isinstance(self.rope_scaling, Mapping):
@@ -741,9 +891,26 @@ class CausalTransformer(nn.Module):
                 if self.head_dim is None else self.head_dim)
 
     @property
+    def mlp_widths(self) -> Tuple[int, ...]:
+        """Each layer's dense feed-forward width."""
+        if self.mlp_features is None:
+            return (4 * self.emb_features,) * self.num_layers
+        if isinstance(self.mlp_features, tuple):
+            return self.mlp_features
+        return (self.mlp_features,) * self.num_layers
+
+    @property
     def hidden_features(self) -> int:
-        return (4 * self.emb_features
-                if self.mlp_features is None else self.mlp_features)
+        """The model's one feed-forward width, which the routed experts fall
+        back to and the prediction depths take; a model whose layers differ
+        has none."""
+        widths = set(self.mlp_widths)
+        if len(widths) != 1:
+            raise ValueError(
+                f"mlp_features names a width per layer ({self.mlp_features}), so "
+                f"the model has no single feed-forward width; set the mixture's "
+                f"expert_features and leave the prediction depths off")
+        return widths.pop()
 
     @property
     def per_layer_types(self) -> Tuple[str, ...]:
@@ -756,6 +923,7 @@ class CausalTransformer(nn.Module):
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
+            num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
@@ -818,7 +986,7 @@ class CausalTransformer(nn.Module):
         return MixerContext(
             emb_features=self.emb_features,
             num_heads=self.num_heads,
-            num_kv_heads=self.kv_heads,
+            num_kv_heads=kind.num_kv_heads,
             head_dim=kind.head_dim,
             max_seq_len=self.max_seq_len,
             causal=self.causal,
@@ -827,6 +995,7 @@ class CausalTransformer(nn.Module):
             qk_norm=self.qk_norm,
             qk_norm_scope=self.qk_norm_scope,
             v_norm=self.v_norm,
+            k_eq_v=self.attention_k_eq_v and kind.window is None,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
@@ -836,6 +1005,8 @@ class CausalTransformer(nn.Module):
             attention_bias=self.attention_bias,
             o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
+            attention_sinks=self.attention_sinks,
+            yarn=self.yarn,
             attn_logit_softcap=self.attn_logit_softcap,
             output_gate=self.output_gate,
             dtype=self.dtype,
@@ -865,6 +1036,10 @@ class CausalTransformer(nn.Module):
             if kind.window is not None and kind.window < 1:
                 raise ValueError(
                     f"the window of {layer_type!r} must be positive, got {kind.window}")
+            if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
+                raise ValueError(
+                    f"num_heads ({self.num_heads}) must be a multiple of the key/value "
+                    f"heads of {layer_type!r} ({kind.num_kv_heads})")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -898,6 +1073,21 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"num_nextn_predict_layers counts prediction depths, got "
                 f"{self.num_nextn_predict_layers}; 0 is a model without them")
+        widths = self.mlp_widths
+        if len(widths) != self.num_layers or min(widths) < 1:
+            raise ValueError(
+                f"mlp_features names one positive width per layer of "
+                f"{self.num_layers}, got {self.mlp_features}")
+        sparsity = self.activation_sparsity_pattern
+        if sparsity is not None and (len(sparsity) != self.num_layers
+                                     or not all(0 <= fraction < 1 for fraction in sparsity)):
+            raise ValueError(
+                f"activation_sparsity_pattern names one fraction within [0, 1) per "
+                f"layer of {self.num_layers}, got {sparsity}")
+        if self.altup is not None and self.num_nextn_predict_layers:
+            raise ValueError(
+                "altup carries a stack of residual copies through the layers and "
+                "the prediction depths read one, so a model has one or the other")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -943,10 +1133,37 @@ class CausalTransformer(nn.Module):
             routed_scaling_factor=mixture.scaling,
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
+            group_score=mixture.group_score,
             expert_bias=mixture.bias,
+            scale_inputs=mixture.scale_inputs,
             shared=shared,
             dtype=self.dtype,
             precision=self.precision)
+        parallel = None if mixture is None or not mixture.parallel else functools.partial(
+            Gemma4Experts,
+            num_experts=mixture.experts,
+            top_k=mixture.top_k,
+            hidden_features=(self.hidden_features
+                             if mixture.expert_features is None
+                             else mixture.expert_features),
+            out_features=self.emb_features,
+            activation=self.mlp,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype,
+            precision=self.precision)
+        if parallel is not None:
+            # The branch rides beside every sparse layer's dense feed-forward.
+            routed = None
+        if self.mlp == 'swigluoai':
+            if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
+                raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+            routed = functools.partial(
+                GptOssMLP, hidden_size=self.emb_features,
+                intermediate_size=self.hidden_features,
+                num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
+                dtype=self.dtype, precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. The one dispatch stays build over
         # the layer's context.
@@ -960,11 +1177,12 @@ class CausalTransformer(nn.Module):
                     if index in sparse and routed is not None else
                     functools.partial(
                         GatedMLP,
-                        hidden_features=(2 * self.hidden_features
+                        hidden_features=(2 * widths[index]
                                          if self.use_double_wide_mlp and index in sharing
-                                         else self.hidden_features),
+                                         else widths[index]),
                         out_features=self.emb_features,
                         activation=self.mlp,
+                        activation_sparsity=0.0 if sparsity is None else sparsity[index],
                         precision=self.precision)),
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
@@ -973,6 +1191,10 @@ class CausalTransformer(nn.Module):
                 sandwich_norms=self.sandwich_norms,
                 pre_norms=self.pre_norms,
                 per_layer_input_dim=ple or 0,
+                parallel=parallel if index in sparse else None,
+                layer_scalar=self.layer_scalar,
+                altup=self.altup,
+                laurel_rank=self.laurel_rank,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
                 precision=self.precision,
@@ -980,16 +1202,22 @@ class CausalTransformer(nn.Module):
             for index, layer_type in enumerate(types)]
         # Prediction depths mirror whole-sequence hidden states, so their
         # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward is dense.
+        # one, else from the first layer's kind; the feed-forward routes
+        # like the last layer's (GLM 4.5 ships its depth with the trunk's
+        # experts) and is dense otherwise.
         mtp_type = 'full_attention' if 'full_attention' in types else types[0]
         mtp_mixer = mixer_spec.build(self.mixer_context(
             kinds[mtp_type], mtp_type, False))
-        mtp_feedforward = functools.partial(
-            GatedMLP,
-            hidden_features=self.hidden_features,
-            out_features=self.emb_features,
-            activation=self.mlp,
-            precision=self.precision)
+        mtp_feedforward = (
+            routed if routed is not None and self.num_layers - 1 in sparse else
+            functools.partial(
+                GatedMLP,
+                # The last layer's width: the one width of every model with
+                # depths, since the widths that vary are Gemma 3n's alone.
+                hidden_features=widths[-1],
+                out_features=self.emb_features,
+                activation=self.mlp,
+                precision=self.precision))
         self.mtp = [
             MTPBlock(
                 mixer=mtp_mixer, feedforward=mtp_feedforward,
@@ -1002,6 +1230,19 @@ class CausalTransformer(nn.Module):
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
+        if self.altup is not None:
+            # The copies past the first enter through their own projections
+            # and leave through their own (modeling_gemma3n.py,
+            # Gemma3nTextModel.altup_projections and altup_unembed_projections).
+            projection = functools.partial(
+                nn.Dense, self.emb_features, use_bias=False, dtype=self.dtype,
+                precision=self.precision)
+            self.altup_projections = [
+                projection(name=f'altup_projections_{index}')
+                for index in range(self.altup.num_inputs - 1)]
+            self.altup_unembed_projections = [
+                projection(name=f'altup_unembed_projections_{index}')
+                for index in range(self.altup.num_inputs - 1)]
         self.norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
@@ -1099,12 +1340,23 @@ class CausalTransformer(nn.Module):
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
         ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        if self.altup is not None:
+            # The embeddings and, rescaled to their magnitude, each projected
+            # copy: [num_inputs, B, S, D].
+            x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
         kv_store = {} if self.num_kv_shared_layers else None
         for index, layer in enumerate(self.layers):
             x = layer(x, train=train, decode=decode,
                       positions=positions, segment_ids=segment_ids,
                       kv_store=kv_store,
                       per_layer_input=None if ple is None else ple[:, :, index, :])
+        if self.altup is not None:
+            # The copies past the first come back through their own
+            # projections, rescaled to the first's magnitude, and the mean of
+            # all of them is what the final norm reads.
+            copies = [x[0]] + [rescale_to(project(copy), x[0])
+                               for project, copy in zip(self.altup_unembed_projections, x[1:])]
+            x = jnp.mean(jnp.stack(copies), axis=0)
         return self.norm(x)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
