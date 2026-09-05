@@ -425,8 +425,10 @@ def test_jepa_trains_under_fsdp(mask):
                      jax.tree.leaves(state.params["params"]["context_encoder"])]
     assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]
     assert int(state.step) == 2
-    assert all(np.isfinite(entry["train/loss"]) for entry in logged)
-    assert all(entry["train/repr_std"] > 0 for entry in logged), "collapse telemetry was lost"
+    ticks = [entry for entry in logged if "train/loss" in entry]
+    assert len(ticks) == 2
+    assert all(np.isfinite(entry["train/loss"]) for entry in ticks)
+    assert all(entry["train/repr_std"] > 0 for entry in ticks), "collapse telemetry was lost"
 
 
 def test_evaluation_reads_the_ema_encoder(mask):

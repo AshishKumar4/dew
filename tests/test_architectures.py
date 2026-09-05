@@ -540,7 +540,7 @@ def run_case(case: Case, tmp_path, fsdp):
                         metrics=(Spread(seen, artifact),))
 
     assert dict(trainer.device_mesh.shape) == {"data": jax.device_count() // fsdp, "expert": 1,
-                                               "fsdp": fsdp, "tensor": 1, "sequence": 1}
+                                               "fsdp": fsdp, "tensor": 1, "sequence": 1, "stage": 1}
     assert int(state.step) == 2
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == 2 and all(np.isfinite(loss) for loss in losses), losses

@@ -37,8 +37,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple, Union
 
+import ml_dtypes
 import numpy as np
 
+from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
@@ -1637,7 +1639,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     return variables
 
 
-_DTYPES = {'F32': np.float32, 'F16': np.float16}
+# An fp8 weight widens to fp32 exactly, and its block scales are applied by
+# `dequantize_checkpoint` once every shard is read.
+_DTYPES = {'F32': np.float32, 'F16': np.float16, 'F8_E4M3': ml_dtypes.float8_e4m3fn}
 # MXFP4 payloads stay uint8. They are unpacked into weights by the family
 # that reads them.
 _PACKED = {'U8': np.uint8}
@@ -1723,7 +1727,7 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
     if max_seq_len is not None:
         config['max_seq_len'] = int(max_seq_len)
 
-    tensors = _load_shards(directory)
+    tensors = dequantize_checkpoint(_load_shards(directory), fp8_block(hf_config))
     variables = translate_weights(tensors, config)
 
     built = with_precision('causal_transformer', config,

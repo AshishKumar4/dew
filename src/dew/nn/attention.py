@@ -8,10 +8,11 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional
 from flax.typing import Dtype, PrecisionLike
+from jax.sharding import PartitionSpec as P
 from flax.linen.dtypes import promote_dtype
 import functools
 import math
-from .sharding import logical_axes
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 from .attention_sinks import attention_with_sinks
 
 def repeat_kv_heads(x, num_heads: int):
@@ -230,6 +231,13 @@ def open_kv_cache(module: nn.Module, key, max_seq_len):
     first call only allocates: a freshly initialised model hands back a zeroed
     cache at index 0.
     """
+    shards = sequence_shards()
+    if shards > 1:
+        raise ValueError(
+            f"decoding is not supported under a sequence axis of {shards}: the KV "
+            "cache holds whole sequences and appends one token to each, which "
+            "sequence parallelism splits over devices. Generate on a mesh with "
+            "sequence=1.")
     if max_seq_len is None:
         raise ValueError(
             "decoding needs max_seq_len: the KV cache is allocated once, at the "
@@ -304,6 +312,90 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     return out[:, :q_len] if q_pad else out
 
 
+def stripe(x, shards: int, axis: int = 1):
+    """`x` with `axis` in the striped order of load-balanced context
+    parallelism: the axis is cut into 2 * shards chunks and shard i holds
+    chunks i and 2 * shards - 1 - i, so under a causal mask every shard's
+    queries see the same number of (query, key) pairs. For two shards,
+    [0, 1, 2, 3, 4, 5, 6, 7] becomes [0, 1, 6, 7, 2, 3, 4, 5], the order
+    MaxText's reorder_sequence writes (src/maxtext/utils/maxtext_utils.py).
+
+    Written as a reshape, two slices, a flip and a stack, not as a gather
+    with the permutation: GSPMD lowers these to
+    collective-permutes of the chunks that change shard, half of the rows,
+    and a gather along a split axis to an all-gather of the whole array on
+    every device (measured in tests/test_sequence_parallel.py).
+    """
+    axis %= x.ndim
+    length = x.shape[axis]
+    if length % (2 * shards):
+        raise ValueError(
+            f"sequence parallelism over {shards} shards pairs chunks of the "
+            f"sequence to balance the causal work, which needs the sequence "
+            f"length to be a multiple of {2 * shards}, got {length}")
+    chunk = length // (2 * shards)
+    chunks = x.reshape(x.shape[:axis] + (2 * shards, chunk) + x.shape[axis + 1:])
+    first = jax.lax.slice_in_dim(chunks, 0, shards, axis=axis)
+    second = jnp.flip(jax.lax.slice_in_dim(chunks, shards, 2 * shards, axis=axis), axis=axis)
+    return jnp.stack([first, second], axis=axis + 1).reshape(x.shape)
+
+
+def unstripe(x, shards: int, axis: int = 1):
+    """The inverse of `stripe`: `axis` back in sequence order."""
+    axis %= x.ndim
+    chunk = x.shape[axis] // (2 * shards)
+    pairs = x.reshape(x.shape[:axis] + (shards, 2, chunk) + x.shape[axis + 1:])
+    first = jax.lax.index_in_dim(pairs, 0, axis=axis + 1, keepdims=False)
+    second = jnp.flip(jax.lax.index_in_dim(pairs, 1, axis=axis + 1, keepdims=False), axis=axis)
+    return jnp.concatenate([first, second], axis=axis).reshape(x.shape)
+
+
+def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causal,
+                                sliding_window, mask, bias):
+    """`kernel` over queries split along the sequence axis of the mesh in
+    context, with the keys and values gathered whole once.
+
+    The batch rows of every activation stay split over the mesh's other
+    axes but tensor and stage, which hold a width and a pipeline stage and
+    never a row; the heads are left to GSPMD, so a width the rules put on
+    the tensor axis stays there. A
+    causal call, a windowed one and a masked one reorder the queries with
+    `stripe` so each shard holds equal causal work, carry the queries'
+    positions into the mask (`causal_attention_mask` reads positions, so the
+    mask and the rotary angles the caller already applied stay exact under
+    the reorder) and put the output back in sequence order with
+    `unstripe`. A call with no mask at all has equal work on every row and
+    keeps its order. Under the reorder the kernels see an explicit mask, not
+    their causal flag: a striped row's position is in the mask, not its index.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    rows = tuple(axis for axis in mesh.axis_names
+                 if axis not in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS))
+    split = P(rows or None, SEQUENCE_AXIS, P.UNCONSTRAINED, P.UNCONSTRAINED)
+    whole = P(rows or None, None, P.UNCONSTRAINED, P.UNCONSTRAINED)
+    constrain = jax.lax.with_sharding_constraint
+    query = constrain(query, split)
+    key, value = constrain(key, whole), constrain(value, whole)
+    if not (causal or sliding_window is not None or mask is not None):
+        return constrain(kernel(query, key, value, causal=False, sliding_window=None,
+                                mask=None, bias=bias), split)
+
+    q_len, kv_len = query.shape[-3], key.shape[-3]
+    query = constrain(stripe(query, shards), split)
+
+    def rows_in_order(x: jax.Array | None) -> jax.Array | None:
+        # A broadcast query row has the same value in either order.
+        if x is not None and x.ndim >= 2 and x.shape[-2] == q_len:
+            return stripe(x, shards, axis=-2)
+        return x
+
+    mask, bias = rows_in_order(mask), rows_in_order(bias)
+    if causal or sliding_window is not None:
+        structural = causal_attention_mask(
+            stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
+        mask = structural if mask is None else jnp.logical_and(mask, structural)
+    out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias)
+    return constrain(unstripe(constrain(out, split), shards), split)
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 CUDNN_MAX_HEAD_DIM = 128
 
@@ -390,6 +482,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     and xla paths include it in the denominator; auto chooses xla, and the
     fused cudnn and tpu kernels refuse it.
 
+    Under a mesh in context whose sequence axis is above one, the call runs
+    through `sequence_parallel_attention`: the queries split over that axis,
+    the keys and values are gathered whole, and a causal or masked call
+    balances its work across the shards.
+
     `softcap` is Gemma 2's tanh on the scaled logits before the mask and the
     softmax. No fused kernel applies it, so a softcapped call runs
     `softcapped_attention` under both the reference and the xla
@@ -397,6 +494,24 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
     raise a ValueError that names the implementation.
     """
+    kernel = functools.partial(
+        attention_kernel, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
+        sinks=sinks, softcap=softcap)
+    shards = sequence_shards()
+    if shards > 1:
+        return sequence_parallel_attention(
+            kernel, query, key, value, shards, causal=causal,
+            sliding_window=sliding_window, mask=mask, bias=bias)
+    return kernel(query, key, value, causal=causal, sliding_window=sliding_window,
+                  mask=mask, bias=bias)
+
+
+def attention_kernel(query, key, value, dtype=None, precision=None,
+                     force_fp32_for_softmax=True, implementation=None,
+                     causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
+                     softcap=None):
+    """`scaled_dot_product_attention`'s kernel dispatch over whole sequences."""
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if sinks is not None:

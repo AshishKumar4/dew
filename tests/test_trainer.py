@@ -369,6 +369,110 @@ def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
     assert not (tmp_path / "gs:").exists()
 
 
+# --------------------------------------------------------------------------
+# Local checkpoints
+# --------------------------------------------------------------------------
+
+def local_trainer(tmp_path, **kwargs):
+    return Trainer(
+        Regression(), optax.sgd(0.1), key=jax.random.key(0),
+        layout=Layout(min_shard=1, tolerance=1.0),
+        checkpoints=Checkpoints(str(tmp_path / "run"), keep=4,
+                                local_directory=str(tmp_path / "local"), local_every=2),
+        **kwargs)
+
+
+def stop_at_local_step(trainer, stop: int):
+    """Kill the run right after its local save of `stop` has landed."""
+    class Stop(Exception):
+        pass
+
+    save_local = trainer.checkpoints.save_local
+
+    def save_then_stop(step, state, position):
+        save_local(step, state, position)
+        trainer.checkpoints.wait()
+        if step == stop:
+            raise Stop()
+
+    trainer.checkpoints.save_local = save_then_stop
+    with pytest.raises(Stop):
+        trainer.fit(Data(), steps=100, log_every=1, checkpoint_every=3)
+
+
+def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest(tmp_path):
+    """Local every two, persistent every three: after eight steps the
+    persistent directory holds 3, 6 and the final 8 with their losses, the
+    local one holds 6 alone (2 and 4 replaced, the end of the run being the
+    persistent save's), and the persistent directory holds nothing of the
+    local cadence."""
+    trainer = local_trainer(tmp_path)
+    trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
+    checkpoints = trainer.checkpoints
+
+    assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
+    assert sorted(checkpoints._open_local().all_steps()) == [6]
+    assert checkpoints.best in (3, 6, 8)
+    assert checkpoints.local_path == str(tmp_path / "local" / "process0")
+    assert (tmp_path / "local" / "process0" / "6" / "commit_success.txt").exists()
+    assert not (tmp_path / "local" / "process0" / "4").exists()
+    assert not (tmp_path / "run" / "4").exists()
+
+
+def test_a_newer_local_checkpoint_wins_the_resume_and_leaves_the_persistent_one(tmp_path):
+    """Killed after local step 8 with persistent step 6 the newest on disk:
+    the resume opens at 8, reads it from the local directory, and lands
+    where an unkilled run lands, while the persistent files at 3 and 6 are
+    byte for byte what they were."""
+    stop_at_local_step(local_trainer(tmp_path), 8)
+    persistent = tmp_path / "run"
+    assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6]
+    before = {path: path.read_bytes() for path in persistent.rglob("*") if path.is_file()}
+    checkpoints = Checkpoints(str(persistent), local_directory=str(tmp_path / "local"),
+                              local_every=2)
+    assert checkpoints.latest == 8
+    assert checkpoints.source(8) == str(tmp_path / "local" / "process0")
+    assert checkpoints.source(6) == str(persistent)
+
+    resumed = local_trainer(tmp_path).fit(Data(), steps=9, log_every=1, checkpoint_every=3)
+    whole = make_trainer(tmp_path / "whole").fit(Data(), steps=9, log_every=1, checkpoint_every=3)
+
+    assert int(resumed.step) == 9
+    assert jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
+                        resumed.params, whole.params) == jax.tree.map(lambda _: True, whole.params)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6, 9]
+
+
+@pytest.mark.mesh
+def test_a_local_checkpoint_refuses_another_placement_and_names_the_way_out(tmp_path):
+    """The local copy holds this process's shards for the mesh it was
+    written on; a resume on another mesh is refused with the leaf that
+    moved and the persistent step to fall back to."""
+    stop_at_local_step(local_trainer(tmp_path), 8)
+
+    with pytest.raises(ValueError) as error:
+        local_trainer(tmp_path, mesh=MeshSpec(fsdp=2)).fit(Data(), steps=9, log_every=1)
+    message = str(error.value)
+    assert "holds step 8 written with" in message and "places it as" in message
+    assert f"delete {tmp_path / 'local'}" in message
+    assert "persistent checkpoint at step 6" in message
+
+
+def test_local_checkpoints_take_both_the_directory_and_the_cadence(tmp_path):
+    with pytest.raises(ValueError, match="both local_directory and local_every"):
+        Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"))
+    with pytest.raises(ValueError, match="both local_directory and local_every"):
+        Checkpoints(str(tmp_path / "run"), local_every=2)
+    with pytest.raises(ValueError, match="local_every must be at least 1"):
+        Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"), local_every=0)
+
+
+def test_a_local_cadence_needs_a_stream_that_reports_its_position(tmp_path):
+    with pytest.raises(ValueError, match="get_state"):
+        local_trainer(tmp_path).fit(Data(endless), steps=2)
+
+
 class ExplodingManager:
     """Orbax when the filesystem refuses the write.
 
@@ -511,9 +615,9 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
     tracker = RecordingTracker()
     make_trainer(tracker=tracker).fit(Data(endless), steps=4, log_every=2)
 
-    steps = [step for step, _ in tracker.scalars]
-    assert steps == [2, 4]
-    for _, scalars in tracker.scalars:
+    ticks = [(step, scalars) for step, scalars in tracker.scalars if "train/loss" in scalars]
+    assert [step for step, _ in ticks] == [2, 4]
+    for _, scalars in ticks:
         assert scalars["train/probe"] == 1.0
         assert np.isfinite(scalars["train/loss"])
         assert scalars["train/step_time_ms"] > 0
@@ -521,21 +625,32 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
 
 
 class ManualClock:
+    """Both clocks the trainer reads, advanced by hand."""
+
     def __init__(self):
         self.now = 0.0
 
     def time(self):
         return self.now
 
+    def perf_counter(self):
+        return self.now
+
 
 def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     """Every interval, the first one included, reports the time its steps
-    took; the compile is outside every window and never lands in train/step_time_ms."""
+    took; placement and compile are outside every window and never land in
+    train/step_time_ms, and the goodput numbers at the end count them as the
+    time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tracker=tracker)
-    compile_step = trainer.compile
+    place, compile_step = trainer.place, trainer.compile
+
+    def slow_place():
+        clock.now += 20.0
+        return place()
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -547,10 +662,68 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
             return outputs
         return timed
 
+    monkeypatch.setattr(trainer, "place", slow_place)
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     trainer.fit(Data(endless), steps=3, log_every=1)
 
-    assert [s["train/step_time_ms"] for _, s in tracker.scalars] == pytest.approx([1000.0] * 3)
+    ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
+    assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
+    # Placement (20), the compile (100) and the first step (1) make the time
+    # to the first step; the two steps after it are the 2 of 123 seconds in steps.
+    goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
+    assert [step for step, _ in goodput] == [3]
+    assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(121.0)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 123)
+
+
+def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkeypatch, tmp_path):
+    """Four steps of one second each, a compile of ten, an evaluation of
+    five at step two and at the end, a checkpoint write of two at step two
+    and at the end: the first step lands at 11, the other three steps are
+    the 3 seconds in steps of the 28 the fit took."""
+    clock = ManualClock()
+    monkeypatch.setattr(trainer_module, "time", clock)
+    tracker = RecordingTracker()
+    trainer = make_trainer(tmp_path, tracker=tracker)
+    compile_step, evaluate, save = trainer.compile, trainer._evaluate, trainer.checkpoints.save
+
+    def compile_then_time_each_step(*args):
+        executable = compile_step(*args)
+        clock.now += 10.0
+
+        def timed(*step_args):
+            outputs = executable(*step_args)
+            clock.now += 1.0
+            return outputs
+        return timed
+
+    def slow_evaluate(*args):
+        clock.now += 5.0
+        return evaluate(*args)
+
+    def slow_save(*args):
+        clock.now += 2.0
+        return save(*args)
+
+    monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
+    monkeypatch.setattr(trainer, "_evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
+    trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2)
+
+    goodput = [s for _, s in tracker.scalars if "goodput/step_fraction" in s]
+    assert len(goodput) == 1
+    assert goodput[0]["goodput/time_to_first_step_s"] == pytest.approx(11.0)
+    assert goodput[0]["goodput/step_fraction"] == pytest.approx(3 / 28)
+
+
+def test_goodput_arithmetic():
+    """The fraction is what is left of the wall time after the first step
+    and the time outside steps; a fit that ran no step has no first step and
+    no time in steps."""
+    assert trainer_module.goodput(10.0, 2.0, 3.0) == {
+        "goodput/time_to_first_step_s": 2.0, "goodput/step_fraction": 0.5}
+    assert trainer_module.goodput(10.0, None, 4.0) == {"goodput/step_fraction": 0.0}
+    assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
 
 
 def test_only_process_zero_logs_and_every_process_validates(monkeypatch):
@@ -819,7 +992,7 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
     # step 1 moved the discriminator half way to the generator.
     assert float(state.params["params"]["gen"]["g"]) == pytest.approx(0.5)
     assert float(state.params["params"]["disc"]["d"]) == pytest.approx(0.25)
-    assert [s["train/player"] for _, s in tracker.scalars] == [0.0, 1.0]
+    assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
     resumed = trainer().fit(Data(), steps=4, log_every=1)
     assert float(resumed.params["params"]["gen"]["g"]) == pytest.approx(0.75)

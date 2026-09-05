@@ -40,7 +40,7 @@ class Objective:
 - With `dynamic_scale=True`, the mixed-precision branch runs the same loss through `DynamicScale.value_and_grad`; a step whose gradients came back non-finite keeps the old params and optimizer state, does not advance the step and does not move the EMA.
 - The EMA runs on the update clock, not the micro-batch clock. Under `accumulation=k` the params only move on every k-th micro-step, so the average happens on that step and the decay schedule is indexed by completed updates.
 - The collections in `Aux.variables` are written back into the tree after the update.
-- The step is compiled once with explicit in and out shardings and donates the train state. `Trainer.compile(state, batch)` returns that step, and the benchmarks time it.
+- The step is compiled once with explicit in and out shardings and donates the train state. `Trainer.compile(state, batch)` returns the function that runs that step under the mesh context, and the benchmarks time it.
 
 Every `eval_every` steps the trainer runs the validation pass, calls `evaluate` on each batch, hands each artifact to the metrics that read its type, and to the tracker, which renders it. A `Metric` names the artifact type it `reads`, measures one batch, and `reduce`s a pass; `metrics.perplexity()` reads `TokenScores` and reduces to exp of the target-weighted mean over the whole pass, so a batch of padding weighs nothing. Every process agrees how many validation batches it holds before the pass starts, and an exception in evaluation fails the run.
 
