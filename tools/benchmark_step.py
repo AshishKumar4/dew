@@ -363,7 +363,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     peak_before = device_peak_bytes()
     trainer = build_trainer(case, config.attention_impl)
 
-    source = DevicePrefetchIterator(batches(case), trainer.batch_sharding)
+    source = DevicePrefetchIterator(batches(case), trainer.device_mesh)
     abstract = jax.eval_shape(trainer.initial_state)
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     scale = None

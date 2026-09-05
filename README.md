@@ -60,11 +60,11 @@ state = trainer.fit(data, steps=50 * data.steps_per_epoch)
 | `hybrid_dit` | S5 state space blocks between attention blocks |
 | `video_dit` | Factorized spatial and temporal attention for video |
 | `jepa_encoder`, `jepa_video_encoder`, `jepa_predictor` | The ViTs the JEPA objective trains |
-| `causal_transformer` | A decoder for language models, in the Hugging Face layout |
+| `causal_transformer` | A decoder for language models in the Hugging Face layout, with grouped-query attention or a gated delta net per layer, and a mixture of experts per layer |
 
 Each is a Flax module, registered under a name so a config file can build it: `models.build("simple_dit", patch_size=4, ...)`. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads unchanged on a TPU.
 
-Language model checkpoints load from Hugging Face. Qwen 3 and Gemma 3 and 4 text decoders translate and match the reference logits; DeepSeek V3 and V4, and the Qwen 3.5 linear-attention generation, are in progress.
+Language model checkpoints load from Hugging Face. Llama 3, Qwen 3, Qwen 3.5 (the gated delta net and full attention hybrid) and the Gemma 3 and 4 text decoders translate and match the reference logits; DeepSeek V3 and V3.2 (multi-head latent attention) are in progress.
 
 ## The parts
 
@@ -284,7 +284,7 @@ To work on dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The goal is to train the way the large labs train and to run what they release, on the same trainer.
 
-**Architecture parity.** Multi-head latent attention and multi-token prediction for DeepSeek V3 and V4; the GatedDeltaNet linear-attention mixer and gated attention for the Qwen 3.5 generation; the per-layer input embeddings and KV sharing Gemma 4 uses at its larger sizes; mixture of experts with shared experts; diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
+**Architecture parity.** Multi-head latent attention and multi-token prediction for DeepSeek V3 and V3.2, and from them Kimi K2; GLM 4.5 and 5; gpt-oss with its attention sinks; Mixtral and Llama 4; the per-layer input embeddings and KV sharing Gemma 4 uses at its larger sizes; diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
 
 **Systems.** Tensor, sequence and pipeline parallelism as further mesh axes; expert-parallel training; FP8 with fine-grained scaling and MXFP4 weight loading; the Muon and MuonClip optimizers; long context through RoPE scaling and sequence packing; multi-host checkpointing and goodput measurement; scan over layers for compile time at depth.
 
