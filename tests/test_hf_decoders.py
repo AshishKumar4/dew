@@ -8,6 +8,11 @@ whose logits are committed, so the comparison runs in CI without a download.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
+- gemma-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
+  7.0; Gemma 1 with hidden_act 'gelu', the erf form.
+- gemma2-tiny : max |logit difference| 4.05e-06, tolerance 1e-4, logits up to
+  10; alternating sliding and full layers, the sandwich norms without q/k
+  norms, and the attention softcap at 5, which moves the logits by 1.45.
 - mistral-tiny: max |logit difference| 6.44e-06, tolerance 1e-4.
 - qwen2-tiny  : max |logit difference| 8.39e-06, tolerance 1e-4, logits up to
   6.7; biased q/k/v over a bias-free o_proj, with a window from layer 1 on.
@@ -57,7 +62,8 @@ from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny")
+TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
+        "gemma-tiny", "gemma2-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("mixtral-tiny",)
 TORCH_VENV = Path("/tmp/hfref/bin/python")
@@ -215,8 +221,6 @@ def test_the_real_gemma3_1b_config_translates():
 
 @pytest.mark.parametrize("field, value, message", [
     ('model_type', 'mamba', "model_type 'mamba'"),
-
-    ('attn_logit_softcapping', 50.0, "attn_logit_softcapping"),
     ('use_bidirectional_attention', True, "use_bidirectional_attention"),
     ('hidden_activation', 'relu', "hidden_act 'relu'"),
     ('rope_parameters', {'rope_type': 'linear', 'factor': 8.0, 'rope_theta': 1e6},
@@ -228,6 +232,87 @@ def test_a_config_field_with_no_counterpart_is_refused(field, value, message):
     config = {**fixture_config("gemma3-tiny"), field: value}
     with pytest.raises(ValueError, match=message):
         translate_config(config)
+
+
+def test_an_attention_softcap_maps_where_the_reference_applies_it():
+    """Gemma 2 squashes its attention logits (modeling_gemma2.py:282); Gemma 3
+    reads the same field into its attention and never passes it on
+    (modeling_gemma3.py:334, :370-379), so there it changes nothing and maps
+    to nothing. Llama's reference has no such field at all."""
+    assert translate_config(fixture_config("gemma2-tiny"))['attn_logit_softcap'] == 5.0
+    ignored = translate_config({**fixture_config("gemma3-tiny"), 'attn_logit_softcapping': 50.0})
+    assert 'attn_logit_softcap' not in ignored
+    with pytest.raises(ValueError, match="attn_logit_softcapping"):
+        translate_config({**fixture_config("llama-tiny"), 'attn_logit_softcapping': 50.0})
+
+
+def test_the_released_gemma_2b_config_translates_field_by_field():
+    """unsloth/gemma-2b carries google/gemma-2b's config: hidden_act 'gelu',
+    which transformers 5.16.1 runs as the erf gelu (modeling_gemma.py:93),
+    the (1 + w) norms, sqrt(d) embeddings and a tied head."""
+    assert translate_config(fixture_config("gemma-2b")) == {
+        'vocab_size': 256000, 'emb_features': 2048, 'num_layers': 18,
+        'num_heads': 8, 'num_kv_heads': 1, 'head_dim': 256, 'mlp': 'geglu_exact',
+        'mlp_features': 16384, 'max_seq_len': 8192, 'rope_theta': 1e4,
+        'layer_types': ('full_attention',) * 18, 'kinds': {},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': True,
+        'scale_offset': True, 'embedding_scale': True,
+    }
+
+
+def test_the_released_gemma_2_2b_config_translates_field_by_field():
+    """unsloth/gemma-2-2b carries google/gemma-2-2b's config: 26 layers
+    alternating sliding and full at one rope base, query_pre_attn_scalar
+    256 on head_dim 256, both softcaps, and the sandwich norms."""
+    config = translate_config(fixture_config("gemma-2-2b"))
+    assert config == {
+        'vocab_size': 256000, 'emb_features': 2304, 'num_layers': 26,
+        'num_heads': 8, 'num_kv_heads': 4, 'head_dim': 256, 'mlp': 'geglu',
+        'mlp_features': 9216, 'max_seq_len': 8192, 'rope_theta': 1e4,
+        'layer_types': ('sliding_attention', 'full_attention') * 13,
+        'kinds': {'sliding_attention': {'window': 4096}},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': True,
+        'scale_offset': True, 'embedding_scale': True, 'sandwich_norms': True,
+        'attention_scale': 256 ** -0.5, 'final_logit_softcap': 30.0,
+        'attn_logit_softcap': 50.0,
+    }
+
+
+def test_a_gemma2_config_without_layer_types_alternates_like_the_reference():
+    """Gemma2Config fills the pattern itself (configuration_gemma2.py:95-98);
+    the expected pattern comes from the reference class."""
+    from transformers import Gemma2Config
+
+    config = {**fixture_config("gemma2-tiny"), "num_hidden_layers": 5}
+    del config["layer_types"]
+    reference = Gemma2Config(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
+    assert translate_config(config)["layer_types"] == tuple(reference)
+    assert translate_config(config)["layer_types"][-1] == "sliding_attention"
+
+
+def test_dropping_the_attention_softcap_breaks_gemma2_parity():
+    """The fixture caps at 5 so the tanh moves the logits by 1.45; a load
+    that read the cap and applied none would pass no tolerance below that."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'gemma2-tiny')
+    ids = np.load(FIXTURES / 'gemma2-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'gemma2-tiny' / 'logits.npy')
+    uncapped = model.clone(attn_logit_softcap=None)
+    assert np.max(np.abs(np.asarray(uncapped.apply(variables, ids)) - reference)) > 1.0
+
+
+def test_the_erf_gelu_is_not_the_tanh_gelu_on_gemma():
+    """gemma-tiny names hidden_act 'gelu'; run through the tanh approximation
+    instead, its logits drift 1.7e-03 from the reference, above the 1e-4
+    parity tolerance, so the two activations are two mlp values."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'gemma-tiny')
+    ids = np.load(FIXTURES / 'gemma-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'gemma-tiny' / 'logits.npy')
+    approximate = model.clone(mlp='geglu')
+    difference = np.max(np.abs(np.asarray(approximate.apply(variables, ids)) - reference))
+    assert 1e-4 < difference < 1e-2
 
 
 def test_a_rope_scaling_spelled_the_old_way_is_refused():
@@ -578,7 +663,7 @@ def test_the_real_e2b_config_translates():
 @pytest.mark.parametrize("field,value", [
     ("attention_k_eq_v", True),
     ("enable_moe_block", True),
-    ("hidden_act", "gelu"),
+    ("hidden_act", "relu"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
     """Every gemma4 knob Dew cannot express names itself instead of loading
