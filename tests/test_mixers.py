@@ -1,7 +1,7 @@
 """The mixer seam: one declared value naming a layer's mixer, by kind.
 
-The backbone takes a `mixer` value from the `mixers` registry — None for
-today's grouped-query causal attention — and each kind builds its own
+The backbone takes a `mixer` value from the `mixers` registry (None for
+today's grouped-query causal attention), and each kind builds its own
 `DecoderBlock` factory from the layer's context. A new kind registers its
 value and plugs in with no branch on the backbone, which `test_scale` here
 proves by being one: a second member that exists only in this file, yet
@@ -138,7 +138,7 @@ def test_the_registry_builds_kinds_by_name():
 
 
 def test_a_kind_without_a_build_is_refused_loudly():
-    """A registered value that builds nothing fails at setup, not silently."""
+    """A registered value that builds nothing raises NotImplementedError at setup."""
 
     @mixers("test_empty")
     @dataclasses.dataclass(frozen=True)

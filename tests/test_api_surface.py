@@ -3,7 +3,7 @@
 Section 5 of the design names what the new surface replaces. Dew is
 unpublished and keeps no migrations (decision 7), so each of those names
 reads zero across the tree: not deprecated, not aliased, gone. A name that
-comes back is a second path, which is what the design exists to prevent.
+comes back is a second path to the same thing.
 """
 
 import re

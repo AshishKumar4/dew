@@ -1,9 +1,9 @@
 """What a run publishes, and how many times.
 
-Publishing is the one thing a recipe does after `fit` that talks to a service,
-so the two facts that matter on a pod are checked here without one: it happens
-once per run rather than once per process, and a checkpoint directory that is
-a bucket URI is referenced rather than uploaded, with the run spec beside it.
+Publishing is the only step a recipe takes after `fit` that talks to a
+service, so the two facts that matter on a pod are checked here without one:
+it happens once per run, not once per process, and a checkpoint directory
+that is a bucket URI is referenced, not uploaded, with the run spec beside it.
 """
 
 import sys
@@ -80,8 +80,8 @@ def test_a_local_checkpoint_is_uploaded_with_its_run_spec(tmp_path, wandb):
 
 def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp_path, wandb):
     """A pod writes its checkpoints to the bucket, and os.path.exists on a
-    gs:// path is False, so the spec used to be dropped from every pod
-    publish and the upload had nothing local to read."""
+    gs:// path is False, so the spec is found through the path's own parent
+    and the reference carries it with no local read."""
     class Uri:
         """The three things publish asks a path: its parent, a child, and
         whether it is there. A real gs:// path would need credentials."""

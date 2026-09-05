@@ -104,7 +104,7 @@ def test_every_translated_leaf_is_load_bearing(path):
     """One mutation per module of the tower: zeroing any leaf the translator
     places must move the outputs past the tolerance, or the parity test above
     proves nothing about that module. The relative bias table, the gate and
-    both norms are each the one thing a name map gets wrong quietly."""
+    both norms are each a leaf a name map can misplace without a shape error."""
     encoder = T5Text.from_pretrained(str(TINY))
     expected = reference(TINY)
     tokens = {"input_ids": expected["input_ids"],
@@ -124,7 +124,7 @@ def test_every_translated_leaf_is_load_bearing(path):
 def test_the_name_map_takes_the_encoder_and_refuses_the_rest():
     """The decoder, the lm_head and the encoder's tied copy of the embedding
     are not this tower and translate to nothing; a name the map cannot
-    explain raises, so a renamed upstream layout cannot load half a tower."""
+    explain raises ValueError, so a renamed upstream layout fails whole."""
     from dew.nn.text_encoders import translate_t5_weights
 
     beside_the_encoder = {

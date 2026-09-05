@@ -4,8 +4,8 @@ This is a file and not an argument to `python -c` because grain's worker
 processes re-exec the path they were started from, and "<stdin>" is not a path
 they can import. Every mode records what it saw into --out and asserts nothing,
 so the invariants stay in the test that reads the files back. The test imports
-this module as well, which is what keeps its single-process reference run and
-the spawned processes the same run in two topologies.
+this module as well, so its single-process reference run and the spawned
+processes are the same run in two topologies.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ from dew.data import Loading
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
-# lower it or fsdp > 1 would silently mean "everything replicated".
+# the threshold is lowered; at the production value fsdp > 1 would replicate
+# every parameter.
 TINY = 256
 
 
@@ -49,8 +50,8 @@ def checkpoint_dir(base: str | Path, name: str) -> Path:
 def make_objective():
     """Squared error against the input through the real DiT, no randomness.
 
-    dew is imported here rather than at module scope because a JAX backend
-    opened before jax.distributed.initialize() would pin the process to its own
+    dew is imported here, not at module scope, because a JAX backend opened
+    before jax.distributed.initialize() would pin the process to its own
     devices, and this module is imported before the pool is joined.
     """
     import jax.numpy as jnp
@@ -209,7 +210,7 @@ class BlockUntilKilled:
     spends its waiting time asking the source for a batch, so stopping there
     leaves the process in the state a preempted run dies in, and makes the step
     it dies on the same on every machine. The wait is bounded so a test that
-    never kills anything fails rather than hangs.
+    never kills anything fails on the timeout.
     """
 
     def __init__(self, loader, limit: int, marker: Path, timeout: float = 300.0):
@@ -367,7 +368,7 @@ def restored_state(checkpoints):
 def mode_steps(args) -> dict:
     """`--steps` more steps of the executable fit runs, from the directory's state.
 
-    Driven step by step here rather than through fit so every process records
+    Driven step by step here, not through fit, so every process records
     the losses it computed; fit reports them through the tracker on process 0
     alone.
     """
@@ -603,8 +604,8 @@ def parse_args(argv=None):
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.coordinator:
-        # What mpirun puts in the environment, which is how a pod run finds
-        # its pool: jax's OMPI detector reads the size and the ranks from it,
+        # What mpirun puts in the environment, and what a pod run finds its
+        # pool by: jax's OMPI detector reads the size and the ranks from it,
         # and JAX_COORDINATOR_ADDRESS names the coordinator. The join and the
         # rendezvous right after it are then the recipes' own.
         os.environ.update({

@@ -62,8 +62,9 @@ def largest(computed, expected):
 
 def test_masked_mean_ignores_every_position_the_mask_drops():
     """A padded position holds whatever the allocator left there, so the mean
-    of [1, 2, nan] under mask [1, 1, 0] is 1.5 and not a nan. Multiplying by a
-    zero mask instead of replacing would return one here and poison the loss."""
+    of [1, 2, nan] under mask [1, 1, 0] is 1.5 and not a nan. A mean that
+    multiplied by the zero mask, without replacing, would return nan here and
+    poison the loss."""
     x = jnp.array([[1.0, 2.0, jnp.nan], [4.0, jnp.inf, -3.0]])
     mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
 
@@ -91,8 +92,8 @@ def test_masked_whiten_centres_and_scales_by_the_unbiased_deviation():
     """Four values survive the mask, 1, 3, 5 and 7. Their mean is 4, their mean
     square deviation 5 and the Bessel correction 4/3, so the deviation is
     sqrt(20/3). The two positions outside the mask are scaled by the same
-    numbers rather than zeroed, which is what both references return and what
-    the loss masks again."""
+    numbers, not zeroed, as both references return them; the loss masks them
+    again."""
     x = jnp.array([[1.0, 3.0, 100.0], [5.0, 7.0, -100.0]])
     mask = jnp.array([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]])
 

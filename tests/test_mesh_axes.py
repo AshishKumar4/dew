@@ -3,9 +3,8 @@
 The mesh carries five axes; parameters distinguish fsdp, expert and tensor,
 and the batch's sequence dimension rides sequence. Widths stay on fsdp
 unless a run's rules redirect them onto tensor, so the default mesh places
-exactly as the three-axis one did. A fit on each of the four sim-mesh
-topologies trains the same losses: sharding moves values, never changes
-them.
+as the three-axis one did. A fit on each of the four sim-mesh topologies
+trains the same losses: sharding moves values, never changes them.
 """
 
 import jax
@@ -97,7 +96,7 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
 
 def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     """Seventeen columns over two sequence shards divide nothing, so the
-    rows still split and the width replicates instead of failing."""
+    rows still split and the width replicates."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
     batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 2), np.float32))
 

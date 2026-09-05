@@ -65,7 +65,7 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal):
 
 def test_flags_are_appended_to_what_the_environment_already_carries(monkeypatch):
     """The test suite itself sets a flag, and a run's own flags have to add to
-    it rather than replace it."""
+    it, not replace it."""
     monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
     apply_xla_flags("--xla_gpu_autotune_level=4")
     assert os.environ["XLA_FLAGS"] == (

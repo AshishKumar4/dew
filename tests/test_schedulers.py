@@ -184,7 +184,7 @@ def test_sqrt_schedule_matches_the_diffusion_lm_formula():
 
 def test_discrete_table_reaches_its_last_entry_at_t_equal_T():
     """A sampling grid starts at T itself, one past the last index, and reads
-    the noisiest entry rather than whatever an out-of-range gather returns."""
+    the noisiest entry; an out-of-range gather would return something else."""
     schedule = CosineNoiseScheduler(1000)
     top = schedule.rates(jnp.array([1000.0]))
     last = schedule.rates(jnp.array([999]))
