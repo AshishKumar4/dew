@@ -21,7 +21,7 @@ against verl's `verl/trainer/ppo/core_algos.py`
 (`compute_grpo_outcome_advantage`, `compute_rloo_outcome_advantage`,
 `compute_gae_advantage_return`, commit 896a9bb) and verl's
 `verl/utils/torch_functional.py` masked reductions. Both projects are
-Apache-2.0, which is why this file carries their notice. tools/parity_rl.py
+Apache-2.0, and this file carries their notice. tools/parity_rl.py
 runs both references on fixed tensors and
 tests/test_rl_advantage.py holds the tolerances.
 
@@ -136,11 +136,11 @@ def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
 
     `delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)` and
     `A_t = delta_t + gamma * lam * A_{t+1}`, backwards from the last step
-    (arXiv:1506.02438). A masked step contributes nothing, passing the running
-    advantage and the next value through unchanged, so a padded tail cannot
-    discount the real steps before it. Positions outside the mask hold the
-    neighbouring step's carry, as in both references, for the loss to mask
-    again.
+    (arXiv:1506.02438). A masked step contributes nothing and passes the
+    running advantage and the next value through unchanged, so a padded tail
+    leaves the real steps before it undiscounted. Positions outside the mask
+    hold the neighbouring step's carry, as in both references, for the loss
+    to mask again.
 
     Returns the whitened advantages and the unwhitened returns, in that order.
     `returns = A + V` happens before the whitening in both references.

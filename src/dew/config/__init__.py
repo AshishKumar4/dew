@@ -136,7 +136,7 @@ class TrainerConfig:
     eval_every: Union[int, Literal["epoch"], None] = "epoch"
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
-    reports no record count is refused by name, since it has no pass."""
+    reports no record count raises a ValueError, since it has no pass."""
     checkpoint_every: Union[int, Literal["epoch"], None] = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
