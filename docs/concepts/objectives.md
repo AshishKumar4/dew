@@ -42,7 +42,7 @@ class Objective:
 - The collections in `Aux.variables` are written back into the tree after the update.
 - The step is compiled once with explicit in and out shardings and donates the train state. `Trainer.compile(state, batch)` returns that step, and the benchmarks time it.
 
-Every `eval_every` steps the trainer runs the validation pass, calls `evaluate` on each batch, hands each artifact to the metrics that read its type, and to the tracker, which renders it. A `Metric` names the artifact type it `reads`, measures one batch, and `reduce`s a pass; `metrics.perplexity()` reads `TokenScores` and reduces to exp of the target-weighted mean over the whole pass, so a batch of padding weighs nothing. Every process agrees how many validation batches it holds before the pass starts, so a pod cannot wedge on an uneven split, and an exception in evaluation fails the run rather than printing.
+Every `eval_every` steps the trainer runs the validation pass, calls `evaluate` on each batch, hands each artifact to the metrics that read its type, and to the tracker, which renders it. A `Metric` names the artifact type it `reads`, measures one batch, and `reduce`s a pass; `metrics.perplexity()` reads `TokenScores` and reduces to exp of the target-weighted mean over the whole pass, so a batch of padding weighs nothing. Every process agrees how many validation batches it holds before the pass starts, and an exception in evaluation fails the run.
 
 A `Trainer` opens nothing when constructed: no tracker, no checkpoint directory, no mesh. `fit` does, and only through the `Checkpoints` and `Tracker` it was given; a run with neither trains and validates locally and logs to the terminal.
 
