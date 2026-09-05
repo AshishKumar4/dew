@@ -21,7 +21,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
-    causal_attention_mask, open_kv_cache, rotary_freqs, scaled_dot_product_attention,
+    RopeScaling, causal_attention_mask, open_kv_cache, rotary_freqs,
+    scaled_dot_product_attention,
 )
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import apply_rotary_interleave
@@ -81,6 +82,7 @@ class Llama4Attention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 500000.0
+    rope_scaling: Optional[RopeScaling] = None
     use_rope: bool = True
     use_qk_norm: bool = True
     attention_chunk_size: Optional[int] = None
@@ -129,7 +131,8 @@ class Llama4Attention(nn.Module):
             positions = jnp.asarray(positions)
 
         if self.use_rope:
-            freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta)
+            freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta,
+                                                rope_scaling=self.rope_scaling)
             query = apply_rotary_interleave(query, freqs_cos, freqs_sin)
             key = apply_rotary_interleave(key, freqs_cos, freqs_sin)
             if self.use_qk_norm:
@@ -180,8 +183,9 @@ class Llama4Mixer(MixerBase):
 
     `use_rope` is the layer's `no_rope_layers` entry, so a config names the
     local kind with the chunk and the global kind without rope; the other
-    fields are the config's. The head geometry, rope base, bias, norm
-    epsilon and kernel choice come from the backbone through the context.
+    fields are the config's. The head geometry, rope base and its llama3
+    ramp, bias, norm epsilon and kernel choice come from the backbone
+    through the context.
     """
 
     use_rope: bool = True
@@ -220,6 +224,7 @@ class Llama4Mixer(MixerBase):
             max_seq_len=ctx.max_seq_len,
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
+            rope_scaling=ctx.rope_scaling,
             use_rope=self.use_rope,
             use_qk_norm=self.use_qk_norm,
             attention_chunk_size=self.attention_chunk_size,
