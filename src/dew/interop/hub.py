@@ -1,10 +1,9 @@
 """Moving an export directory to and from the Hugging Face Hub.
 
-`save_hf_layout` writes the directory; these two carry it. They are the two
-`huggingface_hub` calls a caller would otherwise write out, with the repo
-created on the way up and the snapshot path handed back on the way down.
-Retries, progress and caching are the hub client's own behaviour, not
-something repeated here.
+`save_hf_layout` writes the directory; these two carry it. They wrap the two
+`huggingface_hub` calls involved, creating the repo on the way up and handing
+back the snapshot path on the way down. Retries, progress and caching stay the
+hub client's behaviour.
 """
 
 from __future__ import annotations
