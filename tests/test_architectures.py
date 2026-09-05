@@ -296,6 +296,13 @@ VARIANTS = [
     # dial's declarations are walked with the odd projection left out.
     Case("causal_transformer", {**LM, "attention_bias": True, "o_proj_bias": False},
          seq_len=SEQ_LEN, label="qwen2"),
+    # Gemma 2's stack: the sandwich norms with (1 + w) scales, the attention
+    # softcap and the erf gelu; the softcap and the activation add no leaf,
+    # so the case pins that they build and place like the plain stack.
+    Case("causal_transformer", {**LM, "sandwich_norms": True, "scale_offset": True,
+                                "embedding_scale": True, "attn_logit_softcap": 5.0,
+                                "final_logit_softcap": 30.0, "mlp": "geglu_exact"},
+         seq_len=SEQ_LEN, label="gemma2"),
 ]
 
 

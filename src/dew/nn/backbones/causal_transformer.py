@@ -206,6 +206,7 @@ class CausalSelfAttention(nn.Module):
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
     attention_sinks: bool = False
     yarn: Optional[YarnScaling] = None
+    attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
@@ -382,12 +383,21 @@ class CausalSelfAttention(nn.Module):
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask,
             sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
-                   if self.attention_sinks else None))
+                   if self.attention_sinks else None),
+            softcap=self.attn_logit_softcap)
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
+
+
+def _gated_activation(activation: str, gate):
+    """The gate's nonlinearity by the mlp's name: silu, tanh-approximate gelu
+    or the erf gelu (torch's default, ACT2FN['gelu'])."""
+    if activation == 'swiglu':
+        return nn.silu(gate)
+    return nn.gelu(gate, approximate=activation == 'geglu')
 
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
@@ -395,7 +405,9 @@ class CausalSelfAttention(nn.Module):
     ("down_proj",): ("mlp", "embed"),
 })
 class GatedMLP(nn.Module):
-    """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is gelu.
+    """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
+    the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
+    the erf form (HF's gelu, which Gemma's released config names).
 
     Bias-free, like the gated MLP of every open decoder this loads.
     """
@@ -406,9 +418,9 @@ class GatedMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.activation not in ('swiglu', 'geglu'):
+        if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
-                f"mlp must be 'swiglu' or 'geglu', got {self.activation!r}")
+                f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.gate_proj = dense(self.hidden_features, name='gate_proj')
@@ -417,7 +429,7 @@ class GatedMLP(nn.Module):
 
     def __call__(self, x):
         gate = self.gate_proj(x)
-        gate = nn.silu(gate) if self.activation == 'swiglu' else nn.gelu(gate)
+        gate = _gated_activation(self.activation, gate)
         return self.down_proj(gate * self.up_proj(x))
 
 
@@ -496,7 +508,7 @@ class DecoderBlock(nn.Module):
             # like its feed-forward, multiplied by the layer's input signal,
             # projected back and normed.
             gated = self.per_layer_input_gate(x)
-            gated = nn.silu(gated) if self._gate_activation == 'swiglu' else nn.gelu(gated)
+            gated = _gated_activation(self._gate_activation, gated)
             projected = self.per_layer_projection(gated * per_layer_input)
             x = x + self.post_per_layer_input_norm(projected)
         return x
@@ -643,7 +655,7 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: Optional[int] = None       # None: as many as the query heads
     head_dim: Optional[int] = None           # None: emb_features // num_heads
-    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu'
+    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
     mlp_features: Optional[int] = None       # None: four times emb_features
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
@@ -662,6 +674,7 @@ class CausalTransformer(nn.Module):
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
     attention_sinks: bool = False
     yarn: Optional[YarnScaling] = None
+    attn_logit_softcap: Optional[float] = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
@@ -813,6 +826,7 @@ class CausalTransformer(nn.Module):
             attention_scale=self.attention_scale,
             attention_sinks=self.attention_sinks,
             yarn=self.yarn,
+            attn_logit_softcap=self.attn_logit_softcap,
             output_gate=self.output_gate,
             dtype=self.dtype,
             precision=self.precision,

@@ -124,6 +124,40 @@ def test_sliding_window_agrees_across_kernels(rng):
     assert jnp.allclose(reference, fused, atol=1e-5)
 
 
+def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, monkeypatch):
+    """Gemma 2's tanh on the logits, against the equation on a hand-computed
+    case: reference and xla agree with it, and 'auto' resolves a softcapped
+    call to that same math even where cudnn would otherwise run (bf16 inputs,
+    an 8-wide head, a gpu backend), while cudnn and tpu refuse by name.
+    A cap of 2 on logits of order 10 changes the weights by a wide margin,
+    so an uncapped path cannot pass."""
+    query, key, value = (jax.random.normal(k, (1, 6, 2, 8)) * 3
+                         for k in jax.random.split(rng, 3))
+    scaled = np.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(8)
+    capped = 2.0 * np.tanh(scaled / 2.0)
+    causal = np.tril(np.ones((6, 6), bool))
+    weights = jax.nn.softmax(np.where(causal, capped, -np.inf), axis=-1)
+    expected = np.einsum('bhqk,bkhd->bqhd', weights, value)
+    uncapped = scaled_dot_product_attention(query, key, value, causal=True)
+    assert np.max(np.abs(np.asarray(uncapped) - expected)) > 0.1
+
+    reference = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0)
+    fused = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0,
+                                         implementation='xla')
+    assert np.allclose(reference, expected, atol=1e-5)
+    assert np.allclose(fused, expected, atol=1e-5)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
+    routed = scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
+                                          implementation='auto')
+    assert np.allclose(routed.astype(jnp.float32), expected, atol=5e-2)
+    for implementation in ('cudnn', 'tpu'):
+        with pytest.raises(ValueError, match=f"'{implementation}' cannot apply an attention logit softcap"):
+            scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
+                                         implementation=implementation)
+
+
 def test_registry_builds_the_backbone_and_takes_the_precision_policy():
     assert models['causal_transformer'] is CausalTransformer
     config = with_precision(
