@@ -376,8 +376,9 @@ def write_released_config(name: str, repo: str) -> None:
         del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+    layers = config.get('num_hidden_layers', config.get('n_layers', config.get('num_layers')))
     print(f"{directory / 'config.json'}: {repo}, "
-          f"{config['num_hidden_layers']} layers, {len(config)} fields")
+          f"{layers} layers, {len(config)} fields")
 
 
 def main() -> None:
