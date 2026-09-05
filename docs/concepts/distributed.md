@@ -14,9 +14,10 @@ MeshSpec(fsdp=4)                    # each large parameter split four ways
 MeshSpec(fsdp=2, expert=4)          # experts split four ways, the rest two ways
 MeshSpec(fsdp=2, tensor=2)          # widths a rule redirects split over tensor
 MeshSpec(fsdp=4, sequence=2)        # token rows split over sequence
+MeshSpec(fsdp=4, stage=2, microbatches=8)  # the layer stack in two pipeline stages
 ```
 
-`build_mesh(spec)` returns the `(data, expert, fsdp, tensor, sequence)` mesh. Parameters shard over `fsdp`, an MoE layer's expert dimension over `expert`, a width the rules redirect over `tensor`, and everything replicates over `data`. The sequence axis never places a parameter; it splits the batch's sequence dimension. A product of sizes that does not divide the device count is an error.
+`build_mesh(spec)` returns the `(data, expert, fsdp, tensor, sequence, stage)` mesh. Parameters shard over `fsdp`, an MoE layer's expert dimension over `expert`, a width the rules redirect over `tensor`, and everything replicates over `data`. The sequence axis never places a parameter; it splits the batch's sequence dimension. The stage axis holds the decoder's pipeline stages and never places a stored parameter either. A product of sizes that does not divide the device count is an error.
 
 The expert dimension has an axis of its own because it is the one dimension no dense model has. Splitting eight experts four ways leaves every expert whole, where splitting a width costs a collective on every matmul.
 
@@ -56,7 +57,7 @@ A key is the tail of a module path, so one entry covers every block that reuses 
 | `exp` | mixture-of-experts rows | the stacked expert kernels and the router |
 | `batch` | sample rows | activations only |
 | `sequence` | token positions | activations only |
-| `stage` | pipeline stage | reserved |
+| `stage` | pipeline stage | the stacked layer weights and activations inside a pipelined step |
 
 ## The rules
 
@@ -67,7 +68,7 @@ A key is the tail of a module path, so one entry covers every block that reuses 
 | `vocab`, `mlp`, `modulation`, `attention`, `embed`, `head_dim`, `heads`, `kv`, `output` | `fsdp` |
 | `exp` | `expert` |
 | `sequence` | `sequence` |
-| `batch`, `stage` | none |
+| `batch`, `stage` | none; the mesh axis of the same name places them |
 
 When two dimensions of one parameter both claim `fsdp`, the earlier row wins and the other dimension stays whole, which is flax's and MaxText's semantics. The order puts the larger dimension first for every shipped shape: `mlp` over `embed` in a feed-forward kernel, `vocab` over `embed` in an embedding table, `embed` over the narrower `heads` or `kv` in a projection. A dimension the assigned axis does not divide evenly is dropped and the axis passes to the next dimension that names it; GPT-2's 50257 vocabulary rows cannot split over any mesh, so its embedding shards on `embed`.
 
@@ -78,6 +79,33 @@ When two dimensions of one parameter both claim `fsdp`, the earlier row wins and
 ## Sharding tolerance
 
 `Layout.check` runs before step one whenever a parameter axis of the mesh is above one. If more than `tolerance` (2% by default) of the shardable parameter elements are replicated, the run stops and names the fraction and the five largest replicated parameters by path, shape and element count. This is the check MaxText runs (`assert_params_sufficiently_sharded`), restricted here to parameters at or above `min_shard`, since a small parameter is replicated on purpose. `--trainer.layout.tolerance 1.0` disables it.
+
+## The stage axis
+
+`MeshSpec(stage=N)` splits a `CausalTransformer`'s layers into N contiguous stages and runs its training step as a pipeline over the stage axis, the GPipe schedule MaxText's `layers/pipeline.py` runs. The batch splits into `microbatches` microbatches (a multiple of N; unset is one per stage). Every iteration runs all N stages at once on one microbatch each, stage s on the microbatch that stage s - 1 finished the iteration before, and hands each stage's output to the next stage with a collective permute. The microbatches wait in a stage-sharded buffer that rotates up a stage each iteration, so each one reaches stage 0 in turn and each finished one lands in the last stage's slot; nothing is gathered until the loop ends. The first N - 1 iterations and the last N - 1 run stages on nothing, and that idle share, (N - 1) / (microbatches + N - 1), is what more microbatches buy down. The embeddings, the final norm, the head and the loss run on the whole batch on every stage's devices, so the loss is the whole stack's mean over the same rows; the pipeline covers the layers alone, and a model's prediction depths run after it.
+
+Each stage's layers sit on that stage's devices. The step stacks every stage's copy of a layer position along a leading stage dimension and constrains it to the stage axis, so the matmuls of stage s run where stage s's slice lives, sharded over `fsdp` and `tensor` within the stage as the rules place them. The stored train state stays the plain loop's tree: one subtree per layer, placed by the same rules and replicated over the stage axis, so a checkpoint written on a pipelined mesh restores on any other and a Hugging Face tree loads unchanged. The stacking costs one copy of the layer parameters each way per step, and the gradient of every layer reaches every stage's devices before the optimizer's update, an all-gather over the stage axis of the parameters' size.
+
+The stack has to split evenly. Every stage runs one program, so the stages have the same length and layer j of each stage is the same kind of layer as layer j of the first: the same kind, the same feed-forward, the same width, the same say in keys and values. A pattern that does not repeat every `num_layers / N` layers is refused with the first two layers that differ and the fields they differ in. DeepSeek V3's dense first layer, Gemma 4's and Gemma 3n's sharing layers at the end of the stack and Gemma 3's 26 layers of a six-layer pattern all fail that test; Mixtral, Qwen3 and the dense Llamas split at any divisor of their depth, and a Gemma pattern splits into stages that are whole periods of it. Decoding under a stage axis is refused too: generation runs outside the trainer's mesh context, on the whole stack.
+
+On the eight simulated CPU devices the pipeline's loss and gradients agree with the whole stack's to 4.8e-07 and 3.4e-07 (tests/test_layer_stack.py, dense and MoE with the balance loss), and a pool of two processes each holding half of every stage's devices trains the losses of one process to 4.8e-07 (tests/test_multiprocess.py). The MFU the trainer logs counts the bubble's matmuls, since the device runs them.
+
+## Scanned layers
+
+`CausalTransformer(scan_layers=True)` runs every run of consecutive layers that share a parameter shape and a computation as iterations of one body under flax's scan, and the layers between such runs unrolled. The grouping is read off the resolved layers: same kind, same feed-forward and width, same activation sparsity, the same say in keys and values, and a layer whose keys and values a later layer reads is always a run of one. Qwen3's stack is one run; Gemma's 5:1 pattern is runs of five sliding layers with a full layer between them; DeepSeek V3 is its dense first layer and then one run of routed layers.
+
+The tree stays the plain loop's. `init` always runs the plain loop, and the scan reads the same `layers_N` leaves through a stacked view: stacked along a leading layer axis on the way in and, for what a run creates (the KV cache, the routers' sowing), unstacked per layer on the way out. A checkpoint or a Hugging Face tree loads into a scanned model unchanged and saves back unchanged, and the scanned logits, decode path and gradients hold to the plain loop's at fp32 (tests/test_layer_stack.py, with the observed differences beside each bound). The one numeric difference is under a bf16 policy, where the plain loop's first layer returns the residual stream in fp32 and the scan carries fp32 from the start of a run; the logits move by 3e-02 on values of order 4 and the argmax not at all.
+
+What it buys is compile time at depth, measured with `tools/benchmark_stack.py` on a decoder of width 64 (the command and the cases are in the tool):
+
+| depth | CPU (i9-12900K), fp32 | RTX 4080, bf16, cudnn |
+| --- | --- | --- |
+| 24, plain | 3.41 s, 77 ms/step | 8.38 s, 3.2 ms/step |
+| 24, scanned | 1.92 s, 100 ms/step | 4.29 s, 5.2 ms/step |
+| 48, plain | 7.38 s, 151 ms/step | 17.36 s, 11.2 ms/step |
+| 48, scanned | 3.54 s, 190 ms/step | 8.19 s, 19.4 ms/step |
+
+Compile time halves at both depths and keeps a slope with depth, since the optimizer updates one leaf per layer either way. The step time at this width rises with the stacking of the per-layer leaves into the loop's input and the unstacking of their gradients, one copy of the layer parameters each way, and with the loop's dispatch; at a width where a layer's matmuls take the step, those copies are a small share of it.
 
 ## The step
 
