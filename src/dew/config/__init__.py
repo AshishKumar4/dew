@@ -5,9 +5,8 @@ optimize it, and how the trainer runs. Recipes parse it with tyro, build the
 objective and the data it names, and hand both to `RunConfig.train`, so
 `to_dict()` is a full record of a run and `from_dict()` puts it back together.
 
-Model kwargs stay an opaque JSON dict. The registry already knows which
-architecture takes which fields, and mirroring them here would be a second
-place to keep in sync. A dataset is the registered spec itself, which tyro
+Model kwargs are an opaque JSON dict; the registry knows which architecture
+takes which fields. A dataset is the registered spec itself, which tyro
 turns into a subcommand (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
@@ -110,9 +109,8 @@ class OptimConfig:
 
 @dataclasses.dataclass(frozen=True)
 class Wandb:
-    """Where a run reports to. Its presence is what turns tracking on: the
-    entity and the offline switch mean nothing without a project, and an
-    unset project used to stand in for running without a tracker."""
+    """Where a run reports to. Setting it turns tracking on; the entity and
+    the offline switch mean nothing without a project."""
 
     project: str
     entity: Optional[str] = None
@@ -235,8 +233,8 @@ def _fields(cls, values):
 
 
 def _rebuild(annotation, value) -> Any:
-    """The value `annotation` asks for, built out of a record. Any is the
-    truth here: what comes back is whatever type the field declares."""
+    """The value `annotation` asks for, built out of a record. It returns
+    whatever type the field declares, so the annotation is Any."""
     held = _registry_for(annotation)
     if held is not None:
         member = held[value["name"]]
@@ -282,8 +280,7 @@ class RunConfig:
         """Write this config as `run.json` in `directory` and return the path.
 
         The path goes through `epath`, the same filesystem layer orbax writes
-        the checkpoints with, so a `gs://` run directory takes the record too
-        instead of failing a pod run after the training succeeded.
+        the checkpoints with, so a `gs://` run directory takes the record too.
         """
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
@@ -299,8 +296,8 @@ class RunConfig:
     def train(self, objective: Objective, data: Dataset, *, name: str,
               metrics: Sequence[Metric] = (),
               summary: Mapping[str, object] | None = None) -> TrainState:
-        """Train `objective` on `data` as this run says, which is what every
-        recipe does once it has built both.
+        """Train `objective` on `data` as this run says; every recipe calls
+        this once it has built both.
 
         The run lives under `name` in `trainer.checkpoint_dir`, and process
         zero writes the record there before anything trains. A `trainer.wandb`
