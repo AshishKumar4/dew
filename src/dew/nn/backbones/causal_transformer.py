@@ -511,12 +511,15 @@ class DecoderBlock(nn.Module):
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
 
-    The depth reads the previous hidden states through `enorm` and the token
-    embeddings through `hnorm`, projects the concatenated pair back to the
-    model width, and runs one decoder block over it
-    (modeling_deepseek_v3.py, DeepseekV3MultiTokenPredictor). `block` is a
-    plain forward block: multi-token prediction is a training-time
-    auxiliary, so there is no decode path and no cache.
+    The depth norms the token embeddings with `enorm` and the previous
+    hidden states with `hnorm`, projects the pair concatenated in that
+    order back to the model width, and runs one decoder block over it. That
+    composition is what the released MTP weights were trained for, which
+    the engines that run them state (vLLM deepseek_mtp.py and
+    glm4_moe_mtp.py, SGLang's DeepseekV3ForCausalLMNextN); transformers
+    builds no depth. `block` is a plain forward block: multi-token
+    prediction is a training-time auxiliary, so there is no decode path and
+    no cache.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -552,7 +555,7 @@ class MTPBlock(nn.Module):
     def __call__(self, hidden, embeds, train: bool = False,
                  positions=None, segment_ids=None):
         fused = self.eh_proj(jnp.concatenate(
-            [self.enorm(hidden), self.hnorm(embeds)], axis=-1))
+            [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
         return self.final_norm(self.block(
             fused, train=train, positions=positions, segment_ids=segment_ids))
 
@@ -959,16 +962,20 @@ class CausalTransformer(nn.Module):
             for index, layer_type in enumerate(types)]
         # Prediction depths mirror whole-sequence hidden states, so their
         # mixer builds from the full-attention kind where the pattern has
-        # one, else from the first layer's kind; the feed-forward is dense.
+        # one, else from the first layer's kind; the feed-forward routes
+        # like the last layer's (GLM 4.5 ships its depth with the trunk's
+        # experts) and is dense otherwise.
         mtp_type = 'full_attention' if 'full_attention' in types else types[0]
         mtp_mixer = mixer_spec.build(self.mixer_context(
             kinds[mtp_type], mtp_type, False))
-        mtp_feedforward = functools.partial(
-            GatedMLP,
-            hidden_features=self.hidden_features,
-            out_features=self.emb_features,
-            activation=self.mlp,
-            precision=self.precision)
+        mtp_feedforward = (
+            routed if routed is not None and self.num_layers - 1 in sparse else
+            functools.partial(
+                GatedMLP,
+                hidden_features=self.hidden_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                precision=self.precision))
         self.mtp = [
             MTPBlock(
                 mixer=mtp_mixer, feedforward=mtp_feedforward,

@@ -1023,9 +1023,13 @@ def _stack_experts(params: Dict[str, Any]) -> None:
     whose experts do not form a dense `0..E-1` run refuses rather than
     stacking a shuffled or partial set.
     """
-    for layer, block in params.items():
-        if not (isinstance(block, dict) and layer.startswith('layers_')):
-            continue
+    blocks = [(layer, block) for layer, block in params.items()
+              if isinstance(block, dict) and layer.startswith('layers_')]
+    # An MTP depth's block routes like the layer before it.
+    blocks += [(depth, block['block']) for depth, block in params.items()
+               if isinstance(block, dict) and depth.startswith('mtp_')
+               and isinstance(block.get('block'), dict)]
+    for layer, block in blocks:
         mlp = block.get('mlp')
         if not isinstance(mlp, dict):
             continue
@@ -1077,6 +1081,17 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
             raise ValueError(
                 "tie_word_embeddings is set but lm_head.weight is not the "
                 "embedding it claims to copy")
+    # An MTP depth shares the trunk's embedding and head (arXiv 2412.19437,
+    # section 2.2); a checkpoint that ships copies of them beside the depth
+    # is checked so a depth trained apart cannot load as a shared one.
+    for name, tensor in hf_tensors.items():
+        parts = name.split('.')
+        if (len(parts) >= 4 and parts[:2] == ['model', 'layers']
+                and parts[3:] in (['embed_tokens', 'weight'], ['shared_head', 'head', 'weight'])):
+            shared = 'model.embed_tokens.weight' if parts[3] == 'embed_tokens' else 'lm_head.weight'
+            if not np.array_equal(tensor, hf_tensors.get(shared, tied_head)):
+                raise ValueError(
+                    f"{name} differs from {shared}, which the depth shares")
 
     # params is always a collection, mapped tensors or not: a checkpoint
     # whose every tensor maps to nothing is an empty tree, not no tree.
@@ -1469,6 +1484,70 @@ def _gpt_oss_export(model: CausalTransformer) -> dict[str, object]:
     return {'hidden_act': 'silu', 'num_local_experts': mixture.experts,
             'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0,
             'rope_scaling': None if model.yarn is None else asdict(model.yarn)}
+
+
+def _glm4_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """GLM 4.5 and 5: biased q/k/v over a bias-free o_proj, a half rotary in
+    the 'default' convention, DeepSeek V3's router with the shared experts
+    and dense first layers, and the MTP depths the checkpoint ships."""
+    # The released configs spell the rotary flat (rope_theta beside
+    # partial_rotary_factor); a config transformers wrote nests both under
+    # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
+    entry = hf_config.get('rope_parameters') or {}
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if rope_type not in ('default', 'none') or hf_config.get('rope_scaling') is not None:
+        _refuse(f"rope_parameters (rope_type {rope_type!r})",
+                "Glm4MoeRotaryEmbedding is the plain rotary")
+    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'})
+    if scaling:
+        _refuse(f"rope_parameters scaling fields {scaling}",
+                "Glm4MoeRotaryEmbedding is the plain rotary")
+    theta = float(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)))
+    factor = float(entry.get('partial_rotary_factor',
+                             hf_config.get('partial_rotary_factor', 1.0)))
+    used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
+                 'partial_rotary_factor', 'num_nextn_predict_layers'))
+    config = _base_config(hf_config, used, rope=(theta, None),
+                          qk_norm=bool(hf_config.get('use_qk_norm', False)))
+    layers = int(hf_config['num_hidden_layers'])
+    config.update(
+        o_proj_bias=False,
+        partial_rotary_factor=None if factor == 1.0 else factor,
+        partial_rotary_type='default',
+        mixture=_deepseek_mixture(hf_config, layers, used),
+        num_nextn_predict_layers=int(hf_config.get('num_nextn_predict_layers', 0)),
+    )
+    return config
+
+
+def _glm4_moe_path(name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
+    """GLM's MTP depths are the layers past num_hidden_layers, one block each.
+
+    Depth d arrives as model.layers.{num_layers + d}.*: its own enorm, hnorm,
+    eh_proj and shared_head.norm around a decoder block named like any
+    layer, plus copies of the trunk's embedding and head, which the depth
+    shares here as in the reference (translate_weights checks the copies).
+    """
+    parts = name.split('.')
+    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and int(parts[2]) >= int(config['num_layers'])):
+        return _dew_path(name, config)
+    depth = f"mtp_{int(parts[2]) - int(config['num_layers'])}"
+    tail = parts[3:]
+    if tail in (['embed_tokens', 'weight'], ['shared_head', 'head', 'weight']):
+        return None
+    if tail == ['shared_head', 'norm', 'weight']:
+        return ('params', depth, 'final_norm', 'scale')
+    if len(tail) == 2 and tail[0] in ('enorm', 'hnorm') and tail[1] == 'weight':
+        return ('params', depth, tail[0], 'scale')
+    if tail == ['eh_proj', 'weight']:
+        return ('params', depth, 'eh_proj', 'kernel')
+    path = _dew_path('.'.join(['model', 'layers', '0', *tail]), config)
+    if path is None:
+        return None
+    return (path[0], depth, 'block', *path[2:])
+
+
 def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
     mixer = fields['mixer']
     return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
@@ -1492,6 +1571,12 @@ _FAMILY_ENTRIES = (
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
                   weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path),
+    DecoderFamily(('glm4_moe',), _glm4_moe_config,
+                  lambda fields: (fields['partial_rotary_type'] == 'default'
+                                  and (mixture := _mixture_value(fields)) is not None
+                                  and mixture.bias),
+                  'glm4_moe', 'Glm4MoeForCausalLM', lambda model: {},
+                  weight_path=_glm4_moe_path),
     DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
                   lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
                                   and mixer.index_topk is not None),

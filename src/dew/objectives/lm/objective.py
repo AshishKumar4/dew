@@ -256,7 +256,12 @@ class LMObjective(Objective):
             # rule between the state's document and the target's.
             states = self.model.apply(
                 params, hidden, inputs, train=train, rngs=rngs,
-                method=type(self.model).mtp_hidden_states, **packing)
+                method=type(self.model).mtp_hidden_states,
+                mutable=["router"] if routing else False, **packing)
+            if routing:
+                # A routed depth balances and counts like a trunk layer.
+                states, depth_sown = states
+                sown = {**(sown or {}), **depth_sown.get("router", {})}
             for depth, state in enumerate(states, start=1):
                 depth_losses, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
@@ -325,9 +330,13 @@ class LMObjective(Objective):
                 raise ValueError(
                     "balance_rate moves the routers' balancing bias, so the model "
                     "needs a mixture with bias=True")
-            balanced, load = balance(params["moe"], routing, rate)
+            moe = params["moe"]
+            # A depth the step never ran observed no load, so its bias stays.
+            ran = {name: bias for name, bias in moe.items()
+                   if self.mtp_weight is not None or not name.startswith("mtp_")}
+            balanced, load = balance(ran, routing, rate)
             reported.update(load)
-            variables = {"moe": balanced}
+            variables = {"moe": {**moe, **balanced}}
         return loss, Aux(reported, variables)
 
     def evaluate(self, params, batch, step: Step):
