@@ -49,6 +49,7 @@ from transformers import (
     GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
+    Qwen3MoeConfig, Qwen3MoeForCausalLM,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -127,6 +128,22 @@ def tiny_mistral() -> MistralForCausalLM:
         sliding_window=4, max_position_embeddings=64, rope_theta=10000.0))
     torch.manual_seed(0)
     return MistralForCausalLM(config)
+
+
+def tiny_qwen3_moe() -> Qwen3MoeForCausalLM:
+    """Three layers: the first dense by mlp_only_layers, the second routed
+    and the third dense by decoder_sparse_step 2, so both dials pick a
+    layer. norm_topk_prob stays at the release's False, where the top-k
+    softmax weights are used as they are, and the routed width differs
+    from the dense one so the two cannot be confused."""
+    config = Qwen3MoeConfig.from_dict(dict(
+        hidden_size=32, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, intermediate_size=48,
+        moe_intermediate_size=16, num_experts=4, num_experts_per_tok=2,
+        decoder_sparse_step=2, mlp_only_layers=[0], norm_topk_prob=False,
+        vocab_size=128, max_position_embeddings=64, rope_theta=1e6))
+    torch.manual_seed(0)
+    return Qwen3MoeForCausalLM(config)
 
 
 def tiny_gemma() -> GemmaForCausalLM:
@@ -339,6 +356,8 @@ def main() -> None:
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
     write_tiny("qwen2-tiny", tiny_qwen2())
+    write_tiny("qwen3-moe-tiny", tiny_qwen3_moe())
+    write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
     write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
     write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")

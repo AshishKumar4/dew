@@ -303,6 +303,12 @@ VARIANTS = [
                                 "embedding_scale": True, "attn_logit_softcap": 5.0,
                                 "final_logit_softcap": 30.0, "mlp": "geglu_exact"},
          seq_len=SEQ_LEN, label="gemma2"),
+    # Qwen3-MoE's routing: the top-k softmax weights used unrenormalised
+    # (norm_topk_prob off), with q/k norms and experts narrower than the
+    # dense feed-forward, on the second layer only.
+    Case("causal_transformer", {**LM, "qk_norm": True, "mixture": {
+        "experts": 8, "top_k": 2, "layers": (1,), "norm_topk_prob": False,
+        "expert_features": 32}}, seq_len=SEQ_LEN, label="qwen3_moe"),
 ]
 
 

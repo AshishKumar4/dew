@@ -345,6 +345,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     if sinks is not None:
         if implementation not in (None, 'auto', 'xla'):
             raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
+        if softcap is not None:
+            raise ValueError(
+                "attention sinks and a logit softcap have no reference that "
+                "combines them, so the sink path takes no softcap")
         if causal or sliding_window is not None:
             structural = causal_attention_mask(
                 jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
