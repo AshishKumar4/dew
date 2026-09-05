@@ -156,9 +156,9 @@ class ScheduleWeighting:
 
 @dataclass(frozen=True)
 class MinSNR:
-    """min-SNR-gamma (Hang et al. 2023): min(SNR, gamma) on the x_0 loss,
-    converted into the space the model is trained in. It replaces the
-    schedule's own weight rather than stacking on top of it."""
+    """min-SNR-gamma (Hang et al. 2023). min(SNR, gamma) on the x_0 loss,
+    converted into the space the model is trained in. It is used in place of
+    the schedule's own weight."""
 
     gamma: float
 

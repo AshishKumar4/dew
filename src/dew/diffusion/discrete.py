@@ -65,9 +65,9 @@ class DiscreteProcess:
     T = 1.0
 
     def sample_t(self, key, n: int) -> jax.Array:
-        """`n` times stratified over [0, 1), MDLM's antithetic draw: one
-        uniform offset shared by the batch, so the weights 1 / t of one batch
-        cover the trajectory instead of clustering."""
+        """`n` times stratified over [0, 1), MDLM's antithetic draw. One
+        uniform offset is shared by the batch, so the weights 1 / t of one
+        batch cover the trajectory."""
         offset = jax.random.uniform(key, (), minval=0.0, maxval=1.0)
         return (jnp.arange(n, dtype=jnp.float32) + offset) / n
 
@@ -79,7 +79,7 @@ class DiscreteProcess:
 
     def weight(self, t) -> jax.Array:
         """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross
-        entropy, and exactly zero at t = 0: nothing is masked there, so no
+        entropy, and exactly zero at t = 0. Nothing is masked there, so no
         token contributes, and the quotient itself is undefined."""
         t = jnp.asarray(t, jnp.float32)
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
@@ -104,9 +104,9 @@ class DiscreteProcess:
 class DiscreteDenoiser:
     """`(x_t, t) -> (argmax fill, log-probabilities)` for `model` under `params`.
 
-    The model's own logits at an unmasked position are irrelevant: the
-    position keeps its token, which is MDLM's carry-over parameterization.
-    The mask token itself carries no mass: it marks corruption, so the
+    The model's own logits at an unmasked position are irrelevant. The
+    position keeps its token (MDLM's carry-over parameterization).
+    The mask token itself carries no mass. It marks corruption, so the
     categorical a reveal draws from never offers it, however the model
     scores it.
     """
