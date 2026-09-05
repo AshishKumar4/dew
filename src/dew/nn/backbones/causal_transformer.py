@@ -176,6 +176,8 @@ class CausalSelfAttention(nn.Module):
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch
+    gate_activation: str = 'sigmoid'  # 'sigmoid' | 'silu', qwen4_exp's output_gate_type
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -183,9 +185,17 @@ class CausalSelfAttention(nn.Module):
     force_fp32_for_softmax: bool = True
 
     def setup(self):
+        if self.gate_activation not in ('sigmoid', 'silu'):
+            raise ValueError(
+                f"gate_activation must be 'sigmoid' or 'silu' (the reference's "
+                f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
+        # The gate doubles the query projection: the reference chunks its
+        # output in half, one half the query and the other the gate the
+        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
+        self.q_proj = dense(
+            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, exactly as the reference
         # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
@@ -224,7 +234,16 @@ class CausalSelfAttention(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
-        query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
+        projected = self.q_proj(x)
+        gate = None
+        if self.output_gate:
+            # The reference views the doubled output as [.., heads, 2*head_dim]
+            # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
+            query, gate = jnp.split(
+                projected.reshape(B, S, self.num_heads, 2 * self.head_dim),
+                2, axis=-1)
+        else:
+            query = projected.reshape(B, S, self.num_heads, self.head_dim)
         if self.kv_shared:
             # The provider ran earlier in the same forward pass and stashed
             # its post-norm, post-rope keys and values with their positions,
@@ -321,6 +340,11 @@ class CausalSelfAttention(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask)
+        if gate is not None:
+            # The branch multiplies by the activated gate, then the output
+            gate = (jax.nn.sigmoid(gate) if self.gate_activation == 'sigmoid'
+                    else nn.silu(gate))
+            attention = attention * gate.astype(attention.dtype)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 @logical_axes({
@@ -517,6 +541,8 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    output_gate: bool = False                 # Qwen3.5 gates the attention branch
+    gate_activation: str = 'sigmoid'         # 'sigmoid' | 'silu' (output_gate_type)
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
     tie_embeddings: bool = True
@@ -661,6 +687,8 @@ class CausalTransformer(nn.Module):
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
             attention_scale=self.attention_scale,
+            output_gate=self.output_gate,
+            gate_activation=self.gate_activation,
             dtype=self.dtype,
             precision=self.precision,
             attention_impl=self.attention_impl,
