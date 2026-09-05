@@ -59,6 +59,8 @@ from transformers import (
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "clip"
 REAL_MODEL = "openai/clip-vit-large-patch14"
 MAX_LENGTH = 77
+# One patch per image: the vision tower's input is 8 pixels square.
+IMAGE_SIDE = 8
 
 TINY_PROMPTS = ["a red bird", "", "two cats on a mat, painted", "x"]
 REAL_PROMPTS = [
@@ -109,7 +111,7 @@ def tiny_model(vocab_size: int) -> CLIPModel:
             bos_token_id=0, eos_token_id=1, pad_token_id=1),
         vision_config=CLIPVisionConfig(
             hidden_size=32, intermediate_size=64, num_hidden_layers=1,
-            num_attention_heads=2, image_size=8, patch_size=8,
+            num_attention_heads=2, image_size=IMAGE_SIDE, patch_size=IMAGE_SIDE,
             projection_dim=16),
         projection_dim=16)
     torch.manual_seed(0)
@@ -200,9 +202,8 @@ def write_tiny(directory: Path) -> None:
     tokenizer.save_pretrained(directory)
     model = tiny_model(len(tokenizer.get_vocab()))
     model.save_pretrained(directory, safe_serialization=True)
-    side = model.config.vision_config.image_size
-    processor = CLIPImageProcessorPil(size={"shortest_edge": side},
-                                      crop_size={"height": side, "width": side})
+    processor = CLIPImageProcessorPil(size={"shortest_edge": IMAGE_SIDE},
+                                      crop_size={"height": IMAGE_SIDE, "width": IMAGE_SIDE})
     processor.save_pretrained(directory)
 
     reference = encode(model, tokenizer, TINY_PROMPTS)
@@ -245,24 +246,25 @@ def write_real(directory: Path) -> None:
     print(json.dumps({"hidden": list(reference["last_hidden_state"].shape)}))
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=Path, default=FIXTURES)
     parser.add_argument("--skip-real", action="store_true",
                         help="write tiny/ only, no 1.7 GB download")
     parser.add_argument("--fp64", type=Path, default=None,
                         help="also write the real tower's fp64 outputs here, "
                              "outside the fixtures, as evidence for the tolerance")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
-    write_tiny(FIXTURES / "tiny")
+    write_tiny(arguments.out / "tiny")
     if not arguments.skip_real:
-        write_real(FIXTURES / "large-patch14")
+        write_real(arguments.out / "large-patch14")
     if arguments.fp64 is not None:
         write_fp64(arguments.fp64)
 
-    for path in sorted(FIXTURES.rglob("*")):
+    for path in sorted(arguments.out.rglob("*")):
         if path.is_file():
-            print(f"{path.relative_to(FIXTURES)}: {path.stat().st_size / 1024:.1f} KiB")
+            print(f"{path.relative_to(arguments.out)}: {path.stat().st_size / 1024:.1f} KiB")
 
 
 if __name__ == "__main__":

@@ -83,3 +83,20 @@ def test_moe_expert_tensors_undo_the_gate_up_merge():
         assert np.array_equal(written[f"mlp.experts.{index}.down_proj.weight"], down[index])
     assert not np.array_equal(gate_up[0, :tool.EXPERT_HIDDEN], gate_up[0, tool.EXPERT_HIDDEN:]), (
         "gate and up rows are identical here, so a swap would pass")
+
+
+# ---------------------------------------------------------------------------
+# tools/clip_reference.py
+# ---------------------------------------------------------------------------
+
+def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
+    """tiny/ regenerates byte for byte: the prompts and image recipe, the
+    random-weight checkpoint, and the reference outputs the parity test reads.
+    The real tower is left to the network-marked test; nothing downloads."""
+    load("clip_reference").write_tiny(tmp_path)
+
+    committed = FIXTURES / "clip" / "tiny"
+    assert json.loads((tmp_path / "prompts.json").read_text()) == json.loads(
+        (committed / "prompts.json").read_text())
+    assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
+    assert_same_arrays(tmp_path / "reference.npz", committed / "reference.npz")
