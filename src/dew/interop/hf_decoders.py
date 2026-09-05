@@ -503,6 +503,19 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     return config
 
 
+def _mixtral_config(hf_config, used):
+    config = _mistral_config(hf_config, used)
+    used.update(('num_local_experts', 'num_experts_per_tok', 'output_router_logits',
+                 'router_aux_loss_coef', 'router_jitter_noise'))
+    if hf_config.get('router_jitter_noise', 0.0):
+        _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
+    config['mixture'] = {
+        'experts': int(hf_config['num_local_experts']),
+        'top_k': int(hf_config['num_experts_per_tok']),
+    }
+    return config
+
+
 def _mistral_config(hf_config, used):
     layers = int(hf_config['num_hidden_layers'])
     window = hf_config.get('sliding_window')
@@ -1299,6 +1312,15 @@ def _qwen3_export(model: CausalTransformer) -> dict[str, object]:
     return fields
 
 
+
+def _mixtral_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    name = name.replace('.block_sparse_moe.', '.mlp.')
+    for theirs, ours in (('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj')):
+        name = name.replace(f'.{theirs}.weight', f'.{ours}.weight')
+    return _dew_path(name, config)
+
+
+
 @dataclass(frozen=True)
 class DecoderFamily:
     """One family's config, tensor paths and export vocabulary.
@@ -1406,6 +1428,9 @@ _FAMILY_ENTRIES = (
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
     DecoderFamily(('qwen3',), _qwen3_config, lambda model: model.qk_norm,
                   'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
+    DecoderFamily(('mixtral',), _mixtral_config, lambda model: model.mixture is not None,
+                  'mixtral', 'MixtralForCausalLM', lambda model: {},
+                  weight_path=_mixtral_path),
     DecoderFamily(('mistral',), _mistral_config,
                   lambda model: all(model.kind_of(kind).window is not None
                                     for kind in model.per_layer_types),
