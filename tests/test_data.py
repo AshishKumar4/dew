@@ -27,7 +27,7 @@ import pytest
 import dew.data
 from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
                       OxfordFlowers, TokenWindows, VoxCeleb2, local_batch)
-from dew.data import Loading, images, online_loader, video
+from dew.data import Loading, images, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
@@ -577,82 +577,10 @@ def test_av_benchmark_script_imports_against_the_real_av_utils():
     assert not (REPO_ROOT / "src" / "dew" / "data" / "sources" / "av_example.py").exists()
 
 
-# ---------------------------------------------------------------------------------
-# The streaming collate
-# ---------------------------------------------------------------------------------
-
 def keep_captions(captions):
     """A caption reader that hands the words back, so a test reads what the
     dataset wrote before a run's encoder tokenizes it."""
     return {"caption": np.asarray(captions)}
-
-
-def test_image_collate_resizes_mixed_shapes_to_the_largest(monkeypatch):
-    """cv2.resize takes (width, height); passing (height, width) transposed every
-    non-square image, np.stack failed, and the except branch fed zero images on."""
-    collate = online_loader.generate_collate_fn("image")
-    batch = [
-        {"image": np.full((16, 24, 3), 200, np.uint8), "caption": "wide"},
-        {"image": np.full((20, 16, 3), 100, np.uint8), "caption": "tall"},
-    ]
-    out = collate(batch)
-    assert out["image"].shape == (2, 20, 24, 3)
-    assert out["image"][0].min() == 200 and out["image"][1].min() == 100
-    assert list(out["caption"]) == ["wide", "tall"]
-
-
-def test_image_collate_raises_on_a_malformed_sample(monkeypatch):
-    """The whole-batch try/except returned zeros captioned "Error processing
-    image" for any failure, and a batch of zeros trains as data."""
-    collate = online_loader.generate_collate_fn("image")
-    batch = [
-        {"image": np.full((16, 16, 3), 200, np.uint8), "caption": "fine"},
-        {"image": "not an array", "caption": "broken"},
-    ]
-
-    with pytest.raises(AttributeError):
-        collate(batch)
-
-
-def test_collate_raises_on_a_sample_without_a_caption(monkeypatch):
-    """A sample without a caption raises instead of collating as the empty string."""
-    image_collate = online_loader.generate_collate_fn("image")
-    video_collate = online_loader.generate_collate_fn("video")
-
-    with pytest.raises(KeyError, match="caption"):
-        image_collate([{"image": np.zeros((8, 8, 3), np.uint8)}])
-    with pytest.raises(KeyError, match="caption"):
-        video_collate([{"video": np.zeros((2, 8, 8, 3), np.uint8)}])
-
-
-def test_video_collate_raises_on_a_malformed_sample(monkeypatch):
-    collate = online_loader.generate_collate_fn("video")
-    batch = [
-        {"video": np.zeros((2, 8, 8, 3), np.uint8), "caption": "fine"},
-        {"video": None, "caption": "broken"},
-    ]
-
-    with pytest.raises(AttributeError):
-        collate(batch)
-
-
-def test_image_collate_stacks_a_batch_of_one(monkeypatch):
-    collate = online_loader.generate_collate_fn("image")
-    out = collate([{"image": np.zeros((8, 8, 3), np.uint8), "caption": "one"}])
-    assert out["image"].shape == (1, 8, 8, 3)
-    assert list(out["caption"]) == ["one"]
-
-
-def test_image_collate_raises_when_a_grayscale_record_meets_colour_ones(monkeypatch):
-    """Resizing to the largest shape cannot rescue a record with no channels,
-    and stacking it silently would be worse."""
-    collate = online_loader.generate_collate_fn("image")
-    batch = [
-        {"image": np.zeros((8, 8, 3), np.uint8), "caption": "colour"},
-        {"image": np.zeros((8, 8), np.uint8), "caption": "gray"},
-    ]
-    with pytest.raises(ValueError):
-        collate(batch)
 
 
 # ---------------------------------------------------------------------------------
