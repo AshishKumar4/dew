@@ -11,7 +11,7 @@ The public modules and the names each exports. This page is written by
 | --- | --- |
 | `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
 | `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `resolve_dtype`, `dtype_name`, `with_precision` |
-| `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid` |
+| `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid`, `host` |
 | `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig`, `Wandb` |
 
 ## Training
@@ -19,7 +19,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Step`, `Tracker`, `TrainState`, `Trainer`, `WandbTracker`, `build_mesh`, `build_optimizer`, `ema_update`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
-| `dew.training.distributed` | `Checkpointable`, `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_sharding`, `broadcast_from_process_zero`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
+| `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `broadcast_from_process_zero`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers` |
 | `dew.training.runtime` | `prepare_process`, `run_timestamp` |
 | `dew.telemetry.instrumentation` | `compiled_flops`, `default_compilation_cache_dir`, `enable_compilation_cache`, `hlo_flops`, `model_flops_utilization`, `step_flops` |
@@ -39,7 +39,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.diffusion` | `NoiseScheduler`, `GeneralizedNoiseScheduler`, `DiscreteNoiseScheduler`, `ContinuousNoiseScheduler`, `LinearNoiseScheduler`, `linear_beta_schedule`, `CosineNoiseScheduler`, `cosine_beta_schedule`, `ExpNoiseScheduler`, `exp_beta_schedule`, `CosineGeneralNoiseScheduler`, `CosineContinuousNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler`, `compute_resolution_shift`, `expand`, `PredictionTransform`, `EpsilonPredictionTransform`, `DirectPredictionTransform`, `VPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `Weighting`, `ScheduleWeighting`, `MinSNR`, `broadcast_rates`, `Process`, `Denoiser`, `presets`, `discrete` |
-| `dew.diffusion.presets` | `Cosine`, `EDM`, `Flow`, `Karras`, `Sqrt` |
+| `dew.diffusion.presets` | `Cosine`, `EDM`, `Flow`, `Karras`, `Preset`, `Sqrt` |
 | `dew.diffusion.schedules` | `NoiseScheduler`, `GeneralizedNoiseScheduler`, `DiscreteNoiseScheduler`, `ContinuousNoiseScheduler`, `LinearNoiseScheduler`, `linear_beta_schedule`, `CosineNoiseScheduler`, `cosine_beta_schedule`, `ExpNoiseScheduler`, `exp_beta_schedule`, `CosineGeneralNoiseScheduler`, `CosineContinuousNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler`, `compute_resolution_shift`, `expand` |
 | `dew.diffusion.transforms` | `DirectPredictionTransform`, `EpsilonPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `MinSNR`, `PredictionTransform`, `ScheduleWeighting`, `VPredictionTransform`, `Weighting`, `broadcast_rates` |
 | `dew.diffusion.discrete` | `DiscreteDenoiser`, `DiscreteProcess`, `LogLinear`, `MDLM`, `MaskingSchedule`, `Unmask` |
@@ -67,8 +67,8 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `Audio`, `CharTable`, `unit_range` |
-| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
+| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `Audio`, `CharTable`, `rebuild`, `unit_range` |
+| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Checkpointable`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
 
 ## Evaluation and interop
 

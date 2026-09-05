@@ -75,7 +75,9 @@ typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
 # grain ships no py.typed, so its stubs live in stubs/: RandomMap.random_map
-# and MapDataset.__getitem__ as they really are, plus the used surface.
+# and MapDataset.__getitem__ as they really are, plus the used surface. The
+# optional video-reader-rs is stubbed the same way; where it is not installed
+# pyright reports the missing source as a warning, which is the true state.
 stubPath = "stubs"
 
 [tool.pytest.ini_options]

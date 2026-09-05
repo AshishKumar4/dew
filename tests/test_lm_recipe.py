@@ -63,9 +63,9 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
 def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
     recipe = load_recipe()
     with pytest.raises(FileNotFoundError, match="meta.json"):
-        recipe.read_meta(str(tmp_path))
+        recipe.token_directory(str(tmp_path))
     with pytest.raises(ValueError, match="--data.path"):
-        recipe.read_meta(None)
+        recipe.token_directory(None)
 
 
 def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
