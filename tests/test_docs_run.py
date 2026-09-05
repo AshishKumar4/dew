@@ -2,18 +2,17 @@
 
 Every ```python block in README.md and docs/**/*.md is executed in file order,
 in one namespace per file, on CPU. The namespace starts with the small real
-objects a snippet refers to by name without building them (`data`, `steps`,
+objects a snippet refers to without building them (`data`, `steps`,
 `prompt`, `key`, a tiny `model`, `objective`, `trainer`, `state`, `process`,
 `inputs`, `text`, `fields`), so a block that trains does so for a few steps on
-random records, and a block that names a symbol the library no longer has, or
-calls it with arguments it no longer takes, fails here rather than in a
-reader's terminal.
+random records, and a block that names a symbol the library lacks, or calls
+it with arguments it does not take, fails here before a reader's terminal.
 
 A block whose first line is `# runs elsewhere: <reason>` is compiled but not
 run; the reason is for the reader (a download, a run directory on disk, a
 process pool). A syntax error or a misspelled import in it still fails.
 
-The tutorials are notebooks, so they are checked rather than executed: every
+The tutorials are notebooks, so they are checked, not executed: every
 `dew` name a code cell imports has to exist, and every call of one of those
 names has to match its signature. That is what a markdown block gets for free
 by being run, and without it a notebook keeps naming a symbol the library

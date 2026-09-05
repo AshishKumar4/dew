@@ -138,8 +138,8 @@ def test_router_reproduces_the_mixtral_choice_and_gate_values():
 
 
 def test_mixtral_parity_needs_the_renormalisation():
-    """The mutation the router's weights would survive silently: keep the
-    top-k softmax mass without dividing by it."""
+    """The mutation the router's weights would survive: keep the top-k
+    softmax mass without dividing by it."""
     tensors = fixture("mixtral")
     hidden = jnp.asarray(tensors["hidden"]).reshape(-1, CONFIG["mixtral"]["hidden_size"])
     weights, indices = mixtral_router(normalize_weights=False).apply(
@@ -385,7 +385,7 @@ def balanced_run(steps=40, rate=0.01, direction=1.0):
     The gate reads a constant first feature, so every expert has a standing
     preference on top of what a token asks for, which is the imbalance a real
     router starts with. `direction` of -1 is the mutation: an update that
-    follows the load instead of opposing it.
+    follows the load, where the reference opposes it.
     """
     router = Router(num_experts=EXPERTS, in_features=16, top_k=2, expert_bias=True)
     tokens = jax.random.normal(jax.random.key(3), (128, 16)).at[:, 0].set(1.0)
@@ -413,9 +413,9 @@ def test_the_bias_update_evens_out_the_expert_load():
     """The mechanism end to end: the update applied to the bias every step,
     and the load spread has to close.
 
-    The router reads the bias out of the `moe` collection and never writes it,
-    which is where transformers keeps it and how MaxText hands the update
-    back, so the step that applies it is this loop.
+    The router reads the bias out of the `moe` collection and never writes it
+    (transformers keeps it there, and MaxText hands the update back the same
+    way), so the step that applies it is this loop.
     """
     start, final, bias = balanced_run()
 
@@ -596,7 +596,7 @@ def test_a_sparse_layer_replaces_only_its_own_feed_forward():
 
 
 def test_the_expert_leaves_hold_every_expert_of_the_reference_layout():
-    """One leaf per projection, stacked over the experts, which is what a
+    """One leaf per projection, stacked over the experts, the layout a
     checkpoint's `mlp.experts.N.gate_proj.weight` tensors translate into."""
     model = decoder(emb_features=32, mixture=Mixture(experts=8, top_k=2, layers=(0,)))
     variables = model.init(jax.random.key(0), jnp.zeros((2, SEQ_LEN), jnp.int32))
@@ -669,7 +669,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     assert sparse.apply(variables, tokens).dtype == jnp.bfloat16
 
     # The same tokens at fp32 choose the same experts and weight them the
-    # same, which is what running the gate in fp32 is for.
+    # same; that is the property the fp32 gate is for.
     exact = SparseMLP(num_experts=4, top_k=2, hidden_features=16, out_features=8)
     wide = exact.apply(variables, jnp.asarray(tokens, jnp.float32),
                        method=lambda module, x: module.gate(x))
@@ -709,7 +709,7 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     """Eight experts over one, two and four expert shards. The expert axis
-    carries the expert dimension and nothing else, so the widths keep fsdp."""
+    carries the expert dimension alone, so the widths keep fsdp."""
     _, specs = expert_specs(expert_size, fsdp_size)
     expert_axis = 'expert' if expert_size > 1 else None
 
@@ -761,10 +761,10 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
 
 
 def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
-    """Expert parallelism splits the experts and nothing else, so a model
-    whose experts are a fifth of it runs mostly replicated. The check has to
-    see that, which the fsdp-only rule could not: it returned as soon as the
-    fsdp axis was one.
+    """Expert parallelism splits the experts alone, so a model whose experts
+    are a fifth of it runs mostly replicated. The check has to see that,
+    which the fsdp-only rule could not: it returned as soon as the fsdp axis
+    was one.
     """
     model = models.build("causal_transformer", **moe_config())
     variables = jax.eval_shape(
@@ -862,8 +862,8 @@ def test_the_expert_shards_train_the_same_model():
     assert one[-1] < one[0] / 2, one
     difference = np.max(np.abs(np.array(one) - np.array(four)))
     # Observed equal on all 50 steps, 4.649611 down to 0.594418. The
-    # tolerance is 1e-6 rather than zero because a different collective order
-    # is allowed to round differently.
+    # tolerance is 1e-6, not zero, because a different collective order is
+    # allowed to round differently.
     assert difference < 1e-6, difference
 
 

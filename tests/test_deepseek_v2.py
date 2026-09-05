@@ -3,7 +3,7 @@
 The router fixture comes from tools/moe_reference.py (`DeepseekV2TopkRouter`
 under group_limited_greedy with no renormalisation); the balance loss is
 checked against the released `MoEGate` equations by hand and then through
-`LMObjective`, which is where a training run adds it.
+`LMObjective`, where a training run adds it.
 """
 
 import json

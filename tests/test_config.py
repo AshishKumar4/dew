@@ -138,9 +138,9 @@ def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
 
 
 def test_a_fresh_process_resolves_models_and_datasets_through_the_config():
-    """The lm and jepa recipes run in a process that imports nothing else
-    first, and both resolve a model and a dataset by name through this
-    module, so importing it has to be enough to fill those registries."""
+    """The lm and jepa recipes run in a fresh process, and both resolve a
+    model and a dataset from their registry names through this module, so
+    importing it has to be enough to fill those registries."""
     root = Path(__file__).resolve().parents[1]
     code = ("from dew.config import ModelConfig;"
             "from dew.registry import datasets, models;"
@@ -233,8 +233,8 @@ def test_an_interval_is_steps_a_pass_or_never():
 
 
 def test_a_pass_over_the_data_needs_a_record_count():
-    """A stream with no record count has no epoch, so "epoch" is refused by
-    name instead of silently becoming every step or never."""
+    """A stream with no record count has no epoch, so "epoch" raises a
+    ValueError that names the field."""
     streaming = _data(records=None)
 
     with pytest.raises(ValueError, match="checkpoint-every epoch needs a dataset"):
@@ -276,9 +276,8 @@ class _Bucket:
 
 
 def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
-    """A gs:// checkpoint directory has no local form: os.makedirs used to make
-    a directory called `gs:` beside the run and the open then failed, after the
-    training had already succeeded."""
+    """A gs:// checkpoint directory has no local form: the record is written
+    through epath, and no local filesystem call sees the URI."""
     def refuse(*args, **kwargs):
         raise AssertionError("a URI must not reach the local filesystem calls")
 

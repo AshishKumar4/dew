@@ -2,7 +2,7 @@
 
 `measure` walks the loader for warmup + steps batches and times the steps
 after warmup. The count it pulls is the contract: a loader that ends early
-is reported, not silently extrapolated.
+is reported as the count it reached.
 """
 
 import importlib.util

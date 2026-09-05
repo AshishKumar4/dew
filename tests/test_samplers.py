@@ -5,8 +5,8 @@ E[x0 | x_t] = alpha * s^2 / (alpha^2 s^2 + sigma^2) * x_t. A solver
 integrating the reverse process with this oracle must produce samples with
 mean 0 and std s, and on a variance exploding schedule the probability flow
 ODE it integrates, dx/dsigma = x sigma / (s^2 + sigma^2), has the closed
-form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2),
-which is what each solver's order of accuracy is measured against.
+form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
+Each solver's order of accuracy is measured against that closed form.
 """
 
 import jax
