@@ -24,6 +24,10 @@ Tolerances and the differences actually observed, fp32 on CPU:
 - olmo3-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
   6.2; the post-norm block, q/k norms over the whole projection and three
   sliding layers to one full (per-head norms of the same scale miss by 0.1).
+- llama31-tiny: max |logit difference| 9.89e-06, tolerance 1e-4, logits up to
+  6.4; Llama 3.1's rope_scaling (factor 8 over 64 pretraining positions, so
+  the ramp moves 7 of 8 pairs), and plain rope on the same weights misses
+  by 4.4.
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -69,7 +73,7 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
-        "gemma-tiny", "gemma2-tiny", "olmo3-tiny")
+        "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
@@ -443,6 +447,93 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
     factor_only = {**fixture_config("llama-tiny"), 'rope_scaling': {'factor': 8.0}}
     with pytest.raises(ValueError, match=r"rope_scaling scaling fields \['factor'\]"):
         translate_config(factor_only)
+
+
+@pytest.mark.parametrize("head_dim, theta, ramp", [
+    (16, 5e5, {'factor': 8.0, 'low_freq_factor': 1.0, 'high_freq_factor': 4.0,
+               'original_max_position_embeddings': 64}),
+    (128, 5e5, {'factor': 8.0, 'low_freq_factor': 1.0, 'high_freq_factor': 4.0,
+                'original_max_position_embeddings': 8192}),
+])
+def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp):
+    """RopeScaling.apply against transformers' _compute_llama3_parameters,
+    the reference's own function, on the tiny fixture's geometry and on
+    Llama-3.1-8B's (head_dim 128, base 5e5, factor 8 off 8192). Observed
+    difference 0.0 on both; the ramp moves 7 of the tiny table's 8 pairs
+    and 35 of the release's 64."""
+    from transformers import LlamaConfig
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from dew.nn.attention import RopeScaling
+
+    config = LlamaConfig.from_dict(dict(
+        hidden_size=head_dim * 4, num_attention_heads=4, head_dim=head_dim,
+        rope_theta=theta, rope_scaling={'rope_type': 'llama3', **ramp},
+        max_position_embeddings=8 * ramp['original_max_position_embeddings']))
+    reference, attention_factor = ROPE_INIT_FUNCTIONS['llama3'](config, 'cpu')
+    assert attention_factor == 1.0
+    plain = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+    scaled = np.asarray(RopeScaling(**ramp).apply(jnp.asarray(plain)))
+    assert np.max(np.abs(scaled - reference.numpy())) < 1e-7
+    assert np.sum(scaled != plain) >= head_dim // 4
+
+
+def test_a_llama3_rope_scaling_translates_and_loads():
+    """The tiny Llama 3.1 fixture: rope_scaling under the reference's names
+    on the backbone, and the same weights under plain rope at rope_theta
+    miss the reference by 4.4."""
+    config = translate_config(fixture_config("llama31-tiny"))
+    assert config['rope_scaling'] == {
+        'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+        'high_freq_factor': 4.0, 'original_max_position_embeddings': 64}
+    model, variables, _ = fp32_decoder(FIXTURES / 'llama31-tiny')
+    ids = np.load(FIXTURES / 'llama31-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'llama31-tiny' / 'logits.npy')
+    plain = model.clone(rope_scaling=None)
+    assert np.max(np.abs(np.asarray(plain.apply(variables, ids)) - reference)) > 1.0
+
+
+def test_the_released_llama_3_1_8b_config_translates_field_by_field():
+    """unsloth/Llama-3.1-8B carries meta-llama/Llama-3.1-8B's config."""
+    assert translate_config(fixture_config("llama-3.1-8b")) == {
+        'vocab_size': 128256, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 8, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 14336, 'max_seq_len': 8192, 'rope_theta': 5e5,
+        'layer_types': ('full_attention',) * 32, 'kinds': {},
+        'norm_eps': 1e-5, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': False,
+        'rope_scaling': {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+                         'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192},
+    }
+
+
+def test_a_ramp_the_reference_puts_on_one_kind_lands_on_that_kind():
+    """OLMo 3 moves a flat rope_scaling onto its full-attention entry
+    (configuration_olmo3.py:110-113) and leaves the sliding layers plain, and
+    a nested rope_parameters may state the same directly. Both land on the
+    full kind, not the model, since a kind's None rides the model's ramp and
+    could not turn one off. A ramp with a field missing refuses by name."""
+    ramp = {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+            'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192}
+    flat = {**fixture_config("olmo-3-7b"), 'rope_scaling': ramp}
+    config = translate_config(flat)
+    assert 'rope_scaling' not in config
+    assert config['kinds'] == {'sliding_attention': {'window': 4096},
+                               'full_attention': {'rope_scaling': ramp}}
+    from transformers import Olmo3Config
+
+    parameters = Olmo3Config.from_dict(flat).to_dict()['rope_parameters']
+    assert parameters['sliding_attention']['rope_type'] == 'default'
+    assert parameters['full_attention']['rope_type'] == 'llama3'
+
+    nested = {**fixture_config("olmo3-tiny"), 'rope_parameters': {
+        'full_attention': {**ramp, 'rope_theta': 5e5},
+        'sliding_attention': {'rope_type': 'default', 'rope_theta': 5e5}}}
+    assert translate_config(nested)['kinds']['full_attention'] == {'rope_scaling': ramp}
+
+    with pytest.raises(ValueError, match="missing \\['high_freq_factor'\\]"):
+        translate_config({**flat, 'rope_scaling': {
+            k: v for k, v in ramp.items() if k != 'high_freq_factor'}})
 
 
 @pytest.mark.parametrize("name", TINY + ROUTED)
