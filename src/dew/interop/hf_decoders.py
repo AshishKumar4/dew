@@ -34,7 +34,9 @@ from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 import numpy as np
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn import llama4
 from dew.nn.gpt_oss import unpack_mxfp4
+from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
 from dew.registry import models, with_precision
@@ -57,7 +59,7 @@ _DEEPSEEK = ('deepseek_v3', 'deepseek_v32')
 # whole model and whose text_config holds the decoder. Its own weights live
 # under model.language_model.*, next to vision and audio towers this has no
 # counterpart for, so the wrapper is refused by name.
-_WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n', 'qwen3_5')
+_WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n', 'qwen3_5', 'llama4')
 
 # The gated delta net's own geometry, the config's names and the mixer kind's.
 _LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
@@ -1097,14 +1099,14 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     # whose every tensor maps to nothing is an empty tree, not no tree.
     variables: Dict[str, Any] = {'params': {}}
     family = _family_for_config(config)
-    # GPT OSS ships its experts as MXFP4 blocks and scales; the unpacked
-    # tensor is what the reference runs, so the path map only ever sees it.
-    for name, tensor in unpack_mxfp4(hf_tensors).items():
+    for name, tensor in family.prepare_weights(hf_tensors).items():
         path = family.weight_path(name, config)
         if path is None:
             continue
         leaf = np.asarray(tensor, np.float32)
-        if path[-1] == 'kernel':
+        # torch Linear holds [out, in]; a stacked expert kernel arrives
+        # [E, in, out], which is the layout dew keeps.
+        if path[-1] == 'kernel' and leaf.ndim == 2:
             leaf = np.ascontiguousarray(leaf.T)
         node = variables
         for key in path[:-1]:
@@ -1419,6 +1421,9 @@ class DecoderFamily:
     weight_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]] = _dew_path
     export_path: Callable[[str, Mapping[str, object]], Optional[str]] = _hf_name
     sandwich_norms: bool = False
+    prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
+    """The checkpoint's tensors as the path map reads them: GPT OSS unpacks
+    its MXFP4 blocks, Llama 4 splits its fused expert kernels."""
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
@@ -1548,6 +1553,133 @@ def _glm4_moe_path(name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, 
     return (path[0], depth, 'block', *path[2:])
 
 
+def _llama4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Llama 4's text decoder: chunked rotated local layers around global
+    layers with no rope, every interleaved layer routed with a shared
+    expert, and the wider dense MLP of the other layers."""
+    layers = int(hf_config['num_hidden_layers'])
+    no_rope = hf_config.get('no_rope_layers') or None
+    if no_rope is None:
+        no_rope = llama4.default_no_rope_layers(
+            layers, int(hf_config.get('no_rope_layer_interval', 4)))
+    no_rope = tuple(int(flag) for flag in no_rope)
+    if len(no_rope) != layers or set(no_rope) - {0, 1}:
+        _refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
+    layer_types = llama4.rope_layer_types(no_rope)
+    stated = hf_config.get('layer_types')
+    if stated is not None and tuple(stated) != layer_types:
+        _refuse(f"layer_types {list(stated)!r}",
+                "it disagrees with no_rope_layers, which is what the reference reads")
+    entry = hf_config.get('rope_parameters') or hf_config.get('rope_scaling') or {}
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if rope_type not in ('default', 'none'):
+        _refuse(f"rope_parameters (rope_type {rope_type!r})",
+                "the llama4 mixer rotates its local layers at rope_theta")
+    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta'})
+    if scaling:
+        _refuse(f"rope_parameters scaling fields {scaling}",
+                "the llama4 mixer rotates its local layers at rope_theta")
+    theta = float(entry.get('rope_theta', hf_config.get('rope_theta', 500000.0)))
+    used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types',
+                 'rope_theta', 'rope_parameters', 'rope_scaling'))
+    config = _base_config(hf_config, used, layer_types=layer_types, rope=(theta, None))
+    if hf_config.get('router_jitter_noise', 0.0):
+        _refuse("router_jitter_noise", "the router selects on the logits alone")
+    if hf_config.get('output_router_logits', False):
+        _refuse("output_router_logits", "the decoder returns token logits")
+    used.update(('router_jitter_noise', 'output_router_logits', 'router_aux_loss_coef',
+                 'intermediate_size_mlp', 'num_local_experts', 'num_experts_per_tok',
+                 'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
+                 'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
+    rule = {
+        'kind': 'llama4',
+        'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
+        'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
+        'floor_scale': float(hf_config.get('floor_scale', 8192)),
+        'attn_scale': float(hf_config.get('attn_scale', 0.1)),
+    }
+    chunk = hf_config.get('attention_chunk_size')
+    kinds: Dict[str, Any] = {
+        'full_attention': {'mixer': {**rule, 'use_rope': False}},
+        'chunked_attention': {'mixer': {**rule, 'use_rope': True,
+                                        'attention_chunk_size': None if chunk is None else int(chunk)}},
+    }
+    moe_layers = hf_config.get('moe_layers')
+    step = int(hf_config.get('interleave_moe_layer_step', 1))
+    mixture: Dict[str, Any] = {
+        'experts': int(hf_config['num_local_experts']),
+        'top_k': int(hf_config.get('num_experts_per_tok', 1)),
+        'score_function': 'sigmoid',
+        'norm_topk_prob': False,
+        'scale_inputs': True,
+        'expert_features': int(hf_config['intermediate_size']),
+        'shared_features': int(hf_config['intermediate_size']),
+    }
+    if moe_layers is not None:
+        mixture['layers'] = tuple(int(index) for index in moe_layers)
+    else:
+        mixture['every'] = step
+    config.update(
+        # The dense layers take intermediate_size_mlp; the experts and the
+        # shared expert take intermediate_size.
+        mlp_features=int(hf_config['intermediate_size_mlp']),
+        qk_norm=False,
+        kinds={name: kinds[name] for name in kinds if name in layer_types},
+        mixture=mixture,
+    )
+    return config
+
+
+def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """The fused `experts.gate_up_proj` split into the two stacked kernels.
+
+    `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in
+    the first half (`gate_up.chunk(2)`), already in the `[E, in, out]`
+    layout dew's stacked expert kernels keep.
+    """
+    prepared: Dict[str, np.ndarray] = {}
+    for name, tensor in tensors.items():
+        if name.endswith('.feed_forward.experts.gate_up_proj'):
+            width = tensor.shape[-1] // 2
+            stem = name[:-len('gate_up_proj')]
+            prepared[stem + 'gate_proj'] = tensor[..., :width]
+            prepared[stem + 'up_proj'] = tensor[..., width:]
+        else:
+            prepared[name] = tensor
+    return prepared
+
+
+def _llama4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    """Llama 4 names its feed-forward `feed_forward`, its router `router` and
+    its dense branch `shared_expert`; the stacked expert kernels arrive
+    without a `.weight` suffix."""
+    parts = name.split('.')
+    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and parts[3] == 'feed_forward':
+        layer = ('params', f'layers_{parts[2]}', 'mlp')
+        if parts[4:] == ['router', 'weight']:
+            return (*layer, 'gate', 'kernel')
+        if len(parts) == 6 and parts[4] == 'experts' and parts[5] in _MOE_SHARED:
+            return (*layer, 'experts', parts[5], 'kernel')
+        if len(parts) == 7 and parts[4] == 'shared_expert' and parts[5] in _MOE_SHARED and parts[6] == 'weight':
+            return (*layer, 'shared_experts', parts[5], 'kernel')
+        if len(parts) == 6 and parts[4] in _MOE_SHARED and parts[5] == 'weight':
+            return (*layer, parts[4], 'kernel')
+        raise ValueError(f"unknown tensor name {name!r}")
+    return _dew_path(name, config)
+
+
+def _kind_mixers(fields: Mapping[str, Any]) -> list[MixerBase]:
+    """The mixer value of every kind a config names, records built."""
+    found = []
+    for kind in (fields['kinds'] or {}).values():
+        mixer = kind.mixer if isinstance(kind, LayerKind) else kind.get('mixer')
+        if isinstance(mixer, Mapping):
+            mixer = mixer_from_record(mixer)
+        if mixer is not None:
+            found.append(mixer)
+    return found
+
+
 def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
     mixer = fields['mixer']
     return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
@@ -1570,7 +1702,12 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('gpt_oss',), _gpt_oss_config,
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
-                  weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path),
+                  weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path,
+                  prepare_weights=unpack_mxfp4),
+    DecoderFamily(('llama4_text',), _llama4_config,
+                  lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
+                  'llama4_text', 'Llama4ForCausalLM', lambda model: {},
+                  weight_path=_llama4_path, prepare_weights=_llama4_prepare),
     DecoderFamily(('glm4_moe',), _glm4_moe_config,
                   lambda fields: (fields['partial_rotary_type'] == 'default'
                                   and (mixture := _mixture_value(fields)) is not None

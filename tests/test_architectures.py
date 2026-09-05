@@ -217,6 +217,20 @@ CASES = [
                     "bias": True, "expert_features": 16, "shared_features": 16},
         "num_nextn_predict_layers": 1,
     }, seq_len=SEQ_LEN, label="glm4_moe"),
+    # Llama 4's stack at toy width: chunked rotated layers around a global
+    # layer under the llama4 kind, the routed layers scaling their inputs.
+    Case("causal_transformer", {
+        **LM, "head_dim": 8, "qk_norm": False,
+        "layer_types": ("chunked_attention", "full_attention"),
+        "kinds": {"chunked_attention": {"mixer": {
+                      "kind": "llama4", "use_rope": True, "attention_chunk_size": 4,
+                      "floor_scale": 4.0}},
+                  "full_attention": {"mixer": {"kind": "llama4", "use_rope": False,
+                                               "floor_scale": 4.0}}},
+        "mixture": {"experts": 8, "top_k": 1, "every": 2, "score_function": "sigmoid",
+                    "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
+                    "shared_features": 16},
+    }, seq_len=SEQ_LEN, label="llama4"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,

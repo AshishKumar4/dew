@@ -1547,3 +1547,74 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
     with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
         fp32_decoder(directory)
 
+
+
+# --------------------------------------------------------------------------
+# Llama 4 (text): iRoPE with chunked local layers, input-scaled experts
+# --------------------------------------------------------------------------
+
+LLAMA4 = FIXTURES / "llama4-tiny"
+
+
+def test_llama4_config_translates_field_by_field():
+    """The tiny text config: three chunked rotated layers and one global
+    layer, each kind naming the llama4 mixer under its own rule, the dense
+    layers at intermediate_size_mlp and the routed layers 1 and 3 with a
+    shared expert at intermediate_size, sigmoid weights on the inputs."""
+    config = translate_config(fixture_config("llama4-tiny"))
+
+    assert config["layer_types"] == ("chunked_attention",) * 3 + ("full_attention",)
+    rule = {"kind": "llama4", "use_qk_norm": True, "attn_temperature_tuning": True,
+            "floor_scale": 4.0, "attn_scale": 0.1}
+    assert config["kinds"] == {
+        "full_attention": {"mixer": {**rule, "use_rope": False}},
+        "chunked_attention": {"mixer": {**rule, "use_rope": True, "attention_chunk_size": 4}}}
+    assert config["mixture"] == {
+        "experts": 4, "top_k": 2, "score_function": "sigmoid", "norm_topk_prob": False,
+        "scale_inputs": True, "expert_features": 48, "shared_features": 48, "layers": (1, 3)}
+    assert config["mlp_features"] == 64 and not config["qk_norm"]
+    assert config["rope_theta"] == 500000.0 and config["scale_after_cast"]
+
+
+def test_a_llama4_wrapper_config_is_refused_by_name():
+    """meta-llama/Llama-4-Scout-17B-16E's config.json wraps the text decoder
+    beside a vision tower; the text_config alone is what translates."""
+    with pytest.raises(ValueError, match="model_type 'llama4'"):
+        translate_config(fixture_config("llama-4-scout"))
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("layer_types", ["full_attention"] * 4, "disagrees with no_rope_layers"),
+    ("router_jitter_noise", 0.1, "router_jitter_noise"),
+    ("output_router_logits", True, "output_router_logits"),
+    ("no_rope_layers", [1, 1, 2, 0], "no_rope_layers"),
+])
+def test_a_llama4_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("llama4-tiny"), field: value})
+
+
+def test_llama4_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
+    with identical argmax. The fused expert kernels arrive split in place."""
+    model, variables, _ = fp32_decoder(LLAMA4)
+    ids = np.load(LLAMA4 / "input_ids.npy")
+    reference = np.load(LLAMA4 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    experts = variables["params"]["layers_1"]["mlp"]["experts"]
+    assert experts["gate_proj"]["kernel"].shape == (4, 32, 48)
+    assert experts["down_proj"]["kernel"].shape == (4, 48, 32)
+    assert "shared_experts" in variables["params"]["layers_1"]["mlp"]
+    assert "experts" not in variables["params"]["layers_0"]["mlp"]
+
+
+def test_llama4_export_is_refused_by_name(tmp_path):
+    model, variables, _ = fp32_decoder(LLAMA4)
+    with pytest.raises(ValueError, match="a mixer other than attention"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
