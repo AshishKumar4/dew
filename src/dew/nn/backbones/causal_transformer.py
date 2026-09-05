@@ -24,13 +24,15 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Mapping, Optional, Tuple, Union
+from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 
 import flax.core
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import (
     RMSNorm, RopeScaling, apply_rotary, causal_attention_mask, open_kv_cache,
@@ -42,7 +44,7 @@ from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..mla import YarnScaling, mla_rope_freqs
-from ..sharding import logical_axes
+from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 from dew.registry import models
 
 
@@ -50,17 +52,16 @@ from dew.registry import models
 class LayerKind:
     """What the layers of one kind in the pattern do differently.
 
-    The pattern already names each layer's kind, so what the kind means
-    belongs here rather than in a field name: a windowed kind is what
-    "sliding attention" used to say, and `rope_theta` and `head_dim` are the
-    model's unless this kind states its own. Rotary positions rotate every
-    dimension of a windowed kind, which is where Gemma 4 puts its partial
-    rotary (the global layers') and where the sliding layers rotate whole.
+    The pattern names each layer's kind, and this is what the kind means: a
+    windowed kind is the "sliding attention" of the reference configs, and
+    `rope_theta` and `head_dim` are the model's unless this kind states its
+    own. Rotary positions rotate every dimension of a windowed kind; Gemma 4
+    puts its partial rotary on the global layers and its sliding layers
+    rotate whole.
 
     `mixer` is this kind's token mixer, a value from the `mixers` registry;
     None rides the model's mixer. A hybrid stack names its per-layer mixers
-    here, keyed by the names already in the pattern, instead of growing a
-    second switch on layer names.
+    here, keyed by the names already in the pattern.
     """
 
     window: Optional[int] = None
@@ -106,16 +107,66 @@ class ResolvedKind:
     head_dim: int
     mixer: Optional[MixerBase]
 
+
+@dataclasses.dataclass(frozen=True)
+class LayerSpec:
+    """What one layer of the stack is, resolved: everything its block's
+    parameters and computation depend on that the layers do not share.
+
+    Two layers with equal specs have parameters of the same shapes and run
+    the same program, so a scan can run them as iterations of one body and a
+    pipeline can run them at the same position of different stages.
+    Everything the whole model sets (norms, the attention dials, per-layer
+    inputs, AltUp) is the same for every layer and so is not repeated here.
+    """
+
+    layer_type: str
+    kind: ResolvedKind
+    routed: bool
+    """The feed-forward routes to the mixture's experts."""
+    width: int
+    """The dense feed-forward width, doubled on a sharing layer when the model asks."""
+    sparsity: float
+    """The gaussian top-k fraction on the feed-forward gate, 0 for none."""
+    kv_shared: bool
+    """The layer reads its keys and values from an earlier layer's."""
+    provider: Optional[int]
+    """The layer's own index when a later layer reads its keys and values; such
+    a layer runs unrolled, since what it stashes leaves the stack's loop."""
+
+
+def scan_groups(specs: Sequence[LayerSpec]) -> Tuple[Tuple[int, int], ...]:
+    """The stack as runs of layers, `(first, count)` each, in order.
+
+    Consecutive layers with equal specs form one run, which a scan runs as
+    iterations of one body; a layer with no equal neighbour is a run of one,
+    which stays unrolled. The grouping is read off the specs, never written
+    by hand, so a model's pattern decides what scans.
+    """
+    groups: list[Tuple[int, int]] = []
+    for index, spec in enumerate(specs):
+        if groups and specs[groups[-1][0]] == spec:
+            first, count = groups[-1]
+            groups[-1] = (first, count + 1)
+        else:
+            groups.append((index, 1))
+    return tuple(groups)
+
+
+def group_name(first: int, count: int) -> str:
+    """The module name of a scanned run: `layers_3_7` runs layers 3 through 7."""
+    return f'layers_{first}_{first + count - 1}'
+
 @dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts some layers route to, and how the router chooses.
 
-    `experts` is what the rest depends on, which is why they live together:
-    a top_k, a cadence or a balancing bias says nothing about a model with
-    no experts. `layers` names the sparse layers by index, or `every` makes
-    every nth layer sparse counting from the end of the first group, which
-    is what Qwen3-MoE's decoder_sparse_step means; neither makes every layer
-    sparse, which is Mixtral.
+    `experts` is what the rest depends on, so they live together: a top_k, a
+    cadence or a balancing bias says nothing about a model with no experts.
+    `layers` names the sparse layers by index, or `every` makes every nth
+    layer sparse counting from the end of the first group, the meaning of
+    Qwen3-MoE's decoder_sparse_step; neither makes every layer sparse, which
+    is Mixtral.
 
     The routing options are `Router`'s: `score_function` softmax, sigmoid or
     sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
@@ -123,7 +174,7 @@ class Mixture:
     `groups` with `groups_per_token` for DeepSeek's node limit, `group_score`
     for how a group is scored ('top2' is V3's, 'max' is V2's), `bias`
     for V3's aux-loss-free balancing bias, and `scale_inputs` for Llama 4's
-    weight on the expert input rather than its output.
+    weight on the expert input in place of its output.
 
     `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
     beside the dense feed-forward on the same residual and the two are
@@ -200,9 +251,9 @@ class CausalSelfAttention(nn.Module):
 
     decode=True runs the call against the cache: the first call writes the
     whole prompt and each later call appends one token, so prefill and decode
-    are one code path. Keys are rotated before they enter the cache, which is
-    why the rotary positions come from the cache index rather than from the row
-    index of the token.
+    are one code path. Keys are rotated before they enter the cache, so the
+    rotary positions come from the cache index and not from the row index of
+    the token.
 
     causal=False is full attention over the sequence, which a masked
     diffusion model reads the whole corrupted sequence with; there is no
@@ -254,8 +305,8 @@ class CausalSelfAttention(nn.Module):
         self.q_proj = dense(
             self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
-        # no projections or key norm of its own, exactly as the reference
-        # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
+        # no projections or key norm of its own, as the reference skips them
+        # (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.kv_shared:
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             if not self.k_eq_v:
@@ -347,9 +398,9 @@ class CausalSelfAttention(nn.Module):
             query = self.q_norm(query)
 
         # The cache slot carries position while decoding, so the rotation and
-        # the mask both read it instead of the row index of the token. A
-        # packed batch supplies the position inside its document instead of
-        # the row index, which is what restarts RoPE at every boundary.
+        # the mask both read it and not the row index of the token. A packed
+        # batch supplies the position inside its document in place of the
+        # row index, and RoPE restarts at every boundary.
         append = None
         kv_len = key.shape[-3]
         if decode:
@@ -403,7 +454,7 @@ class CausalSelfAttention(nn.Module):
             # Attention stays inside each packed document: the segment ids
             # make the mask block-diagonal, padding (segment 0) sees nothing,
             # and causality (with the layer's window) travels in the same mask
-            # rather than as the kernels' flag.
+            # and not as the kernels' flag.
             segment_ids = jnp.asarray(segment_ids)
             inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
                       & (segment_ids[:, :, None] != 0))[:, None]
@@ -506,7 +557,7 @@ class DecoderBlock(nn.Module):
     states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share.
 
     sandwich_norms adds Gemma's second pair of norms, on the output of each
-    sublayer rather than on its input; the pre-norms keep their names and their
+    sublayer and not on its input; the pre-norms keep their names and their
     places, so a checkpoint without them loads into the same tree minus two
     leaves per layer. pre_norms=False drops the input pair, which with the
     output pair on is OLMo 3's post-norm block (modeling_olmo3.py:249-266):
@@ -521,7 +572,7 @@ class DecoderBlock(nn.Module):
     altup makes the block take and return Gemma 3n's stack of residual
     copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
     active prediction, corrects every copy by what it computed, and adds the
-    per-layer residual to the copies past the first rather than to its own
+    per-layer residual to the copies past the first and not to its own
     output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
     adds the LAuReL block over the attention's normed input, averaged with
     the attention residual over sqrt(2).
@@ -703,6 +754,207 @@ class MTPBlock(nn.Module):
             fused, train=train, positions=positions, segment_ids=segment_ids))
 
 
+Block = Callable[[int, str], DecoderBlock]
+"""Layer `index`'s block under a module name: what the stack and its stages
+build their layers from, so one factory describes every view of them."""
+
+
+def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
+              groups: Sequence[Tuple[int, int]], x, *, train: bool, decode: bool,
+              positions, segment_ids, kv_store, per_layer_input):
+    """The layers over `x`, one run at a time as `groups` says.
+
+    A run of one layer is `layers[first]`, called as the plain loop calls it.
+    A longer run is one block, named for its range, under flax's scan: its
+    variables carry a leading layer axis that the view outside stacks and
+    unstacks, and each iteration reads its own slice of the per-layer inputs.
+    Building that block here needs a compact caller.
+
+    A run's layers all share or all own their keys and values. Sharing layers
+    read the store their providers filled before the run, a constant the loop
+    closes over. Owning layers would write into it from inside the loop,
+    where a Python dict cannot follow, so they get no store; nothing reads
+    what they would have written, because a provider is always a run of one.
+    """
+    for first, count in groups:
+        inputs = (None if per_layer_input is None
+                  else per_layer_input[:, :, first:first + count, :])
+        if count == 1:
+            x = layers[first](x, train=train, decode=decode, positions=positions,
+                              segment_ids=segment_ids, kv_store=kv_store,
+                              per_layer_input=None if inputs is None else inputs[:, :, 0, :])
+            continue
+        store = kv_store if specs[first].kv_shared else None
+
+        def step(layer, carry, per_layer_input):
+            return layer(carry, train=train, decode=decode, positions=positions,
+                         segment_ids=segment_ids, kv_store=store,
+                         per_layer_input=per_layer_input), None
+
+        scanned = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+                          in_axes=2, length=count)
+        x, _ = scanned(block(first, group_name(first, count)), x, inputs)
+    return x
+
+
+class PipelineStage(nn.Module):
+    """The layers one pipeline stage holds, over one microbatch.
+
+    The pipeline vmaps this module over the stage axis, so every stage runs
+    it over its own slice of the stacked layer weights and its variables
+    carry a leading stage axis that the view outside stacks and unstacks.
+    Layer `j` of a stage is `layers_j` here and `layers_{stage * count + j}`
+    in the stored tree; `specs` and `groups` are stage 0's, which every
+    stage repeats.
+    """
+    block: Block
+    specs: Tuple[LayerSpec, ...]
+    groups: Tuple[Tuple[int, int], ...]
+
+    def setup(self):
+        self.layers = [self.block(index, f'layers_{index}') for index in range(len(self.specs))]
+
+    @nn.compact
+    def __call__(self, x, train: bool = False, positions=None, segment_ids=None,
+                 per_layer_input=None):
+        return run_stack(self.layers, self.block, self.specs, self.groups, x,
+                         train=train, decode=False, positions=positions,
+                         segment_ids=segment_ids, kv_store=None,
+                         per_layer_input=per_layer_input)
+
+
+def _stack_leaves(*trees):
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
+
+
+@dataclasses.dataclass(frozen=True)
+class StackView:
+    """The layer stack's variables as its loops read them.
+
+    Outside, every collection holds one subtree per layer, `layers_N`, which
+    is the tree a checkpoint stores and a Hugging Face loader fills. Inside
+    a scanned run the same leaves are stacked along a leading layer axis
+    under the run's name (`layers_3_7`), and inside a pipeline every stage's
+    copy of a position is stacked along a leading stage axis under `stages`.
+    `stack` builds the inside from the outside and `unstack` the outside
+    from the inside, so what a run reads, sows and caches lands leaf for
+    leaf where the plain loop puts it.
+
+    `groups` are the runs of one stage (of the whole stack without a
+    pipeline). A collection that entered the pipeline's loop keeps `[stage,
+    ...]` leaves; one the loop created (what the routers sow) keeps
+    `[iteration, stage, microbatch, ...]` leaves, of which the real
+    iterations of each stage are its microbatches in order.
+    """
+    groups: Tuple[Tuple[int, int], ...]
+    stages: int = 1
+    microbatches: int = 1
+    broadcast: Tuple[str, ...] = ()
+
+    @property
+    def per_stage(self) -> int:
+        return sum(count for _, count in self.groups)
+
+    def _inside_name(self, first: int, count: int) -> Optional[str]:
+        """A run's name inside, None for a layer the view leaves as it is."""
+        if count > 1:
+            return group_name(first, count)
+        return f'layers_{first}' if self.stages > 1 else None
+
+    def _outside_names(self, first: int, count: int) -> list[list[str]]:
+        """The stored names of a run's layers, one list per stage."""
+        return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
+                for stage in range(self.stages)]
+
+    def stack(self, variables: Mapping[str, Mapping]) -> dict:
+        inside = {}
+        for collection, tree in variables.items():
+            tree = dict(tree)
+            stages = {}
+            for first, count in self.groups:
+                name = self._inside_name(first, count)
+                if name is None:
+                    continue
+                names = self._outside_names(first, count)
+                held = [layer in tree for stage in names for layer in stage]
+                if not any(held):
+                    continue
+                if not all(held):
+                    raise ValueError(
+                        f"collection {collection!r} holds some of the layers "
+                        f"{sorted(layer for stage in names for layer in stage)} and not "
+                        "the others; a run reads every one of its layers or none")
+                runs = [_stack_leaves(*[tree.pop(layer) for layer in stage]) if count > 1
+                        else tree.pop(stage[0]) for stage in names]
+                if self.stages == 1:
+                    tree[name] = runs[0]
+                else:
+                    stages[name] = jax.tree.map(_on_stage_axis, _stack_leaves(*runs))
+            if stages:
+                tree['stages'] = stages
+            inside[collection] = tree
+        return inside
+
+    def unstack(self, variables: Mapping[str, Mapping]) -> dict:
+        outside = {}
+        for collection, tree in variables.items():
+            tree = dict(tree)
+            stages = dict(tree.pop('stages', {})) if self.stages > 1 else tree
+            for first, count in self.groups:
+                name = self._inside_name(first, count)
+                if name is None or name not in stages:
+                    continue
+                view = stages.pop(name)
+                for stage, names in enumerate(self._outside_names(first, count)):
+                    for offset, layer in enumerate(names):
+                        tree[layer] = jax.tree.map(
+                            functools.partial(self._leaf, stage, offset if count > 1 else None,
+                                              collection in self.broadcast), view)
+            if self.stages > 1 and stages:
+                tree['stages'] = stages
+            outside[collection] = tree
+        return outside
+
+    def _leaf(self, stage: int, offset: Optional[int], broadcast: bool, leaf):
+        """One layer's leaf out of a run's stacked one."""
+        if self.stages == 1:
+            return leaf[offset]
+        if broadcast:
+            leaf = leaf[stage]
+            return leaf if offset is None else leaf[offset]
+        real = leaf[stage:stage + self.microbatches, stage]
+        if offset is not None:
+            real = real[:, offset]
+        return real.reshape((-1,) + real.shape[2:])
+
+
+def _on_stage_axis(leaf):
+    """`leaf`, its leading dimension placed on the stage axis of the mesh in context."""
+    return jax.lax.with_sharding_constraint(leaf, _stage_sharding(leaf.ndim))
+
+
+def _stage_sharding(ndim: int) -> NamedSharding:
+    """The leading dimension on the stage axis; the rest as the layout and the
+    batch's placement propagate them."""
+    return NamedSharding(jax.sharding.get_abstract_mesh(),
+                         P(STAGE_AXIS, *([P.UNCONSTRAINED] * (ndim - 1))))
+
+
+def _microbatched(value, axis: int, count: int):
+    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: the batch axis cut
+    into `count` microbatches of consecutive rows, in order."""
+    shape = value.shape
+    split = value.reshape(shape[:axis] + (count, shape[axis] // count) + shape[axis + 1:])
+    return jnp.moveaxis(split, axis, 0)
+
+
+def _whole(value, axis: int):
+    """The batch `_microbatched` cut, back in one piece."""
+    moved = jnp.moveaxis(value, 0, axis)
+    shape = moved.shape
+    return moved.reshape(shape[:axis] + (shape[axis] * shape[axis + 1],) + shape[axis + 2:])
+
+
 @models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
@@ -790,6 +1042,19 @@ class CausalTransformer(nn.Module):
     with the embedding of the token at p + d and scores what follows p + d
     (arXiv 2412.19437, section 2.2), so each depth is one position shorter
     than the last.
+
+    `scan_layers` runs every run of consecutive layers that share a
+    parameter shape and a computation (same kind, same feed-forward and
+    width, the same say in keys and values) as iterations of one body under
+    flax's scan, and the layers between such runs unrolled; the grouping
+    is read off the resolved layers, never configured. A body compiles
+    once however many layers it runs, so compile time stops growing with
+    depth. The variables tree is the unscanned one leaf for leaf: `init`
+    always runs the plain loop, and the scan reads and writes its stacked
+    view of the same leaves (`StackView`), so a checkpoint or a Hugging Face
+    tree loads either way. A stage axis above one on the mesh in context
+    runs the stack as a pipeline over that axis (`_pipeline`) whether or
+    not the layers scan.
     """
     vocab_size: int
     emb_features: int = 512
@@ -842,6 +1107,7 @@ class CausalTransformer(nn.Module):
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
+    scan_layers: bool = False                 # runs of like layers under flax's scan
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -855,8 +1121,8 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "altup", AltUp(**self.altup))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
-        # plain constructor takes the same records, which is what a test or
-        # a notebook writes.
+        # plain constructor takes the same records, as a test or a notebook
+        # writes them.
         if isinstance(self.yarn, Mapping):
             object.__setattr__(self, 'yarn', YarnScaling(**self.yarn))
         if isinstance(self.mixture, Mapping):
@@ -979,9 +1245,9 @@ class CausalTransformer(nn.Module):
 
         `head_dim`, `rope_theta` and `window` already carry the layer kind's
         overrides; a windowed kind rotates every dimension, so the partial
-        rotary belongs to the kinds that attend the whole sequence, which is
-        where Gemma 4 puts it. A kind builds its `DecoderBlock` factory from
-        this and its own record, which is the one place the mixer is chosen.
+        rotary belongs to the kinds that attend the whole sequence, where
+        Gemma 4 puts it. A kind builds its `DecoderBlock` factory from this
+        and its own record; `setup` chooses the mixer there and nowhere else.
         """
         return MixerContext(
             emb_features=self.emb_features,
@@ -1165,24 +1431,36 @@ class CausalTransformer(nn.Module):
                 num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
                 dtype=self.dtype, precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
-        # and otherwise rides the model's. The one dispatch stays build over
-        # the layer's context.
+        # and otherwise rides the model's. Both build over the layer's
+        # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
-        self.layers = [
-            DecoderBlock(
-                mixer=(kinds[layer_type].mixer or mixer_spec).build(
-                    self.mixer_context(kinds[layer_type], layer_type, index in sharing)),
+        providers = set(sharing.values())
+        specs = tuple(
+            LayerSpec(
+                layer_type=layer_type,
+                kind=kinds[layer_type],
+                routed=index in sparse,
+                width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
+                       else widths[index]),
+                sparsity=0.0 if sparsity is None else sparsity[index],
+                kv_shared=index in sharing,
+                provider=index if index in providers else None)
+            for index, layer_type in enumerate(types))
+
+        def block(index: int, name: str) -> DecoderBlock:
+            spec = specs[index]
+            return DecoderBlock(
+                mixer=(spec.kind.mixer or mixer_spec).build(
+                    self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
                 feedforward=(
                     routed
-                    if index in sparse and routed is not None else
+                    if spec.routed and routed is not None else
                     functools.partial(
                         GatedMLP,
-                        hidden_features=(2 * widths[index]
-                                         if self.use_double_wide_mlp and index in sharing
-                                         else widths[index]),
+                        hidden_features=spec.width,
                         out_features=self.emb_features,
                         activation=self.mlp,
-                        activation_sparsity=0.0 if sparsity is None else sparsity[index],
+                        activation_sparsity=spec.sparsity,
                         precision=self.precision)),
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
@@ -1191,15 +1469,20 @@ class CausalTransformer(nn.Module):
                 sandwich_norms=self.sandwich_norms,
                 pre_norms=self.pre_norms,
                 per_layer_input_dim=ple or 0,
-                parallel=parallel if index in sparse else None,
+                parallel=parallel if spec.routed else None,
                 layer_scalar=self.layer_scalar,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
                 precision=self.precision,
-                name=f'layers_{index}')
-            for index, layer_type in enumerate(types)]
+                name=name)
+
+        self.specs = specs
+        self.block = block
+        self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
+        self.groups = scan_groups(specs) if self.scan_layers else tuple(
+            (index, 1) for index in range(self.num_layers))
         # Prediction depths mirror whole-sequence hidden states, so their
         # mixer builds from the full-attention kind where the pattern has
         # one, else from the first layer's kind; the feed-forward routes
@@ -1326,7 +1609,7 @@ class CausalTransformer(nn.Module):
         A loss that pairs this with `head_weight` scores tokens without ever
         holding the full `[B, S, vocab]` logits tensor. A packed batch passes
         its per-document `positions` and `segment_ids` through to the layers,
-        which is where RoPE and the mask read them.
+        where RoPE and the mask read them.
         """
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
@@ -1344,12 +1627,8 @@ class CausalTransformer(nn.Module):
             # The embeddings and, rescaled to their magnitude, each projected
             # copy: [num_inputs, B, S, D].
             x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
-        kv_store = {} if self.num_kv_shared_layers else None
-        for index, layer in enumerate(self.layers):
-            x = layer(x, train=train, decode=decode,
-                      positions=positions, segment_ids=segment_ids,
-                      kv_store=kv_store,
-                      per_layer_input=None if ple is None else ple[:, :, index, :])
+        x = self.stack(x, train=train, decode=decode, positions=positions,
+                       segment_ids=segment_ids, per_layer_input=ple)
         if self.altup is not None:
             # The copies past the first come back through their own
             # projections, rescaled to the first's magnitude, and the mean of
@@ -1358,6 +1637,213 @@ class CausalTransformer(nn.Module):
                                for project, copy in zip(self.altup_unembed_projections, x[1:])]
             x = jnp.mean(jnp.stack(copies), axis=0)
         return self.norm(x)
+
+    def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
+              per_layer_input):
+        """The layer stack over `x`: the plain loop, the scanned runs, or the
+        pipeline over the mesh's stages.
+
+        The plain loop is what `init` always runs, so the variables tree is
+        the one it creates whatever the model is asked to do afterwards.
+        With `scan_layers`, or a stage axis above one on the mesh in context,
+        the stack runs under `StackView`: the same leaves, stacked along the
+        loops' axes while the loops run and unstacked on the way out. The
+        loops carry the residual stream in one dtype, so it enters them in
+        the dtype it settles in (`residual_dtype`).
+        """
+        stages = pipeline_stages()
+        if self.is_initializing() or (stages == 1 and not self.scan_layers):
+            return run_stack(
+                self.layers, self.block, self.specs,
+                tuple((index, 1) for index in range(self.num_layers)), x,
+                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+                kv_store={} if self.num_kv_shared_layers else None,
+                per_layer_input=per_layer_input)
+        if stages == 1:
+            view = StackView(self.groups)
+        else:
+            if decode:
+                raise ValueError(
+                    "decoding appends one token at a time to the cache, which no "
+                    "pipeline over the stage axis runs; decode outside jax.set_mesh")
+            count = self.stage_layers(stages)
+            batch_axis = 1 if self.altup is not None else 0
+            rows, count_microbatches = x.shape[batch_axis], microbatches()
+            if count_microbatches % stages or rows % count_microbatches:
+                raise ValueError(
+                    f"a batch of {rows} rows over {stages} stages needs a microbatch "
+                    f"count that divides the rows and is a multiple of the stages, "
+                    f"got {count_microbatches}")
+            view = StackView(
+                scan_groups(self.specs[:count]) if self.scan_layers
+                else tuple((index, 1) for index in range(count)),
+                stages=stages, microbatches=count_microbatches,
+                # What enters the loop is read on every iteration; what the
+                # loop creates (the routers' sowing) comes out per iteration.
+                broadcast=tuple(name for name, tree in self.variables.items() if tree))
+        x = x.astype(self.residual_dtype(
+            x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            per_layer_input=per_layer_input))
+        run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+                               trans_out_fn=view.unstack, init=False, mutable=True)
+        return run(self, view, x, train, decode, positions, segment_ids, per_layer_input)
+
+    def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
+                       per_layer_input) -> jnp.dtype:
+        """The dtype the residual stream settles in: `x`'s promoted with what
+        the first layer returns for it.
+
+        A scan carries one dtype from its first iteration to its last, and
+        every pipeline stage takes the dtype the stage before it returns.
+        Under a bf16 policy the dense feed-forward returns fp32, so the
+        plain loop's stream is fp32 from the first layer on and the loops
+        take it in fp32 from the start; at fp32 nothing changes. The layer
+        runs abstractly, in a scope of its own, so it writes no cache and
+        sows nothing here, and its RNG streams take placeholder keys, since
+        a shape needs a key of each name and no value.
+        """
+        layer, scope = self.layers[0], self.layers[0].scope
+        assert scope is not None
+        rngs = {name: jax.random.key(0) for name in scope.rngs}
+        output = jax.eval_shape(lambda: layer.apply(
+            layer.variables, x, mutable=True, rngs=rngs,
+            train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            kv_store={} if self.num_kv_shared_layers else None,
+            per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :])[0])
+        return jnp.result_type(x.dtype, output.dtype)
+
+    def stage_layers(self, stages: int) -> int:
+        """Layers per stage when the stack splits into `stages`, or why it cannot.
+
+        Every stage runs one program over its own layers, so the stages have
+        to be the same length and layer `j` of every stage the same kind of
+        layer as layer `j` of the first: same kind, same feed-forward, same
+        width, the same say in keys and values. A pattern that does not
+        repeat every `num_layers / stages` layers is refused with the first
+        pair of layers that differ and what differs between them.
+        """
+        if self.num_layers % stages:
+            raise ValueError(
+                f"{self.num_layers} layers do not split into {stages} stages of "
+                f"equal length; set stage to a divisor of num_layers")
+        count = self.num_layers // stages
+        for index, spec in enumerate(self.specs):
+            first = self.specs[index % count]
+            if spec == first:
+                continue
+            differing = [field.name for field in dataclasses.fields(LayerSpec)
+                         if getattr(spec, field.name) != getattr(first, field.name)]
+            raise ValueError(
+                f"layer {index} differs from layer {index % count} in "
+                f"{', '.join(differing)}, so stage {index // count} cannot run the "
+                f"first stage's program; a pipeline of {stages} stages needs the "
+                f"layer pattern to repeat every {count} layers, which means a "
+                f"mixture, a layer_types pattern and a K/V sharing that do")
+        return count
+
+    @nn.compact
+    def _stacked(self, view: StackView, x, train: bool, decode: bool, positions,
+                 segment_ids, per_layer_input):
+        """The stack inside `view`: scanned runs, or the pipeline over stages."""
+        if view.stages == 1:
+            return run_stack(
+                self.layers, self.block, self.specs, view.groups, x,
+                train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+                kv_store={} if self.num_kv_shared_layers else None,
+                per_layer_input=per_layer_input)
+        return self._pipeline(view, x, train=train, positions=positions,
+                              segment_ids=segment_ids, per_layer_input=per_layer_input)
+
+    def _pipeline(self, view: StackView, x, *, train: bool, positions, segment_ids,
+                  per_layer_input):
+        """GPipe over the stage axis, as MaxText's `layers/pipeline.py` runs it.
+
+        The batch splits into `view.microbatches` microbatches. Iteration t
+        runs every stage at once on one microbatch each, stage s on
+        microbatch t - s, with the whole stack's layers stacked over the
+        stages under `jax.vmap` so GSPMD keeps each stage's computation on
+        its own devices; the outputs shift one stage down for the next
+        iteration through a `ppermute`. The microbatches sit in `state_io`,
+        `[stages, microbatches / stages, ...]`, stage-sharded like the rest:
+        stage 0 reads its slot t % (microbatches / stages) and the slot
+        rotates up a stage each iteration, so every microbatch reaches stage
+        0 in turn and every finished one lands in the last stage's slot,
+        without a gather. The first stages - 1 iterations compute on nothing
+        and the last stages - 1 finish the pipeline; both are the bubble.
+
+        Only the layers pipeline. The embeddings before them and the norm,
+        the head and the loss after them run on the whole batch on every
+        stage's devices, so the loss is the plain loop's mean over the same
+        rows.
+        """
+        stages, count = view.stages, view.microbatches
+        per_stage = view.per_stage
+        batch_axis = 1 if self.altup is not None else 0
+        micro = functools.partial(_microbatched, count=count)
+        x = micro(x, batch_axis)
+        per_row = [None if value is None else micro(jnp.asarray(value), 0)
+                   for value in (positions, segment_ids)]
+        inputs = None if per_layer_input is None else micro(per_layer_input, 0)
+        slots = count // stages
+        state_io = _on_stage_axis(x.reshape((stages, slots) + x.shape[1:]))
+        shift = _on_stage_axis(jnp.zeros((stages,) + x.shape[1:], x.dtype))
+        mesh = jax.sharding.get_abstract_mesh()
+        stage_ids = jnp.arange(stages)
+
+        @functools.partial(jax.shard_map, mesh=mesh, in_specs=P(STAGE_AXIS),
+                           out_specs=P(STAGE_AXIS), axis_names={STAGE_AXIS})
+        def shift_down(out):
+            """Each stage's output as the next stage's input; the first gets nothing."""
+            out = jax.lax.ppermute(out, STAGE_AXIS, [(s, (s + 1) % stages) for s in range(stages)])
+            return jnp.where(jax.lax.axis_index(STAGE_AXIS) == 0, jnp.zeros_like(out), out)
+
+        @functools.partial(jax.shard_map, mesh=mesh, in_specs=(P(STAGE_AXIS), P(STAGE_AXIS)),
+                           out_specs=P(STAGE_AXIS), axis_names={STAGE_AXIS})
+        def rotate_up(slot, out):
+            """The slot one stage up, the last stage's taking the finished microbatch."""
+            slot = jax.lax.ppermute(slot, STAGE_AXIS, [(s, (s - 1) % stages) for s in range(stages)])
+            return jnp.where(jax.lax.axis_index(STAGE_AXIS) == stages - 1, out, slot)
+
+        def gather(values, ids):
+            """Each stage's microbatch out of `[microbatches, ...]` values."""
+            if values is None:
+                return values
+            return _on_stage_axis(jax.vmap(
+                lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
+
+        def call_stage(stage, x, positions, segment_ids, per_layer_input):
+            return stage(x, train=train, positions=positions, segment_ids=segment_ids,
+                         per_layer_input=per_layer_input)
+
+        def iteration(module, carry, step):
+            state_io, shift = carry
+            slot = step % slots
+            stream = jax.lax.dynamic_index_in_dim(state_io, slot, 1, keepdims=False)
+            stages_in = _on_stage_axis(jnp.where(
+                jax.lax.broadcasted_iota(jnp.int32, shift.shape, 0) == 0, stream, shift))
+            ids = jnp.clip(step - stage_ids, 0, count - 1)
+            stage_inputs = (None if inputs is None else _on_stage_axis(jax.vmap(
+                lambda index, stage: jax.lax.dynamic_slice_in_dim(
+                    jax.lax.dynamic_index_in_dim(inputs, index, 0, keepdims=False),
+                    stage * per_stage, per_stage, axis=2))(ids, stage_ids)))
+            stage = PipelineStage(block=module.block, specs=module.specs[:per_stage],
+                                  groups=view.groups, name='stages')
+            run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
+                          in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
+            out = _on_stage_axis(run(stage, stages_in, gather(per_row[0], ids),
+                                     gather(per_row[1], ids), stage_inputs))
+            state_io = jax.lax.dynamic_update_index_in_dim(
+                state_io, rotate_up(stream, out), slot, 1)
+            return (state_io, shift_down(out)), None
+
+        loop = nn.scan(iteration, variable_broadcast=view.broadcast,
+                       variable_axes={True: 0}, split_rngs={True: True})
+        (state_io, _), _ = loop(self, (state_io, shift), jnp.arange(count + stages - 1))
+        # Microbatch 0 finished stages - 1 iterations in, so it sits that
+        # many slots along; the rest follow it in order.
+        order = (np.arange(slots) + (stages - 1) % slots) % slots
+        finished = state_io[:, order].reshape((count,) + x.shape[1:])
+        return _whole(finished, batch_axis)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
