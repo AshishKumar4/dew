@@ -743,8 +743,24 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
-    assert out["caption"] == "A photo of a rose flower" and out["label"] == 5
-    assert out["label"].dtype == np.int32
+    assert out["caption"] in {template.format("rose") for template in images.PROMPT_TEMPLATES}
+    assert out["label"] == 5 and out["label"].dtype == np.int32
+
+
+def test_resizing_interpolates_up_and_averages_down():
+    """`resize_image` says area interpolation down and cubic up. It used to
+    pick by the target size alone, cubic above 256 and area below, so a small
+    source going up to 128 came out in nearest-neighbour blocks and a large
+    one going down to 300 kept every third pixel of a fine pattern."""
+    board = np.zeros((4, 4, 3), np.uint8)
+    board[::2, ::2] = board[1::2, 1::2] = 255
+    up = images.resize_image(board, 8)
+    assert ((up > 0) & (up < 255)).any(), "cubic blends between the squares"
+
+    fine = np.zeros((900, 900, 3), np.uint8)
+    fine[::2, ::2] = fine[1::2, 1::2] = 255
+    down = images.resize_image(fine, 300)
+    assert 100 <= down.min() and down.max() <= 160, "area averages the squares it covers"
 
 
 @pytest.mark.network
