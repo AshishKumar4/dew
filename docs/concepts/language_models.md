@@ -66,6 +66,8 @@ objective = LMObjective(model, seq_len=256, samples=Samples(
 
 `pad_id` excludes padded targets from the mean and defaults to `None`, because a fixed-window token file has no padding. A packed batch needs no pad id; its segment ids say which slots are padding.
 
+`mtp_weight` turns on DeepSeek's multi-token-prediction term for a model built with `num_nextn_predict_layers` above zero (arXiv 2412.19437, section 2.2). Depth d of the model pairs the previous depth's state at each position with the embedding of the token d further on and scores the token after that through the shared head; the training loss adds `mtp_weight` times the mean over the depths of each depth's cross entropy, normalised by the same target count as the main term and with a packed batch's document boundaries weighted out the same way. `train/mtp_ce` reports the mean depth cross entropy. Unset, the loss is the main cross entropy alone and the depths get no gradient.
+
 `ema` averages the whole parameter tree at `ema_decay`, and the EMA copy is what validation reads. At validation the objective returns `TokenScores` for `metrics.perplexity()`, which reduces to the exponential of the target-weighted mean over the whole pass, and `TextSamples` when `samples` are configured.
 
 ## Generation
@@ -132,6 +134,6 @@ python recipes/lm/train.py data:token-windows --data.path data/shakespeare-byte 
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.seq-len` is the context the model trains on; it reaches the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget past the training context raises that limit to fit it. `--tokenizer` names the tokenizer `meta.json` was written with. `--balance-rate` turns on the aux-loss-free routing bias of a mixture-of-experts model. The rest is the shared configuration: `--optim.*` for the optimizer, `--trainer.mesh.fsdp` and `--trainer.accumulation` for scaling, `--trainer.wandb.project` to log.
+`--data.seq-len` is the context the model trains on; it reaches the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget past the training context raises that limit to fit it. `--tokenizer` names the tokenizer `meta.json` was written with. `--balance-rate` turns on the aux-loss-free routing bias of a mixture-of-experts model, and `--mtp-weight` the multi-token-prediction term of a model with prediction depths. The rest is the shared configuration: `--optim.*` for the optimizer, `--trainer.mesh.fsdp` and `--trainer.accumulation` for scaling, `--trainer.wandb.project` to log.
 
-Every logging tick writes `train/loss`, `train/ce` and `train/token_accuracy` beside the trainer's throughput numbers. Every validation pass writes `val/perplexity` and, with a prompt configured, the generated text as a table.
+Every logging tick writes `train/loss`, `train/ce` and `train/token_accuracy` (and `train/mtp_ce` with the term on) beside the trainer's throughput numbers. Every validation pass writes `val/perplexity` and, with a prompt configured, the generated text as a table.
