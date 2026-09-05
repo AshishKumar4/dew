@@ -1,10 +1,11 @@
-"""Sequence and tensor mesh axes: placement, batches, and loss equality.
+"""Sequence, tensor and stage mesh axes: placement, batches, and loss equality.
 
-The mesh carries five axes; parameters distinguish fsdp, expert and tensor,
-and the batch's sequence dimension rides sequence. Widths stay on fsdp
-unless a run's rules redirect them onto tensor, so the default mesh places
-as the three-axis one did. A fit on each of the four sim-mesh topologies
-trains the same losses: sharding moves values, never changes them.
+The mesh carries six axes; parameters distinguish fsdp, expert and tensor,
+the batch's sequence dimension rides sequence, and the layer stack's
+pipeline stages ride stage. Widths stay on fsdp unless a run's rules
+redirect them onto tensor, so the default mesh places as the three-axis one
+did. A fit on each of the sim-mesh topologies trains the same losses:
+sharding moves values, never changes them.
 """
 
 import jax
@@ -18,16 +19,18 @@ pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 import dew.nn.backbones.causal_transformer  # registers the model built below
+from dew.data import Dataset
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import batch_shardings, shard_batch
 VOCAB = 64
-# Training batches carry seq_len + 1 columns for the one-token shift, and a
-# sequence-sharded batch needs that width to divide: 15 + 1 splits over two
-# sequence shards. A width that does not divide stays replicated instead of
-# failing, the batch analogue of the layout dropping an indivisible name.
-SEQ_LEN = 15
+# Training batches carry seq_len + 1 columns for the one-token shift, so the
+# 17 columns of a 16-token model never split over a sequence axis of two: the
+# batch stays whole over it, and the attention claims the axis for the
+# model's 16 tokens itself (tests/test_sequence_parallel.py). The striped
+# order needs a length that is a multiple of twice the shard count.
+SEQ_LEN = 16
 BATCH = 8
 TINY_SHARD = 256
 # The widths a tensor run redirects off fsdp: the plan's heads, mlp and
@@ -56,7 +59,7 @@ def tensor_layout():
 def test_the_default_mesh_places_like_the_three_axis_one():
     """New axes at size 1 change no spec: widths keep fsdp, and the layout fits."""
     mesh = build_mesh(MeshSpec(fsdp=8))
-    assert mesh.axis_names == ("data", "expert", "fsdp", "tensor", "sequence")
+    assert mesh.axis_names == ("data", "expert", "fsdp", "tensor", "sequence", "stage")
     specs = jax.tree.map(
         lambda sharding: sharding.spec,
         Layout(min_shard=TINY_SHARD).shardings(mesh, variables()))["params"]
@@ -88,20 +91,20 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
     """Sequence parallelism splits activations: rows over every other axis,
     positions over sequence."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
-    assert batch.addressable_shards[0].data.shape == (BATCH // 4, (SEQ_LEN + 1) // 2)
+    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN // 2)
 
 
 def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     """Seventeen columns over two sequence shards divide nothing, so the
     rows still split and the width replicates."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 2), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
     assert batch.sharding.spec == P(("data", "expert", "fsdp", "tensor"))
-    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 2)
+    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 1)
 
 
 def test_an_image_batch_never_takes_the_sequence_axis():
@@ -129,16 +132,6 @@ def token_batches():
         yield batch
 
 
-class Data:
-    def __init__(self, train):
-        self._train, self.val, self.batch, self.records = train, None, BATCH, None
-
-    def train(self):
-        return self._train()
-
-    steps_per_epoch = None
-
-
 class RecordingTracker:
     def __init__(self):
         self.scalars = []
@@ -151,11 +144,13 @@ class RecordingTracker:
 
 
 def run_losses(mesh, layout, steps):
+    tracker = RecordingTracker()
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-        mesh=mesh, layout=layout, tracker=RecordingTracker())
-    trainer.fit(Data(token_batches), steps=steps, log_every=1)
-    return [entry["train/loss"] for entry in trainer.tracker.scalars]
+        mesh=mesh, layout=layout, tracker=tracker)
+    trainer.fit(Dataset(train=token_batches, val=None, records=None, batch=BATCH),
+                steps=steps, log_every=1)
+    return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
 
 def dense_layout():
@@ -163,11 +158,18 @@ def dense_layout():
 
 
 TOPOLOGIES = {
-    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh.
+    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh,
+    # plus the sequence axis beside a data axis, where the batch rows split
+    # over data and fsdp and the sequence over its own axis, and the stage
+    # axis beside them: the two-layer model splits into two stages of one
+    # layer, fed four microbatches of two rows.
     "fsdp": (MeshSpec(fsdp=8), dense_layout()),
     "tensor": (MeshSpec(fsdp=4, tensor=2), tensor_layout()),
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
+    "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
     "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), tensor_layout()),
+    "stage": (MeshSpec(fsdp=2, stage=2, microbatches=4), dense_layout()),
+    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), tensor_layout()),
 }
 
 
@@ -182,14 +184,15 @@ def test_every_topology_trains_the_same_losses(name):
 
 
 def test_topologies_agree_with_data_parallel():
-    """The largest difference across the four topologies, with its number."""
+    """The largest difference across the topologies, with its number."""
     steps = 30
     runs = {name: np.array(run_losses(*spec, steps)) for name, spec in TOPOLOGIES.items()}
 
     difference = max(
         np.max(np.abs(first - second))
         for first in runs.values() for second in runs.values())
-    # Observed 0.0 across all four topologies and all 30 steps on CPU; the
-    # tolerance is 1e-6 because a different collective order on another
-    # backend is allowed to round differently.
-    assert difference < 1e-6, difference
+    # Observed 9.5e-07 at most between any two of the seven topologies over
+    # 30 steps on CPU. Reduction order differs per topology, and fp32
+    # rounding over 30 steps on losses of order 4 is about 1e-6; a placement
+    # that changed a value would show at 1e-2 or worse.
+    assert difference < 4e-6, difference

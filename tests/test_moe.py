@@ -847,7 +847,7 @@ def run_losses(trainer, steps):
     """Per-step losses of a fit, as the tracker receives them."""
     trainer.tracker = tracker = RecordingTracker()
     trainer.fit(Data(token_batches), steps=steps, log_every=1)
-    return [entry["train/loss"] for entry in tracker.scalars]
+    return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
 
 def test_the_expert_shards_train_the_same_model():
@@ -906,9 +906,10 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     assert bias.min() < 0 < bias.max(), bias
     # Every step moved every expert by the rate, one way or the other.
     np.testing.assert_allclose(np.abs(bias) / 0.01, np.round(np.abs(bias) / 0.01), atol=1e-4)
-    loads = [entry["train/moe/max_load"] for entry in tracker.scalars]
+    ticks = [entry for entry in tracker.scalars if "train/moe/max_load" in entry]
+    loads = [entry["train/moe/max_load"] for entry in ticks]
     assert len(loads) == steps and all(1 / 8 <= load <= 1.0 for load in loads)
-    assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in tracker.scalars)
+    assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in ticks)
     # The bias is state, not a parameter: the optimizer holds no moment for it.
     assert "moe" not in state.opt_state[0].mu
 
