@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _benchmark_step():
     spec = importlib.util.spec_from_file_location(
         "benchmark_step_under_test", REPO_ROOT / "tools" / "benchmark_step.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("tools/benchmark_step.py is not importable as a module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
