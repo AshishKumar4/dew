@@ -38,9 +38,9 @@ def test_log_linear_schedule_and_its_nelbo_weight():
 
 def test_a_zero_time_row_contributes_nothing_to_the_loss(rng, monkeypatch):
     """t = 0 masks nothing, so its NELBO contribution is exactly zero: the
-    loss stays finite and equals the batch with that row removed. The weight
-    1/t used to make it NaN on a ~1/2^24 draw of the stratified offset, which
-    the trainer counts as non-finite and aborts the run over."""
+    loss stays finite and equals the batch with that row removed. The
+    stratified offset draws t = 0 about once in 2^24 rows, and a weight of
+    1 / t there would be a NaN the trainer aborts the run over."""
     process = MDLM(mask_id=MASK)()
     objective = MaskedDiffusionObjective(transformer(causal=False), process, 8)
     params = objective.init(rng)

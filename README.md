@@ -107,7 +107,7 @@ import jax
 from dew import CFG, sample
 from dew.sampling import Heun
 
-weights = {**state.params, **state.ema}
+weights = state.averaged
 encode = lambda prompts: {"textcontext": text.encode(weights["encoders"]["textcontext"], text.tokenize(prompts))}
 denoise = process.denoiser(model, weights, encode(["a water lily", "a rose"]), unconditional=encode(["", ""]))
 x_T = process.noise(jax.random.key(1), (2, *inputs.sample.shape))
@@ -255,7 +255,7 @@ Validation runs every `eval_every` steps: the objective produces artifacts and t
 ```python
 from dew.interop import save_hf_layout
 
-save_hf_layout(state.ema["params"], config={"architecture": "simple_dit", **fields}, directory="export/flowers")
+save_hf_layout(state.averaged["params"], config={"architecture": "simple_dit", **fields}, directory="export/flowers")
 ```
 
 `push_to_hub(directory, repo_id)` uploads that directory, and `pull_from_hub(repo_id)` downloads a repo snapshot.

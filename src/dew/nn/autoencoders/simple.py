@@ -103,10 +103,9 @@ class SimpleAutoEncoder(AutoEncoder):
     Like StableDiffusionVAE it loads a tree into `params` and takes the tree
     to use on every call; unlike it, the weights start random. Train them (or
     pass a trained tree as `params`) before the reconstructions mean
-    anything. The
-    latent is deterministic: there is no KL bottleneck, so the encode `key` is
-    accepted and ignored. Video comes free from the AutoEncoder base class,
-    which flattens [B, T, H, W, C] to frames.
+    anything. The latent is deterministic: there is no KL bottleneck, so the
+    encode `key` is accepted and ignored. Video comes free from the
+    AutoEncoder base class, which flattens [B, T, H, W, C] to frames.
     """
 
     def __init__(
@@ -147,8 +146,8 @@ class SimpleAutoEncoder(AutoEncoder):
         )
 
         # One conv stage per feature depth, each halving the resolution
-        self.__downscale_factor__ = 2 ** len(self.feature_depths)
-        self.__latent_channels__ = latent_channels
+        self._downscale_factor = 2 ** len(self.feature_depths)
+        self._latent_channels = latent_channels
 
         if params is None:
             params = self.init_params(key if key is not None else jax.random.PRNGKey(0))
@@ -169,7 +168,7 @@ class SimpleAutoEncoder(AutoEncoder):
         Convolutional, so the init resolution is irrelevant as long as it
         survives every downscale stage; the smallest such image is used.
         """
-        size = self.__downscale_factor__
+        size = self._downscale_factor
         encode_key, decode_key = jax.random.split(key)
         image = jnp.zeros((1, size, size, self.out_channels), dtype=self.dtype)
         encoder_params = self.encoder.init(encode_key, image)["params"]
@@ -187,26 +186,9 @@ class SimpleAutoEncoder(AutoEncoder):
 
     @property
     def downscale_factor(self) -> int:
-        """Spatial downscale factor between image and latent space."""
-        return self.__downscale_factor__
+        return self._downscale_factor
 
     @property
     def latent_channels(self) -> int:
-        """Number of channels in the latent space."""
-        return self.__latent_channels__
+        return self._latent_channels
 
-    @property
-    def name(self) -> str:
-        return "simple_autoencoder"
-
-    def serialize(self) -> dict:
-        """Config only, matching StableDiffusionVAE: weights live in a checkpoint."""
-        return {
-            "name": self.name,
-            "latent_channels": self.__latent_channels__,
-            "feature_depths": list(self.feature_depths),
-            "out_channels": self.out_channels,
-            "dtype": str(self.dtype),
-            "latent_shift": self.latent_shift,
-            "latent_scale": self.latent_scale,
-        }

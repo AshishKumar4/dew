@@ -8,8 +8,9 @@ There is no timestep to condition on, so the blocks run in their unmodulated
 
 Position never comes from RoPE here. Both the encoder and the predictor work
 on a masked subset of the sequence, where a token's index in the sequence is
-not its position on the grid, so RoPE is left at identity and position is
-carried entirely by the 2D sincos embedding that travels with each token.
+not its position on the grid, so the spatial blocks run unrotated and
+position is carried entirely by the 2D sincos embedding that travels with
+each token.
 """
 
 import jax.numpy as jnp
@@ -17,11 +18,11 @@ from flax import linen as nn
 from typing import Optional, Sequence, Tuple, Literal
 from flax.typing import Dtype, PrecisionLike
 
+from ..attention import rotary_freqs
 from ..dit import (
-    PatchSequenceEmbed, ModulatedBlock, build_block_pattern,
-    identity_rope_freqs, scan_ordered_pos_embed,
+    ROPE_THETA, PatchSequenceEmbed, ModulatedBlock, build_block_pattern,
+    scan_ordered_pos_embed,
 )
-from ..vit import RotaryEmbedding
 from dew.registry import models
 from ..sharding import logical_axes
 
@@ -73,8 +74,6 @@ class TokenStack(nn.Module):
         ]
 
     def __call__(self, tokens, freqs_cis=None, train: bool = False):
-        if freqs_cis is None:
-            freqs_cis = identity_rope_freqs(tokens.shape[-2], self.features // self.num_heads)
         for block in self.blocks:
             tokens = block(tokens, conditioning=None, freqs_cis=freqs_cis, train=train)
         return tokens
@@ -84,12 +83,11 @@ class FactorizedTokenStack(nn.Module):
     """Spatial then temporal blocks over [B, T, N, F], as in VideoDiT.
 
     Time is a real 1D axis that masking never touches, so the temporal half
-    keeps genuine RoPE while the spatial half runs at identity.
+    is rotated by frame index while the spatial half runs unrotated.
     """
     features: int
     num_layers: int
     num_heads: int
-    max_frames: int = 1024
     mlp_ratio: int = 4
     ssm_attention_ratio: str = "all-attn"
     block_pattern: Optional[Sequence[str]] = None
@@ -121,13 +119,10 @@ class FactorizedTokenStack(nn.Module):
         self.spatial = [stack(f"spatial_{i}", 1, "all-ssm" if kind == 'ssm' else "all-attn")
                         for i, kind in enumerate(pattern)]
         self.temporal = [stack(f"temporal_{i}", 1, "all-attn") for i in range(self.num_layers)]
-        self.temporal_rope = RotaryEmbedding(
-            dim=self.features // self.num_heads, max_seq_len=self.max_frames,
-            name="temporal_rope")
 
     def __call__(self, tokens, train: bool = False):
         B, T, N, F = tokens.shape
-        freqs_temporal = self.temporal_rope(seq_len=T)
+        freqs_temporal = rotary_freqs(jnp.arange(T), self.features // self.num_heads, ROPE_THETA)
 
         tokens = tokens.reshape(B * T, N, F)
         for spatial, temporal in zip(self.spatial, self.temporal):

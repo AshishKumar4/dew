@@ -1,13 +1,11 @@
-"""The CLIP towers as linen modules, and their Hugging Face weights.
+"""The CLIP towers and the T5 encoder as linen modules, and their Hugging
+Face weights.
 
-transformers 5 removed every Flax class, `FlaxCLIPTextModel` and
-`FlaxCLIPModel` among them, so the loader the text conditioning encoder
-reached for does not exist any more and text conditioning could not run at
-all, and the CLIP metrics in `dew.eval.images` died the same way. This is the decision the Stable Diffusion VAE already took in
-`dew/nn/autoencoders/vae.py` when diffusers dropped Flax: vendor the modules,
-keep the reference layout, read the weights ourselves.
+transformers 5 ships no Flax classes, so the towers are vendored the way
+`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE: the reference
+layout, the weights read by name from the checkpoint's safetensors.
 
-Ported here is `openai/clip-vit-large-patch14`: the text tower, which is the
+The CLIP port is `openai/clip-vit-large-patch14`: the text tower, which is the
 part a diffusion model conditions on, and the vision tower with the two
 projection heads, which is what the metrics score generated images with. The
 operation order follows transformers 5.16.1 `models/clip/modeling_clip.py`.
@@ -536,23 +534,44 @@ def _check_tree(params: Mapping[str, Any], module: nn.Module, *inputs) -> None:
 
 
 def _checkpoint_dir(name_or_dir: str, revision: Optional[str]) -> Path:
-    """The directory holding config.json and model.safetensors.
+    """The directory holding config.json and the safetensors weights.
 
-    A local directory is taken as it is. A repo id fetches those two files and
-    nothing else: openai's repos carry the torch, TensorFlow and Flax copies of
-    the same weights beside them, five gigabytes no one here reads.
+    A local directory is taken as it is. A repo id fetches the config and the
+    weights, whole (`model.safetensors`) or sharded
+    (`model-0000N-of-0000M.safetensors`, T5-XXL), and nothing else: openai's
+    repos carry the torch, TensorFlow and Flax copies of the same weights
+    beside them, five gigabytes no one here reads.
     """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
-    from huggingface_hub import hf_hub_download
-    config = hf_hub_download(name_or_dir, CONFIG_FILE, revision=revision)
-    hf_hub_download(name_or_dir, WEIGHTS_FILE, revision=revision)
-    return Path(config).parent
+    from huggingface_hub import snapshot_download
+    return Path(snapshot_download(name_or_dir, revision=revision,
+                                  allow_patterns=[CONFIG_FILE, "model*.safetensors"]))
 
 
 def _read_config(directory: Path) -> Dict[str, Any]:
     with open(directory / CONFIG_FILE) as handle:
         return json.load(handle)
+
+
+def _read_tensors(directory: Path) -> Dict[str, np.ndarray]:
+    """Every tensor of the checkpoint in `directory` by its Hugging Face
+    name, from the one weights file or from every shard. A name has no '/',
+    so `load_params` hands the flat table back as it is."""
+    from dew.interop import load_params
+
+    shards = sorted(directory.glob("model*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(
+            f"no {WEIGHTS_FILE} in {directory}: a Hub repo holds {WEIGHTS_FILE} or "
+            "sharded model-0000N-of-0000M.safetensors")
+    tensors: Dict[str, np.ndarray] = {}
+    for shard in shards:
+        for name, tensor in load_params(shard).items():
+            if name in tensors:
+                raise ValueError(f"tensor {name!r} is in more than one shard")
+            tensors[name] = tensor
+    return tensors
 
 
 class CLIPTextModel:
@@ -580,13 +599,11 @@ class CLIPTextModel:
         it was on the Flax classes this replaces. The weights themselves stay
         fp32, which is how the checkpoint stores them.
         """
-        from dew.interop import load_params
-
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_config(_read_config(directory))
 
         transformer = CLIPTextTransformer(dtype=dtype, **config)
-        params = translate_weights(load_params(directory / WEIGHTS_FILE))
+        params = translate_weights(_read_tensors(directory))
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
 
@@ -622,8 +639,6 @@ class CLIPModel:
                         revision: Optional[str] = None) -> "CLIPModel":
         """Load a full checkpoint from the Hub or a local directory; `dtype`
         as on `CLIPTextModel.from_pretrained`."""
-        from dew.interop import load_params
-
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_clip_config(_read_config(directory))
 
@@ -631,7 +646,7 @@ class CLIPModel:
             text_model=CLIPTextTransformer(dtype=dtype, **config["text"]),
             vision_model=CLIPVisionTransformer(dtype=dtype, **config["vision"]),
             projection_dim=config["projection_dim"], dtype=dtype)
-        params = translate_clip_weights(load_params(directory / WEIGHTS_FILE))
+        params = translate_clip_weights(_read_tensors(directory))
         vision = config["vision"]
         _check_tree(
             params, module,
@@ -648,9 +663,7 @@ class CLIPModel:
             attention_mask = jnp.asarray(attention_mask)
         return self._text_features(self.variables, jnp.asarray(input_ids), attention_mask)
 
-############################################################################################################
-# T5 encoder
-############################################################################################################
+# The T5 encoder.
 
 DEFAULT_T5_MODEL = "google-t5/t5-v1_1-xxl"
 
@@ -932,88 +945,43 @@ _T5_WIDTHS = {"wi", "wi_0", "wi_1", "wo"}
 def _t5_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     """One HF T5 tensor name into its path in a `T5EncoderTransformer` tree.
 
-    Only the shared embedding and the encoder blocks map; the decoder, the
+    Only the shared embedding and the encoder blocks map. The decoder, the
     lm_head and the encoder's tied copy of the embedding are not this tower
-    and come back as None.
+    and come back as None; any other name raises, so a renamed upstream
+    layout fails here instead of loading half a tower.
     """
     if hf_name == "shared.weight":
         return ("embed_tokens", "embedding")
     if hf_name == "encoder.final_layer_norm.weight":
         return ("final_layer_norm", "scale")
+    if hf_name == "encoder.embed_tokens.weight" or hf_name.startswith(("decoder.", "lm_head.")):
+        return None
     parts = hf_name.split(".")
-    if len(parts) < 2 or parts[0] != "encoder" or parts[1] != "block":
-        return None
-    try:
-        index = int(parts[2])
-    except (ValueError, IndexError):
-        return None
-    layer = ["layers_" + str(index)]
-    rest = parts[3:]
-    if rest[:2] == ["layer", "0"] and rest[2] == "SelfAttention":
-        if len(rest) == 5 and rest[3] in _T5_PROJECTIONS:
-            return tuple(layer + ["self_attn", _T5_PROJECTIONS[rest[3]], "kernel"])
-        if rest[3:] == ["relative_attention_bias", "weight"]:
-            return tuple(layer + ["self_attn", "rel_bias", "embedding"])
-    elif rest[:2] == ["layer", "0"] and rest[2] == "layer_norm" and len(rest) == 4:
-        return tuple(layer + ["attn_norm", "scale"])
-    elif rest[:2] == ["layer", "1"] and rest[2] in ("DenseReluDense", "DenseGatedGeluDense"):
-        if len(rest) == 5 and rest[3] in _T5_WIDTHS:
-            return tuple(layer + ["mlp", rest[3], "kernel"])
-    elif rest[:2] == ["layer", "1"] and rest[2] == "layer_norm" and len(rest) == 4:
-        return tuple(layer + ["mlp_norm", "scale"])
-    return None
+    if len(parts) >= 3 and parts[:2] == ["encoder", "block"] and parts[2].isdigit():
+        layer = ["layers_" + parts[2]]
+        rest = parts[3:]
+        if rest[:2] == ["layer", "0"] and rest[2] == "SelfAttention":
+            if len(rest) == 5 and rest[3] in _T5_PROJECTIONS:
+                return tuple(layer + ["self_attn", _T5_PROJECTIONS[rest[3]], "kernel"])
+            if rest[3:] == ["relative_attention_bias", "weight"]:
+                return tuple(layer + ["self_attn", "rel_bias", "embedding"])
+        elif rest[:2] == ["layer", "0"] and rest[2] == "layer_norm" and len(rest) == 4:
+            return tuple(layer + ["attn_norm", "scale"])
+        elif rest[:2] == ["layer", "1"] and rest[2] in ("DenseReluDense", "DenseGatedGeluDense"):
+            if len(rest) == 5 and rest[3] in _T5_WIDTHS:
+                return tuple(layer + ["mlp", rest[3], "kernel"])
+        elif rest[:2] == ["layer", "1"] and rest[2] == "layer_norm" and len(rest) == 4:
+            return tuple(layer + ["mlp_norm", "scale"])
+    raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
 def translate_t5_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     """HF T5 encoder tensors into a `T5EncoderTransformer` params tree, in fp32.
 
     Dense kernels transpose from torch's [out, in] to linen's [in, out]; the
-    embedding, the norms and the relative bias table keep their layout. A
-    tensor that is neither the encoder's nor a known ignore (the decoder, the
-    lm_head, the tied embedding copy) raises, so a renamed upstream layout
-    fails here instead of loading half a tower.
+    embedding, the norms and the relative bias table keep their layout.
     """
-    params: Dict[str, Any] = {}
-    for hf_name, tensor in hf_tensors.items():
-        path = _t5_path(hf_name)
-        if path is None:
-            if (hf_name == "encoder.embed_tokens.weight"
-                    or hf_name.startswith("decoder.") or hf_name.startswith("lm_head.")):
-                continue
-            raise ValueError(f"unknown tensor name {hf_name!r}")
-        leaf = np.asarray(tensor, dtype=np.float32)
-        if path[-1] == "kernel":
-            leaf = leaf.T
-        node = params
-        for entry in path[:-1]:
-            node = node.setdefault(entry, {})
-        node[path[-1]] = leaf
-    return params
-
-
-def _t5_checkpoint_dir(name_or_dir: str, revision: Optional[str]) -> Path:
-    """The directory holding config.json and the encoder's safetensors.
-
-    A local directory is taken as it is. A repo id fetches config.json and
-    the weight file, sharded or whole: T5-XXL repos hold
-    model-0000N-of-0000M.safetensors, small ones a single model.safetensors.
-    """
-    if os.path.isdir(name_or_dir):
-        return Path(name_or_dir)
-    from huggingface_hub import hf_hub_download
-
-    config = hf_hub_download(name_or_dir, CONFIG_FILE, revision=revision)
-    try:
-        weights = hf_hub_download(name_or_dir, WEIGHTS_FILE, revision=revision)
-    except Exception:
-        from huggingface_hub import hf_hub_download as download
-
-        index = download(name_or_dir, "model.safetensors.index.json", revision=revision)
-        shards = sorted(json.loads(Path(index).read_text())["weight_map"].values())
-        for shard in dict.fromkeys(shards):
-            download(name_or_dir, shard, revision=revision)
-        weights = index
-    return Path(config).parent
+    return _translate(hf_tensors, _t5_path)
 
 
 class T5EncoderModel:
@@ -1042,23 +1010,10 @@ class T5EncoderModel:
         them. Sharded checkpoints (model-00001-of-00002.safetensors) load as
         one tower.
         """
-        from dew.interop import load_params
-
-        directory = _t5_checkpoint_dir(name_or_dir, revision)
+        directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_t5_config(_read_config(directory))
-        shards = sorted(directory.glob("model*.safetensors"))
-        if not shards:
-            raise FileNotFoundError(
-                f"no model.safetensors in {directory}: a T5 Hub repo holds "
-                "model.safetensors or sharded model-0000N-of-0000M.safetensors")
-        tensors: Dict[str, Any] = {}
-        for shard in shards:
-            for name, tensor in _flat_params(load_params(shard)).items():
-                if name in tensors:
-                    raise ValueError(f"tensor {name!r} is in more than one shard")
-                tensors[name] = tensor
         transformer = T5EncoderTransformer(dtype=dtype, **config)
-        params = translate_t5_weights(tensors)
+        params = translate_t5_weights(_read_tensors(directory))
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
 
@@ -1066,18 +1021,3 @@ class T5EncoderModel:
         if attention_mask is not None:
             attention_mask = jnp.asarray(attention_mask)
         return self._apply(self.variables, jnp.asarray(input_ids), attention_mask)
-
-
-def _flat_params(tree: Mapping[str, Any]) -> Dict[str, np.ndarray]:
-    """A nested params tree back into dotted tensor names."""
-    flat: Dict[str, np.ndarray] = {}
-
-    def visit(node, prefix: str):
-        if isinstance(node, Mapping):
-            for name, child in node.items():
-                visit(child, f"{prefix}.{name}" if prefix else name)
-        else:
-            flat[prefix] = node
-
-    visit(tree, "")
-    return flat

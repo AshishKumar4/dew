@@ -21,6 +21,8 @@ Usage:
         --attention-impl cudnn
     python tools/benchmark_step.py --architectures unet \\
         --xla-flags=--xla_gpu_triton_gemm_any=true
+    python tools/benchmark_step.py --architectures simple_dit \\
+        --profile-dir /tmp/dew-trace --profile-steps 5
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
         "num_heads": 8}, "batch_size": 32, "image_size": 32, "fsdp_size": 2}]'
@@ -28,12 +30,14 @@ Usage:
 
 import contextlib
 import dataclasses
+import glob
 import io
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Annotated, Iterator, Literal, Mapping
+from typing import Annotated, Any, Iterator, Literal, Mapping
 
 import jax
 import numpy as np
@@ -48,7 +52,7 @@ from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
 from dew.registry import with_precision
 from dew.telemetry.devices import apply_xla_flags
-from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
+from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
@@ -90,6 +94,9 @@ class Case:
     """Set for language models: documents packed into every row, with the
     segment ids and positions the packed loader emits; 0 feeds a fixed
     window, which is what a stream of tokens gives."""
+    head_chunks: int | None = None
+    """For language models, the vocabulary slices the loss scores a batch in;
+    None is the objective's own default."""
     fsdp_min_param_size: int = 2 ** 16
 
     @property
@@ -251,6 +258,13 @@ class BenchmarkConfig:
     """Documents per row for the language-model cases; the others are left
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
+    profile_dir: str | None = None
+    """Trace `profile_steps` more steps into this directory with jax.profiler
+    after the timed windows, and read the device timeline back into the row:
+    the fraction of the window the device was busy, kernels per step and
+    kernel milliseconds per step by category. The trace itself stays on disk
+    for TensorBoard or Perfetto."""
+    profile_steps: int = 5
     json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
@@ -305,7 +319,8 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
     sample_key = "video" if case.frames else "image"
 
     if case.is_lm:
-        objective = LMObjective(model, case.seq_len)
+        objective = (LMObjective(model, case.seq_len) if case.head_chunks is None
+                     else LMObjective(model, case.seq_len, head_chunks=case.head_chunks))
     elif case.predictor is not None:
         patch = case.config.get("patch_size", 16)
         if not isinstance(patch, int):
@@ -375,6 +390,90 @@ def parameter_count(params) -> int:
     return int(sum(np.prod(leaf.shape, dtype=np.int64) for leaf in jax.tree.leaves(params)))
 
 
+# A kernel's category from the tokens of its name, first match wins: XLA
+# names its fusions after the ops they hold (`loop_convert_fusion`,
+# `input_add_reduce_fusion`, `gemm_fusion_dot`), cuDNN and cuBLAS after the
+# kernel family. Tokens rather than substrings, so `convert` is not `conv`.
+KERNEL_CATEGORIES = (
+    ("attention", ("sdpa", "fmha", "flash")),
+    ("conv", ("conv", "fprop", "dgrad", "wgrad", "implicit")),
+    ("gemm", ("gemm", "cublas", "cutlass", "nvjet", "xmma", "matmul", "dot")),
+    ("reduce", ("reduce",)),
+    ("convert", ("convert",)),
+    ("copy", ("memcpy", "memset", "copy", "transpose", "concatenate", "gather",
+              "scatter", "slice", "pad", "broadcast", "select", "dynamic")),
+    ("elementwise", ("fusion",)),
+)
+
+
+def kernel_category(name: str) -> str:
+    lowered = name.lower()
+    if "cudnn::fusion" in lowered:
+        # cuDNN's helpers around its flash kernel (dO.O, dQ rearrangement).
+        return "attention"
+    tokens = set(re.split(r"[^a-z0-9]+", lowered))
+    for category, needles in KERNEL_CATEGORIES:
+        if tokens & set(needles):
+            return category
+    return "other"
+
+
+def device_timeline(directory: str, steps: int) -> dict[str, Any]:
+    """What the device did during the traced `steps`, from the newest trace
+    under `directory`.
+
+    Busy is the union of every kernel's interval across the device's streams,
+    over the window from the first kernel's start to the last one's end, so
+    the fraction is what the card was doing while the loop ran and its
+    complement is the idle the host left it. Kernel milliseconds are summed
+    per category and divided by the steps; streams can overlap, so the sum of
+    categories is an attribution and not a second step timer.
+    """
+    from jax.profiler import ProfileData
+
+    traces = sorted(glob.glob(os.path.join(directory, "**", "*.xplane.pb"), recursive=True),
+                    key=os.path.getmtime)
+    kernels = []
+    for plane in ProfileData.from_file(traces[-1]).planes:
+        if not plane.name.startswith("/device:"):
+            continue
+        for line in plane.lines:
+            for event in line.events:
+                kernels.append((event.name, event.start_ns, event.end_ns))
+    if not kernels:
+        raise ValueError(
+            f"the trace under {directory} holds no device kernels: the profiler "
+            "saw no accelerator, and a CPU run has no device timeline to read")
+    kernels.sort(key=lambda kernel: kernel[1])
+    busy, current_start, current_end = 0, kernels[0][1], kernels[0][2]
+    for _, start, end in kernels[1:]:
+        if start > current_end:
+            busy += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    busy += current_end - current_start
+    window = kernels[-1][2] - kernels[0][1]
+    by_category: dict[str, float] = {}
+    by_name: dict[str, float] = {}
+    for name, start, end in kernels:
+        by_category[kernel_category(name)] = by_category.get(kernel_category(name), 0.0) + end - start
+        by_name[name] = by_name.get(name, 0.0) + end - start
+    per_step = 1e-6 / steps
+    return {
+        "profiled_steps": steps,
+        "kernels_per_step": len(kernels) / steps,
+        "device_busy_percent": 100.0 * busy / window,
+        "device_busy_ms_per_step": busy * per_step,
+        "device_window_ms_per_step": window * per_step,
+        "kernel_ms_by_category": {
+            category: ms * per_step
+            for category, ms in sorted(by_category.items(), key=lambda item: -item[1])},
+        "top_kernels": [(name[:100], ms * per_step)
+                        for name, ms in sorted(by_name.items(), key=lambda item: -item[1])[:12]],
+    }
+
+
 def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
@@ -421,7 +520,17 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         synced.append((time.perf_counter() - step_start) * 1e3)
     p10, p50, p90 = np.percentile(synced, [10, 50, 90])
 
-    flops = compiled_flops(compiled)
+    timeline = {}
+    if config.profile_dir:
+        # After the timed windows, so the trace's own overhead is not in them.
+        directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"))
+        jax.profiler.start_trace(directory)
+        for _ in range(config.profile_steps):
+            state, scale, loss, is_finite = step(state, scale)
+        loss.block_until_ready()
+        jax.profiler.stop_trace()
+        timeline = device_timeline(directory, config.profile_steps)
+    flops = trainer.flops_per_step
     step_time = elapsed / config.steps
     utilization = model_flops_utilization(flops, step_time)
     peak = device_peak_bytes()
@@ -452,6 +561,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             None if peak is None or peak_before is None else max(0, peak - peak_before)),
         "loss": float(loss),
         "finite": bool(is_finite),
+        **timeline,
     }
     # The state holds every device buffer this case allocated; drop it before
     # the next case builds its own.
@@ -510,6 +620,13 @@ def run(config: BenchmarkConfig) -> list[Row]:
         rows.append(row)
         print(f"{case.label}: {row['ms_per_step']} ms/step, "
               f"{row['samples_per_sec']} samples/s")
+        categories = row.get("kernel_ms_by_category")
+        if isinstance(categories, dict):
+            categories = ", ".join(f"{category} {ms:.2f}" for category, ms in categories.items())
+            print(f"  device busy {row['device_busy_percent']:.1f}% of "
+                  f"{row['device_window_ms_per_step']:.2f} ms/step, "
+                  f"{row['kernels_per_step']:.0f} kernels/step; ms/step by category: "
+                  f"{categories}")
         if config.json_out:
             # A GPU sweep is minutes of compilation per case; rewriting the
             # file as each case lands means an interrupted sweep still keeps
