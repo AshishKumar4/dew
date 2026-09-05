@@ -47,6 +47,7 @@ from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
+    MixtralConfig, MixtralForCausalLM,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -94,6 +95,16 @@ def tiny_llama() -> LlamaForCausalLM:
         rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return LlamaForCausalLM(config)
+
+
+def tiny_mixtral() -> MixtralForCausalLM:
+    config = MixtralConfig.from_dict(dict(
+        hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=48, vocab_size=128,
+        num_local_experts=4, num_experts_per_tok=2, sliding_window=4,
+        max_position_embeddings=64))
+    torch.manual_seed(0)
+    return MixtralForCausalLM(config)
 
 
 def tiny_mistral() -> MistralForCausalLM:
@@ -289,6 +300,8 @@ def main() -> None:
     write_tiny("gemma3-tiny", tiny_gemma3())
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("mistral-tiny", tiny_mistral())
+    write_tiny("mixtral-tiny", tiny_mixtral())
+    write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
