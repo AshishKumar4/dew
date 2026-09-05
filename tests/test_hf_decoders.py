@@ -1867,6 +1867,31 @@ def test_llama4_config_translates_field_by_field():
     assert config["rope_theta"] == 500000.0 and config["scale_after_cast"]
 
 
+def test_the_real_llama_4_scout_text_config_translates():
+    """meta-llama/Llama-4-Scout-17B-16E's text_config, from a mirror: 48
+    layers with every fourth global, 40 query and 8 key/value heads of 128,
+    16 experts with one per token on every layer beside a shared expert of
+    8192, dense layers of 16384, chunks of 8192 with temperature tuning at
+    floor_scale 8192, and the llama3 ramp at theta 500000 on the rotated
+    layers."""
+    config = translate_config(fixture_config("llama-4-scout")["text_config"])
+
+    assert config["num_layers"] == 48
+    assert config["layer_types"][:4] == ("chunked_attention",) * 3 + ("full_attention",)
+    assert config["layer_types"].count("full_attention") == 12
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (40, 8, 128)
+    assert config["mixture"] == {
+        "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
+        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
+    assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
+    local = config["kinds"]["chunked_attention"]["mixer"]
+    assert local["attention_chunk_size"] == 8192 and local["floor_scale"] == 8192.0
+    assert config["rope_theta"] == 500000.0
+    assert config["rope_scaling"] == {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+
+
 def test_a_llama4_wrapper_config_is_refused_by_name():
     """meta-llama/Llama-4-Scout-17B-16E's config.json wraps the text decoder
     beside a vision tower; the text_config alone is what translates."""

@@ -54,6 +54,9 @@ DEFAULT_MAX_SEQ_LEN = 8192
 # names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
 _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
 _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
+# GPT OSS names its clamped experts 'silu' too; the family's own dial is
+# the mlp value, so the export vocabulary maps it back to the reference's.
+_HF_ACTIVATIONS['swigluoai'] = 'silu'
 
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
@@ -1645,7 +1648,7 @@ def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str
     pattern = tuple('sliding_attention' if index % 2 == 0 else 'full_attention'
                     for index in range(layers))
     config = _base_config(hf_config, used, layer_types=pattern,
-                          rope=(theta, None), scale_after_cast=False)
+                          rope=_Ropes(theta), scale_after_cast=False)
     config.update(mlp='swigluoai', attention_sinks=True, yarn=yarn,
                   mixture={'experts': experts, 'top_k': top_k})
     if hf_config.get('swiglu_limit', 7.0) != 7.0:
@@ -1721,7 +1724,7 @@ def _glm4_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, 
                              hf_config.get('partial_rotary_factor', 1.0)))
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
                  'partial_rotary_factor', 'num_nextn_predict_layers'))
-    config = _base_config(hf_config, used, rope=(theta, None),
+    config = _base_config(hf_config, used, rope=_Ropes(theta),
                           qk_norm=bool(hf_config.get('use_qk_norm', False)))
     layers = int(hf_config['num_hidden_layers'])
     config.update(
@@ -1779,19 +1782,12 @@ def _llama4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
     if stated is not None and tuple(stated) != layer_types:
         _refuse(f"layer_types {list(stated)!r}",
                 "it disagrees with no_rope_layers, which is what the reference reads")
-    entry = hf_config.get('rope_parameters') or hf_config.get('rope_scaling') or {}
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    if rope_type not in ('default', 'none'):
-        _refuse(f"rope_parameters (rope_type {rope_type!r})",
-                "the llama4 mixer rotates its local layers at rope_theta")
-    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta'})
-    if scaling:
-        _refuse(f"rope_parameters scaling fields {scaling}",
-                "the llama4 mixer rotates its local layers at rope_theta")
-    theta = float(entry.get('rope_theta', hf_config.get('rope_theta', 500000.0)))
-    used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types',
-                 'rope_theta', 'rope_parameters', 'rope_scaling'))
-    config = _base_config(hf_config, used, layer_types=layer_types, rope=(theta, None))
+    # The released Scout spells its llama3 ramp flat (rope_theta beside
+    # rope_scaling); a config transformers wrote nests both. Either way the
+    # ramp is the model's: every rotated layer applies it.
+    used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
+    config = _base_config(hf_config, used, layer_types=layer_types,
+                          rope=dataclasses.replace(_rope(hf_config, used), local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
         _refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):
