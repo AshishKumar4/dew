@@ -66,6 +66,8 @@ objective = LMObjective(model, seq_len=256, samples=Samples(
 
 `pad_id` excludes padded targets from the mean and defaults to `None`, because a fixed-window token file has no padding. A packed batch needs no pad id; its segment ids say which slots are padding.
 
+`mtp_weight` turns on DeepSeek's multi-token-prediction term for a model built with `num_nextn_predict_layers` above zero (arXiv 2412.19437, section 2.2). Depth d of the model pairs the previous depth's state at each position with the embedding of the token d further on and scores the token after that through the shared head; the training loss adds `mtp_weight` times the mean over the depths of each depth's cross entropy, normalised by the same target count as the main term and with a packed batch's document boundaries weighted out the same way. `train/mtp_ce` reports the mean depth cross entropy. Unset, the loss is the main cross entropy alone and the depths get no gradient.
+
 `ema` averages the whole parameter tree at `ema_decay`, and the EMA copy is what validation reads. At validation the objective returns `TokenScores` for `metrics.perplexity()`, which reduces to the exponential of the target-weighted mean over the whole pass, and `TextSamples` when `samples` are configured.
 
 ## Generation
@@ -108,8 +110,9 @@ save_pretrained_decoder(model, variables, "out/qwen3-tuned", tokenizer_name="Qwe
 | Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and are refused by name |
 | Gemma 4 | `gemma4_text` | the text decoder: per-layer inputs, KV sharing, partial rotary, logit softcap |
 | Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and are refused by name |
+| DeepSeek V3, V3.2 | `deepseek_v3`, `deepseek_v32` | multi-head latent attention with YaRN, the V3.2 sparse indexer, the sigmoid router with grouping, scaling and the balancing bias, shared experts; `num_nextn_predict_layers` reads as 0 because the released repos ship no MTP weights |
 
-A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. DeepSeek V3 and V3.2 (multi-head latent attention) are in progress; see the README roadmap.
+A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. The families still to come are in the README roadmap.
 
 Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 
@@ -133,6 +136,6 @@ python recipes/lm/train.py data:token-windows --data.path data/shakespeare-byte 
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.seq-len` is the context the model trains on; it reaches the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget past the training context raises that limit to fit it. `--tokenizer` names the tokenizer `meta.json` was written with. `--balance-rate` turns on the aux-loss-free routing bias of a mixture-of-experts model. The rest is the shared configuration: `--optim.*` for the optimizer, `--trainer.mesh.fsdp` and `--trainer.accumulation` for scaling, `--trainer.wandb.project` to log.
+`--data.seq-len` is the context the model trains on; it reaches the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget past the training context raises that limit to fit it. `--tokenizer` names the tokenizer `meta.json` was written with. `--balance-rate` turns on the aux-loss-free routing bias of a mixture-of-experts model, and `--mtp-weight` the multi-token-prediction term of a model with prediction depths. The rest is the shared configuration: `--optim.*` for the optimizer, `--trainer.mesh.fsdp` and `--trainer.accumulation` for scaling, `--trainer.wandb.project` to log.
 
-Every logging tick writes `train/loss`, `train/ce` and `train/token_accuracy` beside the trainer's throughput numbers. Every validation pass writes `val/perplexity` and, with a prompt configured, the generated text as a table.
+Every logging tick writes `train/loss`, `train/ce` and `train/token_accuracy` (and `train/mtp_ce` with the term on) beside the trainer's throughput numbers. Every validation pass writes `val/perplexity` and, with a prompt configured, the generated text as a table.
