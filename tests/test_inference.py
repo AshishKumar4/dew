@@ -178,16 +178,19 @@ def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
     assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
 
 
-def test_an_unconditional_default_model_takes_a_step():
-    """text=None on the default unet builds, inits and takes one trainer
-    step: with no text the cross-attention blocks fall back to
-    self-attention."""
-    from dew.data import Dataset
-    from dew.objectives.base import Step
+def test_an_unconditional_unet_takes_a_step():
+    """text=None on a unet builds, inits and takes one trainer step: with no
+    text the cross-attention blocks fall back to self-attention. A tiny unet
+    at 16 pixels; the default one at 128 pixels attends over 16k positions
+    per stage and needs tens of GB on a CPU."""
     from dew.training import Trainer
-    config = DiffusionRunConfig(text=None)
+    unet = {"emb_features": 32, "feature_depths": [8, 16], "num_res_blocks": 1,
+            "norm_groups": 4, "attention_configs": [None, {"heads": 2}]}
+    config = DiffusionRunConfig(
+        model=ModelConfig("unet", unet, dtype="float32", attention_impl="reference"),
+        data=OxfordFlowers(image_size=16), text=None)
     objective = config.build()
-    images = np.zeros((8, 128, 128, 3), np.uint8)
+    images = np.zeros((8, 16, 16, 3), np.uint8)
 
     def batches():
         while True:
