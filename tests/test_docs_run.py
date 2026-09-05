@@ -26,6 +26,7 @@ the list, and a new notebook is checked from the day it is added.
 """
 
 import ast
+import contextlib
 import importlib
 import inspect
 import itertools
@@ -107,24 +108,28 @@ def tiny_world(tmp_path):
     )
 
 
-@pytest.fixture
+@contextlib.contextmanager
 def registries_restored():
     """A snippet that registers a model (README's `@models("my_dit")`) must
     not leave it behind for the tests that share this worker: the sweep over
-    every registered model would then meet a class no case covers."""
+    every registered model would then meet a class no case covers. Entered
+    after `tiny_world` has built its objects, so every table is filled before
+    the snapshot; dew's exports register lazily."""
     from dew import registry
 
     tables = [registry.models, registry.presets, registry.samplers, registry.datasets,
               registry.encoders, registry.metrics, registry.objectives]
     before = [dict(table._members) for table in tables]
-    yield
-    for table, members in zip(tables, before):
-        table._members.clear()
-        table._members.update(members)
+    try:
+        yield
+    finally:
+        for table, members in zip(tables, before):
+            table._members.clear()
+            table._members.update(members)
 
 
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
-def test_the_documented_code_runs(path, tmp_path, monkeypatch, registries_restored):
+def test_the_documented_code_runs(path, tmp_path, monkeypatch):
     found = blocks(path)
     if not found:
         pytest.skip("no python blocks")
@@ -133,15 +138,16 @@ def test_the_documented_code_runs(path, tmp_path, monkeypatch, registries_restor
     # Concept pages name jax bare where a snippet builds an array.
     if path != ROOT / "README.md":
         namespace.update(dict(jnp=__import__("jax.numpy", fromlist=["x"]), jax=__import__("jax")))
-    for line, source in found:
-        where = f"{path.relative_to(ROOT)}:{line}"
-        code = compile(source, where, "exec")
-        if ELSEWHERE.match(source):
-            continue
-        try:
-            exec(code, namespace)
-        except Exception as error:  # noqa: BLE001 - the report names the block
-            raise AssertionError(f"{where} failed: {type(error).__name__}: {error}") from error
+    with registries_restored():
+        for line, source in found:
+            where = f"{path.relative_to(ROOT)}:{line}"
+            code = compile(source, where, "exec")
+            if ELSEWHERE.match(source):
+                continue
+            try:
+                exec(code, namespace)
+            except Exception as error:  # noqa: BLE001 - the report names the block
+                raise AssertionError(f"{where} failed: {type(error).__name__}: {error}") from error
 
 
 def test_the_api_page_is_the_code():
