@@ -37,7 +37,7 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    """A huggingface tokenizer, loaded by name on first use.
+    """A huggingface tokenizer, loaded from its hub name on first use.
 
     Lazy loading keeps `import dew.data.text` (and `import dew.data`) from
     paying for `transformers` and any hub lookup a caller never asked for.
