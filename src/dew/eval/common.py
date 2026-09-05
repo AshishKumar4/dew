@@ -1,4 +1,4 @@
-"""The metric shape the trainer consumes: one artifact type, a per-batch
+"""The metric shape the trainer consumes. One artifact type, a per-batch
 measurement, the mean over the pass."""
 
 from dataclasses import dataclass
@@ -19,9 +19,9 @@ def frames(artifact) -> Any:
 def paired(artifact, batch, field: str):
     """The sampled pixels and the records they were sampled for, row for row.
 
-    An objective samples a fixed few rows of a batch rather than all of them,
-    so a metric that measures a sample against its record takes the leading
-    rows of the batch, and says so when the batch is the shorter of the two.
+    An objective samples a fixed few rows of a batch, so a metric that measures
+    a sample against its record takes the leading rows of the batch. A batch
+    shorter than the samples is refused with both counts.
     """
     from dew.inputs import unit_range
 

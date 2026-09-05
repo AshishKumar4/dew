@@ -2,7 +2,7 @@
 
 Both metrics run the vendored towers in `dew.nn.text_encoders`, since
 transformers 5 ships no `FlaxCLIPModel`, and preprocess with the checkpoint's
-own PIL image processor, which transformers 5 still ships. A score here is
+own PIL image processor, which transformers 5 ships. A score here is
 what the reference computes for the same pixels and tokens;
 `tests/test_metrics.py` states the tolerance and the difference observed.
 """
@@ -19,7 +19,7 @@ from .common import ImageMetric
 @functools.lru_cache(maxsize=None)
 def _get_clip(modelname: str):
     """The vendored CLIP towers and the checkpoint's image processor, loaded
-    once per model name: CLIP-L/14 is about 600 MB in HBM, and every metric
+    once per model name. CLIP-L/14 is about 600 MB in HBM, and every metric
     built from this module shares the copy."""
     from transformers import CLIPImageProcessorPil
     from dew.nn.text_encoders import CLIPModel
@@ -35,7 +35,7 @@ def _clip_image_text_cosine(model, processor, artifact, batch, field):
     leading rows of the batch's, row for row with the samples, as `paired`
     takes them for the pixel metrics.
     """
-    # The sampler's [-1, 1] floats as uint8 pixels: nearest value, and clipped
+    # The sampler's [-1, 1] floats as uint8 pixels, nearest value, clipped
     # because a sample can leave the range.
     images = np.clip(np.round((np.asarray(artifact.images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
     count = images.shape[0]
@@ -56,9 +56,8 @@ def _clip_image_text_cosine(model, processor, artifact, batch, field):
 
 @metrics("clip")
 def clip(modelname: str = "openai/clip-vit-large-patch14", field: str = "text") -> ImageMetric:
-    """CLIP distance, mean(1 - cos(image, text)), lower is better. Older runs
-    were ranked by it as val/clip_similarity; `clip_score` is the standard
-    number for a new run.
+    """CLIP distance, mean(1 - cos(image, text)), lower is better. It logs as
+    val/clip_similarity; `clip_score` is the standard number for a new run.
     """
 
     def measure(artifact, batch):

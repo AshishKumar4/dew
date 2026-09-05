@@ -12,9 +12,8 @@ import numpy as np
 def _check_digest(path: str, repo: str, filename: str, revision: str, digest: str) -> str:
     """`path` back, once its bytes hash to `digest`.
 
-    A separate function so the pin is testable over local bytes: the only
-    thing standing between a downloaded pickle and the unpickler is this
-    comparison.
+    A separate function so the pin is testable over local bytes. This
+    comparison is what stands between a downloaded pickle and the unpickler.
     """
     with open(path, 'rb') as handle:
         found = hashlib.file_digest(handle, 'sha256').hexdigest()
@@ -29,11 +28,8 @@ def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
     """The path to `filename` of `repo` at `revision`, once its bytes hash to
     `digest`.
 
-    The weights used to come from a consumer file-sharing link with no
-    checksum, which a released package then unpickled: whoever held that link
-    chose what ran. A Hub repo pins a revision, and the digest is checked here
-    as well, so the bytes are what this code was written against whatever the
-    transport did.
+    The repo pins the revision and the digest is checked here as well, so the
+    bytes are what this code was written against whatever the transport did.
     """
     from huggingface_hub import hf_hub_download
 
@@ -41,12 +37,11 @@ def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
                          repo, filename, revision, digest)
 
 
-# What a pickle of numpy arrays needs to rebuild them, and nothing else. The
-# FID weights were written under numpy 1, where these lived under
-# `numpy.core`; numpy 2 keeps that path alive only as a shim that warns on
-# every attribute read, so a legacy name is resolved at its current home
-# instead. Anything outside this set is refused rather than imported, so a
-# downloaded pickle cannot run code.
+# Only what a pickle of numpy arrays needs to rebuild them. The
+# FID weights name these under `numpy.core`, the numpy 1 home; numpy 2 keeps
+# that path as a shim that warns on every attribute read, so a legacy name
+# resolves at its current home instead. Anything outside this set is refused,
+# so a downloaded pickle cannot run code.
 _ARRAY_GLOBALS = {
     ('numpy', 'dtype'),
     ('numpy', 'ndarray'),
