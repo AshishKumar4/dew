@@ -28,6 +28,7 @@ from termcolor import colored
 from dew.artifacts import host
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
+from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
@@ -347,12 +348,14 @@ class Trainer:
         off the ahead-of-time executable: jit lowers through the same cache,
         so the first call finds that compilation and compiles nothing.
 
-        Every call runs under `jax.set_mesh`, which puts the mesh in context
-        while the step traces: the attention seam reads the sequence axis off
-        it (`dew.nn.sharding.sequence_shards`), and the context is part of
-        jit's cache key, so a call outside it would trace and compile the
-        step a second time. Entering it costs nothing measurable beside the
-        dispatch (32 us either way on the CPU above).
+        Every call runs under `jax.set_mesh` and the pipeline's microbatch
+        count, which put the mesh and the schedule in context while the step
+        traces: the attention seam reads the sequence axis off the mesh
+        (`dew.nn.sharding.sequence_shards`), a decoder reads the stage axis
+        and the count (`pipeline_stages` and `microbatches`), and the mesh
+        context is part of jit's cache key, so a call outside it would trace
+        and compile the step a second time. Entering it costs nothing
+        measurable beside the dispatch (32 us either way on the CPU above).
         """
         body = self._step_body()
         mesh = self.device_mesh
@@ -371,11 +374,11 @@ class Trainer:
                            replicated, replicated, replicated),
             donate_argnums=(0,),
         )
-        with jax.set_mesh(mesh):
+        with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
             self.flops_per_step = step_flops(jitted, state, scale, batch)
 
         def run(state, scale, batch):
-            with jax.set_mesh(mesh):
+            with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
                 return jitted(state, scale, batch)
 
         return run
