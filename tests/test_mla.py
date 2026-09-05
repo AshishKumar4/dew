@@ -94,7 +94,12 @@ def block_output(name: str, settings: dict) -> float:
 
 
 def test_yarn_matches_the_reference_derivation():
-    """Inverse frequencies, cos/sin amplitude and positions, standalone."""
+    """Inverse frequencies, cos/sin amplitude and positions, standalone.
+
+    Tolerance rtol 1e-6 on the inverse frequencies and 1e-5 on cos and sin;
+    observed 0 on the inverse frequencies, the attention factor and the
+    query scale, 6.0e-8 on cos and 3.0e-8 on sin.
+    """
     tensors = fixture("yarn")
     yarn = yarn_of(CONFIG["v3"])
 
@@ -165,10 +170,18 @@ def test_mla_reproduces_the_v3_block_without_the_query_lora():
 def test_mla_reproduces_the_v32_block():
     """DeepseekV32Attention: biased projections, indexer top-k mask fold.
 
-    Tolerance 2e-5; observed 1.9e-6. The dense mixer on the same weights
-    differs from the fixture by 3.4, so the fixture is the sparse block and
-    the parity covers the selection; a generator that lost the eager mask
-    fold again would fail here on the dense side.
+    Tolerance 2e-5; observed 1.9e-6.
+
+    The first fixture was the dense block, not the sparse one. The
+    reference folds the indexer's top-k into the attention mask only when
+    its config names the eager or sdpa attention path, and a standalone
+    DeepseekV32Config leaves `_attn_implementation` None, so the generator
+    handed the indices to the eager kernel as a keyword it ignores. The
+    port, which always selects, differed from that fixture by 3.42 while
+    every intermediate up to the selection matched to 1e-6. The generator
+    names the eager path now (5aa94b9). The dense mixer on the same weights
+    still differs from the fixture by 3.4, so a fixture that lost the
+    selection again fails on the second assertion.
     """
     assert block_output("mla_v32", CONFIG["v32"]) < 2e-5
     dense = dict(CONFIG["v32"], index_topk=None, index_n_heads=None,
@@ -225,7 +238,9 @@ def test_the_mla_record_and_value_agree():
 def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     """The kind lands the block at layers_0/self_attn with the translated
     tree's names, and there it computes what the standalone block does on
-    the same weights: the fixture's output, within the block's tolerance."""
+    the same weights, bit for bit, and the fixture's output within the
+    block's tolerance. Tolerance 2e-5; observed 2.9e-6 (v3) and 1.9e-6 (v32).
+    """
     settings = CONFIG[SETTINGS[name]]
     tensors = fixture(name)
     model = mla_model(settings)
