@@ -62,7 +62,7 @@ BATCH, LENGTH = 2, 12
 # exercised: value heads outnumbering key heads, key and value dims apart,
 # a partial rotary of a quarter of the head (the released factor), the
 # doubled gated q_proj, and a conv with a real history.
-CONFIG = dict(
+CONFIG: dict = dict(
     vocab_size=256, hidden_size=64, intermediate_size=128,
     num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
     head_dim=32, hidden_act="silu", max_position_embeddings=64,
@@ -160,6 +160,9 @@ def conv_fixture(generator: torch.Generator) -> dict:
 def layer_fixture(model: Qwen3_5ForCausalLM, generator: torch.Generator) -> dict:
     """One Qwen3_5GatedDeltaNet with the tiny model's first-layer weights."""
     layer = model.model.layers[0].linear_attn
+    # torch types a submodule attribute as Tensor | Module; this one is the
+    # Qwen3_5GatedDeltaNet of a linear_attention layer.
+    assert isinstance(layer, torch.nn.Module)
     hidden = torch.randn((RULE_BATCH, LAYER_LENGTH, CONFIG["hidden_size"]), generator=generator)
     with torch.no_grad():
         out = layer(hidden, attention_mask=None)
