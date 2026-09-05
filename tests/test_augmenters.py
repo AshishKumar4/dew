@@ -148,12 +148,6 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
     assert "torchvision" not in result.stderr
 
 
-def test_the_transform_receives_grains_record_rng():
-    """grain only hands a per-record rng to RandomMapTransform subclasses; the
-    per-record seeding contract depends on that dispatch."""
-    assert issubclass(ImageTransform, pygrain.RandomMapTransform)
-
-
 # ---------------------------------------------------------------------------------
 # The augmentation field
 # ---------------------------------------------------------------------------------

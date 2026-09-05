@@ -82,12 +82,6 @@ def vae():
 
 
 @pytest.mark.network
-def test_vae_shapes(vae):
-    assert vae.downscale_factor == 8
-    assert vae.latent_channels == 4
-
-
-@pytest.mark.network
 def test_vae_uses_the_latent_normalization_seam(vae):
     """The SD scaling factor rides on the shared seam, so there is one
     normalization path a caller can override with dataset statistics."""

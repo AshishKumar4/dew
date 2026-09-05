@@ -39,7 +39,12 @@ def test_the_advertised_geometry_is_the_encoders(depths):
     image = jnp.zeros((1, size, size, 3))
     latent = autoencoder.encode(autoencoder.params, image)
     assert latent.shape == (1, 2, 2, autoencoder.latent_channels)
-    assert autoencoder.decode(autoencoder.params, latent).shape == image.shape
+    assert jnp.all(jnp.isfinite(latent))
+    other = autoencoder.encode(autoencoder.params, jnp.ones_like(image))
+    assert not jnp.allclose(latent, other, atol=1e-6)
+    decoded = autoencoder.decode(autoencoder.params, latent)
+    assert decoded.shape == image.shape
+    assert jnp.all(jnp.isfinite(decoded))
 
 
 def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
@@ -90,7 +95,10 @@ def test_group_norm_survives_depths_not_divisible_by_norm_groups():
     """GroupNorm needs a divisor of the channel count; the AE picks one."""
     autoencoder = SimpleAutoEncoder(latent_channels=2, feature_depths=(12,), norm_groups=8)
     image = jnp.zeros((1, 2, 2, 3))
-    assert autoencoder(autoencoder.params, image).shape == image.shape
+    out = autoencoder(autoencoder.params, image)
+    assert out.shape == image.shape
+    assert jnp.all(jnp.isfinite(out))
+    assert not jnp.allclose(out, autoencoder(autoencoder.params, jnp.ones_like(image)), atol=1e-6)
 
 
 def test_params_can_be_reused_across_instances(autoencoder, image):
