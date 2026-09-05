@@ -199,6 +199,7 @@ class Llama4Mixer(MixerBase):
         unsupported = {
             "qk_norm": ctx.qk_norm,
             "v_norm": ctx.v_norm,
+            "k_eq_v": ctx.k_eq_v,
             "kv_shared": ctx.kv_shared,
             "sliding_window": ctx.sliding_window,
             "attention_scale": ctx.attention_scale,

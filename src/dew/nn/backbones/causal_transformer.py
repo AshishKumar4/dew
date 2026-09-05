@@ -38,6 +38,7 @@ from ..attention import (
 )
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
+from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..mla import YarnScaling, mla_rope_freqs
 from ..sharding import logical_axes
@@ -63,6 +64,9 @@ class LayerKind:
 
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
+    num_kv_heads: Optional[int] = None
+    """This kind's key/value head count; None takes the model's. Gemma 4's
+    global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
     rope_scaling: Optional[RopeScaling] = None
     """This kind's llama3 ramp or its record; None rides the model's."""
@@ -95,6 +99,7 @@ class ResolvedKind:
     """
 
     window: Optional[int]
+    num_kv_heads: int
     rope_theta: float
     rope_scaling: Optional[RopeScaling]
     head_dim: int
@@ -119,6 +124,13 @@ class Mixture:
     for V3's aux-loss-free balancing bias, and `scale_inputs` for Llama 4's
     weight on the expert input rather than its output.
 
+    `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
+    beside the dense feed-forward on the same residual and the two are
+    summed after a norm each, under `Gemma4TextRouter`, which softmaxes,
+    keeps the renormalised top k and scales each choice per expert; the
+    routing dials above belong to the replacing routers and are refused
+    with it.
+
     `expert_features` is the routed experts' width, None for the model's
     `mlp_features`; DeepSeek sizes its experts apart from its dense layers
     (`moe_intermediate_size` beside `intermediate_size`). `shared_features`
@@ -140,6 +152,7 @@ class Mixture:
     group_score: str = 'top2'
     bias: bool = False
     scale_inputs: bool = False
+    parallel: bool = False
     expert_features: Optional[int] = None
     shared_features: int = 0
 
@@ -164,6 +177,14 @@ class Mixture:
             raise ValueError(
                 f"shared_features is the shared branch's width, got "
                 f"{self.shared_features}; 0 is a layer without one")
+        if self.parallel and (
+                self.score_function != 'softmax' or not self.norm_topk_prob
+                or self.scaling != 1.0 or self.groups != 1 or self.bias
+                or self.scale_inputs or self.shared_features):
+            raise ValueError(
+                "a parallel mixture routes with Gemma 4's router, which has no "
+                "score function, scaling, groups, balancing bias, input scaling "
+                "or shared branch to set")
 
 
 @logical_axes({
@@ -214,6 +235,7 @@ class CausalSelfAttention(nn.Module):
     attention_sinks: bool = False
     yarn: Optional[YarnScaling] = None
     attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
+    k_eq_v: bool = False  # Gemma 4's global layers project no values: the raw keys, values-normed
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
@@ -235,7 +257,8 @@ class CausalSelfAttention(nn.Module):
         # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.kv_shared:
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-            self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
+            if not self.k_eq_v:
+                self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
         if self.qk_norm:
@@ -308,10 +331,13 @@ class CausalSelfAttention(nn.Module):
             key, value, positions = kv_store[self.kv_store_key]
         else:
             key = self.k_proj(x)
+            # attention_k_eq_v reads the values off the key projection before
+            # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
+            value = (key if self.k_eq_v else self.v_proj(x)).reshape(
+                B, S, self.num_kv_heads, self.head_dim)
             if whole:
                 key = self.k_norm(key)
             key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
-            value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
             if self.qk_norm and not whole:
                 key = self.k_norm(key)
             if self.v_norm:
@@ -490,6 +516,10 @@ class DecoderBlock(nn.Module):
     sandwich_norms: bool = False
     pre_norms: bool = True
     per_layer_input_dim: int = 0
+    parallel: Optional[Callable[..., nn.Module]] = None
+    """A branch summed with the feed-forward's output before its output norm,
+    called with the residual and that output (Gemma 4's routed experts)."""
+    layer_scalar: bool = False  # Gemma 4 multiplies each layer's output by a learned scalar
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -507,6 +537,12 @@ class DecoderBlock(nn.Module):
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
         self.mlp = self.feedforward(name='mlp')
+        if self.parallel is not None:
+            self.moe = self.parallel(name='moe')
+        if self.layer_scalar:
+            # The reference's layer_scalar buffer, a checkpoint leaf of one
+            # value, which the released Gemma 4 checkpoints carry.
+            self.output_scalar = self.param('layer_scalar', nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
@@ -527,6 +563,8 @@ class DecoderBlock(nn.Module):
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
         hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
+        if self.parallel is not None:
+            hidden = self.moe(x, hidden)
         if self.sandwich_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
@@ -539,6 +577,8 @@ class DecoderBlock(nn.Module):
             gated = _gated_activation(self._gate_activation, gated)
             projected = self.per_layer_projection(gated * per_layer_input)
             x = x + self.post_per_layer_input_norm(projected)
+        if self.layer_scalar:
+            x = x * self.output_scalar.astype(x.dtype)
         return x
 
     @property
@@ -702,6 +742,8 @@ class CausalTransformer(nn.Module):
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
+    attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
+    layer_scalar: bool = False               # Gemma 4 scales each layer's output by a learned scalar
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
     o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
@@ -782,6 +824,7 @@ class CausalTransformer(nn.Module):
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
+            num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
@@ -844,7 +887,7 @@ class CausalTransformer(nn.Module):
         return MixerContext(
             emb_features=self.emb_features,
             num_heads=self.num_heads,
-            num_kv_heads=self.kv_heads,
+            num_kv_heads=kind.num_kv_heads,
             head_dim=kind.head_dim,
             max_seq_len=self.max_seq_len,
             causal=self.causal,
@@ -853,6 +896,7 @@ class CausalTransformer(nn.Module):
             qk_norm=self.qk_norm,
             qk_norm_scope=self.qk_norm_scope,
             v_norm=self.v_norm,
+            k_eq_v=self.attention_k_eq_v and kind.window is None,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
@@ -893,6 +937,10 @@ class CausalTransformer(nn.Module):
             if kind.window is not None and kind.window < 1:
                 raise ValueError(
                     f"the window of {layer_type!r} must be positive, got {kind.window}")
+            if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
+                raise ValueError(
+                    f"num_heads ({self.num_heads}) must be a multiple of the key/value "
+                    f"heads of {layer_type!r} ({kind.num_kv_heads})")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -977,6 +1025,23 @@ class CausalTransformer(nn.Module):
             shared=shared,
             dtype=self.dtype,
             precision=self.precision)
+        parallel = None if mixture is None or not mixture.parallel else functools.partial(
+            Gemma4Experts,
+            num_experts=mixture.experts,
+            top_k=mixture.top_k,
+            hidden_features=(self.hidden_features
+                             if mixture.expert_features is None
+                             else mixture.expert_features),
+            out_features=self.emb_features,
+            activation=self.mlp,
+            norm_eps=self.norm_eps,
+            scale_offset=self.scale_offset,
+            scale_after_cast=self.scale_after_cast,
+            dtype=self.dtype,
+            precision=self.precision)
+        if parallel is not None:
+            # The branch rides beside every sparse layer's dense feed-forward.
+            routed = None
         if self.mlp == 'swigluoai':
             if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
                 raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
@@ -1011,6 +1076,8 @@ class CausalTransformer(nn.Module):
                 sandwich_norms=self.sandwich_norms,
                 pre_norms=self.pre_norms,
                 per_layer_input_dim=ple or 0,
+                parallel=parallel if index in sparse else None,
+                layer_scalar=self.layer_scalar,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
                 precision=self.precision,
