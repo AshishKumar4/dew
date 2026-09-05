@@ -66,7 +66,7 @@ def decode_image(encoded: bytes) -> np.ndarray:
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:
     """`image` at `size` square; area interpolation down, cubic up."""
     import cv2
-    interpolation = cv2.INTER_CUBIC if size > 256 else cv2.INTER_AREA
+    interpolation = cv2.INTER_AREA if max(image.shape[:2]) > size else cv2.INTER_CUBIC
     return cv2.resize(image, (size, size), interpolation=interpolation)
 
 

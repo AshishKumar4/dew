@@ -122,6 +122,7 @@ class LMObjective(Objective):
         samples: Optional[Samples] = None,
         pretrained: Optional[Variables] = None,
         balance_rate: Optional[float] = None,
+        mtp_weight: Optional[float] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
         in; four is the measured best on one RTX 4080 at vocabulary 50,304,
@@ -135,7 +136,13 @@ class LMObjective(Objective):
         `balance_rate` moves each sparse layer's routing bias against its
         load by this much every step (DeepSeek's aux-loss-free balancing);
         the model has to keep that bias, `bias=True` on the
-        CausalTransformer's mixture. Unset leaves the bias where it is."""
+        CausalTransformer's mixture. Unset leaves the bias where it is.
+
+        `mtp_weight` is DeepSeek's lambda on the multi-token-prediction term
+        (arXiv 2412.19437, eq. 24): the training loss adds that times the
+        mean over the model's prediction depths of each depth's cross
+        entropy, so the model needs `num_nextn_predict_layers` above zero.
+        Unset leaves the term out and the depths untrained."""
         self.model = model
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -143,6 +150,17 @@ class LMObjective(Objective):
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
+        if mtp_weight is not None:
+            depths = getattr(model, "num_nextn_predict_layers", 0)
+            if depths < 1:
+                raise ValueError(
+                    "mtp_weight scales the prediction depths' cross entropy, so "
+                    "the model needs num_nextn_predict_layers above zero")
+            if mtp_weight <= 0:
+                raise ValueError(
+                    f"mtp_weight is a positive weight on the term, got {mtp_weight}; "
+                    "None leaves the term out")
+        self.mtp_weight = mtp_weight
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
         if samples is not None:
@@ -158,12 +176,14 @@ class LMObjective(Objective):
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
-                     segment_ids=None, positions=None, routing: bool = False):
+                     segment_ids=None, positions=None, routing: bool = False,
+                     depths: bool = False):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns the `[B, seq_len]` losses, the weight of each target (1 where
-        it counts), whether each prediction was right, and what the routers
-        sowed when `routing` asked for it.
+        it counts), whether each prediction was right, what the routers
+        sowed when `routing` asked for it, and the prediction depths' losses
+        and weights when `depths` asked for them.
 
         A packed batch carries `segment_ids` for the same rows: the last token
         of a document does not predict the first of the next one, so that
@@ -195,32 +215,66 @@ class LMObjective(Objective):
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        weights = (jnp.ones_like(losses) if self.pad_id is None
-                   else (targets != self.pad_id).astype(losses.dtype))
+        weights = self._target_weights(targets, segment_ids, losses.dtype)
+        correct = (predicted == targets).astype(losses.dtype)
+        depth_scores = []
+        if depths:
+            # Depth d's state at p scores the target d further out, so its
+            # targets are the shifted row's from d on, with the same weight
+            # rule between the state's document and the target's.
+            states = self.model.apply(
+                params, hidden, inputs, train=train, rngs=rngs,
+                method=type(self.model).mtp_hidden_states, **packing)
+            for depth, state in enumerate(states, start=1):
+                depth_losses, _ = chunked_cross_entropy(
+                    state, head, targets[:, depth:], self.head_chunks,
+                    softcap=self.model.final_logit_softcap,
+                    precision=self.model.precision)
+                depth_scores.append((depth_losses, self._target_weights(
+                    targets[:, depth:], segment_ids, losses.dtype, depth)))
+        return losses, weights, correct, sown, depth_scores
+
+    def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
+        """1 where a target counts: not padding, and in a packed batch inside
+        the document of the state that predicts it, which sits `depth + 1`
+        positions before it."""
+        weights = (jnp.ones_like(targets, dtype) if self.pad_id is None
+                   else (targets != self.pad_id).astype(dtype))
         if segment_ids is not None:
             # A target counts only inside a document: the first token of the
             # next packed document, the padding after the last one (segment 0,
             # which the seg==seg comparison alone would keep), and every
             # cross-boundary transition drop out of loss and accuracy alike.
+            span = depth + 1
             weights = weights * (
-                (segment_ids[:, 1:] == segment_ids[:, :-1])
-                & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
-        correct = (predicted == targets).astype(losses.dtype)
-        return losses, weights, correct, sown
+                (segment_ids[:, span:] == segment_ids[:, :-span])
+                & (segment_ids[:, span:] != 0)).astype(dtype)
+        return weights
 
     def loss(self, params, batch, step: Step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
-        losses, weights, correct, routing = self.token_scores(
+        losses, weights, correct, routing, depths = self.token_scores(
             params, tokens, train=True, rngs={"dropout": step.key},
-            segment_ids=segment_ids, positions=positions, routing=rate is not None)
+            segment_ids=segment_ids, positions=positions, routing=rate is not None,
+            depths=self.mtp_weight is not None)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
         ce = jnp.sum(losses * weights) / counted
         reported = {"ce": ce, "perplexity": jnp.exp(ce),
                     "token_accuracy": jnp.sum(correct * weights) / counted}
+        loss = ce
+        if self.mtp_weight is not None:
+            # Each depth's cross entropy over the same count as the main
+            # term, which is the paper's 1/T with the depth's missing tail
+            # positions contributing nothing, averaged over the depths.
+            mtp = jnp.mean(jnp.stack([
+                jnp.sum(depth_losses * depth_weights) / counted
+                for depth_losses, depth_weights in depths]))
+            reported["mtp_ce"] = mtp
+            loss = ce + self.mtp_weight * mtp
         variables = None
         if rate is not None:
             if "moe" not in params or routing is None:
@@ -230,7 +284,7 @@ class LMObjective(Objective):
             balanced, load = balance(params["moe"], routing, rate)
             reported.update(load)
             variables = {"moe": balanced}
-        return ce, Aux(reported, variables)
+        return loss, Aux(reported, variables)
 
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced token scores, plus the sampled text when asked for.
@@ -261,7 +315,7 @@ class LMObjective(Objective):
     def _scored(self):
         """The teacher-forced scores, compiled once per objective."""
         def scored(params, tokens, segment_ids, positions):
-            losses, weights, _, _ = self.token_scores(
+            losses, weights, _, _, _ = self.token_scores(
                 params, tokens, segment_ids=segment_ids, positions=positions)
             return losses, weights
 

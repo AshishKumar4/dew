@@ -49,13 +49,13 @@ Payload: TypeAlias = dict[str, object]
 
 
 @functools.singledispatch
-def render(value: object, step: int) -> Payload | None:
+def render(value: object) -> Payload | None:
     """The wandb payload for one artifact, or None for a type nothing draws
     (a metric reads it instead)."""
     return None
 
 @render.register
-def _(value: ImageGrid, step: int) -> Payload | None:
+def _(value: ImageGrid) -> Payload | None:
     import wandb
 
     captions = list(value.captions) + [None] * (len(value.images) - len(value.captions))
@@ -64,7 +64,7 @@ def _(value: ImageGrid, step: int) -> Payload | None:
 
 
 @render.register
-def _(value: VideoGrid, step: int) -> Payload | None:
+def _(value: VideoGrid) -> Payload | None:
     import wandb
 
     # wandb reads clips as [N, T, C, H, W].
@@ -73,7 +73,7 @@ def _(value: VideoGrid, step: int) -> Payload | None:
 
 
 @render.register
-def _(value: TextSamples, step: int) -> Payload | None:
+def _(value: TextSamples) -> Payload | None:
     import wandb
 
     texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
@@ -85,7 +85,7 @@ def _(value: TextSamples, step: int) -> Payload | None:
 
 
 @render.register
-def _(value: Representations, step: int) -> Payload | None:
+def _(value: Representations) -> Payload | None:
     import wandb
 
     # The per-dimension spread across the batch: the collapse view of a
@@ -129,7 +129,7 @@ class WandbTracker:
         self.run.log({name: float(value) for name, value in scalars.items()}, step=step)
 
     def artifact(self, value: object, step: int) -> None:
-        payload = self.render(value, step)
+        payload = self.render(value)
         if payload is not None:
             self.run.log(payload, step=step)
 

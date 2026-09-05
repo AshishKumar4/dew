@@ -14,6 +14,8 @@ Set up the venv once (torch CPU, transformers, safetensors):
         --extra-index-url https://pypi.org/simple
     /tmp/t5ref/bin/python tools/t5_reference.py
 
+--out DIR writes the fixtures somewhere other than tests/fixtures/t5.
+
 What lands in tests/fixtures/t5:
 
 - tiny/: a random-weight T5 encoder in the Hugging Face layout
@@ -66,18 +68,16 @@ def tiny_model(vocab_size: int) -> T5EncoderModel:
         num_layers=2, num_heads=4, relative_attention_num_buckets=16,
         relative_attention_max_distance=64, dropout_rate=0.0,
         layer_norm_epsilon=1e-6, feed_forward_proj="gated-gelu",
-        pad_token_id=0, eos_token_id=1, decoder_start_token_id=0)
+        pad_token_id=0, eos_token_id=1)
+    # Every published T5 config.json carries this field. transformers 5
+    # accepts it at construction but its typed signature does not declare
+    # it, so it is set the way the loader would read it.
+    config.decoder_start_token_id = 0
     torch.manual_seed(0)
     return T5EncoderModel(config)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--skip-write", action="store_true",
-                        help="print shapes without writing fixtures")
-    args = parser.parse_args()
-
-    tiny = FIXTURES / "tiny"
+def write_tiny(tiny: Path) -> None:
     tiny.mkdir(parents=True, exist_ok=True)
     tokenizer = tiny_tokenizer()
     model = tiny_model(tokenizer.vocab_size)
@@ -91,11 +91,9 @@ def main() -> None:
         outputs = model(input_ids=tokens["input_ids"],
                         attention_mask=tokens["attention_mask"])
     hidden = outputs.last_hidden_state.float().numpy()
-    print("tiny hidden:", hidden.shape, "ids:", tokens["input_ids"].shape)
-    assert np.all(np.isfinite(hidden))
+    if not np.all(np.isfinite(hidden)):
+        raise ValueError("the reference encoder produced a non-finite hidden state")
 
-    if args.skip_write:
-        return
     # Full state dict on purpose: decoder and lm_head ride along so the
     # loader proves it reads past them. The shared embedding is stored twice
     # under both names, so clone before saving.
@@ -111,7 +109,13 @@ def main() -> None:
              attention_mask=tokens["attention_mask"].numpy().astype(np.int32),
              last_hidden_state=hidden)
     size_mb = sum(p.stat().st_size for p in tiny.iterdir()) / 2 ** 20
-    print(f"wrote {tiny} ({size_mb:.1f} MB)")
+    print(f"wrote {tiny} ({size_mb:.1f} MB): hidden {hidden.shape}, ids {tuple(tokens['input_ids'].shape)}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=Path, default=FIXTURES)
+    write_tiny(parser.parse_args(argv).out / "tiny")
 
 
 if __name__ == "__main__":

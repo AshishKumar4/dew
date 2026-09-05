@@ -160,7 +160,7 @@ class Tracker(Protocol):
     def artifact(self, value: Artifact, step: int) -> None: ...
 
 class WandbTracker:
-    render = functools.singledispatch(lambda value, step: NotImplemented)
+    render = functools.singledispatch(lambda value: None)
     @render.register(ImageGrid) ...  @render.register(TextSamples) ...  @render.register(VideoGrid) ...
 ```
 

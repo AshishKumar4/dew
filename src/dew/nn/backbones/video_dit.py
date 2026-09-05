@@ -13,11 +13,11 @@ from flax import linen as nn
 from typing import Optional, Literal
 from flax.typing import Dtype, PrecisionLike
 
+from ..attention import rotary_freqs
 from ..dit import (
-    PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    ModulatedBlock, remat_block, neutralized_rope_freqs,
+    ROPE_THETA, PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
+    ModulatedBlock, remat_block, rope_for_scan,
 )
-from ..vit import RotaryEmbedding
 from dew.registry import models
 
 
@@ -55,11 +55,6 @@ class VideoDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
         )
-        dim_head = self.emb_features // self.num_heads
-        self.spatial_rope = RotaryEmbedding(
-            dim=dim_head, max_seq_len=4096, dtype=self.dtype, name="spatial_rope")
-        self.temporal_rope = RotaryEmbedding(
-            dim=dim_head, max_seq_len=1024, dtype=self.dtype, name="temporal_rope")
 
         def block(name):
             return remat_block(ModulatedBlock, self.remat)(
@@ -101,9 +96,10 @@ class VideoDiT(nn.Module):
         cond_spatial = jnp.repeat(cond_emb, T, axis=0)   # [B*T, F]
         cond_temporal = jnp.repeat(cond_emb, S, axis=0)  # [B*S, F]
 
-        freqs_spatial = neutralized_rope_freqs(self.spatial_rope, S, self.scan_order)
+        dim_head = self.emb_features // self.num_heads
+        freqs_spatial = rope_for_scan(S, dim_head, self.scan_order)
         # Time is a genuine 1D axis, RoPE applies directly
-        freqs_temporal = self.temporal_rope(seq_len=T)
+        freqs_temporal = rotary_freqs(jnp.arange(T), dim_head, ROPE_THETA)
 
         for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks):
             tokens = spatial(tokens, cond_spatial, freqs_spatial, train)

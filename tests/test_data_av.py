@@ -1,195 +1,116 @@
-"""Audio-video reader tests.
+"""The audio-video clip reader, on a clip whose frames and audio carry
+their own index.
 
-`read_av_improved` decodes frames with PyAV, which the `av` extra installs;
-the random-clip readers need more (`video_reader`/PyVideoReader, moviepy)
-plus ffmpeg. The frame-window plumbing is checked against a stubbed reader
-so it runs everywhere; the tests that decode real media skip when the
-libraries are missing.
+Every frame of the synthesized clip is a flat grey of five times its index,
+and the audio under frame f is the constant sample 100 f, so a clip that
+comes back says which frames it holds and which frames its audio is under.
+The clip is muxed losslessly (ffv1 video, PCM audio at the reader's rate),
+so the audio has to come back sample-exact, not just aligned. The reader
+needs moviepy, which is the `av` extra, and its bundled ffmpeg writes the
+fixture, so nothing here depends on a binary on PATH.
 """
 
-import importlib
-import shutil
 import subprocess
-import sys
-import types
 
 import numpy as np
 import pytest
 
-from dew.data.sources import av_utils
-from dew.data.sources.av_utils import read_av_improved, read_av_random_clip
+from dew.data.sources.av_utils import audio_window, choose_clip_start, read_av_random_clip
 
-FPS = 25.0
+moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
+
+FPS = 25
 SAMPLE_RATE = 16000
-CLIP_SECONDS = 2
-CLIP_FRAMES = int(FPS * CLIP_SECONDS)
+SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
+CLIP_FRAMES = 50
+# Small enough that a frame's cubic-free grey survives ffv1 exactly, and an
+# index recovered as round(grey / 5) is never ambiguous.
+GREY_STEP = 5
+SAMPLE_STEP = 100
 
 
-@pytest.fixture
-def stub_reader(monkeypatch):
-    """Install a fake `av` module and audio reader, recording calls."""
-    calls = {}
-
-    class FakeFrame:
-        def __init__(self, index):
-            self.index = index
-
-        def to_ndarray(self, format="rgb24"):
-            assert format == "rgb24"
-            return np.full((4, 4, 3), self.index, dtype=np.uint8)
-
-    class FakeContainer:
-        def __init__(self, path):
-            calls["path"] = path
-            self.streams = types.SimpleNamespace(video=[object()])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def decode(self, stream):
-            return [FakeFrame(index) for index in range(CLIP_FRAMES)]
-
-    module = types.ModuleType("av")
-    module.open = lambda path: FakeContainer(path)
-    monkeypatch.setitem(sys.modules, "av", module)
-
-    def fake_read_audio(path, start_time=None, duration=None, target_sr=SAMPLE_RATE,
-                        method='ffmpeg'):
-        calls["start_time"] = start_time
-        calls["duration"] = duration
-        samples = int((duration if duration is not None else CLIP_SECONDS) * target_sr)
-        return np.zeros(samples, dtype=np.float32), target_sr
-
-    monkeypatch.setattr(av_utils, "read_audio", fake_read_audio)
-    return calls
-
-
-def test_read_av_improved_stops_at_the_end_frame(stub_reader):
-    """Only `[start, end)` comes back: the stub numbers its frames, so the
-    window is checked by content, not just by length."""
-    audio, video = read_av_improved("clip.mp4", start=5, end=10, fps=FPS)
-
-    assert video.shape == (5, 4, 4, 3)
-    assert video[0, 0, 0, 0] == 5
-    assert video[-1, 0, 0, 0] == 9
-    # The audio window must line up with the frame window
-    assert stub_reader["start_time"] == pytest.approx(5 / FPS)
-    assert stub_reader["duration"] == pytest.approx(5 / FPS)
-    assert len(audio) == pytest.approx(SAMPLE_RATE * 5 / FPS, abs=1)
-
-
-def test_read_av_improved_without_an_end_reads_to_the_clip_end(stub_reader):
-    _, video = read_av_improved("clip.mp4", start=5, fps=FPS)
-
-    assert stub_reader["duration"] is None
-    assert video.shape == (CLIP_FRAMES - 5, 4, 4, 3)
-    assert video[0, 0, 0, 0] == 5
-
-
-# ---------------------------------------------------------------------------------
-# Real decoding: needs the native readers and ffmpeg
-# ---------------------------------------------------------------------------------
-
-def needs_rsreader():
-    """`video-reader-rs` is not in the `av` extra and its wheel needs libwebp
-    present, so a test that decodes through it skips rather than fails. A
-    missing module and a module whose native library will not load are the
-    same thing here; pytest.importorskip re-raises the second."""
-    try:
-        importlib.import_module("video_reader")
-    except ImportError as error:
-        pytest.skip(f"PyVideoReader is unusable here: {error}")
+def _clip(directory, name="clip.mkv", audio=True):
+    frames = np.stack([np.full((32, 32, 3), GREY_STEP * index, np.uint8)
+                       for index in range(CLIP_FRAMES)])
+    samples = np.repeat(np.arange(CLIP_FRAMES, dtype=np.int16) * SAMPLE_STEP, SAMPLES_PER_FRAME)
+    (directory / "frames.raw").write_bytes(frames.tobytes())
+    (directory / "audio.raw").write_bytes(samples.tobytes())
+    path = directory / name
+    video = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "32x32", "-r", str(FPS),
+             "-i", str(directory / "frames.raw")]
+    sound = (["-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", str(directory / "audio.raw"),
+              "-c:a", "pcm_s16le"] if audio else ["-an"])
+    subprocess.run([moviepy_config.FFMPEG_BINARY, "-y", "-loglevel", "error", *video, *sound,
+                    "-c:v", "ffv1", str(path)], check=True)
+    return str(path)
 
 
 @pytest.fixture(scope="module")
-def synthesized_clip(tmp_path_factory):
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("needs the ffmpeg binary")
-
-    path = tmp_path_factory.mktemp("av") / "clip.mp4"
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"testsrc=duration={CLIP_SECONDS}:size=64x64:rate={int(FPS)}",
-            "-f", "lavfi", "-i",
-            f"sine=frequency=440:duration={CLIP_SECONDS}:sample_rate={SAMPLE_RATE}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-            str(path),
-        ],
-        check=True, capture_output=True,
-    )
-    return path
+def clip(tmp_path_factory):
+    return _clip(tmp_path_factory.mktemp("av"))
 
 
-def test_read_av_improved_decodes_only_the_requested_window(synthesized_clip):
-    pytest.importorskip("av")
-    audio, video = read_av_improved(str(synthesized_clip), start=5, end=15, fps=FPS)
-
-    assert len(video) == 10
-    assert len(audio) == pytest.approx(SAMPLE_RATE * 10 / FPS, rel=0.05)
-
-    _, full_video = read_av_improved(str(synthesized_clip), fps=FPS)
-    assert len(full_video) > len(video)
+def _frame_indices(frames):
+    return [int(round(int(frame[16, 16, 0]) / GREY_STEP)) for frame in frames]
 
 
-# Each random-clip reader's own decoder. 'moviepy' is the default and reads
-# from wheels alone; the other two decode their frames with PyVideoReader.
-_CLIP_READER_DEPS = {"pyav": "av", "alt": "moviepy", "moviepy": "moviepy"}
-_CLIP_READERS_NEEDING_RSREADER = ("pyav", "alt")
+def _audio_indices(audio):
+    return [int(round(float(np.median(row)) * 32768 / SAMPLE_STEP)) for row in audio]
 
 
-@pytest.mark.parametrize("method", sorted(_CLIP_READER_DEPS))
-def test_random_clip_readers_are_seeded_locally(synthesized_clip, method):
-    """Same seed, same clip; and no reader may reseed the process-global RNG."""
-    pytest.importorskip(_CLIP_READER_DEPS[method])
-    if method in _CLIP_READERS_NEEDING_RSREADER:
-        needs_rsreader()
+@pytest.mark.parametrize("seed", [0, 3, 7])
+def test_a_clip_holds_the_frames_the_seed_picks_and_the_audio_under_them(clip, seed):
+    """Frames [start, start + N), audio rows [start - P, start + N + P), and
+    every audio row bit-exact: the clip is lossless and the reader asks
+    ffmpeg for the track at its own rate. Read through moviepy's audio
+    reader the rows came back scaled by 0.707 (its stereo upmix of a mono
+    track) and sampled off a 44.1 kHz stream, so no row was exact."""
+    start = choose_clip_start(CLIP_FRAMES, 8, 2, np.random.default_rng(seed))
 
+    frames, audio = read_av_random_clip(clip, num_frames=8, audio_padding=2, seed=seed)
+
+    assert frames.shape == (8, 32, 32, 3) and frames.dtype == np.uint8
+    assert audio.shape == (12, SAMPLES_PER_FRAME) and audio.dtype == np.float32
+    assert _frame_indices(frames) == list(range(start, start + 8))
+    assert _audio_indices(audio) == list(range(start - 2, start + 10))
+    expected = np.arange(start - 2, start + 10, dtype=np.float32)[:, None] * SAMPLE_STEP / 32768
+    assert np.array_equal(audio, np.broadcast_to(expected, audio.shape))
+
+
+def test_the_same_seed_reads_the_same_clip_without_touching_the_global_rng(clip):
     np.random.seed(99)
     global_state = np.random.get_state()[1].copy()
 
-    def read(seed):
-        return read_av_random_clip(
-            str(synthesized_clip), num_frames=8, audio_frame_padding=1,
-            target_sr=SAMPLE_RATE, target_fps=FPS, random_seed=seed, method=method,
-        )
+    first = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=3)
+    second = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=3)
+    other = read_av_random_clip(clip, num_frames=8, audio_padding=1, seed=4)
 
-    first_framewise, first_audio, first_frames = read(3)
-    second_framewise, second_audio, second_frames = read(3)
-
-    assert np.array_equal(first_frames, second_frames)
-    assert np.array_equal(first_audio, second_audio)
-    assert np.array_equal(first_framewise, second_framewise)
-    assert first_frames.shape[0] == 8
-    assert first_audio.shape[0] == 8 + 2  # padded on both sides
+    assert np.array_equal(first[0], second[0]) and np.array_equal(first[1], second[1])
+    assert not np.array_equal(first[0], other[0])
     assert np.array_equal(global_state, np.random.get_state()[1])
 
 
-def test_the_fps_conversion_takes_a_path_the_shell_would_have_eaten(tmp_path, monkeypatch):
-    """The conversion runs ffmpeg on a caller's path. Built as a shell string
-    it split on a space and ran anything after a metacharacter, so the two
-    paths a shell would mangle are what this reads."""
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("needs the ffmpeg binary")
-    from dew.data.sources.av_utils import read_video
+def test_an_audio_window_is_the_samples_between_its_times(clip):
+    """The window is cut by time, mono at the rate asked for; a clip a few
+    frames in starts at exactly that frame's first sample."""
+    window = audio_window(clip, 3 / FPS, 2 / FPS, SAMPLE_RATE)
 
-    work = tmp_path / "a dir"
-    work.mkdir()
-    clip = work / "clip.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
-         "-i", f"testsrc=duration=1:size=32x32:rate={int(FPS)}", str(clip)],
-        check=True, capture_output=True)
-    dangerous = work / "clip; touch injected.txt"
-    dangerous.write_bytes(clip.read_bytes())
-    monkeypatch.chdir(work)
+    assert window.shape == (2 * SAMPLES_PER_FRAME,) and window.dtype == np.float32
+    assert np.array_equal(window[:SAMPLES_PER_FRAME], np.full(SAMPLES_PER_FRAME, 3 * SAMPLE_STEP / 32768, np.float32))
+    assert np.array_equal(window[SAMPLES_PER_FRAME:], np.full(SAMPLES_PER_FRAME, 4 * SAMPLE_STEP / 32768, np.float32))
 
-    spaced = read_video(str(clip), change_fps=True, reader="opencv")
-    metacharacter = read_video(str(dangerous), change_fps=True, reader="opencv")
 
-    assert len(spaced) == len(metacharacter) > 0
-    assert spaced[0].shape == (32, 32, 3)
-    assert not (work / "injected.txt").exists(), "the path reached a shell"
+def test_a_clip_longer_than_the_video_is_refused(clip):
+    with pytest.raises(ValueError, match="needs 54"):
+        read_av_random_clip(clip, num_frames=50, audio_padding=2, seed=0)
+
+
+def test_a_rate_that_is_not_whole_samples_per_frame_is_refused(clip):
+    with pytest.raises(ValueError, match="whole number"):
+        read_av_random_clip(clip, num_frames=8, audio_padding=2, seed=0, fps=30.0)
+
+
+def test_a_video_without_audio_is_refused(tmp_path):
+    silent = _clip(tmp_path, name="silent.mkv", audio=False)
+    with pytest.raises(ValueError, match="does not contain any stream"):
+        read_av_random_clip(silent, num_frames=8, audio_padding=2, seed=0)

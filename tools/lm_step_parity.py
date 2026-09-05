@@ -1,17 +1,22 @@
-"""Same-seed per-step training losses, this branch against main.
+"""Record the per-step losses of the small language model preset from one seed.
 
 Runs the small benchmark preset's language model for a fixed number of steps
-from one seed and writes every step's loss as JSON. Run it twice, once with
-PYTHONPATH pointing at this worktree and once at the main checkout, then
-compare: the chunked head only ships if the two agree to the tolerance
-CONTRIBUTING states for a replaced loss, 1e-5 relative.
+from one seed on one fixed batch and writes every step's loss and token
+accuracy as JSON. Run it twice, once with PYTHONPATH at each checkout, and
+compare the two files: a replaced loss ships only if they agree to fp32
+tolerance, as CONTRIBUTING asks of any replaced computation.
 
 Usage:
-  PYTHONPATH=<checkout>/src python tools/lm_step_parity.py --steps 20 \
+  PYTHONPATH=<checkout>/src python tools/lm_step_parity.py --steps 20 \\
       --out /tmp/lm-head/losses-<name>.json
+
+--precision sets `model.precision`; unset is XLA's default, which uses TF32
+for fp32 matmuls on an Ampere or later card.
 """
+
 import argparse
 import json
+from dataclasses import asdict, dataclass
 
 import jax
 import jax.numpy as jnp
@@ -24,26 +29,27 @@ from dew.registry import with_precision
 from dew.training import MeshSpec, Trainer
 
 # tools/benchmark_step.py's small causal_transformer preset.
-CONFIG = dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
-              mlp_features=4 * 768, max_seq_len=512)
+CONFIG: dict[str, int] = dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
+                              mlp_features=4 * 768, max_seq_len=512)
 BATCH, SEQ = 16, 512
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--precision", default=None,
-                        help="model.precision: unset is XLA's default, which "
-                             "uses TF32 for fp32 matmuls on this card")
-    args = parser.parse_args()
+@dataclass(frozen=True)
+class Record:
+    """Every step's loss and token accuracy, in step order."""
 
-    config = with_precision("causal_transformer", dict(CONFIG),
+    losses: list[float]
+    token_accuracy: list[float]
+
+
+def run(config: dict[str, int], batch: int, seq: int, steps: int,
+        precision: str | None = None) -> Record:
+    fields = with_precision("causal_transformer", config,
                             dtype="bfloat16", attention_impl="reference")
-    if args.precision is not None:
-        config["precision"] = args.precision
-    model = models.build("causal_transformer", **config)
-    trainer = Trainer(LMObjective(model, SEQ), optax.adam(1e-4),
+    if precision is not None:
+        fields["precision"] = precision
+    model = models.build("causal_transformer", **fields)
+    trainer = Trainer(LMObjective(model, seq), optax.adam(1e-4),
                       key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                       checkpoints=None, tracker=None)
     abstract = jax.eval_shape(trainer.initial_state)
@@ -52,22 +58,33 @@ def main():
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
     generator = np.random.default_rng(0)
-    tokens = generator.integers(0, CONFIG["vocab_size"],
-                                size=(BATCH, SEQ + 1)).astype(np.int32)
-    batch = {TEXT_KEY: jnp.asarray(tokens)}
+    tokens = generator.integers(0, config["vocab_size"], size=(batch, seq + 1)).astype(np.int32)
+    data = {TEXT_KEY: jnp.asarray(tokens)}
 
-    step = trainer.compile(state, batch)
-    losses, accuracies = [], []
-    for _ in range(args.steps):
-        state, scale, loss, metrics, finite = step(state, scale, batch)
-        losses.append(float(loss))
-        accuracies.append(float(metrics["token_accuracy"]))
-        assert bool(finite), "the loss went non-finite"
+    step = trainer.compile(state, data)
+    record = Record([], [])
+    for index in range(steps):
+        state, scale, loss, metrics, finite = step(state, scale, data)
+        if not bool(finite):
+            raise RuntimeError(f"the loss went non-finite at step {index}")
+        record.losses.append(float(loss))
+        record.token_accuracy.append(float(metrics["token_accuracy"]))
+    return record
 
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--precision", default=None,
+                        help="model.precision; unset is XLA's default")
+    args = parser.parse_args(argv)
+
+    record = run(CONFIG, BATCH, SEQ, args.steps, args.precision)
     with open(args.out, "w") as handle:
-        json.dump({"losses": losses, "token_accuracy": accuracies}, handle, indent=2)
-    print(json.dumps({"first": losses[0], "last": losses[-1],
-                      "accuracy_last": accuracies[-1]}, indent=2))
+        json.dump(asdict(record), handle, indent=2)
+    print(json.dumps({"first": record.losses[0], "last": record.losses[-1],
+                      "accuracy_last": record.token_accuracy[-1]}, indent=2))
     print(f"wrote {args.out}")
 
 

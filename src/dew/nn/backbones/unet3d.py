@@ -1,24 +1,21 @@
 """
 UNet3D: the 2D UNet inflated for video, AnimateDiff-style.
 
-The forward mirrors Unet exactly (same blocks, same explicit module names,
-same auto-name ordering), processing every frame through the spatial path,
-with zero-initialized temporal attention blocks interleaved at each
-resolution level. Zero init means a freshly inflated model reproduces the 2D
-UNet frame by frame, so a pretrained image checkpoint (inflate_unet_params)
-is the starting point and training only has to learn motion.
+Every frame goes through the 2D UNet's body, with a zero-initialized
+temporal attention block after the residual blocks of each resolution level.
+Zero init means a freshly inflated model reproduces the 2D UNet frame by
+frame, so a pretrained image checkpoint (inflate_unet_params) is the starting
+point and training only has to learn motion.
 """
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from typing import Callable, Optional, Sequence
-from functools import partial
+from typing import Optional
 
-from ..blocks import ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
-from ..attention import Stage, TransformerBlock
-from ..vit import RotaryEmbedding, RoPEAttention
+from ..attention import NormalAttention, rotary_freqs
+from ..dit import ROPE_THETA
+from .unet import Unet, unet_body
 from dew.registry import models
 from ..sharding import logical_axes
 
@@ -45,18 +42,15 @@ class TemporalBlock(nn.Module):
         h = h.transpose(0, 2, 1, 3).reshape(B * H * W, frames, C)
 
         h = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(h)
-        rope = RotaryEmbedding(
-            dim=C // self.heads, max_seq_len=1024, dtype=self.dtype, name="temporal_rope")
-        h = RoPEAttention(
+        h = NormalAttention(
             query_dim=C,
             heads=self.heads,
             dim_head=C // self.heads,
             dtype=self.dtype,
             precision=self.precision,
             use_bias=True,
-            rope_emb=rope,
             name="temporal_attention",
-        )(h, freqs_cis=rope(frames))
+        )(h, freqs_cis=rotary_freqs(jnp.arange(frames), C // self.heads, ROPE_THETA))
         # zero-init gate: identity at init, so inflation preserves the 2D model
         h = nn.Dense(
             features=C, dtype=self.dtype, precision=self.precision,
@@ -67,234 +61,24 @@ class TemporalBlock(nn.Module):
 
 
 @models("unet_3d")
-class UNet3D(nn.Module):
-    """Video UNet over (B, T, H, W, C): the 2D Unet forward per frame, with a
+class UNet3D(Unet):
+    """Video UNet over (B, T, H, W, C): the 2D Unet body per frame, with a
     TemporalBlock at every resolution level. Spatial param paths are
     identical to Unet, so 2D checkpoints inflate directly."""
-    output_channels:int=3
-    emb_features:int=64*4
-    feature_depths: Sequence[int] = (64, 128, 256, 512)
-    attention_configs: Sequence[Optional[Stage]] = (
-        Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
-    """Attention per resolution stage, one entry per feature depth; None is a
-    stage with no attention."""
-    num_res_blocks:int=2
-    num_middle_res_blocks:int=1
-    activation:Callable = jax.nn.swish
-    norm_groups:int=8
-    dtype: Optional[Dtype] = None
-    precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
     temporal_heads: int = 8
-
-    def setup(self):
-        if self.norm_groups > 0:
-            norm = partial(nn.GroupNorm, self.norm_groups)
-            self.conv_out_norm = norm()
-        else:
-            norm = partial(nn.RMSNorm, 1e-5)
-            self.conv_out_norm = norm()
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
         B, T, H, W, C = x.shape
-        x = x.reshape(B * T, H, W, C)
-        temb = jnp.repeat(temb, T, axis=0)
-        if textcontext is not None:
-            textcontext = jnp.repeat(textcontext.hidden, T, axis=0)
+        text = None if textcontext is None else jnp.repeat(textcontext.hidden, T, axis=0)
 
-        temb = FourierEmbedding(features=self.emb_features)(temb)
-        temb = TimeProjection(features=self.emb_features)(temb)
+        def temporal(x, name):
+            return TemporalBlock(features=x.shape[-1], heads=self.temporal_heads,
+                                 dtype=self.dtype, precision=self.precision, name=name)(x, T)
 
-        feature_depths = self.feature_depths
-        attention_configs = self.attention_configs
-
-        conv_type = up_conv_type = down_conv_type = middle_conv_type = "conv"
-
-        x = ConvLayer(
-            conv_type,
-            features=self.feature_depths[0],
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            dtype=self.dtype,
-            precision=self.precision
-        )(x)
-        downs = [x]
-
-        # Downscaling blocks
-        for i, (dim_out, attention_config) in enumerate(zip(feature_depths, attention_configs)):
-            dim_in = x.shape[-1]
-            for j in range(self.num_res_blocks):
-                x = ResidualBlock(
-                    down_conv_type,
-                    name=f"down_{i}_residual_{j}",
-                    features=dim_in,
-                    kernel_size=(3, 3),
-                    strides=(1, 1),
-                    activation=self.activation,
-                    norm_groups=self.norm_groups,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                )(x, temb)
-                if attention_config is not None and j == self.num_res_blocks - 1:
-                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
-                                        dim_head=dim_in // attention_config.heads,
-                                        use_projection=attention_config.use_projection,
-                                        use_self_and_cross=attention_config.use_self_and_cross,
-                                        precision=attention_config.precision or self.precision,
-                                        only_pure_attention=attention_config.only_pure_attention,
-                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
-                                        norm_inputs=attention_config.norm_inputs,
-                                        explicitly_add_residual=attention_config.explicitly_add_residual,
-                                        use_linear_attention=attention_config.use_linear_attention,
-                                        norm_epsilon=attention_config.norm_epsilon,
-                                        name=f"down_{i}_attention_{j}")(x, textcontext)
-                downs.append(x)
-            x = TemporalBlock(
-                features=x.shape[-1],
-                heads=self.temporal_heads,
-                dtype=self.dtype,
-                precision=self.precision,
-                name=f"down_{i}_temporal"
-            )(x, T)
-            if i != len(feature_depths) - 1:
-                x = Downsample(
-                    features=dim_out,
-                    scale=2,
-                    activation=self.activation,
-                    name=f"down_{i}_downsample",
-                    dtype=self.dtype,
-                    precision=self.precision
-                )(x)
-
-        # Middle Blocks
-        middle_dim_out = self.feature_depths[-1]
-        middle_attention = self.attention_configs[-1]
-        for j in range(self.num_middle_res_blocks):
-            x = ResidualBlock(
-                middle_conv_type,
-                name=f"middle_res1_{j}",
-                features=middle_dim_out,
-                kernel_size=(3, 3),
-                strides=(1, 1),
-                activation=self.activation,
-                norm_groups=self.norm_groups,
-                dtype=self.dtype,
-                precision=self.precision,
-            )(x, temb)
-            if middle_attention is not None and j == self.num_middle_res_blocks - 1:
-                x = TransformerBlock(heads=middle_attention.heads, dtype=middle_attention.dtype, attention_impl=self.attention_impl,
-                                    dim_head=middle_dim_out // middle_attention.heads,
-                                    use_projection=middle_attention.use_projection,
-                                    use_self_and_cross=False,
-                                    precision=middle_attention.precision or self.precision,
-                                    only_pure_attention=middle_attention.only_pure_attention,
-                                    force_fp32_for_softmax=middle_attention.force_fp32_for_softmax,
-                                    norm_inputs=middle_attention.norm_inputs,
-                                    explicitly_add_residual=middle_attention.explicitly_add_residual,
-                                    use_linear_attention=middle_attention.use_linear_attention,
-                                    norm_epsilon=middle_attention.norm_epsilon,
-                                    name=f"middle_attention_{j}")(x, textcontext)
-            x = TemporalBlock(
-                features=x.shape[-1],
-                heads=self.temporal_heads,
-                dtype=self.dtype,
-                precision=self.precision,
-                name=f"middle_temporal_{j}"
-            )(x, T)
-            x = ResidualBlock(
-                middle_conv_type,
-                name=f"middle_res2_{j}",
-                features=middle_dim_out,
-                kernel_size=(3, 3),
-                strides=(1, 1),
-                activation=self.activation,
-                norm_groups=self.norm_groups,
-                dtype=self.dtype,
-                precision=self.precision,
-            )(x, temb)
-
-        # Upscaling Blocks
-        for i, (dim_out, attention_config) in enumerate(zip(reversed(feature_depths), reversed(attention_configs))):
-            for j in range(self.num_res_blocks):
-                x = jnp.concatenate([x, downs.pop()], axis=-1)
-                kernel_size = (3, 3)
-                x = ResidualBlock(
-                    up_conv_type,
-                    name=f"up_{i}_residual_{j}",
-                    features=dim_out,
-                    kernel_size=kernel_size,
-                    strides=(1, 1),
-                    activation=self.activation,
-                    norm_groups=self.norm_groups,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                )(x, temb)
-                if attention_config is not None and j == self.num_res_blocks - 1:
-                    x = TransformerBlock(heads=attention_config.heads, dtype=attention_config.dtype, attention_impl=self.attention_impl,
-                                        dim_head=dim_out // attention_config.heads,
-                                        use_projection=attention_config.use_projection,
-                                        use_self_and_cross=attention_config.use_self_and_cross,
-                                        precision=attention_config.precision or self.precision,
-                                        only_pure_attention=attention_config.only_pure_attention,
-                                        force_fp32_for_softmax=attention_config.force_fp32_for_softmax,
-                                        norm_inputs=attention_config.norm_inputs,
-                                        explicitly_add_residual=attention_config.explicitly_add_residual,
-                                        use_linear_attention=attention_config.use_linear_attention,
-                                        norm_epsilon=attention_config.norm_epsilon,
-                                        name=f"up_{i}_attention_{j}")(x, textcontext)
-            x = TemporalBlock(
-                features=x.shape[-1],
-                heads=self.temporal_heads,
-                dtype=self.dtype,
-                precision=self.precision,
-                name=f"up_{i}_temporal"
-            )(x, T)
-            if i != len(feature_depths) - 1:
-                x = Upsample(
-                    features=feature_depths[-i],
-                    scale=2,
-                    activation=self.activation,
-                    name=f"up_{i}_upsample",
-                    dtype=self.dtype,
-                    precision=self.precision
-                )(x)
-
-        x = ConvLayer(
-            conv_type,
-            features=self.feature_depths[0],
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            dtype=self.dtype,
-            precision=self.precision
-        )(x)
-
-        x = jnp.concatenate([x, downs.pop()], axis=-1)
-
-        x = ResidualBlock(
-            conv_type,
-            name="final_residual",
-            features=self.feature_depths[0],
-            kernel_size=(3,3),
-            strides=(1, 1),
-            activation=self.activation,
-            norm_groups=self.norm_groups,
-            dtype=self.dtype,
-            precision=self.precision,
-        )(x, temb)
-
-        x = self.conv_out_norm(x)
-        x = self.activation(x)
-
-        noise_out = ConvLayer(
-            conv_type,
-            features=self.output_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            dtype=self.dtype,
-            precision=self.precision
-        )(x)
-        return noise_out.reshape(B, T, H, W, self.output_channels)
+        out = unet_body(self, x.reshape(B * T, H, W, C), jnp.repeat(temb, T, axis=0), text,
+                        temporal=temporal)
+        return out.reshape(B, T, H, W, self.output_channels)
 
 
 def inflate_unet_params(params_2d, params_3d):

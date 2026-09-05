@@ -11,7 +11,7 @@ directory of `/home/you`.
 ## Install
 
 ```
-pip install dew-ml
+pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
 ```
 
 ## A v5e-16 slice from nothing to a training run

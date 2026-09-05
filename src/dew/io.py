@@ -12,8 +12,7 @@ from collections.abc import Sequence
 from etils import epath
 import jax
 
-from dew.checkpoints import is_uri
-from dew.config import RUN_FILE
+from dew.checkpoints import RUN_FILE, is_uri
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"

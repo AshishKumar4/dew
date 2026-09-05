@@ -30,8 +30,8 @@ SEQUENCE_AXIS = 'sequence'
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
 # expert axis, a width the rules redirect takes tensor, everything else
-# takes fsdp. The sequence axis never places parameters: it splits the
-# batch's sequence dimension, which no parameter has.
+# takes fsdp. The data and sequence axes split the batch and never place a
+# parameter, which `Layout` refuses a rule for.
 PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 
 # The batch's rows split across every axis but sequence, whichever they sit
@@ -49,21 +49,28 @@ LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
 
 # Rule order is precedence when two logical dimensions target the one fsdp axis.
 # It reproduces the largest-axis choice for the declared model shapes while
-# giving a config one place to redirect model semantics onto a future mesh.
+# giving a config one place to redirect a width onto the tensor axis.
 DEFAULT_RULES: LogicalAxisRules = (
     ("vocab", FSDP_AXIS),
     ("mlp", FSDP_AXIS),
     ("modulation", FSDP_AXIS),
     ("attention", FSDP_AXIS),
+    # The gated delta net's projected width (keys, values and their gate),
+    # placed like the attention's: the width over the model dimension.
+    ("linear", FSDP_AXIS),
     ("embed", FSDP_AXIS),
     ("head_dim", FSDP_AXIS),
     ("heads", FSDP_AXIS),
     ("kv", FSDP_AXIS),
+    # The latent widths multi-head latent attention compresses through and
+    # the sparse indexer's head dim: model-width-like, so they ride fsdp for
+    # now. That is a real choice, not a default: there is no tensor axis
+    # today, and one must not silently re-place these when it lands.
+    ("index", FSDP_AXIS),
+    ("kvlora", FSDP_AXIS),
+    ("qlora", FSDP_AXIS),
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
-    ("batch", None),
-    ("sequence", SEQUENCE_AXIS),
-    ("stage", None),
 )
 
 
@@ -78,11 +85,22 @@ class MeshSpec:
     sequence: int = 1
     """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
 
+
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     """One entry of a spec or a rule as the mesh axes it names."""
     if assignment is None:
         return ()
     return (assignment,) if isinstance(assignment, str) else tuple(assignment)
+
+
+def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxisRules:
+    """`rules` as the tuple of pairs flax reads, in precedence order. They are
+    written as a mapping in code, as pairs on the command line, and arrive as
+    lists from a JSON record."""
+    items = rules.items() if isinstance(rules, Mapping) else rules
+    return tuple((name, axes if axes is None or isinstance(axes, str) else tuple(axes))
+                 for name, axes in items)
+
 
 
 def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
@@ -145,10 +163,7 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     names: list[str | None] = list(axes)
     while True:
         mapped = spmd.logical_to_mesh_axes(tuple(names), rules)
-        if mapped is None:
-            raise ValueError(
-                f"the rules {rules} give the logical axes {tuple(names)} no mesh "
-                "assignment, so the parameter they name cannot be placed")
+        assert mapped is not None, "flax answers None for array_dim_names=None only"
         assigned = [
             tuple(axis for axis in _mesh_axes(assignment) if mesh.shape[axis] > 1)
             for assignment in mapped]
@@ -171,12 +186,14 @@ class Layout:
     """How a train state is placed on a mesh.
 
     `rules` map the logical axes the modules declare (`dew.nn.sharding`) onto
-    mesh axes, in precedence order; a rule that names a mesh axis this mesh
-    does not have is dropped, which is what lets one table carry a future
-    'tensor' axis. Below `min_shard` elements a parameter costs more in
-    collectives than it saves in memory, so it stays replicated. `tolerance`
-    is the fraction of shardable parameter elements a layout may leave
-    replicated before `check` refuses it.
+    the parameter axes of the mesh, in precedence order; an axis of size 1
+    shards nothing, so the same table serves every topology. A rule onto the
+    data or the sequence axis is refused: those split the batch, and a
+    parameter placed on either would be gathered on every use. Below
+    `min_shard` elements a parameter costs more in collectives than it saves
+    in memory, so it stays replicated. `tolerance` is the fraction of
+    shardable parameter elements a layout may leave replicated before
+    `check` refuses it.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
@@ -186,20 +203,15 @@ class Layout:
         if not 0.0 <= self.tolerance <= 1.0:
             raise ValueError(
                 f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
-        # Rules are written as a mapping or arrive as lists from a JSON
-        # record; the table is a tuple of pairs, in precedence order.
-        items = self.rules.items() if isinstance(self.rules, Mapping) else self.rules
-        object.__setattr__(self, "rules", tuple(
-            (name, axes if axes is None or isinstance(axes, str) else tuple(axes))
-            for name, axes in items))
-
-    def _rules_for(self, mesh: Mesh) -> LogicalAxisRules:
-        normalized = []
-        for logical_axis, mesh_axes in self.rules:
-            axes = tuple(axis for axis in _mesh_axes(mesh_axes) if axis in mesh.axis_names)
-            normalized.append(
-                (logical_axis, axes[0] if len(axes) == 1 else axes or None))
-        return tuple(normalized)
+        rules = _rule_table(self.rules)
+        for name, axes in rules:
+            outside = [axis for axis in _mesh_axes(axes) if axis not in PARAMETER_AXES]
+            if outside:
+                raise ValueError(
+                    f"rule {name!r} places a parameter on {outside}; parameters "
+                    f"split over {list(PARAMETER_AXES)}, and the data and sequence "
+                    f"axes split the batch")
+        object.__setattr__(self, "rules", rules)
 
     def shardings(self, mesh: Mesh, tree: Any) -> Placement:
         """A NamedSharding per leaf of `tree`, from the declared parameter axes.
@@ -209,7 +221,7 @@ class Layout:
         if a caller's own module attached any, is removed here, because the
         state the trainer materialises against this tree carries plain arrays.
         """
-        rules = self._rules_for(mesh)
+        rules = _rule_table(self.rules)
         fsdp_size = mesh.shape[FSDP_AXIS]
         sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
 
@@ -320,7 +332,6 @@ class DevicePrefetchIterator:
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._terminal: Optional[BaseException] = None
         self._source = self._iterator if isinstance(self._iterator, Checkpointable) else None
-        self.checkpointable = self._source is not None
         if source_state is not None:
             if self._source is None:
                 raise TypeError(

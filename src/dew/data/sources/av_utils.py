@@ -1,637 +1,97 @@
+"""One random clip of frames and aligned audio out of a video file.
+
+moviepy is the reader because it is what the `av` extra installs and it
+reads from wheels alone; it drives ffmpeg, so nothing here holds a decoder
+open across records.
 """
-Functions for reading audio-video data without memory leaks.
-"""
-import cv2
-import os
-import shutil
+
+from __future__ import annotations
+
 import subprocess
+
 import numpy as np
-from typing import Tuple, Optional, Union, List
-from .audio_utils import read_audio
 
 
-def choose_clip_start(
-    total_frames: int,
-    num_frames: int,
-    padding: int,
-    rng: np.random.Generator,
-) -> int:
-    """Pick a random clip start leaving `padding` frames on either side.
+def choose_clip_start(total_frames: int, num_frames: int, padding: int,
+                      rng: np.random.Generator) -> int:
+    """A start for a clip of `num_frames` that leaves `padding` frames free
+    on either side, drawn from `rng`, or the only start that fits.
 
-    Takes an explicit Generator, because np.random.seed() inside a data-loading
-    worker reseeds the process-global RNG and silently perturbs every other
-    consumer of np.random.
-
-    Args:
-        total_frames: Number of frames in the video.
-        num_frames: Number of frames the clip needs.
-        padding: Frames kept available on either side of the clip.
-        rng: Random source; seed it per call for reproducibility.
-
-    Returns:
-        The start frame index.
+    The generator is an argument because np.random.seed() inside a
+    data-loading worker reseeds the process-global RNG and perturbs every
+    other consumer of np.random.
     """
-    min_start = padding
-    max_start = total_frames - num_frames - padding
-    if max_start <= min_start:
-        return min_start
-    return int(rng.integers(min_start, max_start))
+    latest = total_frames - num_frames - padding
+    if latest <= padding:
+        return padding
+    return int(rng.integers(padding, latest))
 
-def get_video_fps(video_path: str):
-    cam = cv2.VideoCapture(video_path)
-    fps = cam.get(cv2.CAP_PROP_FPS)
-    cam.release()
-    return fps
 
-def read_video(video_path: str, change_fps=False, reader="opencv"):
-    """Every frame of `video_path` as RGB uint8.
+def audio_window(path: str, start: float, duration: float, sample_rate: int) -> np.ndarray:
+    """The sound of `path` from `start` for `duration` seconds, mono at
+    `sample_rate`, float32 in [-1, 1].
 
-    `reader` defaults to opencv because it works from the wheels the `av`
-    extra installs. `decord` and `rsreader` are faster on long files and stay
-    reachable by name; each needs more than a wheel, and says so.
+    ffmpeg does the seek, the resampling and the downmix, through the binary
+    moviepy drives. moviepy's own audio reader asks for stereo at 44.1 kHz
+    whatever the track is, and ffmpeg's mono-to-stereo upmix takes 3 dB off
+    a mono track; sampling that stream at another rate then picks the
+    nearest 44.1 kHz sample, which aliases and is never sample-exact.
     """
-    temp_dir = None
-    try:
-        if change_fps:
-            print(f"Changing fps of {video_path} to 25")
-            temp_dir = "temp"
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            os.makedirs(temp_dir, exist_ok=True)
-            target_video_path = os.path.join(temp_dir, "video.mp4")
-            # An argument list, not a shell string: a path holds spaces and a
-            # caller's path is not the place to run a shell.
-            subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-y", "-nostdin", "-i", video_path,
-                 "-r", "25", "-crf", "18", target_video_path],
-                check=True)
-        else:
-            target_video_path = video_path
+    from moviepy.config import FFMPEG_BINARY
 
-        if reader == "rsreader":
-            return read_video_rsreader(target_video_path)
-        elif reader == "rsreader_fast":
-            return read_video_rsreader(target_video_path, fast=True)
-        elif reader == "decord":
-            return read_video_decord(target_video_path)
-        elif reader == "opencv":
-            return read_video_opencv(target_video_path)
-        else:
-            raise ValueError(f"Unknown reader: {reader}")
-    finally:
-        # Clean up temp directory when done
-        if change_fps and temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+    done = subprocess.run(
+        [FFMPEG_BINARY, "-loglevel", "error", "-nostdin", "-ss", f"{start:.6f}",
+         "-t", f"{duration:.6f}", "-i", path, "-vn", "-f", "s16le", "-ac", "1",
+         "-ar", str(sample_rate), "-"],
+        capture_output=True)
+    if done.returncode:
+        raise ValueError(f"ffmpeg could not read the audio of {path}: "
+                         f"{done.stderr.decode(errors='replace').strip()}")
+    return np.frombuffer(done.stdout, np.int16).astype(np.float32) / 32768.0
 
-def read_video_decord(video_path: str):
-    """`decord`, whose wheel is x86-64 Linux only; opencv is the default for
-    that reason."""
-    from decord import VideoReader
-    vr = VideoReader(video_path)
-    video_frames = vr[:].asnumpy()
-    vr.seek(0)
-    return video_frames
 
-# Fixed OpenCV video reader - properly release resources
-def read_video_opencv(video_path):
-    cap = cv2.VideoCapture(video_path)
-    try:
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(frame)
-        return np.array(frames)[:, :, :, ::-1]
-    finally:
-        cap.release()
+def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed: int,
+                        sample_rate: int = 16000, fps: float = 25.0
+                        ) -> tuple[np.ndarray, np.ndarray]:
+    """`num_frames` consecutive frames of `path` from a start `seed` picks,
+    and the audio under them with `audio_padding` frames more on each side.
 
-def read_video_rsreader(video_path, fast=False):
-    """`video-reader-rs`, which is not in the `av` extra: its wheel carries
-    libsharpyuv but leaves a build-machine RUNPATH on libwebp, so the loader
-    never finds the bundled copy and reinstalling changes nothing. Use it
-    only with an install you have seen import, and pass `reader="rsreader"`."""
-    from video_reader import PyVideoReader
-    vr = PyVideoReader(video_path)
-    return vr.decode_fast() if fast else vr.decode()
-
-def read_audio_decord(audio_path:str):
-    from decord import AudioReader
-    ar = AudioReader(audio_path)
-    # The whole track in one read; decord's AudioReader has no seek to rewind.
-    return ar[:].asnumpy()
-
-def read_av_decord(path: str, start: int = 0, end: int | None = None, ctx=None):
-    from decord import AVReader, cpu
-    if ctx is None:
-        ctx = cpu(0)
-    vr = AVReader(path, ctx=ctx, sample_rate=16000)
-    audio, video = vr[start:end]
-    return audio, video.asnumpy()
-
-def _decode_frame_window_pyav(path: str, start: int = 0, end: int | None = None) -> np.ndarray:
-    """Frames `[start, end)` of the first video stream as RGB uint8."""
-    import av
-    with av.open(path) as container:
-        video = container.streams.video
-        if not video:
-            raise ValueError(f"{path} has no video stream")
-        frames = []
-        for index, frame in enumerate(container.decode(video[0])):
-            if end is not None and index >= end:
-                break
-            if index >= start:
-                frames.append(frame.to_ndarray(format="rgb24"))
-    if not frames:
-        raise ValueError(f"{path} has no frames in [{start}, {end})")
-    return np.stack(frames)
-
-def read_av_improved(
-    path: str,
-    start: int = 0,
-    end: Optional[int] = None,
-    fps: float = 25.0,
-    target_sr: int = 16000,
-    audio_method: str = 'ffmpeg'
-) -> Tuple[Union[List, np.ndarray], np.ndarray]:
-    """
-    Read audio-video data with explicit cleanup and without memory leaks.
-    Frames come from PyAV, the default because the `dew-ml[av]` extra installs
-    it and its wheels import as shipped. Audio comes from FFmpeg/moviepy
-    extraction.
-
-    Args:
-        path: Path to the video file.
-        start: Start frame index.
-        end: End frame index (or None to read until the end).
-        fps: Video frames per second (used for audio timing).
-        target_sr: Target audio sample rate.
-        audio_method: Method to extract audio ('ffmpeg' or 'moviepy').
-
-    Returns:
-        Tuple of (audio_data, video_frames) where video_frames is a numpy array.
-    """
-    # Calculate time information for audio extraction
-    start_time = start / fps if start > 0 else 0
-    duration = None
-    if end is not None:
-        duration = (end - start) / fps
-
-    # The requested frame window; end=None means "to the end".
-    video = _decode_frame_window_pyav(path, start, end)
-
-    # Get audio data using our custom audio utilities
-    audio, _ = read_audio(
-        path,
-        start_time=start_time,
-        duration=duration,
-        target_sr=target_sr,
-        method=audio_method
-    )
-
-    # Convert audio to list for API compatibility with original read_av
-    audio_list = list(audio)
-
-    return audio_list, video
-
-def read_av_moviepy(
-    video_path: str,
-    start_idx: Optional[int] = None,
-    end_idx: Optional[int] = None,
-    target_fps: float = 25.0,
-    target_sr: int = 16000,
-):
-    """
-    Read audio-video data using moviepy.
-    
-    Args:
-        video_path: Path to the video file.
-        start_idx: Start frame index (optional).
-        end_idx: End frame index (optional).
-        target_sr: Target sample rate for the audio.
-        
-    Returns:
-        Tuple of (audio_data, video_frames) where video_frames is a numpy array.
-    """
-    # Use moviepy to read audio and video
-    from moviepy import VideoFileClip
-    
-    video = VideoFileClip(video_path).with_fps(target_fps)
-    
-    # Convert frame indexes to time
-    start_time = start_idx / target_fps if start_idx is not None else 0
-    end_time = end_idx / target_fps if end_idx is not None else None
-    video = video.subclipped(start_time, end_time)
-    
-    # Extract audio
-    audio = video.audio.with_fps(target_sr)
-    audio_data = audio.to_soundarray()
-    if audio_data.ndim > 1 and audio_data.shape[1] > 1:
-        audio_data = np.mean(audio_data, axis=1)
-        
-    # Extract video frames
-    video_frames = []
-    for frame in video.iter_frames(fps=target_fps, dtype='uint8'):
-        video_frames.append(frame)
-    video_frames = np.array(video_frames)
-    video.close()
-    return audio_data, video_frames
-def read_av_random_clip_moviepy(
-    video_path: str,
-    num_frames: int = 16,
-    audio_frames_per_video_frame: int = 1,
-    audio_frame_padding: int = 0,
-    target_sr: int = 16000,
-    target_fps: float = 25.0,
-    random_seed: Optional[int] = None,
-):
-    """
-    Read a random clip of audio and video frames.
-    Works by first selecting a random appropriate start frame, then reading the specified number of frames (1, N, H, W, C).
-    It then selects the audio clip corresponding to the video frames + some extra padding frames on either side. This is 
-    of shape (1, P + N + P, K) where P is the padding, N is the number of video frames, and K is the audio data shape per frame.
-    if audio_frames_per_video_frame > 1, It then also creates a tensor of shape (1, N, F, K) where F = audio_frames_per_video_frame.
-    Otherwise (1, N, 1, K) is returned in the case of audio_frames_per_video_frame = 1.
-    
-    The final audio and video tensors are returned.
-    Args:
-        video_path: Path to the video file.
-        num_frames: Number of video frames to read.
-        audio_frames_per_video_frame: Number of audio frames per video frame.
-        audio_frame_padding: Padding for audio frames.
-        target_sr: Target sample rate for the audio.
-        target_fps: Target frames per second for the video.
-        random_seed: Random seed for reproducibility (optional).
-        
-    Returns:
-        Tuple of (frame_wise_audio, full_padded_audio, video_frames) where video_frames is a numpy array.
+    Frames are sampled at `fps` and come back as uint8 `[num_frames, H, W, 3]`
+    RGB. The audio is decoded mono at `sample_rate` and cut into one row per
+    video frame, float32 in [-1, 1] of shape `[num_frames + 2 * audio_padding,
+    sample_rate / fps]`, so row `audio_padding + i` is the sound under frame
+    `i`; the rate therefore has to be a whole number of samples per frame.
     """
     from moviepy import VideoFileClip
-    rng = np.random.default_rng(random_seed)
-    # Load the video
-    video = VideoFileClip(video_path).with_fps(target_fps)
-    original_duration = video.duration
-    if original_duration is None:
-        raise ValueError(f"{video_path} reports no duration, so no clip can be cut from it")
-    total_frames = int(original_duration * target_fps)
-    
-    # Calculate effective padding needed based on audio segmentation
-    effective_padding = max(audio_frame_padding, (audio_frames_per_video_frame) // 2)
 
-    # Make sure we have enough frames
-    if total_frames < num_frames + 2 * effective_padding:
-        raise ValueError(f"Video has only {total_frames} frames, but {num_frames + 2 * effective_padding} were requested (including effective padding)")
-
-    # Select a random start frame that allows for padding on both sides
-    start_idx = choose_clip_start(total_frames, num_frames, effective_padding, rng)
-    end_idx = start_idx + num_frames
-    
-    # Convert to time
-    video_start_time = start_idx / target_fps
-    video_end_time = end_idx / target_fps
-        
-    # Extract video frames
-    main_clip : VideoFileClip = video.subclipped(video_start_time, video_end_time)
-    # Replace the video frame extraction with:
-    frame_count = 0
-    video_frames = []
-    for frame in video.iter_frames(fps=target_fps, dtype='uint8'):
-        if frame_count >= start_idx and frame_count < start_idx + num_frames:
-            video_frames.append(frame)
-        frame_count += 1
-        if len(video_frames) == num_frames:
-            break
-        
-    # Convert to numpy array
-    video_frames = np.array(video_frames)
-    
-    audio_start_time = (start_idx - effective_padding) / target_fps
-    audio_end_time = (end_idx + effective_padding) / target_fps
-    num_audio_frames = num_frames + 2 * effective_padding
-    audio_duration = audio_end_time - audio_start_time
-    # Ensure we don't go out of bounds
-    if audio_start_time < 0 or audio_end_time > original_duration:
-        raise ValueError(f"Audio start time {audio_start_time} or end time {audio_end_time} is out of bounds for video duration {original_duration}")
-    
-    # Extract the subclip
-    clip = video.subclipped(audio_start_time, audio_end_time)
-    if clip.audio is None:
-        raise ValueError(f"{video_path} has no audio track")
-    audio_data = clip.audio.to_soundarray(fps=target_sr)
-    # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
-    num_audio_samples_required = int(round(audio_duration * target_sr))
-    if len(audio_data) < num_audio_samples_required:
-        raise ValueError(f"Audio data length {len(audio_data)} is less than required {num_audio_samples_required}")
-    audio_data = audio_data[:num_audio_samples_required]
-    # Convert to mono if stereo
-    if audio_data.ndim > 1 and audio_data.shape[1] > 1:
-        audio_data = np.mean(audio_data, axis=1)
-        
-    # Close the clips
-    clip.close()
-    main_clip.close()
-    video.close()
-    
-    # Reshape audio data
-    audio_data = np.array(audio_data)   # This is just 1D
-    
-    # Calculate dimensions for audio
-    audio_data_per_frame = int(round(target_sr / target_fps))
-    # print(f"Audio {audio_duration * target_sr}->{num_audio_samples_required} data len {audio_data.shape},  shape: {num_audio_frames}, {audio_data_per_frame}")
-    audio_data = audio_data.reshape(num_audio_frames, audio_data_per_frame)
-    
-    # Create frame-wise audio
-    if audio_frames_per_video_frame > 1:
-        raise NotImplementedError("Frame-wise audio extraction is not implemented yet.")
-    else:
-        # Extract the central part (for effective frames) and reshape to (1, N, 1, K)
-        start_idx = effective_padding
-        end_idx = start_idx + num_frames
-        central_audio = audio_data[start_idx:end_idx]
-        frame_wise_audio = central_audio.reshape(1, num_frames, 1, audio_data_per_frame)
-        
-    return frame_wise_audio, audio_data, video_frames
-
-
-def read_av_random_clip_alt(
-    video_path: str,
-    num_frames: int = 16,
-    audio_frames_per_video_frame: int = 1,
-    audio_frame_padding: int = 0,
-    target_sr: int = 16000,
-    target_fps: float = 25.0,
-    random_seed: Optional[int] = None,
-):
-    """
-    Read a random clip of audio and video frames.
-    Works by first selecting a random appropriate start frame, then reading the specified number of frames (1, N, H, W, C).
-    It then selects the audio clip corresponding to the video frames + some extra padding frames on either side. This is 
-    of shape (1, P + N + P, K) where P is the padding, N is the number of video frames, and K is the audio data shape per frame.
-    if audio_frames_per_video_frame > 1, It then also creates a tensor of shape (1, N, F, K) where F = audio_frames_per_video_frame.
-    Otherwise (1, N, 1, K) is returned in the case of audio_frames_per_video_frame = 1.
-    
-    The final audio and video tensors are returned.
-    Args:
-        video_path: Path to the video file.
-        num_frames: Number of video frames to read.
-        audio_frames_per_video_frame: Number of audio frames per video frame.
-        audio_frame_padding: Padding for audio frames.
-        target_sr: Target sample rate for the audio.
-        target_fps: Target frames per second for the video.
-        random_seed: Random seed for reproducibility (optional).
-        
-    Returns:
-        Tuple of (frame_wise_audio, full_padded_audio, video_frames) where video_frames is a numpy array.
-    """
-    from moviepy import VideoFileClip, AudioFileClip
-    from video_reader import PyVideoReader
-    rng = np.random.default_rng(random_seed)
-    # Load the video
-    vr = PyVideoReader(video_path)
-    info = vr.get_info()
-    total_frames = int(info['frame_count'])
-    
-    # Calculate effective padding needed based on audio segmentation
-    effective_padding = max(audio_frame_padding, (audio_frames_per_video_frame) // 2)
-
-    # Make sure we have enough frames
-    if total_frames < num_frames + 2 * effective_padding:
-        raise ValueError(f"Video has only {total_frames} frames, but {num_frames + 2 * effective_padding} were requested (including effective padding)")
-
-    # Select a random start frame that allows for padding on both sides
-    start_idx = choose_clip_start(total_frames, num_frames, effective_padding, rng)
-    end_idx = start_idx + num_frames
-    
-    video_frames = vr.decode(start_idx, end_idx)
-    
-    audio_start_time = (start_idx - effective_padding) / target_fps
-    audio_end_time = (end_idx + effective_padding) / target_fps
-    num_audio_frames = num_frames + 2 * effective_padding
-    audio_duration = audio_end_time - audio_start_time
-    
-    assert audio_duration > 0, f"Audio duration {audio_duration} is not positive"
-    assert audio_start_time >= 0, f"Audio start time {audio_start_time} is negative"
-    
-    # Extract the subclip
-    track = VideoFileClip(video_path).audio
-    if track is None:
-        raise ValueError(f"{video_path} has no audio track")
-    audio_clip = track.subclipped(audio_start_time, audio_end_time)
-    audio_data = audio_clip.to_soundarray(fps=target_sr)
-    # Make sure len(audio_data) == (num_frames + 2 * effective_padding) * target_sr
-    num_audio_samples_required = int(round(audio_duration * target_sr))
-    
-    if len(audio_data) < num_audio_samples_required:
-        raise ValueError(f"Audio data length {len(audio_data)} is less than required {num_audio_samples_required}")
-    
-    audio_data = audio_data[:num_audio_samples_required]
-    # Convert to mono if stereo
-    if audio_data.ndim > 1 and audio_data.shape[1] > 1:
-        audio_data = np.mean(audio_data, axis=1)
-        
-    # Close the clips
-    audio_clip.close()
-    
-    # Reshape audio data
-    audio_data = np.array(audio_data)   # This is just 1D
-    
-    # Calculate dimensions for audio
-    audio_data_per_frame = int(round(target_sr / target_fps))
-    # print(f"Audio {audio_duration * target_sr}->{num_audio_samples_required} data len {audio_data.shape},  shape: {num_audio_frames}, {audio_data_per_frame}")
-    audio_data = audio_data.reshape(num_audio_frames, audio_data_per_frame)
-    
-    # Create frame-wise audio
-    if audio_frames_per_video_frame > 1:
-        raise NotImplementedError("Frame-wise audio extraction is not implemented yet.")
-    else:
-        # Extract the central part (for effective frames) and reshape to (1, N, 1, K)
-        start_idx = effective_padding
-        end_idx = start_idx + num_frames
-        central_audio = audio_data[start_idx:end_idx]
-        frame_wise_audio = central_audio.reshape(1, num_frames, 1, audio_data_per_frame)
-        
-    return frame_wise_audio, audio_data, video_frames
-
-def read_av_random_clip_pyav(
-    video_path: str,
-    num_frames: int = 16,
-    audio_frames_per_video_frame: int = 1,
-    audio_frame_padding: int = 0,
-    target_sr: int = 16000,
-    target_fps: float = 25.0,
-    random_seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Decodes a random video clip and its corresponding audio from `video_path`,
-    padding audio by `audio_frame_padding` on each side in terms of video frames.
-    Uses PyAV's built-in resampler to produce mono 16-bit audio at `target_sr`.
-
-    Returns:
-      (frame_wise_audio, full_padded_audio, video_frames)
-        * frame_wise_audio: (1, num_frames, 1, audio_data_per_frame)
-        * full_padded_audio: (num_frames + 2*padding, audio_data_per_frame)
-        * video_frames: (num_frames, H, W, 3)
-    """
-    from video_reader import PyVideoReader
-    import av
-
-    rng = np.random.default_rng(random_seed)
-
-    # --- 1) Determine which video frames to read ---
-    vr = PyVideoReader(video_path)
-    total_frames = int(vr.get_info()["frame_count"])
-    eff_pad = max(audio_frame_padding, audio_frames_per_video_frame // 2)
-    needed_frames = num_frames + 2 * eff_pad
-    if total_frames < needed_frames:
+    samples_per_frame = sample_rate / fps
+    if not samples_per_frame.is_integer():
         raise ValueError(
-            f"Video has only {total_frames} frames but needs {needed_frames} (with padding)."
-        )
+            f"{sample_rate} Hz at {fps} fps is {samples_per_frame} audio samples a "
+            "frame, and a row of audio per frame needs a whole number")
+    samples_per_frame = int(samples_per_frame)
+    padded_frames = num_frames + 2 * audio_padding
 
-    start_idx = choose_clip_start(total_frames, num_frames, eff_pad, rng)
-    end_idx = start_idx + num_frames
+    # The audio is not opened here: a file without a track fails in
+    # audio_window with ffmpeg's own words for it.
+    with VideoFileClip(path, audio=False) as video:
+        if video.duration is None:
+            raise ValueError(f"{path} reports no duration, so no clip can be cut from it")
+        total_frames = int(video.duration * fps)
+        if total_frames < padded_frames:
+            raise ValueError(
+                f"{path} has {total_frames} frames at {fps} fps and a clip of "
+                f"{num_frames} with {audio_padding} of padding needs {padded_frames}")
+        start = choose_clip_start(total_frames, num_frames, audio_padding,
+                                  np.random.default_rng(seed))
+        # One frame per index, asked for by its own time: the reader seeks
+        # to the first and steps to the rest, where a subclip's iterator
+        # enumerates times from a float duration and can come up one short.
+        frames = np.stack([video.get_frame((start + index) / fps) for index in range(num_frames)])
 
-    # --- 2) Decode the chosen video frames ---
-    video_frames = vr.decode(start_idx, end_idx)  # shape => (num_frames, H, W, 3)
-    del vr
-
-    # --- 3) Define audio time window ---
-    audio_start_time = max(0.0, (start_idx - eff_pad) / target_fps)
-    audio_end_time = (end_idx + eff_pad) / target_fps
-    with av.open(video_path) as container:
-        if not container.streams.audio:
-            raise ValueError("No audio stream found in the file.")
-        audio_stream = container.streams.audio[0]
-
-        # --- 4) Decode all audio, resample to s16 mono @ target_sr ---
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=target_sr)
-        audio_segments = []
-        segment_times = []
-        sample_rate = audio_stream.codec_context.sample_rate
-        for packet in container.demux(audio_stream):
-            for frame in packet.decode():
-                if not isinstance(frame, av.AudioFrame) or frame.pts is None:
-                    continue
-                out = resampler.resample(frame)
-                out = [out] if not isinstance(out, list) else out
-                for oframe in out:
-                    # Extract samples from the PyAV audio frame
-                    arr = oframe.to_ndarray()   # shape: (1, samples) for mono
-                    samples = arr.flatten().astype(np.int16)
-                    start_t = float((oframe.pts or 0) * (oframe.time_base or 0))
-                    end_t = start_t + oframe.samples / oframe.sample_rate
-                    audio_segments.append(samples)
-                    segment_times.append((start_t, end_t))
-                    
-        del resampler
-    
-    if not audio_segments:
-        raise ValueError("No audio frames were decoded.")
-
-    full_audio = np.concatenate(audio_segments, axis=0)
-    seg_lens = [len(seg) for seg in audio_segments]
-    offsets = np.cumsum([0] + seg_lens)
-
-    # Helper: convert time -> sample index in full_audio
-    def time_to_sample(t):
-        if t <= segment_times[0][0]:
-            return 0
-        if t >= segment_times[-1][1]:
-            return len(full_audio)
-        for i, (st, ed) in enumerate(segment_times):
-            if st <= t < ed:
-                seg_offset = int(round((t - st) * (sample_rate or target_sr)))
-                return offsets[i] + min(seg_offset, seg_lens[i] - 1)
-        return len(full_audio)
-
-    start_sample = time_to_sample(audio_start_time)
-    end_sample = time_to_sample(audio_end_time)
-    if end_sample <= start_sample:
-        raise ValueError("No audio in the requested range.")
-
-    # Slice out the desired portion
-    sliced_audio = full_audio[start_sample:end_sample]
-
-    # --- 5) Convert to float32 in [-1,1], pad or trim to the exact length ---
-    # Overall expected sample count for the window
-    needed_samples_window = int(round((audio_end_time - audio_start_time) * target_sr))
-    if len(sliced_audio) < needed_samples_window:
-        pad = needed_samples_window - len(sliced_audio)
-        sliced_audio = np.pad(sliced_audio, (0, pad), "constant")
-    else:
-        sliced_audio = sliced_audio[:needed_samples_window]
-    # Convert to float in [-1, 1]
-    sliced_audio = sliced_audio.astype(np.float32) / 32768.0
-
-    # We ultimately need (num_frames + 2*pad) * audio_data_per_frame
-    num_audio_frames = num_frames + 2 * eff_pad
-    audio_data_per_frame = int(round(target_sr / target_fps))
-    needed_total_samples = num_audio_frames * audio_data_per_frame
-
-    # Final pad/trim to expected shape
-    if len(sliced_audio) < needed_total_samples:
-        pad = needed_total_samples - len(sliced_audio)
-        sliced_audio = np.pad(sliced_audio, (0, pad), "constant")
-    else:
-        sliced_audio = sliced_audio[:needed_total_samples]
-
-    full_padded_audio = sliced_audio.reshape(num_audio_frames, audio_data_per_frame)
-
-    # --- 6) Extract the clip's central audio & reshape for per-frame usage ---
-    if audio_frames_per_video_frame > 1:
-        raise NotImplementedError("Multiple audio frames per video frame not supported.")
-    center = full_padded_audio[eff_pad:eff_pad + num_frames]
-    frame_wise_audio = center.reshape(1, num_frames, 1, audio_data_per_frame)
-
-    return frame_wise_audio, full_padded_audio, video_frames
-
-# Create a registry of all random clip readers for easier function selection
-CLIP_READERS = {
-    'moviepy': read_av_random_clip_moviepy,
-    'alt': read_av_random_clip_alt,
-    'pyav': read_av_random_clip_pyav
-}
-
-def read_av_random_clip(
-    path: str,
-    num_frames: int = 16,
-    audio_frames_per_video_frame: int = 1,
-    audio_frame_padding: int = 0,
-    target_sr: int = 16000,
-    target_fps: float = 25.0,
-    random_seed: Optional[int] = None,
-    method: str = 'moviepy'
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Read a random clip of audio and video frames using specified method.
-    Args:
-        path (str): Path to the media file.
-        num_frames (int): Number of video frames to read.
-        audio_frames_per_video_frame (int): Number of audio frames per video frame.
-        audio_frame_padding (int): Padding for audio frames.
-        target_sr (int): Target sample rate for audio.
-        target_fps (float): Target frames per second for video.
-        random_seed (Optional[int]): Seed for random number generator.
-        method (str): Method to use for reading the clip.
-            Options: 'moviepy', 'alt', 'pyav'. 'moviepy' is the default
-            because it reads from the wheels the `av` extra installs; 'alt'
-            and 'pyav' decode their frames with `video-reader-rs`, which the
-            extra does not install (see `read_video_rsreader`).
-    Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray]: Tuple of (frame_wise_audio, full_padded_audio, video_frames).
-            - frame_wise_audio: Shape (1, num_frames, 1, audio_data_per_frame)
-            - full_padded_audio: Shape (num_frames + 2*padding, audio_data_per_frame)
-            - video_frames: Shape (num_frames, H, W, 3)
-    """
-
-    if method not in CLIP_READERS:
-        raise ValueError(f"Unknown method: {method}. Available methods: {list(CLIP_READERS.keys())}")
-
-    return CLIP_READERS[method](
-        path,
-        num_frames=num_frames,
-        audio_frames_per_video_frame=audio_frames_per_video_frame,
-        audio_frame_padding=audio_frame_padding,
-        target_sr=target_sr,
-        target_fps=target_fps,
-        random_seed=random_seed
-    )
+    samples = audio_window(path, (start - audio_padding) / fps, padded_frames / fps, sample_rate)
+    needed = padded_frames * samples_per_frame
+    if len(samples) < needed:
+        raise ValueError(
+            f"{path} gave {len(samples)} audio samples where the clip needs {needed}")
+    return frames, samples[:needed].reshape(padded_frames, samples_per_frame)

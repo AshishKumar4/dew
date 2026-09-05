@@ -1,38 +1,32 @@
 # Language models
 
-An autoregressive language model is another objective on the same trainer. The mesh, the sharding, the EMA, the checkpoints and the logging are the ones diffusion and JEPA runs use; what is different is the data (packed token ids instead of images), the loss (cross entropy against the next token) and the validation artifact (text the model wrote).
+An autoregressive language model is another objective on the same trainer. The mesh, the sharding, the EMA, the checkpoints and the logging are the ones diffusion and JEPA runs use; what differs is the data (token ids instead of images), the loss (cross entropy against the next token) and the validation artifact (text the model wrote).
 
 ## From text to batches
 
-`tools/tokenize_text.py` turns a file or a directory of files into three files:
+`tools/tokenize_text.py` turns a file or a directory of files into a token directory:
 
 ```bash
 python tools/tokenize_text.py --input data/shakespeare.txt \
     --out data/shakespeare-byte --tokenizer byte --val-fraction 0.01
 ```
 
-- `train.bin` and `val.bin` are flat arrays of token ids in the smallest unsigned dtype that holds the vocabulary, `uint8` up to 256 ids, `uint16` up to 65536 and `uint32` beyond, with no separators or padding.
-- `meta.json` records the `tokenizer`, its `vocab_size`, the `dtype` of the id arrays and the `train_tokens` / `val_tokens` counts. The recipe reads the vocabulary from here, so the model is always built for the ids on disk.
+- `train.bin` and `val.bin` are flat arrays of token ids in the smallest unsigned dtype that holds the vocabulary (`uint8` up to 256 ids, `uint16` up to 65536, `uint32` beyond), with no separators or padding.
+- `meta.json` records the `tokenizer`, its `vocab_size`, the `dtype` of the arrays and the token counts. The recipe reads the vocabulary from here, so the model is always built for the ids on disk.
 
-`--tokenizer` is either `byte`, which is `dew.data.ByteTokenizer` over raw UTF-8 bytes with a vocabulary of 256, or the name of a HuggingFace tokenizer, which `dew.data.HFTokenizer` loads through `transformers.AutoTokenizer`. Both expose `encode(str) -> list[int]` and `decode(ids) -> str`, and nothing downstream needs anything else from them.
+`--tokenizer` is `byte` (`dew.data.ByteTokenizer`, raw UTF-8 bytes, vocabulary 256) or the name of a Hugging Face tokenizer (`dew.data.HFTokenizer`). Both have `encode(str) -> list[int]` and `decode(ids) -> str`.
 
-`dew.data.TokenFileSource(path, seq_len)` is a random-access view over a memory-mapped `.bin`: record `i` is `tokens[i * seq_len : i * seq_len + seq_len + 1]`, so the records tile the file and the last token of one is the first of the next. `dew.data.TokenWindows(path, seq_len).load(batch=...)` wraps that source in the same Grain pipeline the image specs use (a shuffled, process-sharded training stream and a canonical validation pass) and yields batches of
-
-```text
-{"text": int32[B, seq_len + 1]}
-```
-
-The record is one id longer than the context on purpose. The inputs are `text[:, :-1]` and the targets are `text[:, 1:]`, so a batch carries its own labels and nothing has to be shifted twice.
+`TokenWindows(path, seq_len).load(batch=...)` reads windows of `seq_len + 1` ids off the memory-mapped file, so a batch is `{"text": int32[B, seq_len + 1]}` and carries its own labels: inputs are `text[:, :-1]`, targets `text[:, 1:]`.
 
 ## Packed documents
 
-A flat stream has no document boundaries, so a fixed window can straddle two unrelated texts: attention runs across the seam and RoPE never restarts. `--pack` closes every document (input file) with the tokenizer's eos id and records that id in `meta.json` as `eos_id`:
+A flat stream has no document boundaries, so a fixed window can straddle two unrelated texts. `--pack` closes every input file with the tokenizer's eos id and records it in `meta.json`:
 
 ```bash
 python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --tokenizer byte --pack
 ```
 
-`data:packed-tokens` selects `dew.data.PackedTokens`, which is grain's `Dataset` API rather than its `DataLoader`, because packing is the reason grain gives for switching. `dew.data.TokenDocumentSource` reads a record as one document, documents longer than the window are cut into consecutive pieces first (grain's packer refuses an over-long element), and `grain.experimental.FirstFitPackIterDataset` fills windows of `seq_len + 1` with whole documents. A batch is then
+`PackedTokens` fills each window with whole documents (grain's first-fit packer; documents longer than the window are cut into consecutive pieces first) and yields
 
 ```text
 {"text": int32[B, seq_len + 1],
@@ -40,63 +34,61 @@ python tools/tokenize_text.py --input data/corpus --out data/corpus-byte --token
  "text_positions": int32[B, seq_len + 1]}     # position inside that document
 ```
 
-Three things read those two arrays. The backbone takes `positions` and `segment_ids` as call arguments: RoPE rotates by the position inside the document, and the attention mask is causal and block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding. And the kernel changes: cuDNN has no mask argument, so jax converts a bool mask into an additive bias of `-2**41` in the compute dtype (`combine_bias_and_mask`) and refuses odd sequence lengths in training once a bias is present, while the xla kernel takes the mask itself on every backend with the same fp32 softmax. A segment-masked batch therefore runs on xla. Passing neither argument leaves every unpacked run bit-identical.
+The backbone takes `positions` and `segment_ids`: RoPE rotates by the position inside the document and the attention mask is causal and block-diagonal, so no query reaches another document or the padding. The objective drops the one target a packed row must not train on, the last token of a document predicting the first of the next, along with padding.
 
-That kernel costs, one NVIDIA GeForce RTX 4080 (16 GiB, driver 595.84), 3 layers of GPT-2 small's width in bf16, 20 steps, one process per row:
+A segment mask costs the fused kernel. cuDNN takes no mask argument, so a packed batch runs on the XLA kernel, which materialises the fp32 attention logits per layer. On an RTX 4080 with three layers of GPT-2 small's width in bf16:
 
 | shape | batch | kernel | ms/step | peak GiB |
 |---|---|---|---:|---:|
 | 16 x 512 | fixed window | cuDNN | 75.8 | 4.99 |
 | 16 x 512 | packed, 4 documents | xla | 83.6 | 5.80 |
-| 16 x 512 | fixed window, xla pinned | xla | 83.5 | 5.80 |
 | 4 x 2048 | fixed window | cuDNN | 78.5 | 5.00 |
 | 4 x 2048 | packed, 4 documents | xla | 108.2 | 8.34 |
-
-The third row is where the cost is. A fixed window on the xla kernel costs what a packed batch costs on it, so the mask is free and the whole difference is the fused kernel. The xla path materializes the fp32 `[B, N, T, S]` logits per layer and keeps them for the backward pass, which is why the gap grows with the sequence: 0.81 GiB at 512, 3.34 GiB at 2048. Keeping cuDNN for a packed batch means training against the bias it builds from the mask, so it needs a parity check against xla on the card in question before it can be the default.
 
 ```bash
 python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20
 python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --packed-documents 4
-python tools/benchmark_step.py --preset small --architectures causal_transformer --steps 20 --attention-impl xla
-
-LONG='{"architecture": "causal_transformer", "config": {"vocab_size": 50304,
-  "emb_features": 768, "num_layers": 3, "num_heads": 12, "mlp_features": 3072,
-  "max_seq_len": 2048}, "batch_size": 4, "seq_len": 2048, "dtype": "bfloat16"}'
-python tools/benchmark_step.py --steps 20 --cases "[$LONG]"
-python tools/benchmark_step.py --steps 20 --cases "[$LONG]" --packed-documents 4
 ```
 
-Sharding happens before packing (each process slices the documents), and the iterator's position saves and restores with the checkpoint like the fixed-window one. `train_len` counts window-sized chunks, which is the windows a pass yields at most: every window first-fit emits holds at least one chunk, and which chunks share a window depends on the shuffle, so the exact number is not known until the pass has run. A recipe divides it by the batch size for `steps_per_epoch`.
+Sharding happens before packing (each process slices the documents), and the packed iterator's position saves and restores with the checkpoint like the fixed-window one.
 
 ## The objective
-
-`dew.objectives.lm.LMObjective(model, seq_len, vocab_size=..., pad_id=None, head_chunks=4, samples=None)` is the whole learning problem:
-
-- `loss` reads the model's final hidden states, multiplies them by its head matrix a vocabulary slice at a time, and returns the mean cross entropy of the targets in float32. Float32 is deliberate: a bfloat16 logsumexp over a large vocabulary loses enough precision to move the loss and the gradient with it. The slicing is why the full `[tokens, vocab]` logits tensor is never built, which at the small benchmark preset is 1.57 GiB read four times over; `head_chunks` is how many slices, and four is the measured best on one RTX 4080 at vocabulary 50,304 ([research](../research/lm-head.md)). The scalar comes with `ce` and `token_accuracy`, which the trainer logs under `train/`; the perplexity is a validation metric over the whole pass, from the `TokenScores` `evaluate` returns. The accuracy is the same top-1 the whole row would have given, tie for tie, taken as a running best across the slices.
-- The model has to expose the seam the loss reads: `hidden_states(tokens, train=..., positions=..., segment_ids=...)` for the states before the head, `head_weight(params)` for the `[width, vocab]` matrix the forward multiplies them by, and `final_logit_softcap` and `precision` so the loss applies what the forward would have. `CausalTransformer` does; a model with a bias on its head does not fit, because then the projection is not a matmul.
-- `pad_id` excludes padded targets from the mean. It defaults to `None` because a fixed-window token file has no padding, and masking an id that is really in the data would drop those tokens from the average. A packed batch needs no pad id: `text_segment_ids` says which slots are padding, and those targets are excluded whatever the id.
-- `ema` averages the whole parameter tree at `--ema-decay`, and the EMA copy is what validation reads (`step.ema` inside `evaluate`).
-- `inputs` is `InputSpec(Field("text", (seq_len + 1,)))`, where `InputSpec` and `Field` come from `dew`, and the `Trainer` takes the init batch from it, with int32 ids, so a run needs nothing diffusion-shaped to describe a text batch.
-
-## Generation
-
-`dew.sampling.generate(model, params, prompt, max_new_tokens, *, key, temperature=1.0, top_k=None)` prefills the KV cache on the prompt and then runs one `lax.scan` over the decode steps, returning `int32[B, P + max_new_tokens]`. The prompt is `int32[B, P]`, `temperature=0` is greedy, and `top_k` truncates the distribution before sampling. `params` is the variables dict the trainer holds, so the EMA copy can be sampled from directly.
-
-The objective generates during validation when it is given a `samples` dict:
 
 ```python
 from dew.objectives.lm import LMObjective, Samples
 
-objective = LMObjective(model, 256, samples=Samples(
+objective = LMObjective(model, seq_len=256, samples=Samples(
     prompt=tokenizer.encode("To be, or not to be"),
     max_new_tokens=128, temperature=0.8, decode=tokenizer.decode))
 ```
 
-The prompt in `samples` is one sequence of ids or several of the same length, which the objective batches into the `[B, P]` that `generate` takes. The sampling key is folded with the step so each validation writes different text, and `decode` is what turns the ids back into the string that gets logged.
+`loss` multiplies the final hidden states by the head matrix one vocabulary slice at a time and returns the mean cross entropy in float32, so the full `[tokens, vocab]` logits tensor is never built; `head_chunks` (default 4, the measured best at vocabulary 50k on an RTX 4080) is how many slices. Float32 is deliberate: a bfloat16 logsumexp over a large vocabulary moves the loss and the gradient with it. The model exposes `hidden_states(...)` and `head_weight(params)` for this; `CausalTransformer` does.
+
+`pad_id` excludes padded targets from the mean and defaults to `None`, because a fixed-window token file has no padding. A packed batch needs no pad id; its segment ids say which slots are padding.
+
+`mtp_weight` turns on DeepSeek's multi-token-prediction term for a model built with `num_nextn_predict_layers` above zero (arXiv 2412.19437, section 2.2). Depth d of the model pairs the previous depth's state at each position with the embedding of the token d further on and scores the token after that through the shared head; the training loss adds `mtp_weight` times the mean over the depths of each depth's cross entropy, normalised by the same target count as the main term and with a packed batch's document boundaries weighted out the same way. `train/mtp_ce` reports the mean depth cross entropy. Unset, the loss is the main cross entropy alone and the depths get no gradient.
+
+`ema` averages the whole parameter tree at `ema_decay`, and the EMA copy is what validation reads. At validation the objective returns `TokenScores` for `metrics.perplexity()`, which reduces to the exponential of the target-weighted mean over the whole pass, and `TextSamples` when `samples` are configured.
+
+## Generation
+
+```python
+import jax, jax.numpy as jnp
+from dew import models
+from dew.sampling import generate
+
+lm = models.CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, max_seq_len=16)
+variables = lm.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+tokens = generate(lm, variables, jnp.array([list(b"ROME")]), max_new_tokens=8,
+                  key=jax.random.key(1), temperature=0.8, top_k=40)
+assert tokens.shape == (1, 12)
+```
+
+`generate` prefills the KV cache on the prompt and runs one `lax.scan` over the decode steps, returning `int32[B, P + max_new_tokens]`. `temperature=0` is greedy and `top_k` truncates the distribution before sampling. The second argument is the variables dict the trainer holds, so the EMA copy samples directly.
 
 ## Pretrained checkpoints
 
-`dew.interop.hf_decoders` loads a Hugging Face decoder into the same `CausalTransformer` a from-scratch run trains, because the backbone's parameter names are the HF ones and its config surface covers what these families vary:
+`dew.interop.hf_decoders` loads a Hugging Face decoder into the same `CausalTransformer` a from-scratch run trains:
 
 ```python
 # runs elsewhere: downloads a Qwen checkpoint from the Hub
@@ -104,45 +96,46 @@ from dew.interop import load_pretrained_decoder, save_pretrained_decoder
 
 model, variables, config = load_pretrained_decoder("Qwen/Qwen3-0.6B")
 logits = model.apply(variables, tokens)              # [B, S, 151936] fp32
-save_pretrained_decoder(model, variables, "out/qwen3-tuned",
-                        tokenizer_name="Qwen/Qwen3-0.6B")
+save_pretrained_decoder(model, variables, "out/qwen3-tuned", tokenizer_name="Qwen/Qwen3-0.6B")
 ```
 
-- `load_pretrained_decoder(name_or_dir, *, dtype='bfloat16', attention_impl='auto', max_seq_len=None, revision=None)` takes a hub repo id or a local directory in the HF layout. It downloads only `*.safetensors` and `*.json`, reads the shards as float32 without torch (`safetensors.numpy` cannot read bfloat16, so those leaves are widened here), and builds the model through `models.build` with the same `with_precision` fields a recipe uses, so `dtype` is the compute dtype and the parameters stay float32. `max_seq_len` defaults to the config's context clamped to 8192, since the KV cache is allocated at that length whether decoding uses it or not. The third return is the dew config the model was built from, which is what a run logs.
-- `translate_config(hf_config)` is the field map on its own, and `translate_weights(tensors, config)` the key map: `.weight` of a Linear becomes a transposed `.kernel`, a norm's `.weight` becomes `.scale`, `embed_tokens.weight` becomes `embed_tokens.embedding`, and a tied `lm_head.weight` is dropped after checking it really is the copy of the embedding it claims to be.
-- `save_pretrained_decoder(model, variables, directory, *, tokenizer_name=None)` writes `config.json`, `model.safetensors` and `generation_config.json` back in HF vocabulary: `gemma3_text` when the sandwich norms are on, `qwen3` when the q/k norms are, `llama` otherwise. transformers loads the result, and `load_pretrained_decoder` on it returns bitwise-equal parameters.
+`load_pretrained_decoder(name_or_dir, *, dtype="bfloat16", attention_impl="auto", max_seq_len=None, revision=None)` takes a hub repo id or a local directory. It downloads the safetensors and JSON only, reads the weights without torch, and builds the model through `models.build`, so `dtype` is the compute dtype and the parameters stay float32. The third return is the dew config the model was built from, which is what a run logs.
 
-What loads today is `llama`, `qwen3` and `gemma3_text`. Of Gemma 3 that is `gemma-3-1b-pt`: the 4B, 12B and 27B are multimodal `gemma3` checkpoints, refused both for the vision tower nothing here runs and for the linear RoPE factor of 8 in their `text_config`. `qwen2` is refused by name: it biases q, k and v and leaves `o_proj` bias-free, and the backbone has one `attention_bias` flag for all four projections, so its checkpoints cannot load unchanged. Gemma needs four things beyond a Qwen: `sandwich_norms` for the norms on each sublayer's output (HF calls them `post_attention_layernorm` and `post_feedforward_layernorm`, which is why the rename exists), `scale_offset` for its `(1 + w)` norm scales, `embedding_scale` for the `sqrt(hidden)` on the embeddings, and `attention_scale` for `query_pre_attn_scalar ** -0.5` in place of `head_dim ** -0.5`.
+`translate_config` and `translate_weights` are the two halves on their own: a Linear's `.weight` becomes a transposed `.kernel`, a norm's `.weight` becomes `.scale`, and a tied `lm_head.weight` is dropped after a check that it is the embedding's copy. `save_pretrained_decoder` writes `config.json`, `model.safetensors` and `generation_config.json` back in the family's vocabulary, and transformers loads the result.
 
-A config field that changes what the model computes and has no counterpart here is a `ValueError` naming the field, not a silent skip: `attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation that is neither silu nor tanh-gelu, and any `rope_scaling` other than plain rope. Llama 3's `llama3` scaling is refused, and so is the `linear` factor of 8 that Gemma 3 carries in the `text_config` of its 4B, 12B and 27B; `gemma-3-1b-pt` names no scaling at all, which is why it loads. A scaling spelled the old way, `{"type": "yarn", ...}` instead of `{"rope_type": "yarn", ...}`, is read as the scaling it is, as transformers reads it. What does not load at all yet, for want of the layers rather than the names: Qwen3.5's GatedDeltaNet mixer, and Gemma 4's per-layer embeddings and cross-layer KV sharing.
+| Family | `model_type` | Loads |
+|---|---|---|
+| Llama 3 | `llama` | dense GQA decoders |
+| Qwen 3 | `qwen3` | dense; q/k norms, sliding layers |
+| Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and are refused by name |
+| Gemma 4 | `gemma4_text` | the text decoder: per-layer inputs, KV sharing, partial rotary, logit softcap |
+| Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and are refused by name |
+| DeepSeek V3, V3.2 | `deepseek_v3`, `deepseek_v32` | multi-head latent attention with YaRN, the V3.2 sparse indexer, the sigmoid router with grouping, scaling and the balancing bias, shared experts; `num_nextn_predict_layers` reads as 0 because the released repos ship no MTP weights |
 
-Parity is the acceptance bar for a family, not a nice-to-have. `tools/hf_reference.py` writes the fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 on CPU: 8.3e-06 max absolute difference on a random-weight Qwen3, 3.3e-06 on a random-weight Gemma3, 6.1e-06 on a random-weight Llama, and on the real Qwen3-0.6B weights the same argmax at all 48 prompt positions with 1.4e-04 max difference over the reference's top 32 logits per position. Gemma 3's own weights are gated on the Hub, so what is tested there is the translation of the real `gemma-3-1b-pt` config plus a random-weight fixture, not Google's weights.
+A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. The families still to come are in the README roadmap.
+
+Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 
 `recipes/lm/train.py --pretrained` continues training one of these:
 
 ```bash
-python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-qwen3 \
-    --tokenizer Qwen/Qwen3-0.6B
-python recipes/lm/train.py data:token-windows --data.path data/corpus-qwen3 --pretrained Qwen/Qwen3-0.6B \
-    --tokenizer Qwen/Qwen3-0.6B --sequence-length 512 --data.batch-size 4 \
+python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-qwen3 --tokenizer Qwen/Qwen3-0.6B
+python recipes/lm/train.py data:token-windows --data.path data/corpus-qwen3 --data.seq-len 512 \
+    --pretrained Qwen/Qwen3-0.6B --tokenizer Qwen/Qwen3-0.6B --trainer.batch-size 4 \
     --optim.learning-rate 1e-5
 ```
 
-The checkpoint decides every architecture field, so `--model.config` may carry `max_seq_len` and nothing else, and the token files have to come from the checkpoint's own tokenizer: a `meta.json` written with a different one stops the run instead of training the embedding table against ids that mean something else.
+The checkpoint decides every architecture field, and the token files have to come from the checkpoint's own tokenizer; a `meta.json` written with a different one stops the run.
 
 ## Running it
 
 ```bash
-python recipes/lm/train.py data:token-windows --data.path data/shakespeare-byte \
-    --sequence-length 256 --data.batch-size 32 --trainer.epochs 10 \
+python recipes/lm/train.py data:token-windows --data.path data/shakespeare-byte --data.seq-len 256 \
+    --trainer.batch-size 32 --trainer.epochs 10 \
     --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}' \
     --sample-prompt "To be, or not to be" --sample-tokens 200
 ```
 
-`--data.dataset` is the token directory, not a dataset name. `--sequence-length` is the context the model trains on; it reaches the loader as the record length and the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget that outruns the training context raises that limit to fit it. `--tokenizer` has to name the tokenizer `meta.json` was written with, otherwise the run stops rather than decoding samples with the wrong vocabulary. Everything else is the shared configuration: `--optim.*` for the solver, `--trainer.fsdp-size` and `--optim.grad-accum-steps` for scaling, `--trainer.wandb-project` to log anywhere at all.
+`--data.seq-len` is the context the model trains on; it reaches the model as its `max_seq_len`, which is also the size of the decode cache, so a `--sample-tokens` budget past the training context raises that limit to fit it. `--tokenizer` names the tokenizer `meta.json` was written with. `--balance-rate` turns on the aux-loss-free routing bias of a mixture-of-experts model, and `--mtp-weight` the multi-token-prediction term of a model with prediction depths. The rest is the shared configuration: `--optim.*` for the optimizer, `--trainer.mesh.fsdp` and `--trainer.accumulation` for scaling, `--trainer.wandb.project` to log.
 
-## What a run reports
-
-Every logging tick writes `train/loss` and, from the objective's auxiliary metrics, `train/ce`, `train/perplexity` and `train/token_accuracy`, alongside the trainer's throughput numbers.
-
-At the end of each epoch the validation loop runs the objective's validation step over `--data.val-steps-per-epoch` batches. It reports the teacher-forced cross entropy, which `dew.eval.get_perplexity_metric()` turns into `val/perplexity` (lower is better, and tracked as `best_val/perplexity`), and the generated ids, which the objective decodes into a `val/samples` table. `--trainer.best-tracker-metric` defaults to `val/perplexity` for this recipe, and it decides whether the run is published rather than which step is: the trainer compares this run against the project's best five on that metric, and a run among them pushes its newest checkpoint to the registry, with the `best` alias when it leads.
+Every logging tick writes `train/loss`, `train/ce` and `train/token_accuracy` (and `train/mtp_ce` with the term on) beside the trainer's throughput numbers. Every validation pass writes `val/perplexity` and, with a prompt configured, the generated text as a table.
