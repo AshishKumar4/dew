@@ -258,6 +258,10 @@ VARIANTS = [
     # A multi-token-prediction depth adds its projection and block beside the
     # backbone, so the declarations behind them are checked here.
     Case("causal_transformer", {**LM, "num_nextn_predict_layers": 1}, seq_len=SEQ_LEN, label="mtp"),
+    # Qwen2 biases q, k and v while o_proj stays bias-free, so the split
+    # dial's declarations are walked with the odd projection left out.
+    Case("causal_transformer", {**LM, "attention_bias": True, "o_proj_bias": False},
+         seq_len=SEQ_LEN, label="qwen2"),
 ]
 
 
