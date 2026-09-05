@@ -1,9 +1,9 @@
 """Typed configuration for a training run.
 
 One dataclass tree describes a run: what to build, what to feed it, how to
-optimize it, and how the trainer runs. Recipes parse it with tyro and hand the
-pieces to the trainer, so `to_dict()` is a full record of a run and
-`from_dict()` puts it back together.
+optimize it, and how the trainer runs. Recipes parse it with tyro, build the
+objective and the data it names, and hand both to `RunConfig.train`, so
+`to_dict()` is a full record of a run and `from_dict()` puts it back together.
 
 Model kwargs stay an opaque JSON dict. The registry already knows which
 architecture takes which fields, and mirroring them here would be a second
@@ -19,23 +19,32 @@ class does not have, or one the file lacks, raises.
 import dataclasses
 import json
 import os
+import re
 import types
 import typing
+from collections.abc import Sequence
 from typing import (TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self,
                     TypeAlias, Union)
 
+import jax
 import tyro
 
 from etils import epath
 
 import dew.data  # noqa: F401  registers the datasets a config names
-from dew.data import DatasetSpec
+import dew.io
+from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.data import Dataset, DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
+from dew.objectives.base import Metric, Objective
 from dew.registry import Registry, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.trainer import Profile
+from dew.training.optim import build_optimizer
+from dew.training.state import TrainState
+from dew.training.tracker import WandbTracker
+from dew.training.trainer import Profile, Trainer
 
 JsonDict = Annotated[
     dict[str, Any],
@@ -56,8 +65,6 @@ if TYPE_CHECKING:
     DataSpec: TypeAlias = DatasetSpec
 else:
     DataSpec = datasets.union
-
-RUN_FILE = "run.json"
 
 REGISTRIES: tuple[Registry[Any], ...] = (registry.models, registry.presets, registry.samplers, registry.datasets,
               registry.encoders, registry.metrics, registry.objectives)
@@ -161,7 +168,7 @@ class TrainerConfig:
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
 
-    def total_steps(self, data) -> int:
+    def total_steps(self, data: Dataset) -> int:
         """The run's length in steps, from `steps` or from `epochs` over `data`."""
         if self.steps is not None:
             return self.steps
@@ -173,16 +180,16 @@ class TrainerConfig:
                 "one, so give the run length as --trainer.steps")
         return self.epochs * data.steps_per_epoch
 
-    def eval_interval(self, data) -> Optional[int]:
+    def eval_interval(self, data: Dataset) -> Optional[int]:
         """Steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, data, "eval-every")
 
-    def checkpoint_interval(self, data) -> Optional[int]:
+    def checkpoint_interval(self, data: Dataset) -> Optional[int]:
         """Steps between checkpoints over `data`, or None for never."""
         return self._interval(self.checkpoint_every, data, "checkpoint-every")
 
     @staticmethod
-    def _interval(value, data, flag: str) -> Optional[int]:
+    def _interval(value, data: Dataset, flag: str) -> Optional[int]:
         if value is None or isinstance(value, int):
             return value
         if data.steps_per_epoch is None:
@@ -288,3 +295,52 @@ class RunConfig:
     def load(cls, directory: str) -> Self:
         """The config a run in `directory` was built from, as this class."""
         return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
+
+    def train(self, objective: Objective, data: Dataset, *, name: str,
+              metrics: Sequence[Metric] = (),
+              summary: Mapping[str, object] | None = None) -> TrainState:
+        """Train `objective` on `data` as this run says, which is what every
+        recipe does once it has built both.
+
+        The run lives under `name` in `trainer.checkpoint_dir`, and process
+        zero writes the record there before anything trains. A `trainer.wandb`
+        opens a tracker under the same name, with the record, `summary` (the
+        recipe's own view of the run) and the step count as its config, and
+        the checkpoint the run ends on is published to the registry under the
+        name with slashes and spaces replaced, since an artifact name allows
+        neither. Without one the run trains and checkpoints alone.
+        """
+        trainer = self.trainer
+        steps = trainer.total_steps(data)
+        print("Experiment_Name:", name)
+        tracker = None
+        if trainer.wandb is not None:
+            tracker = WandbTracker(
+                trainer.wandb.project, name, entity=trainer.wandb.entity,
+                offline=trainer.wandb.offline,
+                config={"run_config": self.to_dict(), **(summary or {}), "steps": steps})
+        checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
+        if jax.process_index() == 0:
+            self.save(checkpoints.directory)
+        state = Trainer(
+            objective, build_optimizer(self.optim, steps),
+            key=jax.random.key(trainer.seed),
+            mesh=trainer.mesh,
+            layout=trainer.layout,
+            accumulation=trainer.accumulation,
+            dynamic_scale=trainer.dynamic_scale,
+            checkpoints=checkpoints,
+            tracker=tracker,
+            profile=trainer.profile,
+        ).fit(
+            data, steps=steps,
+            log_every=trainer.log_every,
+            eval_every=trainer.eval_interval(data),
+            checkpoint_every=trainer.checkpoint_interval(data),
+            metrics=metrics,
+        )
+        if tracker is not None:
+            # fit wrote the step it ended on, so that checkpoint is the run's.
+            dew.io.publish(checkpoints.path(int(state.step)), re.sub(r"[^\w.-]", "-", name),
+                           tracker=tracker)
+        return state

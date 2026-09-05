@@ -19,6 +19,10 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 STATE_LEAVES = ("step", "params", "opt_state", "ema", "key")
 
+RUN_FILE = "run.json"
+"""The run record `RunConfig.save` writes into the run directory, beside the
+step directories, and `dew.io.publish` ships with a step."""
+
 
 def is_uri(path: str) -> bool:
     """A `<scheme>://` location, such as a gs:// bucket, which has no local form.
@@ -217,8 +221,3 @@ class Checkpoints:
         """
         if self._manager is not None:
             self._manager.wait_until_finished()
-
-    def close(self) -> None:
-        if self._manager is not None:
-            self._manager.close()
-            self._manager = None
