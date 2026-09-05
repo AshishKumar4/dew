@@ -110,8 +110,9 @@ class Mixture:
     sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
     token's selected weights by their sum, `scaling` on the routed output,
     `groups` with `groups_per_token` for DeepSeek's node limit, `group_score`
-    for how a group is scored ('top2' is V3's, 'max' is V2's), and `bias`
-    for V3's aux-loss-free balancing bias.
+    for how a group is scored ('top2' is V3's, 'max' is V2's), `bias`
+    for V3's aux-loss-free balancing bias, and `scale_inputs` for Llama 4's
+    weight on the expert input rather than its output.
 
     `expert_features` is the routed experts' width, None for the model's
     `mlp_features`; DeepSeek sizes its experts apart from its dense layers
@@ -133,6 +134,7 @@ class Mixture:
     groups_per_token: int = 1
     group_score: str = 'top2'
     bias: bool = False
+    scale_inputs: bool = False
     expert_features: Optional[int] = None
     shared_features: int = 0
 
@@ -919,6 +921,7 @@ class CausalTransformer(nn.Module):
             groups_per_token=mixture.groups_per_token,
             group_score=mixture.group_score,
             expert_bias=mixture.bias,
+            scale_inputs=mixture.scale_inputs,
             shared=shared,
             dtype=self.dtype,
             precision=self.precision)
