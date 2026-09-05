@@ -64,6 +64,9 @@ class LmRunConfig(RunConfig):
     """How far a sparse run moves each router's balancing bias against its
     load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
     with bias=True; unset leaves the bias where it is."""
+    mtp_weight: Optional[float] = None
+    """DeepSeek's lambda on the multi-token-prediction term. Needs a model
+    with num_nextn_predict_layers above zero; unset leaves the term out."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
@@ -228,6 +231,7 @@ def main(config: LmRunConfig) -> TrainState:
         samples=samples,
         pretrained=pretrained,
         balance_rate=config.balance_rate,
+        mtp_weight=config.mtp_weight,
     )
 
     name = config.trainer.name or (

@@ -11,9 +11,11 @@ grouped matmul over tokens sorted by expert (`:1500` `sparse_matmul`).
 The two routers this reproduces are `MixtralSparseMoeBlock`, which softmaxes
 over the experts, takes the top k and renormalises, and `DeepseekV3MoE`, which
 scores with a sigmoid, selects with a per-expert bias added, limits the choice
-to the best expert groups, renormalises and scales. Both are transformers
-5.16.1; `tests/test_moe.py` holds the fp32 parity numbers and
-`tools/moe_reference.py` writes the fixtures they run against.
+to the best expert groups, renormalises and scales, then adds one shared
+expert every token takes. DeepSeek V4's `DeepseekV4TopKRouter` and
+`DeepseekV4Experts` contribute the sqrt(softplus) score and the swiglu limit.
+All are transformers 5.16.1; `tests/test_moe.py` holds the fp32 parity
+numbers and `tools/moe_reference.py` writes the fixtures they run against.
 
 Parameters follow the Hugging Face layout of a sparse decoder layer, with the
 experts stacked on an expert dimension: `mlp/gate/kernel` is `[embed, exp]`,
@@ -26,6 +28,7 @@ shards.
 
 import functools
 import importlib
+from collections.abc import Callable
 from typing import Optional
 
 import jax
@@ -37,9 +40,11 @@ from flax.typing import Dtype, PrecisionLike
 from .sharding import logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
-# Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3 and V4, GLM,
-# Kimi, LLaDA2).
-SCORE_FUNCTIONS = ('softmax', 'sigmoid')
+# Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
+# LLaDA2); 'sqrtsoftplus' is DeepSeek V4's sqrt(softplus(logit))
+# (transformers activations.py, SqrtSoftplusActivation), unbounded above
+# where a sigmoid saturates.
+SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
 GROUPED_MATMULS = ('xla', 'tokamax')
 
@@ -170,6 +175,8 @@ class Router(nn.Module):
                             precision=self.precision)
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
+        if self.score_function == 'sqrtsoftplus':
+            return jnp.sqrt(jax.nn.softplus(logits))
         return jax.nn.sigmoid(logits)
 
     def group_mask(self, selection):
@@ -252,12 +259,18 @@ class ExpertMLP(nn.Module):
     The sum over a token's experts runs in fp32, because that is the dtype the
     router weights are computed in, and the result rejoins the residual stream
     in the compute dtype.
+
+    `swiglu_limit` is DeepSeek V4's clamp before the activation
+    (`modeling_deepseek_v4.py`, `DeepseekV4Experts._apply_gate`): the gate is
+    capped at the limit from above and the up projection on both sides, which
+    bounds what one expert can add. None is the plain gated MLP.
     """
     num_experts: int
     hidden_features: int
     out_features: int
     activation: str = 'swiglu'
     implementation: str = 'xla'
+    swiglu_limit: Optional[float] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -265,6 +278,10 @@ class ExpertMLP(nn.Module):
         if self.activation not in ('swiglu', 'geglu'):
             raise ValueError(
                 f"mlp must be 'swiglu' or 'geglu', got {self.activation!r}")
+        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
+            raise ValueError(
+                f"swiglu_limit caps the gate and up projections, so it is "
+                f"positive, got {self.swiglu_limit}; None leaves them unclamped")
         expert = functools.partial(
             ExpertLinear, num_experts=self.num_experts,
             implementation=self.implementation, dtype=self.dtype,
@@ -291,9 +308,12 @@ class ExpertMLP(nn.Module):
         grouped = tokens[order // top_k]
 
         gate = self.gate_proj(grouped, group_sizes)
+        up = self.up_proj(grouped, group_sizes)
+        if self.swiglu_limit is not None:
+            gate = jnp.minimum(gate, self.swiglu_limit)
+            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         gate = nn.silu(gate) if self.activation == 'swiglu' else nn.gelu(gate)
-        expert_out = self.down_proj(gate * self.up_proj(grouped, group_sizes),
-                                   group_sizes)
+        expert_out = self.down_proj(gate * up, group_sizes)
 
         per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
         combined = jnp.einsum(
@@ -310,13 +330,22 @@ class ExpertMLP(nn.Module):
     ("experts", "gate_proj"): ("exp", "embed", "mlp"),
     ("experts", "up_proj"): ("exp", "embed", "mlp"),
     ("experts", "down_proj"): ("exp", "mlp", "embed"),
+    # The shared branch is one dense gated MLP beside the experts, sharded
+    # like the dense layers' own.
+    ("shared_experts", "gate_proj"): ("embed", "mlp"),
+    ("shared_experts", "up_proj"): ("embed", "mlp"),
+    ("shared_experts", "down_proj"): ("mlp", "embed"),
 })
 class SparseMLP(nn.Module):
     """A router over `num_experts` gated MLPs, `top_k` of them per token.
 
-    Goes where `GatedMLP` goes in a decoder block and holds the two submodules
-    a Hugging Face sparse layer names, `gate` for the router and `experts` for
-    the stacked expert weights.
+    Goes where `GatedMLP` goes in a decoder block and holds the submodules a
+    Hugging Face sparse layer names: `gate` for the router, `experts` for the
+    stacked expert weights and, when `shared` is set, `shared_experts` for
+    the dense branch every token takes. `shared` is a factory taking only a
+    name, the shape of `DecoderBlock`'s slots, so the backbone hands in its
+    own `GatedMLP` at the shared width and the sum is what `DeepseekV3MoE`
+    computes: the routed output plus the shared branch of the same input.
     """
     num_experts: int
     top_k: int
@@ -329,6 +358,8 @@ class SparseMLP(nn.Module):
     expert_groups: int = 1
     groups_per_token: int = 1
     expert_bias: bool = False
+    swiglu_limit: Optional[float] = None
+    shared: Optional[Callable[..., nn.Module]] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -344,9 +375,14 @@ class SparseMLP(nn.Module):
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
-            implementation=self.implementation, dtype=self.dtype,
-            precision=self.precision, name='experts')
+            implementation=self.implementation, swiglu_limit=self.swiglu_limit,
+            dtype=self.dtype, precision=self.precision, name='experts')
+        if self.shared is not None:
+            self.shared_experts = self.shared(name='shared_experts')
 
     def __call__(self, x):
         weights, indices = self.gate(x)
-        return self.experts(x, weights, indices)
+        routed = self.experts(x, weights, indices)
+        if self.shared is None:
+            return routed
+        return routed + self.shared_experts(x)

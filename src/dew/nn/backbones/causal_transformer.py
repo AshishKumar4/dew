@@ -104,9 +104,18 @@ class Mixture:
     is what Qwen3-MoE's decoder_sparse_step means; neither makes every layer
     sparse, which is Mixtral.
 
-    The routing options are `Router`'s: `score_function` softmax or sigmoid,
-    `scaling` on the routed output, `groups` with `groups_per_token` for
-    DeepSeek's node limit, and `bias` for its aux-loss-free balancing bias.
+    The routing options are `Router`'s: `score_function` softmax, sigmoid or
+    sqrtsoftplus, `scaling` on the routed output, `groups` with
+    `groups_per_token` for DeepSeek's node limit, and `bias` for its
+    aux-loss-free balancing bias.
+
+    `expert_features` is the routed experts' width, None for the model's
+    `mlp_features`; DeepSeek sizes its experts apart from its dense layers
+    (`moe_intermediate_size` beside `intermediate_size`). `shared_features`
+    is the width of the one dense gated MLP every token takes beside the
+    routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
+    as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
+    product is the whole record of them.
     """
 
     experts: int
@@ -118,6 +127,8 @@ class Mixture:
     groups: int = 1
     groups_per_token: int = 1
     bias: bool = False
+    expert_features: Optional[int] = None
+    shared_features: int = 0
 
     def __post_init__(self):
         if self.layers is not None:
@@ -132,6 +143,14 @@ class Mixture:
                 "sparse layers, so only one of them can be set")
         if self.every is not None and self.every < 1:
             raise ValueError(f"every must be positive, got {self.every}")
+        if self.expert_features is not None and self.expert_features < 1:
+            raise ValueError(
+                f"expert_features is the routed experts' width, got "
+                f"{self.expert_features}; None takes the model's mlp_features")
+        if self.shared_features < 0:
+            raise ValueError(
+                f"shared_features is the shared branch's width, got "
+                f"{self.shared_features}; 0 is a layer without one")
 
 
 @logical_axes({
@@ -512,10 +531,12 @@ class MTPBlock(nn.Module):
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
 
-    def __call__(self, hidden, embeds, train: bool = False):
+    def __call__(self, hidden, embeds, train: bool = False,
+                 positions=None, segment_ids=None):
         fused = self.eh_proj(jnp.concatenate(
             [self.enorm(hidden), self.hnorm(embeds)], axis=-1))
-        return self.final_norm(self.block(fused, train=train))
+        return self.final_norm(self.block(
+            fused, train=train, positions=positions, segment_ids=segment_ids))
 
 
 @models("causal_transformer")
@@ -588,8 +609,10 @@ class CausalTransformer(nn.Module):
     `num_nextn_predict_layers` stacks that many multi-token-prediction
     depths after the final norm, each an `MTPBlock` with the model-level
     mixer and a dense feed-forward; 0 is a plain decoder and leaves the
-    tree unchanged. A depth predicts one token further out, so depth d
-    scores what follows position p + d.
+    tree unchanged. Depth d pairs the previous depth's state at position p
+    with the embedding of the token at p + d and scores what follows p + d
+    (arXiv 2412.19437, section 2.2), so each depth is one position shorter
+    than the last.
     """
     vocab_size: int
     emb_features: int = 512
@@ -840,11 +863,24 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
         mixture = self.mixture
+        # The shared branch is the dense feed-forward at the mixture's shared
+        # width, handed to the sparse layer as a factory the way the block
+        # takes its own slots.
+        shared = None if mixture is None or not mixture.shared_features else (
+            functools.partial(
+                GatedMLP,
+                hidden_features=mixture.shared_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                dtype=self.dtype,
+                precision=self.precision))
         routed = None if mixture is None else functools.partial(
             SparseMLP,
             num_experts=mixture.experts,
             top_k=mixture.top_k,
-            hidden_features=self.hidden_features,
+            hidden_features=(self.hidden_features
+                             if mixture.expert_features is None
+                             else mixture.expert_features),
             out_features=self.emb_features,
             activation=self.mlp,
             score_function=mixture.score_function,
@@ -852,6 +888,7 @@ class CausalTransformer(nn.Module):
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
             expert_bias=mixture.bias,
+            shared=shared,
             dtype=self.dtype,
             precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
@@ -924,7 +961,8 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_logits(x, tokens, train=train)
+            self.mtp_hidden_states(x, tokens, train=train, positions=positions,
+                                   segment_ids=segment_ids)
         return self._logits(x)
 
     def _logits(self, x):
@@ -943,23 +981,43 @@ class CausalTransformer(nn.Module):
             logits = cap * jnp.tanh(logits / cap)
         return logits
 
-    def mtp_logits(self, hidden, tokens, train: bool = False):
-        """One `[B, S, vocab]` fp32 logits array per prediction depth.
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False,
+                          positions=None, segment_ids=None):
+        """One `[B, S - d, D]` final-normed state array per prediction depth d.
 
-        Depth d reads the previous hidden states and the token embeddings
-        and scores what follows each position d tokens out, through the
-        shared head. Empty without prediction depths.
+        Depth d reads the previous depth's states at positions p and the
+        embeddings of the tokens at p + d, the sequence one shorter per
+        depth, so its state at p is what scores the token after p + d
+        through the shared head (`mtp_logits`, or a chunked loss over
+        `head_weight`). `positions` and `segment_ids` are the main forward's,
+        sliced with the states, so a packed batch keeps its documents apart
+        in the depths too. Empty without prediction depths; a sequence with
+        no position d tokens out raises.
 
         A plain init of the main forward holds these depths too: `__call__`
         reaches them while initializing, so the tree does not depend on which
         method built it.
         """
+        if self.mtp and tokens.shape[1] <= len(self.mtp):
+            raise ValueError(
+                f"{len(self.mtp)} prediction depths need more than "
+                f"{len(self.mtp)} tokens, got {tokens.shape[1]}")
         embeds = self.embed_tokens(tokens)
-        depth_logits = []
-        for block in self.mtp:
-            hidden = block(hidden, embeds, train=train)
-            depth_logits.append(self._logits(hidden))
-        return depth_logits
+        states = []
+        for depth, block in enumerate(self.mtp, start=1):
+            hidden = block(
+                hidden[:, :-1], embeds[:, depth:], train=train,
+                positions=None if positions is None else positions[:, :-depth],
+                segment_ids=None if segment_ids is None else segment_ids[:, :-depth])
+            states.append(hidden)
+        return states
+
+    def mtp_logits(self, hidden, tokens, train: bool = False,
+                   positions=None, segment_ids=None):
+        """One `[B, S - d, vocab]` fp32 logits array per prediction depth d:
+        the depth states of `mtp_hidden_states` through the shared head."""
+        return [self._logits(state) for state in self.mtp_hidden_states(
+            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids)]
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None):

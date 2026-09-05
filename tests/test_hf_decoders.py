@@ -22,6 +22,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
   tiny config with every Gemma 4 gap at once: partial rotary, mixed head
   dims, double-wide MLP, KV sharing, per-layer inputs and the values norm.
   The logit cap is absent because the text path never reads it.
+- deepseek-v3-tiny : max |logit difference| 4.4e-06, tolerance 1e-4. MLA
+  with q and kv LoRA, the released YaRN spelling, a dense layer over a
+  routed one with a shared expert, the group limit and the balancing bias.
+- deepseek-v32-tiny: max |logit difference| 3.6e-06, tolerance 1e-4. The
+  same over the sparse indexer; the dense mixer on the same weights differs
+  from the fixture by 3.8, so the fixture is the sparse model.
 - qwen35-tiny : max |logit difference| 9.1e-05, tolerance 5e-4, on logits of
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
@@ -46,6 +52,7 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
+DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -165,17 +172,19 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
         translate_config(factor_only)
 
 
-@pytest.mark.parametrize("name", TINY)
-def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
-    """Same paths, same shapes, same dtypes as a freshly initialised model."""
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+def test_translated_weights_are_exactly_the_models_variables(name, rng):
+    """Same collections, same paths, same shapes, same dtypes as a freshly
+    initialised model: `params` for every family, and the `moe` collection
+    DeepSeek's routers keep their bias in."""
     config = translate_config(fixture_config(name))
     built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
     model = models.build('causal_transformer', **built)
-    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
 
     from dew.interop.hf_decoders import _load_shards
-    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config)['params'])
+    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config))
 
     assert set(loaded) == set(initialised)
     for path, leaf in loaded.items():
@@ -183,7 +192,7 @@ def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY)
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
@@ -325,8 +334,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
         expected['.'.join(path)] = (tuple(reversed(shape))
                                     if path[-1] == 'kernel' else shape)
 
-    tree = jax.eval_shape(
-        lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    tree = jax.eval_shape(lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32)))
     initialised = {path: leaf.shape for path, leaf in flat_tree(tree).items()}
 
     assert initialised == expected
@@ -755,6 +763,131 @@ def test_a_gemma3_pattern_keeps_its_last_layer():
     config = fixture_config("gemma3-1b")
 
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
+
+
+def test_the_router_bias_lands_in_the_moe_collection():
+    """DeepSeek's `e_score_correction_bias` is router state a training step
+    moves, not a weight, and `Router` keeps it in the `moe` collection. The
+    checkpoint names it `model.layers.N.mlp.gate.e_score_correction_bias`,
+    six dot-separated parts, one fewer than the per-expert tensors the map
+    also reads under `mlp`; a map that counts it as seven falls through to
+    the params map and refuses the name. Its leaf is the checkpoint's tensor
+    and the loaded model selects on it: zeroing the bias moves the logits by
+    2.1 on deepseek-v3-tiny.
+    """
+    from dew.interop.hf_decoders import _dew_path, _load_shards
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    config = translate_config(fixture_config("deepseek-v3-tiny"))
+    tensors = _load_shards(directory)
+    name = 'model.layers.1.mlp.gate.e_score_correction_bias'
+    assert _dew_path(name, config) == (
+        'moe', 'layers_1', 'mlp', 'gate', 'e_score_correction_bias')
+
+    variables = translate_weights(tensors, config)
+    assert set(flat_tree(variables['moe'])) == {
+        'layers_1.mlp.gate.e_score_correction_bias'}
+    assert np.array_equal(
+        variables['moe']['layers_1']['mlp']['gate']['e_score_correction_bias'],
+        tensors[name])
+    assert not [path for path in flat_tree(variables['params'])
+                if path.endswith('e_score_correction_bias')]
+
+    model, loaded, _ = fp32_decoder(directory)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    zeroed = {**loaded, 'moe': jax.tree.map(jnp.zeros_like, loaded['moe'])}
+    moved = float(np.max(np.abs(np.asarray(model.apply(loaded, ids))
+                                - np.asarray(model.apply(zeroed, ids)))))
+    assert moved > 1.0, moved
+
+
+def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
+    """The tree check holds every collection to account, so a checkpoint
+    that drops the balancing bias fails naming the leaf instead of loading
+    a router at zeros."""
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import save_hf_layout
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    tensors = _load_shards(directory)
+    del tensors['model.layers.1.mlp.gate.e_score_correction_bias']
+    save_hf_layout(tensors, fixture_config("deepseek-v3-tiny"), str(tmp_path))
+
+    with pytest.raises(ValueError, match=r"missing \['moe\.layers_1\.mlp\.gate\.e_score_correction_bias'\]"):
+        fp32_decoder(tmp_path)
+
+
+def test_deepseek_configs_translate_field_by_field():
+    """The V3 config becomes the mla mixer record with the released YaRN
+    spelling and the mixture DeepseekV3MoE builds: a dense first layer, eight
+    sigmoid-scored experts in four groups with two per token, top-4 scaled
+    by 2.5, the balancing bias, and one shared expert of the routed width.
+    V3.2 adds the indexer's three fields and names its sparse layer kind."""
+    v3 = translate_config(fixture_config("deepseek-v3-tiny"))
+    v32 = translate_config(fixture_config("deepseek-v32-tiny"))
+
+    assert v3['mixer'] == {
+        'kind': 'mla', 'q_lora_rank': 8, 'kv_lora_rank': 8,
+        'qk_nope_head_dim': 8, 'qk_rope_head_dim': 8, 'v_head_dim': 8,
+        'rope_interleave': True,
+        'yarn': {'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 40.0,
+                 'original_max_position_embeddings': 4096, 'beta_fast': 32.0,
+                 'beta_slow': 1.0, 'mscale': 1.0, 'mscale_all_dim': 1.0,
+                 'truncate': True, 'attention_factor': None},
+        'index_topk': None, 'index_n_heads': None, 'index_head_dim': None,
+    }
+    assert v3['mixture'] == {
+        'experts': 8, 'top_k': 4, 'layers': (1,), 'score_function': 'sigmoid',
+        'scaling': 2.5, 'groups': 4, 'groups_per_token': 2, 'bias': True,
+        'shared_features': 16, 'expert_features': 16,
+    }
+    assert v3['head_dim'] == 16 and v3['scale_after_cast'] and not v3['qk_norm']
+    assert v3['layer_types'] == ('full_attention', 'full_attention')
+
+    assert v32['mixer'] == {**v3['mixer'], 'index_topk': 4, 'index_n_heads': 8,
+                            'index_head_dim': 16}
+    assert v32['mixture'] == v3['mixture']
+    assert v32['layer_types'] == ('deepseek_sparse_attention',) * 2
+
+
+def test_the_v32_fixture_is_the_sparse_model():
+    """The dense mixer on deepseek-v32-tiny's weights differs from the
+    fixture by 3.8, so the parity above covers the indexer's selection; a
+    generator that lost the eager mask fold again would fail here."""
+    directory = FIXTURES / "deepseek-v32-tiny"
+    _, variables, built = fp32_decoder(directory)
+    dense = models.build('causal_transformer', **{
+        **built, 'mixer': {**built['mixer'], 'index_topk': None,
+                           'index_n_heads': None, 'index_head_dim': None}})
+    params = {layer: ({**block, 'self_attn': {name: leaf for name, leaf
+                                              in block['self_attn'].items()
+                                              if name != 'indexer'}}
+                      if layer.startswith('layers_') else block)
+              for layer, block in variables['params'].items()}
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+
+    logits = np.asarray(dense.apply({**variables, 'params': params}, ids))
+    assert float(np.max(np.abs(logits - np.load(directory / "logits.npy")))) > 1.0
+
+
+@pytest.mark.parametrize("name", DEEPSEEK)
+def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
+    """The writer covers the three attention families; a model with the mla
+    mixer is refused naming the mixer, and one with routed experts on
+    standard attention naming the mixture, instead of writing a checkpoint
+    without their tensors."""
+    model, variables, _ = fp32_decoder(FIXTURES / name)
+    with pytest.raises(ValueError, match="a mixer other than attention"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+    config = translate_config(fixture_config(name))
+    routed = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**config, "mixer": None, "head_dim": None,
+                               "layer_types": None, "kinds": {}},
+        dtype="float32", attention_impl="reference"))
+    variables = routed.init(rng, jnp.ones((1, 4), jnp.int32))
+    with pytest.raises(ValueError, match="a model with a mixture"):
+        save_pretrained_decoder(routed, variables, str(tmp_path))
 
 
 # --------------------------------------------------------------------------
