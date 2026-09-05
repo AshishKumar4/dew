@@ -318,7 +318,7 @@ def _merged_call_counts(computation: _Computation) -> Dict[str, float]:
     return merged
 
 
-def compiled_flops(compiled) -> Optional[float]:
+def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
     """FLOPs for one call of an executable that is already compiled.
 
     Reading the count off the executable the loop actually runs costs nothing;
@@ -332,7 +332,8 @@ def compiled_flops(compiled) -> Optional[float]:
     twice. None comes back when the module contains a loop whose length XLA
     does not state, since the count would be the body's rather than the run's.
     """
-    return hlo_flops(compiled.as_text())
+    text = compiled.as_text()
+    return None if text is None else hlo_flops(text)
 
 
 def hlo_flops(text: str) -> Optional[float]:
@@ -351,7 +352,7 @@ def hlo_flops(text: str) -> Optional[float]:
     return total if math.isfinite(total) else None
 
 
-def step_flops(jitted, *args, **kwargs) -> Optional[float]:
+def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> Optional[float]:
     """FLOPs for one call of a jitted function, straight from the compiler.
 
     Measured rather than derived from a hand-written parameter-count formula, so

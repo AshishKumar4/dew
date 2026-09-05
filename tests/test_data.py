@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 
 import dew.data
-from dew.data import (Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
+from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
                       OxfordFlowers, TokenWindows, VoxCeleb2, local_batch)
 from dew.data import Loading, images, online_loader, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
@@ -304,6 +304,9 @@ def test_the_training_iterator_carries_its_position():
     on the batch after it."""
     data = Indexed().load(batch=8)
     first = data.train()
+    # The trainer reads the protocol statically, and a caption stage that only
+    # forwarded get_state through __getattr__ failed it while hasattr passed.
+    assert isinstance(first, Checkpointable)
     seen = _indices(first, 2)
     state = first.get_state()
     rest = _indices(first, 2)

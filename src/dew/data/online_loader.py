@@ -230,7 +230,7 @@ def fetch_single_video(video_url: str, timeout: Optional[int] = None, retries: i
             # Delete the temporary file
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
                 
             return frames if frames else None
@@ -709,25 +709,22 @@ def parallel_media_loader(
         downscale_interpolation=downscale_interpolation,
         feature_extractor=feature_extractor
     )
-    
-    # Calculate shard length
-    shard_len = len(dataset) // num_workers
-    print(f"Local Shard length: {shard_len}")
-    
+    # Every row belongs to one worker: the bounds split len(dataset) evenly,
+    # so a row past an even split is the last shard's tail rather than a row
+    # no pass ever fetches.
+    bounds = [index * len(dataset) // num_workers for index in range(num_workers + 1)]
+
     with _WORKER_CONTEXT.Pool(num_workers, initializer=_init_media_worker,
                               initargs=(data_queue,)) as pool:
         iteration = 0
         while True:
-            # Create shards for each worker
-            shards = [dataset[i*shard_len:(i+1)*shard_len] for i in range(num_workers)]
-            print(f"Mapping {len(shards)} shards")
-            
+            shards = [dataset[start:stop] for start, stop in zip(bounds, bounds[1:])]
+
             # Process shards in parallel
             pool.map(map_batch_fn, shards)
-            
+
             # Shuffle dataset for next iteration
             iteration += 1
-            print(f"Shuffling dataset with seed {iteration}")
             dataset = dataset.shuffle(seed=iteration)
 
 
@@ -865,23 +862,6 @@ class MediaBatchIterator:
     def __len__(self):
         """Get the number of batches in the dataset."""
         return len(self.dataset) // self.batch_size
-
-
-def dataMapper(map: Dict[str, Any]):
-    """Create a function to map dataset samples to a standard format.
-    
-    Args:
-        map: Dictionary mapping standard keys to dataset-specific keys.
-        
-    Returns:
-        Function that maps a sample to the standard format.
-    """
-    def _map(sample) -> Dict[str, Any]:
-        return {
-            "url": sample[map["url"]],
-            "caption": sample[map["caption"]],
-        }
-    return _map
 
 
 # Sentinel the prefetch thread leaves behind when it stops, so a consumer

@@ -8,10 +8,13 @@ about where they will be drawn.
 
 from __future__ import annotations
 
+from typing import TypeVar
+
 from flax import struct
 import jax
 import numpy as np
 
+T = TypeVar("T")
 
 @struct.dataclass
 class ImageGrid:
@@ -61,17 +64,17 @@ Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
 Artifacts = Artifact | tuple[Artifact, ...]
 
 
-def _addressable(leaf):
+def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
     """`leaf` as numpy, gathering it across the pool when it is a global
     array this process holds only a shard of."""
-    if getattr(leaf, "is_fully_addressable", True):
-        return np.asarray(leaf)
-    from jax.experimental import multihost_utils
+    if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
+        from jax.experimental import multihost_utils
 
-    return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
+        return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
+    return np.asarray(leaf)
 
 
-def host(value):
+def host(value: T) -> T:
     """An artifact whose arrays are host-local numpy.
 
     Scoring and drawing happen on the host: a metric reads the arrays with

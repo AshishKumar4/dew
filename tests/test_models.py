@@ -188,6 +188,23 @@ def test_attention_impl_parity(rng):
     assert jnp.max(jnp.abs(out_ref - out_xla)) < 1e-4
 
 
+def test_fused_attention_rejects_a_dtype_it_cannot_honor(rng):
+    """The fused kernels compute in the inputs' dtype, so a dtype asking for
+    anything else is refused rather than silently dropped, as precision and
+    the softmax flag already are. The reference path keeps honoring it."""
+    from dew.nn.attention import scaled_dot_product_attention
+    query = jax.random.normal(rng, (2, 8, 4, 16), jnp.bfloat16)
+    key = jax.random.normal(jax.random.fold_in(rng, 1), (2, 8, 4, 16), jnp.bfloat16)
+    value = jax.random.normal(jax.random.fold_in(rng, 2), (2, 8, 4, 16), jnp.bfloat16)
+    with pytest.raises(ValueError, match="cannot honor"):
+        scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
+                                     implementation="xla")
+    assert scaled_dot_product_attention(query, key, value, dtype=jnp.bfloat16,
+                                        implementation="xla").dtype == jnp.bfloat16
+    assert scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
+                                        implementation=None).dtype == jnp.float32
+
+
 def test_video_dit_forward(rng):
     """Factorized ST video model over (B, T, H, W, C), the replacement for
     the never-wired diffusers-derived UNet3D."""

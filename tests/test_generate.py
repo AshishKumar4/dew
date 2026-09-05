@@ -181,7 +181,7 @@ def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
     compiler's choice and can shard the batch, which a decode must not
     depend on."""
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import batch_sharding, build_mesh
+    from dew.training.distributed import batch_shardings, build_mesh
 
     model = tiny(max_seq_len=8)
     mesh = build_mesh(MeshSpec(fsdp=2))
@@ -189,8 +189,8 @@ def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
     placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
     # The prompt arrives the way a validation batch does, split over the
     # mesh, which is what the output layout would otherwise follow.
-    prompt = jax.device_put(jax.random.randint(rng, (8, 3), 0, VOCAB),
-                            batch_sharding(mesh))
+    prompt = jax.random.randint(rng, (8, 3), 0, VOCAB)
+    prompt = jax.device_put(prompt, batch_shardings(mesh, prompt))
 
     generated = generate(model, placed, prompt, 3, key=jax.random.PRNGKey(0),
                          temperature=0)

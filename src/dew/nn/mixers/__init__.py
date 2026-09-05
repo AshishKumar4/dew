@@ -79,6 +79,13 @@ class MixerBase:
     `mixers.build`: an unknown kind or field raises there. `build` turns the
     value and the layer's context into the `DecoderBlock` factory, the
     `Callable[..., nn.Module]` the block calls with `name='self_attn'`.
+
+    The backbone types its `mixer` field as this base, not as the registry
+    union: a union of members that register over time cannot be spelled
+    before they exist, and the checker rejects a late-bound name in type
+    position. Records still dispatch on their kind through `mixers.build`,
+    and `mixers.union` stays the live union for config introspection and a
+    tyro subcommand per kind.
     """
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:

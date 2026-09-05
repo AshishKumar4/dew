@@ -5,10 +5,9 @@ reach the environment before the first JAX call of the process.
 """
 
 import os
-from typing import Optional
 
 
-def apply_xla_flags(flags: Optional[str]):
+def apply_xla_flags(flags: str | None) -> None:
     """Append flags to XLA_FLAGS, which XLA reads when it initializes a backend.
 
     Appended rather than assigned: the environment may already carry flags

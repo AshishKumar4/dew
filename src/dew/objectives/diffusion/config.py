@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, Literal, Optional
 
 from dew.config import JsonDict, ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, VideoDataset
-from dew.inputs import Condition, Field, InputSpec
+from dew.diffusion.process import Process
+from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.registry import datasets, encoders, metrics, models, presets, samplers
+from dew.registry import datasets, metrics, models, presets, samplers
 from dew.sampling.guidance import CFG
 from .objective import DiffusionObjective
 
@@ -82,7 +83,7 @@ class TextCondition:
                   (("max_length", self.max_length), ("revision", self.revision))
                   if value is not None}
         return Condition(
-            encoders[self.encoder].from_pretrained(self.checkpoint, dtype=self.dtype, **fields),
+            rebuild(self.encoder, {"checkpoint": self.checkpoint, "dtype": self.dtype, **fields}),
             field=self.field, unconditional=self.unconditional)
 
 
@@ -165,8 +166,14 @@ class DiffusionRunConfig(RunConfig):
         conditions = {} if self.text is None else {"textcontext": self.text.build()}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
         model = models.build(self.model.architecture, **self.model_fields(autoencoder))
+        process = self.preset()
+        if not isinstance(process, Process):
+            raise ValueError(
+                f"preset {presets.name_of(type(self.preset))!r} builds a "
+                f"{type(process).__name__}, and DiffusionObjective trains a Gaussian "
+                "Process; a discrete preset trains through MaskedDiffusionObjective")
         return DiffusionObjective(
-            model, self.preset(), inputs,
+            model, process, inputs,
             autoencoder=autoencoder,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,

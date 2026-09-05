@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Any, Optional
+from typing import Optional
 import einops
 from flax.typing import Dtype, PrecisionLike
 
@@ -23,8 +23,8 @@ def unpatchify(x, channels=3, H_P=None, W_P=None):
 class PatchEmbedding(nn.Module):
     patch_size: int
     embedding_dim: int
-    dtype: Any = jnp.float32
-    precision: Any = jax.lax.Precision.HIGH
+    dtype: Optional[Dtype] = jnp.float32
+    precision: PrecisionLike = jax.lax.Precision.HIGH
 
     @nn.compact
     def __call__(self, x):

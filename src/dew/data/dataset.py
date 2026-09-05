@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -92,6 +92,19 @@ CAPTION = "caption"
 conditions read it."""
 
 
+@runtime_checkable
+class Checkpointable(Protocol):
+    """A data stream that can say where it stopped and be put back there.
+
+    grain's iterators satisfy this; a plain iterator does not, which is what
+    `Trainer.fit` refuses when a run asks for checkpoints.
+    """
+
+    def get_state(self) -> Any: ...
+
+    def set_state(self, state: Any) -> None: ...
+
+
 def _no_captions(captions: Sequence[str]) -> Mapping[str, Any]:
     """What an unconditional run reads out of a batch's captions: nothing."""
     return {}
@@ -120,7 +133,7 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     class Tokenizing:
         """The stream's iterator with the caption stage on its end."""
 
-        def __init__(self, source):
+        def __init__(self, source: Iterator[Batch]):
             self.source = source
 
         def __iter__(self):
@@ -132,14 +145,27 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
             batch.update(read(captions))
             return batch
 
-        def __getattr__(self, name):
-            # get_state/set_state belong to the grain iterator underneath,
-            # and a stream without them stays a stream without them.
-            if name in ("get_state", "set_state"):
-                return getattr(self.source, name)
-            raise AttributeError(name)
+    class CheckpointableTokenizing(Tokenizing):
+        """The same stage over a stream that can report and restore its
+        position, forwarding both, so the trainer's protocol check sees them.
+        A forwarding `__getattr__` would satisfy `hasattr` and not the
+        protocol, which reads attributes statically."""
 
-    return lambda: Tokenizing(iter(stream()))
+        source: Checkpointable
+
+        def get_state(self) -> Any:
+            return self.source.get_state()
+
+        def set_state(self, state: Any) -> None:
+            self.source.set_state(state)
+
+    def start() -> Iterator[Batch]:
+        source = iter(stream())
+        if isinstance(source, Checkpointable):
+            return CheckpointableTokenizing(source)
+        return Tokenizing(source)
+
+    return start
 
 
 def local_batch(batch: int) -> int:

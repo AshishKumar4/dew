@@ -40,7 +40,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, TEXT_KEY
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import batch_sharding
+from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
@@ -716,6 +716,9 @@ def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
     assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
     assert specs["experts"]["down_proj"]["kernel"] == P(expert_axis, 'fsdp')
+    # The router's expert dimension rides the axis too; its width keeps fsdp.
+    assert specs["gate"]["kernel"] == (
+        P('fsdp', 'expert') if expert_size > 1 else P('fsdp'))
 
 
 def test_the_expert_axis_shards_experts_without_an_fsdp_axis():
@@ -783,8 +786,7 @@ def test_the_batch_is_split_over_the_expert_axis_too():
     """Expert parallelism must not cost data parallelism: every device holds a
     slice of the batch whichever axis it sits on."""
     mesh = build_mesh(MeshSpec(fsdp=2, expert=4))
-    batch = jax.make_array_from_process_local_data(
-        batch_sharding(mesh), np.zeros((jax.device_count(), 4), np.float32))
+    batch = shard_batch(mesh, np.zeros((jax.device_count(), 4), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
     assert batch.addressable_shards[0].data.shape == (1, 4)

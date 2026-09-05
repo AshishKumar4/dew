@@ -19,9 +19,10 @@ from typing import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew import registry
-from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text
+from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -58,7 +59,7 @@ class Condition:
     @classmethod
     def from_json(cls, data: Mapping) -> "Condition":
         encoder = data["encoder"]
-        return cls(encoder=registry.encoders[encoder["name"]].from_pretrained(**encoder["fields"]),
+        return cls(encoder=rebuild(encoder["name"], encoder["fields"]),
                    field=data["field"], unconditional=data["unconditional"])
 
 
@@ -76,7 +77,16 @@ class InputSpec:
     sample: Field
     conditions: Mapping[str, Condition] = field(default_factory=dict)
 
-    def tokenize(self, captions: Sequence[str]) -> dict[str, dict]:
+    def __post_init__(self):
+        fields = [condition.field for condition in self.conditions.values()]
+        if len(set(fields)) != len(fields):
+            raise ValueError(
+                f"two conditions share the batch field {sorted(set(fields))}: "
+                "the objective reads batch[condition.field] under each keyword, "
+                "so the second tokenization would overwrite the first. "
+                "Name a field per condition")
+
+    def tokenize(self, captions: Sequence[str]) -> dict[str, Mapping[str, np.ndarray]]:
         """The batch fields this run's conditions read out of `captions`.
 
         Empty for a run that conditions on nothing, which is how the
@@ -102,5 +112,5 @@ class InputSpec:
 
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "Audio", "CharTable",
+           "Audio", "CharTable", "rebuild",
            "unit_range"]
