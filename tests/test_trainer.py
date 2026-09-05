@@ -444,6 +444,7 @@ def test_a_newer_local_checkpoint_wins_the_resume_and_leaves_the_persistent_one(
     assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6, 9]
 
 
+@pytest.mark.mesh
 def test_a_local_checkpoint_refuses_another_placement_and_names_the_way_out(tmp_path):
     """The local copy holds this process's shards for the mesh it was
     written on; a resume on another mesh is refused with the leaf that

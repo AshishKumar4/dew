@@ -145,16 +145,19 @@ def deepseek_shaped(**overrides):
 # gradients against the plain loop's, both compiled as a training step
 # compiles them. A provider (the last layer of its kind before the sharing
 # layers) is a run of one, and so is the layer between two runs of another
-# kind. Largest observed differences on CPU: logits 0.0 and gradients
-# 2.3e-08 (gemma4), 0.0 and 0.0 (deepseek), and 2.7e-05 on logits of order
-# 4 and 1.1e-03 on the embedding gradient of order 8 for gemma3n. Gemma
-# 3n's activation sparsity is a relu at 1.64 standard deviations above
-# each gate row's mean, so a rounding difference in the row's statistics
-# moves the kink, and the ten layers of it between the loss and the
-# embedding turn that into a relative difference of 1e-4 there.
+# kind. Largest observed differences at fp32 matmuls, CPU then RTX 4080:
+# gemma4 logits 0.0 / 1.9e-05, gradients 2.3e-08 / 3.4e-05; deepseek 0.0 /
+# 0.0 and 0.0 / 2.5e-07; gemma3n 2.7e-05 / 1.5e-04 on logits of order 4 and
+# 1.1e-03 / 6.0e-03 on the embedding gradient of order 8. The GPU lowers the
+# scan body and the unrolled layers to different fusions, so reductions
+# round in a different order. Gemma 3n's activation sparsity is a relu at
+# 1.64 standard deviations above each gate row's mean, so a rounding
+# difference in the row's statistics moves the kink, and the ten layers of
+# it between the loss and the embedding amplify that. A scan that read the
+# wrong layer's weights would miss by 1e-1 or more.
 SHAPES = {
-    "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-6, 1e-6),
-    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 1e-4, 5e-3),
+    "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-4, 1e-4),
+    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 5e-4, 2e-2),
     "deepseek": (deepseek_shaped, ((0, 1), (1, 5)), 1e-6, 1e-6),
 }
 
