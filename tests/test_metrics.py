@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import dew.eval as metrics
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
     ImageMetric,
@@ -166,6 +165,42 @@ def test_ssim_matches_the_closed_form_on_constant_images():
     assert float(ssim(x, y, data_range=data_range)) == pytest.approx(expected, rel=1e-4)
 
 
+def _reference_ssim(x, y, data_range):
+    """Wang et al.'s SSIM on one channel in float64, as skimage computes it
+    with gaussian_weights=True, sigma=1.5 and use_sample_covariance=False:
+    the means, variances and covariance filtered with an 11-tap gaussian
+    (scipy's truncate=3.5 at sigma 1.5), and the border the window does not
+    cover cropped before the mean."""
+    from scipy.ndimage import gaussian_filter
+
+    def filt(a):
+        return gaussian_filter(a, sigma=1.5, truncate=3.5, mode="reflect")
+
+    ux, uy = filt(x), filt(y)
+    vx, vy, vxy = filt(x * x) - ux * ux, filt(y * y) - uy * uy, filt(x * y) - ux * uy
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    score = ((2 * ux * uy + c1) * (2 * vxy + c2)) / ((ux**2 + uy**2 + c1) * (vx + vy + c2))
+    return score[5:-5, 5:-5].mean()
+
+
+@pytest.mark.parametrize("data_range", [1.0, 2.0])
+def test_ssim_matches_the_filtered_equations_of_wang_et_al(rng, data_range):
+    """The port against the reference on noisy ramps, per frame: observed
+    2.2e-07 off the float64 reference at data_range 1.0 and 1.9e-07 at 2.0,
+    against a tolerance of 1e-5 on scores near 0.5. A window that is not
+    gaussian, not 11 taps or not cropped moves the score by 1e-3 or more."""
+    key_x, key_noise = jax.random.split(rng)
+    x = _ramp_image((4, 32, 32, 3), key_x)
+    y = x + 0.2 * jax.random.normal(key_noise, x.shape)
+    x64, y64 = np.asarray(x, np.float64), np.asarray(y, np.float64)
+
+    got = np.asarray(ssim(x, y, data_range=data_range, per_example=True))
+
+    expected = [np.mean([_reference_ssim(x64[n, ..., c], y64[n, ..., c], data_range)
+                         for c in range(3)]) for n in range(4)]
+    assert np.abs(got - expected).max() < 1e-5, f"{got} against {expected}"
+
+
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
 def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
     """(B, T, H, W, C) must score exactly as the (B*T, H, W, C) frames do."""
@@ -193,33 +228,8 @@ def test_per_example_scores_have_one_entry_per_frame(rng, metric_fn, shape):
 
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
 def test_metrics_reject_unbatched_inputs(metric_fn):
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match=r"\(B, H, W, C\)"):
         metric_fn(jnp.zeros((32, 32, 3)), jnp.zeros((32, 32, 3)), data_range=2.0)
-
-
-def test_psnr_metric_factory_wires_up_the_trainer_contract(rng):
-    metric = psnr_metric()
-    assert isinstance(metric, ImageMetric)
-    assert metric.name == 'psnr' and metric.reads is ImageGrid
-
-    batch = _uint8_batch((2, 32, 32, 3), rng)
-    degraded = _normalised(batch) + 0.1
-    assert metric(ImageGrid(degraded), batch) == pytest.approx(
-        float(psnr(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
-    )
-    assert metric.reduce([1.0, 3.0]) == 2.0
-
-
-def test_ssim_metric_factory_wires_up_the_trainer_contract(rng):
-    metric = ssim_metric()
-    assert isinstance(metric, ImageMetric)
-    assert metric.name == 'ssim' and metric.reads is ImageGrid
-
-    batch = _uint8_batch((2, 32, 32, 3), rng)
-    degraded = _blur(_normalised(batch))
-    assert metric(ImageGrid(degraded), batch) == pytest.approx(
-        float(ssim(degraded, _normalised(batch), data_range=2.0)), rel=1e-5
-    )
 
 
 def test_psnr_metric_scores_a_perfect_reconstruction_as_infinite(rng):
@@ -236,11 +246,14 @@ def test_ssim_metric_scores_a_perfect_reconstruction_as_one(rng):
 
 def test_psnr_metric_matches_the_closed_form_for_a_grey_level_error():
     """A constant error of 51 grey levels is 0.4 on the [-1, 1] scale, and the
-    default data_range of 2.0 makes the score 10 log10(4 / 0.16)."""
+    default data_range of 2.0 makes the score 10 log10(4 / 0.16). The name is
+    the wandb key the score logs under."""
     batch = {'image': jnp.full((2, 8, 8, 3), 100, dtype=jnp.uint8)}
     generated = jnp.full((2, 8, 8, 3), (151 - 127.5) / 127.5)
     expected = 10.0 * np.log10(2.0**2 / 0.4**2)
-    assert psnr_metric()(ImageGrid(generated), batch) == pytest.approx(expected, rel=1e-5)
+    metric = psnr_metric()
+    assert metric.name == "psnr"
+    assert metric(ImageGrid(generated), batch) == pytest.approx(expected, rel=1e-5)
 
 
 def test_ssim_metric_matches_the_closed_form_on_constant_images():
@@ -252,7 +265,9 @@ def test_ssim_metric_matches_the_closed_form_on_constant_images():
     mu_y = (128 - 127.5) / 127.5
     c1 = (0.01 * 2.0) ** 2
     expected = c1 / (mu_y**2 + c1)
-    assert ssim_metric()(ImageGrid(jnp.zeros((1, 16, 16, 1))), batch) == pytest.approx(
+    metric = ssim_metric()
+    assert metric.name == "ssim"
+    assert metric(ImageGrid(jnp.zeros((1, 16, 16, 1))), batch) == pytest.approx(
         expected, rel=1e-4
     )
 
@@ -286,23 +301,9 @@ def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
         float(raw(degraded, reference, data_range=2.0)), rel=1e-5)
 
 
-def test_metrics_package_exports_resolve():
-    """The package surface the trainer configures metrics from, and the
-    registry the design names them in."""
-    assert set(metrics.__all__) == {
-        'ImageMetric',
-        'frames',
-        'clip',
-        'clip_score',
-        'fid',
-        'frechet_distance',
-        'peak_signal_noise_ratio',
-        'psnr',
-        'structural_similarity',
-        'ssim',
-    }
-    for name in metrics.__all__:
-        assert getattr(metrics, name) is not None
+def test_the_registry_names_every_metric_factory():
+    """A run configures metrics by name through `dew.registry.metrics`, so a
+    factory that loses its decorator is a metric no run can ask for."""
     assert registry['psnr'] is psnr_metric and registry.psnr is psnr_metric
     assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
 

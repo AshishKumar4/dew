@@ -99,16 +99,13 @@ def test_byte_tokenizer_decode_tolerates_junk_bytes():
 # HFTokenizer, only when the hub (or its cache) cooperates
 # ---------------------------------------------------------------------------------
 
-def _hf_tokenizer():
-    try:
-        from dew.data import HFTokenizer
-        return HFTokenizer("gpt2")
-    except Exception as exc:  # no transformers, no cache, no network
-        pytest.skip(f"the HF tokenizer is unavailable here: {exc}")
-
-
+@pytest.mark.network
 def test_hf_tokenizer_encodes_and_decodes():
-    tok = _hf_tokenizer()
+    """Loads gpt2 from the hub or its cache; a broken HFTokenizer used to be
+    skipped here along with a missing network."""
+    from dew.data import HFTokenizer
+
+    tok = HFTokenizer("gpt2")
     ids = tok.encode("hello world")
     assert 0 < len(ids) < 11 and all(isinstance(i, int) for i in ids)
     assert tok.decode(ids) == "hello world"
@@ -203,20 +200,29 @@ def _packed_tokens(tmp_path, **fields):
     return PackedTokens(path=str(tmp_path), **fields)
 
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
+    """Window k is tokens [k seq_len, k seq_len + seq_len], so consecutive
+    windows share one token: the last of one is the first of the next, the
+    target of the last position and the input of the next window's first.
+    The stream is a counter, so a row says which tokens it holds."""
     seq_len, batch = 8, 4
     # (n - 1) // seq_len windows: 17*8 tokens -> 16 train, 5*8 -> 4 val.
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=5 * seq_len,
-               seq_len=seq_len)
+               seq_len=seq_len, body=np.arange(22 * seq_len))
     data = _windows(tmp_path, seq_len=seq_len).load(batch=batch)
 
     assert data.records == 16 and data.batch == batch and data.steps_per_epoch == 4
 
-    for batches, windows in ((itertools.islice(data.train(), 4), 16), (data.val(), 4)):
-        batches = list(batches)
-        assert len(batches) == windows // batch
-        for b in batches:
-            assert b["text"].shape == (batch, seq_len + 1)
-            assert b["text"].dtype == np.int32
+    for batches, windows, first in ((itertools.islice(data.train(), 4), 16, 5 * seq_len),
+                                    (data.val(), 4, 0)):
+        rows = np.concatenate([b["text"] for b in batches])
+        assert rows.shape == (windows, seq_len + 1) and rows.dtype == np.int32
+        starts = rows[:, 0] - first
+        assert sorted(starts) == [seq_len * k for k in range(windows)], "every window once"
+        assert np.array_equal(rows, starts[:, None] + first + np.arange(seq_len + 1)), \
+            "each row is seq_len + 1 consecutive tokens"
+
+    val_rows = np.concatenate([b["text"] for b in data.val()])
+    assert np.array_equal(val_rows[:-1, -1], val_rows[1:, 0]), "the pass is in order"
 
 
 def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
@@ -288,6 +294,9 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
 
 
 def test_token_loader_seeds_its_train_sampler(tmp_path):
+    """The seed decides the order: the same seed reads the same first batch
+    twice, a different seed reads a different one. A sampler that ignored
+    the seed and shuffled afresh each call would pass the second half alone."""
     seq_len, records = 8, 24
     _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len,
                seq_len=seq_len)
@@ -296,6 +305,7 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
         data = _windows(tmp_path, seq_len=seq_len, seed=seed, loading=Loading(workers=0)).load(batch=4)
         return next(data.train())["text"]
 
+    assert np.array_equal(first_batch(0), first_batch(0))
     assert not np.array_equal(first_batch(0), first_batch(1))
 
 

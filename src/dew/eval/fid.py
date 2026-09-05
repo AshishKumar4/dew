@@ -1,3 +1,4 @@
+import functools
 import warnings
 
 import jax
@@ -9,20 +10,16 @@ from dew.registry import metrics
 from .common import ImageMetric
 
 
-# The FID InceptionV3 is ~90MB of weights; one copy is enough for every metric
-# built from this module.
-_inception_cache: dict = {}
-
-
+@functools.lru_cache(maxsize=None)
 def _get_inception():
-    """Cached (model, params) for the pool3 feature extractor."""
-    if 'inception' not in _inception_cache:
-        from .inception import InceptionV3
-        print("[metrics] Loading InceptionV3 FID weights (cached for reuse)...")
-        model = InceptionV3(pretrained=True)
-        params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 299, 299, 3)))
-        _inception_cache['inception'] = (model, params)
-    return _inception_cache['inception']
+    """The pool3 feature extractor and its parameters, loaded once per
+    process: the FID InceptionV3 is about 90 MB of weights, and every metric
+    built from this module shares the copy."""
+    from .inception import InceptionV3
+    print("[metrics] Loading InceptionV3 FID weights (cached for reuse)...")
+    model = InceptionV3(pretrained=True)
+    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 299, 299, 3)))
+    return model, params
 
 
 def _sqrtm(product):
@@ -47,8 +44,8 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     mu_a, mu_b = np.atleast_1d(mu_a), np.atleast_1d(mu_b)
     sigma_a, sigma_b = np.atleast_2d(sigma_a), np.atleast_2d(sigma_b)
 
-    # scipy >= 1.16 dropped the `disp` kwarg; sqrtm returns (possibly
-    # complex) results without it.
+    # sqrtm's result is complex when rounding leaves the product with a
+    # negative eigenvalue; the imaginary part is that noise.
     covmean = _sqrtm(sigma_a.dot(sigma_b))
     if not np.isfinite(covmean).all():
         # Singular product covariance, nudge the diagonal as in the reference
@@ -67,27 +64,26 @@ def _gaussian_stats(activations):
     return activations.mean(axis=0), np.cov(activations, rowvar=False)
 
 
+@functools.lru_cache(maxsize=None)
 def _get_activations():
     """The jitted pool3 feature extractor, built on first use.
 
     Building it loads the ~90MB weights, so it happens here rather than in
     the factory: constructing the metric opens nothing.
     """
-    if "activations" not in _inception_cache:
-        model, params = _get_inception()
+    model, params = _get_inception()
 
-        @jax.jit
-        def activations(images):
-            # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
-            resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
-            features = model.apply(params, resized, train=False)
-            # apply returns the output alone unless mutable collections were asked
-            # for, and none were.
-            assert not isinstance(features, tuple)
-            return features.reshape(features.shape[0], -1)
+    @jax.jit
+    def activations(images):
+        # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
+        resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
+        features = model.apply(params, resized, train=False)
+        # apply returns the output alone unless mutable collections were asked
+        # for, and none were.
+        assert not isinstance(features, tuple)
+        return features.reshape(features.shape[0], -1)
 
-        _inception_cache["activations"] = activations
-    return _inception_cache["activations"]
+    return activations
 
 
 @metrics("fid")
