@@ -13,7 +13,7 @@ import dataclasses
 from typing import TYPE_CHECKING, Literal, Optional
 
 from dew.config import JsonDict, ModelConfig, RunConfig
-from dew.data import ImageDataset, OnlineImages, VideoDataset
+from dew.data import ImageDataset, OnlineImages, OxfordFlowers, VideoDataset
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
@@ -34,9 +34,13 @@ if TYPE_CHECKING:
     # those tables is, which is what a reader and a checker need.
     PresetSpec = Preset
     SamplerSpec = Solver
+    # The run reads captions through `load(tokenize=)`, which the token
+    # datasets do not take; `sample_field` refuses those at runtime.
+    CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
 else:
     PresetSpec = presets.union
     SamplerSpec = samplers.union
+    CaptionedSpec = datasets.union
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
@@ -113,6 +117,7 @@ class DiffusionRunConfig(RunConfig):
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
+    data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)
     preset: PresetSpec = dataclasses.field(default_factory=presets.EDM)
     """The convention the model is trained and sampled with."""
     sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)

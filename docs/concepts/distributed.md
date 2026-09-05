@@ -1,136 +1,110 @@
 # Distributed training
 
-Every run is sharded, and a single device is the degenerate case. There is one code path: the trainer builds a three-axis mesh over the devices it was given, derives a sharding for every leaf of the train state, and hands both to `jax.jit`. GSPMD infers the collectives.
-
-The pieces live in `dew.training.distributed`.
+Every run is sharded; one device is the degenerate case. The trainer builds a mesh over the devices it was given, derives a sharding for every leaf of the train state, and hands both to `jax.jit`. GSPMD inserts the collectives. The pieces live in `dew.training.distributed`.
 
 ## The mesh
 
-`build_mesh(MeshSpec(fsdp, expert), devices=None)` returns a `(data, expert, fsdp)` mesh of shape `(device_count // (fsdp * expert), expert, fsdp)`. Parameters shard over `fsdp`, an MoE layer's expert dimension shards over `expert`, and both replicate over `data`, so `fsdp_size=1, expert_size=1` is plain data parallelism and needs no separate branch. A product that does not divide the device count is an error rather than a silent reshape.
+`MeshSpec` names how many devices each sharding axis takes, and the data axis fills the rest:
 
-The expert dimension gets an axis of its own rather than competing for `fsdp` because it is the one dimension no dense model has. Splitting eight experts four ways leaves every expert whole, where splitting a width costs a collective on every matmul.
+```python
+from dew import MeshSpec
 
-Batches split across every device on all three axes at once: `BATCH_SPEC = P(('data', 'expert', 'fsdp'))`. Only parameters distinguish the axes.
+MeshSpec()                          # data parallel: parameters replicated
+MeshSpec(fsdp=4)                    # each large parameter split four ways
+MeshSpec(fsdp=2, expert=4)          # experts split four ways, the rest two ways
+MeshSpec(fsdp=2, tensor=2)          # widths a rule redirects split over tensor
+MeshSpec(fsdp=4, sequence=2)        # token rows split over sequence
+```
+
+`build_mesh(spec)` returns the `(data, expert, fsdp, tensor, sequence)` mesh. Parameters shard over `fsdp`, an MoE layer's expert dimension over `expert`, a width the rules redirect over `tensor`, and everything replicates over `data`. The sequence axis never places a parameter; it splits the batch's sequence dimension. A product of sizes that does not divide the device count is an error.
+
+The expert dimension has an axis of its own because it is the one dimension no dense model has. Splitting eight experts four ways leaves every expert whole, where splitting a width costs a collective on every matmul.
+
+## How a batch is placed
+
+`batch_shardings(mesh, batch)` gives one sharding per leaf. Rows split across every axis but sequence. A leaf of rank 2 or 3 is a sequence per row (token ids, segment ids, positions) and its second dimension splits over the sequence axis when the axis divides it; an image or a video keeps every dimension but its rows whole. `shard_batch(mesh, batch)` assembles this process's slice of each array into the global array with `jax.make_array_from_process_local_data`, which is what makes a multi-host run the same code as a single-host one.
 
 ## Logical axes
 
-A logical axis name says what a parameter's dimension is, never where it goes. A DiT attention query kernel, shape `[embed, heads, head_dim]`, carries `("embed", "heads", "head_dim")`.
+A logical axis name says what a parameter's dimension is, never where it goes. A DiT query kernel of shape `[embed, heads, head_dim]` carries `("embed", "heads", "head_dim")`.
 
-`@logical_axes({...})` on the module that owns the parameters declares them, keyed by the module path a parameter sits under and read outermost dimension first. Every declaration is merged into `dew.nn.sharding.DECLARED`, and `declared_axes(path, ndim)` is what reads one back. A parameter takes the trailing names its rank can hold, so `("to_q",): ("embed", "heads", "head_dim")` names the query kernel's three dimensions and, from the same entry, its bias's two. A key matches the end of a path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's.
+The module that owns the parameters declares them:
 
-The names are declared on the module rather than on the initializers because `nn.with_partitioning` hands a parameter back inside a `Partitioned` box and `model.init` then gives that box to the caller. Parameter trees are frozen and a caller reads plain arrays under the documented names, `save_params` among them. Declaring the names here also keeps sharding vocabulary on the trainer's side of the seam, where the mesh already lives. What it costs: a module rename does not carry its entry along, so `test_every_declared_parameter_axis_names_a_module_some_model_has` fails as soon as an entry stops naming a parameter of a registry model, and a caller's own module gets the shape heuristic unless its parameters sit under a declared name.
+```python
+import flax.linen as nn
+from dew.nn.sharding import logical_axes
 
-Declared today: `CausalTransformer`'s token embedding, its attention and MLP projections, its untied head and the router and stacked expert kernels of a sparse layer, and the DiT stack's patch embedding, attention, adaLN projections, MLP and output head. Through the shared modules that reaches `simple_dit`, `simple_udit`, `video_dit`, `hybrid_dit`, the MMDiT ada and output projections, UViT, the JEPA encoders and the attention blocks inside the U-Nets. The MMDiT and UViT blocks' own MLPs, the S5 layers and the rest of `blocks.py` fall back on shape.
+@logical_axes({("my_q",): ("embed", "heads", "head_dim"),
+               ("my_out",): ("attention", "embed")})
+class MyAttention(nn.Module):
+    ...
+```
 
-The vocabulary:
+A key is the tail of a module path, so one entry covers every block that reuses the module, and an optimizer moment or an EMA copy inherits its parameter's names because its own path ends in the parameter's. A parameter takes the trailing names its rank can hold, so the entry above names the query kernel's three dimensions and its bias's two. Two modules that declare the same path differently are refused at import. A module whose kernels have no honest name (a convolution's taps, a raw patch projection) lists them under `heuristic=` and takes the shape rule below.
 
 | Axis | Meaning | Where it appears |
 | --- | --- | --- |
 | `embed` | model width | every kernel's contract or output axis |
-| `mlp` | feed-forward width | gate/up/down projections |
-| `heads` | query heads | q projections, attention out (with `head_dim`) |
-| `kv` | key/value heads | k and v projections in grouped-query attention |
+| `mlp` | feed-forward width | gate, up and down projections |
+| `heads` | query heads | q projections, attention out with `head_dim` |
+| `kv` | key and value heads | k and v projections of grouped-query attention |
 | `head_dim` | width of one head | attention projections carrying both head axes |
 | `vocab` | vocabulary rows | the embedding table and the untied LM head |
-| `modulation` | adaLN shift/scale/gate outputs | the per-block and final ada projections |
-| `output` | patch output channels | the zero-init output head |
+| `modulation` | adaLN shift, scale and gate outputs | the per-block and final ada projections |
+| `output` | patch output channels | the zero-initialised output head |
 | `attention` | flattened attention input | the out projection's contract axis |
 | `exp` | mixture-of-experts rows | the stacked expert kernels and the router |
-| `batch` | sample rows | activations only, never parameters |
-| `sequence` | token positions | activations only, never parameters |
-| `stage` | pipeline stage index | reserved, no model uses it yet |
+| `batch` | sample rows | activations only |
+| `sequence` | token positions | activations only |
+| `stage` | pipeline stage | reserved |
 
-A parameter no entry names keeps the shape heuristic below, so a family can be declared at a time. Norms and other 1-D parameters are left alone: they are replicated either way. So is any dimension whose width the model does not choose, the raw patch content of the Hilbert projection and the conditioning encoder's feature width, because there is no honest name for it and the heuristic already picks the larger side, which for CLIP-L into a 384-wide DiT is the encoder's 768.
+## The rules
 
-## The rules table
+`DEFAULT_RULES` maps each name to a mesh axis, in precedence order:
 
-`DEFAULT_LOGICAL_AXIS_RULES` maps each name to mesh axes, in precedence order. On the current mesh it is:
-
-| Logical axis | Mesh axes |
+| Logical axis | Mesh axis |
 | --- | --- |
-| `vocab` | `fsdp` |
-| `mlp` | `fsdp` |
-| `modulation` | `fsdp` |
-| `attention` | `fsdp` |
-| `embed` | `fsdp` |
-| `head_dim` | `fsdp` |
-| `heads` | `fsdp` |
-| `kv` | `fsdp` |
-| `output` | `fsdp` |
+| `vocab`, `mlp`, `modulation`, `attention`, `embed`, `head_dim`, `heads`, `kv`, `output` | `fsdp` |
 | `exp` | `expert` |
-| `batch` | none |
-| `sequence` | none |
-| `stage` | none |
+| `sequence` | `sequence` |
+| `batch`, `stage` | none |
 
-Rule order is precedence: when two logical dimensions of one parameter both claim the single `fsdp` axis, the earlier row wins and the other dimension is left whole. That is flax's and MaxText's semantics. The order is chosen so the winner is the dimension the shape heuristic used to pick, which is what makes the default table a no-op:
+When two dimensions of one parameter both claim `fsdp`, the earlier row wins and the other dimension stays whole, which is flax's and MaxText's semantics. The order puts the larger dimension first for every shipped shape: `mlp` over `embed` in a feed-forward kernel, `vocab` over `embed` in an embedding table, `embed` over the narrower `heads` or `kv` in a projection. A dimension the assigned axis does not divide evenly is dropped and the axis passes to the next dimension that names it; GPT-2's 50257 vocabulary rows cannot split over any mesh, so its embedding shards on `embed`.
 
-| Kernel | Shape | Winner | Why it is also the largest |
-| --- | --- | --- | --- |
-| MLP expand/contract | `[embed, mlp]` | `mlp` | `mlp_ratio` is 2 or 4 in every shipped config |
-| adaLN projection | `[embed, modulation]` | `modulation` | six modulation vectors per block |
-| token embedding / LM head | `[vocab, embed]` | `vocab` | vocabularies are tens of thousands wide |
-| attention out | `[attention, embed]` | `attention` | `heads * head_dim == embed`, and the tie goes left |
-| q/k/v | `[embed, heads]`, `[embed, kv]` | `embed` | grouped-query `kv` is narrower; a tie goes left |
-| output head | `[embed, output]` | `embed` | `patch^2 * channels` is far below the model width |
+`Layout(rules, min_shard, tolerance)` holds the table. `--trainer.layout.rules '{"heads": "tensor", "mlp": "tensor"}'` replaces rows, which is how a run moves its attention and feed-forward widths onto the tensor axis with no model edits. A name set to `null` leaves that dimension whole. Below `min_shard` elements (65536 by default) a parameter stays replicated, because below that a parameter costs more in collectives than it saves in memory.
 
-Precedence is fixed, so it cannot track the largest axis for every conceivable shape: a model narrower than its own output head, or an `mlp_ratio` of exactly 1, would land on the other dimension. That is a different split of the same parameter over the same axis, with identical memory, identical collectives and identical numbers, not a different model, and no shipped configuration reaches it. `test_default_logical_rules_match_previous_specs_for_every_registry_model` pins spec-for-spec equality with the old heuristic across every registry architecture at the sizes the suite builds, and the FSDP/DP parity tests pin the numbers.
-
-`--trainer.layout.rules` takes a JSON object and replaces the table, e.g. `{"mlp": "fsdp"}`. A name set to `null`, or absent from the table, leaves that dimension whole. Mesh axes the current mesh does not have are dropped, so one table can name `tensor` today and mean it later.
-
-The table is the whole mechanism for future parallelism. Adding a `tensor` axis to the mesh and changing two rows (`"heads": "tensor"`, `"mlp": ["tensor"]`) moves every declared model to hybrid FSDP/tensor parallelism with no model edits, exactly as MaxText's `logical_axis_rules` does (`docs/research/google-jax-stack.md`, MaxText section). An `fsdp_transpose` axis would land in the same place.
-
-`Layout.shardings(mesh, tree)` implements the derivation, one pass over the abstract state: `declared_axes` reads the declared names off each leaf's path, `nn.logical_to_mesh_axes` applies the rules table, and the result drops mesh axes of size 1. Below `min_shard` elements a declared parameter stays replicated. Deriving names and values in the same pass is what lets an optimizer state hold leaves that are not arrays at all, `optax.MaskedNode` under a masked transform among them.
-
-A dimension the assigned mesh axes do not divide evenly cannot be split, so its name is dropped and the rules hand the axis to the next dimension that names it. GPT-2's 50257 rows, Qwen's 151665 and Gemma's 256000 all make the `vocab` rule unusable on any real mesh, and the embedding then shards on `embed`, which is what the shape heuristic picked. Only a parameter where no named dimension divides stays whole, and the tolerance check below is what turns that into an error when it matters.
-
-## Which parameters shard
-
-A module declares what its dimensions mean with `@logical_axes({...})`, and `Layout(rules, min_shard, tolerance)` merges every declaration in the tree into shardings; a parameter no module declared falls back to `parameter_spec(shape, fsdp_size, min_shard)`, which picks the largest axis that divides evenly by `fsdp` and shards it. Anything smaller than `Layout.min_shard` elements (65536 by default) stays replicated: below that a parameter costs more in collectives than it saves in memory.
-
-`Layout.shardings` maps sharding over the whole train state, not just the params, declared and undeclared alike. Optimizer moments and the EMA copy carry the same axes as the parameters they track, so they pick up the same spec without anyone describing the optimizer's layout.
-
-The state is then built straight into that layout: the trainer runs `jax.jit(lambda: nn.unbox(init_fn()), out_shardings=state_sharding)()`, so a model too large for one device is never materialized on one device, and any flax metadata a caller's own module attached is gone before the optimizer, the EMA or the checkpointer can see it.
+`Layout.shardings(mesh, state)` derives the placement of the whole train state in one pass: `declared_axes` reads the names off each leaf's path, the rules map them to mesh axes, and axes of size 1 drop out. Optimizer moments and the EMA copy pick up their parameter's spec without anyone describing the optimizer's layout. The trainer then builds the state straight into that layout with `jax.jit(initial_state, out_shardings=...)`, so a model too large for one device is never materialised on one.
 
 ## Sharding tolerance
 
-`Layout.check` is a startup assertion, run by the trainer whenever a parameter axis of the mesh is above one: if more than `sharding_tolerance` of the shardable parameter elements ended up replicated, the run stops before step one, naming the fraction and the five largest replicated parameters by path, shape and element count. This is the guardrail against a mesh whose parameter axes divide none of the model's dimensions, which the shape heuristic used to absorb in silence. `--trainer.layout.tolerance 1.0` disables it.
-
-"Shardable" means at or above `min_shard`. The reference (`utils/sharding.py:605` `assert_params_sufficiently_sharded`, tolerance from `configs/base.yml:672-673`) is the same ratio (replicated elements over total, raise above the tolerance, name the five largest by `jax.tree_util.keystr` path) taken over every parameter, which it can do because it has no size threshold. Here a small parameter is replicated on purpose, so counting it would make the check fire on models that are merely small rather than badly laid out. MaxText also restricts the check to mesh axes that exist and are larger than one (`_get_nontrival_mesh_axes`); on a `(data, expert, fsdp)` mesh those are `expert` and `fsdp`, and a parameter split over either one counts as sharded, so the check is skipped only when both are one. The default tolerance is MaxText's 0.02.
+`Layout.check` runs before step one whenever a parameter axis of the mesh is above one. If more than `tolerance` (2% by default) of the shardable parameter elements are replicated, the run stops and names the fraction and the five largest replicated parameters by path, shape and element count. This is the check MaxText runs (`assert_params_sufficiently_sharded`), restricted here to parameters at or above `min_shard`, since a small parameter is replicated on purpose. `--trainer.layout.tolerance 1.0` disables it.
 
 ## The step
 
-The training step is jitted with explicit `in_shardings` (state, replicated rng, sharded batch) and `out_shardings`, and donates the train state so its buffers are reused. Nothing may alias the donated state after the call, which is why the trainer reassigns `self.state` from the step's return value.
+The training step is jitted with explicit `in_shardings` (the state's layout, a replicated loss scale, the batch placement) and `out_shardings`, and donates the train state. The loss is a mean over the batch-sharded axis, so the gradient carries its own cross-device all-reduce; there is no `pmean` in the trainer.
 
-The loss is a mean over the batch-sharded axis, so gradients carry their cross-device all-reduce on their own. There is no explicit `pmean` anywhere in the trainer.
-
-Loss health is watched on device: a non-finite streak counter rides along with the step and is read on the logging cadence, so the loop never synchronizes just to check. A streak of `max_bad_loss_steps` stops the run with an error instead of letting it burn through the schedule.
+Loss health is watched on device. A counter of consecutive non-finite losses rides along with the step and is read on the logging cadence, so the loop never synchronises to check it. A streak of `BAD_LOSS_STEPS` (5) stops the run.
 
 ## Feeding the devices
 
-`shard_batch(sharding, batch)` assembles this process's slice of each array into a globally sharded array with `jax.make_array_from_process_local_data`, which is what makes the multi-host case identical to the single-host one.
+`DevicePrefetchIterator(iterator, mesh, depth=2)` runs the host-to-device transfer a few batches ahead of the loop on a background thread. It tracks the position of the batch it most recently handed out, not the one the thread has raced ahead to, which is what makes a mid-epoch resume land on the next unseen batch. An exception in the thread is raised on the consumer's side.
 
-A multi-process run has to join the process pool before any of that. The recipes call `jax.distributed.initialize()`, which finds the coordinator from the environment on TPU pods and clusters; on a machine with no cluster environment the call reports that and the run continues on one process. Any other failure stops the run rather than training one process on a slice of the data and calling it a full run. `--trainer.multi-host True` requires the pool, `--trainer.multi-host False` never asks for it, and the default `None` is the behaviour above. Right after the join, `prepare_process` runs one collective (`sync_global_devices`) while the processes are still together, which they are only there: `initialize()` returns everywhere once the last process has connected. The first collective otherwise falls inside orbax's checkpoint-manager barrier in the trainer, after a wandb init on process 0, an artifact download and every process's model build have spread the processes out, and on CPU a rendezvous has a 30 second deadline. The pool tests join the same way, from the environment a launcher leaves.
+A multi-process run joins the process pool before any of that. `prepare_process(multi_host=...)` calls `jax.distributed.initialize()`, which finds the coordinator from the environment on TPU pods and clusters; on a machine with no cluster environment the run continues on one process. `multi_host=True` requires the pool, `multi_host=False` never asks for it. Right after the join every process runs one collective while the processes are still together, so a process that missed the pool fails there and not minutes later inside the first step.
 
-`DevicePrefetchIterator(iterator, sharding, depth=2)` runs that transfer a few batches ahead of the loop on a background thread. Without it the host-to-device copy sits on the critical path, because the loop only starts moving batch N+1 after step N has been dispatched. Exceptions raised in the thread are re-raised on the consumer's side rather than swallowed.
-
-If the underlying iterator can report a position (grain's can), the prefetcher tracks the position of the batch it most recently handed out, not the one the thread has raced ahead to. That is what makes a mid-epoch resume land on the next unseen batch.
-
-A validation pass scores the same number of batches on every process. The token and packed splits are whole files strided per process, so one process can pack a batch more than another, and a process that left the pass while the others waited in its collectives would wedge the pool. Before the loop each process pulls up to `val_steps_per_epoch` batches, the counts are gathered, and every process scores the smallest; a process that holds more prints how many it left out.
+A validation pass scores the same number of batches on every process. The token splits are whole files strided per process, so one process can run out before another; each batch is agreed with `minimum_across_processes` before it is scored, so no process leaves the pass while the others wait in its collectives.
 
 ## Checkpoints
 
-Saving is async and sharded arrays go straight to orbax; gathering them onto the host first would serialize the whole state through one process. `Checkpoints.wait()` blocks until the writes have landed, and anything that reads a checkpoint back has to call it first.
+`Checkpoints(directory, keep=2)` writes with Orbax, asynchronously, and sharded arrays go from the devices to storage without passing through one host. `Checkpoints.wait()` blocks until the writes have landed; `fit` calls it before returning.
 
-A checkpoint holds the train state (`step`, `params`, `opt_state`, `ema`, `key`) and the data iterator's position when there is one, and nothing else: no metrics, no loss scale, no epoch counter. Grain reports a position as JSON bytes, and every process has its own, because each reads its own shard of the data. Orbax writes a host array from process 0 alone, so before a save the positions are gathered onto every process into the checkpoint's one `position` entry: `rows`, a uint8 array with one row per process padded to the longest, and `lengths`, the unpadded length of each. On restore each process takes the row at its own `jax.process_index()`. A checkpoint written by a different process count is refused at load with both counts in the message, because a position is where one shard stopped and has no meaning on another shard count; only a checkpoint without a position resumes on any count.
+A checkpoint holds the train state (`step`, `params`, `opt_state`, `ema`, `key`) and `position`, every process's place in its data stream: one row per process, gathered before the save because Orbax writes a host array from process zero alone. On restore each process takes its own row. A checkpoint written by two processes refuses to resume on one, with both counts in the message, since a position per process has no meaning on a different count.
 
-Restoring builds a template from the freshly initialized state, so shapes, dtypes and the step counter survive, and it passes `ArrayRestoreArgs` with this run's sharding for the state alone. A checkpoint written on one mesh therefore restores onto a different one, and the rest of the payload stays on the host.
+Restoring builds a template from the freshly initialised state, so shapes, dtypes and the step survive, and passes this run's shardings for the state. A checkpoint written on one mesh restores onto another.
 
 ## Throughput
 
-`dew.telemetry.instrumentation` measures rather than estimates. `step_flops(jitted, *args)` counts the matmuls and convolutions in the compiled step's optimized HLO, from their own shapes: every `dot` and `convolution`, and the cuBLAS, cuDNN convolution and cuDNN fused-attention custom calls a GPU backend hands them to, which the compiler's own cost analysis leaves out. The count is per device, because the optimized module is what one device runs. `model_flops_utilization(flops_per_step, step_time)` turns that into a fraction of one device's peak using a small table of vendor dense bf16 numbers; hardware that is not in the table reports nothing rather than a made-up number. `enable_compilation_cache(path)` persists compiled executables so a restart skips XLA compilation.
+`dew.telemetry.instrumentation` measures rather than estimates. `compiled_flops(compiled)` counts the matmuls and convolutions in the compiled step's optimised HLO from their own shapes, including the cuBLAS, cuDNN convolution and fused-attention custom calls a GPU backend hands them to. `model_flops_utilization(flops, step_time)` turns that into a fraction of one device's dense bf16 peak from a table covering TPU v4 to v6e, A100, H100, H200 and the RTX 4080; hardware not in the table reports nothing. The trainer logs `train/samples_per_sec` and `train/mfu` on the logging cadence.
 
-That cache is on by default: `--trainer.compilation-cache-dir` starts at `default_compilation_cache_dir()` (`$XDG_CACHE_HOME/dew/xla`, or `~/.cache/dew/xla`), and `--trainer.compilation-cache-dir None` turns it off. On a DiT-B it takes the time to the first step from 55s to 5s and leaves the step itself alone.
+The XLA compilation cache is on by default under `~/.cache/dew/xla` (`--trainer.compilation-cache-dir None` turns it off). On a DiT-B it takes the time to the first step from 55 s to 5 s.
 
-The trainer logs `train/samples_per_sec` and the MFU it could compute alongside the loss, on the same logging cadence.
-
-`--trainer.xla-flags` appends to `XLA_FLAGS` for the run. `prepare_process` applies it, which is a recipe's first line, because XLA reads that variable once when it opens a backend: a flag set after the first JAX call does nothing. A library user who never runs a recipe sets `XLA_FLAGS` in the environment instead. The default is None, and `docs/performance.md` has the sweep behind that default.
+`--trainer.xla-flags` appends to `XLA_FLAGS` for the run. `prepare_process` applies it as a recipe's first line, because XLA reads the variable once when it opens a backend. A library user who never runs a recipe sets `XLA_FLAGS` in the environment. `docs/performance.md` has the sweep behind the default.

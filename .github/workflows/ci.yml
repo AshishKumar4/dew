@@ -1,5 +1,5 @@
-# Installs dew-ml, checks for syntax errors and undefined names, runs the
-# CPU test lane. For more information see:
+# Installs dew-ml, checks for syntax errors and undefined names, type checks
+# src/dew, runs the CPU test lane. For more information see:
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: CI
@@ -33,6 +33,12 @@ jobs:
       run: |
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    - name: Type check with pyright
+      run: |
+        # dew ships py.typed; the declared boundary is src/dew at zero errors.
+        # The runner has no .venv, so the interpreter is named explicitly.
+        pip install uv
+        uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
     - name: Test with pytest
       run: |
         JAX_PLATFORMS=cpu pytest -m "not network" -q -ra --junitxml=pytest-report.xml
