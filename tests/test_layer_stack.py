@@ -142,20 +142,20 @@ def deepseek_shaped(**overrides):
 
 
 # The runs the three shapes form, and the bounds on the scanned logits and
-# gradients against the plain loop's. A provider (the last layer of its
-# kind before the sharing layers) is a run of one, and so is the layer
-# between two runs of another kind. Largest observed differences on CPU:
-# logits 2.5e-05 (gemma4), 1.5e-04 (gemma3n), 4.5e-06 (deepseek) on logits
-# of order 4; gradients 3.0e-05 (gemma4), 4.9e-07 (deepseek), and 2.1e-02
-# on the gemma3n shape's embedding gradient of order 8. Gemma 3n's
-# activation sparsity is a relu at 1.64 standard deviations above each
-# gate row's mean, so a rounding difference in the row's statistics moves
-# the kink, and the ten layers of it between the loss and the embedding
-# turn fusion-order rounding into a relative difference of 3e-3 there.
+# gradients against the plain loop's, both compiled as a training step
+# compiles them. A provider (the last layer of its kind before the sharing
+# layers) is a run of one, and so is the layer between two runs of another
+# kind. Largest observed differences on CPU: logits 0.0 and gradients
+# 2.3e-08 (gemma4), 0.0 and 0.0 (deepseek), and 2.7e-05 on logits of order
+# 4 and 1.1e-03 on the embedding gradient of order 8 for gemma3n. Gemma
+# 3n's activation sparsity is a relu at 1.64 standard deviations above
+# each gate row's mean, so a rounding difference in the row's statistics
+# moves the kink, and the ten layers of it between the loss and the
+# embedding turn that into a relative difference of 1e-4 there.
 SHAPES = {
-    "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-4, 1e-4),
-    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 1e-3, 5e-2),
-    "deepseek": (deepseek_shaped, ((0, 1), (1, 5)), 1e-4, 1e-5),
+    "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-6, 1e-6),
+    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 1e-4, 5e-3),
+    "deepseek": (deepseek_shaped, ((0, 1), (1, 5)), 1e-6, 1e-6),
 }
 
 
@@ -182,17 +182,16 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     plain, scanned, variables, ids = scanned_pair(build)
     assert scanned.bind(variables).groups == runs
 
-    logits = scanned.apply(variables, ids)
-    difference = float(jnp.max(jnp.abs(logits - plain.apply(variables, ids))))
+    logits = jax.jit(scanned.apply)(variables, ids)
+    difference = float(jnp.max(jnp.abs(logits - jax.jit(plain.apply)(variables, ids))))
     assert difference < logit_bound, f"max |logit difference| {difference:.3e}"
 
-    def loss(params, model):
-        return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
+    def gradients(model):
+        def loss(params):
+            return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
+        return jax.jit(jax.grad(loss))(variables["params"])
 
-    plain_grads = jax.grad(loss)(variables["params"], plain)
-    scanned_grads = jax.grad(loss)(variables["params"], scanned)
-    difference = max(jax.tree.leaves(jax.tree.map(
-        lambda a, b: float(jnp.max(jnp.abs(a - b))), plain_grads, scanned_grads)))
+    difference = largest_difference(gradients(plain), gradients(scanned))
     assert difference < gradient_bound, f"max |gradient difference| {difference:.3e}"
 
 
