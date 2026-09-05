@@ -3,7 +3,7 @@
 The mesh carries five axes; parameters distinguish fsdp, expert and tensor,
 and the batch's sequence dimension rides sequence. Widths stay on fsdp
 unless a run's rules redirect them onto tensor, so the default mesh places
-as the three-axis one did. A fit on each of the four sim-mesh topologies
+as the three-axis one did. A fit on each of the five sim-mesh topologies
 trains the same losses: sharding moves values, never changes them.
 """
 
@@ -26,8 +26,8 @@ VOCAB = 64
 # Training batches carry seq_len + 1 columns for the one-token shift, so the
 # 17 columns of a 16-token model never split over a sequence axis of two: the
 # batch stays whole over it, and the attention claims the axis for the
-# model's 16 tokens itself (tests/test_sequence_parallel.py). A model length
-# the striped order cannot pair, 15 say, is refused by name.
+# model's 16 tokens itself (tests/test_sequence_parallel.py). The striped
+# order needs a length that is a multiple of twice the shard count.
 SEQ_LEN = 16
 BATCH = 8
 TINY_SHARD = 256
