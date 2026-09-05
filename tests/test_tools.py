@@ -5,7 +5,7 @@ benchmark_data.py, and run on a case small enough for CPU in seconds. A
 reference generator writes its tiny fixture into a temporary directory and
 the result is compared with what is committed, so a generator that drifts
 from its fixture, or a library upgrade that changes the reference, shows up
-here rather than in a parity test measuring Dew against stale evidence. A
+here, before a parity test measures Dew against stale evidence. A
 benchmark runs its pure pieces, and its real entry point where the step
 compiles on CPU in seconds.
 """
@@ -268,8 +268,8 @@ TINY_LM = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2
 
 
 def test_step_benchmark_keeps_the_cases_it_measured_when_a_later_one_fails(tmp_path):
-    """A sweep writes --json-out after every case, so a case that cannot be
-    built loses nothing measured before it: the file holds the finished row,
+    """A sweep writes --json-out after every case, so the rows measured before
+    a case that cannot be built are kept: the file holds the finished row,
     and only that row."""
     tool = load("benchmark_step")
     out = tmp_path / "rows.json"
@@ -321,7 +321,7 @@ def test_step_benchmark_refuses_a_case_it_cannot_name():
 def test_step_benchmark_packed_rows_restart_positions_at_every_document():
     """A row of 17 tokens packed as 4 documents is three of 5 and one of 2:
     the segment ids count the documents from 1 and the positions count from
-    0 inside each, which is what the packed loader's mask and RoPE read."""
+    0 inside each, the form the packed loader's mask and RoPE read."""
     tool = load("benchmark_step")
     case = tool.Case("causal_transformer", dict(TINY_LM), batch_size=2, seq_len=16,
                      packed_documents=4)

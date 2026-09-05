@@ -1,7 +1,7 @@
 """The mixer seam: one declared value naming a layer's mixer, by kind.
 
-The backbone takes a `mixer` value from the `mixers` registry — None for
-today's grouped-query causal attention — and each kind builds its own
+The backbone takes a `mixer` value from the `mixers` registry (None for
+today's grouped-query causal attention), and each kind builds its own
 `DecoderBlock` factory from the layer's context. A new kind registers its
 value and plugs in with no branch on the backbone, which `test_scale` here
 proves by being one: a second member that exists only in this file, yet
@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import pytest
 from flax import linen as nn
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
 from dew.registry import models
 
@@ -52,14 +52,6 @@ class ScaleMixer(MixerBase):
     def build(self, ctx: MixerContext):
         del ctx
         return functools.partial(ScaleMixerModule, scale=self.scale)
-
-
-def test_the_default_mixer_is_todays_attention():
-    """None builds the grouped-query attention tree, unchanged."""
-    params = tiny().init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-
-    assert tiny().mixer is None
-    assert params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"].shape == (32, 32)
 
 
 def test_none_and_the_attention_value_build_the_same_tree():
@@ -138,7 +130,7 @@ def test_the_registry_builds_kinds_by_name():
 
 
 def test_a_kind_without_a_build_is_refused_loudly():
-    """A registered value that builds nothing fails at setup, not silently."""
+    """A registered value that builds nothing raises NotImplementedError at setup."""
 
     @mixers("test_empty")
     @dataclasses.dataclass(frozen=True)
@@ -157,30 +149,24 @@ def hybrid(**overrides):
     return tiny(layer_types=("full_attention", "linear"), **overrides)
 
 
-def test_a_kind_names_its_own_mixer():
-    """One kind's layers build from its value, the other kind from the model's."""
-    from dew.nn.backbones.causal_transformer import CausalSelfAttention, LayerKind
+def test_a_kind_selects_the_mixer_its_layers_run():
+    """A kind's mixer value builds that kind's layers and the model's value
+    the rest, observed through the forward pass: a ScaleMixer of 0 on one
+    kind zeroes that kind's mixing, so the logits move when the assignment
+    flips and the two kinds are told apart by what they compute."""
+    ids = jnp.ones((2, 8), jnp.int32)
+    key = jax.random.key(0)
+    per_kind = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(scale=0.0))})
+    swapped = hybrid(mixer=ScaleMixer(scale=0.0), kinds={"linear": LayerKind(mixer={"kind": "attention"})})
+    plain = hybrid()
 
-    model = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(scale=0.0))})
-    bound = model.bind(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
+    kind_logits = per_kind.apply(per_kind.init(key, ids), ids)
+    swapped_logits = swapped.apply(swapped.init(key, ids), ids)
+    plain_logits = plain.apply(plain.init(key, ids), ids)
 
-    assert isinstance(bound.layers[0].self_attn, CausalSelfAttention)
-    assert isinstance(bound.layers[1].self_attn, ScaleMixerModule)
-    logits = model.apply(model.init(jax.random.key(0), jnp.ones((2, 8), jnp.int32)),
-                         jnp.ones((2, 8), jnp.int32))
-    assert logits.shape == (2, 8, VOCAB)
-
-
-def test_a_kind_mixer_beats_the_model_mixer():
-    """The kind's value wins where set; elsewhere the model's applies."""
-    from dew.nn.backbones.causal_transformer import CausalSelfAttention, LayerKind
-
-    model = hybrid(mixer=ScaleMixer(scale=0.0),
-                   kinds={"linear": LayerKind(mixer={"kind": "attention"})})
-    bound = model.bind(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
-
-    assert isinstance(bound.layers[0].self_attn, ScaleMixerModule)
-    assert isinstance(bound.layers[1].self_attn, CausalSelfAttention)
+    assert not jnp.allclose(kind_logits, plain_logits)
+    assert not jnp.allclose(swapped_logits, plain_logits)
+    assert not jnp.allclose(kind_logits, swapped_logits)
 
 
 def test_a_kind_record_coerces_like_the_model_record():

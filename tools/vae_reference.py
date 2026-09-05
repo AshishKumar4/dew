@@ -22,9 +22,9 @@ What lands in tests/fixtures/vae:
   (config.json + diffusion_pytorch_model.safetensors), shaped like the SD3.5
   and Flux VAE where it matters: `latent_channels` 16, `use_quant_conv` and
   `use_post_quant_conv` false, and the SD3 `shift_factor`/`scaling_factor`.
-  Two stages instead of four, so it is a few megabytes rather than 320. The
-  reference's fp32 encode (the posterior mean) and decode of one committed
-  image, so the parity test needs no network.
+  Two stages, where the released VAE has four, so it is a few megabytes and
+  not 320. The reference's fp32 encode (the posterior mean) and decode of
+  one committed image, so the parity test needs no network.
 """
 
 import argparse

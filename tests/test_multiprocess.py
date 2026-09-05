@@ -146,8 +146,8 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     """A tokenized corpus whose windows say which record they are.
 
     The stream is a ramp, so the window of record i opens with token
-    i * seq_len and a process can report the records it read rather than their
-    contents.
+    i * seq_len and a process can report the records it read by index, with
+    no contents.
     """
     directory.mkdir(parents=True, exist_ok=True)
     tokens = np.arange(records * seq_len + 1, dtype=np.uint16)
@@ -228,9 +228,9 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
 @pytest.mark.distributed
 def test_a_default_run_name_takes_its_timestamp_from_process_zero(two_processes):
     """The date in a default run name is the checkpoint directory's name, and
-    every process writes into that directory. Each process used to read its
-    own clock; the worker sets process 1's a year ahead, and a name built
-    from it would put process 1's shards in a directory of their own."""
+    every process writes into that directory, so the name comes from process
+    zero's clock. The worker sets process 1's clock a year ahead; a name
+    built from it would put process 1's shards in a directory of their own."""
     stamps = [report["run_timestamp"] for report in two_processes]
     assert stamps[0] == stamps[1]
     assert int(stamps[0][:4]) == two_processes[0]["own_year"]
@@ -277,8 +277,8 @@ def test_processes_read_disjoint_shards_that_cover_the_corpus(tmp_path):
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(records))
     for report in reports:
-        # The dataset reports the whole corpus, which is what a run turns into
-        # steps per epoch, and batches the local slice of the global batch.
+        # The dataset reports the whole corpus (a run turns that into steps
+        # per epoch) and batches the local slice of the global batch.
         assert report["train_len"] == records
         assert report["global_batch_size"] == worker.BATCH
         assert report["local_batch_size"] == worker.BATCH // 2
@@ -318,11 +318,11 @@ def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
     The packed split strides its documents over the processes and packs each
     stride on its own. Of these 60 documents, 16 on process 0's stride and
     20 on process 1's fill a window and the rest are one eos each, so the
-    strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each process
-    used to bound its own pass with an islice: asked for 5, process 1 issued
-    a fifth validation collective after process 0 had left the pass, and the
-    pool sat in it until the heartbeat killed both. Each batch is agreed
-    before it is scored, so both score 4.
+    strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each batch is
+    agreed before it is scored, so both score 4; a process that bounded its
+    own pass with an islice would issue a fifth validation collective after
+    the other had left the pass, and the pool would sit in it until the
+    heartbeat killed both.
     """
     seq_len, val_steps = 8, 5
     lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
@@ -416,9 +416,9 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
 def test_a_checkpoint_written_by_a_pool_restores_in_one_process(tmp_path):
     """Two processes write the shards of one checkpoint; one process reads it.
 
-    A checkpoint is bytes rather than arithmetic, so the restored parameters
-    have to be equal, not close. The reading run also uses a different mesh,
-    which is what a resume on smaller hardware does.
+    A checkpoint is bytes, not arithmetic, so the restored parameters have
+    to be equal, not close. The reading run also uses a different mesh, as a
+    resume on smaller hardware does.
     """
     pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=2, steps=4, save=True,
                     name="pool", run_dir=tmp_path / "written")
@@ -438,7 +438,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     """The other direction, onto a mesh whose fsdp axis is four wide.
 
     Every process has to end up with the same parameters the writer had, and
-    with arrays that span the pool rather than copies of a local restore.
+    with arrays that span the pool, not copies of a local restore.
     """
     single = run_worker("steps", tmp_path / "single.json", fsdp_size=1, steps=4,
                         save=True, name="single", run_dir=tmp_path / "written")
@@ -550,8 +550,8 @@ def committed_steps(checkpoints: Path) -> list[int]:
 def kill_when_blocked(process, marker: Path, landed: Path, timeout=600) -> int:
     """SIGKILL the run once it is blocked mid-epoch with `landed` on disk.
 
-    Waiting on the checkpoint rather than on a duration is what makes the step
-    the run dies past the same everywhere. The source has stopped handing out
+    Waiting on the checkpoint, not on a duration, is what makes the step the
+    run dies past the same everywhere. The source has stopped handing out
     batches, so nothing can advance while this waits.
     """
     deadline = time.monotonic() + timeout
@@ -615,7 +615,7 @@ def test_a_killed_run_resumes_on_the_batch_after_its_checkpoint(tmp_path, whole_
 
     assert resumed["step"] == STEPS
     # Same final position means the same batches were consumed overall, in the
-    # same order, with the two uncommitted ones redone rather than skipped.
+    # same order, with the two uncommitted ones redone, not skipped.
     assert resumed["dataset_state"] == whole_run["dataset_state"]
     assert_same_parameters(dumped_params(tmp_path / "resumed.json"), whole_run["params"])
 
@@ -656,14 +656,14 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
 
 @pytest.mark.distributed
 def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
-    """The default diffusion validation, in the topology it used to die in.
+    """The default diffusion validation on two ranks.
 
     Every rank holds one shard of the sampled grid and of the batch the metric
-    reads, and numpy cannot read a shard at all: `evaluate` decoded captions
-    off the batch's tokens with np.asarray and the clip metric read the
-    artifact the same way, so the pass raised on every rank at once. The
-    artifacts and the batch come home through one collective every rank makes,
-    so the score is over the whole global batch and both ranks agree on it.
+    reads, and numpy cannot read a shard at all: `evaluate` decoding captions
+    off the batch's tokens with np.asarray, or the clip metric reading the
+    artifact the same way, raises on every rank at once. The artifacts and the
+    batch come home through one collective every rank makes, so the score is
+    over the whole global batch and both ranks agree on it.
     """
     reports = run_pool("validate", tmp_path, 2, fsdp_size=2, steps=1)
 

@@ -709,8 +709,8 @@ def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
     return params
 
 
-# The SD1-era flax weights live on their own branches, so these name a layout
-# rather than a revision anyone pinned.
+# The SD1-era flax weights live on their own branches, so these name a layout,
+# not a pinned revision.
 FLAX_REVISIONS = ("bf16", "flax")
 
 
@@ -722,13 +722,13 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
-    reads by name, so the newer latent spaces load through the same seam.
+    reads, so the newer latent spaces load through the same seam.
     Returns a dict with `config` (dict) and `params` (nested param tree).
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision is
-    a pin: the torch path reads exactly it and raises rather than falling back
-    to the default branch, so a rerun cannot quietly read other weights.
+    a pin: the torch path reads only that revision and raises
+    FileNotFoundError when the repo has no weights at it.
     """
     from flax.serialization import msgpack_restore
 

@@ -132,7 +132,7 @@ def test_a_named_dataset_reloads_by_name_and_split(hub):
 
     reloaded = pickle.loads(payload)
     assert reloaded[3]["caption"] == "caption number 3"
-    # The worker's copy went back to load_dataset rather than carrying rows.
+    # The worker's copy went back to load_dataset and carried no rows.
     assert hub == [{"name": "acme/pets", "split": "validation"}] * 2
 
 

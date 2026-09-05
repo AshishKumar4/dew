@@ -35,7 +35,8 @@ from dew.training.optim import OPTIMIZER_MAP
 RES = 8
 BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
-# lower it or "FSDP on" would silently mean "everything replicated".
+# the threshold is lowered; at the production value "FSDP on" would replicate
+# everything.
 TINY = 256
 
 
@@ -205,7 +206,7 @@ def dit_variables(**overrides):
 
 def test_causal_transformer_axes_land_on_the_dimensions_they_name():
     """One rule at a time: the dimension that moves is the one the module
-    declares, which is what a declared axis has to mean."""
+    declares."""
     model = CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
         num_kv_heads=1, mlp_features=64, max_seq_len=8, tie_embeddings=False)
@@ -326,8 +327,8 @@ def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
 @pytest.mark.parametrize("axis", ["sequence", "data", "fspd"])
 def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused(axis):
     """The data and sequence axes split the batch: a parameter placed on
-    either would be gathered on every use. A misspelt axis is refused the
-    same way, at construction, rather than as a KeyError inside placement."""
+    either would be gathered on every use. A misspelt axis raises the same
+    ValueError, at construction, before placement reads the rules."""
     with pytest.raises(ValueError, match=axis):
         Layout(rules={"embed": axis})
 
@@ -390,8 +391,8 @@ def test_odd_vocabulary_shards_the_embedding_on_its_other_axis(fsdp_size):
     """GPT-2's 50257 rows divide by nothing, so the rule that wins the
     embedding cannot be taken: the width has to carry the shard, or a real run
     stops on the tolerance check with 98% of the model replicated. Nothing
-    about that changes as the fsdp axis widens, which is where a fallback that
-    only ever divided by two would show up."""
+    about that changes as the fsdp axis widens; a fallback that only ever
+    divided by two would show up at four and eight."""
     model = CausalTransformer(
         vocab_size=50257, emb_features=64, num_layers=1, num_heads=2,
         num_kv_heads=1, mlp_features=128, max_seq_len=8)
@@ -612,7 +613,7 @@ def test_a_checkpoint_restores_across_the_whole_fsdp_range(tmp_path, written, re
 
     Both directions of the widest change the simulated mesh allows: every
     parameter replicated, and every parameter split eight ways. A checkpoint
-    is bytes rather than arithmetic, so the values have to come back equal.
+    is bytes, not arithmetic, so the values have to come back equal.
     """
     trained = make_trainer(tmp_path, fsdp=written).fit(Data(batches), steps=1, log_every=1)
     before = [np.asarray(leaf).copy() for leaf in jax.tree.leaves(trained.params)]
@@ -646,7 +647,7 @@ def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_
 def make_accumulating(tmp_path=None, accumulation=1):
     return make_trainer(
         tmp_path, fsdp=2, optimizer=optax.sgd(0.5), accumulation=accumulation,
-        # A ramp rather than a constant, so indexing the schedule by micro-step
+        # A ramp, not a constant, so indexing the schedule by micro-step
         # instead of by update is visible in the result.
         objective=DeterministicObjective(optax.linear_schedule(0.9, 1.0, transition_steps=8)))
 
@@ -1003,12 +1004,12 @@ def test_a_one_dimensional_parameter_shards_on_its_only_axis(fsdp_size):
 @pytest.mark.parametrize("fsdp_size,replicated_fraction", [(2, 0.0), (4, 0.36), (8, 0.90)])
 def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it(
         fsdp_size, replicated_fraction):
-    """62 features divide by two and by nothing else the mesh offers.
+    """62 features divide by two and by no other size the mesh offers.
 
     The rules drop a name they cannot use, so the wider the fsdp axis the more
     of this model stays whole: nothing at two, a third at four, nine tenths at
     eight. What must not happen is a run that trains anyway with the model
-    replicated on every device, which is what the tolerance check is for.
+    replicated on every device; the tolerance check stops it.
     """
     model = CausalTransformer(
         vocab_size=64, emb_features=62, num_layers=1, num_heads=1, num_kv_heads=1,
@@ -1019,7 +1020,7 @@ def test_a_width_the_mesh_cannot_divide_stops_the_run_rather_than_replicating_it
     layout = Layout(min_shard=TINY)
     shardings = layout.shardings(mesh, variables)
 
-    # Whatever the rules could not place, they left alone rather than named.
+    # Whatever the rules could not place, they left alone and unnamed.
     assert_specs_can_split(variables["params"], shardings["params"], fsdp_size)
 
     if not replicated_fraction:

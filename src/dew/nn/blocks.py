@@ -20,7 +20,7 @@ class FourierEmbedding(nn.Module):
 
     def setup(self):
         # Fixed frequencies via numpy so they are identical across jax versions
-        # (jax 0.5.0 changed the default PRNG and silently altered these)
+        # (jax 0.5.0 changed the default PRNG, which changed these).
         freqs = np.random.RandomState(42).normal(size=(self.features // 2,))
         self.freqs = jnp.asarray(freqs, dtype=jnp.float32) * self.scale
 

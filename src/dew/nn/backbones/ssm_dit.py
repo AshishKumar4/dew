@@ -24,9 +24,8 @@ class HybridSSMAttentionDiT(nn.Module):
 
     The mixer of every layer comes from `ssm_attention_ratio`, a shorthand
     that reads the same at any depth ("3:1", "all-ssm"), or from
-    `block_pattern`, which names each layer. Setting both is refused, since
-    a pattern that won over the ratio in silence would train something other
-    than what the config says.
+    `block_pattern`, which names each layer. Setting both raises a ValueError
+    at setup.
     """
     output_channels: int = 3
     patch_size: int = 16

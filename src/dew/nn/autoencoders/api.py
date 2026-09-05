@@ -20,8 +20,7 @@ class AutoEncoder(ABC):
 
     The weights are an argument, as a `ConditionEncoder`'s are: `params` holds
     what a run loaded, and every call takes the tree to use, so the layout
-    places the weights and the checkpoint carries them, rather than a step
-    baking them in as a constant replicated on every device.
+    places the weights and the checkpoint carries them.
     """
 
     latent_shift: float = 0.0

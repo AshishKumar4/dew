@@ -41,8 +41,8 @@ class Registry(Mapping[str, T], Generic[T]):
         self.kind = kind
         # A decorator has no base class to test the member against, and it
         # hands back the class it decorated so a caller's checker keeps the
-        # concrete type (`DiffusionObjective` rather than `Objective`). The
-        # table is untyped here and typed on the way out.
+        # concrete type (`DiffusionObjective`, not `Objective`). The table is
+        # untyped here and typed on the way out.
         self._members: dict[str, Any] = {}
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
@@ -101,8 +101,8 @@ class Registry(Mapping[str, T], Generic[T]):
 
         A field the member does not declare is an error. Fields arrive from
         JSON as often as from code, so a field whose declared type is a value
-        builds from a record here, the one boundary where a logged config
-        becomes an object: `models.build("m", attention={"heads": 8})` and
+        builds from a record here, where a logged config becomes an object:
+        `models.build("m", attention={"heads": 8})` and
         `models.build("m", attention=Attention(heads=8))` agree.
         """
         member = self[name]
@@ -211,8 +211,8 @@ def from_record(annotation: Any, value: Any) -> Any:
         held = _value_type(annotation)
         if held is None:
             # A record with no value class behind it, such as one of the unets'
-            # per-stage attention settings: entries are walked and the dtype
-            # rule below still applies by name.
+            # per-stage attention settings: entries are walked and a "dtype"
+            # entry resolves the same way as a dtype field.
             entries = entry_types(annotation, len(value))
             return {key: resolve_dtype(item) if key == "dtype" else from_record(entry, item)
                     for entry, (key, item) in zip(entries, value.items())}
@@ -231,7 +231,7 @@ def from_record(annotation: Any, value: Any) -> Any:
 
 
 def _field_value(member: Any, field: str, value: Any) -> Any:
-    """One field on its way into `member`: a dtype by name, a value from a record."""
+    """One field on its way into `member`: a dtype from its name, a value from a record."""
     if field == "dtype":
         return resolve_dtype(value)
     return from_record(_declared_type(member, field), value)

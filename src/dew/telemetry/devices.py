@@ -11,8 +11,8 @@ def apply_xla_flags(flags: str | None) -> None:
     """Append flags to XLA_FLAGS, which XLA reads when it initializes a backend.
 
     The flags are appended because the environment may already carry some
-    (CI sets the host device count). Only useful before the first JAX call,
-    which is why `dew.training.prepare_process` is the one caller.
+    (CI sets the host device count). Only useful before the first JAX call;
+    `dew.training.prepare_process` calls it there.
     """
     if not flags:
         return

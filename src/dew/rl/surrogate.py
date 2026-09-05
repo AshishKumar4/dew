@@ -21,7 +21,7 @@ stop-gradient trick) and of Tunix's `compute_kl_divergence`
 (`tunix/rl/common.py`), read against verl's `compute_policy_loss_vanilla`,
 `compute_policy_loss_gspo`, `agg_loss` and `kl_penalty_forward`
 (`verl/trainer/ppo/core_algos.py`, commit 896a9bb). Both projects are
-Apache-2.0, which is why this file carries their notice.
+Apache-2.0, and this file carries their notice.
 
 Where the two references disagree, this file follows verl, whose functions
 tools/parity_rl.py can call directly and tests/test_rl_surrogate.py compares

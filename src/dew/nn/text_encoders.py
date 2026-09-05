@@ -3,8 +3,8 @@ Face weights.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
 `dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE, in the
-reference layout with the weights read by name from the checkpoint's
-safetensors.
+reference layout, with each weight read from the checkpoint's safetensors
+under its reference tensor name.
 
 The CLIP port is `openai/clip-vit-large-patch14`: the text tower, which is the
 part a diffusion model conditions on, and the vision tower with the two
@@ -214,8 +214,8 @@ class CLIPVisionTransformer(nn.Module):
     `pixel_values` are what the checkpoint's image processor emits and what
     the reference takes: [B, C, H, W] at `image_size`, normalized. The
     sequence returned is the encoder output, and the pooled row is the class
-    token through the post layer norm, which is how `CLIPVisionModel.forward`
-    parts them.
+    token through the post layer norm, the split `CLIPVisionModel.forward`
+    makes.
     """
     hidden_size: int = 768
     intermediate_size: int = 3072
@@ -427,9 +427,8 @@ def _tower_path(hf_name: str, prefix: str,
     that tower's tree.
 
     None means the tensor has no place in the tree: position_ids is a buffer
-    of `arange`, not a parameter. A name the map cannot explain raises, so an
-    unfamiliar checkpoint fails here instead of loading with half of its
-    weights.
+    of `arange`, not a parameter. A name the map cannot explain raises
+    ValueError, so an unfamiliar checkpoint fails here with the tensor name.
     """
     name = hf_name.removeprefix(prefix)
     if name == "embeddings.position_ids":
@@ -596,7 +595,7 @@ class CLIPTextModel:
         """Load a checkpoint from the Hub or a local directory.
 
         `dtype` is the compute dtype, as on every other dew module. The
-        weights stay fp32, which is how the checkpoint stores them.
+        weights stay fp32, the dtype the checkpoint stores them in.
         """
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_config(_read_config(directory))
@@ -945,8 +944,8 @@ def _t5_path(hf_name: str) -> Optional[Tuple[str, ...]]:
 
     Only the shared embedding and the encoder blocks map. The decoder, the
     lm_head and the encoder's tied copy of the embedding are not this tower
-    and come back as None; any other name raises, so a renamed upstream
-    layout fails here instead of loading half a tower.
+    and come back as None; any other name raises ValueError with the tensor
+    name.
     """
     if hf_name == "shared.weight":
         return ("embed_tokens", "embedding")
@@ -1004,7 +1003,7 @@ class T5EncoderModel:
         tensors only.
 
         `dtype` is the compute dtype, as on every other dew module. The
-        weights stay fp32, which is how the checkpoint stores them. Sharded
+        weights stay fp32, the dtype the checkpoint stores them in. Sharded
         checkpoints (model-00001-of-00002.safetensors) load as one tower.
         """
         directory = _checkpoint_dir(name_or_dir, revision)

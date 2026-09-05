@@ -118,8 +118,8 @@ def tiny_qwen2() -> Qwen2ForCausalLM:
 # Llama 3.1's released ramp: factor 8 off 8192 positions, smoothing between
 # wavelengths 8192 / 4 and 8192 / 1. The tiny fixture keeps the ramp and
 # shrinks the pretraining context so that, at head_dim 16 and base 5e5, the
-# smoothing band holds frequencies of the tiny table rather than lying
-# beyond all of them.
+# smoothing band holds frequencies of the tiny table; at the released
+# context it would lie beyond all of them.
 LLAMA3_ROPE = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
                "high_freq_factor": 4.0, "original_max_position_embeddings": 64}
 
@@ -233,7 +233,8 @@ DEEPSEEK_YARN = {
     "original_max_position_embeddings": 4096,
 }
 # n_group 4 over 8 experts with topk_group 2 reaches four experts, which is
-# the top_k, so the group limit decides the choice rather than its order.
+# the top_k, so the group limit decides which experts are chosen, beyond
+# their order.
 DEEPSEEK_TINY = dict(
     vocab_size=256, hidden_size=32, intermediate_size=48,
     moe_intermediate_size=16, num_hidden_layers=2, num_attention_heads=4,
@@ -252,14 +253,14 @@ def tiny_deepseek_v3() -> DeepseekV3ForCausalLM:
     return DeepseekV3ForCausalLM(config)
 
 
-# The v32 fixture's weights come from this seed rather than the family's
-# 1234. The indexer scores a key at zero whenever every head's query-key
-# agreement is negative (the relu), and torch.topk and jax.lax.top_k break
-# an exact tie at the top-k boundary differently, so a fixture with a tie
-# on any row compares two selections rather than two implementations. At
-# two heads a quarter of the keys score zero and no seed in 3000 clears
-# every row by more than 3.6e-3; at eight heads seed 202 keeps the fourth
-# and fifth scores of every row of both layers at least 0.0217 apart.
+# The v32 fixture's weights come from this seed, not the family's 1234. The
+# indexer scores a key at zero whenever every head's query-key agreement is
+# negative (the relu), and torch.topk and jax.lax.top_k break an exact tie
+# at the top-k boundary differently, so a fixture with a tie on any row
+# compares two selections, not two implementations. At two heads a quarter
+# of the keys score zero and no seed in 3000 clears every row by more than
+# 3.6e-3; at eight heads seed 202 keeps the fourth and fifth scores of
+# every row of both layers at least 0.0217 apart.
 DEEPSEEK_V32_SEED = 202
 
 
@@ -366,7 +367,7 @@ def write_released_config(name: str, repo: str) -> None:
     Google's Gemma repos answer 401 without an accepted licence, so those
     come from unsloth's mirrors, which carry the identical config plus
     marker keys of their own (unsloth_fixed, unsloth_version); the markers
-    are dropped so the fixture is the released config and nothing else.
+    are dropped so the fixture is the released config alone.
     """
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)

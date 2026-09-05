@@ -24,7 +24,7 @@ from dew.telemetry.instrumentation import (
 # The suite compiles the same kernels every run, on both lanes, in every xdist
 # worker. XLA's persistent cache is keyed by the executable, so a second run
 # reuses the first one's compilations. DEW_TEST_NO_CACHE=1 measures the cold
-# cost, which is what the numbers in docs/performance.md were taken with.
+# cost; the numbers in docs/performance.md were taken with it set.
 if not os.environ.get("DEW_TEST_NO_CACHE"):
     _cache = default_compilation_cache_dir()
     if _cache:

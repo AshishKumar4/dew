@@ -75,7 +75,7 @@ def prepare_process(wandb: Wandb | None = None,
             # fall inside orbax's checkpoint-manager barrier in the trainer, by
             # which time the processes are as far apart as a wandb init and
             # their model builds, and a process that arrives late dies in gloo
-            # instead of failing where the run can report it.
+            # before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
     print(f"Number of devices: {jax.device_count()}")
 

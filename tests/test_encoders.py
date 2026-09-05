@@ -40,8 +40,8 @@ def test_masked_mean_ignores_padded_rows():
 
 
 def test_an_empty_mask_row_contributes_nothing(rng):
-    """A row with no real tokens pools to exactly zero, the same vector the
-    model gets with no text at all, rather than 0/0 = NaN."""
+    """A row with no real tokens pools to zero, the same vector the model
+    gets with no text at all; 0/0 would be NaN."""
     embed = ConditioningEmbed(emb_features=16, mlp_ratio=1)
     hidden = jax.random.normal(rng, (2, 6, 8))
     mask = jnp.array([[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]])

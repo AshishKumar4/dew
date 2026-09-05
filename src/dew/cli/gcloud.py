@@ -1,7 +1,6 @@
-"""The one seam between dew-tpu and the outside world.
+"""The subprocesses dew-tpu starts: every one is built, printed and run here.
 
-Every subprocess dew-tpu starts is built, printed and run here. A dry run
-prints the command and returns success without touching gcloud.
+A dry run prints the command and returns success without touching gcloud.
 """
 
 from __future__ import annotations

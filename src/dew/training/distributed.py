@@ -62,9 +62,9 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("heads", FSDP_AXIS),
     ("kv", FSDP_AXIS),
     # The latent widths multi-head latent attention compresses through and
-    # the sparse indexer's head dim: model-width-like, so they ride fsdp for
-    # now. That is a real choice, not a default: there is no tensor axis
-    # today, and one must not silently re-place these when it lands.
+    # the sparse indexer's head dim: model-width-like, so they ride fsdp.
+    # There is no tensor axis today; when one lands, these keep fsdp until
+    # a rule moves them.
     ("index", FSDP_AXIS),
     ("kvlora", FSDP_AXIS),
     ("qlora", FSDP_AXIS),
@@ -131,13 +131,12 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> M
 
     An MoE layer's expert dimension is the one dimension no dense model has,
     and splitting it is what expert parallelism is, so it gets its own axis
-    and does not compete with the model's widths for 'fsdp'. The tensor
-    axis is where a run's rules redirect a width when one card cannot hold
-    it; the sequence axis is where long sequences split; the stage axis is
-    where a decoder's layers split into pipeline stages, each stage on its
-    own devices. Sizes of 1 degenerate to plain data parallelism, so the
-    same code path serves every topology without a flag. Axes are Auto so
-    GSPMD infers the collectives.
+    and leaves 'fsdp' to the model's widths. The tensor axis is where a run's
+    rules redirect a width when one card cannot hold it; the sequence axis is
+    where long sequences split; the stage axis is where a decoder's layers
+    split into pipeline stages, each stage on its own devices. Sizes of 1
+    degenerate to plain data parallelism, so the same code path serves every
+    topology without a flag. Axes are Auto so GSPMD infers the collectives.
     """
     devices = list(devices) if devices is not None else jax.devices()
     sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
@@ -159,9 +158,10 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> M
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     """Shard the largest evenly-divisible axis over 'fsdp', else replicate.
 
-    Applied to every leaf of the train state, not just params: optimizer moments
-    and EMA copies have the same shapes as the params they track, so they pick
-    up the same spec without anyone having to describe the optimizer's layout.
+    Applied to every leaf of the train state, params, optimizer moments and
+    EMA copies alike: the moments and the copies have the same shapes as the
+    params they track, so they pick up the same spec without anyone having
+    to describe the optimizer's layout.
     """
     if fsdp_size == 1 or int(np.prod(shape, dtype=np.int64)) < min_shard_size:
         return P()
@@ -174,14 +174,13 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
 def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: Mesh) -> P:
     """The spec these logical axes ask for, reduced to one the shape can take.
 
-    A mesh axis of size 1 shards nothing, so it is dropped rather than left in
-    the spec where it would only obscure what is replicated. A dimension its
-    assigned axes do not divide evenly cannot be split at all, so its name is
-    dropped and the rules hand the axis to the next dimension that names it:
-    an odd vocabulary shards the embedding on its width instead of taking the
-    whole table out of the layout. Only a parameter no named dimension can
-    split stays whole, which the tolerance check turns into an error when it
-    matters.
+    A mesh axis of size 1 shards nothing, so it is dropped from the spec,
+    where it would only obscure what is replicated. A dimension its assigned
+    axes do not divide evenly cannot be split at all, so its name is dropped
+    and the rules hand the axis to the next dimension that names it: an odd
+    vocabulary shards the embedding on its width and keeps the table in the
+    layout. Only a parameter no named dimension can split stays whole, which
+    the tolerance check turns into an error when it matters.
     """
     names: list[str | None] = list(axes)
     while True:
@@ -267,7 +266,7 @@ class Layout:
 
         MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
         parameter axes divide none of the model's dimensions, which the shape
-        heuristic otherwise absorbs in silence.
+        heuristic otherwise absorbs by replicating everything.
 
         MaxText measures excess per-chip memory over perfect sharding across
         every parameter. Here the same ratio is taken over the parameters the
@@ -362,7 +361,7 @@ class DevicePrefetchIterator:
                     f"{type(self._iterator).__name__} cannot resume from a saved position")
             self._source.set_state(self._position_for(self._source, source_state))
         # Position of the source iterator as of the batch most recently handed
-        # out, so a checkpoint resumes at the next unseen batch rather than at
+        # out, so a checkpoint resumes at the next unseen batch, not at
         # whatever the prefetch thread has already raced ahead to.
         self.source_state = source_state
         self._thread = threading.Thread(target=self._prefetch, daemon=True)

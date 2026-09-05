@@ -1,7 +1,7 @@
 # Step benchmarks
 
 What one training step costs, per architecture, measured through
-the `Trainer`'s own compiled step rather than a hand-written forward
+the `Trainer`'s own compiled step, not a hand-written forward
 pass. Reproduce with `tools/benchmark_step.py`; the loader is measured
 separately by `tools/benchmark_data.py`.
 
@@ -24,8 +24,8 @@ driver 595.84, RTX 4080 16 GiB, dew at `6b0f119`. Every model in bf16
 steps per architecture. One invocation per architecture (`--architectures
 unet` and so on), so each row's peak memory is its own; `ms/step` times the
 loop the way a run dispatches it, and `p10 / p50 / p90 ms` come from a second
-window of the same length that waits on every step, which is where a long
-tail shows up.
+window of the same length that waits on every step, so a long tail shows
+up there.
 
 | architecture       | sample    | batch |      params | ms/step | p10 / p50 / p90 ms | samples/s | GFLOP/step |  util | peak GiB | compile s |
 |--------------------|-----------|-------|-------------|---------|--------------------|-----------|------------|-------|----------|-----------|
@@ -101,13 +101,12 @@ step.
 
 - The DiT family is the efficient shape on this card: `simple_dit`,
   `simple_udit` and `hybrid_dit` all sit under 10 ms/step at 28-40% of peak,
-  which is where a 64px/patch-4 (256 token) workload should be.
+  the range a 64px/patch-4 (256 token) workload should be in.
 - `unet` does the most arithmetic of the image models relative to its time:
   646 GFLOP/step in 16 ms is 40.5% of peak, ahead of the transformers at the
-  same resolution. The 1.6% an earlier version of this table reported was its
-  convolution arithmetic missing from the counter, not the card idling; the
-  same measurement with XLA's own `cost_analysis()` as the numerator still
-  shows 28.7 GFLOP/step, which is what that table had counted.
+  same resolution. The same measurement with XLA's own `cost_analysis()` as
+  the numerator shows 28.7 GFLOP/step: the difference is the convolution
+  arithmetic cost analysis cannot see, not the card idling.
 - `unet_3d` is the slowest step in the table at 41.8%: its 3D convolutions
   carry 1.38 TFLOP/step, more than twice `video_dit`'s 760 for the same
   (8, 64, 64, 3) samples. For video, the factorized transformer buys a third
@@ -118,7 +117,7 @@ step.
   step. A sweep is mostly XLA, and a real run should set
   `compilation_cache_dir`.
 
-### What the counter used to say
+### `cost_analysis()` against the optimized HLO
 
 The same executable, measured both ways on 2026-09-02, one compile each:
 
@@ -157,8 +156,8 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \
     python tools/benchmark_step.py --preset cpu-smoke --steps 2
 ```
 
-Tiny models on the simulated 8-device CPU mesh, for checking the tool itself
-rather than the hardware. `tests/test_benchmark_step.py` runs one case of this
+Tiny models on the simulated 8-device CPU mesh, for checking the tool itself,
+not the hardware. `tests/test_benchmark_step.py` runs one case of this
 preset so the tool cannot rot against the trainer internals it drives.
 Utilisation and peak memory come back `null`: there is no published peak
 FLOP/s for a CPU and no allocator counter behind it.
@@ -187,4 +186,4 @@ checked here first.
 
 These two points are not the loader's ceiling. `benchmark_data.py` defaults to
 16 read threads, where the dataset specs default to 32 workers and 64 read threads, and
-Oxford Flowers is 8189 small records rather than a sharded 12M-record set.
+Oxford Flowers is 8189 small records, not a sharded 12M-record set.

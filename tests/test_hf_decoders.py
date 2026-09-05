@@ -151,8 +151,8 @@ def test_a_multimodal_gemma3_config_is_refused():
     """Only a text decoder maps, and no published multimodal Gemma 3 has a
     text_config that would: gemma-3-4b, 12b and 27b all carry rope_scaling
     {'rope_type': 'linear', 'factor': 8}, which the field map refuses. So the
-    refusal names the model_type instead of loading the text half of a
-    checkpoint whose vision tower nothing here runs."""
+    refusal names the model_type; the text half of a checkpoint whose vision
+    tower nothing here runs stays unloaded."""
     wrapped = {'model_type': 'gemma3', 'text_config': fixture_config("gemma3-tiny"),
                'vision_config': {'hidden_size': 8}, 'mm_tokens_per_image': 256,
                'boi_token_index': 255999, 'eoi_token_index': 256000,
@@ -535,7 +535,8 @@ def test_a_ramp_the_reference_puts_on_one_kind_lands_on_that_kind():
     (configuration_olmo3.py:110-113) and leaves the sliding layers plain, and
     a nested rope_parameters may state the same directly. Both land on the
     full kind, not the model, since a kind's None rides the model's ramp and
-    could not turn one off. A ramp with a field missing refuses by name."""
+    could not turn one off. A ramp with a field missing raises a ValueError
+    naming the field."""
     ramp = {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
             'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192}
     flat = {**fixture_config("olmo-3-7b"), 'rope_scaling': ramp}
@@ -681,10 +682,10 @@ def biased_qwen3(rng):
 
 
 def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
-    """attention_bias is one flag for all four projections, which is what
+    """attention_bias is one flag for all four projections, the flag
     Qwen3Attention builds from config.attention_bias (modeling_qwen3.py:225-236)
     and Gemma3Attention from the same field (modeling_gemma3.py:322-333), so a
-    biased qk_norm model is exportable rather than a refusal."""
+    biased qk_norm model exports."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
 
@@ -701,8 +702,8 @@ def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
 def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
     """No weights: the 311 names and shapes of Qwen3-0.6B against our tree.
 
-    This is the check that a config translation and a key map stay honest
-    about a checkpoint nobody wants to download in CI.
+    This is the check that a config translation and a key map fit a
+    checkpoint nobody wants to download in CI.
     """
     from dew.interop.hf_decoders import _dew_path
 
@@ -895,8 +896,8 @@ def test_the_real_e2b_config_translates():
     ("use_bidirectional_attention", "all"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
-    """Every gemma4 knob Dew cannot express names itself instead of loading
-    a model that computes something else."""
+    """Every gemma4 knob Dew cannot express raises a ValueError naming the
+    field, and no model is built."""
     config = gemma4_config("gemma4-ple")
     config[field] = value
     with pytest.raises(ValueError, match=field):
@@ -934,14 +935,14 @@ def test_a_multimodal_wrapper_config_is_refused_by_name(model_type):
     assert "text_config" in str(raised.value)
     assert "model.language_model" in str(raised.value)
 
-    # The decoder underneath it still translates, which is what the message says.
+    # The decoder underneath it still translates, as the message says.
     assert translate_config(wrapper["text_config"])["num_kv_shared_layers"] == 2
 
 
 def test_a_wrapper_shaped_config_of_an_unknown_family_is_refused_as_one():
     """A config with a text_config and a model_type this has never heard of
-    is the same shape of thing, so it gets the same answer rather than the
-    bare family list."""
+    is the same shape of thing, so it gets the same answer, with no bare
+    family list."""
     with pytest.raises(ValueError, match="multimodal wrapper"):
         translate_config({"model_type": "someone_elses_vlm",
                           "text_config": gemma4_config("gemma4-ple")})
@@ -1008,7 +1009,7 @@ def test_a_per_layer_count_equal_to_the_models_still_translates():
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
-    lands, which is what _check_tree enforces leaf for leaf."""
+    lands; _check_tree enforces both leaf for leaf."""
     directory = FIXTURES / name
     model, variables, _ = fp32_decoder(directory)
     assert model.v_norm and model.attention_scale == 1.0
@@ -1132,7 +1133,7 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
 
 def test_export_refuses_the_new_features(tmp_path, rng):
     """The three exported families have neither, so a model with any of them
-    set is refused instead of silently dropping its leaves."""
+    set raises a ValueError naming the feature, and no leaves are dropped."""
     config = translate_config(gemma4_config("gemma4-kvshare"))
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="xla"))
@@ -1219,8 +1220,8 @@ def test_the_router_bias_lands_in_the_moe_collection():
 
 def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
     """The tree check holds every collection to account, so a checkpoint
-    that drops the balancing bias fails naming the leaf instead of loading
-    a router at zeros."""
+    that drops the balancing bias fails naming the leaf, and no router loads
+    at zeros."""
     from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -1289,9 +1290,8 @@ def test_the_v32_fixture_is_the_sparse_model():
 @pytest.mark.parametrize("name", DEEPSEEK)
 def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
     """The writer covers the three attention families; a model with the mla
-    mixer is refused naming the mixer, and one with routed experts on
-    standard attention naming the mixture, instead of writing a checkpoint
-    without their tensors."""
+    mixer raises naming the mixer, and one with routed experts on standard
+    attention raises naming the mixture. Neither writes a checkpoint."""
     model, variables, _ = fp32_decoder(FIXTURES / name)
     with pytest.raises(ValueError, match="a mixer other than attention"):
         save_pretrained_decoder(model, variables, str(tmp_path))
@@ -1635,8 +1635,8 @@ def quantize_mxfp4(matrix):
     """[expert, input, output] fp32 into the released blocks and scales.
 
     Every value is scaled to a representable E2M1 magnitude by a shared
-    power-of-two exponent per 32 inputs, which is what the test needs to
-    pin: the sign nibble order and the transpose back to the input axis.
+    power-of-two exponent per 32 inputs. The test pins the sign nibble order
+    and the transpose back to the input axis.
     """
     values = np.ascontiguousarray(matrix.transpose(0, 2, 1))
     groups = values.reshape(values.shape[0], values.shape[1], -1, 32)
@@ -1653,11 +1653,11 @@ def quantize_mxfp4(matrix):
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
                     reason="DEW_NETWORK_TESTS=1 downloads openai/gpt-oss-20b")
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
-    """Not yet run: the released MXFP4 checkpoint through the loader against
-    transformers' own dequantized bf16 forward at the same prompt. Tolerance
-    on the top-32 logits 5e-2 for bf16 accumulation over 24 layers; the
-    argmax must agree everywhere. Observed difference: not recorded until
-    the test runs on a machine with the download."""
+    """The released MXFP4 checkpoint through the loader against transformers'
+    own dequantized bf16 forward at the same prompt. Tolerance on the top-32
+    logits 5e-2 for bf16 accumulation over 24 layers; the argmax must agree
+    everywhere. The largest observed difference is not recorded here: the
+    test needs the download."""
     import torch
     from transformers import AutoTokenizer, GptOssForCausalLM
 
@@ -2096,9 +2096,9 @@ def test_the_layer_scalars_are_what_the_parity_tests():
 
 
 def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
-    """The same weights under a config with the flag off are refused on the
-    global layer's missing v_proj leaf rather than loaded with a value
-    projection the checkpoint never had."""
+    """The same weights under a config with the flag off raise on the
+    global layer's missing v_proj leaf; no value projection the checkpoint
+    never had is loaded."""
     directory = tmp_path / "gemma4"
     directory.mkdir()
     (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
@@ -2260,8 +2260,8 @@ def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
 ])
 def test_a_gemma3n_field_with_no_counterpart_is_refused(field, value, message):
     """A rope_scaling beside the nested rope_parameters lands on the full
-    layers as Gemma3nTextConfig folds it, so a type the rotary table cannot
-    express is refused there by name."""
+    layers as Gemma3nTextConfig folds it, and a type the rotary table cannot
+    express raises there with the field's name."""
     with pytest.raises(ValueError, match=message):
         translate_config({**fixture_config("gemma3n-tiny"), field: value})
 

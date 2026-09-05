@@ -218,7 +218,7 @@ def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
 def test_weight_decay_reaches_the_norm_scales():
     """Decay on the norm scale is the piece of the recipe that lives in the
     AdamW group (docs/research/frontier-training.md:184), so the config's
-    decay has to reach that group and not only Muon's."""
+    decay has to reach that group as well as Muon's."""
     params = decoder_params()
     decayed, _ = group_updates(params, weight_decay=0.1)
     plain, _ = group_updates(params)
@@ -290,8 +290,8 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
 
 def test_the_router_gate_takes_the_adamw_update():
     """A router gate is declared ('embed', 'exp'): one column per expert, so
-    its output side counts choices rather than features, and the labs keep
-    the router on AdamW along with the embeddings and the head. The same axis
+    its output side counts choices, not features, and the labs keep the
+    router on AdamW along with the embeddings and the head. The same axis
     name leads the expert kernels, where it stacks matrices, so position is
     what tells the two apart."""
     params = {'params': {'layers_0': {'mlp': {'gate': {

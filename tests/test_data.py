@@ -491,9 +491,9 @@ def keep_captions(captions):
 class Augmenting(ImageDataset):
     """Deterministic images and class captions, addressed by index, through
     the real image transform: resize, flip, jitter and the prompt template
-    all draw from grain's per-record rng, which is what a worker count could
-    move. The captions are read back as text, so one stays comparable after a
-    trip through a worker process."""
+    all draw from grain's per-record rng, the draw a worker count could move.
+    The captions are read back as text, so one stays comparable after a trip
+    through a worker process."""
 
     length: int = 16
 
@@ -567,9 +567,9 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     """The trainer saves the iterator's position in its checkpoint, so a
     restored run owes the epoch its unseen records, no more and no fewer.
 
-    The loader is built again from a source object of its own, which is what a
-    resumed process has: grain validates a saved position against
-    `repr(source)` and will not restore one it cannot match.
+    The loader is built again from a source object of its own, as a resumed
+    process has: grain validates a saved position against `repr(source)` and
+    will not restore one it cannot match.
 
     Eight training records over two workers is two whole batches, since each
     worker batches its own slice and drops what is left over.
@@ -722,8 +722,8 @@ def test_decoding_drops_alpha_and_hands_back_rgb():
 
 def test_a_truncated_image_raises_rather_than_becoming_an_array():
     """cv2.imdecode hands back None for a half-written jpeg, and None resized
-    to the training size would be a black record; the decoder says so by name
-    instead of letting the colour conversion raise cv2's own error."""
+    to the training size would be a black record; the decoder raises a
+    ValueError ("cv2 could not decode ...") before the colour conversion sees it."""
     whole = np.random.RandomState(0).randint(0, 256, (16, 16, 3), np.uint8)
     encoded, buffer = cv2.imencode(".jpg", whole)
     assert encoded
@@ -748,10 +748,10 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
 
 
 def test_resizing_interpolates_up_and_averages_down():
-    """`resize_image` says area interpolation down and cubic up. It used to
-    pick by the target size alone, cubic above 256 and area below, so a small
-    source going up to 128 came out in nearest-neighbour blocks and a large
-    one going down to 300 kept every third pixel of a fine pattern."""
+    """`resize_image` interpolates by direction: area down, cubic up. Picking
+    by the target size alone (cubic above 256, area below) sends a small
+    source going up to 128 into nearest-neighbour blocks and keeps every
+    third pixel of a fine pattern in a large one going down to 300."""
     board = np.zeros((4, 4, 3), np.uint8)
     board[::2, ::2] = board[1::2, 1::2] = 255
     up = images.resize_image(board, 8)
