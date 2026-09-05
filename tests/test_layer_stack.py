@@ -430,3 +430,27 @@ def test_decoding_under_a_stage_axis_is_refused():
 def test_a_layout_rule_onto_the_stage_axis_is_refused():
     with pytest.raises(ValueError, match="stage axis holds the pipeline"):
         Layout(rules={"mlp": "stage"})
+
+
+def test_scanned_dropout_uses_the_supplied_rng():
+    model = tiny(num_layers=3, dropout_rate=0.2, scan_layers=True)
+    ids = jnp.asarray(token_batch()["text"][:2, :5])
+    variables = model.init(jax.random.key(0), ids)
+
+    @jax.jit
+    def loss_and_grad(params, key):
+        def loss(weights):
+            logits = model.apply({"params": weights}, ids, train=True,
+                                 rngs={"dropout": key})
+            return jnp.mean(logits ** 2)
+        return jax.value_and_grad(loss)(params)
+
+    first = loss_and_grad(variables["params"], jax.random.key(1))
+    repeated = loss_and_grad(variables["params"], jax.random.key(1))
+    changed = loss_and_grad(variables["params"], jax.random.key(2))
+
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(repeated)):
+        np.testing.assert_array_equal(left, right)
+        assert np.isfinite(left).all()
+    assert float(first[0]) != float(changed[0])
+    assert largest_difference(first[1], changed[1]) > 1e-5
