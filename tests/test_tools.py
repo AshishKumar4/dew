@@ -119,3 +119,22 @@ def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
             (committed / name).read_text()), name
     assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
     assert_same_arrays(written / "reference.npz", committed / "reference.npz")
+
+
+# ---------------------------------------------------------------------------
+# tools/vae_reference.py
+# ---------------------------------------------------------------------------
+
+def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
+    """sd3-tiny/ regenerates byte for byte: the image recipe, the config the
+    loader builds the autoencoder from, its weights, and the encode and
+    decode of the one committed image."""
+    load("vae_reference").main(["--out", str(tmp_path)])
+
+    written, committed = tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny"
+    for name in ("inputs.json", "config.json"):
+        assert json.loads((written / name).read_text()) == json.loads(
+            (committed / name).read_text()), name
+    assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
+                        committed / "diffusion_pytorch_model.safetensors")
+    assert_same_arrays(written / "reference.npz", committed / "reference.npz")

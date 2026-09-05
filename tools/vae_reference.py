@@ -14,6 +14,8 @@ Set up the venv once (torch CPU, diffusers, safetensors):
         --extra-index-url https://pypi.org/simple
     /tmp/vaeref/bin/python tools/vae_reference.py
 
+--out DIR writes the fixtures somewhere other than tests/fixtures/vae.
+
 What lands in tests/fixtures/vae:
 
 - sd3-tiny/: a random-weight 16-channel AutoencoderKL in the diffusers layout
@@ -31,13 +33,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers import AutoencoderKL
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from diffusers.models.autoencoders.vae import DecoderOutput
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "vae"
 
 # The SD3/Flux latent space in miniature: 16 channels, no quant convs, the
-# shift and scale of the real config.
-TINY_CONFIG = dict(
+# shift and scale of the real config. Built through `from_config`, the path a
+# loaded config.json takes, because the constructor declares its block lists
+# as one-element tuples.
+TINY_CONFIG: dict[str, object] = dict(
     in_channels=3, out_channels=3, latent_channels=16,
     down_block_types=["DownEncoderBlock2D"] * 2,
     up_block_types=["UpDecoderBlock2D"] * 2,
@@ -55,35 +61,38 @@ def synthetic_image(recipe) -> np.ndarray:
         0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--skip-write", action="store_true")
-    args = parser.parse_args()
-
-    directory = FIXTURES / "sd3-tiny"
-    directory.mkdir(parents=True, exist_ok=True)
-
+def tiny_model() -> AutoencoderKL:
     torch.manual_seed(0)
-    model = AutoencoderKL(**TINY_CONFIG)
+    model = AutoencoderKL.from_config(TINY_CONFIG)
+    if not isinstance(model, AutoencoderKL):
+        raise TypeError(f"from_config returned {type(model).__name__}, not the model")
     model.eval()
+    return model
+
+
+def write_tiny(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    model = tiny_model()
 
     pixels = synthetic_image(IMAGE)
     # The objective's [-1, 1] scale, NHWC, as dew hands it to an autoencoder.
     sample = (pixels.astype(np.float32) - 127.5) / 127.5
     torch_sample = torch.tensor(sample).permute(0, 3, 1, 2)
     with torch.no_grad():
-        posterior = model.encode(torch_sample).latent_dist
-        latent = posterior.mean
-        decoded = model.decode(latent).sample
+        encoded = model.encode(torch_sample)
+        if not isinstance(encoded, AutoencoderKLOutput):
+            raise TypeError(f"encode returned {type(encoded).__name__}, not its output")
+        latent = encoded.latent_dist.mean
+        decoded = model.decode(latent)
+        if not isinstance(decoded, DecoderOutput):
+            raise TypeError(f"decode returned {type(decoded).__name__}, not its output")
     # Back to NHWC, and the scaled latent the diffusion model would see.
     latent_nhwc = latent.permute(0, 2, 3, 1).numpy()
-    decoded_nhwc = decoded.permute(0, 2, 3, 1).numpy()
-    print("latent:", latent_nhwc.shape, "decoded:", decoded_nhwc.shape)
+    decoded_nhwc = decoded.sample.permute(0, 2, 3, 1).numpy()
     mse = float(np.mean((decoded_nhwc - sample) ** 2))
-    print(f"reference round trip mse {mse:.4f}, psnr {10 * np.log10(4.0 / mse):.2f} dB")
+    print(f"latent {latent_nhwc.shape}, decoded {decoded_nhwc.shape}, "
+          f"reference round trip mse {mse:.4f}, psnr {10 * np.log10(4.0 / mse):.2f} dB")
 
-    if args.skip_write:
-        return
     from safetensors.torch import save_file
 
     model.save_config(directory)
@@ -94,6 +103,12 @@ def main() -> None:
              latent=latent_nhwc, decoded=decoded_nhwc)
     size = sum(p.stat().st_size for p in directory.iterdir()) / 2 ** 20
     print(f"wrote {directory} ({size:.1f} MB)")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=Path, default=FIXTURES)
+    write_tiny(parser.parse_args(argv).out / "sd3-tiny")
 
 
 if __name__ == "__main__":
