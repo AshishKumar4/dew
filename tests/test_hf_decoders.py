@@ -2374,3 +2374,53 @@ def test_diffusion_gemma_text_reuses_the_gemma4_map_in_decoder_mode():
                                   'model_type': 'diffusion_gemma_text'})
     assert diffusion['causal'] is False
     assert {key: value for key, value in diffusion.items() if key != 'causal'} == gemma4
+
+
+def _diffusion_fp32(name):
+    """A tiny diffusion fixture as a model plus variables, without the mask id.
+
+    The backbone holds no mask_token_id field until Compose lands it, so the
+    id is asserted and set aside; the forward never reads it.
+    """
+    from safetensors.numpy import load_file
+
+    directory = FIXTURES / name
+    config = translate_config(fixture_config(name))
+    assert config.pop("mask_token_id") == 120
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
+    return (model, variables, np.load(directory / "input_ids.npy"),
+            np.load(directory / "logits.npy"))
+
+
+def test_llada_logits_match_the_reference_implementation():
+    """fp32 parity on the tiny LLaDA decoder: tolerance 1e-4, observed max
+    |logit difference| 9.3e-07 with identical argmax.
+
+    The reference is the torch port in tools/hf_reference.py following
+    modeling_llada.py's LLaDALlamaBlock (RMS pre-norms, unbiased projections,
+    rotate-half rope at theta 500000, SwiGLU with ff_proj as gate) at fp32 on
+    random weights, not the released 8B weights. A causal model on the same
+    weights misses by 1.5, so the fixture exercises full attention."""
+    model, variables, ids, reference = _diffusion_fp32("llada-tiny")
+    assert np.max(np.abs(np.asarray(model.apply(variables, ids)) - reference)) < 1e-4
+    assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
+    causal = model.clone(causal=True)
+    assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
+
+
+def test_dream_logits_match_the_reference_implementation():
+    """fp32 parity on the tiny Dream decoder: tolerance 1e-4, observed max
+    |logit difference| 4.5e-06 with identical argmax, on logits up to 4.8.
+
+    The reference is the torch port in tools/hf_reference.py following
+    modeling_dream.py's DreamAttention (biased q/k/v over a bias-free o_proj,
+    hard-coded full attention) and bias-free SwiGLU at fp32 on random weights,
+    not the released 7B weights. A causal model on the same weights misses by
+    4.9, so the fixture exercises full attention."""
+    model, variables, ids, reference = _diffusion_fp32("dream-tiny")
+    assert np.max(np.abs(np.asarray(model.apply(variables, ids)) - reference)) < 1e-4
+    assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
+    causal = model.clone(causal=True)
+    assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0

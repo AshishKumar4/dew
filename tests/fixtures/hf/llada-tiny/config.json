@@ -1,0 +1,28 @@
+{
+ "model_type": "llada",
+ "architectures": [
+  "LLaDAModelLM"
+ ],
+ "d_model": 32,
+ "n_layers": 2,
+ "n_heads": 4,
+ "n_kv_heads": 4,
+ "mlp_hidden_size": 64,
+ "embedding_size": 128,
+ "vocab_size": 128,
+ "max_sequence_length": 64,
+ "rms_norm_eps": 1e-05,
+ "rope_theta": 500000.0,
+ "mask_token_id": 120,
+ "weight_tying": false,
+ "include_bias": false,
+ "include_qkv_bias": false,
+ "activation_type": "silu",
+ "block_type": "llama",
+ "layer_norm_type": "rms",
+ "layer_norm_with_affine": true,
+ "attention_layer_norm": false,
+ "bias_for_layer_norm": false,
+ "rope": true,
+ "rope_full_precision": true
+}

@@ -67,12 +67,19 @@ class LmRunConfig(RunConfig):
     mtp_weight: Optional[float] = None
     """DeepSeek's lambda on the multi-token-prediction term. Needs a model
     with num_nextn_predict_layers above zero; unset leaves the term out."""
+    objective: str = "lm"
+    """Which loss trains: 'lm' for next-token prediction, 'masked_diffusion'
+    for MDLM masked denoising on a bidirectional model (a --pretrained
+    diffusion checkpoint carries its mask token id)."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
             raise ValueError(
                 "the language model recipe trains on token files: "
                 "data:token-windows or data:packed-tokens")
+        if self.objective not in ("lm", "masked_diffusion"):
+            raise ValueError(
+                f"--objective {self.objective!r} is 'lm' or 'masked_diffusion'")
 
 
 def token_directory(path: Optional[str]) -> Path:
@@ -193,6 +200,28 @@ def run_summary(config: LmRunConfig, fields: dict) -> dict:
     }
 
 
+def build_masked_objective(config: LmRunConfig, model, fields):
+    """The MDLM objective over a bidirectional model, its mask id from the run.
+
+    A --pretrained diffusion checkpoint carries mask_token_id in the fields it
+    was built from; a from-scratch run names it in --model.config beside
+    causal=False. The validation text is the unmasked rows decoded with the
+    run's tokenizer, or bare ids when --sample-tokens is 0."""
+    from dew.diffusion.discrete import MDLM
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+
+    mask = fields.get("mask_token_id")
+    if mask is None:
+        raise ValueError(
+            "masked_diffusion trains a model with a mask token id: continue a "
+            "--pretrained diffusion checkpoint, which carries one, or name "
+            "mask_token_id in --model.config beside causal=False")
+    decode = None if config.sample_tokens <= 0 else build_tokenizer(config.tokenizer).decode
+    return MaskedDiffusionObjective(
+        model, MDLM(mask_id=int(mask))(), config.data.seq_len,
+        ema_decay=config.ema_decay, decode=decode)
+
+
 def main(config: LmRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
@@ -217,6 +246,7 @@ def main(config: LmRunConfig) -> TrainState:
 
     samples = build_samples(config)
     context = context_length(config, samples)
+
     pretrained = None
     if config.pretrained is None:
         fields = model_fields(config, vocab_size, context)
@@ -224,15 +254,20 @@ def main(config: LmRunConfig) -> TrainState:
     else:
         model, pretrained, fields = load_pretrained(
             config.pretrained, config.model, vocab_size, context, meta)
-    objective = LMObjective(
-        model,
-        config.data.seq_len,
-        ema_decay=config.ema_decay,
-        samples=samples,
-        pretrained=pretrained,
-        balance_rate=config.balance_rate,
-        mtp_weight=config.mtp_weight,
-    )
+    if config.objective == "masked_diffusion":
+        objective = build_masked_objective(config, model, fields)
+        objective_metrics = ()
+    else:
+        objective = LMObjective(
+            model,
+            config.data.seq_len,
+            ema_decay=config.ema_decay,
+            samples=samples,
+            pretrained=pretrained,
+            balance_rate=config.balance_rate,
+            mtp_weight=config.mtp_weight,
+        )
+        objective_metrics = (metrics.perplexity(),)
 
     name = config.trainer.name or (
         f"lm-{tokens.name}/seq-{config.data.seq_len}/"
@@ -240,7 +275,7 @@ def main(config: LmRunConfig) -> TrainState:
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
     return config.train(
-        objective, data, name=name, metrics=(metrics.perplexity(),),
+        objective, data, name=name, metrics=objective_metrics,
         summary={"model": fields, "arguments": run_summary(config, fields),
                  "dataset": {"path": config.data.path, "records": data.records,
                              "tokens": meta.get('train_tokens')}})

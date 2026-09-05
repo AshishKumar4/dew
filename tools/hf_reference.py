@@ -16,7 +16,7 @@ Set up the venv and run it:
 
 What lands in tests/fixtures/hf:
 - <family>-tiny/ for qwen3, gemma, gemma2, gemma3, llama, llama31, mistral,
-  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3 and deepseek-v32: a
+  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3, deepseek-v32, llada and dream: a
   random-weight checkpoint in the HF layout (config.json +
   model.safetensors), the 2 x 12 token ids it was run on, and the fp32
   logits of the reference model in eval mode with eager attention. Small
@@ -27,6 +27,9 @@ What lands in tests/fixtures/hf:
   V3.2, the sparse indexer; their routers' balancing bias is scattered too,
   since a checkpoint carries it and a fixture at its zeros would not tell a
   load that reads it from one that drops it.
+  The llada and dream tinies carry no transformers class (both ship remote
+  code), so their logits come from the small torch port beside them, which
+  follows the released block line for line and runs at fp32.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
@@ -34,9 +37,9 @@ What lands in tests/fixtures/hf:
   weights in fp32, which the network test compares against.
 - One directory per released config the translation is tested on
   (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
-  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b): config.json and the
-  repo it came from in source.json, no weights. Google's and Meta's gated
-  repos come from unsloth's mirrors, minus the mirror's marker keys.
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b):
+  config.json and the repo it came from in source.json, no weights. Google's
+  and Meta's gated repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
 
 import argparse
@@ -273,6 +276,245 @@ def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
     return DeepseekV32ForCausalLM(config)
 
 
+def _diffusion_rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm without bias, the norm both diffusion decoders use."""
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+def _diffusion_rope(seq_len: int, head_dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate-half rope tables, the convention LLaDA and Dream share with Llama."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.einsum("i,j->ij", torch.arange(seq_len).float(), inv_freq)
+    both = torch.cat((freqs, freqs), dim=-1)
+    return both.cos(), both.sin()
+
+
+def _diffusion_rotate(x: torch.Tensor) -> torch.Tensor:
+    first, second = x.chunk(2, dim=-1)
+    return torch.cat((-second, first), dim=-1)
+
+
+def _diffusion_attend(x: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      o: torch.Tensor, qb, kb, vb, ob,
+                      cos: torch.Tensor, sin: torch.Tensor, heads: int) -> torch.Tensor:
+    """Full attention over the sequence, one head width shared by both models."""
+    batch, seq, _ = x.shape
+    head_dim = q.shape[-1] // heads
+    queries = (x @ q.t() + (0 if qb is None else qb)).view(batch, seq, heads, head_dim)
+    keys = (x @ k.t() + (0 if kb is None else kb)).view(batch, seq, -1, head_dim)
+    values = (x @ v.t() + (0 if vb is None else vb)).view(batch, seq, -1, head_dim)
+    table = cos.view(1, seq, 1, head_dim)
+    turn = sin.view(1, seq, 1, head_dim)
+    queries = queries * table + _diffusion_rotate(queries) * turn
+    keys = keys * table + _diffusion_rotate(keys) * turn
+    queries = queries.transpose(1, 2)
+    keys = keys.transpose(1, 2)
+    values = values.transpose(1, 2)
+    if keys.shape[1] != heads:
+        repeat = heads // keys.shape[1]
+        keys = keys.repeat_interleave(repeat, dim=1)
+        values = values.repeat_interleave(repeat, dim=1)
+    attended = torch.nn.functional.scaled_dot_product_attention(
+        queries, keys, values, is_causal=False)
+    return (attended.transpose(1, 2).reshape(batch, seq, heads * head_dim) @ o.t()
+            + (0 if ob is None else ob))
+
+
+class _RmsWeight(torch.nn.Module):
+    """A bare RMS scale, named by its holder to match the checkpoint."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(width))
+
+
+class LladaTinyBlock(torch.nn.Module):
+    """One LLaDA llama block under the released tensor names."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int, eps: float):
+        super().__init__()
+        self.attn_norm = _RmsWeight(hidden)
+        self.q_proj = torch.nn.Linear(hidden, heads * hidden // heads, bias=False)
+        self.k_proj = torch.nn.Linear(hidden, kv_heads * hidden // heads, bias=False)
+        self.v_proj = torch.nn.Linear(hidden, kv_heads * hidden // heads, bias=False)
+        self.attn_out = torch.nn.Linear(heads * hidden // heads, hidden, bias=False)
+        self.ff_norm = _RmsWeight(hidden)
+        self.ff_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.ff_out = torch.nn.Linear(intermediate, hidden, bias=False)
+        self.heads = heads
+
+    def forward(self, x, cos, sin):
+        normed = _diffusion_rms(x, self.attn_norm.weight, 1e-5)
+        x = x + _diffusion_attend(
+            normed, self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
+            self.attn_out.weight, None, None, None, None, cos, sin, self.heads)
+        normed = _diffusion_rms(x, self.ff_norm.weight, 1e-5)
+        return x + self.ff_out(torch.nn.functional.silu(self.ff_proj(normed))
+                               * self.up_proj(normed))
+
+
+class _LladaTransformer(torch.nn.Module):
+    """The transformer holder, so the checkpoint keys read model.transformer.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
+                 vocab: int, eps: float):
+        super().__init__()
+        self.wte = torch.nn.Embedding(vocab, hidden)
+        self.blocks = torch.nn.ModuleList(
+            [LladaTinyBlock(hidden, heads, heads, intermediate, eps) for _ in range(layers)])
+        self.ln_f = _RmsWeight(hidden)
+        self.ff_out = torch.nn.Linear(hidden, vocab, bias=False)
+
+
+class _LladaModel(torch.nn.Module):
+    """The model holder, so the checkpoint keys read model.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
+                 vocab: int, eps: float):
+        super().__init__()
+        self.transformer = _LladaTransformer(hidden, layers, heads, intermediate, vocab, eps)
+
+
+class LladaTiny(torch.nn.Module):
+    """LLaDA-8B's computation at toy width, under its OLMo-style names."""
+
+    def __init__(self, hidden=32, layers=2, heads=4, intermediate=64, vocab=128,
+                 theta=500000.0, eps=1e-5):
+        super().__init__()
+        self.model = _LladaModel(hidden, layers, heads, intermediate, vocab, eps)
+        self.theta = theta
+        self.head_dim = hidden // heads
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        cos, sin = _diffusion_rope(ids.shape[1], self.head_dim, self.theta)
+        x = self.model.transformer.wte(ids)
+        for block in self.model.transformer.blocks:
+            x = block(x, cos, sin)
+        return self.model.transformer.ff_out(
+            _diffusion_rms(x, self.model.transformer.ln_f.weight, 1e-5))
+
+
+class _DreamAttention(torch.nn.Module):
+    """The attention holder, so the checkpoint keys read self_attn.*."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int):
+        super().__init__()
+        head_dim = hidden // heads
+        self.q_proj = torch.nn.Linear(hidden, heads * head_dim, bias=True)
+        self.k_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=True)
+        self.v_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=True)
+        self.o_proj = torch.nn.Linear(heads * head_dim, hidden, bias=False)
+
+
+class _DreamMlp(torch.nn.Module):
+    """The MLP holder, so the checkpoint keys read mlp.*."""
+
+    def __init__(self, hidden: int, intermediate: int):
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
+
+
+class _DreamModel(torch.nn.Module):
+    """The model holder, so the checkpoint keys read model.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, kv_heads: int,
+                 intermediate: int, vocab: int):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(vocab, hidden)
+        self.layers = torch.nn.ModuleList(
+            [DreamTinyLayer(hidden, heads, kv_heads, intermediate) for _ in range(layers)])
+        self.norm = _RmsWeight(hidden)
+
+
+class DreamTinyLayer(torch.nn.Module):
+    """One Dream decoder layer under the qwen2 tensor names."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int):
+        super().__init__()
+        self.input_layernorm = _RmsWeight(hidden)
+        self.self_attn = _DreamAttention(hidden, heads, kv_heads)
+        self.post_attention_layernorm = _RmsWeight(hidden)
+        self.mlp = _DreamMlp(hidden, intermediate)
+        self.heads = heads
+
+    def forward(self, x, cos, sin):
+        normed = _diffusion_rms(x, self.input_layernorm.weight, 1e-6)
+        x = x + _diffusion_attend(
+            normed, self.self_attn.q_proj.weight, self.self_attn.k_proj.weight,
+            self.self_attn.v_proj.weight, self.self_attn.o_proj.weight,
+            self.self_attn.q_proj.bias, self.self_attn.k_proj.bias,
+            self.self_attn.v_proj.bias, None, cos, sin, self.heads)
+        normed = _diffusion_rms(x, self.post_attention_layernorm.weight, 1e-6)
+        return x + self.mlp.down_proj(torch.nn.functional.silu(self.mlp.gate_proj(normed))
+                                      * self.mlp.up_proj(normed))
+
+
+class DreamTiny(torch.nn.Module):
+    """Dream-v0's computation at toy width, under its qwen2 names."""
+
+    def __init__(self, hidden=32, layers=2, heads=4, kv_heads=2, intermediate=64,
+                 vocab=128, theta=1000000.0):
+        super().__init__()
+        self.model = _DreamModel(hidden, layers, heads, kv_heads, intermediate, vocab)
+        self.lm_head = torch.nn.Linear(hidden, vocab, bias=False)
+        self.theta = theta
+        self.head_dim = hidden // heads
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        cos, sin = _diffusion_rope(ids.shape[1], self.head_dim, self.theta)
+        x = self.model.embed_tokens(ids)
+        for layer in self.model.layers:
+            x = layer(x, cos, sin)
+        return self.lm_head(_diffusion_rms(x, self.model.norm.weight, 1e-6))
+
+
+LLADA_TINY_CONFIG = {
+    "model_type": "llada", "architectures": ["LLaDAModelLM"],
+    "d_model": 32, "n_layers": 2, "n_heads": 4, "n_kv_heads": 4,
+    "mlp_hidden_size": 64, "embedding_size": 128, "vocab_size": 128,
+    "max_sequence_length": 64, "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
+    "mask_token_id": 120, "weight_tying": False, "include_bias": False,
+    "include_qkv_bias": False, "activation_type": "silu", "block_type": "llama",
+    "layer_norm_type": "rms", "layer_norm_with_affine": True,
+    "attention_layer_norm": False, "bias_for_layer_norm": False,
+    "rope": True, "rope_full_precision": True,
+}
+
+DREAM_TINY_CONFIG = {
+    "model_type": "Dream", "architectures": ["DreamModel"],
+    "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "intermediate_size": 64, "vocab_size": 128,
+    "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+    "mask_token_id": 120, "tie_word_embeddings": False, "hidden_act": "silu",
+    "use_mrope": False, "use_sliding_window": False, "sliding_window": None,
+    "rope_scaling": None,
+}
+
+
+def write_diffusion_tiny(name: str, model: torch.nn.Module, config: dict,
+                         seed: int = 1234) -> None:
+    """A diffusion tiny fixture: the torch reference's weights under the
+    released tensor names, its config and its fp32 logits on fixed ids."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    scatter_weights(model, seed)
+    model = model.float().eval()
+    save_file(model.state_dict(), directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    ids = np.random.RandomState(7).randint(
+        0, config["vocab_size"], (BATCH, LENGTH)).astype(np.int64)
+    np.save(directory / "input_ids.npy", ids.astype(np.int32))
+    with torch.no_grad():
+        logits = model(torch.from_numpy(ids)).to(torch.float32).numpy()
+    np.save(directory / "logits.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
@@ -407,6 +649,10 @@ def main() -> None:
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
+    write_diffusion_tiny("llada-tiny", LladaTiny(), LLADA_TINY_CONFIG)
+    write_diffusion_tiny("dream-tiny", DreamTiny(), DREAM_TINY_CONFIG)
+    write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
+    write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)
