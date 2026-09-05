@@ -30,8 +30,8 @@ from dew.checkpoints import Checkpoints
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.training.distributed import (
-    Checkpointable, DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding, build_mesh,
-    minimum_across_processes, shard_batch,
+    Checkpointable, DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding,
+    batch_shardings, build_mesh, minimum_across_processes, shard_batch,
 )
 from dew.training.state import TrainState
 from dew.training.tracker import Tracker
@@ -312,7 +312,7 @@ class Trainer:
         jitted = jax.jit(
             step,
             in_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
-                          self.batch_sharding),
+                          batch_shardings(self.device_mesh, batch)),
             out_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
                            replicated, replicated, replicated),
             donate_argnums=(0,),

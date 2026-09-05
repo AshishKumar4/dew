@@ -547,6 +547,9 @@ def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     assert specs["experts"]["gate_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
     assert specs["experts"]["up_proj"]["kernel"] == P(expert_axis, None, 'fsdp')
     assert specs["experts"]["down_proj"]["kernel"] == P(expert_axis, 'fsdp')
+    # The router's expert dimension rides the axis too; its width keeps fsdp.
+    assert specs["gate"]["kernel"] == (
+        P('fsdp', 'expert') if expert_size > 1 else P('fsdp'))
 
 
 def test_the_expert_axis_shards_experts_without_an_fsdp_axis():
