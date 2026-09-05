@@ -26,6 +26,10 @@ What lands in tests/fixtures/hf:
 - llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
   interleaved rope and the L2 q/k norm around one global layer with
   temperature tuning, every other layer routed with the shared expert.
+- gemma3n-tiny/: Gemma 3n at toy width, three copies of the residual
+  stream under AltUp, the LAuReL block, gaussian top-k sparsity on the
+  first two layers, feed-forward widths that differ per layer, per-layer
+  inputs and the last layer sharing the second's keys and values.
 - gemma4-moe-tiny/: Gemma 4's 26B-A4B shape at toy width, the routed
   branch beside every layer's dense MLP under Gemma4TextRouter, global
   layers reading their values off the keys with fewer key/value heads and
@@ -49,6 +53,13 @@ primitive tests read before the family loads:
 - moe.npz: one `Llama4TextMoe` on random weights, its output and the
   per-expert tensors the checkpoint layout carries fused.
 
+What lands in tests/fixtures/gemma3n, for tests/test_gemma3n.py:
+
+- blocks.npz: one `Gemma3nTextAltUp` predicting and correcting a random
+  stream of four copies, one `Gemma3nTextLaurelBlock`, and one
+  `Gemma3nTextMLP` at sparsity 0.95, each on random weights with its
+  inputs and outputs.
+
 What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
 
 - moe.npz: one `Gemma4TextDecoderLayer` feed-forward half on random
@@ -64,10 +75,13 @@ import numpy as np
 import torch
 from safetensors.numpy import load_file, save_file
 from transformers import (
-    DeepseekV2Config, DeepseekV2ForCausalLM, Gemma4TextConfig, Glm4MoeConfig,
-    Glm4MoeForCausalLM, Llama4TextConfig,
+    DeepseekV2Config, DeepseekV2ForCausalLM, Gemma3nTextConfig, Gemma4TextConfig,
+    Glm4MoeConfig, Glm4MoeForCausalLM, Llama4TextConfig,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
+from transformers.models.gemma3n.modeling_gemma3n import (
+    Gemma3nForCausalLM, Gemma3nTextAltUp, Gemma3nTextLaurelBlock, Gemma3nTextMLP,
+)
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM, Gemma4TextDecoderLayer
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
 from transformers.models.llama4.modeling_llama4 import (
@@ -272,6 +286,71 @@ def write_gemma4_moe_block(directory: Path) -> None:
     print(f"{directory}: moe block, {sorted(arrays)}")
 
 
+def gemma3n_tiny_config() -> Gemma3nTextConfig:
+    """Three copies of the residual stream, sparsity on the first two layers,
+    widths of 48 and 64, one layer sharing K/V. The per-layer table has as
+    many rows as the vocabulary, since the reference indexes it with the
+    token ids as they are (the released 262144 rows serve text ids below the
+    multimodal ones)."""
+    return Gemma3nTextConfig.from_dict(dict(
+        vocab_size=64, vocab_size_per_layer_input=64, hidden_size=32,
+        intermediate_size=[48, 48, 64, 64], num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention",
+                     "sliding_attention"],
+        sliding_window=4, max_position_embeddings=64, rms_norm_eps=1e-6,
+        rope_theta=1e6, rope_local_base_freq=1e4, final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=8, altup_num_inputs=3, altup_active_idx=0,
+        altup_coef_clip=120.0, altup_correct_scale=True, num_kv_shared_layers=1,
+        laurel_rank=8, activation_sparsity_pattern=[0.95, 0.95, 0.0, 0.0],
+        tie_word_embeddings=True))
+
+
+def tiny_gemma3n() -> Gemma3nForCausalLM:
+    torch.manual_seed(0)
+    return Gemma3nForCausalLM(gemma3n_tiny_config())
+
+
+def write_gemma3n_blocks(directory: Path) -> None:
+    """AltUp, the LAuReL block and the sparse MLP, each alone on random
+    weights, the way the layer calls them (modeling_gemma3n.py)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    config = Gemma3nTextConfig.from_dict(dict(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8, sliding_window=4,
+        hidden_size_per_layer_input=8, altup_num_inputs=4, laurel_rank=8,
+        activation_sparsity_pattern=[0.95, 0.0], num_kv_shared_layers=0))
+    generator = torch.Generator().manual_seed(46)
+    arrays = {}
+    altup = Gemma3nTextAltUp(config).eval()
+    scatter_weights(altup, seed=47)
+    stream = torch.randn(4, 2, 6, config.hidden_size, generator=generator)
+    activated = torch.randn(2, 6, config.hidden_size, generator=generator)
+    with torch.no_grad():
+        predictions = altup.predict(stream)
+        corrected = altup.correct(predictions, activated)
+        scaled = altup.scale_corrected_output(corrected[config.altup_active_idx])
+    arrays.update(stream=stream.numpy(), activated=activated.numpy(),
+                  predictions=predictions.numpy(), corrected=corrected.numpy(),
+                  scaled=scaled.numpy())
+    arrays.update({f"altup.{name}": tensor.detach().numpy()
+                   for name, tensor in altup.named_parameters()})
+    laurel = Gemma3nTextLaurelBlock(config).eval()
+    scatter_weights(laurel, seed=48)
+    with torch.no_grad():
+        arrays["laurel_output"] = laurel(activated).numpy()
+    arrays.update({f"laurel.{name}": tensor.detach().numpy()
+                   for name, tensor in laurel.named_parameters()})
+    mlp = Gemma3nTextMLP(config, layer_idx=0).eval()
+    scatter_weights(mlp, seed=49)
+    with torch.no_grad():
+        arrays["mlp_output"] = mlp(activated).numpy()
+    arrays.update({f"mlp.{name}": tensor.detach().numpy()
+                   for name, tensor in mlp.named_parameters()})
+    np.savez(directory / "blocks.npz", allow_pickle=False, **arrays)
+    print(f"{directory}: altup, laurel and sparse mlp blocks, {sorted(arrays)}")
+
+
 def add_layer_scalars(name: str) -> None:
     """The ones of the reference's layer_scalar buffer into an older fixture."""
     directory = FIXTURES / name
@@ -283,25 +362,20 @@ def add_layer_scalars(name: str) -> None:
     save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
 
 
-def write_llama4_scout_config() -> None:
-    """meta-llama/Llama-4-Scout-17B-16E and google/gemma-4-26B-A4B are gated;
-    the mirrors carry the identical configs plus their own marker, which is
-    dropped."""
+def write_mirrored_config(name: str, repo: str) -> None:
+    """A gated release's config from a mirror that carries it identically
+    plus its own marker keys, which are dropped: meta-llama/Llama-4-Scout,
+    google/gemma-4-26B-A4B and google/gemma-3n-E2B."""
     from huggingface_hub import hf_hub_download
     import json
 
-    directory = FIXTURES / "llama-4-scout"
+    directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download("unsloth/Llama-4-Scout-17B-16E", "config.json")).read_text())
-    config["text_config"].pop("for_llm_compressor", None)
-    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({"repo": "unsloth/Llama-4-Scout-17B-16E"}) + "\n")
-    directory = FIXTURES / "gemma4-26b-a4b"
-    directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download("unsloth/gemma-4-26B-A4B-it", "config.json")).read_text())
+    config = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
     config.pop("unsloth_fixed", None)
+    config.get("text_config", config).pop("for_llm_compressor", None)
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({"repo": "unsloth/gemma-4-26B-A4B-it"}) + "\n")
+    (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
 
 
 def main() -> None:
@@ -312,15 +386,19 @@ def main() -> None:
     write_glm4_moe_mtp("glm4-moe-tiny", glm)
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
-    write_llama4_scout_config()
-    write_tiny("gemma4-moe-tiny", tiny_gemma4_moe())
+    write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
+    write_mirrored_config("gemma4-26b-a4b", "unsloth/gemma-4-26B-A4B-it")
+
     write_gemma4_moe_block(FIXTURES.parent / "gemma4")
+    write_tiny("gemma3n-tiny", tiny_gemma3n())
+    write_gemma3n_blocks(FIXTURES.parent / "gemma3n")
     for name in ("gemma4-ple", "gemma4-kvshare", "gemma4-e2b"):
         add_layer_scalars(name)
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")
     write_released_config("glm-4.5-air", "zai-org/GLM-4.5-Air")
+    write_mirrored_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
 
 
 if __name__ == "__main__":

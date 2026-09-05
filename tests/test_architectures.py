@@ -244,6 +244,20 @@ CASES = [
         "attention_k_eq_v": True, "layer_scalar": True,
         "mixture": {"experts": 8, "top_k": 2, "expert_features": 16, "parallel": True},
     }, seq_len=SEQ_LEN, label="gemma4_moe"),
+    # Gemma 3n at toy width: three copies of the residual stream under
+    # AltUp, the LAuReL block, gaussian top-k on the first layer, widths
+    # that differ per layer, per-layer inputs and the last layer sharing the
+    # first's keys and values.
+    Case("causal_transformer", {
+        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
+        "mlp_features": (48, 64), "activation_sparsity_pattern": (0.95, 0.0),
+        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
+        "embedding_scale": True, "attention_scale": 1.0, "final_logit_softcap": 30.0,
+        "layer_types": ("sliding_attention", "sliding_attention"),
+        "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
+        "altup": {"num_inputs": 3}, "laurel_rank": 8,
+        "per_layer_input_dim": 8, "num_kv_shared_layers": 1,
+    }, seq_len=SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,

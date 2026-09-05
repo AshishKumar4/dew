@@ -70,6 +70,10 @@ Tolerances and the differences actually observed, fp32 on CPU:
   routed branch beside every layer's dense MLP, the global layer reading its
   values off one key/value head of 16, and the per-layer scalars; the
   branch's numbers are in tests/test_gemma4_moe.py.
+- gemma3n-tiny: max |logit difference| 4.2e-06, tolerance 1e-4. Three
+  copies of the residual stream under AltUp, the LAuReL block, gaussian
+  top-k on the first two layers, widths of 48 and 64, per-layer inputs and
+  one sharing layer; the blocks' numbers are in tests/test_gemma3n.py.
 """
 
 import dataclasses
@@ -2122,5 +2126,166 @@ def test_gemma4_moe_export_is_refused_by_name(tmp_path):
     """The values norm every Gemma 4 carries is refused before the routed
     branch is reached, and by the field's name."""
     model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    with pytest.raises(ValueError, match="v_norm"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Gemma 3n: AltUp's residual copies, LAuReL, activation sparsity, per-layer widths
+# ---------------------------------------------------------------------------
+
+GEMMA3N = FIXTURES / "gemma3n-tiny"
+
+
+def test_gemma3n_config_translates_field_by_field():
+    """The tiny config: three residual copies with the clip and the output
+    scale, a LAuReL rank of 8, sparsity on the first two of four layers,
+    widths of 48 and 64, per-layer inputs of 8, the last layer sharing K/V,
+    and the sliding kind on its own rope base."""
+    config = translate_config(fixture_config("gemma3n-tiny"))
+
+    assert config["altup"] == {"num_inputs": 3, "active_idx": 0, "coef_clip": 120.0,
+                               "correct_scale": True}
+    assert config["laurel_rank"] == 8
+    assert config["activation_sparsity_pattern"] == (0.95, 0.95, 0.0, 0.0)
+    assert config["mlp_features"] == (48, 48, 64, 64) and config["mlp"] == "geglu"
+    assert config["per_layer_input_dim"] == 8 and config["per_layer_input_vocab"] == 64
+    assert config["num_kv_shared_layers"] == 1
+    assert config["layer_types"] == ("sliding_attention", "sliding_attention",
+                                     "full_attention", "sliding_attention")
+    assert config["kinds"] == {"sliding_attention": {"window": 4, "rope_theta": 10000.0}}
+    assert config["rope_theta"] == 1000000.0
+    assert config["v_norm"] and config["sandwich_norms"] and config["embedding_scale"]
+    assert config["attention_scale"] == 1.0 and config["final_logit_softcap"] == 30.0
+    assert config["head_dim"] == 8 and config["num_kv_heads"] == 2
+
+
+def test_the_real_gemma_3n_e2b_text_config_translates():
+    """google/gemma-3n-E2B's text_config, from a mirror: 30 layers with
+    every fifth full and the last 10 sharing K/V, 8 query and 2 key/value
+    heads of 256 over a hidden size of 2048, one width of 8192 (the list is
+    uniform), sparsity 0.95 on the first 10 layers, four residual copies,
+    LAuReL rank 64, per-layer inputs of 256 from a table of 262144 rows
+    under a vocabulary of 262400, and softcap 30."""
+    config = translate_config(fixture_config("gemma-3n-e2b")["text_config"])
+
+    assert config["num_layers"] == 30
+    assert config["layer_types"].count("full_attention") == 6
+    assert config["layer_types"][4] == "full_attention"
+    assert config["emb_features"] == 2048 and config["vocab_size"] == 262400
+    assert config["num_heads"] == 8 and config["num_kv_heads"] == 2
+    assert config["head_dim"] == 256
+    assert config["mlp_features"] == 8192 and config["mlp"] == "geglu"
+    assert config["activation_sparsity_pattern"] == (0.95,) * 10 + (0.0,) * 20
+    assert config["altup"] == {"num_inputs": 4, "active_idx": 0, "coef_clip": 120.0,
+                               "correct_scale": True}
+    assert config["laurel_rank"] == 64
+    assert config["per_layer_input_dim"] == 256 and config["per_layer_input_vocab"] == 262144
+    assert config["num_kv_shared_layers"] == 10
+    assert config["kinds"] == {"sliding_attention": {"window": 512, "rope_theta": 10000.0}}
+    assert config["rope_theta"] == 1000000.0
+    assert config["final_logit_softcap"] == 30.0
+    assert "mixture" not in config and "rope_scaling" not in config
+
+
+def test_a_gemma3n_config_without_its_lists_takes_the_reference_defaults():
+    """Gemma3nTextConfig fills every fifth layer full, expands one width
+    to every layer and puts sparsity 0.95 on the first ten layers of a
+    deeper model; the expected values come from the reference class."""
+    from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
+
+    config = fixture_config("gemma3n-tiny")
+    for field in ("layer_types", "activation_sparsity_pattern", "rope_parameters"):
+        del config[field]
+    config.update(num_hidden_layers=12, intermediate_size=48, num_kv_shared_layers=2)
+    reference = Gemma3nTextConfig(**config)
+
+    translated = translate_config(config)
+    assert translated["layer_types"] == tuple(reference.layer_types or ())
+    assert isinstance(reference.activation_sparsity_pattern, list)
+    assert translated["activation_sparsity_pattern"] == tuple(reference.activation_sparsity_pattern)
+    assert translated["mlp_features"] == 48 and reference.intermediate_size == [48] * 12
+    assert translated["kinds"]["sliding_attention"]["rope_theta"] == 10000.0
+    assert translated["rope_theta"] == 1000000.0
+
+
+def test_gemma3n_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.2e-06
+    with identical argmax. The copies' projections, each layer's AltUp and
+    LAuReL leaves and the sharing layer's missing K/V are what the tree
+    holds."""
+    model, variables, _ = fp32_decoder(GEMMA3N)
+    ids = np.load(GEMMA3N / "input_ids.npy")
+    reference = np.load(GEMMA3N / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    params = variables["params"]
+    assert {name for name in params if name.startswith("altup")} == {
+        "altup_projections_0", "altup_projections_1",
+        "altup_unembed_projections_0", "altup_unembed_projections_1"}
+    assert params["layers_0"]["altup"]["prediction_coefs"]["kernel"].shape == (3, 9)
+    assert params["layers_0"]["laurel"]["linear_left"]["kernel"].shape == (32, 8)
+    assert params["layers_2"]["mlp"]["gate_proj"]["kernel"].shape == (32, 64)
+    assert "k_proj" not in params["layers_3"]["self_attn"]
+
+
+def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
+    """The stream of copies rides the decode path: a prefill and single-token
+    steps through the KV cache agree with the whole sequence."""
+    model, variables, _ = fp32_decoder(GEMMA3N, max_seq_len=16)
+    ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
+    full = model.apply(variables, ids)
+    state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
+    steps = []
+    for position in range(ids.shape[1]):
+        step, state = model.apply(
+            {**variables, "cache": state["cache"]}, ids[:, position:position + 1],
+            decode=True, mutable=["cache"])
+        steps.append(step)
+    incremental = jnp.concatenate(steps, axis=1)
+    difference = float(jnp.max(jnp.abs(incremental - full)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("activation_sparsity_pattern", [0.95, 0.0], "one fraction per layer"),
+    ("rope_scaling", {"rope_type": "linear", "factor": 2.0}, "rope_type 'linear'"),
+    ("altup_num_inputs", 1, "altup_num_inputs"),
+    ("altup_active_idx", 3, "altup_active_idx"),
+    ("hidden_activation", "relu", "hidden_act"),
+])
+def test_a_gemma3n_field_with_no_counterpart_is_refused(field, value, message):
+    """A rope_scaling beside the nested rope_parameters lands on the full
+    layers as Gemma3nTextConfig folds it, so a type the rotary table cannot
+    express is refused there by name."""
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("gemma3n-tiny"), field: value})
+
+
+def test_a_llama3_rope_scaling_beside_nested_rope_parameters_lands_on_the_full_layers():
+    """The fold Gemma3nTextConfig applies: the ramp reaches the full kind
+    alone, the sliding kind keeps its plain rope."""
+    config = {**fixture_config("gemma3n-tiny"), "rope_scaling": {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 32}}
+    translated = translate_config(config)
+    assert translated["kinds"]["full_attention"]["rope_scaling"]["factor"] == 8.0
+    assert "rope_scaling" not in translated["kinds"]["sliding_attention"]
+    assert "rope_scaling" not in translated
+
+
+def test_a_gemma3n_wrapper_config_is_refused_by_name():
+    """The E2B repo's config.json wraps the text decoder beside vision and
+    audio towers; the text_config alone is what translates."""
+    with pytest.raises(ValueError, match="multimodal wrapper"):
+        translate_config(fixture_config("gemma-3n-e2b"))
+
+
+def test_gemma3n_export_is_refused_by_name(tmp_path):
+    model, variables, _ = fp32_decoder(GEMMA3N)
     with pytest.raises(ValueError, match="v_norm"):
         save_pretrained_decoder(model, variables, str(tmp_path))
