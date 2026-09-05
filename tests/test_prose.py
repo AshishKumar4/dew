@@ -55,7 +55,8 @@ def prose_of(path: Path) -> list[tuple[int, str]]:
             if line.startswith("```"):
                 fenced = not fenced
                 continue
-            if not fenced:
+            # CONTRIBUTING's Writing section quotes the constructions it bans.
+            if not fenced and not (path.name == "CONTRIBUTING.md" and line.startswith("- **")):
                 lines.append((number, line))
         return lines
     spans = [m.span(2) for m in STRING.finditer(text)]
