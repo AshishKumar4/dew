@@ -638,14 +638,18 @@ class ManualClock:
 
 def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     """Every interval, the first one included, reports the time its steps
-    took; the compile is outside every window and never lands in
-    train/step_time_ms, and the goodput numbers at the end count it as the
+    took; placement and compile are outside every window and never land in
+    train/step_time_ms, and the goodput numbers at the end count them as the
     time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tracker=tracker)
-    compile_step = trainer.compile
+    place, compile_step = trainer.place, trainer.compile
+
+    def slow_place():
+        clock.now += 20.0
+        return place()
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -657,17 +661,18 @@ def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
             return outputs
         return timed
 
+    monkeypatch.setattr(trainer, "place", slow_place)
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     trainer.fit(Data(endless), steps=3, log_every=1)
 
     ticks = [s for _, s in tracker.scalars if "train/step_time_ms" in s]
     assert [s["train/step_time_ms"] for s in ticks] == pytest.approx([1000.0] * 3)
-    # The compile (100) and the first step (1) make the time to the first
-    # step; the two steps after it are the 2 of 103 seconds spent in steps.
+    # Placement (20), the compile (100) and the first step (1) make the time
+    # to the first step; the two steps after it are the 2 of 123 seconds in steps.
     goodput = [(step, s) for step, s in tracker.scalars if "goodput/step_fraction" in s]
     assert [step for step, _ in goodput] == [3]
-    assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(101.0)
-    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 103)
+    assert goodput[0][1]["goodput/time_to_first_step_s"] == pytest.approx(121.0)
+    assert goodput[0][1]["goodput/step_fraction"] == pytest.approx(2 / 123)
 
 
 def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkeypatch, tmp_path):

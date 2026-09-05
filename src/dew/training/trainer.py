@@ -398,6 +398,7 @@ class Trainer:
         position are written; every `checkpoints.local_every` steps they are
         written to the local directory as well.
         """
+        started = time.perf_counter()
         mesh = self.device_mesh
         process_zero = jax.process_index() == 0
         state, shardings, position = self.place()
@@ -435,9 +436,6 @@ class Trainer:
         book = fresh_book()
         tracing, traced, seen = False, 0, 0
         loss = None
-        # For the goodput numbers: when the first step's result landed, and
-        # the time spent outside steps after it (evaluations, checkpoints).
-        started = time.perf_counter()
         first_step = None
         other = 0.0
 
