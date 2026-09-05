@@ -24,11 +24,12 @@ from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import batch_shardings, shard_batch
 VOCAB = 64
-# Training batches carry seq_len + 1 columns for the one-token shift, and a
-# sequence-sharded batch needs that width to divide: 15 + 1 splits over two
-# sequence shards. A width that does not divide stays replicated instead of
-# failing, the batch analogue of the layout dropping an indivisible name.
-SEQ_LEN = 15
+# Training batches carry seq_len + 1 columns for the one-token shift, so the
+# 17 columns of a 16-token model never split over a sequence axis of two: the
+# batch stays whole over it, and the attention claims the axis for the
+# model's 16 tokens itself (tests/test_sequence_parallel.py). A model length
+# the striped order cannot pair, 15 say, is refused by name.
+SEQ_LEN = 16
 BATCH = 8
 TINY_SHARD = 256
 # The widths a tensor run redirects off fsdp: the plan's heads, mlp and
@@ -89,20 +90,20 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
     """Sequence parallelism splits activations: rows over every other axis,
     positions over sequence."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
-    assert batch.addressable_shards[0].data.shape == (BATCH // 4, (SEQ_LEN + 1) // 2)
+    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN // 2)
 
 
 def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     """Seventeen columns over two sequence shards divide nothing, so the
     rows still split and the width replicates instead of failing."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 2), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
     assert batch.sharding.spec == P(("data", "expert", "fsdp", "tensor"))
-    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 2)
+    assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 1)
 
 
 def test_an_image_batch_never_takes_the_sequence_axis():
@@ -193,8 +194,7 @@ def test_topologies_agree_with_data_parallel():
     difference = max(
         np.max(np.abs(first - second))
         for first in runs.values() for second in runs.values())
-    # Observed 7.2e-7 between fsdp=4 and fsdp=2,sequence=2 and 0.0 among the
-    # other pairs over 30 steps on CPU; the tolerance is 1e-6 because a
-    # different collective order on another backend is allowed to round
-    # differently.
+    # Observed 4.8e-7 at most between any two of the five topologies over 30
+    # steps on CPU; the tolerance is 1e-6 because a different collective
+    # order on another backend is allowed to round differently.
     assert difference < 1e-6, difference
