@@ -20,14 +20,13 @@ class GatedDeltaNetMixer(MixerBase):
     conv's window. `output_gate_type` is the activation the gated norm
     applies to its gate, silu in qwen3_5 (`Qwen3_5RMSNormGated.activation`,
     modeling_qwen3_5.py:173) and `output_gate_type or hidden_act` in
-    qwen4_exp (modeling_qwen4_exp.py:438). The chunked/recurrent trade
-    (chunk size 64, the reference's default) is a property of the
-    implementation, not the config, so it is not a field here.
+    qwen4_exp (modeling_qwen4_exp.py:438). The chunk size (64, the
+    reference's default) belongs to the implementation, so it is not a field
+    here.
 
     This kind ignores the context's attention geometry (num_kv_heads,
     head_dim, the window, partial rotary, KV sharing, the output gate): a
-    linear-attention layer has no keys to cache, no rope and no window,
-    which is the whole point of the family.
+    linear-attention layer has no keys to cache, no rope and no window.
     """
 
     linear_num_key_heads: int = 16

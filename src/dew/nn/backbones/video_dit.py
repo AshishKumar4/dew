@@ -4,7 +4,7 @@ DiT machinery.
 
 Each layer is a spatial ModulatedBlock over the patch tokens of every frame
 followed by a temporal ModulatedBlock over the frame axis of every patch
-position - the standard factorized design, so compute stays linear in T for
+position, the standard factorized design, so compute stays linear in T for
 the spatial half and linear in S for the temporal half.
 """
 

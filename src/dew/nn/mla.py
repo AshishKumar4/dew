@@ -9,8 +9,8 @@ small decoupled rotary head: `kv_a_proj_with_mqa` maps the hidden states to
 expands it back out to every head's nope keys and values. Queries are
 low-rank the same way when `q_lora_rank` is set (a plain `q_proj` when it is
 None, which no released checkpoint uses). Decode caches the compressed
-latents, which is what the V3 reference holds; the V3.2 reference caches the
-expanded keys and values instead, so the sparse variant does that too.
+latents, as the V3 reference does; the V3.2 reference caches the expanded
+keys and values instead, so the sparse variant does that too.
 
 The rotary head rotates interleaved pairs (even/odd slices, one frequency
 each) rather than the rotate-half convention `apply_rotary` implements, so
@@ -34,9 +34,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
-# The norm and the rotary primitives live on the backbone, which imports the
-# mixers package, whose hub imports this module: a module reference, read at
-# build time, is what completes in either import order.
+# The backbone holds the norm and rotary primitives, and it imports the
+# mixers package, whose hub imports this module; a module reference read at
+# build time completes in either import order.
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import logical_axes
@@ -48,9 +48,9 @@ class YarnScaling:
 
     Both released DeepSeek configs carry this spelling (rope_type yarn,
     factor 40 off 4096 base positions), so the record keeps the reference's
-    names: translation renames nothing. `rope_theta` repeats the mixer's own
-    base, and the two must agree, so the scaling is configured once (the
-    mscale lives in the attention as a query pre-scale, not in the rope).
+    names and a translation renames nothing. `rope_theta` repeats the
+    mixer's own base, and the two must agree, so the scaling is configured
+    once (the mscale is applied in the attention as a query pre-scale).
     """
 
     rope_type: str = 'yarn'
@@ -71,8 +71,8 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
     """YaRN inverse frequencies over the rope width: `[head_dim // 2]`.
 
     Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
-    head dim, which is what DeepSeek's configs do by pointing `head_dim` at
-    the rope slice. Low dims interpolate towards `1 / (factor * pos_freqs)`,
+    head dim, as DeepSeek's configs do by pointing `head_dim` at the rope
+    slice. Low dims interpolate towards `1 / (factor * pos_freqs)`,
     high dims keep extrapolating, and the linear ramp between the correction
     bounds blends them.
     """
@@ -104,8 +104,8 @@ def yarn_attention_factor(yarn: YarnScaling) -> float:
     """The cos/sin multiplier of `_compute_yarn_parameters`.
 
     Both released configs set mscale and mscale_all_dim to 1.0, so this is
-    1.0 for them; the general form stays, because a config that sets them
-    apart rotates at a different amplitude and must not silently lose it.
+    1.0 for them; a config that sets them apart rotates at a different
+    amplitude.
     """
     if yarn.attention_factor is not None:
         return float(yarn.attention_factor)
@@ -138,8 +138,8 @@ def mla_rope_freqs(positions, head_dim: int, theta: float,
 
     Plain rope is `rotary_freqs`, the one layout every mixer shares. YaRN
     replaces the inverse frequencies with the ramp and scales the resulting
-    cos/sin by its attention factor, which is what the reference's rotary
-    embedding returns.
+    cos/sin by its attention factor, as the reference's rotary embedding
+    does.
     """
     if yarn is None:
         return backbone.rotary_freqs(positions, head_dim, theta)
@@ -160,8 +160,7 @@ def apply_rotary_interleave(x, freqs_cos, freqs_sin):
     (`modeling_deepseek_v3.apply_rotary_pos_emb_interleave`): the even and
     odd slices turn against the first half of the cos/sin, and the halves
     stack real over imaginary rather than interleaving back. Query and key
-    take the same layout, so the dot product keeps the complex structure;
-    matching the layout exactly is what parity needs.
+    take the same layout, so the dot product keeps the complex structure.
     """
     if freqs_cos.ndim == 3:
         cos = freqs_cos[:, :, None, :]
@@ -354,7 +353,7 @@ class SparseIndexer(nn.Module):
 
         `keys` are the rotated keys of every candidate (the cache on
         decode), `mask` the `[B, S, T]` additive float bias of what the
-        query may not attend, and the query side is computed, never cached.
+        query may not attend, and the query side is computed on each call.
         Scores run in fp32: the head weighting multiplies by
         `n_heads ** -0.5` in fp32 in the reference, and the relu keeps only
         the positive agreements.
@@ -396,7 +395,7 @@ class MultiHeadLatentAttention(nn.Module):
     call writes the whole prompt and each later call appends one token. The
     dense variant caches the compressed latent and the rotated rope head;
     the sparse (V3.2 indexer) variant caches the expanded keys and values
-    with the indexer's keys, which is what each reference holds. `positions`
+    with the indexer's keys, as each reference does. `positions`
     and `segment_ids` behave as on the standard mixer: absolute positions
     for the cache slots, per-document positions and a block-diagonal mask
     for a packed batch.
@@ -667,15 +666,15 @@ class MLAMixer(MixerBase):
     rope-scaling record (or None for plain rope), and the three index fields
     together turn on the V3.2 sparse indexer (None is dense MLA). The rope
     base is the model's `rope_theta`, transformed by the yarn ramp rather
-    than replaced, so scaling is configured once; the mscale lives in the
-    attention as a query pre-scale, not in the rope.
+    than replaced, so scaling is configured once, and the mscale is applied
+    in the attention as a query pre-scale.
 
     The context's grouped-query geometry (`num_kv_heads`, `head_dim`) has
     no meaning here and is not read, as the backbone documents; `qk_norm` is
     not read either, since the latent norms are the design's own and always
-    present. The dials a standard attention would honour and this cannot
-    (a values norm, KV sharing, a window, an attention scale, a partial
-    rotary) refuse rather than drop silently.
+    present. The dials a standard attention honours and this cannot (a
+    values norm, KV sharing, a window, an attention scale, a partial rotary)
+    are refused.
     """
 
     q_lora_rank: Optional[int] = None

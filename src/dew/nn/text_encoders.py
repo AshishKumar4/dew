@@ -2,12 +2,13 @@
 Face weights.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
-`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE: the reference
-layout, the weights read by name from the checkpoint's safetensors.
+`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE, in the
+reference layout with the weights read by name from the checkpoint's
+safetensors.
 
 The CLIP port is `openai/clip-vit-large-patch14`: the text tower, which is the
 part a diffusion model conditions on, and the vision tower with the two
-projection heads, which is what the metrics score generated images with. The
+projection heads, which the metrics score generated images with. The
 operation order follows transformers 5.16.1 `models/clip/modeling_clip.py`.
 For the text tower, token and position embeddings added, twelve pre-norm
 layers of causal attention and a quick-GELU MLP, a final layer norm, and the
@@ -23,9 +24,9 @@ sqrt(head_dim) before the logits where the reference scales the logits after;
 reference.
 
 Weights come from the checkpoint's safetensors through `dew.interop`, mapped by
-name, so neither torch nor a Flax class from transformers is needed.
-`AutoTokenizer` still ships in transformers 5 and stays the tokenizer, and so
-does the PIL image processor the metrics preprocess with.
+name, so neither torch nor a Flax class from transformers is needed. The
+tokenizer is transformers' `AutoTokenizer`, and the metrics preprocess with
+its PIL image processor.
 """
 
 import functools
@@ -147,7 +148,7 @@ class CLIPTextTransformer(nn.Module):
     """The text tower of CLIP, param layout and defaults of `CLIPTextConfig`.
 
     `attention_mask` is the tokenizer's, ones on the real tokens and zeros on
-    the padding. It narrows the causal mask to the unpadded keys, which is what
+    the padding. It narrows the causal mask to the unpadded keys, as
     `create_causal_mask` does with it in the reference, so the rows past the
     end of a prompt hold what the reference puts there too.
     """
@@ -278,8 +279,8 @@ class CLIP(nn.Module):
     """Both towers and their projection heads, `CLIPModel` in the reference.
 
     `get_text_features` and `get_image_features` are the pooled rows through
-    the heads, unnormalized, which is what the reference methods of those
-    names return; `CLIPModel.forward` normalizes them before the cosine.
+    the heads, unnormalized, as the reference methods of those names return
+    them; `CLIPModel.forward` normalizes them before the cosine.
     """
     text_model: CLIPTextTransformer
     vision_model: CLIPVisionTransformer
@@ -474,8 +475,8 @@ def _leaf(path: Tuple[str, ...], tensor) -> np.ndarray:
 
     torch Linear holds [out, in] and `nn.Dense` keeps [in, out]; torch Conv2d
     holds [out, in, kh, kw] and `nn.Conv` [kh, kw, in, out]. A norm's `weight`
-    becomes `scale` and an embedding's becomes `embedding`, which is what
-    those params are called in linen.
+    becomes `scale` and an embedding's becomes `embedding`, the names linen
+    gives those params.
     """
     leaf = np.asarray(tensor, np.float32)
     if path[-1] == "kernel":
@@ -538,9 +539,9 @@ def _checkpoint_dir(name_or_dir: str, revision: Optional[str]) -> Path:
 
     A local directory is taken as it is. A repo id fetches the config and the
     weights, whole (`model.safetensors`) or sharded
-    (`model-0000N-of-0000M.safetensors`, T5-XXL), and nothing else: openai's
-    repos carry the torch, TensorFlow and Flax copies of the same weights
-    beside them, five gigabytes no one here reads.
+    (`model-0000N-of-0000M.safetensors`, T5-XXL). openai's repos also carry
+    torch, TensorFlow and Flax copies of the same weights, five gigabytes this
+    never reads, so the patterns leave them out.
     """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
@@ -577,10 +578,9 @@ def _read_tensors(directory: Path) -> Dict[str, np.ndarray]:
 class CLIPTextModel:
     """A CLIP text tower with its weights, callable the way the encoder calls it.
 
-    This is what `dew.inputs.encoders.CLIPText.from_pretrained` loads its
-    tower and weights from, in the place `FlaxCLIPTextModel` used to take:
-    call it with `input_ids` and the tokenizer's `attention_mask`, read
-    `last_hidden_state` off the result.
+    `dew.inputs.encoders.CLIPText.from_pretrained` loads its tower and
+    weights from this. Call it with `input_ids` and the tokenizer's
+    `attention_mask` and read `last_hidden_state` off the result.
     """
 
     def __init__(self, transformer: CLIPTextTransformer, variables, config):
@@ -595,9 +595,8 @@ class CLIPTextModel:
                         revision: Optional[str] = None) -> "CLIPTextModel":
         """Load a checkpoint from the Hub or a local directory.
 
-        `dtype` is the compute dtype, as it is on every other dew module and as
-        it was on the Flax classes this replaces. The weights themselves stay
-        fp32, which is how the checkpoint stores them.
+        `dtype` is the compute dtype, as on every other dew module. The
+        weights stay fp32, which is how the checkpoint stores them.
         """
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_config(_read_config(directory))
@@ -617,11 +616,10 @@ class CLIPModel:
     """Both CLIP towers with their weights, callable the way the metrics call
     them.
 
-    This is what `dew.eval.images` holds in the place `FlaxCLIPModel` used to
-    take. `get_image_features` takes the checkpoint's image processor output
-    and `get_text_features` the tokenizer's ids and mask; both return the
-    projected embeddings, unnormalized, as the reference methods of those
-    names do.
+    `dew.eval.images` holds one of these. `get_image_features` takes the
+    checkpoint's image processor output and `get_text_features` the
+    tokenizer's ids and mask; both return the projected embeddings,
+    unnormalized, as the reference methods of those names do.
     """
 
     def __init__(self, module: CLIP, variables, config):
@@ -1005,10 +1003,9 @@ class T5EncoderModel:
         """Load a checkpoint from the Hub or a local directory, encoder
         tensors only.
 
-        `dtype` is the compute dtype, as it is on every other dew module. The
-        weights themselves stay fp32, which is how the checkpoint stores
-        them. Sharded checkpoints (model-00001-of-00002.safetensors) load as
-        one tower.
+        `dtype` is the compute dtype, as on every other dew module. The
+        weights stay fp32, which is how the checkpoint stores them. Sharded
+        checkpoints (model-00001-of-00002.safetensors) load as one tower.
         """
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_t5_config(_read_config(directory))
