@@ -48,8 +48,8 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
-| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
+| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
 | `dew.sampling.text` | `generate` |
 
 ## Models
