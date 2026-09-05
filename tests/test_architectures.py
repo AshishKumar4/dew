@@ -175,6 +175,18 @@ CASES = [
     # feed-forward go through the same run.
     Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
          seq_len=SEQ_LEN, label="moe"),
+    # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
+    # indexer on every layer, and the routed layer with the balancing bias,
+    # the group limit and a shared expert.
+    Case("causal_transformer", {
+        **LM, "head_dim": 16,
+        "mixer": {"kind": "mla", "q_lora_rank": 8, "kv_lora_rank": 8,
+                  "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
+                  "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16},
+        "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
+                    "groups": 4, "groups_per_token": 2, "bias": True,
+                    "expert_features": 16, "shared_features": 16},
+    }, seq_len=SEQ_LEN, label="mla"),
 ]
 
 # jepa_predictor has no training step of its own: it is built through the
