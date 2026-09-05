@@ -587,6 +587,27 @@ def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str,
     return config
 
 
+def _olmo3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """OLMo 3: a post-norm block whose two norms sit on the sublayer outputs
+    (modeling_olmo3.py:259-266, the sandwich pair without the input pair),
+    q/k RMSNorms over the whole projection before the head split
+    (:162-163, :178-179), three sliding layers to one full
+    (configuration_olmo3.py:96-98), and one rope base for both kinds. The
+    reference applies `rope_scaling` to its full-attention layers alone
+    (configuration_olmo3.py:110-113); the released checkpoints carry a YaRN
+    there, which the attention has no per-kind ramp for yet, so a config
+    that scales refuses with the entry named rather than loading plain rope
+    under it."""
+    layers = int(hf_config['num_hidden_layers'])
+    layer_types = _specified_layer_types(hf_config, used, tuple(
+        'sliding_attention' if (index + 1) % 4 else 'full_attention'
+        for index in range(layers)))
+    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
+                          scale_after_cast=False)
+    config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
+    return config
+
+
 def _gemma_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     """Gemma 1: (1 + w) norms scaled in fp32, sqrt(d)-scaled embeddings, a
     tied head, and no norms beyond the two pre-norms (modeling_gemma.py:77,
@@ -1465,6 +1486,9 @@ _FAMILY_ENTRIES = (
                   lambda fields: bool(fields['output_gate']
                                       or 'linear_attention' in (fields['layer_types'] or ())),
                   _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}),
+    DecoderFamily(('olmo3',), _olmo3_config,
+                  lambda fields: not fields['pre_norms'],
+                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),
     DecoderFamily(('gemma4_text',), _gemma4_config,
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),

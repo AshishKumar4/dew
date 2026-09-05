@@ -188,6 +188,7 @@ class CausalSelfAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
     v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
@@ -224,6 +225,9 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
         if self.qk_norm:
+            if self.qk_norm_scope not in ('head', 'projection'):
+                raise ValueError(
+                    f"qk_norm_scope is 'head' or 'projection', got {self.qk_norm_scope!r}")
             norm = functools.partial(
                 RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype)
@@ -262,6 +266,13 @@ class CausalSelfAttention(nn.Module):
                  positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
         projected = self.q_proj(x)
+        # OLMo 3 norms the whole projection, one scale of heads * head_dim,
+        # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
+        # and the Gemmas norm each head after it, which the reference marks
+        # "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147).
+        whole = self.qk_norm and self.qk_norm_scope == 'projection'
+        if whole:
+            projected = self.q_norm(projected)
         gate = None
         if self.output_gate:
             # The reference views the doubled output as [.., heads, 2*head_dim]
@@ -282,13 +293,16 @@ class CausalSelfAttention(nn.Module):
                     "its layer stack")
             key, value, positions = kv_store[self.kv_store_key]
         else:
-            key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
+            key = self.k_proj(x)
+            if whole:
+                key = self.k_norm(key)
+            key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
             value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
-            if self.qk_norm:
+            if self.qk_norm and not whole:
                 key = self.k_norm(key)
             if self.v_norm:
                 value = self.values_norm(value)
-        if self.qk_norm:
+        if self.qk_norm and not whole:
             query = self.q_norm(query)
 
         # The cache slot carries position while decoding, so the rotation and
@@ -432,7 +446,10 @@ class DecoderBlock(nn.Module):
     sandwich_norms adds Gemma's second pair of norms, on the output of each
     sublayer rather than on its input; the pre-norms keep their names and their
     places, so a checkpoint without them loads into the same tree minus two
-    leaves per layer.
+    leaves per layer. pre_norms=False drops the input pair, which with the
+    output pair on is OLMo 3's post-norm block (modeling_olmo3.py:249-266):
+    each sublayer reads the residual stream as it is and its output is
+    normed before it is added.
 
     kv_store threads one dict down the layer stack so a KV-sharing mixer
     reads its provider's keys and values; a mixer without a kv_store keyword
@@ -446,6 +463,7 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     sandwich_norms: bool = False
+    pre_norms: bool = True
     per_layer_input_dim: int = 0
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
@@ -455,9 +473,11 @@ class DecoderBlock(nn.Module):
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        self.input_layernorm = norm(name='input_layernorm')
+        if self.pre_norms:
+            self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        self.post_attention_layernorm = norm(name='post_attention_layernorm')
+        if self.pre_norms:
+            self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.sandwich_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
@@ -475,13 +495,13 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  per_layer_input=None):
-        mixed = self.self_attn(self.input_layernorm(x), decode=decode,
-                               positions=positions, segment_ids=segment_ids,
+        mixed = self.self_attn(self.input_layernorm(x) if self.pre_norms else x,
+                               decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}))
         if self.sandwich_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
-        hidden = self.mlp(self.post_attention_layernorm(x))
+        hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
         if self.sandwich_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
@@ -522,6 +542,7 @@ class MTPBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     sandwich_norms: bool = False
+    pre_norms: bool = True
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -542,6 +563,7 @@ class MTPBlock(nn.Module):
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             sandwich_norms=self.sandwich_norms,
+            pre_norms=self.pre_norms,
             dropout_rate=self.dropout_rate,
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
@@ -647,7 +669,9 @@ class CausalTransformer(nn.Module):
     scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
+    pre_norms: bool = True                   # False with sandwich_norms: OLMo 3's post-norm block
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
     o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
@@ -790,6 +814,7 @@ class CausalTransformer(nn.Module):
             causal=self.causal,
             rope_theta=kind.rope_theta,
             qk_norm=self.qk_norm,
+            qk_norm_scope=self.qk_norm_scope,
             v_norm=self.v_norm,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -935,6 +960,7 @@ class CausalTransformer(nn.Module):
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
+                pre_norms=self.pre_norms,
                 per_layer_input_dim=ple or 0,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
@@ -961,6 +987,7 @@ class CausalTransformer(nn.Module):
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
+                pre_norms=self.pre_norms,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
