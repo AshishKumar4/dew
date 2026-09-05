@@ -48,6 +48,16 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
     """Declare the parameter axes of the modules `cls` creates."""
     declared = {tuple(suffix): tuple(axes) for suffix, axes in declared.items()}
     heuristic = tuple(tuple(suffix) for suffix in heuristic)
+    for suffix, axes in declared.items():
+        names = [name for name in axes if name is not None]
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        if repeated:
+            # The rules hand a mesh axis to a logical name once per array, so
+            # a second dimension of the same name could never be placed.
+            raise ValueError(
+                f"{'/'.join(suffix)} is declared {axes}, which names "
+                f"{', '.join(repeated)} twice; a kernel whose two sides share a "
+                f"width names one of them or leaves the other None")
 
     def decorate(cls):
         for suffix, axes in declared.items():

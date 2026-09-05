@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Time the real training step, one architecture at a time.
 
-tools/benchmark_data.py answers "is the loader the bottleneck". This answers
-the other half: what a step of the Trainer costs for a given
-architecture, batch size and fsdp width. The step measured here is the one the
-trainer compiles for a real run (same objective, same sharding, same donated
-state), so a number from this tool is a number from training, not from a
-hand-written forward pass.
+tools/benchmark_data.py measures the loader. This measures what a step of the
+Trainer costs for a given architecture, batch size and fsdp width. The step
+is the one the trainer compiles for a real run (same objective, same
+sharding, same donated state), so a number from this tool is a number from
+training.
 
-FLOPs are counted off the compiled executable's optimized HLO
-(dew.telemetry.instrumentation), never from a parameter-count formula, and the
-utilisation is the same figure the trainer logs as train/mfu. Each case is
-timed twice over the same number of steps: once with the asynchronous dispatch
-a real run uses, which gives ms/step, and once waiting on every step, which
-gives the p10/p50/p90 spread.
+FLOPs are read off the compiled executable's optimized HLO
+(dew.telemetry.instrumentation), and the utilisation is the figure the
+trainer logs as train/mfu. Each case is timed twice over the same number of
+steps: once with the asynchronous dispatch a real run uses, which gives
+ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
 Usage:
     python tools/benchmark_step.py --preset cpu-smoke
@@ -35,10 +33,9 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Iterator, Literal, Mapping
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
@@ -55,23 +52,14 @@ from dew.telemetry.instrumentation import compiled_flops, model_flops_utilizatio
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
-JsonCases = Annotated[
-    list[dict[str, Any]],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, list),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
-"""A list of case dicts, written as one JSON string on the command line."""
-
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
 # the step cost depends only on the context's shape.
 TEXT_TOKENS = 77
 TEXT_FEATURES = 768
+
+Batch = dict[str, np.ndarray | Mapping[str, np.ndarray]]
+Row = dict[str, object]
 
 
 def text_condition() -> Condition:
@@ -83,7 +71,7 @@ class Case:
     """One measurement: what to build, how much to feed it, how to shard it."""
 
     architecture: str
-    config: dict = field(default_factory=dict)
+    config: dict[str, object] = field(default_factory=dict)
     dtype: str = 'float32'
     """Compute dtype, written into the model config by the precision policy."""
     batch_size: int = 8
@@ -94,7 +82,7 @@ class Case:
     image_size: int = 32
     frames: int = 0
     """Video models take (frames, H, W, C) samples; 0 means images."""
-    predictor: Optional[dict] = None
+    predictor: dict[str, object] | None = None
     """Set for JEPA: the architecture is an encoder and this builds its predictor."""
     seq_len: int = 0
     """Set for language models: batches are token windows of this length, not images."""
@@ -113,16 +101,47 @@ class Case:
         return self.seq_len > 0
 
     @property
-    def sample_shape(self) -> tuple:
+    def sample_shape(self) -> tuple[int, ...]:
         square = (self.image_size, self.image_size, 3)
         return square if self.frames == 0 else (self.frames, *square)
 
     @property
     def label(self) -> str:
         mixture = self.config.get("mixture")
-        experts = f" x{mixture['experts']}experts" if mixture else ""
+        experts = f" x{mixture['experts']}experts" if isinstance(mixture, dict) else ""
         return (f"{self.architecture}{experts} b{self.batch_size} fsdp{self.fsdp_size} "
                 f"expert{self.expert_size}")
+
+
+def cases_from_json(text: str) -> list[Case]:
+    """`--cases`: a JSON list of objects whose keys are Case fields."""
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        raise ValueError("--cases is a JSON list of objects, one per case")
+    fields = {f.name for f in dataclasses.fields(Case)}
+    cases = []
+    for spec in parsed:
+        if not isinstance(spec, dict):
+            raise ValueError(f"--cases entry {spec!r} is not a JSON object")
+        unknown = sorted(set(spec) - fields)
+        if unknown:
+            raise ValueError(
+                f"--cases entry has no such field {unknown}; valid fields are {sorted(fields)}")
+        cases.append(Case(**spec))
+    return cases
+
+
+JsonCases = Annotated[
+    list[Case],
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda args: cases_from_json(args[0]),
+        is_instance=lambda value: isinstance(value, list),
+        str_from_instance=lambda cases: [json.dumps([dataclasses.asdict(c) for c in cases])],
+    ),
+]
+"""A list of cases, written as one JSON string on the command line."""
 
 
 def cpu_smoke_cases() -> list[Case]:
@@ -148,15 +167,16 @@ def small_cases(dtype: str) -> list[Case]:
     Sized so the whole sweep is minutes rather than hours: real token counts
     (256 image tokens at 64px/patch 4) and real widths, but few layers.
     """
-    dit = {"patch_size": 4, "emb_features": 384, "num_layers": 6, "num_heads": 6,
-           "mlp_ratio": 4}
-    unet = {"emb_features": 256, "feature_depths": [64, 128, 256],
-            "attention_configs": [None, {"heads": 4}, {"heads": 4}],
-            "num_res_blocks": 2, "num_middle_res_blocks": 1}
-    encoder = {"patch_size": 4, "emb_features": 384, "num_layers": 6, "num_heads": 6,
-               "mlp_ratio": 4}
-    predictor = {"grid": (16, 16), "emb_features": 384, "predictor_features": 192,
-                 "num_layers": 3, "num_heads": 6, "mlp_ratio": 4}
+    dit: dict[str, object] = {"patch_size": 4, "emb_features": 384, "num_layers": 6,
+                              "num_heads": 6, "mlp_ratio": 4}
+    unet: dict[str, object] = {"emb_features": 256, "feature_depths": [64, 128, 256],
+                               "attention_configs": [None, {"heads": 4}, {"heads": 4}],
+                               "num_res_blocks": 2, "num_middle_res_blocks": 1}
+    encoder: dict[str, object] = {"patch_size": 4, "emb_features": 384, "num_layers": 6,
+                                  "num_heads": 6, "mlp_ratio": 4}
+    predictor: dict[str, object] = {"grid": (16, 16), "emb_features": 384,
+                                    "predictor_features": 192, "num_layers": 3,
+                                    "num_heads": 6, "mlp_ratio": 4}
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
@@ -184,8 +204,8 @@ def small_cases(dtype: str) -> list[Case]:
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
         Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                     "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512,
-                     "mixture": {"experts": 8, "top_k": 2, "every": 2}},
+                                    "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512,
+                                    "mixture": {"experts": 8, "top_k": 2, "every": 2}},
              batch_size=16, seq_len=512),
     ]
     cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
@@ -207,7 +227,7 @@ class BenchmarkConfig:
     preset: Literal['small', 'cpu-smoke'] = 'small'
     cases: JsonCases = field(default_factory=list)
     """Explicit cases as a JSON list of Case fields; replaces the preset."""
-    architectures: Optional[list[str]] = None
+    architectures: list[str] | None = None
     """Keep only these cases from the preset."""
     warmup: int = 2
     steps: int = 100
@@ -217,35 +237,28 @@ class BenchmarkConfig:
     """Model compute dtype for --preset small; losses stay fp32 either way."""
     attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
-    xla_flags: Optional[str] = None
+    xla_flags: str | None = None
     """Appended to XLA_FLAGS before the first JAX call, as TrainerConfig.xla_flags
     is. A flag only takes effect in a process that has not opened a backend
     yet, so a sweep runs one configuration per process."""
-    batch_size: Optional[int] = None
+    batch_size: int | None = None
     """Override every case's batch size."""
-    fsdp_size: Optional[int] = None
-    image_size: Optional[int] = None
-    frames: Optional[int] = None
+    fsdp_size: int | None = None
+    image_size: int | None = None
+    frames: int | None = None
     """Frame count for the video cases; image cases are left alone."""
-    packed_documents: Optional[int] = None
+    packed_documents: int | None = None
     """Documents per row for the language-model cases; the others are left
     alone. This is the packed loader's batch, which reroutes attention off the
     fused kernel."""
-    json_out: Optional[str] = None
+    json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
     if config.cases:
-        fields = {f.name for f in dataclasses.fields(Case)}
-        for spec in config.cases:
-            unknown = sorted(set(spec) - fields)
-            if unknown:
-                raise ValueError(
-                    f"--cases entry has no such field {unknown}; "
-                    f"valid fields are {sorted(fields)}")
-        cases = [Case(**spec) for spec in config.cases]
+        cases = config.cases
     elif config.preset == 'cpu-smoke':
         cases = cpu_smoke_cases()
     else:
@@ -258,14 +271,16 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
             raise ValueError(f"--architectures {sorted(unknown)} not in preset {config.preset}")
         cases = [case for case in cases if case.architecture in wanted]
 
-    overrides = {name: getattr(config, name)
-                 for name in ('batch_size', 'fsdp_size', 'image_size')
-                 if getattr(config, name) is not None}
+    overrides: dict[str, int] = {}
+    for name in ('batch_size', 'fsdp_size', 'image_size'):
+        value = getattr(config, name)
+        if value is not None:
+            overrides[name] = value
 
     def apply(case: Case) -> Case:
-        # An image model handed a (T, H, W, C) sample is not a shorter
-        # benchmark, it is a rank error, so --frames only resizes the video
-        # cases, and packing is a language model's batch.
+        # An image model handed a (T, H, W, C) sample is a rank error, so
+        # --frames only resizes the video cases, and packing is a language
+        # model's batch.
         frames = {} if config.frames is None or case.frames == 0 else {'frames': config.frames}
         packed = ({'packed_documents': config.packed_documents}
                   if config.packed_documents is not None and case.is_lm else {})
@@ -282,7 +297,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
     dtype and the attention kernel land in the nested unet attention configs
     too, and a row of this table is a row a real run would produce.
     """
-    def built(architecture: str, config: dict):
+    def built(architecture: str, config: Mapping[str, object]):
         return models.build(architecture, **with_precision(
             architecture, config, dtype=case.dtype, attention_impl=attention_impl))
 
@@ -291,8 +306,10 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
 
     if case.is_lm:
         objective = LMObjective(model, case.seq_len)
-    elif case.is_jepa:
+    elif case.predictor is not None:
         patch = case.config.get("patch_size", 16)
+        if not isinstance(patch, int):
+            raise ValueError(f"{case.architecture}'s patch_size is {patch!r}, not an int")
         grid = (case.image_size // patch, case.image_size // patch)
         objective = JepaObjective(
             model, built("jepa_predictor", {**case.predictor, "grid": grid}),
@@ -310,13 +327,16 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
         checkpoints=None, tracker=None)
 
 
-def batches(case: Case):
+def batches(case: Case) -> Iterator[Batch]:
     """One host batch, reused: the loader is benchmarked by benchmark_data.py."""
     rng = np.random.default_rng(0)
+    batch: Batch = {}
     if case.is_lm:
+        vocab = case.config["vocab_size"]
+        if not isinstance(vocab, int):
+            raise ValueError(f"{case.architecture}'s vocab_size is {vocab!r}, not an int")
         width = case.seq_len + 1
-        batch = {"text": rng.integers(0, case.config["vocab_size"],
-                                      size=(case.batch_size, width)).astype(np.int32)}
+        batch["text"] = rng.integers(0, vocab, size=(case.batch_size, width)).astype(np.int32)
         if case.packed_documents:
             # Equal documents tiling the row. A packed row from the loader is
             # ragged and can end in padding; what the mask and the kernel cost
@@ -330,25 +350,22 @@ def batches(case: Case):
                 np.arange(width) - document * per_document, rows).astype(np.int32)
     else:
         sample_key = "video" if case.frames else "image"
-        batch = {sample_key: rng.integers(
-            0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)}
+        batch[sample_key] = rng.integers(
+            0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)
         if not case.is_jepa:
             batch["text"] = text_condition().encoder.tokenize(["a flower"] * case.batch_size)
     while True:
         yield batch
 
 
-def device_peak_bytes() -> Optional[int]:
+def device_peak_bytes() -> int | None:
     """The allocator's high-water mark, where the backend reports one (not CPU).
 
     Monotonic for the life of the process and with no reset hook, so in a sweep
     it is this case's own peak only for the first case; every later case gets
     an upper bound plus its own delta.
     """
-    try:
-        stats = jax.local_devices()[0].memory_stats()
-    except Exception:
-        return None
+    stats = jax.local_devices()[0].memory_stats()
     if not stats:
         return None
     return stats.get('peak_bytes_in_use') or stats.get('bytes_in_use')
@@ -358,12 +375,14 @@ def parameter_count(params) -> int:
     return int(sum(np.prod(leaf.shape, dtype=np.int64) for leaf in jax.tree.leaves(params)))
 
 
-def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
+def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
+    if config.steps < 1:
+        raise ValueError(f"--steps must be at least 1, got {config.steps}")
     peak_before = device_peak_bytes()
     trainer = build_trainer(case, config.attention_impl)
 
-    source = DevicePrefetchIterator(batches(case), trainer.batch_sharding)
+    source = DevicePrefetchIterator(batches(case), trainer.device_mesh)
     abstract = jax.eval_shape(trainer.initial_state)
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     scale = None
@@ -372,26 +391,32 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     compiled = trainer.compile(state, next(source))
     compile_seconds = time.perf_counter() - compile_start
 
-    loss = None
-    for _ in range(max(config.warmup, 1)):
-        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
+    def step(state, scale):
+        state, scale, loss, _, finite = compiled(state, scale, next(source))
+        return state, scale, loss, finite
+
+    # At least one warm step, so the timed window never holds the first
+    # dispatch of the executable.
+    state, scale, loss, is_finite = step(state, scale)
+    for _ in range(config.warmup - 1):
+        state, scale, loss, is_finite = step(state, scale)
     loss.block_until_ready()
 
     start = time.perf_counter()
     for _ in range(config.steps):
-        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
+        state, scale, loss, is_finite = step(state, scale)
     loss.block_until_ready()
     elapsed = time.perf_counter() - start
 
     # A second window of the same length, waiting on every step, for the
-    # spread. The loop above dispatches asynchronously on purpose - that is
-    # how a run behaves - so timing its individual iterations would time the
-    # dispatch, not the step. These per-step numbers are therefore a different
-    # quantity from ms_per_step above, and each carries one synchronisation.
+    # spread. The loop above dispatches asynchronously on purpose, as a run
+    # does, so timing its individual iterations would time the dispatch and
+    # not the step. These per-step numbers are a different quantity from
+    # ms_per_step above, and each carries one synchronisation.
     synced = []
     for _ in range(config.steps):
         step_start = time.perf_counter()
-        state, scale, loss, _, is_finite = compiled(state, scale, next(source))
+        state, scale, loss, is_finite = step(state, scale)
         loss.block_until_ready()
         synced.append((time.perf_counter() - step_start) * 1e3)
     p10, p50, p90 = np.percentile(synced, [10, 50, 90])
@@ -400,7 +425,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
     step_time = elapsed / config.steps
     utilization = model_flops_utilization(flops, step_time)
     peak = device_peak_bytes()
-    row = {
+    row: Row = {
         "architecture": case.architecture,
         "batch_size": case.batch_size,
         "fsdp_size": case.fsdp_size,
@@ -415,7 +440,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "params": parameter_count(state.params),
         "measured_steps": config.steps,
         "compile_seconds": round(compile_seconds, 2),
-        "ms_per_step": round(elapsed / config.steps * 1e3, 3),
+        "ms_per_step": round(step_time * 1e3, 3),
         "p10_ms": round(float(p10), 3),
         "p50_ms": round(float(p50), 3),
         "p90_ms": round(float(p90), 3),
@@ -424,7 +449,7 @@ def measure(case: Case, config: BenchmarkConfig) -> dict[str, Any]:
         "utilization": utilization,
         "peak_device_bytes": peak,
         "case_peak_delta_bytes": (
-            None if peak_before is None else max(0, peak - peak_before)),
+            None if peak is None or peak_before is None else max(0, peak - peak_before)),
         "loss": float(loss),
         "finite": bool(is_finite),
     }
@@ -449,10 +474,12 @@ TABLE_COLUMNS = (
     ("utilization", "util %", 7, "{:.1f}"),
     ("peak_device_bytes", "peak GiB", 9, "{:.2f}"),
 )
+# Units the table shows a column in: FLOPs as GFLOP, a fraction as a
+# percentage, bytes as GiB.
+TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "peak_device_bytes": 2 ** -30}
 
 
-def format_table(rows: list[dict]) -> str:
-    scale = {"flops_per_step": 1e-9, "utilization": 100.0, "peak_device_bytes": 2 ** -30}
+def format_table(rows: list[Row]) -> str:
     header = " ".join(title.rjust(width) if key != "architecture" else title.ljust(width)
                       for key, title, width, _ in TABLE_COLUMNS)
     lines = [header, "-" * len(header)]
@@ -462,15 +489,17 @@ def format_table(rows: list[dict]) -> str:
             value = row.get(key)
             if value is None:
                 text = "n/a"
+            elif isinstance(value, (int, float)):
+                text = fmt.format(value * TABLE_SCALE.get(key, 1))
             else:
-                text = fmt.format(value * scale[key] if key in scale else value)
+                text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))
         lines.append(" ".join(cells))
     return "\n".join(lines)
 
 
-def run(config: BenchmarkConfig) -> list[dict]:
-    rows = []
+def run(config: BenchmarkConfig) -> list[Row]:
+    rows: list[Row] = []
     for case in build_cases(config):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
@@ -489,12 +518,12 @@ def run(config: BenchmarkConfig) -> list[dict]:
     return rows
 
 
-def write_json(rows: list[dict], path: str):
+def write_json(rows: list[Row], path: str) -> None:
     with open(path, "w") as handle:
         json.dump(rows, handle, indent=2)
 
 
-def main(config: BenchmarkConfig):
+def main(config: BenchmarkConfig) -> list[Row]:
     apply_xla_flags(config.xla_flags)
     print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
     print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "

@@ -22,7 +22,7 @@ The public modules and the names each exports. This page is written by
 | `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `broadcast_from_process_zero`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers` |
 | `dew.training.runtime` | `prepare_process`, `run_timestamp` |
-| `dew.telemetry.instrumentation` | `compiled_flops`, `default_compilation_cache_dir`, `enable_compilation_cache`, `hlo_flops`, `model_flops_utilization`, `step_flops` |
+| `dew.telemetry.instrumentation` | `compiled_flops`, `default_compilation_cache_dir`, `enable_compilation_cache`, `hlo_flops`, `model_flops_utilization`, `peak_flops`, `step_flops` |
 | `dew.io` | `publish` |
 
 ## Objectives

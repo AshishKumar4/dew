@@ -1,6 +1,6 @@
 # Mixture of experts
 
-A sparse layer replaces one feed-forward with many: a router scores every expert for a token, the token goes through the `top_k` best ones, and their outputs are summed with the router's weights. The parameter count grows with the expert count while the work per token stays at `top_k` experts, which is why every frontier decoder from Mixtral to DeepSeek V4 is built this way.
+A sparse layer replaces one feed-forward with many: a router scores every expert for a token, the token goes through the `top_k` best ones, and their outputs are summed with the router's weights. The parameter count grows with the expert count while the work per token stays at `top_k` experts, which is why the large open decoders from Mixtral to DeepSeek are built this way.
 
 The modules live in `dew.nn.moe` and the mesh axis in `dew.training.distributed`.
 
@@ -52,13 +52,13 @@ indices = jnp.asarray([[0, 3], [1, 3], [2, 3]], jnp.int32)
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
-It is `+rate` for every expert below the average load, `-rate` for every expert above it. A training step that applies it owns the write, and no Dew trainer does that yet. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what the LM objective's `balance_rate` moves and what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices, `score_function`, `scaling`, `groups` and `groups_per_token`, which no config could name before.
+It is `+rate` for every expert below the average load, `-rate` for every expert above it. `LMObjective(balance_rate=...)` applies it every step and hands the moved bias back to the trainer through `Aux.variables`, the one channel for a collection a step updates without a gradient; under the compiled step the load count is global, so the bias stays one replicated value on every shard. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices: `score_function`, `scaling`, `groups` and `groups_per_token`.
 
 ## The grouped matmul
 
 `ExpertMLP` sorts the tokens by expert, runs the three projections as grouped matmuls over that order, puts the rows back in token order and sums each token's `top_k` results with its router weights in fp32. The expert weights are stacked on an expert dimension, `[exp, embed, mlp]` for `gate_proj` and `up_proj` and `[exp, mlp, embed]` for `down_proj`, which is the layout the grouped matmul takes and the `expert` mesh axis shards.
 
-`implementation` picks the kernel, the seam `dew.nn.attention` has:
+`implementation` picks the kernel:
 
 | Value | Kernel |
 | --- | --- |
@@ -82,7 +82,7 @@ The translation is the one every Dew kernel takes, a transpose of each matrix, p
 
 ## Expert parallelism
 
-`MeshSpec(fsdp, expert)` gives the expert dimension its own mesh axis, and one rules row (`exp` to `expert`) puts it there. On an eight-device mesh with `expert_size=4, fsdp_size=2`, an 8-expert `[8, 32, 64]` kernel holds two experts and half a width per device. See [distributed training](distributed.md) for the mesh and the rules table.
+`MeshSpec(fsdp=2, expert=4)` gives the expert dimension its own mesh axis, and one rules row (`exp` to `expert`) puts it there. On that eight-device mesh an 8-expert `[8, 32, 64]` kernel holds two experts and half a width per device, and a 50-step run there matches the same run at `expert=1` step for step. See [distributed training](distributed.md) for the mesh and the rules table.
 
 ## What is measured
 
@@ -99,4 +99,4 @@ Everything below ran on CPU at fp32 with `JAX_PLATFORMS=cpu .venv/bin/python -m 
 
 The tokamax row needs the package, which Dew does not depend on, so its test skips without it. It was run once with tokamax 0.0.13 and its dependencies staged on `PYTHONPATH`.
 
-The 2000-step acceptance run of the 8-expert decoder on FineWeb-Edu, its load-balance band and its loss curve against a dense model of the same active parameter count are not run yet; they need the v5e-16 slice in `docs/design/plan.md` section 4.7.
+The 2000-step run of the 8-expert decoder on FineWeb-Edu, with its load-balance band and its loss curve against a dense model of the same active parameter count, needs a TPU slice and has not been run.

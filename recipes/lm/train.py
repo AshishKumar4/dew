@@ -15,26 +15,17 @@ takes the vocabulary from the data rather than the command line.
 """
 
 import json
-import os
-import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-import jax
 import tyro
 
-import dew.io
 from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import datasets, metrics, models
-from dew.training import (Checkpoints, Trainer, TrainState, WandbTracker,
-                          build_optimizer, prepare_process, run_timestamp)
-
-# HF tokenizers fork a thread pool; grain's workers fork the process.
-os.environ['TOKENIZERS_PARALLELISM'] = "false"
+from dew.training import TrainState, prepare_process, run_timestamp
 
 DEFAULT_MODEL_CONFIG = {"emb_features": 512, "num_layers": 8, "num_heads": 8}
 
@@ -73,6 +64,9 @@ class LmRunConfig(RunConfig):
     """How far a sparse run moves each router's balancing bias against its
     load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
     with bias=True; unset leaves the bias where it is."""
+    mtp_weight: Optional[float] = None
+    """DeepSeek's lambda on the multi-token-prediction term. Needs a model
+    with num_nextn_predict_layers above zero; unset leaves the term out."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
@@ -220,7 +214,6 @@ def main(config: LmRunConfig) -> TrainState:
             f"{data.records} training windows do not fill one batch of "
             f"{config.trainer.batch_size}, so an epoch is no steps at all: read "
             "more data or lower --trainer.batch-size")
-    steps = config.trainer.total_steps(data)
 
     samples = build_samples(config)
     context = context_length(config, samples)
@@ -238,6 +231,7 @@ def main(config: LmRunConfig) -> TrainState:
         samples=samples,
         pretrained=pretrained,
         balance_rate=config.balance_rate,
+        mtp_weight=config.mtp_weight,
     )
 
     name = config.trainer.name or (
@@ -245,53 +239,11 @@ def main(config: LmRunConfig) -> TrainState:
         f"emb-{model.emb_features}/layers-{model.num_layers}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
-    print("Experiment_Name:", name)
-    directory = os.path.join(config.trainer.checkpoint_dir, name)
-
-    run_config = config.to_dict()
-    tracker = None
-    if config.trainer.wandb is not None:
-        tracker = WandbTracker(
-            config.trainer.wandb.project, name, entity=config.trainer.wandb.entity,
-            offline=config.trainer.wandb.offline,
-            config={"run_config": run_config, "model": fields,
-                    "arguments": run_summary(config, fields),
-                    "dataset": {"path": config.data.path, "records": data.records,
-                                "tokens": meta.get('train_tokens')},
-                    "steps": steps})
-
-    checkpoints = Checkpoints(directory, keep=config.trainer.keep)
-    if jax.process_index() == 0:
-        config.save(checkpoints.directory)
-    trainer = Trainer(
-        objective, build_optimizer(config.optim, steps),
-        key=jax.random.key(config.trainer.seed),
-        mesh=config.trainer.mesh,
-        layout=config.trainer.layout,
-        accumulation=config.trainer.accumulation,
-        dynamic_scale=config.trainer.dynamic_scale,
-        checkpoints=checkpoints,
-        tracker=tracker,
-        profile=config.trainer.profile,
-    )
-
-    start = time.time()
-    state = trainer.fit(
-        data, steps=steps,
-        log_every=config.trainer.log_every,
-        eval_every=config.trainer.eval_interval(data),
-        checkpoint_every=config.trainer.checkpoint_interval(data),
-        metrics=(metrics.perplexity(),),
-    )
-    print(f"Training finished in {time.time() - start:.0f}s")
-    if tracker is not None:
-        step = checkpoints.latest
-        if step is None:
-            raise RuntimeError(
-                f"fit returned with no checkpoint under {checkpoints.directory}; "
-                "a trainer with a checkpointer writes the step its run ends on")
-        dew.io.publish(checkpoints.path(step), re.sub(r"[^\w.-]", "-", name), tracker=tracker)
-    return state
+    return config.train(
+        objective, data, name=name, metrics=(metrics.perplexity(),),
+        summary={"model": fields, "arguments": run_summary(config, fields),
+                 "dataset": {"path": config.data.path, "records": data.records,
+                             "tokens": meta.get('train_tokens')}})
 
 
 if __name__ == '__main__':

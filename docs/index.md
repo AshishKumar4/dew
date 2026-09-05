@@ -2,7 +2,7 @@
 
 Dew is a framework for building and training modern architectures in JAX and Flax, at any scale from one CPU to a TPU pod. It trains image and video diffusion, flow matching, latent diffusion with a VAE, I-JEPA and V-JEPA encoders, autoregressive language models and masked diffusion language models, all through one trainer with data-parallel, fully sharded and expert-parallel layouts.
 
-Dew is the successor to FlaxDiff, restructured once the trainer stopped being about diffusion alone. What to learn is an objective you plug in; how to learn it is the trainer's, and the same trainer serves every objective.
+It grew out of [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). What you train is an objective; the trainer, the data pipeline, the sharding and the checkpoints are shared by every objective.
 
 ## Install
 
@@ -36,7 +36,7 @@ trainer = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(4), mesh=Mesh
 state = trainer.fit(data, steps=100 * data.steps_per_epoch, eval_every=data.steps_per_epoch)
 ```
 
-Every noun in that run is one of the API's: a registered model, a preset that builds a `Process`, an `InputSpec` of a sample and its conditions, an `Objective`, a `Dataset`, a `Trainer` given its capabilities. `import dew` fills the registries, so `models.SimpleDiT`, `presets.EDM` and `datasets["oxford_flowers102"]` resolve with nothing else imported, and an unknown name or field raises rather than being guessed. For a run described by flags instead of by code, see [Recipes](recipes.md).
+For the same run described by flags instead of code, see [Recipes](recipes.md).
 
 ## Where things are
 
