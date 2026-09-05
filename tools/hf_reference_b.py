@@ -158,7 +158,7 @@ def write_glm4_moe_mtp(name: str, model: Glm4MoeForCausalLM, seed: int = 2026) -
     depth = Glm4MoeMTP(model.config).eval()
     scatter_weights(depth, seed)
     # The layer's submodules sit behind a class decorator that hides them
-    # from a checker, so the routed block's parts are read by name.
+    # from a checker, so the routed block's parts are fetched by their paths.
     experts = depth.block.get_submodule("mlp.experts")
     bias = depth.block.get_buffer("mlp.gate.e_score_correction_bias")
     ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))

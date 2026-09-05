@@ -5,8 +5,8 @@ Every arm of a comparison sees the same model, the same seed and the same
 batches in the same order, so the curves differ only by the solver. The step
 is the trainer's own compiled step over the model and the data a language
 model recipe trains, so nothing here is a second wiring of a run. What is
-local is the loop, which records every step's loss instead of logging one per
-interval.
+local is the loop, which records every step's loss where the trainer logs
+one per interval.
 
 `--optimizer` takes one of the library's solver names, or `muon-unsplit`,
 which runs `optax.contrib.muon` with its own rule (every rank-2 parameter

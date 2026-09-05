@@ -9,9 +9,10 @@ each use, RMSNorm/LayerNorm statistics in fp32, RoPE in fp32, softmax in fp32,
 the fp32 (TF32) output head, the fp32 loss, Adam with Optax's constants, an
 EMA copy of every parameter updated each step, and the finiteness check on the
 loss. Diffusion cases use fixed NumPy image, CFG-mask, timestep, and noise
-tensors. The paired JAX harness uses the same byte values. This avoids
-comparing JAX threefry with PyTorch Philox. The measured step is otherwise the
-whole of the Trainer's train step, not a bare forward pass.
+tensors. The paired JAX benchmark uses the same byte values, so the
+comparison is between frameworks, not between JAX threefry and PyTorch
+Philox. The measured step is otherwise the whole of the Trainer's train
+step, not a bare forward pass.
 
 Environment: a uv venv at /tmp/torchbench with torch CUDA 12 wheels
 (see the report for the exact versions used). Compiler scratch and caches
@@ -616,8 +617,8 @@ def diffusion_loss(model, batch):
     B = data.shape[0]
     device = data.device
     # These tensors are generated once by NumPy and kept on device. The JAX
-    # parity harness uses the same seed and arrays. This compares frameworks,
-    # not threefry against Philox.
+    # parity benchmark uses the same seed and arrays, so this compares
+    # frameworks, not threefry against Philox.
     uncond = batch['uncond']
     # StubTextEncoder: tokens are ones, embedded as 1/77 broadcast to 768 features;
     # the unconditional context is the embedding of zeros
