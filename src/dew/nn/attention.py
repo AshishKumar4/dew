@@ -245,6 +245,19 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     return out[:, :q_len] if q_pad else out
 
 
+CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
+CUDNN_MAX_HEAD_DIM = 128
+
+
+def cudnn_runs(query) -> bool:
+    """Whether cudnn's fused kernel takes this query: a gpu backend, one of its
+    two dtypes, and a head dimension it tiles. 'auto' asks this; an explicit
+    'cudnn' refuses by name instead."""
+    head_dim = query.shape[-1]
+    return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
+            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM)
+
+
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
                                  causal=False, sliding_window=None, mask=None, bias=None):
@@ -258,8 +271,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
-    - 'auto': 'cudnn' on a gpu backend, 'xla' anywhere else. Resolved per
-      trace, so a config logged as 'auto' still runs on the next machine.
+    - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
+      inputs, a head dimension that is a multiple of 8 and at most 128), 'xla'
+      anywhere else. Resolved per trace, so a config logged as 'auto' still
+      runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -299,7 +314,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
     if implementation == 'auto':
-        implementation = 'cudnn' if jax.default_backend() == 'gpu' else 'xla'
+        implementation = 'cudnn' if cudnn_runs(query) else 'xla'
 
     requested = {str(getattr(p, 'name', p)).upper()
                  for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
@@ -324,11 +339,17 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             "the reference implementation (attention_impl 'reference').")
 
     if implementation == 'cudnn':
-        if query.dtype not in (jnp.bfloat16, jnp.float16):
+        if query.dtype not in CUDNN_DTYPES:
             raise ValueError(
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
+        head_dim = query.shape[-1]
+        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
+            raise ValueError(
+                f"cudnn attention needs a head dimension that is a multiple of 8 "
+                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
+                "'xla' for this shape.")
         return cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
     if implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
