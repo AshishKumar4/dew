@@ -380,6 +380,109 @@ def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
     assert not (tmp_path / "gs:").exists()
 
 
+# --------------------------------------------------------------------------
+# Local checkpoints
+# --------------------------------------------------------------------------
+
+def local_trainer(tmp_path, **kwargs):
+    return Trainer(
+        Regression(), optax.sgd(0.1), key=jax.random.key(0),
+        layout=Layout(min_shard=1, tolerance=1.0),
+        checkpoints=Checkpoints(str(tmp_path / "run"), keep=4,
+                                local_directory=str(tmp_path / "local"), local_every=2),
+        **kwargs)
+
+
+def stop_at_local_step(trainer, stop: int):
+    """Kill the run right after its local save of `stop` has landed."""
+    class Stop(Exception):
+        pass
+
+    save_local = trainer.checkpoints.save_local
+
+    def save_then_stop(step, state, position):
+        save_local(step, state, position)
+        trainer.checkpoints.wait()
+        if step == stop:
+            raise Stop()
+
+    trainer.checkpoints.save_local = save_then_stop
+    with pytest.raises(Stop):
+        trainer.fit(Data(), steps=100, log_every=1, checkpoint_every=3)
+
+
+def test_the_local_checkpoint_is_written_on_its_own_cadence_and_keeps_the_newest(tmp_path):
+    """Local every two, persistent every three: after eight steps the
+    persistent directory holds 3, 6 and the final 8 with their losses, the
+    local one holds 6 alone (2 and 4 replaced, the end of the run being the
+    persistent save's), and the persistent directory holds nothing of the
+    local cadence."""
+    trainer = local_trainer(tmp_path)
+    trainer.fit(Data(), steps=8, log_every=1, checkpoint_every=3)
+    checkpoints = trainer.checkpoints
+
+    assert sorted(checkpoints._open().all_steps()) == [3, 6, 8]
+    assert sorted(checkpoints._open_local().all_steps()) == [6]
+    assert checkpoints.best in (3, 6, 8)
+    assert checkpoints.local_path == str(tmp_path / "local" / "process0")
+    assert (tmp_path / "local" / "process0" / "6" / "commit_success.txt").exists()
+    assert not (tmp_path / "local" / "process0" / "4").exists()
+    assert not (tmp_path / "run" / "4").exists()
+
+
+def test_a_newer_local_checkpoint_wins_the_resume_and_leaves_the_persistent_one(tmp_path):
+    """Killed after local step 8 with persistent step 6 the newest on disk:
+    the resume opens at 8, reads it from the local directory, and lands
+    where an unkilled run lands, while the persistent files at 3 and 6 are
+    byte for byte what they were."""
+    stop_at_local_step(local_trainer(tmp_path), 8)
+    persistent = tmp_path / "run"
+    assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6]
+    before = {path: path.read_bytes() for path in persistent.rglob("*") if path.is_file()}
+    checkpoints = Checkpoints(str(persistent), local_directory=str(tmp_path / "local"),
+                              local_every=2)
+    assert checkpoints.latest == 8
+    assert checkpoints.source(8) == str(tmp_path / "local" / "process0")
+    assert checkpoints.source(6) == str(persistent)
+
+    resumed = local_trainer(tmp_path).fit(Data(), steps=9, log_every=1, checkpoint_every=3)
+    whole = make_trainer(tmp_path / "whole").fit(Data(), steps=9, log_every=1, checkpoint_every=3)
+
+    assert int(resumed.step) == 9
+    assert jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
+                        resumed.params, whole.params) == jax.tree.map(lambda _: True, whole.params)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert sorted(int(p.name) for p in persistent.iterdir() if p.name.isdigit()) == [3, 6, 9]
+
+
+def test_a_local_checkpoint_refuses_another_placement_and_names_the_way_out(tmp_path):
+    """The local copy holds this process's shards for the mesh it was
+    written on; a resume on another mesh is refused with the leaf that
+    moved and the persistent step to fall back to."""
+    stop_at_local_step(local_trainer(tmp_path), 8)
+
+    with pytest.raises(ValueError) as error:
+        local_trainer(tmp_path, mesh=MeshSpec(fsdp=2)).fit(Data(), steps=9, log_every=1)
+    message = str(error.value)
+    assert "holds step 8 written with" in message and "places it as" in message
+    assert f"delete {tmp_path / 'local'}" in message
+    assert "persistent checkpoint at step 6" in message
+
+
+def test_local_checkpoints_take_both_the_directory_and_the_cadence(tmp_path):
+    with pytest.raises(ValueError, match="both local_directory and local_every"):
+        Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"))
+    with pytest.raises(ValueError, match="both local_directory and local_every"):
+        Checkpoints(str(tmp_path / "run"), local_every=2)
+    with pytest.raises(ValueError, match="local_every must be at least 1"):
+        Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"), local_every=0)
+
+
+def test_a_local_cadence_needs_a_stream_that_reports_its_position(tmp_path):
+    with pytest.raises(ValueError, match="get_state"):
+        local_trainer(tmp_path).fit(Data(endless), steps=2)
+
+
 class ExplodingManager:
     """Orbax when the filesystem refuses the write.
 
