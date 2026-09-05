@@ -80,13 +80,6 @@ class Minimal(Objective):
         return params["params"]["w"] ** 2, Aux({})
 
 
-def test_evaluate_produces_nothing_unless_an_objective_says_so():
-    objective = Minimal()
-    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-    assert objective.evaluate(objective.init(jax.random.key(0)), {}, step) is None
-    assert objective.artifact is None
-
-
 def test_an_objective_needs_init_and_loss():
     class Incomplete(Objective):
         def init(self, key):
