@@ -9,6 +9,8 @@ whose logits are committed, so the comparison runs in CI without a download.
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - mistral-tiny: max |logit difference| 6.44e-06, tolerance 1e-4.
+- mixtral-tiny: max |logit difference| 2.32e-06, tolerance 1e-4, logits up
+  to 4.4 in magnitude; the released per-expert w1/w2/w3 tensors stack.
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -54,6 +56,7 @@ from dew.registry import models, with_precision
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
+ROUTED = DEEPSEEK + ("mixtral-tiny",)
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -129,6 +132,25 @@ def test_released_mistral_v03_config_translates_every_computational_field():
     }
 
 
+def test_released_mixtral_8x7b_config_translates_every_computational_field():
+    config = translate_config(fixture_config("mixtral-8x7b"))
+    assert config['mixture'] == {'experts': 8, 'top_k': 2}
+    assert config['layer_types'] == ('full_attention',) * 32
+    assert (config['emb_features'], config['mlp_features'], config['num_kv_heads']) == (4096, 14336, 8)
+
+
+def test_mixtral_experts_stack_in_checkpoint_order():
+    model, variables, _ = fp32_decoder(FIXTURES / 'mixtral-tiny')
+    ids = np.load(FIXTURES / 'mixtral-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'mixtral-tiny' / 'logits.npy')
+    params = variables['params']
+    experts = params['layers_0']['mlp']['experts']
+    swapped = {**experts, 'gate_proj': {'kernel': experts['gate_proj']['kernel'][::-1]}}
+    shuffled = {**variables, 'params': {**params, 'layers_0': {**params['layers_0'], 'mlp': {
+        **params['layers_0']['mlp'], 'experts': swapped}}}}
+    assert np.max(np.abs(np.asarray(model.apply(shuffled, ids)) - reference)) > 0.1
+
+
 def test_mistral_window_changes_the_reference_logits():
     model, variables, _ = fp32_decoder(FIXTURES / 'mistral-tiny')
     ids = np.load(FIXTURES / 'mistral-tiny' / 'input_ids.npy')
@@ -194,7 +216,7 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
         translate_config(factor_only)
 
 
-@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+@pytest.mark.parametrize("name", TINY + ROUTED)
 def test_translated_weights_are_exactly_the_models_variables(name, rng):
     """Same collections, same paths, same shapes, same dtypes as a freshly
     initialised model: `params` for every family, and the `moe` collection
@@ -214,7 +236,7 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+@pytest.mark.parametrize("name", TINY + ROUTED)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
