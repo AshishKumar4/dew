@@ -48,7 +48,8 @@ def test_forward_backward_roundtrip(tname, transform, sname, schedule, steps, rn
 
 
 def test_karras_preconditioning_matches_paper(rng):
-    """c_in, c_skip and c_out must match Karras et al. 2022 Table 1."""
+    """c_in, c_skip and c_out must match Karras et al. 2022 Table 1, at rtol
+    1e-4; the observed difference is 0.0, the same expression grouped the same way."""
     transform = KarrasPredictionTransform(sigma_data=0.5)
     schedule = KarrasVENoiseScheduler(sigma_max=80, rho=7, sigma_data=0.5)
     steps = jnp.array([0.3])

@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,6 +25,17 @@ def _get_inception():
     return _inception_cache['inception']
 
 
+def _sqrtm(product):
+    """`sqrtm` without its singularity warning: a singular product is the
+    case the finiteness check in `frechet_distance` handles, so the warning
+    is noise."""
+    from scipy import linalg
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", linalg.LinAlgWarning)
+        return linalg.sqrtm(product)
+
+
 def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     """Frechet distance between two multivariate gaussians.
 
@@ -30,19 +43,18 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     product has no jax equivalent, and FID is computed once per validation
     batch so the transfer is irrelevant.
     """
-    from scipy import linalg
 
     mu_a, mu_b = np.atleast_1d(mu_a), np.atleast_1d(mu_b)
     sigma_a, sigma_b = np.atleast_2d(sigma_a), np.atleast_2d(sigma_b)
 
     # scipy >= 1.16 dropped the `disp` kwarg; sqrtm returns (possibly
     # complex) results without it.
-    covmean = linalg.sqrtm(sigma_a.dot(sigma_b))
+    covmean = _sqrtm(sigma_a.dot(sigma_b))
     if not np.isfinite(covmean).all():
         # Singular product covariance, nudge the diagonal as in the reference
         # implementations rather than returning a nan
         offset = np.eye(sigma_a.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma_a + offset).dot(sigma_b + offset))
+        covmean = _sqrtm((sigma_a + offset).dot(sigma_b + offset))
     if np.iscomplexobj(covmean):
         covmean = np.real(covmean)
 
@@ -55,6 +67,29 @@ def _gaussian_stats(activations):
     return activations.mean(axis=0), np.cov(activations, rowvar=False)
 
 
+def _get_activations():
+    """The jitted pool3 feature extractor, built on first use.
+
+    Building it loads the ~90MB weights, so it happens here rather than in
+    the factory: constructing the metric opens nothing.
+    """
+    if "activations" not in _inception_cache:
+        model, params = _get_inception()
+
+        @jax.jit
+        def activations(images):
+            # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
+            resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
+            features = model.apply(params, resized, train=False)
+            # apply returns the output alone unless mutable collections were asked
+            # for, and none were.
+            assert not isinstance(features, tuple)
+            return features.reshape(features.shape[0], -1)
+
+        _inception_cache["activations"] = activations
+    return _inception_cache["activations"]
+
+
 @metrics("fid")
 def fid(field: str = "image") -> ImageMetric:
     """FID between the sampled images and the batch's, lower is better.
@@ -63,19 +98,9 @@ def fid(field: str = "image") -> ImageMetric:
     meaningful as a relative trend across checkpoints, not as a headline number
     comparable to published FID-50k.
     """
-    model, params = _get_inception()
-
-    @jax.jit
-    def activations(images):
-        # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
-        resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
-        features = model.apply(params, resized, train=False)
-        # apply returns the output alone unless mutable collections were asked
-        # for, and none were.
-        assert not isinstance(features, tuple)
-        return features.reshape(features.shape[0], -1)
 
     def measure(artifact, batch):
+        activations = _get_activations()
         mu_gen, sigma_gen = _gaussian_stats(activations(artifact.images))
         mu_real, sigma_real = _gaussian_stats(activations(unit_range(batch[field])))
         return frechet_distance(mu_gen, sigma_gen, mu_real, sigma_real)

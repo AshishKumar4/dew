@@ -50,6 +50,92 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
     return mask[None, None]
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm normalized in fp32, with Gemma's (1 + w) scale behind a flag.
+
+    scale_offset also flips the initializer to zeros, so the identity is the
+    starting point either way and a Gemma checkpoint's stored weights land
+    unchanged.
+
+    The families differ in where the scale meets the activation dtype. Gemma
+    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150);
+    Llama and Qwen3 cast the normalized activations first and multiply by
+    the scale in that dtype (modeling_qwen3.py:61-64), which
+    scale_after_cast reproduces. The two agree at fp32 and differ under bf16.
+    """
+    epsilon: float = 1e-5
+    scale_offset: bool = False
+    scale_after_cast: bool = False
+    with_scale: bool = True
+    dtype: Optional[Dtype] = None
+
+    @nn.compact
+    def __call__(self, x):
+        dtype = self.dtype if self.dtype is not None else x.dtype
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        if not self.with_scale:
+            # A pure normalization with no learned weight, as Gemma 4 norms
+            # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
+            return y.astype(dtype)
+        scale = self.param(
+            'scale',
+            nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
+            (x.shape[-1],), jnp.float32)
+        weight = (1.0 + scale) if self.scale_offset else scale
+        if self.scale_after_cast:
+            return y.astype(dtype) * weight.astype(dtype)
+        return (y * weight).astype(dtype)
+def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None):
+    """cos/sin of the rotary angles at absolute `positions`: [P, head_dim // 2].
+
+    `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
+    documents each restart at 0); the angle axes line up with the trailing
+    [B, S] either way. Computed in fp32 so a token gets the same rotation
+    whether it arrives in a prefill or comes back as a single decode step.
+
+    rot_dim narrows the rotation to the first rot_dim dimensions, the rest
+    keeping frequency zero (cosine one, sine zero, so the rotation is the
+    identity there). That is proportional partial rotary
+    (modeling_rope_utils.py, _compute_proportional_rope_parameters), whose
+    exponents run over the full head_dim with a zero tail.
+    """
+    pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / head_dim))
+    if rot_dim is not None:
+        padding = head_dim // 2 - pairs
+        inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
+    positions = jnp.asarray(positions, jnp.float32)
+    if positions.ndim == 1:
+        angles = positions[:, None] * inv_freq[None, :]
+    else:
+        angles = positions[:, :, None] * inv_freq[None, None, :]
+    return jnp.cos(angles), jnp.sin(angles)
+
+
+def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
+    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
+
+    The freqs are [S, D] for one sequence, or [B, S, D] when a packed batch
+    restarts positions per document. `scale` multiplies the rotated heads
+    inside the fp32 arithmetic, so a query's attention scale narrows once,
+    with the product.
+    """
+    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
+    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
+    if cos.ndim == 3:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+    else:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    fp32 = x.astype(jnp.float32)
+    x1, x2 = jnp.split(fp32, 2, axis=-1)
+    rotated = jnp.concatenate([-x2, x1], axis=-1)
+    out = fp32 * cos + rotated * sin
+    return (out if scale is None else out * scale).astype(x.dtype)
+
+
 def open_kv_cache(module: nn.Module, key, max_seq_len):
     """Fixed-size KV cache in the flax MultiHeadDotProductAttention style.
 
@@ -140,8 +226,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
-      whatever the inputs are. dtype is ignored, the other two are rejected
-      rather than silently dropped.
+      whatever the inputs are. A dtype that asks for anything other than the
+      inputs' own dtype is rejected rather than silently dropped, as are the
+      other two.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -192,6 +279,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             "force_fp32_for_softmax=False: fused attention runs the softmax in "
             "fp32 regardless. Leave it True, or use the reference implementation "
             "(attention_impl 'reference').")
+    if dtype is not None and jnp.dtype(dtype) != query.dtype:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            f"dtype={dtype}: fused attention computes in the inputs' dtype "
+            f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
+            "the reference implementation (attention_impl 'reference').")
 
     if implementation in ('xla', 'cudnn'):
         if implementation == 'cudnn' and query.dtype not in (jnp.bfloat16, jnp.float16):
@@ -344,7 +437,7 @@ class FlaxGEGLU(nn.Module):
     dim: int
     dropout: float = 0.0
     dtype: Optional[Dtype] = jnp.float32
-    precision: Any = jax.lax.Precision.DEFAULT
+    precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
     def setup(self):
         inner_dim = self.dim * 4
@@ -376,7 +469,7 @@ class FlaxFeedForward(nn.Module):
 
     dim: int
     dtype: Optional[Dtype] = jnp.float32
-    precision: Any = jax.lax.Precision.DEFAULT
+    precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
     def setup(self):
         # The second linear layer needs to be called

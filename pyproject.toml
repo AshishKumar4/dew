@@ -74,6 +74,9 @@ typeCheckingMode = "standard"
 # Name the environment, or two people get two counts for the same tree.
 venvPath = "."
 venv = ".venv"
+# grain ships no py.typed, so its stubs live in stubs/: RandomMap.random_map
+# and MapDataset.__getitem__ as they really are, plus the used surface.
+stubPath = "stubs"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -116,6 +119,12 @@ filterwarnings = [
     # speaks. Counted 44 of them in the grain worker tests.
     'ignore:ResourceTracker called reentrantly:UserWarning:multiprocessing\.resource_tracker',
     'ignore:resource_tracker:UserWarning:multiprocessing\.resource_tracker',
+    # moviepy's audio reader leaves its ffmpeg pipe open until garbage
+    # collection and sets .shape on an array the way NumPy 2.5 deprecated.
+    # Both are inside moviepy, scoped to it so the same warning from dew's
+    # own code still fails the run.
+    'ignore::ResourceWarning:moviepy\.audio\.io\.readers',
+    'ignore:Setting the shape on a NumPy array:DeprecationWarning:moviepy\.video\.io\.ffmpeg_reader',
 ]
 
 [tool.setuptools.dynamic]

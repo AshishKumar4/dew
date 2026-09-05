@@ -282,14 +282,14 @@ class YearAhead(datetime):
 def mode_topology(args) -> dict:
     import jax
     from dew.training import runtime
-    from dew.training.distributed import MeshSpec, batch_sharding, build_mesh, shard_batch
+    from dew.training.distributed import MeshSpec, build_mesh, shard_batch
 
     if args.process_id > 0:
         runtime.datetime = YearAhead
     mesh = build_mesh(MeshSpec(fsdp=args.fsdp_size))
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
-    sharded = shard_batch(batch_sharding(mesh), {"image": local})["image"]
+    sharded = shard_batch(mesh, {"image": local})["image"]
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),
@@ -378,7 +378,7 @@ def mode_steps(args) -> dict:
     state, _, _ = trainer.place()
     rows = BATCH // args.processes
     images = global_images()[args.process_id * rows:(args.process_id + 1) * rows]
-    batch = shard_batch(trainer.batch_sharding, {"image": images})
+    batch = shard_batch(trainer.device_mesh, {"image": images})
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(args.steps):

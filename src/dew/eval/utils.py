@@ -9,6 +9,22 @@ import jax
 import numpy as np
 
 
+def _check_digest(path: str, repo: str, filename: str, revision: str, digest: str) -> str:
+    """`path` back, once its bytes hash to `digest`.
+
+    A separate function so the pin is testable over local bytes: the only
+    thing standing between a downloaded pickle and the unpickler is this
+    comparison.
+    """
+    with open(path, 'rb') as handle:
+        found = hashlib.file_digest(handle, 'sha256').hexdigest()
+    if found != digest:
+        raise ValueError(
+            f"{repo}/{filename} at {revision} hashes to {found}, not the {digest} "
+            "this code was written against")
+    return path
+
+
 def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
     """The path to `filename` of `repo` at `revision`, once its bytes hash to
     `digest`.
@@ -21,14 +37,8 @@ def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
     """
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(repo, filename, revision=revision)
-    with open(path, 'rb') as handle:
-        found = hashlib.file_digest(handle, 'sha256').hexdigest()
-    if found != digest:
-        raise ValueError(
-            f"{repo}/{filename} at {revision} hashes to {found}, not the {digest} "
-            "this code was written against")
-    return path
+    return _check_digest(hf_hub_download(repo, filename, revision=revision),
+                         repo, filename, revision, digest)
 
 
 # What a pickle of numpy arrays needs to rebuild them, and nothing else. The
