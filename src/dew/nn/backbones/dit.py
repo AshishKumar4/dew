@@ -5,9 +5,8 @@ from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
     PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    ModulatedBlock, remat_block, neutralized_rope_freqs,
+    ModulatedBlock, remat_block, rope_for_scan,
 )
-from ..vit import RotaryEmbedding
 from dew.registry import models
 
 
@@ -45,13 +44,10 @@ class SimpleDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
         )
-        self.rope = RotaryEmbedding(
-            dim=self.emb_features // self.num_heads, max_seq_len=4096, dtype=self.dtype)
         self.blocks = [
             remat_block(ModulatedBlock, self.remat)(
                 features=self.emb_features,
                 num_heads=self.num_heads,
-                rope_emb=self.rope,
                 mixer='attention',
                 mlp_ratio=self.mlp_ratio,
                 dropout_rate=self.dropout_rate,
@@ -77,7 +73,8 @@ class SimpleDiT(nn.Module):
         B, H, W, C = x.shape
         x_seq, inv_idx = self.embed(x)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = neutralized_rope_freqs(self.rope, x_seq.shape[1], self.scan_order)
+        freqs_cis = rope_for_scan(x_seq.shape[1], self.emb_features // self.num_heads,
+                                  self.scan_order)
 
         for block in self.blocks:
             x_seq = block(x_seq, cond_emb, freqs_cis, train)

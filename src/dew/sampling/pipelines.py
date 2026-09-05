@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.objectives.base import Variables
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
-from dew.sampling.solvers import DDIM
+from dew.sampling.solvers import DDIM, Solver
 
 
 @dataclass(frozen=True, eq=False)
@@ -26,10 +29,10 @@ class TextToImage:
     publishes.
     """
 
-    model: Any
+    model: nn.Module
     process: Process
     inputs: InputSpec
-    params: Any
+    params: Variables
     autoencoder: Optional[AutoEncoder] = None
 
     @classmethod
@@ -94,7 +97,8 @@ class TextToImage:
         return given, null
 
     def __call__(self, prompts: Sequence[str], *, steps: int = 50,
-                 guidance: CFG | float | None = None, sampler=DDIM(), key) -> jax.Array:
+                 guidance: CFG | float | None = None, sampler: Solver[Any] = DDIM(),
+                 key) -> jax.Array:
         """Images in [-1, 1], `[len(prompts), H, W, C]`. `guidance` is a
         classifier-free guidance scale, or a `CFG` with its interval, or None
         for the plain conditional prediction."""
@@ -102,14 +106,18 @@ class TextToImage:
             guidance = CFG(float(guidance))
         given, null = self.conditions(prompts)
         x_T = self.process.noise(key, (len(prompts), *self.latent_shape))
+        return _run(self, self.params, given, null, x_T, jax.random.fold_in(key, 1),
+                    steps=steps, sampler=sampler, guidance=guidance)
 
-        @jax.jit
-        def run(params, given, null, x_T, key):
-            denoise = self.process.denoiser(self.model, params, given,
-                                            None if guidance is None else null)
-            samples = sample(denoise, x_T, steps, solver=sampler, guidance=guidance, key=key)
-            if self.autoencoder is not None:
-                samples = self.autoencoder.decode(params["autoencoder"], samples)
-            return jnp.clip(samples, -1.0, 1.0)
 
-        return run(self.params, given, null, x_T, jax.random.fold_in(key, 1))
+# The pipeline (by identity), the step count, the solver and the guidance
+# are compile-time constants, so a second call with the same settings runs
+# the compiled loop instead of tracing it again.
+@functools.partial(jax.jit, static_argnames=("pipe", "steps", "sampler", "guidance"))
+def _run(pipe: TextToImage, params, given, null, x_T, key, *, steps, sampler, guidance):
+    denoise = pipe.process.denoiser(pipe.model, params, given,
+                                    None if guidance is None else null)
+    samples = sample(denoise, x_T, steps, solver=sampler, guidance=guidance, key=key)
+    if pipe.autoencoder is not None:
+        samples = pipe.autoencoder.decode(params["autoencoder"], samples)
+    return jnp.clip(samples, -1.0, 1.0)

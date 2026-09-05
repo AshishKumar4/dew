@@ -71,8 +71,6 @@ class DDPM:
     and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
     """
 
-    State = tuple
-
     def init(self, x):
         return ()
 
@@ -92,7 +90,6 @@ class DDIM:
     1 DDPM-like."""
 
     eta: float = 0.0
-    State = tuple
 
     def init(self, x):
         return ()
@@ -113,9 +110,8 @@ class DDIM:
 @samplers("euler")
 @dataclass(frozen=True)
 class Euler:
-    """The DDIM update written as an Euler step of the probability flow ODE."""
-
-    State = tuple
+    """The DDIM update written as an Euler step of the probability flow ODE:
+    on a variance exploding schedule it is dx/dsigma = eps."""
 
     def init(self, x):
         return ()
@@ -128,47 +124,25 @@ class Euler:
         return x + dx * dt, state
 
 
-@samplers("simplified_euler")
-@dataclass(frozen=True)
-class SimplifiedEuler:
-    """Euler for the variance exploding forward process x_{t+1} = x_t + sigma_t eps_t,
-    where the derivative is (x - x_0) / sigma. Integrates a
-    `GeneralizedNoiseScheduler`."""
-
-    State = tuple
-
-    def init(self, x):
-        return ()
-
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        _sigma_integrator("SimplifiedEuler", process)
-        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
-        dt = sigma_s - sigma_t
-        dx = (x - denoised) / sigma_t
-        return x + dx * dt, state
-
-
 @samplers("euler_ancestral")
 @dataclass(frozen=True)
 class EulerAncestral:
-    """Euler with the ancestral noise injection of k-diffusion, on a variance
-    exploding schedule."""
-
-    State = tuple
+    """Euler with the ancestral noise injection of k-diffusion
+    (`get_ancestral_step`, eta 1): the step goes down to sigma_down and
+    sigma_up of fresh noise brings the marginal back to sigma_s. Integrates a
+    `GeneralizedNoiseScheduler`."""
 
     def init(self, x):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         _sigma_integrator("EulerAncestral", process)
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
+        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
         sigma_up = (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5
         sigma_down = (sigma_s ** 2 - sigma_up ** 2) ** 0.5
-        dt = sigma_down - sigma_t
-        x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / (sigma_s - sigma_t)
-        dx = (x - x_0_coeff * denoised) / sigma_t
+        dx = (x - denoised) / sigma_t
         dW = jax.random.normal(key, x.shape) * sigma_up
-        return x + dx * dt + dW, state
+        return x + dx * (sigma_down - sigma_t) + dW, state
 
 
 @samplers("heun")
@@ -176,8 +150,6 @@ class EulerAncestral:
 class Heun:
     """Heun's second order method (Karras et al. 2022, Algorithm 2): an Euler
     step, the derivative re-evaluated at its end, and the average of the two."""
-
-    State = tuple
 
     def init(self, x):
         return ()
@@ -204,8 +176,6 @@ class RK4:
     schedule; the stages at half steps read the model at the time the schedule
     maps that sigma back to."""
 
-    State = tuple
-
     def init(self, x):
         return ()
 
@@ -229,8 +199,6 @@ class RK4:
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
     exploding schedule, from finite differences of the last three eps."""
-
-    State = tuple
 
     def init(self, x):
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
@@ -260,5 +228,4 @@ class MultiStepDPM:
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)
 
 
-__all__ = ["Solver", "DDPM", "DDIM", "Euler", "SimplifiedEuler", "EulerAncestral",
-           "Heun", "RK4", "MultiStepDPM"]
+__all__ = ["Solver", "DDPM", "DDIM", "Euler", "EulerAncestral", "Heun", "RK4", "MultiStepDPM"]

@@ -836,3 +836,13 @@ def test_node_reads_spot_preemptible_and_queued_resources():
 def test_the_first_failure_is_the_exit_code():
     assert exit_code([Result(("a",), 0), Result(("b",), 3), Result(("c",), 1)]) == 3
     assert exit_code([Result(("a",), 0)]) == 0
+
+
+def test_a_corrupt_zone_cache_is_named_rather_than_emptied(fake):
+    """A cache that fails to parse used to read as empty, so a typo in the
+    file silently sent every command back through the zone search. It is
+    refused by path with the remedy."""
+    config_dir().mkdir(parents=True, exist_ok=True)
+    (config_dir() / "zones.json").write_text("{not json")
+    with pytest.raises(ValueError, match="zones.json.*delete it"):
+        tpu_config.cached_zone("slice")

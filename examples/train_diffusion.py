@@ -48,7 +48,7 @@ def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
     data = data or OxfordFlowers(image_size=config.image_size).load(
         batch=config.batch_size, tokenize=inputs.tokenize)
-    steps = config.steps or config.epochs * data.steps_per_epoch
+    steps = config.steps or data.epoch_steps(config.epochs)
     fields = dict(config.model, output_channels=3, dtype="bfloat16")
     model = models.build("simple_dit", **fields)
     process = presets.EDM()()
@@ -59,14 +59,14 @@ def main(config: Config, data=None, inputs=None):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    pipe = TextToImage(model=model, process=process, inputs=inputs, params={**state.params, **state.ema})
+    pipe = TextToImage(model=model, process=process, inputs=inputs, params=state.averaged)
     images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), key=jax.random.key(1))
     pixels = np.clip(np.round((np.asarray(images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")
 
-    save_hf_layout(state.ema["params"], {"architecture": "simple_dit", **fields}, config.out / "export")
+    save_hf_layout(state.averaged["params"], {"architecture": "simple_dit", **fields}, config.out / "export")
     return state
 
 

@@ -121,6 +121,7 @@ def test_no_depths_scores_nothing():
     assert model.apply(params, hidden, ids, method=CausalTransformer.mtp_logits) == []
 
 
+@pytest.mark.mesh
 def test_a_depth_places_on_a_sharded_mesh():
     """The fused projection's input is two embed widths concatenated, so it
     cannot carry the embed name twice: flax refuses a repeated logical name,
