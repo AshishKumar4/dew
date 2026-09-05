@@ -25,7 +25,7 @@ something else.
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 import numpy as np
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mla import MLAMixer
 from dew.registry import models, with_precision
@@ -957,6 +958,8 @@ def _stack_experts(params: Dict[str, Any]) -> None:
         experts = mlp.get('experts')
         if not isinstance(experts, dict):
             continue
+        if not any(index.isdigit() for index in experts):
+            continue
         indices = sorted(experts, key=int)
         if ([int(index) for index in indices]
                 != list(range(len(indices)))):
@@ -1005,7 +1008,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     # whose every tensor maps to nothing is an empty tree, not no tree.
     variables: Dict[str, Any] = {'params': {}}
     family = _family_for_model(models.build('causal_transformer', **dict(config)))
-    for name, tensor in hf_tensors.items():
+    # GPT OSS ships its experts as MXFP4 blocks and scales; the unpacked
+    # tensor is what the reference runs, so the path map only ever sees it.
+    for name, tensor in unpack_mxfp4(hf_tensors).items():
         path = family.weight_path(name, config)
         if path is None:
             continue
@@ -1021,6 +1026,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
 
 
 _DTYPES = {'F32': np.float32, 'F16': np.float16}
+# MXFP4 payloads stay uint8: they are unpacked into weights by the family
+# that reads them, not widened like a weight.
+_PACKED = {'U8': np.uint8}
 
 
 def _read_shard(path: Path) -> Dict[str, np.ndarray]:
@@ -1049,6 +1057,8 @@ def _read_shard(path: Path) -> Dict[str, np.ndarray]:
             elif dtype in _DTYPES:
                 tensors[name] = np.frombuffer(
                     raw, dtype=_DTYPES[dtype]).astype(np.float32).reshape(shape)
+            elif dtype in _PACKED:
+                tensors[name] = np.frombuffer(raw, dtype=_PACKED[dtype]).reshape(shape)
             else:
                 raise ValueError(
                     f"tensor {name} in {path.name} has dtype {dtype}, which this "
@@ -1143,7 +1153,7 @@ def save_pretrained_decoder(model, variables, directory, *,
             "families this exports, so a model with output_gate, "
             "partial_rotary_factor or a linear-attention kind set cannot be "
             "written back to the HF layout")
-    if model.mixture is not None:
+    if model.mixture is not None and _family_for_model(model).export_path is _hf_name:
         raise ValueError(
             "routed experts have no writer here yet: the config half "
             "round-trips through _export_config, but the router and the "
@@ -1303,7 +1313,76 @@ class DecoderFamily:
     sandwich_norms: bool = False
 
 
+def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
+    theta, yarn = _deepseek_rope(hf_config, used)
+    layers = hf_config['num_hidden_layers']
+    experts = hf_config['num_local_experts']
+    top_k = hf_config['num_experts_per_tok']
+    if not isinstance(layers, int) or not isinstance(experts, int) or not isinstance(top_k, int):
+        _refuse('num_hidden_layers/num_local_experts/num_experts_per_tok', 'integer counts are required')
+    pattern = tuple('sliding_attention' if index % 2 == 0 else 'full_attention'
+                    for index in range(layers))
+    config = _base_config(hf_config, used, layer_types=pattern,
+                          rope=(theta, None), scale_after_cast=False)
+    config.update(mlp='swigluoai', attention_sinks=True, yarn=yarn,
+                  mixture={'experts': experts, 'top_k': top_k})
+    if hf_config.get('swiglu_limit', 7.0) != 7.0:
+        _refuse('swiglu_limit', 'GptOssExperts clamps at 7.0')
+    if hf_config.get('experts_per_token', top_k) != top_k:
+        _refuse('experts_per_token', 'it disagrees with num_experts_per_tok')
+    if hf_config.get('output_router_logits', False):
+        _refuse('output_router_logits', 'the decoder returns token logits')
+    quantization = hf_config.get('quantization_config')
+    if quantization is not None and (not isinstance(quantization, Mapping)
+                                    or quantization.get('quant_method') != 'mxfp4'):
+        _refuse('quantization_config', 'GPT OSS supports MXFP4 blocks and scales')
+    used.update(('num_local_experts', 'num_experts_per_tok', 'experts_per_token',
+                 'swiglu_limit', 'initial_context_length', 'router_aux_loss_coef',
+                 'output_router_logits', 'quantization_config'))
+    return config
+
+
+def _gpt_oss_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    parts = name.split('.')
+    if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+        prefix = ('params', f'layers_{parts[2]}')
+        if parts[3:] == ['self_attn', 'sinks']:
+            return (*prefix, 'self_attn', 'sinks')
+        if len(parts) == 6 and parts[3:5] == ['mlp', 'router'] and parts[5] in ('weight', 'bias'):
+            return (*prefix, 'mlp', 'router', 'kernel' if parts[5] == 'weight' else 'bias')
+        if (len(parts) == 6 and parts[3:5] == ['mlp', 'experts']
+                and parts[5] in ('gate_up_proj', 'gate_up_proj_bias', 'down_proj', 'down_proj_bias')):
+            return (*prefix, 'mlp', 'experts', parts[5])
+    return _dew_path(name, config)
+
+
+def _gpt_oss_export_path(name: str, config: Mapping[str, object]) -> Optional[str]:
+    parts = name.split('.')
+    if parts[0].startswith('layers_'):
+        prefix = f"model.layers.{parts[0].removeprefix('layers_')}"
+        if parts[1:] == ['self_attn', 'sinks']:
+            return prefix + '.self_attn.sinks'
+        if len(parts) == 4 and parts[1:3] == ['mlp', 'router']:
+            return prefix + '.mlp.router.' + ('weight' if parts[3] == 'kernel' else 'bias')
+        if len(parts) == 4 and parts[1:3] == ['mlp', 'experts']:
+            return prefix + '.mlp.experts.' + parts[3]
+    return _hf_name(name, config)
+
+
+def _gpt_oss_export(model: CausalTransformer) -> dict[str, object]:
+    mixture = model.mixture
+    if mixture is None:
+        _refuse('mixture', 'GPT OSS needs routed experts')
+    return {'hidden_act': 'silu', 'num_local_experts': mixture.experts,
+            'num_experts_per_tok': mixture.top_k, 'swiglu_limit': 7.0,
+            'rope_scaling': None if model.yarn is None else asdict(model.yarn)}
+
+
 _FAMILY_ENTRIES = (
+    DecoderFamily(('gpt_oss',), _gpt_oss_config,
+                  lambda model: model.mlp == 'swigluoai',
+                  'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
+                  weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path),
     DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
                   lambda model: isinstance(model.mixer, MLAMixer) and model.mixer.index_topk is not None,
                   'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}),
