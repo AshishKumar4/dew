@@ -443,16 +443,11 @@ class MultiHeadLatentAttention(nn.Module):
             raise ValueError(
                 "the nope head dim and the value head dim must be positive, "
                 f"got {self.qk_nope_head_dim} and {self.v_head_dim}")
-        index_fields = (self.index_topk, self.index_n_heads, self.index_head_dim)
-        sparse = self.index_topk is not None
-        if sparse != all(field is not None for field in index_fields):
+        index = (self.index_topk, self.index_n_heads, self.index_head_dim)
+        if index != (None, None, None) and None in index:
             raise ValueError(
                 "the indexer needs its top-k, head count and head dim "
                 "together, all set or all unset")
-        if sparse and self.q_lora_rank is None:
-            raise ValueError(
-                "the indexer reads the query residual, which only exists "
-                "with a q_lora_rank")
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
@@ -481,8 +476,12 @@ class MultiHeadLatentAttention(nn.Module):
             use_bias=False, dtype=self.dtype, precision=self.precision,
             name='kv_b_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
-        if self.sparse:
-            assert self.q_lora_rank is not None
+        if (self.index_topk is not None and self.index_n_heads is not None
+                and self.index_head_dim is not None):
+            if self.q_lora_rank is None:
+                raise ValueError(
+                    "the indexer reads the query residual, which only exists "
+                    "with a q_lora_rank")
             self.indexer = SparseIndexer(
                 q_lora_rank=self.q_lora_rank, n_heads=self.index_n_heads,
                 head_dim=self.index_head_dim,
