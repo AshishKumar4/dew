@@ -11,7 +11,7 @@ The public modules and the names each exports. This page is written by
 | --- | --- |
 | `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
 | `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `resolve_dtype`, `dtype_name`, `with_precision` |
-| `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid`, `host` |
+| `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid` |
 | `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig`, `Wandb` |
 
 ## Training
@@ -39,7 +39,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.diffusion` | `NoiseScheduler`, `GeneralizedNoiseScheduler`, `DiscreteNoiseScheduler`, `ContinuousNoiseScheduler`, `LinearNoiseScheduler`, `linear_beta_schedule`, `CosineNoiseScheduler`, `cosine_beta_schedule`, `ExpNoiseScheduler`, `exp_beta_schedule`, `CosineGeneralNoiseScheduler`, `CosineContinuousNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler`, `compute_resolution_shift`, `expand`, `PredictionTransform`, `EpsilonPredictionTransform`, `DirectPredictionTransform`, `VPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `Weighting`, `ScheduleWeighting`, `MinSNR`, `broadcast_rates`, `Process`, `Denoiser`, `presets`, `discrete` |
-| `dew.diffusion.presets` | `Cosine`, `EDM`, `Flow`, `Karras`, `Preset`, `Sqrt` |
+| `dew.diffusion.presets` | `Cosine`, `EDM`, `Flow`, `Karras`, `Sqrt` |
 | `dew.diffusion.schedules` | `NoiseScheduler`, `GeneralizedNoiseScheduler`, `DiscreteNoiseScheduler`, `ContinuousNoiseScheduler`, `LinearNoiseScheduler`, `linear_beta_schedule`, `CosineNoiseScheduler`, `cosine_beta_schedule`, `ExpNoiseScheduler`, `exp_beta_schedule`, `CosineGeneralNoiseScheduler`, `CosineContinuousNoiseScheduler`, `SqrtContinuousNoiseScheduler`, `KarrasVENoiseScheduler`, `EDMNoiseScheduler`, `FlowMatchingScheduler`, `compute_resolution_shift`, `expand` |
 | `dew.diffusion.transforms` | `DirectPredictionTransform`, `EpsilonPredictionTransform`, `FlowMatchPredictionTransform`, `KarrasPredictionTransform`, `MinSNR`, `PredictionTransform`, `ScheduleWeighting`, `VPredictionTransform`, `Weighting`, `broadcast_rates` |
 | `dew.diffusion.discrete` | `DiscreteDenoiser`, `DiscreteProcess`, `LogLinear`, `MDLM`, `MaskingSchedule`, `Unmask` |

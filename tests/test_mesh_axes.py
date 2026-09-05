@@ -22,7 +22,7 @@ import dew.nn.backbones.causal_transformer  # registers the model built below
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import batch_sharding
+from dew.training.distributed import batch_shardings, shard_batch
 VOCAB = 64
 # Training batches carry seq_len + 1 columns for the one-token shift, and a
 # sequence-sharded batch needs that width to divide: 15 + 1 splits over two
@@ -89,8 +89,7 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
     """Sequence parallelism splits activations: rows over every other axis,
     positions over sequence."""
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = jax.make_array_from_process_local_data(
-        batch_sharding(mesh), np.zeros((BATCH, SEQ_LEN + 1), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
     assert len(batch.addressable_shards) == jax.device_count()
     assert batch.addressable_shards[0].data.shape == (BATCH // 4, (SEQ_LEN + 1) // 2)
@@ -99,13 +98,24 @@ def test_the_batch_sequence_dimension_takes_the_sequence_axis():
 def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     """Seventeen columns over two sequence shards divide nothing, so the
     rows still split and the width replicates instead of failing."""
-    from dew.training.distributed import shard_batch
-
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
-    batch = shard_batch(batch_sharding(mesh), np.zeros((BATCH, SEQ_LEN + 2), np.float32))
+    batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 2), np.float32))
 
     assert batch.sharding.spec == P(("data", "expert", "fsdp", "tensor"))
     assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 2)
+
+
+def test_an_image_batch_never_takes_the_sequence_axis():
+    """Only a sequence per row splits over the sequence axis. An image's
+    second dimension is its height, so a rank-4 leaf keeps every dimension
+    but its rows whole, and a global array is placed from its shape alone."""
+    mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
+    images = np.zeros((BATCH, 8, 8, 3), np.float32)
+    batch = shard_batch(mesh, {"image": images, "label": np.zeros((BATCH,), np.int32)})
+
+    assert batch["image"].sharding.spec == P(("data", "expert", "fsdp", "tensor"))
+    assert batch["label"].sharding.spec == P(("data", "expert", "fsdp", "tensor"))
+    assert batch_shardings(mesh, batch)["image"].spec == batch["image"].sharding.spec
 
 
 def test_build_mesh_rejects_sizes_the_devices_cannot_hold():

@@ -271,43 +271,39 @@ class Layout:
             f"Largest replicated parameters:\n{details}")
 
 
-def batch_sharding(mesh: Mesh) -> NamedSharding:
-    return NamedSharding(mesh, BATCH_SPEC)
-
-
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
-    """A sharding per leaf of `batch`, from the batch spec and the leaf's rank.
+    """A sharding per leaf of `batch`, from the batch spec and the leaf's shape.
 
-    Rows always split over every axis but sequence. The second dimension
-    splits over the sequence axis when it divides evenly — token rows — and
-    stays replicated when it does not, the way `_mesh_spec` drops a name no
-    dimension can split: placement is opportunistic, values never change.
-    Shorter leaves split over the leading axes they have, so a per-row
-    vector still splits over rows and a scalar replicates.
+    Rows split over every axis but sequence. A leaf of rank 2 or 3 is a
+    sequence per row (token ids, segment ids, positions, encoded tokens), and
+    its second dimension splits over the sequence axis when the axis divides
+    it; otherwise that dimension stays whole, the way `_mesh_spec` drops a
+    name no dimension can split. An image or a video is not a sequence, so
+    only its rows split. Placement is all this decides: values never change,
+    and until a model constrains its attention to the axis, the sequence
+    splits here and gathers there. Only the shape is read, so a leaf that is
+    already a global array costs no transfer.
     """
-    spec = BATCH_SPEC
+    rows, sequence = BATCH_SPEC
     sequence_size = mesh.shape[SEQUENCE_AXIS]
 
     def leaf_sharding(leaf):
-        array = np.asarray(leaf)
-        if array.ndim == 0:
+        shape = np.shape(leaf)
+        if not shape:
             return NamedSharding(mesh, P())
-        if array.ndim == 2 and array.shape[1] % sequence_size:
-            return NamedSharding(mesh, P(spec[0]))
-        entries = [spec[0]] + [spec[1] if index == 1 else None
-                               for index in range(1, array.ndim)]
-        return NamedSharding(mesh, P(*entries))
+        split_sequence = len(shape) in (2, 3) and shape[1] % sequence_size == 0
+        rest = [sequence if split_sequence else None] + [None] * (len(shape) - 2)
+        return NamedSharding(mesh, P(rows, *rest[:len(shape) - 1]))
 
     return jax.tree.map(leaf_sharding, batch)
 
 
-def shard_batch(sharding: NamedSharding, batch: Batch) -> Batch:
+def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     """Assemble this process's slice of each array into a globally sharded one."""
-    placed = batch_shardings(sharding.mesh, batch)
     return jax.tree.map(
-        lambda leaf, leaf_sharding: jax.make_array_from_process_local_data(
-            leaf_sharding, np.asarray(leaf)),
-        batch, placed)
+        lambda leaf, sharding: jax.make_array_from_process_local_data(
+            sharding, np.asarray(leaf)),
+        batch, batch_shardings(mesh, batch))
 
 
 class DevicePrefetchIterator:
@@ -317,10 +313,10 @@ class DevicePrefetchIterator:
     the loop only starts moving batch N+1 after step N has been dispatched.
     """
 
-    def __init__(self, iterator: Iterator, sharding: NamedSharding, depth: int = 2,
+    def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
                  source_state: Optional[bytes] = None):
         self._iterator = iter(iterator)
-        self._sharding = sharding
+        self._mesh = mesh
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._terminal: Optional[BaseException] = None
         self._source = self._iterator if isinstance(self._iterator, Checkpointable) else None
@@ -353,7 +349,7 @@ class DevicePrefetchIterator:
                 batch = next(self._iterator)
                 state = (self._position_as_bytes(self._source.get_state())
                          if self._source is not None else None)
-                self._queue.put((shard_batch(self._sharding, batch), state))
+                self._queue.put((shard_batch(self._mesh, batch), state))
         except StopIteration:
             self._queue.put(StopIteration())
         except BaseException as error:  # surfaced on the consumer's thread

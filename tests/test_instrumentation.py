@@ -185,7 +185,7 @@ condition=%condition, body=%body
 def test_the_compiled_step_reports_a_positive_flop_count():
     trainer = make_trainer()
     state, _, _ = trainer.place()
-    trainer.compile(state, shard_batch(trainer.batch_sharding, next(batches())))
+    trainer.compile(state, shard_batch(trainer.device_mesh, next(batches())))
     assert trainer.flops_per_step is not None and trainer.flops_per_step > 0
 
 
@@ -321,7 +321,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
                          seq=seq)
     state, _, _ = trainer.place()
     executable = trainer.compile(
-        state, shard_batch(trainer.batch_sharding, next(token_batches(batch, seq, vocab))))
+        state, shard_batch(trainer.device_mesh, next(token_batches(batch, seq, vocab))))
 
     per_layer = 4 * width * width + 3 * width * hidden
     matmuls = width * vocab + layers * per_layer
