@@ -1,8 +1,7 @@
 """Publishing a run's checkpoint, as a step a recipe takes after `fit`.
 
-Training persists; publishing is reporting. The trainer never uploads or
-deletes anything, so a registry outage cannot take a run down and a checkpoint
-on disk is never the copy that gets removed.
+The trainer never uploads or deletes anything, so a registry outage cannot
+take a run down and a checkpoint on disk is never the copy that gets removed.
 """
 
 from __future__ import annotations

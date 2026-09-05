@@ -2,8 +2,8 @@
 
 An objective's `evaluate` returns one of these; a `Tracker` renders it by
 dispatching on the type; a metric is a function of it and the batch. The
-types carry arrays and nothing else, so they cross `jit` and say nothing
-about where they will be drawn.
+types carry only arrays, so they cross `jit` and say nothing about where
+they will be drawn.
 """
 
 from __future__ import annotations
