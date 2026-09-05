@@ -275,9 +275,9 @@ class ExpertMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.activation not in ('swiglu', 'geglu'):
+        if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
-                f"mlp must be 'swiglu' or 'geglu', got {self.activation!r}")
+                f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
@@ -312,7 +312,10 @@ class ExpertMLP(nn.Module):
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
-        gate = nn.silu(gate) if self.activation == 'swiglu' else nn.gelu(gate)
+        if self.activation == 'swiglu':
+            gate = nn.silu(gate)
+        else:
+            gate = nn.gelu(gate, approximate=self.activation == 'geglu')
         expert_out = self.down_proj(gate * up, group_sizes)
 
         per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
@@ -354,6 +357,7 @@ class SparseMLP(nn.Module):
     activation: str = 'swiglu'
     implementation: str = 'xla'
     score_function: str = 'softmax'
+    normalize_weights: bool = True
     routed_scaling_factor: float = 1.0
     expert_groups: int = 1
     groups_per_token: int = 1
@@ -367,6 +371,7 @@ class SparseMLP(nn.Module):
         self.gate = Router(num_experts=self.num_experts,
                            in_features=self.out_features, top_k=self.top_k,
                            score_function=self.score_function,
+                           normalize_weights=self.normalize_weights,
                            routed_scaling_factor=self.routed_scaling_factor,
                            expert_groups=self.expert_groups,
                            groups_per_token=self.groups_per_token,

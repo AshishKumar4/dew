@@ -27,6 +27,7 @@ from typing import Optional
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import RopeScaling
 from dew.registry import Registry
 
 mixers: Registry[type] = Registry("mixer")
@@ -54,7 +55,12 @@ class MixerContext:
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base: a kind's yarn record transforms this, never replaces it."""
+    rope_scaling: Optional[RopeScaling] = None
+    """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'
+    """Where the q/k RMSNorm applies: 'head' norms each head after the split
+    (Qwen3, the Gemmas), 'projection' the whole projection before it (OLMo 3)."""
     v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
@@ -63,7 +69,9 @@ class MixerContext:
     kv_store_key: Optional[str] = None
     sliding_window: Optional[int] = None
     attention_bias: bool = False
+    o_proj_bias: Optional[bool] = None
     attention_scale: Optional[float] = None
+    attn_logit_softcap: Optional[float] = None
     partial_rotary_factor: Optional[float] = None
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
@@ -128,7 +136,9 @@ class AttentionMixer(MixerBase):
             max_seq_len=ctx.max_seq_len,
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
+            rope_scaling=ctx.rope_scaling,
             qk_norm=ctx.qk_norm,
+            qk_norm_scope=ctx.qk_norm_scope,
             v_norm=ctx.v_norm,
             norm_eps=ctx.norm_eps,
             scale_offset=ctx.scale_offset,
@@ -137,7 +147,9 @@ class AttentionMixer(MixerBase):
             kv_store_key=ctx.kv_store_key,
             sliding_window=ctx.sliding_window,
             attention_bias=ctx.attention_bias,
+            o_proj_bias=ctx.o_proj_bias,
             attention_scale=ctx.attention_scale,
+            attn_logit_softcap=ctx.attn_logit_softcap,
             output_gate=ctx.output_gate,
             dtype=ctx.dtype,
             precision=ctx.precision,

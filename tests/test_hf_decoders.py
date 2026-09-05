@@ -8,6 +8,26 @@ whose logits are committed, so the comparison runs in CI without a download.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
+- gemma-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
+  7.0; Gemma 1 with hidden_act 'gelu', the erf form.
+- gemma2-tiny : max |logit difference| 4.05e-06, tolerance 1e-4, logits up to
+  10; alternating sliding and full layers, the sandwich norms without q/k
+  norms, and the attention softcap at 5, which moves the logits by 1.45.
+- mistral-tiny: max |logit difference| 6.44e-06, tolerance 1e-4.
+- qwen2-tiny  : max |logit difference| 8.39e-06, tolerance 1e-4, logits up to
+  6.7; biased q/k/v over a bias-free o_proj, with a window from layer 1 on.
+- mixtral-tiny: max |logit difference| 2.32e-06, tolerance 1e-4, logits up
+  to 4.4 in magnitude; the released per-expert w1/w2/w3 tensors stack.
+- qwen3-moe-tiny: max |logit difference| 2.86e-06, tolerance 1e-4, logits up
+  to 4.1; one routed layer of three between two dense ones, with
+  norm_topk_prob off (renormalising moves the logits by 0.38).
+- olmo3-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
+  6.2; the post-norm block, q/k norms over the whole projection and three
+  sliding layers to one full (per-head norms of the same scale miss by 0.1).
+- llama31-tiny: max |logit difference| 9.89e-06, tolerance 1e-4, logits up to
+  6.4; Llama 3.1's rope_scaling (factor 8 over 64 pretraining positions, so
+  the ramp moves 7 of 8 pairs), and plain rope on the same weights misses
+  by 4.4.
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -34,6 +54,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   tests/test_linear_attention.py.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -51,8 +72,10 @@ from dew.interop.hf_decoders import (
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
+TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
+        "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
+ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -116,6 +139,181 @@ def test_a_multimodal_gemma3_config_is_refused():
         translate_config(wrapped)
 
 
+def test_released_mistral_v03_config_translates_every_computational_field():
+    # v0.3 deliberately disables the window; the tiny fixture exercises it.
+    assert translate_config(fixture_config("mistral-7b-v0.3")) == {
+        'vocab_size': 32768, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 8, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 14336, 'max_seq_len': 8192, 'rope_theta': 1e6,
+        'layer_types': ('full_attention',) * 32, 'kinds': {},
+        'norm_eps': 1e-5, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': False,
+    }
+
+
+def test_released_qwen2_0_5b_config_translates_every_computational_field():
+    """Qwen2-0.5B ships use_sliding_window false with a sliding_window of
+    131072, so every layer attends the whole sequence."""
+    assert translate_config(fixture_config("qwen2-0.5b")) == {
+        'vocab_size': 151936, 'emb_features': 896, 'num_layers': 24,
+        'num_heads': 14, 'num_kv_heads': 2, 'head_dim': 64, 'mlp': 'swiglu',
+        'mlp_features': 4864, 'max_seq_len': 8192, 'rope_theta': 1e6,
+        'layer_types': ('full_attention',) * 24, 'kinds': {},
+        'norm_eps': 1e-6, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': True, 'o_proj_bias': False, 'tie_embeddings': True,
+    }
+
+
+def test_qwen2_loads_its_projection_biases_and_no_o_proj_bias():
+    """The split dial in the loaded tree: zeroing the q/k/v biases moves the
+    reference logits, and o_proj has no bias leaf to zero."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'qwen2-tiny')
+    ids = np.load(FIXTURES / 'qwen2-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'qwen2-tiny' / 'logits.npy')
+    attention = variables['params']['layers_0']['self_attn']
+    assert 'bias' not in attention['o_proj']
+    unbiased = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == 'bias' else leaf,
+        variables)
+    assert np.max(np.abs(np.asarray(model.apply(unbiased, ids)) - reference)) > 0.1
+
+
+def test_released_mixtral_8x7b_config_translates_every_computational_field():
+    config = translate_config(fixture_config("mixtral-8x7b"))
+    assert config['mixture'] == {'experts': 8, 'top_k': 2}
+    assert config['layer_types'] == ('full_attention',) * 32
+    assert (config['emb_features'], config['mlp_features'], config['num_kv_heads']) == (4096, 14336, 8)
+
+
+def test_mixtral_experts_stack_in_checkpoint_order():
+    model, variables, _ = fp32_decoder(FIXTURES / 'mixtral-tiny')
+    ids = np.load(FIXTURES / 'mixtral-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'mixtral-tiny' / 'logits.npy')
+    params = variables['params']
+    experts = params['layers_0']['mlp']['experts']
+    swapped = {**experts, 'gate_proj': {'kernel': experts['gate_proj']['kernel'][::-1]}}
+    shuffled = {**variables, 'params': {**params, 'layers_0': {**params['layers_0'], 'mlp': {
+        **params['layers_0']['mlp'], 'experts': swapped}}}}
+    assert np.max(np.abs(np.asarray(model.apply(shuffled, ids)) - reference)) > 0.1
+
+
+def test_released_qwen3_30b_a3b_config_translates_every_computational_field():
+    """Qwen/Qwen3-30B-A3B spells its expert count num_experts (the released
+    key; num_local_experts is the alias transformers writes back), routes
+    every layer (decoder_sparse_step 1, mlp_only_layers []) and
+    renormalises the top-8 softmax weights."""
+    config = translate_config(fixture_config("qwen3-30b-a3b"))
+    assert config['mixture'] == {'experts': 128, 'top_k': 8, 'layers': tuple(range(48)),
+                                 'norm_topk_prob': True, 'expert_features': 768}
+    assert config['qk_norm'] and config['layer_types'] == ('full_attention',) * 48
+    assert (config['emb_features'], config['mlp_features'], config['head_dim']) == (2048, 6144, 128)
+
+
+def test_qwen3_moe_picks_its_sparse_layers_like_the_reference():
+    """decoder_sparse_step counts layers from one and mlp_only_layers takes
+    layers back out (modeling_qwen3_moe.py:309-313): the tiny fixture's
+    three layers leave only the second routed, and the loaded tree has the
+    experts there and a dense MLP on the other two. A configuration that
+    routes nothing is a dense qwen3 model and refuses."""
+    config = translate_config(fixture_config("qwen3-moe-tiny"))
+    assert config['mixture']['layers'] == (1,)
+    _, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    mlps = {layer: sorted(block['mlp']) for layer, block in variables['params'].items()
+            if layer.startswith('layers_')}
+    assert mlps == {'layers_0': ['down_proj', 'gate_proj', 'up_proj'],
+                    'layers_1': ['experts', 'gate'],
+                    'layers_2': ['down_proj', 'gate_proj', 'up_proj']}
+    with pytest.raises(ValueError, match="mlp_only_layers with decoder_sparse_step"):
+        translate_config({**fixture_config("qwen3-moe-tiny"), 'mlp_only_layers': [0, 1, 2]})
+
+
+def test_norm_topk_prob_off_keeps_the_raw_softmax_weights():
+    """The fixture ships norm_topk_prob false, so a token's two weights are
+    the softmax values themselves; renormalising them to sum to one, which
+    Mixtral always does, moves the logits by 0.38 against the reference."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    ids = np.load(FIXTURES / 'qwen3-moe-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'qwen3-moe-tiny' / 'logits.npy')
+    assert model.mixture is not None and not model.mixture.norm_topk_prob
+    renormalised = model.clone(mixture=dataclasses.replace(model.mixture, norm_topk_prob=True))
+    assert np.max(np.abs(np.asarray(renormalised.apply(variables, ids)) - reference)) > 0.1
+
+
+def test_olmo3_config_translates_to_the_post_norm_block():
+    """The tiny fixture's config: three sliding layers to one full at one
+    base, no pre-norms with the output pair on, and q/k norms over the
+    whole projection. A config without layer_types takes the reference's
+    own 3:1 pattern (configuration_olmo3.py:96-98)."""
+    config = translate_config(fixture_config("olmo3-tiny"))
+    assert config['layer_types'] == ('sliding_attention',) * 3 + ('full_attention',)
+    assert config['sandwich_norms'] and not config['pre_norms']
+    assert config['qk_norm'] and config['qk_norm_scope'] == 'projection'
+    assert not config['scale_after_cast'] and config['rope_theta'] == 5e5
+    assert config['kinds'] == {'sliding_attention': {'window': 4}}
+
+    from transformers import Olmo3Config
+
+    bare = {**fixture_config("olmo3-tiny"), 'num_hidden_layers': 6}
+    del bare['layer_types']
+    reference = Olmo3Config(**{**bare, 'layer_types': None}).layer_types
+    assert reference is not None
+    assert translate_config(bare)['layer_types'] == tuple(reference)
+
+
+def test_olmo3_norms_the_whole_projection_and_no_input():
+    """The loaded tree carries a q_norm of heads * head_dim and no pre-norm
+    leaves. Normed per head instead, with each head taking its slice of the
+    same scale (what a loader that split the projection's norm across heads
+    would compute), the logits leave the reference by more than 0.1: the
+    RMS over 16 dims is not the RMS over 64, so the scope is load-bearing."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'olmo3-tiny')
+    ids = np.load(FIXTURES / 'olmo3-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'olmo3-tiny' / 'logits.npy')
+    attention = variables['params']['layers_0']['self_attn']
+    assert attention['q_norm']['scale'].shape == (model.num_heads * model.features_per_head,)
+    assert attention['k_norm']['scale'].shape == (model.kv_heads * model.features_per_head,)
+    assert 'input_layernorm' not in variables['params']['layers_0']
+
+    per_head = model.clone(qk_norm_scope='head')
+    width = model.features_per_head
+    sliced = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf[:width] if path[-2].key in ('q_norm', 'k_norm') else leaf,
+        variables)
+    difference = np.max(np.abs(np.asarray(per_head.apply(sliced, ids)) - reference))
+    assert difference > 0.1
+
+
+def test_the_released_olmo_3_7b_config_refuses_its_full_layer_yarn_by_name():
+    """allenai/Olmo-3-1025-7B carries a rope_scaling of type yarn that the
+    reference applies to its full-attention layers alone
+    (configuration_olmo3.py:110-113). The attention has no per-kind ramp,
+    so the entry is refused naming it, and the rest of the config
+    translates field for field once it is gone."""
+    released = fixture_config("olmo-3-7b")
+    with pytest.raises(ValueError, match="rope_scaling \\(rope_type 'yarn'\\)"):
+        translate_config(released)
+    del released['rope_scaling']
+    config = translate_config(released)
+    assert config == {
+        'vocab_size': 100278, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 32, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 11008, 'max_seq_len': 8192, 'rope_theta': 5e5,
+        'layer_types': (('sliding_attention',) * 3 + ('full_attention',)) * 8,
+        'kinds': {'sliding_attention': {'window': 4096}},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': True,
+        'attention_bias': False, 'tie_embeddings': False,
+        'sandwich_norms': True, 'pre_norms': False, 'qk_norm_scope': 'projection',
+    }
+
+def test_mistral_window_changes_the_reference_logits():
+    model, variables, _ = fp32_decoder(FIXTURES / 'mistral-tiny')
+    ids = np.load(FIXTURES / 'mistral-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'mistral-tiny' / 'logits.npy')
+    unwindowed = model.clone(kinds={}, layer_types=('full_attention',) * model.num_layers)
+    difference = np.max(np.abs(np.asarray(unwindowed.apply(variables, ids)) - reference))
+    assert difference > 0.1
+
+
 def test_the_real_gemma3_1b_config_translates():
     """google/gemma-3-1b-pt is gated, so the fixture is the identical config
     from a mirror. Nothing in it is beyond the field map."""
@@ -141,8 +339,6 @@ def test_the_real_gemma3_1b_config_translates():
 
 @pytest.mark.parametrize("field, value, message", [
     ('model_type', 'mamba', "model_type 'mamba'"),
-    ('model_type', 'qwen2', "o_proj does not"),
-    ('attn_logit_softcapping', 50.0, "attn_logit_softcapping"),
     ('use_bidirectional_attention', True, "use_bidirectional_attention"),
     ('hidden_activation', 'relu', "hidden_act 'relu'"),
     ('rope_parameters', {'rope_type': 'linear', 'factor': 8.0, 'rope_theta': 1e6},
@@ -154,6 +350,87 @@ def test_a_config_field_with_no_counterpart_is_refused(field, value, message):
     config = {**fixture_config("gemma3-tiny"), field: value}
     with pytest.raises(ValueError, match=message):
         translate_config(config)
+
+
+def test_an_attention_softcap_maps_where_the_reference_applies_it():
+    """Gemma 2 squashes its attention logits (modeling_gemma2.py:282); Gemma 3
+    reads the same field into its attention and never passes it on
+    (modeling_gemma3.py:334, :370-379), so there it changes nothing and maps
+    to nothing. Llama's reference has no such field at all."""
+    assert translate_config(fixture_config("gemma2-tiny"))['attn_logit_softcap'] == 5.0
+    ignored = translate_config({**fixture_config("gemma3-tiny"), 'attn_logit_softcapping': 50.0})
+    assert 'attn_logit_softcap' not in ignored
+    with pytest.raises(ValueError, match="attn_logit_softcapping"):
+        translate_config({**fixture_config("llama-tiny"), 'attn_logit_softcapping': 50.0})
+
+
+def test_the_released_gemma_2b_config_translates_field_by_field():
+    """unsloth/gemma-2b carries google/gemma-2b's config: hidden_act 'gelu',
+    which transformers 5.16.1 runs as the erf gelu (modeling_gemma.py:93),
+    the (1 + w) norms, sqrt(d) embeddings and a tied head."""
+    assert translate_config(fixture_config("gemma-2b")) == {
+        'vocab_size': 256000, 'emb_features': 2048, 'num_layers': 18,
+        'num_heads': 8, 'num_kv_heads': 1, 'head_dim': 256, 'mlp': 'geglu_exact',
+        'mlp_features': 16384, 'max_seq_len': 8192, 'rope_theta': 1e4,
+        'layer_types': ('full_attention',) * 18, 'kinds': {},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': True,
+        'scale_offset': True, 'embedding_scale': True,
+    }
+
+
+def test_the_released_gemma_2_2b_config_translates_field_by_field():
+    """unsloth/gemma-2-2b carries google/gemma-2-2b's config: 26 layers
+    alternating sliding and full at one rope base, query_pre_attn_scalar
+    256 on head_dim 256, both softcaps, and the sandwich norms."""
+    config = translate_config(fixture_config("gemma-2-2b"))
+    assert config == {
+        'vocab_size': 256000, 'emb_features': 2304, 'num_layers': 26,
+        'num_heads': 8, 'num_kv_heads': 4, 'head_dim': 256, 'mlp': 'geglu',
+        'mlp_features': 9216, 'max_seq_len': 8192, 'rope_theta': 1e4,
+        'layer_types': ('sliding_attention', 'full_attention') * 13,
+        'kinds': {'sliding_attention': {'window': 4096}},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': True,
+        'scale_offset': True, 'embedding_scale': True, 'sandwich_norms': True,
+        'attention_scale': 256 ** -0.5, 'final_logit_softcap': 30.0,
+        'attn_logit_softcap': 50.0,
+    }
+
+
+def test_a_gemma2_config_without_layer_types_alternates_like_the_reference():
+    """Gemma2Config fills the pattern itself (configuration_gemma2.py:95-98);
+    the expected pattern comes from the reference class."""
+    from transformers import Gemma2Config
+
+    config = {**fixture_config("gemma2-tiny"), "num_hidden_layers": 5}
+    del config["layer_types"]
+    reference = Gemma2Config(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
+    assert translate_config(config)["layer_types"] == tuple(reference)
+    assert translate_config(config)["layer_types"][-1] == "sliding_attention"
+
+
+def test_dropping_the_attention_softcap_breaks_gemma2_parity():
+    """The fixture caps at 5 so the tanh moves the logits by 1.45; a load
+    that read the cap and applied none would pass no tolerance below that."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'gemma2-tiny')
+    ids = np.load(FIXTURES / 'gemma2-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'gemma2-tiny' / 'logits.npy')
+    uncapped = model.clone(attn_logit_softcap=None)
+    assert np.max(np.abs(np.asarray(uncapped.apply(variables, ids)) - reference)) > 1.0
+
+
+def test_the_erf_gelu_is_not_the_tanh_gelu_on_gemma():
+    """gemma-tiny names hidden_act 'gelu'; run through the tanh approximation
+    instead, its logits drift 1.7e-03 from the reference, above the 1e-4
+    parity tolerance, so the two activations are two mlp values."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'gemma-tiny')
+    ids = np.load(FIXTURES / 'gemma-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'gemma-tiny' / 'logits.npy')
+    approximate = model.clone(mlp='geglu')
+    difference = np.max(np.abs(np.asarray(approximate.apply(variables, ids)) - reference))
+    assert 1e-4 < difference < 1e-2
 
 
 def test_a_rope_scaling_spelled_the_old_way_is_refused():
@@ -172,7 +449,94 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
         translate_config(factor_only)
 
 
-@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+@pytest.mark.parametrize("head_dim, theta, ramp", [
+    (16, 5e5, {'factor': 8.0, 'low_freq_factor': 1.0, 'high_freq_factor': 4.0,
+               'original_max_position_embeddings': 64}),
+    (128, 5e5, {'factor': 8.0, 'low_freq_factor': 1.0, 'high_freq_factor': 4.0,
+                'original_max_position_embeddings': 8192}),
+])
+def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp):
+    """RopeScaling.apply against transformers' _compute_llama3_parameters,
+    the reference's own function, on the tiny fixture's geometry and on
+    Llama-3.1-8B's (head_dim 128, base 5e5, factor 8 off 8192). Observed
+    difference 0.0 on both; the ramp moves 7 of the tiny table's 8 pairs
+    and 35 of the release's 64."""
+    from transformers import LlamaConfig
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from dew.nn.attention import RopeScaling
+
+    config = LlamaConfig.from_dict(dict(
+        hidden_size=head_dim * 4, num_attention_heads=4, head_dim=head_dim,
+        rope_theta=theta, rope_scaling={'rope_type': 'llama3', **ramp},
+        max_position_embeddings=8 * ramp['original_max_position_embeddings']))
+    reference, attention_factor = ROPE_INIT_FUNCTIONS['llama3'](config, 'cpu')
+    assert attention_factor == 1.0
+    plain = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+    scaled = np.asarray(RopeScaling(**ramp).apply(jnp.asarray(plain)))
+    assert np.max(np.abs(scaled - reference.numpy())) < 1e-7
+    assert np.sum(scaled != plain) >= head_dim // 4
+
+
+def test_a_llama3_rope_scaling_translates_and_loads():
+    """The tiny Llama 3.1 fixture: rope_scaling under the reference's names
+    on the backbone, and the same weights under plain rope at rope_theta
+    miss the reference by 4.4."""
+    config = translate_config(fixture_config("llama31-tiny"))
+    assert config['rope_scaling'] == {
+        'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+        'high_freq_factor': 4.0, 'original_max_position_embeddings': 64}
+    model, variables, _ = fp32_decoder(FIXTURES / 'llama31-tiny')
+    ids = np.load(FIXTURES / 'llama31-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'llama31-tiny' / 'logits.npy')
+    plain = model.clone(rope_scaling=None)
+    assert np.max(np.abs(np.asarray(plain.apply(variables, ids)) - reference)) > 1.0
+
+
+def test_the_released_llama_3_1_8b_config_translates_field_by_field():
+    """unsloth/Llama-3.1-8B carries meta-llama/Llama-3.1-8B's config."""
+    assert translate_config(fixture_config("llama-3.1-8b")) == {
+        'vocab_size': 128256, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 8, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 14336, 'max_seq_len': 8192, 'rope_theta': 5e5,
+        'layer_types': ('full_attention',) * 32, 'kinds': {},
+        'norm_eps': 1e-5, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': False,
+        'rope_scaling': {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+                         'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192},
+    }
+
+
+def test_a_ramp_the_reference_puts_on_one_kind_lands_on_that_kind():
+    """OLMo 3 moves a flat rope_scaling onto its full-attention entry
+    (configuration_olmo3.py:110-113) and leaves the sliding layers plain, and
+    a nested rope_parameters may state the same directly. Both land on the
+    full kind, not the model, since a kind's None rides the model's ramp and
+    could not turn one off. A ramp with a field missing refuses by name."""
+    ramp = {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
+            'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192}
+    flat = {**fixture_config("olmo-3-7b"), 'rope_scaling': ramp}
+    config = translate_config(flat)
+    assert 'rope_scaling' not in config
+    assert config['kinds'] == {'sliding_attention': {'window': 4096},
+                               'full_attention': {'rope_scaling': ramp}}
+    from transformers import Olmo3Config
+
+    parameters = Olmo3Config.from_dict(flat).to_dict()['rope_parameters']
+    assert parameters['sliding_attention']['rope_type'] == 'default'
+    assert parameters['full_attention']['rope_type'] == 'llama3'
+
+    nested = {**fixture_config("olmo3-tiny"), 'rope_parameters': {
+        'full_attention': {**ramp, 'rope_theta': 5e5},
+        'sliding_attention': {'rope_type': 'default', 'rope_theta': 5e5}}}
+    assert translate_config(nested)['kinds']['full_attention'] == {'rope_scaling': ramp}
+
+    with pytest.raises(ValueError, match="missing \\['high_freq_factor'\\]"):
+        translate_config({**flat, 'rope_scaling': {
+            k: v for k, v in ramp.items() if k != 'high_freq_factor'}})
+
+
+@pytest.mark.parametrize("name", TINY + ROUTED)
 def test_translated_weights_are_exactly_the_models_variables(name, rng):
     """Same collections, same paths, same shapes, same dtypes as a freshly
     initialised model: `params` for every family, and the `moe` collection
@@ -192,7 +556,7 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+@pytest.mark.parametrize("name", TINY + ROUTED)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
@@ -504,7 +868,7 @@ def test_the_real_e2b_config_translates():
 @pytest.mark.parametrize("field,value", [
     ("attention_k_eq_v", True),
     ("enable_moe_block", True),
-    ("hidden_act", "gelu"),
+    ("hidden_act", "relu"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
     """Every gemma4 knob Dew cannot express names itself instead of loading
@@ -742,6 +1106,7 @@ def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Gemma4TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived.count("sliding_attention") == 11
     assert derived[-1] == "full_attention"
@@ -1033,6 +1398,7 @@ def test_a_qwen35_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Qwen3_5TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived == ("linear_attention", "linear_attention", "full_attention") * 2
 

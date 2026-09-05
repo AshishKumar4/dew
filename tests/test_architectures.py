@@ -248,6 +248,41 @@ VARIANTS = [
     # A multi-token-prediction depth adds its projection and block beside the
     # backbone, so the declarations behind them are checked here.
     Case("causal_transformer", {**LM, "num_nextn_predict_layers": 1}, seq_len=SEQ_LEN, label="mtp"),
+    # Qwen2 biases q, k and v while o_proj stays bias-free, so the split
+    # dial's declarations are walked with the odd projection left out.
+    Case("causal_transformer", {**LM, "attention_bias": True, "o_proj_bias": False},
+         seq_len=SEQ_LEN, label="qwen2"),
+    # Gemma 2's stack: the sandwich norms with (1 + w) scales, the attention
+    # softcap and the erf gelu; the softcap and the activation add no leaf,
+    # so the case pins that they build and place like the plain stack.
+    Case("causal_transformer", {**LM, "sandwich_norms": True, "scale_offset": True,
+                                "embedding_scale": True, "attn_logit_softcap": 5.0,
+                                "final_logit_softcap": 30.0, "mlp": "geglu_exact"},
+         seq_len=SEQ_LEN, label="gemma2"),
+    # Qwen3-MoE's routing: the top-k softmax weights used unrenormalised
+    # (norm_topk_prob off), with q/k norms and experts narrower than the
+    # dense feed-forward, on the second layer only.
+    Case("causal_transformer", {**LM, "qk_norm": True, "mixture": {
+        "experts": 8, "top_k": 2, "layers": (1,), "norm_topk_prob": False,
+        "expert_features": 32}}, seq_len=SEQ_LEN, label="qwen3_moe"),
+    # OLMo 3's block: no input norms, the output pair on, and one q/k norm
+    # over the whole projection, whose scale is heads * head_dim wide.
+    Case("causal_transformer", {**LM, "sandwich_norms": True, "pre_norms": False,
+                                "qk_norm": True, "qk_norm_scope": "projection"},
+         seq_len=SEQ_LEN, label="olmo3"),
+    # Llama 3.1's ramp, on the model and on the full kind alone (OLMo 3's
+    # placement): a value from a record at both seams, no leaf added.
+    Case("causal_transformer", {**LM, "rope_scaling": {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8}},
+         seq_len=SEQ_LEN, label="llama31"),
+    Case("causal_transformer", {
+        **LM, "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4},
+                  "full_attention": {"rope_scaling": {
+                      "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                      "high_freq_factor": 4.0, "original_max_position_embeddings": 8}}}},
+        seq_len=SEQ_LEN, label="kind_ramp"),
 ]
 
 

@@ -15,24 +15,28 @@ Set up the venv and run it:
     /tmp/hfref/bin/python tools/hf_reference.py
 
 What lands in tests/fixtures/hf:
-- qwen3-tiny/, gemma3-tiny/, llama-tiny/, deepseek-v3-tiny/ and
-  deepseek-v32-tiny/: a random-weight checkpoint in the HF layout
-  (config.json + model.safetensors), the 2 x 12 token ids it was run on, and
-  the fp32 logits of the reference model in eval mode with eager attention.
-  Small enough to live in git. The DeepSeek pair is one dense layer over one
-  MoE layer (`first_k_dense_replace` 1) with a shared expert, the released
-  YaRN spelling, q and kv LoRA, and, on V3.2, the sparse indexer; their
-  routers' balancing bias is scattered too, since a checkpoint carries it
-  and a fixture at its zeros would not tell a load that reads it from one
-  that drops it.
+- <family>-tiny/ for qwen3, gemma, gemma2, gemma3, llama, llama31, mistral,
+  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3 and deepseek-v32: a
+  random-weight checkpoint in the HF layout (config.json +
+  model.safetensors), the 2 x 12 token ids it was run on, and the fp32
+  logits of the reference model in eval mode with eager attention. Small
+  enough to live in git. Each tiny config turns on what its family adds
+  (its docstring says which dial and why the size was chosen). The DeepSeek
+  pair is one dense layer over one MoE layer (`first_k_dense_replace` 1)
+  with a shared expert, the released YaRN spelling, q and kv LoRA, and, on
+  V3.2, the sparse indexer; their routers' balancing bias is scattered too,
+  since a checkpoint carries it and a fixture at its zeros would not tell a
+  load that reads it from one that drops it.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
   prompt and reference.npz the top 32 logits per position of the real
   weights in fp32, which the network test compares against.
-- gemma3-1b/: config.json only. google/gemma-3-1b-pt is gated and returns 401
-  without a token, so the config comes from a mirror of it, which is the same
-  file minus the mirror's own marker key.
+- One directory per released config the translation is tested on
+  (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b): config.json and the
+  repo it came from in source.json, no weights. Google's and Meta's gated
+  repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
 
 import argparse
@@ -45,8 +49,11 @@ import torch
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
-    Qwen3Config, Qwen3ForCausalLM,
+    Gemma2Config, Gemma2ForCausalLM, Gemma3ForCausalLM, Gemma3TextConfig,
+    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
+    Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
+    MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
+    Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -71,11 +78,11 @@ BATCH, LENGTH = 2, 12
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
-    config = Qwen3Config(
+    config = Qwen3Config.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
         tie_word_embeddings=True, rope_theta=1e6, max_position_embeddings=64,
-        rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu")
+        rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return Qwen3ForCausalLM(config)
 
@@ -87,17 +94,125 @@ def tiny_llama() -> LlamaForCausalLM:
     what CausalSelfAttention's one flag means, so a biased fixture is the
     test that the bias path loads.
     """
-    config = LlamaConfig(
+    config = LlamaConfig.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
         tie_word_embeddings=False, rope_theta=5e5, max_position_embeddings=64,
-        rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu")
+        rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return LlamaForCausalLM(config)
 
 
+def tiny_qwen2() -> Qwen2ForCausalLM:
+    """Biased q/k/v projections with a bias-free o_proj, and a sliding window
+    from the second layer on (use_sliding_window with max_window_layers)."""
+    config = Qwen2Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=128, vocab_size=256,
+        use_sliding_window=True, sliding_window=4, max_window_layers=1,
+        max_position_embeddings=64, rope_theta=1e6, tie_word_embeddings=True))
+    torch.manual_seed(0)
+    return Qwen2ForCausalLM(config)
+
+
+# Llama 3.1's released ramp: factor 8 off 8192 positions, smoothing between
+# wavelengths 8192 / 4 and 8192 / 1. The tiny fixture keeps the ramp and
+# shrinks the pretraining context so that, at head_dim 16 and base 5e5, the
+# smoothing band holds frequencies of the tiny table rather than lying
+# beyond all of them.
+LLAMA3_ROPE = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+               "high_freq_factor": 4.0, "original_max_position_embeddings": 64}
+
+
+def tiny_llama31() -> LlamaForCausalLM:
+    """The llama-tiny shape under Llama 3.1's rope_scaling, so a load that
+    applied plain rope at rope_theta fails the parity."""
+    config = LlamaConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+        tie_word_embeddings=False, rope_theta=5e5, max_position_embeddings=512,
+        rope_scaling=dict(LLAMA3_ROPE), rms_norm_eps=1e-5, hidden_act="silu"))
+    torch.manual_seed(0)
+    return LlamaForCausalLM(config)
+
+
+def tiny_mixtral() -> MixtralForCausalLM:
+    config = MixtralConfig.from_dict(dict(
+        hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=48, vocab_size=128,
+        num_local_experts=4, num_experts_per_tok=2, sliding_window=4,
+        max_position_embeddings=64))
+    torch.manual_seed(0)
+    return MixtralForCausalLM(config)
+
+
+def tiny_mistral() -> MistralForCausalLM:
+    config = MistralConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+        sliding_window=4, max_position_embeddings=64, rope_theta=10000.0))
+    torch.manual_seed(0)
+    return MistralForCausalLM(config)
+
+
+def tiny_qwen3_moe() -> Qwen3MoeForCausalLM:
+    """Three layers: the first dense by mlp_only_layers, the second routed
+    and the third dense by decoder_sparse_step 2, so both dials pick a
+    layer. norm_topk_prob stays at the release's False, where the top-k
+    softmax weights are used as they are, and the routed width differs
+    from the dense one so the two cannot be confused."""
+    config = Qwen3MoeConfig.from_dict(dict(
+        hidden_size=32, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=8, intermediate_size=48,
+        moe_intermediate_size=16, num_experts=4, num_experts_per_tok=2,
+        decoder_sparse_step=2, mlp_only_layers=[0], norm_topk_prob=False,
+        vocab_size=128, max_position_embeddings=64, rope_theta=1e6))
+    torch.manual_seed(0)
+    return Qwen3MoeForCausalLM(config)
+
+
+def tiny_olmo3() -> Olmo3ForCausalLM:
+    """Four layers, so the reference's own 3:1 sliding-to-full pattern picks
+    one full layer; the q/k norms over the whole projection with grouped
+    heads (so a per-head norm cannot pass) and the post-norm block."""
+    config = Olmo3Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=128, vocab_size=256,
+        sliding_window=4, max_position_embeddings=64, rope_theta=5e5,
+        rms_norm_eps=1e-6))
+    torch.manual_seed(0)
+    return Olmo3ForCausalLM(config)
+
+
+def tiny_gemma() -> GemmaForCausalLM:
+    """Gemma 1 at toy width, with hidden_act 'gelu' as the released config
+    spells it: transformers 5.16.1 computes that as the erf gelu
+    (modeling_gemma.py:93), which is 1.7e-03 away from the tanh form on
+    these weights, so the fixture tells the two apart."""
+    config = GemmaConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=16, intermediate_size=128, vocab_size=256,
+        hidden_act="gelu", max_position_embeddings=64))
+    torch.manual_seed(0)
+    return GemmaForCausalLM(config)
+
+
+def tiny_gemma2() -> Gemma2ForCausalLM:
+    """The Gemma 3 shape without q/k norms, alternating sliding and full
+    layers, and an attention softcap of 5: at the release's 50 the cap moves
+    these logits by 1.9e-02, at 5 by 1.5, so a load that dropped the cap
+    fails the parity by a wide margin instead of a narrow one."""
+    config = Gemma2Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=32, intermediate_size=128, vocab_size=256,
+        query_pre_attn_scalar=16, sliding_window=4, final_logit_softcapping=30.0,
+        attn_logit_softcapping=5.0, max_position_embeddings=64, rope_theta=1e4))
+    torch.manual_seed(0)
+    return Gemma2ForCausalLM(config)
+
+
 def tiny_gemma3() -> Gemma3ForCausalLM:
-    config = Gemma3TextConfig(
+    config = Gemma3TextConfig.from_dict(dict(
         hidden_size=64, num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         num_attention_heads=4, num_key_value_heads=1, head_dim=32,
@@ -105,7 +220,7 @@ def tiny_gemma3() -> Gemma3ForCausalLM:
         vocab_size=256, tie_word_embeddings=True, rope_theta=1e6,
         rope_local_base_freq=1e4, final_logit_softcapping=30.0,
         max_position_embeddings=64, rms_norm_eps=1e-6,
-        hidden_activation="gelu_pytorch_tanh")
+        hidden_activation="gelu_pytorch_tanh"))
     torch.manual_seed(0)
     return Gemma3ForCausalLM(config)
 
@@ -132,7 +247,7 @@ DEEPSEEK_TINY = dict(
 
 
 def tiny_deepseek_v3() -> DeepseekV3ForCausalLM:
-    config = DeepseekV3Config(**DEEPSEEK_TINY, rope_interleave=True)
+    config = DeepseekV3Config.from_dict(dict(DEEPSEEK_TINY, rope_interleave=True))
     torch.manual_seed(0)
     return DeepseekV3ForCausalLM(config)
 
@@ -151,8 +266,8 @@ DEEPSEEK_V32_SEED = 202
 def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
     """The V3 shape with the sparse indexer: eight heads of width 16 over
     the rope width of 8, keeping four of the twelve keys."""
-    config = DeepseekV32Config(
-        **DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16)
+    config = DeepseekV32Config.from_dict(dict(
+        DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16))
     torch.manual_seed(0)
     return DeepseekV32ForCausalLM(config)
 
@@ -178,7 +293,7 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
-def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
+def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
     model.eval()
     model.set_attn_implementation("eager")
     with torch.no_grad():
@@ -186,11 +301,11 @@ def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).numpy()
 
 
-def write_tiny(name: str, model: torch.nn.Module, seed: int = 1234) -> None:
+def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
-    model = model.to(torch.float32)
+    model = model.float()
     model.save_pretrained(directory, safe_serialization=True)
 
     ids = np.random.RandomState(7).randint(
@@ -244,19 +359,23 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
-def write_gemma3_config(directory: Path) -> None:
-    """The real Gemma 3 1B text config, from a mirror of the gated repo.
+def write_released_config(name: str, repo: str) -> None:
+    """The real config.json of a released checkpoint, and the repo it came
+    from in source.json. Only the config is downloaded, never the weights.
 
-    google/gemma-3-1b-pt answers 401 without an accepted licence, and the
-    translation still has to be tested against a real Gemma config rather
-    than only the tiny fixture, so this takes the mirror's copy and drops the
-    marker key the mirror adds.
+    Google's Gemma repos answer 401 without an accepted licence, so those
+    come from unsloth's mirrors, which carry the identical config plus
+    marker keys of their own (unsloth_fixed, unsloth_version); the markers
+    are dropped so the fixture is the released config and nothing else.
     """
+    directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(GEMMA_MIRROR, "config.json")).read_text())
-    config.pop("unsloth_fixed", None)
+    config = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
+    for key in [key for key in config if key.startswith("unsloth")]:
+        del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    print(f"{directory / 'config.json'}: {GEMMA_MIRROR}, "
+    (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+    print(f"{directory / 'config.json'}: {repo}, "
           f"{config['num_hidden_layers']} layers, {len(config)} fields")
 
 
@@ -269,7 +388,21 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
+    write_tiny("gemma-tiny", tiny_gemma())
+    write_tiny("gemma2-tiny", tiny_gemma2())
     write_tiny("llama-tiny", tiny_llama())
+    write_tiny("llama31-tiny", tiny_llama31())
+    write_released_config("llama-3.1-8b", "unsloth/Llama-3.1-8B")
+    write_tiny("mistral-tiny", tiny_mistral())
+    write_tiny("mixtral-tiny", tiny_mixtral())
+    write_tiny("qwen2-tiny", tiny_qwen2())
+    write_tiny("qwen3-moe-tiny", tiny_qwen3_moe())
+    write_tiny("olmo3-tiny", tiny_olmo3())
+    write_released_config("olmo-3-7b", "allenai/Olmo-3-1025-7B")
+    write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
+    write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
+    write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
+    write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
 
@@ -279,7 +412,9 @@ def main() -> None:
     if not args.skip_real:
         write_real_reference(real)
 
-    write_gemma3_config(FIXTURES / "gemma3-1b")
+    write_released_config("gemma3-1b", GEMMA_MIRROR)
+    write_released_config("gemma-2b", "unsloth/gemma-2b")
+    write_released_config("gemma-2-2b", "unsloth/gemma-2-2b")
 
 
 if __name__ == "__main__":

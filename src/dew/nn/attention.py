@@ -9,6 +9,7 @@ from flax import linen as nn
 from typing import Optional
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
+from flax.linen.dtypes import promote_dtype
 import functools
 import math
 from .sharding import SEQUENCE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
@@ -84,8 +85,61 @@ class RMSNorm(nn.Module):
         if self.scale_after_cast:
             return y.astype(dtype) * weight.astype(dtype)
         return (y * weight).astype(dtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class RopeScaling:
+    """Llama 3.1's frequency ramp, under the reference's own names.
+
+    `_compute_llama3_parameters` (transformers modeling_rope_utils.py:580)
+    divides the inverse frequencies whose wavelength exceeds
+    original_max_position_embeddings / low_freq_factor by `factor`, leaves
+    those below original_max_position_embeddings / high_freq_factor alone,
+    and interpolates linearly in between on
+    (original_max_position_embeddings / wavelength - low_freq_factor)
+    / (high_freq_factor - low_freq_factor). `rope_type` is the record's
+    discriminator, and only 'llama3' is this ramp; YaRN is a mixer kind's
+    own value.
+    """
+
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: int
+    rope_type: str = 'llama3'
+
+    def __post_init__(self):
+        if self.rope_type != 'llama3':
+            raise ValueError(
+                f"rope_scaling applies the llama3 ramp, got rope_type {self.rope_type!r}")
+        if self.factor < 1.0:
+            raise ValueError(f"rope_scaling factor is at least 1, got {self.factor}")
+        if self.high_freq_factor <= self.low_freq_factor:
+            raise ValueError(
+                f"rope_scaling needs high_freq_factor above low_freq_factor, got "
+                f"{self.high_freq_factor} and {self.low_freq_factor}")
+        if self.original_max_position_embeddings < 1:
+            raise ValueError(
+                "rope_scaling original_max_position_embeddings is the pretraining "
+                f"context, got {self.original_max_position_embeddings}")
+
+    def apply(self, inv_freq):
+        """The scaled inverse frequencies, the reference's arithmetic in fp32."""
+        old_context_len = float(self.original_max_position_embeddings)
+        wavelen = 2 * math.pi / inv_freq
+        divided = jnp.where(wavelen > old_context_len / self.low_freq_factor,
+                            inv_freq / self.factor, inv_freq)
+        smooth = ((old_context_len / wavelen - self.low_freq_factor)
+                  / (self.high_freq_factor - self.low_freq_factor))
+        smoothed = (1 - smooth) * divided / self.factor + smooth * divided
+        medium = jnp.logical_and(wavelen >= old_context_len / self.high_freq_factor,
+                                 wavelen <= old_context_len / self.low_freq_factor)
+        return jnp.where(medium, smoothed, divided)
+
+
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
-                 partial_rotary_type: str = 'proportional'):
+                 partial_rotary_type: str = 'proportional',
+                 rope_scaling: Optional[RopeScaling] = None):
     """cos/sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
@@ -110,6 +164,9 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
       (modeling_qwen3_5.py:581-591).
 
     With rot_dim None both are the full rotation and the type is moot.
+    `rope_scaling` is Llama 3.1's ramp over the base frequencies, applied
+    before a proportional rope pads its zero-frequency tail, which is where
+    the reference applies it (`dim = head_dim * partial_rotary_factor`).
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -118,6 +175,8 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
     divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
     inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor))
+    if rope_scaling is not None:
+        inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
         padding = head_dim // 2 - pairs
         inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
@@ -334,11 +393,53 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
         mask = structural if mask is None else jnp.logical_and(mask, structural)
     out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias)
     return constrain(unstripe(constrain(out, split), shards), split)
+CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
+CUDNN_MAX_HEAD_DIM = 128
+
+
+def cudnn_runs(query, softcap=None) -> bool:
+    """Whether cudnn's fused kernel takes this query: a gpu backend, one of its
+    two dtypes, a head dimension it tiles, and no logit softcap, which no
+    fused kernel applies. 'auto' asks this; an explicit 'cudnn' refuses by
+    name instead."""
+    head_dim = query.shape[-1]
+    return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
+            and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
+            and softcap is None)
+
+
+def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
+                         force_fp32_for_softmax=True, mask=None, bias=None):
+    """Attention with Gemma 2's tanh softcap on the logits, in plain XLA ops.
+
+    The reference scales the logits, squashes them into (-softcap, softcap)
+    as `softcap * tanh(logits / softcap)`, adds the mask and takes the softmax
+    in fp32 (modeling_gemma2.py:192-208). No fused kernel has that tanh, so
+    this is flax's reference attention with the cap between the scaling and
+    the mask; heads arrive already repeated and the mask already structural,
+    as the reference path prepares them.
+    """
+    query, key, value = promote_dtype(query, key, value, dtype=dtype)
+    dtype = query.dtype
+    logits = jnp.einsum('...qhd,...khd->...hqk',
+                        query / jnp.sqrt(query.shape[-1]).astype(dtype), key,
+                        precision=precision)
+    logits = jnp.tanh(logits / softcap) * softcap
+    if bias is not None:
+        logits = logits + bias
+    if mask is not None:
+        logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
+    if force_fp32_for_softmax and dtype != jnp.float32:
+        weights = jax.nn.softmax(logits.astype(jnp.float32))
+    else:
+        weights = jax.nn.softmax(logits).astype(dtype)
+    return jnp.einsum('...hqk,...khd->...qhd', weights, value, precision=precision)
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
-                                 causal=False, sliding_window=None, mask=None, bias=None):
+                                 causal=False, sliding_window=None, mask=None, bias=None,
+                                 softcap=None):
     """The one attention kernel path for every attention module.
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
@@ -349,8 +450,10 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
-    - 'auto': 'cudnn' on a gpu backend, 'xla' anywhere else. Resolved per
-      trace, so a config logged as 'auto' still runs on the next machine.
+    - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
+      inputs, a head dimension that is a multiple of 8 and at most 128, no
+      softcap), 'xla' anywhere else. Resolved per trace, so a config logged
+      as 'auto' still runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -377,10 +480,18 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     through `sequence_parallel_attention`: the queries split over that axis,
     the keys and values are gathered whole, and a causal or masked call
     balances its work across the shards.
+
+    `softcap` is Gemma 2's tanh on the scaled logits before the mask and the
+    softmax. No fused kernel applies it, so a softcapped call runs
+    `softcapped_attention` under both the reference and the xla
+    implementation, honouring dtype, precision and force_fp32_for_softmax the
+    way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
+    refuse it by name rather than dropping the cap.
     """
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation)
+        force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
+        softcap=softcap)
     shards = sequence_shards()
     if shards > 1:
         return sequence_parallel_attention(
@@ -392,12 +503,21 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation=None,
-                     causal=False, sliding_window=None, mask=None, bias=None):
+                     causal=False, sliding_window=None, mask=None, bias=None, softcap=None):
     """`scaled_dot_product_attention`'s kernel dispatch over whole sequences."""
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
 
-    if implementation is None:
+    if implementation == 'auto':
+        implementation = 'cudnn' if cudnn_runs(query, softcap) else 'xla'
+    if softcap is not None and implementation in ('cudnn', 'tpu'):
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot apply an "
+            f"attention logit softcap of {softcap}: the fused kernel has no tanh "
+            "between its scaling and its softmax. Use attention_impl 'xla' or "
+            "the reference implementation (attention_impl 'reference').")
+
+    if implementation is None or softcap is not None:
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -405,13 +525,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             structural = causal_attention_mask(
                 jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
             mask = structural if mask is None else jnp.logical_and(mask, structural)
+        if softcap is not None:
+            return softcapped_attention(
+                query, key, value, softcap, dtype=dtype, precision=precision,
+                force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
         return nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
-
-    if implementation == 'auto':
-        implementation = 'cudnn' if jax.default_backend() == 'gpu' else 'xla'
 
     requested = {str(getattr(p, 'name', p)).upper()
                  for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
@@ -436,11 +557,17 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             "the reference implementation (attention_impl 'reference').")
 
     if implementation == 'cudnn':
-        if query.dtype not in (jnp.bfloat16, jnp.float16):
+        if query.dtype not in CUDNN_DTYPES:
             raise ValueError(
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
+        head_dim = query.shape[-1]
+        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
+            raise ValueError(
+                f"cudnn attention needs a head dimension that is a multiple of 8 "
+                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
+                "'xla' for this shape.")
         return cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
     if implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
