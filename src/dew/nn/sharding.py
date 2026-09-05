@@ -19,16 +19,21 @@ convolution, a state matrix, a projection with no side worth naming): their
 parameters are placed on their largest divisible axis. Each entry is a run
 of `fnmatch` patterns matched against consecutive names of the parameter
 path, so `("time_embed",)` covers every parameter under that module and
-`("up_dense_*",)` a numbered family. A declared or heuristic name that no
-parameter carries any more is what the coverage test in
-tests/test_architectures.py reports, so a renamed submodule fails there
-rather than silently stopping to match.
+`("up_dense_*",)` a numbered family. The coverage test in
+tests/test_architectures.py reports a declared or heuristic name that no
+parameter carries any more, so a renamed submodule fails there.
+
+The mesh axis names live here too, with the readers of the mesh in context:
+`pipeline_stages` for the decoder's stage count and `microbatches` for the
+schedule the trainer puts in context around its compiled step.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import fnmatch
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TypeAlias
 
 import jax
@@ -36,11 +41,68 @@ import jax
 LogicalAxes: TypeAlias = tuple[str | None, ...]
 Suffix: TypeAlias = tuple[str, ...]
 
+DATA_AXIS = 'data'
+EXPERT_AXIS = 'expert'
+FSDP_AXIS = 'fsdp'
+TENSOR_AXIS = 'tensor'
+SEQUENCE_AXIS = 'sequence'
+STAGE_AXIS = 'stage'
+"""The axes of a mesh `dew.training.build_mesh` builds, plus the stage axis a
+pipeline mesh adds. They are named here because the attention seam and the
+decoder read them off the mesh in context: the sequence axis attention splits
+its queries over, and the tensor and stage axes, which hold a width and a
+pipeline stage and never a row."""
+
 DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
 
 HEURISTIC: set[Suffix] = set()
 """Runs of name patterns whose parameters take the shape heuristic on purpose."""
+
+_MICROBATCHES: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    'pipeline_microbatches', default=None)
+
+
+def pipeline_stages() -> int:
+    """How many pipeline stages the mesh in context has, 1 with no mesh or no
+    such axis.
+
+    The trainer runs its compiled step under `jax.set_mesh`, and that puts
+    the mesh in context while the step traces; a model called outside it
+    runs its layer stack whole.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    return 1 if mesh.empty else mesh.shape.get(STAGE_AXIS, 1)
+
+
+@contextlib.contextmanager
+def pipeline_microbatches(count: int | None) -> Iterator[None]:
+    """How many microbatches a step feeds the stage axis, for the model that
+    traces inside. None leaves one microbatch per stage, the smallest schedule
+    a pipeline runs."""
+    token = _MICROBATCHES.set(count)
+    try:
+        yield
+    finally:
+        _MICROBATCHES.reset(token)
+
+
+def microbatches() -> int:
+    """The microbatch count in context, or one per stage of the mesh in context."""
+    count = _MICROBATCHES.get()
+    return pipeline_stages() if count is None else count
+
+
+def sequence_shards() -> int:
+    """How many ways the mesh in context splits the sequence axis, 1 with no
+    mesh or no such axis.
+
+    The trainer runs its compiled step under `jax.set_mesh`, so the mesh is
+    in context while the step traces; a model called outside
+    it sees whole sequences.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    return 1 if mesh.empty else mesh.shape.get(SEQUENCE_AXIS, 1)
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,

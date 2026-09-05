@@ -18,6 +18,7 @@ every pool test runs.
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -208,7 +209,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["device_count"] == DEVICES
         assert report["local_device_count"] == DEVICES // 2
         assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
-                                        "tensor": 1, "sequence": 1}
+                                        "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == DEVICES
         assert report["mesh_process_indices"] == [0, 1]
 
@@ -221,7 +222,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
         assert report["process_index"] == index
         assert report["local_device_count"] == DEVICES // 4
         assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
-                                        "tensor": 1, "sequence": 1}
+                                        "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
 
@@ -380,6 +381,34 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
                            worker.params_dict(state.params))
 
 
+@pytest.mark.distributed
+def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
+    """A two-stage pipeline over a pool of two processes, each holding half
+    of every stage's devices, against this process running the same twenty
+    steps on the eight devices itself, pipelined and whole. Largest observed
+    difference on CPU: 4.8e-07 for the losses and 2.9e-06 for the
+    parameters, against a tolerance of rtol 2e-4 and atol 2e-5.
+    """
+    steps = 20
+    pool = run_pool("pipeline", tmp_path / "pool", 2, fsdp_size=2, stage_size=2,
+                    microbatches=4, steps=steps)
+
+    piped, piped_state = worker.pipeline_losses(
+        worker.pipeline_trainer(2, 4, 2), worker.token_batch(), steps)
+    whole, whole_state = worker.pipeline_losses(
+        worker.pipeline_trainer(1, None, 4), worker.token_batch(), steps)
+
+    assert len(pool[0]["losses"]) == steps
+    assert np.isfinite(pool[0]["losses"]).all(), "the pool diverged"
+    assert pool[0]["losses"] == pool[1]["losses"], "the processes disagreed with each other"
+    assert pool[0]["mesh_shape"]["stage"] == 2
+    np.testing.assert_allclose(pool[0]["losses"], piped, rtol=PARITY["rtol"], atol=PARITY["atol"])
+    np.testing.assert_allclose(pool[0]["losses"], whole, rtol=PARITY["rtol"], atol=PARITY["atol"])
+    assert pool[0]["sharding"]["fully_addressable"] == [False]
+    assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
+                           worker.params_dict(whole_state.params))
+
+
 # --------------------------------------------------------------------------
 # Checkpoints between topologies
 # --------------------------------------------------------------------------
@@ -422,7 +451,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1}
+        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1, "stage": 1}
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
@@ -621,6 +650,144 @@ def test_two_preemptions_in_one_epoch_still_land_where_the_whole_run_did(tmp_pat
     assert third["step"] == STEPS
     assert third["dataset_state"] == whole_run["dataset_state"]
     assert_same_parameters(dumped_params(tmp_path / "third.json"), whole_run["params"])
+
+
+# --------------------------------------------------------------------------
+# Local checkpoints on a pool
+# --------------------------------------------------------------------------
+
+# A pool run with a local checkpoint every two steps beside the persistent
+# one every three. Local step eight is the last local write of a full run
+# (nine is the final persistent save) and the kill point of the preempted
+# run, so both cases look for it.
+LOCAL_EVERY = 2
+LAST_LOCAL_STEP = 8
+LOCAL_KILL_AFTER = LAST_LOCAL_STEP
+
+
+def local_flags(directory: Path, **flags) -> dict:
+    return {"name": "local", "run_dir": directory / "run", "fsdp_size": 2,
+            "steps": STEPS, "save_every": SAVE_EVERY, "records": RECORDS,
+            "local_dir": directory / "local", "local_every": LOCAL_EVERY, **flags}
+
+
+def local_committed(directory: Path, process: int, step: int) -> Path:
+    return committed(directory / "local" / f"process{process}", step)
+
+
+@pytest.fixture(scope="module")
+def killed_local_pool(tmp_path_factory):
+    """The killed pool run: two processes, both SIGKILLed once every process
+    has committed local step eight, with persistent steps three and six."""
+    directory = tmp_path_factory.mktemp("killed-local")
+    markers = [directory / f"blocked{index}" for index in range(2)]
+    coordinator = f"127.0.0.1:{free_port()}"
+    (directory / "killed").mkdir()
+    pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
+                  process_id=index, coordinator=coordinator,
+                  **local_flags(directory, block_after=LOCAL_KILL_AFTER, marker=marker))
+            for index, marker in enumerate(markers)]
+    deadline = time.monotonic() + 600
+    landed = [local_committed(directory, index, LOCAL_KILL_AFTER) for index in range(2)]
+    landed.append(committed(worker.checkpoint_dir(directory / "run", "local"), 2 * SAVE_EVERY))
+    while time.monotonic() < deadline:
+        if all(marker.exists() for marker in markers) and all(path.exists() for path in landed):
+            break
+        for process in pool:
+            if process.poll() is not None:
+                for other in pool:
+                    terminate(other)
+                pytest.fail(f"a process ended before the pool blocked\n"
+                            f"{process.communicate()[0]}")
+        time.sleep(0.05)
+    else:
+        for process in pool:
+            terminate(process)
+        pytest.fail(f"the pool did not block with local step {LOCAL_KILL_AFTER} landed")
+    for process in pool:
+        terminate(process)
+    assert all(process.returncode == -signal.SIGKILL for process in pool)
+    assert [int(marker.read_text()) for marker in markers] == [LOCAL_KILL_AFTER] * 2
+    return directory
+
+
+def persistent_bytes(checkpoints: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(checkpoints)): path.read_bytes()
+            for path in sorted(checkpoints.rglob("*")) if path.is_file()}
+
+
+@pytest.mark.distributed
+def test_every_process_writes_its_own_local_checkpoint_every_n_steps(tmp_path):
+    """A pool run to the end: every process holds exactly the newest local
+    step under a directory of its own, the persistent directory holds the
+    persistent cadence and nothing of the local one."""
+    directory = tmp_path
+    reports = run_pool("fit", directory / "out", 2, **local_flags(directory))
+    for index, report in enumerate(reports):
+        assert report["step"] == STEPS
+        assert report["local_path"] == str(directory / "local" / f"process{index}")
+        # Steps 2, 4, 6 and 8 were written; one is kept.
+        assert report["local_steps"] == [LAST_LOCAL_STEP]
+        assert local_committed(directory, index, LAST_LOCAL_STEP).exists()
+        assert report["written_steps"] == [SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
+    assert committed_steps(worker.checkpoint_dir(directory / "run", "local")) == [
+        SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
+
+
+@pytest.mark.distributed
+def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_local_pool):
+    """The resume reads local step eight on every process, not persistent
+    step six, opens on the ninth batch, leaves the persistent checkpoints
+    byte for byte as they were, and lands on the parameters of the run
+    nobody killed."""
+    directory = tmp_path / "killed"
+    shutil.copytree(killed_local_pool, directory)
+    persistent = worker.checkpoint_dir(directory / "run", "local")
+    assert committed_steps(persistent) == [SAVE_EVERY, 2 * SAVE_EVERY]
+    before = persistent_bytes(persistent)
+    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == LOCAL_KILL_AFTER
+        assert report["restored_from"] == str(directory / "local" / f"process{index}")
+        position = report["restored_dataset_state"]
+        assert shard_of(position) == index
+        # Eight batches of this process's shard, half the batch each, were
+        # consumed when local step eight was written; grain strides the
+        # sampler's index over the processes, so the last one seen is the
+        # 32nd of this process's stride.
+        assert json.loads(position)["last_seen_indices"] == {
+            "0": (LOCAL_KILL_AFTER * worker.BATCH // 2 - 1) * 2 + index}
+        assert report["step"] == STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+    # The resume added its final step and touched nothing that was there.
+    after = persistent_bytes(persistent)
+    assert committed_steps(persistent) == [SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
+    assert {name: after[name] for name in before} == before
+
+
+@pytest.mark.distributed
+def test_a_local_checkpoint_refuses_another_process_count(tmp_path, killed_local_pool):
+    """One process cannot take over a pool's local checkpoint: it holds the
+    shards of two processes' devices, and the refusal names both counts.
+    Without the local directory the persistent checkpoint's own count
+    refusal stands as before."""
+    directory = tmp_path / "killed"
+    shutil.copytree(killed_local_pool, directory)
+    refused = spawn("fit", tmp_path / "single.json", **local_flags(directory, fsdp_size=1))
+    log = refused.communicate(timeout=600)[0]
+    assert refused.returncode != 0, "one process resumed a two-process local checkpoint"
+    assert "written by 2 processes, and this run has 1 process" in log
+
+    persistent = spawn("fit", tmp_path / "persistent.json", fsdp_size=1, steps=STEPS,
+                       records=RECORDS, name="local", run_dir=directory / "run")
+    log = persistent.communicate(timeout=600)[0]
+    assert persistent.returncode != 0
+    assert "position for each of 2 processes and this run has 1 process" in log
 
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
