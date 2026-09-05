@@ -102,7 +102,7 @@ def run(config: Comparison) -> dict:
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     parameters = sum(x.size for x in jax.tree.leaves(state.params))
 
-    source = DevicePrefetchIterator(data.train(), trainer.batch_sharding)
+    source = DevicePrefetchIterator(data.train(), trainer.device_mesh)
     train_step = trainer.compile(state, next(source))
     scale = None
     losses = []
