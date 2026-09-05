@@ -110,8 +110,9 @@ save_pretrained_decoder(model, variables, "out/qwen3-tuned", tokenizer_name="Qwe
 | Gemma 3 | `gemma3_text` | `gemma-3-1b-pt`; the larger sizes are multimodal repos with a linear RoPE factor and are refused by name |
 | Gemma 4 | `gemma4_text` | the text decoder: per-layer inputs, KV sharing, partial rotary, logit softcap |
 | Qwen 3.5 | `qwen3_5_text` | the hybrid of gated delta net layers and gated full-attention layers; the released repos are multimodal wrappers and are refused by name |
+| DeepSeek V3, V3.2 | `deepseek_v3`, `deepseek_v32` | multi-head latent attention with YaRN, the V3.2 sparse indexer, the sigmoid router with grouping, scaling and the balancing bias, shared experts; `num_nextn_predict_layers` reads as 0 because the released repos ship no MTP weights |
 
-A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. DeepSeek V3 and V3.2 (multi-head latent attention) are in progress; see the README roadmap.
+A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`attn_logit_softcapping`, `use_bidirectional_attention`, a `mlp_bias`, an activation other than silu or tanh-gelu, any `rope_scaling` beyond plain rope). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`) is refused as a wrapper. The families still to come are in the README roadmap.
 
 Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 
