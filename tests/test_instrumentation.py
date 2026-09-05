@@ -320,7 +320,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     trainer = lm_trainer(vocab=vocab, width=width, layers=layers, heads=heads, ratio=ratio,
                          seq=seq)
     state, _, _ = trainer.place()
-    executable = trainer.compile(
+    trainer.compile(
         state, shard_batch(trainer.device_mesh, next(token_batches(batch, seq, vocab))))
 
     per_layer = 4 * width * width + 3 * width * hidden
@@ -332,7 +332,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     # measured count lands on the closed form exactly (956,301,312 vs
     # 956,301,312, largest observed difference 0 FLOPs in 956 million). The
     # step is partitioned over the eight devices, so the count is per device.
-    assert compiled_flops(executable) * jax.device_count() == pytest.approx(analytic, rel=0.05)
+    assert trainer.flops_per_step * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
 def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
