@@ -72,6 +72,15 @@ class Dataset:
     def steps_per_epoch(self) -> int | None:
         return None if self.records is None else self.records // self.batch
 
+    def epoch_steps(self, epochs: int = 1) -> int:
+        """Steps in `epochs` passes over the records. A stream without a
+        record count has no epoch, so a run over it gives its length in steps."""
+        if self.steps_per_epoch is None:
+            raise ValueError(
+                "epochs need a dataset with a record count; this one streams "
+                "without one, so give the run length in steps")
+        return epochs * self.steps_per_epoch
+
 
 class DatasetSpec(ABC):
     """What a dataset is and how it is read; a frozen dataclass per kind.

@@ -33,8 +33,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import (
-    RMSNorm, apply_rotary, causal_attention_mask, open_kv_cache, rotary_freqs,
-    scaled_dot_product_attention,
+    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask, open_kv_cache,
+    rotary_freqs, scaled_dot_product_attention,
 )
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
@@ -62,19 +62,23 @@ class LayerKind:
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
+    rope_scaling: Optional[RopeScaling] = None
+    """This kind's llama3 ramp or its record; None rides the model's."""
     head_dim: Optional[int] = None
     mixer: Optional[MixerBase] = None
     """This kind's mixer value or its record; None is the model's mixer."""
 
     def __post_init__(self):
-        # A kind's mixer arrives as a value from code and as a record from a
-        # config, like the model's own; anything else is neither.
+        # A kind's mixer and ramp arrive as values from code and as records
+        # from a config, like the model's own; anything else is neither.
         if isinstance(self.mixer, Mapping):
             object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"a kind's mixer is a mixer value, its record, or None, "
                 f"not {self.mixer!r}")
+        if isinstance(self.rope_scaling, Mapping):
+            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,6 +94,7 @@ class ResolvedKind:
 
     window: Optional[int]
     rope_theta: float
+    rope_scaling: Optional[RopeScaling]
     head_dim: int
     mixer: Optional[MixerBase]
 
@@ -105,9 +110,10 @@ class Mixture:
     sparse, which is Mixtral.
 
     The routing options are `Router`'s: `score_function` softmax, sigmoid or
-    sqrtsoftplus, `scaling` on the routed output, `groups` with
-    `groups_per_token` for DeepSeek's node limit, and `bias` for its
-    aux-loss-free balancing bias.
+    sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
+    token's selected weights by their sum, `scaling` on the routed output,
+    `groups` with `groups_per_token` for DeepSeek's node limit, and `bias`
+    for its aux-loss-free balancing bias.
 
     `expert_features` is the routed experts' width, None for the model's
     `mlp_features`; DeepSeek sizes its experts apart from its dense layers
@@ -123,6 +129,7 @@ class Mixture:
     layers: Optional[Tuple[int, ...]] = None
     every: Optional[int] = None
     score_function: str = 'softmax'
+    norm_topk_prob: bool = True
     scaling: float = 1.0
     groups: int = 1
     groups_per_token: int = 1
@@ -185,7 +192,9 @@ class CausalSelfAttention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
+    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp over the base frequencies
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
     v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
@@ -193,8 +202,10 @@ class CausalSelfAttention(nn.Module):
     kv_shared: bool = False
     kv_store_key: Optional[str] = None
     sliding_window: Optional[int] = None
-    attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
+    attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
+    o_proj_bias: Optional[bool] = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
@@ -217,8 +228,12 @@ class CausalSelfAttention(nn.Module):
         if not self.kv_shared:
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj')
+        self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
+            self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
         if self.qk_norm:
+            if self.qk_norm_scope not in ('head', 'projection'):
+                raise ValueError(
+                    f"qk_norm_scope is 'head' or 'projection', got {self.qk_norm_scope!r}")
             norm = functools.partial(
                 RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype)
@@ -257,6 +272,13 @@ class CausalSelfAttention(nn.Module):
                  positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
         projected = self.q_proj(x)
+        # OLMo 3 norms the whole projection, one scale of heads * head_dim,
+        # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
+        # and the Gemmas norm each head after it, which the reference marks
+        # "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147).
+        whole = self.qk_norm and self.qk_norm_scope == 'projection'
+        if whole:
+            projected = self.q_norm(projected)
         gate = None
         if self.output_gate:
             # The reference views the doubled output as [.., heads, 2*head_dim]
@@ -277,13 +299,16 @@ class CausalSelfAttention(nn.Module):
                     "its layer stack")
             key, value, positions = kv_store[self.kv_store_key]
         else:
-            key = self.k_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
+            key = self.k_proj(x)
+            if whole:
+                key = self.k_norm(key)
+            key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
             value = self.v_proj(x).reshape(B, S, self.num_kv_heads, self.head_dim)
-            if self.qk_norm:
+            if self.qk_norm and not whole:
                 key = self.k_norm(key)
             if self.v_norm:
                 value = self.values_norm(value)
-        if self.qk_norm:
+        if self.qk_norm and not whole:
             query = self.q_norm(query)
 
         # The cache slot carries position while decoding, so the rotation and
@@ -303,7 +328,7 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(
             positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.partial_rotary_type)
+            partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -362,12 +387,20 @@ class CausalSelfAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask)
+            sliding_window=window, mask=mask, softcap=self.attn_logit_softcap)
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
+
+
+def _gated_activation(activation: str, gate):
+    """The gate's nonlinearity by the mlp's name: silu, tanh-approximate gelu
+    or the erf gelu (torch's default, ACT2FN['gelu'])."""
+    if activation == 'swiglu':
+        return nn.silu(gate)
+    return nn.gelu(gate, approximate=activation == 'geglu')
 
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
@@ -375,7 +408,9 @@ class CausalSelfAttention(nn.Module):
     ("down_proj",): ("mlp", "embed"),
 })
 class GatedMLP(nn.Module):
-    """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is gelu.
+    """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
+    the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
+    the erf form (HF's gelu, which Gemma's released config names).
 
     Bias-free, like the gated MLP of every open decoder this loads.
     """
@@ -386,9 +421,9 @@ class GatedMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.activation not in ('swiglu', 'geglu'):
+        if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
-                f"mlp must be 'swiglu' or 'geglu', got {self.activation!r}")
+                f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.gate_proj = dense(self.hidden_features, name='gate_proj')
@@ -397,7 +432,7 @@ class GatedMLP(nn.Module):
 
     def __call__(self, x):
         gate = self.gate_proj(x)
-        gate = nn.silu(gate) if self.activation == 'swiglu' else nn.gelu(gate)
+        gate = _gated_activation(self.activation, gate)
         return self.down_proj(gate * self.up_proj(x))
 
 
@@ -417,7 +452,10 @@ class DecoderBlock(nn.Module):
     sandwich_norms adds Gemma's second pair of norms, on the output of each
     sublayer rather than on its input; the pre-norms keep their names and their
     places, so a checkpoint without them loads into the same tree minus two
-    leaves per layer.
+    leaves per layer. pre_norms=False drops the input pair, which with the
+    output pair on is OLMo 3's post-norm block (modeling_olmo3.py:249-266):
+    each sublayer reads the residual stream as it is and its output is
+    normed before it is added.
 
     kv_store threads one dict down the layer stack so a KV-sharing mixer
     reads its provider's keys and values; a mixer without a kv_store keyword
@@ -431,6 +469,7 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     sandwich_norms: bool = False
+    pre_norms: bool = True
     per_layer_input_dim: int = 0
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
@@ -440,9 +479,11 @@ class DecoderBlock(nn.Module):
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        self.input_layernorm = norm(name='input_layernorm')
+        if self.pre_norms:
+            self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        self.post_attention_layernorm = norm(name='post_attention_layernorm')
+        if self.pre_norms:
+            self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.sandwich_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
@@ -460,13 +501,13 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  per_layer_input=None):
-        mixed = self.self_attn(self.input_layernorm(x), decode=decode,
-                               positions=positions, segment_ids=segment_ids,
+        mixed = self.self_attn(self.input_layernorm(x) if self.pre_norms else x,
+                               decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}))
         if self.sandwich_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
-        hidden = self.mlp(self.post_attention_layernorm(x))
+        hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
         if self.sandwich_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
@@ -476,7 +517,7 @@ class DecoderBlock(nn.Module):
             # like its feed-forward, multiplied by the layer's input signal,
             # projected back and normed.
             gated = self.per_layer_input_gate(x)
-            gated = nn.silu(gated) if self._gate_activation == 'swiglu' else nn.gelu(gated)
+            gated = _gated_activation(self._gate_activation, gated)
             projected = self.per_layer_projection(gated * per_layer_input)
             x = x + self.post_per_layer_input_norm(projected)
         return x
@@ -507,6 +548,7 @@ class MTPBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     sandwich_norms: bool = False
+    pre_norms: bool = True
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -527,6 +569,7 @@ class MTPBlock(nn.Module):
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
             sandwich_norms=self.sandwich_norms,
+            pre_norms=self.pre_norms,
             dropout_rate=self.dropout_rate,
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
@@ -620,10 +663,11 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: Optional[int] = None       # None: as many as the query heads
     head_dim: Optional[int] = None           # None: emb_features // num_heads
-    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu'
+    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
     mlp_features: Optional[int] = None       # None: four times emb_features
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
+    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: Optional[float] = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
@@ -632,10 +676,14 @@ class CausalTransformer(nn.Module):
     scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
+    pre_norms: bool = True                   # False with sandwich_norms: OLMo 3's post-norm block
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
-    attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
+    attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
+    o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    attn_logit_softcap: Optional[float] = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
@@ -663,6 +711,8 @@ class CausalTransformer(nn.Module):
         # a notebook writes.
         if isinstance(self.mixture, Mapping):
             object.__setattr__(self, "mixture", Mixture(**self.mixture))
+        if isinstance(self.rope_scaling, Mapping):
+            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -707,6 +757,7 @@ class CausalTransformer(nn.Module):
         return ResolvedKind(
             window=kind.window,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
+            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             mixer=kind.mixer)
 
@@ -772,7 +823,9 @@ class CausalTransformer(nn.Module):
             max_seq_len=self.max_seq_len,
             causal=self.causal,
             rope_theta=kind.rope_theta,
+            rope_scaling=kind.rope_scaling,
             qk_norm=self.qk_norm,
+            qk_norm_scope=self.qk_norm_scope,
             v_norm=self.v_norm,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -781,7 +834,9 @@ class CausalTransformer(nn.Module):
             kv_store_key=layer_type,
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
+            o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
+            attn_logit_softcap=self.attn_logit_softcap,
             output_gate=self.output_gate,
             dtype=self.dtype,
             precision=self.precision,
@@ -884,6 +939,7 @@ class CausalTransformer(nn.Module):
             out_features=self.emb_features,
             activation=self.mlp,
             score_function=mixture.score_function,
+            normalize_weights=mixture.norm_topk_prob,
             routed_scaling_factor=mixture.scaling,
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
@@ -915,6 +971,7 @@ class CausalTransformer(nn.Module):
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
+                pre_norms=self.pre_norms,
                 per_layer_input_dim=ple or 0,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype,
@@ -941,6 +998,7 @@ class CausalTransformer(nn.Module):
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
                 sandwich_norms=self.sandwich_norms,
+                pre_norms=self.pre_norms,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]

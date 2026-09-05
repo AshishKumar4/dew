@@ -8,12 +8,13 @@ load_pretrained_decoder returns a (model, variables, config) triple that a
 forward pass takes straight away, config being the dew config the model was
 built from.
 
-The families covered are the ones CausalTransformer can express: llama, qwen3,
-gemma3_text, gemma4_text, qwen3_5_text (the hybrid of gated delta net
-layers and gated full-attention layers, whose linear_attn layers land on the
-gated_delta_net mixer kind), deepseek_v3 and deepseek_v32. qwen2 is refused
-rather than half-loaded, since its q/k/v biases without an o_proj bias have
-no counterpart in the backbone's one attention_bias flag, and a multimodal
+Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
+model_type: the config translation, the tensor path rule and the export
+vocabulary. Entries cover llama (Llama 2, 3 and 3.1's rope_scaling),
+mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
+gemma4_text, olmo3, qwen3_5_text (the hybrid of gated delta net layers and
+gated full-attention layers, whose linear_attn layers land on the
+gated_delta_net mixer kind), deepseek_v3 and deepseek_v32. A multimodal
 wrapper config is refused rather than loading its text half. DeepSeek loads
 through the MLA mixer with DeepSeek's MoE sizing, and its released
 checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
@@ -23,17 +24,21 @@ ValueError naming it, rather than loading a model that silently computes
 something else.
 """
 
+import dataclasses
 import json
 import os
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, NoReturn, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 import ml_dtypes
 import numpy as np
 
 from dew.interop.quantized import dequantize_checkpoint, fp8_block
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mixers import AttentionMixer
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
+from dew.nn.mla import MLAMixer
 from dew.registry import models, with_precision
 
 CONFIG_FILE = "config.json"
@@ -44,14 +49,15 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 DEFAULT_MAX_SEQ_LEN = 8192
 
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
-# are the two the covered families use; anything else is refused by name.
-_ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu'}
+# are the three the covered families use; anything else is refused by name.
+# 'gelu' is torch's erf gelu (ACT2FN['gelu']), which Gemma's released config
+# names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
+_ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
+_HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 
-_QK_NORM_FAMILIES = ('qwen3', 'gemma3_text', 'gemma4_text', 'qwen3_5_text')
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
 _DEEPSEEK = ('deepseek_v3', 'deepseek_v32')
-_FAMILIES = ('llama', 'qwen3', 'gemma3_text', 'gemma4_text', _QWEN35) + _DEEPSEEK
 # A multimodal repo's config.json is a wrapper whose model_type names the
 # whole model and whose text_config holds the decoder. Its own weights live
 # under model.language_model.*, next to vision and audio towers this has no
@@ -82,126 +88,157 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
-def _rope_theta(entry: Optional[Mapping[str, Any]], field: str) -> Optional[float]:
-    """One rope base frequency out of a rope_parameters entry, if it names one.
+_LLAMA3_FIELDS: Tuple[str, ...] = ('factor', 'low_freq_factor', 'high_freq_factor',
+                                   'original_max_position_embeddings')
 
-    Only plain rope ('default' or 'none') maps; a scaled variant changes what
-    the model computes, so the caller refuses it with the field named. 'type'
-    is the older spelling of rope_type and transformers still reads it
-    (modeling_rope_utils.py:785, 839). Plain rope takes no field beyond those
-    two and rope_theta, which is what its validator accepts
+
+@dataclass(frozen=True)
+class _Rope:
+    """One rope entry as read: its base and, for a llama3 entry, the ramp
+    record under the reference's names. `theta` is None where the entry
+    names no base of its own."""
+
+    theta: Optional[float] = None
+    scaling: Optional[Dict[str, Any]] = None
+
+
+def _rope_entry(entry: Optional[Mapping[str, Any]], field: str) -> _Rope:
+    """One rope_parameters entry, if it names a base or a ramp.
+
+    Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
+    variant changes what the model computes, so it refuses with the field
+    named. 'type' is the older spelling of rope_type and transformers still
+    reads it (modeling_rope_utils.py:785, 839). Plain rope takes no field
+    beyond those two and rope_theta, which is what its validator accepts
     (modeling_rope_utils.py:850-857), so a 'factor' or an
-    'original_max_position_embeddings' names a scaling whatever the type says.
+    'original_max_position_embeddings' names a scaling whatever the type
+    says; llama3 takes exactly its four (modeling_rope_utils.py:987-995).
     """
     if entry is None:
-        return None
+        return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    theta = entry.get('rope_theta')
+    theta = None if theta is None else float(theta)
+    if rope_type == 'llama3':
+        missing = sorted(set(_LLAMA3_FIELDS) - set(entry))
+        extra = sorted(set(entry) - set(_LLAMA3_FIELDS) - {'rope_type', 'type', 'rope_theta'})
+        if missing or extra:
+            _refuse(f"{field} (rope_type 'llama3') fields",
+                    f"the llama3 ramp reads exactly {list(_LLAMA3_FIELDS)}; "
+                    f"missing {missing}, unexpected {extra}")
+        return _Rope(theta, {
+            'rope_type': 'llama3',
+            'factor': float(entry['factor']),
+            'low_freq_factor': float(entry['low_freq_factor']),
+            'high_freq_factor': float(entry['high_freq_factor']),
+            'original_max_position_embeddings': int(entry['original_max_position_embeddings']),
+        })
     if rope_type not in ('default', 'none'):
         _refuse(f"{field} (rope_type {rope_type!r})",
-                "the backbone applies plain rotary positions at rope_theta")
+                "the backbone applies plain rotary positions at rope_theta, "
+                "or Llama 3.1's llama3 ramp over them")
     scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta'})
     if scaling:
         _refuse(f"{field} scaling fields {scaling}",
                 "the backbone applies plain rotary positions at rope_theta")
-    theta = entry.get('rope_theta')
-    return None if theta is None else float(theta)
+    return _Rope(theta)
 
 
-def _rope(hf_config: Mapping[str, Any], used: set) -> Tuple[float, Optional[float]]:
-    """(rope_theta, rope_local_theta) from any of the three HF spellings.
+def _rope_theta(entry: Optional[Mapping[str, Any]], field: str) -> Optional[float]:
+    """One plain rope base frequency; a llama3 entry refuses where only plain
+    rope has a place (the DeepSeek and Gemma 4 readers)."""
+    rope = _rope_entry(entry, field)
+    if rope.scaling is not None:
+        _refuse(f"{field} (rope_type 'llama3')",
+                "this family's rotary positions take no llama3 ramp")
+    return rope.theta
 
-    Old configs carry flat rope_theta, gemma3 text configs add
-    rope_local_base_freq, new configs nest per-layer-type rope_parameters.
-    rope_scaling, when present, is the old name for the same thing.
+
+@dataclass(frozen=True)
+class _Ropes:
+    """What the shared rope readers hand a family: the model's base and
+    ramp, and the sliding kind's own where a config states one.
+    `full_only` marks a nested config whose sliding entry names no ramp
+    while the full one does, so the ramp is the full kind's alone."""
+
+    theta: float
+    scaling: Optional[Dict[str, Any]] = None
+    local_theta: Optional[float] = None
+    local_scaling: Optional[Dict[str, Any]] = None
+    full_only: bool = False
+
+
+def _rope(hf_config: Mapping[str, Any], used: set) -> _Ropes:
+    """The rope of any of the three HF spellings.
+
+    Old configs carry flat rope_theta with rope_scaling beside it, gemma3
+    text configs add rope_local_base_freq, new configs nest per-layer-type
+    rope_parameters. A nested config's full_attention entry is the model's
+    rope and its sliding_attention entry the sliding kind's, base and ramp
+    alike (OLMo 3 puts its rope_scaling on full_attention alone,
+    configuration_olmo3.py:110-113).
     """
     used.update(('rope_theta', 'rope_local_base_freq', 'rope_parameters', 'rope_scaling'))
     rope_parameters = hf_config.get('rope_parameters')
 
     if isinstance(rope_parameters, Mapping) and 'rope_theta' not in rope_parameters:
-        theta = (_rope_theta(rope_parameters.get('full_attention'),
-                             'rope_parameters.full_attention') or 10000.0)
-        local = (_rope_theta(rope_parameters.get('sliding_attention'),
-                             'rope_parameters.sliding_attention') or theta)
-        return theta, (None if local == theta else local)
+        full = _rope_entry(rope_parameters.get('full_attention'), 'rope_parameters.full_attention')
+        sliding = _rope_entry(rope_parameters.get('sliding_attention'),
+                              'rope_parameters.sliding_attention')
+        theta = full.theta or 10000.0
+        local = sliding.theta or theta
+        return _Ropes(theta, full.scaling, None if local == theta else local,
+                      None if sliding.scaling == full.scaling else sliding.scaling,
+                      full_only=full.scaling is not None and sliding.scaling is None)
 
-    # Flat spellings: either field may carry the base frequency, and either
-    # may carry a scaling type, which _rope_theta refuses when it is not plain.
-    theta = None
+    # Flat spellings: either field may carry the base frequency and the
+    # ramp; transformers prefers rope_scaling when both are present
+    # (convert_rope_params_to_dict), so it is read last.
+    theta, scaling = None, None
     for field in ('rope_parameters', 'rope_scaling'):
         entry = hf_config.get(field)
         if isinstance(entry, Mapping):
-            theta = _rope_theta(entry, field) or theta
+            rope = _rope_entry(entry, field)
+            theta = rope.theta or theta
+            scaling = rope.scaling or scaling
     if theta is None:
         theta = float(hf_config.get('rope_theta', 10000.0))
     local = hf_config.get('rope_local_base_freq')
-    return theta, (None if local is None else float(local))
+    return _Ropes(theta, scaling, None if local is None else float(local))
 
 
-def _layer_types(hf_config: Mapping[str, Any], used: set) -> Tuple[str, ...]:
-    """Per-layer kinds, derived the way the family's config does.
-
-    A config that carries layer_types is taken at its word, except that
-    gemma4_text forces its last layer full whatever the config says, which is
-    what its own config class does (configuration_gemma4.py:197-201). Without
-    layer_types, qwen3 makes every layer from max_window_layers on sliding,
-    and only when use_sliding_window says so; gemma3_text repeats its
-    sliding_window_pattern and gemma4_text a fixed period of six, five
-    sliding layers to one full; qwen3_5_text makes every
-    full_attention_interval-th layer full attention and the rest linear
-    (configuration_qwen3_5.py:112-117), and reads the interval only then;
-    llama has no sliding layers at all.
-    """
-    layers = int(hf_config['num_hidden_layers'])
-    model_type = hf_config.get('model_type')
-    layer_types = hf_config.get('layer_types')
-    if layer_types is not None:
+def _specified_layer_types(hf_config: Mapping[str, Any], used: set[str],
+                           default: Optional[Tuple[str, ...]] = None) -> Tuple[str, ...]:
+    layers = hf_config.get('layer_types')
+    if layers is not None:
         used.add('layer_types')
-        return _last_layer_full(tuple(layer_types), model_type)
+        return tuple(layers)
+    return default if default is not None else ('full_attention',) * int(hf_config['num_hidden_layers'])
 
-    if model_type == 'qwen3':
-        used.update(('use_sliding_window', 'sliding_window'))
-        if (not hf_config.get('use_sliding_window', False)
-                or hf_config.get('sliding_window') is None):
-            return ('full_attention',) * layers
-        first_sliding = int(hf_config.get('max_window_layers', layers))
-        return tuple('sliding_attention' if index >= first_sliding else 'full_attention'
-                     for index in range(layers))
 
-    if model_type in (_GEMMA, 'gemma4_text'):
-        # Gemma 3 reads its period from the config; Gemma 4 fixes it at six
-        # (configuration_gemma4.py:190-195), so a gemma4 config that omits
-        # the pattern is a 5:1 stack and not the all-full model this read as
-        # one before.
-        if model_type == _GEMMA:
-            pattern = int(hf_config.get('sliding_window_pattern', 6))
+def _qwen_layer_types(hf_config: Mapping[str, Any], used: set[str]) -> Tuple[str, ...]:
+    layers = int(hf_config['num_hidden_layers'])
+    if hf_config.get('layer_types') is not None:
+        return _specified_layer_types(hf_config, used)
+    used.update(('use_sliding_window', 'sliding_window'))
+    enabled = hf_config.get('use_sliding_window', False) and hf_config.get('sliding_window') is not None
+    first = int(hf_config.get('max_window_layers', layers))
+    return tuple('sliding_attention' if enabled and index >= first else 'full_attention'
+                 for index in range(layers))
+
+
+def _gemma_layer_types(hf_config: Mapping[str, Any], used: set[str], *,
+                       last_full: bool = False) -> Tuple[str, ...]:
+    if hf_config.get('layer_types') is not None:
+        types = _specified_layer_types(hf_config, used)
+    else:
+        pattern = 6 if last_full else int(hf_config.get('sliding_window_pattern', 6))
+        if not last_full:
             used.add('sliding_window_pattern')
-        else:
-            pattern = 6
-        return _last_layer_full(
-            tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
-                  for index in range(layers)), model_type)
-
-    if model_type == _QWEN35:
-        used.add('full_attention_interval')
-        interval = int(hf_config.get('full_attention_interval', 4))
-        return tuple('full_attention' if (index + 1) % interval == 0 else 'linear_attention'
-                     for index in range(layers))
-
-    return ('full_attention',) * layers
-
-
-def _last_layer_full(layer_types: Tuple[str, ...], model_type: Optional[str]
-                     ) -> Tuple[str, ...]:
-    """Gemma 4's rule that the last layer attends the whole sequence.
-
-    Gemma4TextConfig rewrites a trailing sliding layer to full and warns
-    (configuration_gemma4.py:197-201), so the weights of a checkpoint whose
-    config ends in a sliding layer were trained with a full one, and reading
-    that config at its word would build a different model.
-    """
-    if model_type != 'gemma4_text' or not layer_types:
-        return layer_types
-    return layer_types[:-1] + ('full_attention',)
+        types = tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
+                      for index in range(int(hf_config['num_hidden_layers'])))
+    # Gemma4TextConfig rewrites the final layer before building the model.
+    return types[:-1] + ('full_attention',) if last_full and types else types
 
 
 def _kinds(layer_types: Tuple[str, ...], window: Optional[int],
@@ -470,50 +507,17 @@ def _qwen35_rope(hf_config: Mapping[str, Any]) -> Tuple[float, float]:
 
 
 
-def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
-    """A decoder config dict into CausalTransformer kwargs.
+def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
+                 layer_types: Optional[Tuple[str, ...]] = None,
+                 rope: Optional[_Ropes] = None,
+                 qk_norm: bool = False, scale_after_cast: bool = True,
+                 tie_embeddings: bool = False) -> Dict[str, Any]:
+    """The shared projection geometry and decoder fields.
 
-    Accepts the text decoder families CausalTransformer can express: llama,
-    qwen3, gemma3_text, gemma4_text, qwen3_5_text, deepseek_v3 and
-    deepseek_v32. Every field that changes what a forward pass computes and
-    has no dew counterpart raises, naming the field."""
-
-    model_type = hf_config.get('model_type')
-    if model_type == 'qwen2':
-        # Qwen2 biases q/k/v and leaves o_proj bias-free (modeling_qwen2.py
-        # 189-192), and CausalSelfAttention has one attention_bias flag for
-        # all four projections, so its checkpoints cannot load unchanged.
-        _refuse("model_type 'qwen2'",
-                "its q/k/v projections carry biases and o_proj does not, which "
-                "the one attention_bias flag cannot say")
-    if model_type in _WRAPPERS or (model_type not in _FAMILIES
-                                   and 'text_config' in hf_config):
-        # google/gemma-4-E2B is one of these: the decoder is real and its
-        # text_config translates, but the repo is a multimodal model whose
-        # weights sit under model.language_model.* beside vision and audio
-        # towers, and loading the text half would build something that is not
-        # the checkpoint. The refusal names the text config so a caller who
-        # wants the decoder alone asks for it deliberately.
-        _refuse(f"model_type {model_type!r}",
-                "it is a multimodal wrapper whose vision and audio towers have "
-                "no counterpart here; its decoder is the text_config, which "
-                "translates on its own, and its weights are the "
-                "model.language_model.* half of the checkpoint")
-    if model_type not in _FAMILIES:
-        _refuse(f"model_type {model_type!r}",
-                f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
-
-    if hf_config.get('use_bidirectional_attention', False):
-        _refuse("use_bidirectional_attention=True", "the backbone is causal")
-    if hf_config.get('attn_logit_softcapping') is not None:
-        _refuse("attn_logit_softcapping",
-                "the attention kernels apply no softcap to the logits")
-    if hf_config.get('mlp_bias'):
-        _refuse("mlp_bias=True", "the gated MLP is bias-free")
-
-    used = {'model_type', 'use_bidirectional_attention', 'attn_logit_softcapping',
-            'mlp_bias', 'num_hidden_layers'}
-
+    A ramp both kinds share is the model's; a ramp the full layers alone
+    carry (OLMo 3's spelling) lands on the full kind, because a kind's None
+    rides the model's value and cannot turn a ramp off.
+    """
     hidden = int(hf_config['hidden_size'])
     heads = int(hf_config['num_attention_heads'])
     kv_heads = hf_config.get('num_key_value_heads')
@@ -525,20 +529,11 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     mapped = _ACTIVATIONS.get(activation)
     if mapped is None:
         _refuse(f"hidden_act {activation!r}",
-                "the gated MLP supports 'swiglu' and 'geglu'")
+                f"the gated MLP supports {sorted(_ACTIVATIONS)}")
 
-    if model_type in ('gemma4_text', _QWEN35):
-        # Partial rotary comes in two conventions, each with its own reader
-        # below; neither has a per-kind local base.
-        rope_theta, rope_local_theta = 10000.0, None
-        yarn = None
-    elif model_type in _DEEPSEEK:
-        rope_theta, yarn = _deepseek_rope(hf_config, used)
-        rope_local_theta = None
-    else:
-        rope_theta, rope_local_theta = _rope(hf_config, used)
-        yarn = None
-    layer_types = _layer_types(hf_config, used)
+    ropes = _rope(hf_config, used) if rope is None else rope
+    rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
+    layer_types = _specified_layer_types(hf_config, used, layer_types)
     sliding_window = hf_config.get('sliding_window')
     used.add('sliding_window')
     if 'sliding_attention' in layer_types and sliding_window is None:
@@ -568,227 +563,443 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
         # norms scale in fp32 and cast the product (modeling_gemma3.py:147-150,
         # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
-        'scale_after_cast': model_type in ('llama', 'qwen3') + _DEEPSEEK,
-        'qk_norm': model_type in _QK_NORM_FAMILIES,
+        'scale_after_cast': scale_after_cast,
+        'qk_norm': qk_norm,
         'attention_bias': bool(hf_config.get('attention_bias', False)),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) has to take its family's default rather than a single one
         # here.
         'tie_embeddings': bool(hf_config.get(
-            'tie_word_embeddings', model_type in (_GEMMA, 'gemma4_text'))),
+            'tie_word_embeddings', tie_embeddings)),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
 
-    if model_type == _GEMMA:
-        config.update(scale_offset=True, embedding_scale=True, sandwich_norms=True)
-        used.update(('query_pre_attn_scalar', 'final_logit_softcapping'))
-        scalar = hf_config.get('query_pre_attn_scalar')
-        if scalar is not None:
-            config['attention_scale'] = float(scalar) ** -0.5
-        softcap = hf_config.get('final_logit_softcapping')
-        if softcap is not None:
-            config['final_logit_softcap'] = float(softcap)
-    if model_type == 'gemma4_text':
-        if hf_config.get('attention_k_eq_v'):
-            _refuse("attention_k_eq_v=True",
-                    "the backbone always projects its own values")
-        if hf_config.get('enable_moe_block'):
-            _refuse("enable_moe_block=True",
-                    "the parallel MoE branch has no counterpart here")
-        used.update(('attention_k_eq_v', 'enable_moe_block'))
-        # The full layers may override the head dim; the sliding ones use
-        # hidden // heads, so that is the model's and the override lands on
-        # the full kind.
-        sliding_dim = hidden // heads
-        if hidden % heads:
-            _refuse(f"hidden_size {hidden}",
-                    f"it does not divide into {heads} heads")
-        full_dim = sliding_dim
-        entries = hf_config.get('per_layer_config') or {}
-        model_kv = heads if kv_heads is None else int(kv_heads)
-        for entry in (entries.values() if isinstance(entries, Mapping) else entries):
-            if not isinstance(entry, Mapping):
-                continue
-            if entry.get('head_dim') is not None:
-                full_dim = int(entry['head_dim'])
-            # The reference gives a layer kind its own key/value head count as
-            # well as its own head dim (modeling_gemma4.py,
-            # Gemma4TextAttention reads layer_config.num_key_value_heads).
-            # The backbone has one count for the model, so a config that
-            # varies it is refused rather than built at the wrong K/V width.
-            if (entry.get('num_key_value_heads') is not None
-                    and int(entry['num_key_value_heads']) != model_kv):
-                _refuse(f"per_layer_config num_key_value_heads "
-                        f"{int(entry['num_key_value_heads'])}",
-                        f"the backbone has one key/value head count for the "
-                        f"model, which this config sets to {model_kv}")
-        global_kv = hf_config.get('num_global_key_value_heads')
-        if global_kv is not None and int(global_kv) != model_kv:
-            _refuse(f"num_global_key_value_heads {int(global_kv)}",
-                    f"the backbone has one key/value head count for the model, "
-                    f"which this config sets to {model_kv}")
-        if hf_config.get('global_head_dim') is not None:
-            full_dim = int(hf_config['global_head_dim'])
-        used.update(('per_layer_config', 'global_head_dim',
-                     'num_global_key_value_heads'))
-        # Proportional rope rotates a fraction of the full layers' head dims
-        # and passes the rest through; sliding layers rotate all of theirs.
-        entries = hf_config.get('rope_parameters') or {}
-        rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
-        used.update(('rope_parameters', 'rope_theta'))
-        per_layer = int(hf_config.get('hidden_size_per_layer_input', 0))
-        config.update(
-            sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
-            v_norm=True,
-            head_dim=sliding_dim,
-            rope_theta=rope_theta,
-            kinds=_kinds(layer_types, config['kinds'].get(
-                'sliding_attention', {}).get('window'), rope_local_theta, None,
-                None if full_dim == sliding_dim else full_dim),
-            partial_rotary_factor=partial,
-            use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
-            num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
-            per_layer_input_dim=per_layer or None,
-            per_layer_input_vocab=int(hf_config.get(
-                'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
-        )
-        used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
-                     'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
-                     'final_logit_softcapping'))
-        # attention_logit_cap is read by no text path: Gemma4TextAttention
-        # never passes it to its attention call (modeling_gemma4.py,
-        # Gemma4TextAttention.forward), so it changes nothing and maps to
-        # nothing. Only the audio attention applies one.
-        used.add('attention_logit_cap')
-        softcap = hf_config.get('final_logit_softcapping')
-        if softcap is not None:
-            config['final_logit_softcap'] = float(softcap)
-        # MoE sizing keys with the branch off: refused above when it is on.
-        used.update(('moe_intermediate_size', 'expert_intermediate_size',
-                     'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
+    if ropes.scaling is not None:
+        if ropes.full_only and 'sliding_attention' in layer_types:
+            config['kinds'].setdefault('full_attention', {})['rope_scaling'] = ropes.scaling
+        else:
+            config['rope_scaling'] = ropes.scaling
+    if ropes.local_scaling is not None:
+        config['kinds']['sliding_attention']['rope_scaling'] = ropes.local_scaling
+    return config
 
-    if model_type in _DEEPSEEK:
-        layers = int(hf_config['num_hidden_layers'])
-        sparse_name = ('deepseek_sparse_attention'
-                       if model_type == 'deepseek_v32' else 'full_attention')
-        if hf_config.get('layer_types') is None:
-            # Neither released config names its pattern: V3 is dense MLA
-            # throughout and V3.2 sparse attention throughout.
-            layer_types = (sparse_name,) * layers
-            config['layer_types'] = layer_types
-        for entry in layer_types:
-            if entry != sparse_name:
-                _refuse(f"layer_types entry {entry!r}",
-                        f"a {model_type} model mixes no attention kinds: "
-                        f"every layer is {sparse_name}")
-        nope = int(hf_config['qk_nope_head_dim'])
-        rope = int(hf_config['qk_rope_head_dim'])
-        head_dim = hf_config.get('head_dim')
-        if head_dim is not None and int(head_dim) != rope:
-            _refuse(f"head_dim {head_dim!r}",
-                    "DeepSeek points head_dim at the rope slice, "
-                    f"which is {rope} wide here")
-        derived = hf_config.get('qk_head_dim')
-        if derived is not None and int(derived) != nope + rope:
-            _refuse(f"qk_head_dim {derived!r}",
-                    f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
-                    f"which is {nope + rope} here")
-        v_dim = hf_config.get('v_head_dim')
-        if v_dim is None:
-            _refuse("v_head_dim",
-                    "the values need their width, and no default keeps a "
-                    "checkpoint's layout")
-        kv_rank = hf_config.get('kv_lora_rank')
-        if kv_rank is None:
-            _refuse("kv_lora_rank",
-                    "the latent needs its width, and no default keeps a "
-                    "checkpoint's layout")
-        interleave = hf_config.get('rope_interleave', True)
-        if model_type == 'deepseek_v32' and interleave is not True:
-            _refuse(f"rope_interleave {interleave!r}",
-                    "the V3.2 reference always rotates interleaved pairs; a "
-                    "flag saying otherwise describes no released model")
-        index: Optional[Dict[str, int]] = None
-        if model_type == 'deepseek_v32':
-            index = {
-                'index_topk': int(hf_config['index_topk']),
-                'index_n_heads': int(hf_config['index_n_heads']),
-                'index_head_dim': int(hf_config['index_head_dim']),
-            }
-            used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
-        # The released checkpoints ship no mtp.* weights (91991 tensors on
-        # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP) and
-        # transformers builds no MTP module, so the field describes nothing
-        # the weights hold and the base model is what loads. Weight
-        # translation refuses mtp.* tensors loudly, so a checkpoint that
-        # ships them cannot drop them silently.
-        # The fp8 scales name the stored dtype, not the computation: dew
-        # loads the dequantized weights, and the reader names an unreadable
-        # dtype where it meets one. ep_size is a runtime parallel hint.
-        used.update(('num_nextn_predict_layers', 'num_mtp_layers'))
-        used.update(('quantization_config', 'ep_size'))
-        used.update(('qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
-                     'kv_lora_rank', 'q_lora_rank', 'qk_head_dim',
-                     'rope_interleave'))
-        config.update(
-            head_dim=nope + rope,
-            mixer={
-                'kind': 'mla',
-                'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
-                                else int(hf_config['q_lora_rank'])),
-                'kv_lora_rank': int(kv_rank),
-                'qk_nope_head_dim': nope,
-                'qk_rope_head_dim': rope,
-                'v_head_dim': int(v_dim),
-                'rope_interleave': bool(interleave),
-                'yarn': yarn,
-                'index_topk': None if index is None else index['index_topk'],
-                'index_n_heads': None if index is None else index['index_n_heads'],
-                'index_head_dim': (None if index is None
-                                   else index['index_head_dim']),
-            },
-            mixture=_deepseek_mixture(hf_config, layers, used),
-        )
-    if model_type == _QWEN35:
-        # The reference's attention always chunks a doubled q_proj into the
-        # query and a sigmoid gate on the branch (modeling_qwen3_5.py:644-646,
-        # 670-673, 701), whatever the config's attn_output_gate says: the
-        # field is read nowhere in transformers 5.16.1, so a config turning
-        # it off describes a model the reference cannot build.
-        if not hf_config.get('attn_output_gate', True):
-            _refuse("attn_output_gate=False",
-                    "Qwen3_5Attention always gates its output")
-        used.update(('attn_output_gate', 'full_attention_interval'))
-        rope_theta, partial = _qwen35_rope(hf_config)
-        used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
-        kinds = dict(config['kinds'])
-        if 'linear_attention' in layer_types:
-            kinds['linear_attention'] = {'mixer': {
-                'kind': 'gated_delta_net',
-                **{field: int(hf_config[field]) for field in _LINEAR_FIELDS}}}
-        unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
-        if unknown_kinds:
-            _refuse(f"layer_types {unknown_kinds}",
-                    "a qwen3_5_text layer is linear_attention or full_attention")
-        used.update(_LINEAR_FIELDS)
-        config.update(
-            # Qwen3_5RMSNorm scales by (1 + w) from a zero init
-            # (modeling_qwen3_5.py:727, 736), the q/k norms included.
-            scale_offset=True,
-            output_gate=True,
-            rope_theta=rope_theta,
-            partial_rotary_factor=partial,
-            partial_rotary_type='default',
-            kinds=kinds,
-        )
-        # Read by no forward pass in transformers 5.16.1: mlp_only_layers and
-        # mamba_ssm_dtype are names no qwen3_5 module looks up, and the MTP
-        # fields describe the mtp.* weights the reference drops on load
-        # (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected).
-        used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_num_hidden_layers',
-                     'mtp_use_dedicated_embeddings'))
+
+def _softmax_mixture(hf_config: Mapping[str, Any], used: set[str],
+                     experts: int, **fields: Any) -> Dict[str, Any]:
+    """The Mixtral-style mixture: a softmax over the experts, the top k, and
+    the renormalisation the family's `norm_topk_prob` says (Mixtral always
+    renormalises, modeling_mixtral.py:109; Qwen3-MoE reads the field,
+    modeling_qwen3_moe.py:263-264). The router's aux loss coefficient and
+    logit output are training-time knobs the forward pass never reads."""
+    used.update(('num_experts_per_tok', 'output_router_logits',
+                 'router_aux_loss_coef'))
+    return {'experts': experts, 'top_k': int(hf_config['num_experts_per_tok']),
+            **fields}
+
+
+def _mixtral_config(hf_config, used):
+    config = _mistral_config(hf_config, used)
+    used.update(('num_local_experts', 'router_jitter_noise'))
+    if hf_config.get('router_jitter_noise', 0.0):
+        _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
+    config['mixture'] = _softmax_mixture(
+        hf_config, used, int(hf_config['num_local_experts']))
+    return config
+
+
+def _mistral_config(hf_config, used):
+    layers = int(hf_config['num_hidden_layers'])
+    window = hf_config.get('sliding_window')
+    return _base_config(hf_config, used, layer_types=(
+        'full_attention' if window is None else 'sliding_attention',) * layers)
+
+
+def _qwen2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    # Qwen2Attention biases q, k and v and builds o_proj without one
+    # (modeling_qwen2.py:189-192), whatever the config says.
+    config = _base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used))
+    config.update(attention_bias=True, o_proj_bias=False)
+    return config
+
+
+def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    return _base_config(hf_config, used, qk_norm=True,
+                        layer_types=_qwen_layer_types(hf_config, used))
+
+
+def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """The Qwen3 block with a routed feed-forward on the layers
+    decoder_sparse_step and mlp_only_layers pick (modeling_qwen3_moe.py:
+    309-313): every decoder_sparse_step-th layer counting from one, minus
+    the listed ones, which stay dense at intermediate_size. The routed
+    experts are moe_intermediate_size wide. Its window rule is not Qwen3's:
+    with use_sliding_window every layer is windowed and max_window_layers is
+    never read (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149).
+    The expert count is `num_experts`, with `num_local_experts` its alias
+    (attribute_map), which is how transformers 5.16.1 writes it back."""
+    layers = int(hf_config['num_hidden_layers'])
+    used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
+    windowed = (hf_config.get('use_sliding_window', False)
+                and hf_config.get('sliding_window') is not None)
+    layer_types = _specified_layer_types(hf_config, used, (
+        'sliding_attention' if windowed else 'full_attention',) * layers)
+    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
+    used.update(('num_experts', 'num_local_experts', 'decoder_sparse_step',
+                 'mlp_only_layers', 'norm_topk_prob', 'moe_intermediate_size'))
+    experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
+    if experts is None:
+        _refuse("num_experts", "a qwen3_moe layer needs its expert count")
+    step = int(hf_config.get('decoder_sparse_step', 1))
+    if step < 1:
+        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
+    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
+    sparse = tuple(index for index in range(layers)
+                   if (index + 1) % step == 0 and index not in dense)
+    if not sparse:
+        _refuse("mlp_only_layers with decoder_sparse_step",
+                "together they leave no routed layer, which is a dense qwen3 model")
+    config['mixture'] = _softmax_mixture(
+        hf_config, used, int(experts), layers=sparse,
+        norm_topk_prob=bool(hf_config.get('norm_topk_prob', False)),
+        expert_features=int(hf_config['moe_intermediate_size']))
+    return config
+
+
+def _olmo3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """OLMo 3: a post-norm block whose two norms sit on the sublayer outputs
+    (modeling_olmo3.py:259-266, the sandwich pair without the input pair),
+    q/k RMSNorms over the whole projection before the head split
+    (:162-163, :178-179), three sliding layers to one full
+    (configuration_olmo3.py:96-98), and one rope base for both kinds. A flat
+    `rope_scaling` is the full-attention layers' alone, which is where the
+    reference moves it (configuration_olmo3.py:110-113), so a llama3 ramp
+    lands on the full kind; the released checkpoints carry a YaRN there,
+    which the attention has no per-kind ramp for, so that entry refuses by
+    name rather than loading plain rope under it."""
+    layers = int(hf_config['num_hidden_layers'])
+    layer_types = _specified_layer_types(hf_config, used, tuple(
+        'sliding_attention' if (index + 1) % 4 else 'full_attention'
+        for index in range(layers)))
+    ropes = _rope(hf_config, used)
+    if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
+        ropes = dataclasses.replace(ropes, full_only=True)
+    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
+                          scale_after_cast=False, rope=ropes)
+    config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
+    return config
+
+
+def _gemma_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Gemma 1: (1 + w) norms scaled in fp32, sqrt(d)-scaled embeddings, a
+    tied head, and no norms beyond the two pre-norms (modeling_gemma.py:77,
+    :374). Its released config names hidden_act 'gelu', which the reference
+    computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu'])."""
+    config = _base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True)
+    config.update(scale_offset=True, embedding_scale=True)
+    return config
+
+
+def _gemma_softcaps(hf_config: Mapping[str, Any], used: set[str],
+                    config: Dict[str, Any]) -> None:
+    """query_pre_attn_scalar, the two softcaps and the sandwich norms Gemma 2
+    introduced and Gemma 3 kept. Gemma 3 reads attn_logit_softcapping into
+    its attention and never passes it on (modeling_gemma3.py:334, :370-379),
+    so there it changes nothing; Gemma 2 applies it (modeling_gemma2.py:282)
+    and its entry maps it below."""
+    config.update(scale_offset=True, embedding_scale=True, sandwich_norms=True)
+    used.update(('query_pre_attn_scalar', 'final_logit_softcapping',
+                 'attn_logit_softcapping'))
+    scalar = hf_config.get('query_pre_attn_scalar')
+    if scalar is not None:
+        config['attention_scale'] = float(scalar) ** -0.5
+    softcap = hf_config.get('final_logit_softcapping')
+    if softcap is not None:
+        config['final_logit_softcap'] = float(softcap)
+
+
+def _gemma2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Gemma 2: Gemma 3's block without the q/k norms, alternating sliding
+    and full layers at one rope base, and the tanh softcap on the attention
+    logits (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206)."""
+    layers = int(hf_config['num_hidden_layers'])
+    layer_types = _specified_layer_types(hf_config, used, tuple(
+        'sliding_attention' if (index + 1) % 2 else 'full_attention'
+        for index in range(layers)))
+    config = _base_config(hf_config, used, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=layer_types)
+    _gemma_softcaps(hf_config, used, config)
+    softcap = hf_config.get('attn_logit_softcapping')
+    if softcap is not None:
+        config['attn_logit_softcap'] = float(softcap)
+    return config
+
+
+def _gemma3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
+    _gemma_softcaps(hf_config, used, config)
+    return config
+
+
+def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    layer_types = _gemma_layer_types(hf_config, used, last_full=True)
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          tie_embeddings=True, layer_types=layer_types, rope=_Ropes(10000.0))
+    # The reference's final-layer rewrite takes precedence over an explicit pattern.
+    config['layer_types'] = layer_types
+    hidden, heads, kv_heads = config['emb_features'], config['num_heads'], config['num_kv_heads']
+    if hf_config.get('attention_k_eq_v'):
+        _refuse("attention_k_eq_v=True",
+                "the backbone always projects its own values")
+    if hf_config.get('enable_moe_block'):
+        _refuse("enable_moe_block=True",
+                "the parallel MoE branch has no counterpart here")
+    used.update(('attention_k_eq_v', 'enable_moe_block'))
+    # The full layers may override the head dim; the sliding ones use
+    # hidden // heads, so that is the model's and the override lands on
+    # the full kind.
+    sliding_dim = hidden // heads
+    if hidden % heads:
+        _refuse(f"hidden_size {hidden}",
+                f"it does not divide into {heads} heads")
+    full_dim = sliding_dim
+    entries = hf_config.get('per_layer_config') or {}
+    model_kv = heads if kv_heads is None else int(kv_heads)
+    for entry in (entries.values() if isinstance(entries, Mapping) else entries):
+        if not isinstance(entry, Mapping):
+            continue
+        if entry.get('head_dim') is not None:
+            full_dim = int(entry['head_dim'])
+        # The reference gives a layer kind its own key/value head count as
+        # well as its own head dim (modeling_gemma4.py,
+        # Gemma4TextAttention reads layer_config.num_key_value_heads).
+        # The backbone has one count for the model, so a config that
+        # varies it is refused rather than built at the wrong K/V width.
+        if (entry.get('num_key_value_heads') is not None
+                and int(entry['num_key_value_heads']) != model_kv):
+            _refuse(f"per_layer_config num_key_value_heads "
+                    f"{int(entry['num_key_value_heads'])}",
+                    f"the backbone has one key/value head count for the "
+                    f"model, which this config sets to {model_kv}")
+    global_kv = hf_config.get('num_global_key_value_heads')
+    if global_kv is not None and int(global_kv) != model_kv:
+        _refuse(f"num_global_key_value_heads {int(global_kv)}",
+                f"the backbone has one key/value head count for the model, "
+                f"which this config sets to {model_kv}")
+    if hf_config.get('global_head_dim') is not None:
+        full_dim = int(hf_config['global_head_dim'])
+    used.update(('per_layer_config', 'global_head_dim',
+                 'num_global_key_value_heads'))
+    # Proportional rope rotates a fraction of the full layers' head dims
+    # and passes the rest through; sliding layers rotate all of theirs.
+    entries = hf_config.get('rope_parameters') or {}
+    rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
+    used.update(('rope_parameters', 'rope_theta'))
+    per_layer = int(hf_config.get('hidden_size_per_layer_input', 0))
+    config.update(
+        sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
+        v_norm=True,
+        head_dim=sliding_dim,
+        rope_theta=rope_theta,
+        kinds=_kinds(layer_types, config['kinds'].get(
+            'sliding_attention', {}).get('window'), rope_local_theta, None,
+            None if full_dim == sliding_dim else full_dim),
+        partial_rotary_factor=partial,
+        use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
+        num_kv_shared_layers=int(hf_config.get('num_kv_shared_layers', 0)),
+        per_layer_input_dim=per_layer or None,
+        per_layer_input_vocab=int(hf_config.get(
+            'vocab_size_per_layer_input', int(hf_config['vocab_size']))),
+    )
+    used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
+                 'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
+                 'final_logit_softcapping'))
+    # attention_logit_cap is read by no text path: Gemma4TextAttention
+    # never passes it to its attention call (modeling_gemma4.py,
+    # Gemma4TextAttention.forward), so it changes nothing and maps to
+    # nothing. Only the audio attention applies one.
+    used.add('attention_logit_cap')
+    softcap = hf_config.get('final_logit_softcapping')
+    if softcap is not None:
+        config['final_logit_softcap'] = float(softcap)
+    # MoE sizing keys with the branch off: refused above when it is on.
+    used.update(('moe_intermediate_size', 'expert_intermediate_size',
+                 'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
+
+    return config
+
+
+def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
+                     sparse: bool = False) -> Dict[str, Any]:
+    rope_theta, yarn = _deepseek_rope(hf_config, used)
+    config = _base_config(hf_config, used, rope=_Ropes(rope_theta))
+    layer_types = config['layer_types']
+    model_type = hf_config['model_type']
+    layers = int(hf_config['num_hidden_layers'])
+    sparse_name = ('deepseek_sparse_attention'
+                   if sparse else 'full_attention')
+    if hf_config.get('layer_types') is None:
+        # Neither released config names its pattern: V3 is dense MLA
+        # throughout and V3.2 sparse attention throughout.
+        layer_types = (sparse_name,) * layers
+        config['layer_types'] = layer_types
+    for entry in layer_types:
+        if entry != sparse_name:
+            _refuse(f"layer_types entry {entry!r}",
+                    f"a {model_type} model mixes no attention kinds: "
+                    f"every layer is {sparse_name}")
+    nope = int(hf_config['qk_nope_head_dim'])
+    rope = int(hf_config['qk_rope_head_dim'])
+    head_dim = hf_config.get('head_dim')
+    if head_dim is not None and int(head_dim) != rope:
+        _refuse(f"head_dim {head_dim!r}",
+                "DeepSeek points head_dim at the rope slice, "
+                f"which is {rope} wide here")
+    derived = hf_config.get('qk_head_dim')
+    if derived is not None and int(derived) != nope + rope:
+        _refuse(f"qk_head_dim {derived!r}",
+                f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
+                f"which is {nope + rope} here")
+    v_dim = hf_config.get('v_head_dim')
+    if v_dim is None:
+        _refuse("v_head_dim",
+                "the values need their width, and no default keeps a "
+                "checkpoint's layout")
+    kv_rank = hf_config.get('kv_lora_rank')
+    if kv_rank is None:
+        _refuse("kv_lora_rank",
+                "the latent needs its width, and no default keeps a "
+                "checkpoint's layout")
+    interleave = hf_config.get('rope_interleave', True)
+    if sparse and interleave is not True:
+        _refuse(f"rope_interleave {interleave!r}",
+                "the V3.2 reference always rotates interleaved pairs; a "
+                "flag saying otherwise describes no released model")
+    index: Optional[Dict[str, int]] = None
+    if sparse:
+        index = {
+            'index_topk': int(hf_config['index_topk']),
+            'index_n_heads': int(hf_config['index_n_heads']),
+            'index_head_dim': int(hf_config['index_head_dim']),
+        }
+        used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
+    # The released checkpoints ship no mtp.* weights (91991 tensors on
+    # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP) and
+    # transformers builds no MTP module, so the field describes nothing
+    # the weights hold and the base model is what loads. Weight
+    # translation refuses mtp.* tensors loudly, so a checkpoint that
+    # ships them cannot drop them silently.
+    # The fp8 scales name the stored dtype, not the computation: dew
+    # loads the dequantized weights, and the reader names an unreadable
+    # dtype where it meets one. ep_size is a runtime parallel hint.
+    used.update(('num_nextn_predict_layers', 'num_mtp_layers'))
+    used.update(('quantization_config', 'ep_size'))
+    used.update(('qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
+                 'kv_lora_rank', 'q_lora_rank', 'qk_head_dim',
+                 'rope_interleave'))
+    config.update(
+        head_dim=nope + rope,
+        mixer={
+            'kind': 'mla',
+            'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
+                            else int(hf_config['q_lora_rank'])),
+            'kv_lora_rank': int(kv_rank),
+            'qk_nope_head_dim': nope,
+            'qk_rope_head_dim': rope,
+            'v_head_dim': int(v_dim),
+            'rope_interleave': bool(interleave),
+            'yarn': yarn,
+            'index_topk': None if index is None else index['index_topk'],
+            'index_n_heads': None if index is None else index['index_n_heads'],
+            'index_head_dim': (None if index is None
+                               else index['index_head_dim']),
+        },
+        mixture=_deepseek_mixture(hf_config, layers, used),
+    )
+    return config
+
+
+def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    if hf_config.get('layer_types') is None:
+        used.add('full_attention_interval')
+    interval = int(hf_config.get('full_attention_interval', 4))
+    layer_types = _specified_layer_types(hf_config, used, tuple(
+        'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
+        for index in range(int(hf_config['num_hidden_layers']))))
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          layer_types=layer_types, rope=_Ropes(10000.0))
+    # The reference's attention always chunks a doubled q_proj into the
+    # query and a sigmoid gate on the branch (modeling_qwen3_5.py:644-646,
+    # 670-673, 701), whatever the config's attn_output_gate says: the
+    # field is read nowhere in transformers 5.16.1, so a config turning
+    # it off describes a model the reference cannot build.
+    if not hf_config.get('attn_output_gate', True):
+        _refuse("attn_output_gate=False",
+                "Qwen3_5Attention always gates its output")
+    used.update(('attn_output_gate', 'full_attention_interval'))
+    rope_theta, partial = _qwen35_rope(hf_config)
+    used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
+    kinds = dict(config['kinds'])
+    if 'linear_attention' in layer_types:
+        kinds['linear_attention'] = {'mixer': {
+            'kind': 'gated_delta_net',
+            **{field: int(hf_config[field]) for field in _LINEAR_FIELDS}}}
+    unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
+    if unknown_kinds:
+        _refuse(f"layer_types {unknown_kinds}",
+                "a qwen3_5_text layer is linear_attention or full_attention")
+    used.update(_LINEAR_FIELDS)
+    config.update(
+        # Qwen3_5RMSNorm scales by (1 + w) from a zero init
+        # (modeling_qwen3_5.py:727, 736), the q/k norms included.
+        scale_offset=True,
+        output_gate=True,
+        rope_theta=rope_theta,
+        partial_rotary_factor=partial,
+        partial_rotary_type='default',
+        kinds=kinds,
+    )
+    # Read by no forward pass in transformers 5.16.1: mlp_only_layers and
+    # mamba_ssm_dtype are names no qwen3_5 module looks up, and the MTP
+    # fields describe the mtp.* weights the reference drops on load
+    # (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected).
+    used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_num_hidden_layers',
+                 'mtp_use_dedicated_embeddings'))
+
+    return config
+
+
+def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Translate one registered family, refusing computation with no counterpart."""
+
+    model_type = hf_config.get('model_type')
+    if model_type in _WRAPPERS or (model_type not in _FAMILIES
+                                   and 'text_config' in hf_config):
+        # google/gemma-4-E2B is one of these: the decoder is real and its
+        # text_config translates, but the repo is a multimodal model whose
+        # weights sit under model.language_model.* beside vision and audio
+        # towers, and loading the text half would build something that is not
+        # the checkpoint. The refusal names the text config so a caller who
+        # wants the decoder alone asks for it deliberately.
+        _refuse(f"model_type {model_type!r}",
+                "it is a multimodal wrapper whose vision and audio towers have "
+                "no counterpart here; its decoder is the text_config, which "
+                "translates on its own, and its weights are the "
+                "model.language_model.* half of the checkpoint")
+    if model_type not in _FAMILIES:
+        _refuse(f"model_type {model_type!r}",
+                f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
+
+    if hf_config.get('use_bidirectional_attention', False):
+        _refuse("use_bidirectional_attention=True", "the backbone is causal")
+    if hf_config.get('mlp_bias'):
+        _refuse("mlp_bias=True", "the gated MLP is bias-free")
+
+    used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
+
+    config = _FAMILIES[model_type].translate_config(hf_config, used)
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})
@@ -1004,8 +1215,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     # params is always a collection, mapped tensors or not: a checkpoint
     # whose every tensor maps to nothing is an empty tree, not no tree.
     variables: Dict[str, Any] = {'params': {}}
+    family = _family_for_config(config)
     for name, tensor in hf_tensors.items():
-        path = _dew_path(name, config)
+        path = family.weight_path(name, config)
         if path is None:
             continue
         leaf = np.asarray(tensor, np.float32)
@@ -1118,10 +1330,10 @@ def save_pretrained_decoder(model, variables, directory, *,
 
     The inverse of load_pretrained_decoder: the same field map, run backwards,
     so a round-trip through dew hands transformers a checkpoint it accepts and
-    a load hands back bitwise-equal parameters. model_type is gemma3_text when
-    the sandwich norms are on, qwen3 when the q/k norms are, llama otherwise.
-    All three references build q/k/v/o with bias=config.attention_bias, so the
-    flag exports as it stands.
+    a load hands back bitwise-equal parameters. The family entry whose
+    predicate matches the model names the model_type, so a model with the
+    sandwich norms writes gemma3_text, one with q/k norms qwen3, one with
+    biased q/k/v over a bias-free o_proj qwen2, and a plain stack llama.
     """
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -1131,7 +1343,7 @@ def save_pretrained_decoder(model, variables, directory, *,
     if model.per_layer_input_dim or model.num_kv_shared_layers or model.v_norm:
         raise ValueError(
             "per-layer input embeddings, KV sharing and the values norm have "
-            "no counterpart in the llama, qwen3 and gemma3_text families this "
+            "no counterpart in the dense families this "
             "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
             "or v_norm set cannot be written back to the HF layout")
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
@@ -1140,7 +1352,7 @@ def save_pretrained_decoder(model, variables, directory, *,
                    for mixer in mixers)):
         raise ValueError(
             "the attention output gate, a partial rotary and a mixer other than "
-            "attention have no counterpart in the llama, qwen3 and gemma3_text "
+            "attention have no counterpart in the dense "
             "families this exports, so a model with output_gate, "
             "partial_rotary_factor or a linear-attention kind set cannot be "
             "written back to the HF layout")
@@ -1153,9 +1365,10 @@ def save_pretrained_decoder(model, variables, directory, *,
     params = variables.get('params', variables)
     config = _export_config(model)
 
+    family = _FAMILIES[config['model_type']]
     hf_tensors: Dict[str, np.ndarray] = {}
     for name, leaf in _flatten(params).items():
-        hf_name = _hf_name(name, config)
+        hf_name = family.export_path(name, config)
         if hf_name is None:
             continue
         leaf = np.asarray(leaf)
@@ -1189,19 +1402,11 @@ def _flatten(tree: Mapping[str, Any], prefix: str = '') -> Dict[str, Any]:
 
 def _export_config(model) -> Dict[str, Any]:
     """A CausalTransformer's fields back into HF vocabulary."""
+    family = _family_for_model(model)
     sandwich = bool(model.sandwich_norms)
-    if sandwich:
-        model_type = 'gemma3_text'
-    elif model.qk_norm:
-        model_type = 'qwen3'
-    else:
-        model_type = 'llama'
-
     config: Dict[str, Any] = {
-        'model_type': model_type,
-        'architectures': ['Gemma3ForCausalLM' if sandwich else
-                          ('Qwen3ForCausalLM' if model.qk_norm else
-                           'LlamaForCausalLM')],
+        'model_type': family.export_model_type,
+        'architectures': [family.architecture],
         'hidden_size': model.emb_features,
         'num_hidden_layers': model.num_layers,
         'num_attention_heads': model.num_heads,
@@ -1213,9 +1418,24 @@ def _export_config(model) -> Dict[str, Any]:
         'rms_norm_eps': model.norm_eps,
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
-        'hidden_act': 'silu' if model.mlp == 'swiglu' else 'gelu_pytorch_tanh',
+        'hidden_act': _HF_ACTIVATIONS[model.mlp],
         'use_cache': True,
     }
+    # A dial only one family's reference reads cannot ride in another
+    # family's config: Qwen2 alone splits the o_proj bias from the others,
+    # and Gemma 2 alone applies the attention softcap (Gemma 3 reads the
+    # field and never passes it on), so a checkpoint written under a family
+    # that would drop the dial is refused naming it.
+    if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
+        if family.export_model_type != 'qwen2':
+            raise ValueError(
+                "o_proj_bias differs from attention_bias, which only the qwen2 "
+                "family's reference builds, so the model cannot be written as "
+                f"{family.export_model_type}")
+    if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
+        raise ValueError(
+            "attn_logit_softcap is applied by the gemma2 reference alone, so "
+            f"the model cannot be written as {family.export_model_type}")
     types = model.per_layer_types
     if any(layer != 'full_attention' for layer in types):
         config['layer_types'] = list(types)
@@ -1236,20 +1456,19 @@ def _export_config(model) -> Dict[str, Any]:
         config['rope_theta'] = model.rope_theta
     if sliding is not None and sliding.window is not None:
         config['sliding_window'] = sliding.window
-    if model_type == 'gemma3_text':
-        config.update(
-            hidden_activation='gelu_pytorch_tanh',
-            query_pre_attn_scalar=(None if model.attention_scale is None
-                                   else round(1.0 / model.attention_scale ** 2)),
-            final_logit_softcapping=model.final_logit_softcap,
-            attn_logit_softcapping=None,
-            use_bidirectional_attention=False,
-        )
-    if model_type == 'qwen3':
-        window = None if sliding is None else sliding.window
-        config['use_sliding_window'] = window is not None
-        if window is not None:
-            config['max_window_layers'] = 0
+    # The ramp writes in the flat spelling every family that reads one
+    # accepts (rope_scaling beside rope_theta, as Llama 3.1 ships it); a
+    # ramp that differs between kinds has that spelling in no reference
+    # this exports, so it is refused naming the kinds.
+    ramps = {kind: model.kind_of(kind).rope_scaling for kind in set(types)}
+    if len(set(ramps.values())) > 1:
+        raise ValueError(
+            f"rope_scaling differs between layer kinds ({sorted(ramps)}), which "
+            "no exported family spells; the model cannot be written back")
+    ramp = model.kind_of(types[0]).rope_scaling
+    if ramp is not None:
+        config['rope_scaling'] = dataclasses.asdict(ramp)
+    config.update(family.export_fields(model))
     return {key: value for key, value in config.items() if value is not None}
 
 
@@ -1276,10 +1495,150 @@ def _hf_name(dew_name: str, config: Mapping[str, Any]) -> Optional[str]:
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
         theirs = {ours: hf for hf, ours in
-                  _norm_names(config['model_type'] == _GEMMA).items()}
+                  _norm_names(_FAMILIES[config['model_type']].sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf == 'scale':
             return f'model.layers.{index}.{theirs[module]}.weight'
     raise ValueError(f"unknown parameter path {dew_name!r}")
+
+
+def _gemma3_export(model: CausalTransformer) -> dict[str, object]:
+    return {
+        'hidden_activation': _HF_ACTIVATIONS[model.mlp],
+        'query_pre_attn_scalar': (None if model.attention_scale is None
+                                 else round(1.0 / model.attention_scale ** 2)),
+        'final_logit_softcapping': model.final_logit_softcap,
+        'attn_logit_softcapping': None,
+        'use_bidirectional_attention': False,
+    }
+
+
+def _gemma2_export(model: CausalTransformer) -> dict[str, object]:
+    return {**_gemma3_export(model), 'attn_logit_softcapping': model.attn_logit_softcap}
+
+
+def _qwen3_export(model: CausalTransformer) -> dict[str, object]:
+    sliding = (model.kind_of('sliding_attention')
+               if 'sliding_attention' in model.per_layer_types else None)
+    window = None if sliding is None else sliding.window
+    fields: dict[str, object] = {'use_sliding_window': window is not None}
+    if window is not None:
+        fields['max_window_layers'] = 0
+    return fields
+
+
+
+def _mixtral_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    name = name.replace('.block_sparse_moe.', '.mlp.')
+    for theirs, ours in (('w1', 'gate_proj'), ('w2', 'down_proj'), ('w3', 'up_proj')):
+        name = name.replace(f'.{theirs}.weight', f'.{ours}.weight')
+    return _dew_path(name, config)
+
+
+
+@dataclass(frozen=True)
+class DecoderFamily:
+    """One family's config, tensor paths and export vocabulary.
+
+    A dew config carries no provenance tag, so `matches` reads the fields
+    the backbone would be built from and names the family whose reference
+    computes them; the same fields come from a built model at export and
+    from a config dict at weight translation. Entries are ordered from the
+    most specific layout to the plain dense decoder, and the first match
+    wins.
+    """
+
+    model_types: tuple[str, ...]
+    translate_config: Callable[[Mapping[str, object], set[str]], dict[str, object]]
+    matches: Callable[[Mapping[str, Any]], bool]
+    export_model_type: str
+    architecture: str
+    export_fields: Callable[[CausalTransformer], dict[str, object]]
+    weight_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]] = _dew_path
+    export_path: Callable[[str, Mapping[str, object]], Optional[str]] = _hf_name
+    sandwich_norms: bool = False
+
+
+def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
+    mixer = fields['mixer']
+    return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
+
+
+def _every_layer_windowed(fields: Mapping[str, Any]) -> bool:
+    kinds = fields['kinds'] or {}
+    windows = {name: (kind.window if isinstance(kind, LayerKind) else kind.get('window'))
+               for name, kind in kinds.items()}
+    return all(windows.get(layer) is not None
+               for layer in fields['layer_types'] or ('full_attention',))
+
+
+_FAMILY_ENTRIES = (
+    DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
+                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
+                                  and mixer.index_topk is not None),
+                  'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}),
+    DecoderFamily(('deepseek_v3',), _deepseek_config,
+                  lambda fields: isinstance(_mixer_value(fields), MLAMixer),
+                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
+    DecoderFamily((_QWEN35,), _qwen35_config,
+                  lambda fields: bool(fields['output_gate']
+                                      or 'linear_attention' in (fields['layer_types'] or ())),
+                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}),
+    DecoderFamily(('olmo3',), _olmo3_config,
+                  lambda fields: not fields['pre_norms'],
+                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),
+    DecoderFamily(('gemma4_text',), _gemma4_config,
+                  lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
+                                      or fields['num_kv_shared_layers']),
+                  'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True),
+    DecoderFamily((_GEMMA,), _gemma3_config,
+                  lambda fields: bool(fields['sandwich_norms'] and fields['qk_norm']),
+                  _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
+    DecoderFamily(('gemma2',), _gemma2_config,
+                  lambda fields: bool(fields['sandwich_norms']),
+                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True),
+    DecoderFamily(('gemma',), _gemma_config,
+                  lambda fields: bool(fields['embedding_scale']),
+                  'gemma', 'GemmaForCausalLM', lambda model: {}),
+    DecoderFamily(('qwen3_moe',), _qwen3_moe_config,
+                  lambda fields: bool(fields['qk_norm'] and fields['mixture'] is not None),
+                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export),
+    DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields['qk_norm']),
+                  'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
+    DecoderFamily(('qwen2',), _qwen2_config,
+                  lambda fields: bool(fields['attention_bias'] and fields['o_proj_bias'] is False),
+                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export),
+    DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields['mixture'] is not None,
+                  'mixtral', 'MixtralForCausalLM', lambda model: {},
+                  weight_path=_mixtral_path),
+    DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
+                  'mistral', 'MistralForCausalLM', lambda model: {}),
+    DecoderFamily(('llama',), _base_config, lambda fields: True,
+                  'llama', 'LlamaForCausalLM', lambda model: {}),
+)
+_FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
+
+# What the backbone takes for a field a config leaves unset, so a partial
+# config (a layer's worth of tensors in a test) selects its family the way
+# the built model would.
+_BACKBONE_DEFAULTS = {
+    field.name: (field.default if field.default_factory is dataclasses.MISSING
+                 else field.default_factory())
+    for field in dataclasses.fields(CausalTransformer)
+    if field.default is not dataclasses.MISSING
+    or field.default_factory is not dataclasses.MISSING}
+
+
+def _family_of(fields: Mapping[str, Any]) -> DecoderFamily:
+    return next(family for family in _FAMILY_ENTRIES if family.matches(fields))
+
+
+def _family_for_config(config: Mapping[str, Any]) -> DecoderFamily:
+    return _family_of({**_BACKBONE_DEFAULTS, **config})
+
+
+def _family_for_model(model: CausalTransformer) -> DecoderFamily:
+    return _family_of({field.name: getattr(model, field.name)
+                       for field in dataclasses.fields(model)})
 
 
 def _check_tree(variables: Mapping[str, Any], model) -> None:

@@ -51,6 +51,22 @@ def test_auto_resolves_to_cudnn_on_gpu(implementations, monkeypatch):
     assert implementations == ['cudnn']
 
 
+def test_auto_keeps_the_shapes_cudnn_refuses_on_xla(implementations, monkeypatch):
+    """'auto' promises the fused kernel where it runs. cudnn takes bf16 or
+    fp16 and a head dimension that is a multiple of 8 up to 128, so a fp32
+    query or a 4-wide head (the UNets' attention at their smallest test
+    size) goes to xla instead of raising inside the kernel."""
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    scaled_dot_product_attention(*qkv(jnp.float32), implementation='auto')
+    narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
+    scaled_dot_product_attention(*narrow, implementation='auto')
+    wide = (jnp.ones((1, 4, 2, 256), jnp.bfloat16),) * 3
+    scaled_dot_product_attention(*wide, implementation='auto')
+    assert implementations == ['xla', 'xla', 'xla']
+    with pytest.raises(ValueError, match="multiple of 8"):
+        scaled_dot_product_attention(*narrow, implementation='cudnn')
+
+
 def test_odd_lengths_reach_cudnn_padded_even(implementations, monkeypatch):
     """cudnn's fused kernel has no backward pass for an odd sequence length,
     and 77 CLIP text tokens are odd: 'auto' used to send every
@@ -127,12 +143,6 @@ def test_cudnn_rejects_float32_inputs():
     would make --model.dtype float32 a lie."""
     with pytest.raises(ValueError, match="bfloat16"):
         scaled_dot_product_attention(*qkv(jnp.float32), implementation='cudnn')
-
-
-def test_auto_on_gpu_rejects_float32_inputs(monkeypatch):
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    with pytest.raises(ValueError, match="bfloat16"):
-        scaled_dot_product_attention(*qkv(jnp.float32), implementation='auto')
 
 
 def test_policy_reaches_nested_unet_attention_configs():

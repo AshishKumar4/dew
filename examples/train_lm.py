@@ -41,7 +41,7 @@ def main(config: Config):
     tokenizer = ByteTokenizer()
     data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length,
                         loading=Loading(workers=4)).load(batch=config.batch_size)
-    steps = config.steps or config.epochs * data.steps_per_epoch
+    steps = config.steps or data.epoch_steps(config.epochs)
 
     prompt = tokenizer.encode(config.prompt)
     model = models.build("causal_transformer", **config.model, vocab_size=int(meta["vocab_size"]),
@@ -55,7 +55,7 @@ def main(config: Config):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    tokens = generate(model, {**state.params, **state.ema}, jnp.asarray([prompt], jnp.int32),
+    tokens = generate(model, state.averaged, jnp.asarray([prompt], jnp.int32),
                       config.sample_tokens, key=jax.random.key(1), temperature=0.8, top_k=40)
     text = tokenizer.decode(tokens[0])
     config.out.mkdir(parents=True, exist_ok=True)

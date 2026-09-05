@@ -7,6 +7,7 @@ guards the config surface the HF decoders need (grouped-query heads, sliding
 layers, the Gemma flags) and the param tree the interop map renames.
 """
 
+import functools
 import math
 
 import jax
@@ -122,6 +123,40 @@ def test_sliding_window_agrees_across_kernels(rng):
     fused = scaled_dot_product_attention(query, key, value, causal=True,
                                          sliding_window=3, implementation='xla')
     assert jnp.allclose(reference, fused, atol=1e-5)
+
+
+def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, monkeypatch):
+    """Gemma 2's tanh on the logits, against the equation on a hand-computed
+    case: reference and xla agree with it, and 'auto' resolves a softcapped
+    call to that same math even where cudnn would otherwise run (bf16 inputs,
+    an 8-wide head, a gpu backend), while cudnn and tpu refuse by name.
+    A cap of 2 on logits of order 10 changes the weights by a wide margin,
+    so an uncapped path cannot pass."""
+    query, key, value = (jax.random.normal(k, (1, 6, 2, 8)) * 3
+                         for k in jax.random.split(rng, 3))
+    scaled = np.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(8)
+    capped = 2.0 * np.tanh(scaled / 2.0)
+    causal = np.tril(np.ones((6, 6), bool))
+    weights = jax.nn.softmax(np.where(causal, capped, -np.inf), axis=-1)
+    expected = np.einsum('bhqk,bkhd->bqhd', weights, value)
+    uncapped = scaled_dot_product_attention(query, key, value, causal=True)
+    assert np.max(np.abs(np.asarray(uncapped) - expected)) > 0.1
+
+    reference = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0)
+    fused = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0,
+                                         implementation='xla')
+    assert np.allclose(reference, expected, atol=1e-5)
+    assert np.allclose(fused, expected, atol=1e-5)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
+    routed = scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
+                                          implementation='auto')
+    assert np.allclose(routed.astype(jnp.float32), expected, atol=5e-2)
+    for implementation in ('cudnn', 'tpu'):
+        with pytest.raises(ValueError, match=f"'{implementation}' cannot apply an attention logit softcap"):
+            scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
+                                         implementation=implementation)
 
 
 def test_registry_builds_the_backbone_and_takes_the_precision_policy():
@@ -244,6 +279,15 @@ def test_attention_bias_adds_the_qkvo_biases(rng):
     attention = model.init(rng, tokens(rng))['params']['layers_0']['self_attn']
     assert all('bias' in attention[proj]
                for proj in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
+
+
+def test_o_proj_bias_false_leaves_only_the_qkv_biases(rng):
+    """Qwen2Attention builds q, k and v with bias=True and o_proj with
+    bias=False (modeling_qwen2.py:189-192), which the split dial names."""
+    model = tiny(attention_bias=True, o_proj_bias=False)
+    attention = model.init(rng, tokens(rng))['params']['layers_0']['self_attn']
+    assert all('bias' in attention[proj] for proj in ('q_proj', 'k_proj', 'v_proj'))
+    assert 'bias' not in attention['o_proj']
     assert 'bias' not in model.init(
         rng, tokens(rng))['params']['layers_0']['mlp']['gate_proj']
 
@@ -467,6 +511,41 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     # exact in real arithmetic, fp32 rounding through the norm is the residue
     assert gap(model) < 1e-3
     assert gap(tiny()) > 0.1
+
+
+def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
+    """OLMo 3's block (pre_norms off, sandwich on): x + norm(attn(x)), then
+    x + norm(mlp(x)), with no input norms (modeling_olmo3.py:249-266). The
+    block's output is checked against that equation computed from its own
+    sublayers, and against the pre-norm block on the same weights, which
+    normalises the input instead and lands elsewhere."""
+    from dew.nn.backbones.causal_transformer import DecoderBlock, GatedMLP, RMSNorm
+    from dew.nn.mixers import AttentionMixer, MixerContext
+
+    features, ids = 32, tokens(rng)
+    x = jax.random.normal(rng, (*ids.shape, features)) * 3
+    mixer = AttentionMixer().build(MixerContext(
+        emb_features=features, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=SEQ))
+    feedforward = functools.partial(GatedMLP, hidden_features=64, out_features=features)
+    block = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
+                         sandwich_norms=True, pre_norms=False)
+    params = block.init(rng, x)
+    assert set(params['params']) == {'self_attn', 'mlp', 'attention_output_norm', 'mlp_output_norm'}
+
+    def norm(name, value):
+        return RMSNorm(epsilon=block.norm_eps).apply({'params': params['params'][name]}, value)
+
+    attended = mixer(name='self_attn').apply({'params': params['params']['self_attn']}, x)
+    mid = x + norm('attention_output_norm', attended)
+    fed = feedforward(name='mlp').apply({'params': params['params']['mlp']}, mid)
+    expected = mid + norm('mlp_output_norm', fed)
+    assert jnp.allclose(block.apply(params, x), expected, atol=1e-5)
+
+    pre = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
+                       sandwich_norms=True)
+    with_input_norms = pre.init(rng, x)
+    with_input_norms['params'].update(params['params'])
+    assert not jnp.allclose(pre.apply(with_input_norms, x), expected, atol=1e-2)
 
 
 def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):

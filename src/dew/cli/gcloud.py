@@ -153,7 +153,10 @@ class Gcloud:
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             bufsize=1,
         ) as process:
-            for line in process.stdout:  # type: ignore[union-attr]
+            stdout = process.stdout
+            if stdout is None:
+                raise RuntimeError(f"{argv[0]} opened without the pipe it was asked for")
+            for line in stdout:
                 emit(prefix + line.rstrip("\n"))
             return Result(tuple(argv), process.wait())
 
