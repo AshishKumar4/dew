@@ -18,6 +18,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
   6.7; biased q/k/v over a bias-free o_proj, with a window from layer 1 on.
 - mixtral-tiny: max |logit difference| 2.32e-06, tolerance 1e-4, logits up
   to 4.4 in magnitude; the released per-expert w1/w2/w3 tensors stack.
+- qwen3-moe-tiny: max |logit difference| 2.86e-06, tolerance 1e-4, logits up
+  to 4.1; one routed layer of three between two dense ones, with
+  norm_topk_prob off (renormalising moves the logits by 0.38).
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -44,6 +47,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   tests/test_linear_attention.py.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -64,7 +68,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
-ROUTED = DEEPSEEK + ("mixtral-tiny",)
+ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -184,6 +188,48 @@ def test_mixtral_experts_stack_in_checkpoint_order():
     shuffled = {**variables, 'params': {**params, 'layers_0': {**params['layers_0'], 'mlp': {
         **params['layers_0']['mlp'], 'experts': swapped}}}}
     assert np.max(np.abs(np.asarray(model.apply(shuffled, ids)) - reference)) > 0.1
+
+
+def test_released_qwen3_30b_a3b_config_translates_every_computational_field():
+    """Qwen/Qwen3-30B-A3B spells its expert count num_experts (the released
+    key; num_local_experts is the alias transformers writes back), routes
+    every layer (decoder_sparse_step 1, mlp_only_layers []) and
+    renormalises the top-8 softmax weights."""
+    config = translate_config(fixture_config("qwen3-30b-a3b"))
+    assert config['mixture'] == {'experts': 128, 'top_k': 8, 'layers': tuple(range(48)),
+                                 'norm_topk_prob': True, 'expert_features': 768}
+    assert config['qk_norm'] and config['layer_types'] == ('full_attention',) * 48
+    assert (config['emb_features'], config['mlp_features'], config['head_dim']) == (2048, 6144, 128)
+
+
+def test_qwen3_moe_picks_its_sparse_layers_like_the_reference():
+    """decoder_sparse_step counts layers from one and mlp_only_layers takes
+    layers back out (modeling_qwen3_moe.py:309-313): the tiny fixture's
+    three layers leave only the second routed, and the loaded tree has the
+    experts there and a dense MLP on the other two. A configuration that
+    routes nothing is a dense qwen3 model and refuses."""
+    config = translate_config(fixture_config("qwen3-moe-tiny"))
+    assert config['mixture']['layers'] == (1,)
+    _, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    mlps = {layer: sorted(block['mlp']) for layer, block in variables['params'].items()
+            if layer.startswith('layers_')}
+    assert mlps == {'layers_0': ['down_proj', 'gate_proj', 'up_proj'],
+                    'layers_1': ['experts', 'gate'],
+                    'layers_2': ['down_proj', 'gate_proj', 'up_proj']}
+    with pytest.raises(ValueError, match="mlp_only_layers with decoder_sparse_step"):
+        translate_config({**fixture_config("qwen3-moe-tiny"), 'mlp_only_layers': [0, 1, 2]})
+
+
+def test_norm_topk_prob_off_keeps_the_raw_softmax_weights():
+    """The fixture ships norm_topk_prob false, so a token's two weights are
+    the softmax values themselves; renormalising them to sum to one, which
+    Mixtral always does, moves the logits by 0.38 against the reference."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    ids = np.load(FIXTURES / 'qwen3-moe-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'qwen3-moe-tiny' / 'logits.npy')
+    assert model.mixture is not None and not model.mixture.norm_topk_prob
+    renormalised = model.clone(mixture=dataclasses.replace(model.mixture, norm_topk_prob=True))
+    assert np.max(np.abs(np.asarray(renormalised.apply(variables, ids)) - reference)) > 0.1
 
 
 def test_mistral_window_changes_the_reference_logits():

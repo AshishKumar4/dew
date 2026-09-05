@@ -105,9 +105,10 @@ class Mixture:
     sparse, which is Mixtral.
 
     The routing options are `Router`'s: `score_function` softmax, sigmoid or
-    sqrtsoftplus, `scaling` on the routed output, `groups` with
-    `groups_per_token` for DeepSeek's node limit, and `bias` for its
-    aux-loss-free balancing bias.
+    sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
+    token's selected weights by their sum, `scaling` on the routed output,
+    `groups` with `groups_per_token` for DeepSeek's node limit, and `bias`
+    for its aux-loss-free balancing bias.
 
     `expert_features` is the routed experts' width, None for the model's
     `mlp_features`; DeepSeek sizes its experts apart from its dense layers
@@ -123,6 +124,7 @@ class Mixture:
     layers: Optional[Tuple[int, ...]] = None
     every: Optional[int] = None
     score_function: str = 'softmax'
+    norm_topk_prob: bool = True
     scaling: float = 1.0
     groups: int = 1
     groups_per_token: int = 1
@@ -901,6 +903,7 @@ class CausalTransformer(nn.Module):
             out_features=self.emb_features,
             activation=self.mlp,
             score_function=mixture.score_function,
+            normalize_weights=mixture.norm_topk_prob,
             routed_scaling_factor=mixture.scaling,
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
