@@ -72,7 +72,7 @@ def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed:
     samples_per_frame = int(samples_per_frame)
     padded_frames = num_frames + 2 * audio_padding
 
-    # The audio is not opened here: a file without a track fails in
+    # The audio is not opened here. A file without a track fails in
     # audio_window with ffmpeg's own words for it.
     with VideoFileClip(path, audio=False) as video:
         if video.duration is None:
@@ -84,7 +84,7 @@ def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed:
                 f"{num_frames} with {audio_padding} of padding needs {padded_frames}")
         start = choose_clip_start(total_frames, num_frames, audio_padding,
                                   np.random.default_rng(seed))
-        # One frame per index, asked for by its own time: the reader seeks
+        # One frame per index, asked for by its own time. The reader seeks
         # to the first and steps to the rest, where a subclip's iterator
         # enumerates times from a float duration and can come up one short.
         frames = np.stack([video.get_frame((start + index) / fps) for index in range(num_frames)])

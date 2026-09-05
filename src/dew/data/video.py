@@ -38,14 +38,14 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
 
 
 class AudioVideoTransform(pygrain.RandomMapTransform):
-    """One clip per record: frames, their audio, and the record's caption."""
+    """One clip per record, with its frames, their audio, and the record's caption."""
 
     def __init__(self, spec: "VideoDataset"):
         self.spec = spec
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 
     def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
-        # moviepy comes in with the reader, on the first record rather than on import.
+        # moviepy is imported on the first record, so importing this module needs no `av` extra.
         from .sources.av_utils import read_av_random_clip
         frames, audio = read_av_random_clip(
             element["video_path"], num_frames=self.spec.frames,
