@@ -3,7 +3,7 @@
 The prompt goes through the model once with the KV cache mutable, which fills
 the cache and gives the logits for the first new token. Every step after that
 is a single-token forward pass inside a lax.scan, so the whole generation is
-one compiled loop rather than max_new_tokens traces.
+one compiled loop.
 """
 
 import functools
@@ -57,10 +57,9 @@ def _replication(params):
     """Replication on the mesh the parameters live on, or None off a mesh.
 
     The sampled tokens are read on the host, decoded to text and logged, so
-    where they land is part of the contract rather than a layout the compiler
-    is free to choose: every device that reads a row has to hold the whole
-    row. A tracer or a numpy tree carries no mesh, and then there is nothing
-    to pin.
+    where they land is part of the contract. Every device that reads a row
+    holds the whole row. A tracer or a numpy tree carries no mesh, and then
+    there is nothing to pin.
     """
     for leaf in jax.tree.leaves(params):
         mesh = getattr(getattr(leaf, 'sharding', None), 'mesh', None)
@@ -77,7 +76,7 @@ def _compiled(out_sharding):
 
 def generate(model, params, prompt, max_new_tokens: int, *, key,
              temperature: float = 1.0, top_k=None):
-    """Sample `max_new_tokens` tokens after `prompt`: [B, P] -> [B, P + max_new_tokens].
+    """Sample `max_new_tokens` tokens after `prompt`, [B, P] -> [B, P + max_new_tokens].
 
     params is the full variables dict the trainer holds ({'params': ...}), the
     same thing the diffusion samplers take. temperature=0 is greedy decoding

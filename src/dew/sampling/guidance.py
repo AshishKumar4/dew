@@ -24,8 +24,8 @@ class CFG:
 
     def __post_init__(self):
         # A record's interval arrives as a list, from a run's json or a
-        # command line; a tuple keeps the value hashable, which is what lets
-        # it ride into a jit as a static argument.
+        # command line; a tuple keeps the value hashable, so it can ride
+        # into a jit as a static argument.
         object.__setattr__(self, "interval", tuple(float(edge) for edge in self.interval))
 
     def __call__(self, denoise: Denoiser):
