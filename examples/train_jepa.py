@@ -35,8 +35,9 @@ class Config:
 
 def main(config: Config, data=None):
     data = data or OxfordFlowers(image_size=config.image_size).load(batch=config.batch_size)
-    steps = config.steps or config.epochs * data.steps_per_epoch
-    grid = (config.image_size // config.patch_size,) * 2
+    steps = config.steps or data.epoch_steps(config.epochs)
+    side = config.image_size // config.patch_size
+    grid = (side, side)
     encoder = models.build("jepa_encoder", **config.model, patch_size=config.patch_size, dtype="bfloat16")
     predictor = models.build(
         "jepa_predictor", grid=grid, emb_features=config.model["emb_features"],
@@ -52,7 +53,7 @@ def main(config: Config, data=None):
                         metrics=(metrics.linear_probe(config.classes), metrics.knn_probe(config.classes)))
 
     config.out.mkdir(parents=True, exist_ok=True)
-    save_params(state.ema["params"]["context_encoder"], config.out / "encoder.safetensors")
+    save_params(state.averaged["params"]["context_encoder"], config.out / "encoder.safetensors")
     return state
 
 

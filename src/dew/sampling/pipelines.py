@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +17,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Variables
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
-from dew.sampling.solvers import DDIM
+from dew.sampling.solvers import DDIM, Solver
 
 
 @dataclass(frozen=True, eq=False)
@@ -97,7 +97,8 @@ class TextToImage:
         return given, null
 
     def __call__(self, prompts: Sequence[str], *, steps: int = 50,
-                 guidance: CFG | float | None = None, sampler=DDIM(), key) -> jax.Array:
+                 guidance: CFG | float | None = None, sampler: Solver[Any] = DDIM(),
+                 key) -> jax.Array:
         """Images in [-1, 1], `[len(prompts), H, W, C]`. `guidance` is a
         classifier-free guidance scale, or a `CFG` with its interval, or None
         for the plain conditional prediction."""
