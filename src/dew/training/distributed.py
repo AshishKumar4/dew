@@ -55,6 +55,9 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("mlp", FSDP_AXIS),
     ("modulation", FSDP_AXIS),
     ("attention", FSDP_AXIS),
+    # The gated delta net's projected width (keys, values and their gate),
+    # placed like the attention's: the width over the model dimension.
+    ("linear", FSDP_AXIS),
     ("embed", FSDP_AXIS),
     ("head_dim", FSDP_AXIS),
     ("heads", FSDP_AXIS),

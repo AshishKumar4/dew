@@ -232,7 +232,7 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
     ("in_proj_b",): ("embed", "kv"),
     ("in_proj_a",): ("embed", "kv"),
     ("out_proj",): ("linear", "embed"),
-})
+}, heuristic=(("conv1d",),))
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
 
@@ -256,7 +256,7 @@ class GatedDeltaNet(nn.Module):
     fresh sequence pads with.
 
     Parameter names are the checkpoint's, so translation moves weights and
-    does not synthesise them: `conv1d/kernel` is the depthwise taps
+    does not synthesise them: `conv1d/weight` is the depthwise taps
     `[D, 1, K]`, and `A_log`/`dt_bias` are the `[Hv]` leaves the reference
     materialises as parameters.
     """
@@ -270,7 +270,7 @@ class GatedDeltaNet(nn.Module):
     max_seq_len: Optional[int] = None
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
-    output_gate: str = 'silu'
+    gate_activation: str = 'silu'  # the norm's gate: 'silu' | 'sigmoid', qwen4_exp's output_gate_type
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -299,10 +299,10 @@ class GatedDeltaNet(nn.Module):
             raise ValueError(
                 "the causal conv needs a history, so a kernel of at least 2, "
                 f"got {self.conv_kernel}")
-        if self.output_gate not in ('silu', 'sigmoid'):
+        if self.gate_activation not in ('silu', 'sigmoid'):
             raise ValueError(
-                "output_gate must be 'silu' or 'sigmoid' (the reference's "
-                f"output_gate_type), got {self.output_gate!r}")
+                "gate_activation must be 'silu' or 'sigmoid' (the reference's "
+                f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
         self.in_proj_qkv = dense(self.key_features * 2 + self.value_features,
@@ -317,7 +317,7 @@ class GatedDeltaNet(nn.Module):
         self.dt_bias = self.param('dt_bias', nn.initializers.ones,
                                   (self.num_v_heads,), jnp.float32)
         self.out_proj = dense(self.emb_features, name='out_proj')
-        self.norm = RMSNormGated(epsilon=self.norm_eps, activation=self.output_gate,
+        self.norm = RMSNormGated(epsilon=self.norm_eps, activation=self.gate_activation,
                                  dtype=self.dtype, name='norm')
 
     def _split_heads(self, mixed, last_dim: int):
@@ -418,8 +418,11 @@ class DepthwiseConv1d(nn.Module):
     A raw parameter rather than flax's Conv, because the checkpoint stores
     `conv1d.weight` exactly this way and nothing else about flax's conv
     (its [K, D, 1] kernel order, its channel-last input) matches the
-    reference's [B, D, S] depthwise conv1d call. The caller reads
-    `kernel[:, 0, :]` for the [D, K] taps.
+    reference's [B, D, S] depthwise conv1d call. The leaf keeps the
+    checkpoint's name, `weight`, because `kernel` is what a translation
+    transposes as a Linear's [out, in]; the caller reads `weight[:, 0, :]`
+    for the [D, K] taps. The depthwise taps have no matrix axis worth a
+    name, so they take the shape heuristic.
     """
 
     features: int
@@ -427,7 +430,7 @@ class DepthwiseConv1d(nn.Module):
 
     @nn.compact
     def __call__(self):
-        return self.param('kernel', nn.initializers.lecun_normal(),
+        return self.param('weight', nn.initializers.lecun_normal(),
                          (self.features, 1, self.kernel))
 
 
