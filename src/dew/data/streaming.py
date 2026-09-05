@@ -13,48 +13,43 @@ from .dataset import Dataset, DatasetSpec, Loading, local_batch, tokenized
 
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
-    """Images fetched by URL as they are read, an endless stream.
+    """Images fetched by url as they are read, an endless stream.
 
     `sources` name hub datasets or `gs://` directories saved with
     `save_to_disk`; their rows carry a url and a caption. The rows are
     concatenated, shuffled once, and sharded by JAX process; each process
-    then walks its shard forever, reshuffling between passes and dropping
-    fetches that fail, so nothing is held out and the stream cannot resume
-    mid-epoch. Needs the streaming extra (HF `datasets`).
+    then walks its shard forever, reshuffling between passes, so nothing is
+    held out and the stream cannot resume mid-epoch. A url that yields no
+    image, or an image that is not RGB, under `min_image_size` on its
+    shorter side, more than 2.4 times as long as wide or a single flat
+    colour, is dropped and counted. Needs the streaming extra (HF
+    `datasets`).
     """
 
     sources: tuple[str, ...] = ()
     image_size: int = 256
     min_image_size: int = 128
-    """Rows whose image is smaller than this on a side are dropped."""
     loading: Loading = Loading(workers=16, threads=512)
     """The fetch pool has no grain reader, so `read_buffer` does not reach
-    this path; `worker_buffer` is the batches prefetched ahead of the run."""
+    this path; `worker_buffer` is how many batches the fetchers run ahead."""
     timeout: int = 15
     retries: int = 3
 
     def load(self, *, batch: int, tokenize=None) -> Dataset:
-        from .online_loader import OnlineStreamingDataLoader, load_rows
-
         if not self.sources:
             raise ValueError(f"{type(self).__name__} needs sources= set to one or more datasets")
-        rows = load_rows(list(self.sources))
+        from .online_loader import ImageStream, load_rows
+
+        rows = load_rows(self.sources)
         per_process = local_batch(batch)
 
         def stream():
-            return OnlineStreamingDataLoader(
-                rows,
-                batch_size=per_process,
-                num_workers=self.loading.workers,
-                num_threads=self.loading.threads,
-                image_shape=(self.image_size, self.image_size),
-                min_image_shape=(self.min_image_size, self.min_image_size),
-                global_process_count=jax.process_count(),
-                global_process_index=jax.process_index(),
-                prefetch=self.loading.worker_buffer,
-                timeout=self.timeout,
-                retries=self.retries,
-            )
+            return ImageStream(
+                rows.shard(num_shards=jax.process_count(), index=jax.process_index()),
+                batch=per_process, size=self.image_size, min_size=self.min_image_size,
+                workers=self.loading.workers, threads=self.loading.threads,
+                timeout=self.timeout, retries=self.retries,
+                prefetch=self.loading.worker_buffer)
 
         return Dataset(train=tokenized(stream, tokenize), val=None,
                        records=len(rows), batch=batch)
