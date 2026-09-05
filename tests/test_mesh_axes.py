@@ -164,10 +164,13 @@ def dense_layout():
 
 
 TOPOLOGIES = {
-    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh.
+    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh,
+    # plus the sequence axis beside a data axis, where the batch rows split
+    # over data and fsdp and the sequence over its own axis.
     "fsdp": (MeshSpec(fsdp=8), dense_layout()),
     "tensor": (MeshSpec(fsdp=4, tensor=2), tensor_layout()),
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
+    "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
     "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), tensor_layout()),
 }
 
@@ -183,14 +186,15 @@ def test_every_topology_trains_the_same_losses(name):
 
 
 def test_topologies_agree_with_data_parallel():
-    """The largest difference across the four topologies, with its number."""
+    """The largest difference across the five topologies, with its number."""
     steps = 30
     runs = {name: np.array(run_losses(*spec, steps)) for name, spec in TOPOLOGIES.items()}
 
     difference = max(
         np.max(np.abs(first - second))
         for first in runs.values() for second in runs.values())
-    # Observed 0.0 across all four topologies and all 30 steps on CPU; the
-    # tolerance is 1e-6 because a different collective order on another
-    # backend is allowed to round differently.
+    # Observed 7.2e-7 between fsdp=4 and fsdp=2,sequence=2 and 0.0 among the
+    # other pairs over 30 steps on CPU; the tolerance is 1e-6 because a
+    # different collective order on another backend is allowed to round
+    # differently.
     assert difference < 1e-6, difference
