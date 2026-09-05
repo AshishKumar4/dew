@@ -4,12 +4,12 @@ Every recipe wires the same solver: a warmup-cosine schedule when one is
 asked for, weight decay folded into the optimizer's own kwargs, and
 global-norm clipping. That wiring is library behavior, so it lives here and
 the recipes call it. Gradient accumulation is the Trainer's, which wraps the
-solver in `optax.MultiSteps` itself.
+solver in `optax.MultiSteps`.
 
 The 'muon' entry is the production parameter-group split the labs converged
 on (docs/research/frontier-training.md:183): AdamW on the embeddings, the
 head, the router and the norms, Muon on the matrices. `optax.contrib.muon`
-owns the masked composition itself (it partitions with `optax.masked` per
+owns the masked composition (it partitions with `optax.masked` per
 group, optax/contrib/_muon.py:694), so what Dew supplies is the parameter
 spec that says which group a parameter belongs to and which of its axes are
 the matrix.
@@ -37,8 +37,8 @@ HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 # own (optax/contrib/_muon.py:56-74).
 BATCH_AXES = frozenset({'exp'})
 
-# A parameter that maps into or out of a discrete index is a lookup rather
-# than a matrix, so AdamW keeps the embeddings, the head and the router
+# A parameter that maps into or out of a discrete index is a lookup, so AdamW
+# keeps the embeddings, the head and the router
 # (docs/research/frontier-training.md:183). An expert dimension is one of
 # these when it is the output, where it counts the experts a router scores,
 # and a batch axis when it leads, where it stacks one matrix per expert.
@@ -51,7 +51,7 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
     A dimension continues the side before it when the declaration leaves it
     unnamed, as the spatial dimensions of a patch embedding are, or when it
     and its predecessor are both head dimensions. What is left has to be two
-    sides, one contracted and one output, which is what MaxText's per-name
+    sides, one contracted and one output, as MaxText's per-name
     table produces for its own trees (maxtext utils/muon_utils.py:100-175).
     """
     sides: list[list[int]] = []
@@ -78,8 +78,8 @@ def muon_weight_dimension_numbers(params):
     """A `MuonDimensionNumbers` per parameter, None where AdamW steps in.
 
     Which group a parameter lands in is read off the logical axes its module
-    declares (`dew.nn.sharding`), the table the sharding derivation already
-    reads, so one declaration answers both questions. A parameter of rank
+    declares (`dew.nn.sharding`), the table the sharding derivation reads,
+    so one declaration answers both questions. A parameter of rank
     below two, a bias, and a parameter that maps into or out of a discrete
     index, the vocabulary, the model's output space or the expert a router
     picks, go to AdamW, which is the split four labs cross-confirmed.
@@ -87,9 +87,8 @@ def muon_weight_dimension_numbers(params):
 
     An undeclared matrix of rank two takes Linen's kernel convention,
     contracting axis 0 into axis 1. An undeclared parameter of higher rank
-    raises: its matrix axes are exactly what this spec cannot guess, and
-    orthogonalizing the wrong pair would show up as a worse loss curve and
-    nothing else.
+    raises. Its matrix axes are what this spec cannot guess, and
+    orthogonalizing the wrong pair would show up as a worse loss curve.
 
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
@@ -146,9 +145,9 @@ def build_optimizer(config: "OptimConfig", steps: int) -> optax.GradientTransfor
     if config.weight_decay is not None:
         opts['weight_decay'] = config.weight_decay
         if config.optimizer == 'muon':
-            # Weight decay reaches the AdamW group too, which is where the
-            # norm scales live, the one place Moonlight calls it crucial
-            # for stability (docs/research/frontier-training.md:184).
+            # Weight decay reaches the AdamW group as well. That is where the
+            # norm scales live, and Moonlight calls it crucial for stability
+            # there (docs/research/frontier-training.md:184).
             opts.setdefault('adam_weight_decay', config.weight_decay)
     solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 
