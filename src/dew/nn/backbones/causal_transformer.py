@@ -104,9 +104,18 @@ class Mixture:
     is what Qwen3-MoE's decoder_sparse_step means; neither makes every layer
     sparse, which is Mixtral.
 
-    The routing options are `Router`'s: `score_function` softmax or sigmoid,
-    `scaling` on the routed output, `groups` with `groups_per_token` for
-    DeepSeek's node limit, and `bias` for its aux-loss-free balancing bias.
+    The routing options are `Router`'s: `score_function` softmax, sigmoid or
+    sqrtsoftplus, `scaling` on the routed output, `groups` with
+    `groups_per_token` for DeepSeek's node limit, and `bias` for its
+    aux-loss-free balancing bias.
+
+    `expert_features` is the routed experts' width, None for the model's
+    `mlp_features`; DeepSeek sizes its experts apart from its dense layers
+    (`moe_intermediate_size` beside `intermediate_size`). `shared_features`
+    is the width of the one dense gated MLP every token takes beside the
+    routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
+    as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
+    product is the whole record of them.
     """
 
     experts: int
@@ -118,6 +127,8 @@ class Mixture:
     groups: int = 1
     groups_per_token: int = 1
     bias: bool = False
+    expert_features: Optional[int] = None
+    shared_features: int = 0
 
     def __post_init__(self):
         if self.layers is not None:
@@ -132,6 +143,14 @@ class Mixture:
                 "sparse layers, so only one of them can be set")
         if self.every is not None and self.every < 1:
             raise ValueError(f"every must be positive, got {self.every}")
+        if self.expert_features is not None and self.expert_features < 1:
+            raise ValueError(
+                f"expert_features is the routed experts' width, got "
+                f"{self.expert_features}; None takes the model's mlp_features")
+        if self.shared_features < 0:
+            raise ValueError(
+                f"shared_features is the shared branch's width, got "
+                f"{self.shared_features}; 0 is a layer without one")
 
 
 @logical_axes({
@@ -176,7 +195,9 @@ class CausalSelfAttention(nn.Module):
     sliding_window: Optional[int] = None
     attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
     partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
+    partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
@@ -185,7 +206,11 @@ class CausalSelfAttention(nn.Module):
     def setup(self):
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
+        # The gate doubles the query projection: the reference chunks its
+        # output in half, one half the query and the other the gate the
+        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
+        self.q_proj = dense(
+            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, exactly as the reference
         # skips them (modeling_gemma4.py, Gemma4TextAttention.__init__).
@@ -209,7 +234,14 @@ class CausalSelfAttention(nn.Module):
                                        dtype=self.dtype, name='v_norm')
 
     def _rot_dim(self) -> int | None:
-        """Head dims the rotary rotates, or None for all of them."""
+        """Head dims the rotary rotates, or None for all of them.
+
+        `partial_rotary_type` says what the fraction means: 'proportional'
+        rotates the first rot_dim dims of a head_dim-wide rope and passes the
+        rest at frequency zero (Gemma 4), 'default' builds a rot_dim-wide rope
+        and leaves the rest unrotated (Qwen3.5); `rotary_freqs` names the
+        reference lines. Both rotate `int(head_dim * factor)` dims.
+        """
         factor = self.partial_rotary_factor
         if factor is None:
             return None
@@ -224,7 +256,16 @@ class CausalSelfAttention(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None):
         B, S, _ = x.shape
-        query = self.q_proj(x).reshape(B, S, self.num_heads, self.head_dim)
+        projected = self.q_proj(x)
+        gate = None
+        if self.output_gate:
+            # The reference views the doubled output as [.., heads, 2*head_dim]
+            # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
+            query, gate = jnp.split(
+                projected.reshape(B, S, self.num_heads, 2 * self.head_dim),
+                2, axis=-1)
+        else:
+            query = projected.reshape(B, S, self.num_heads, self.head_dim)
         if self.kv_shared:
             # The provider ran earlier in the same forward pass and stashed
             # its post-norm, post-rope keys and values with their positions,
@@ -261,7 +302,8 @@ class CausalSelfAttention(nn.Module):
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim())
+            positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+            partial_rotary_type=self.partial_rotary_type)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -321,6 +363,10 @@ class CausalSelfAttention(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask)
+        if gate is not None:
+            # The branch multiplies by the sigmoid of its gate, then projects
+            # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
+            attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
 
 @logical_axes({
@@ -440,7 +486,9 @@ class DecoderBlock(nn.Module):
         return getattr(self.mlp, 'activation', 'swiglu')
 
 @logical_axes({
-    ("eh_proj",): ("embed", "embed"),
+    # The input is two embed-width vectors concatenated, which no single name
+    # describes and the rules must not split twice; the output side shards.
+    ("eh_proj",): (None, "embed"),
 })
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
@@ -483,10 +531,12 @@ class MTPBlock(nn.Module):
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
 
-    def __call__(self, hidden, embeds, train: bool = False):
+    def __call__(self, hidden, embeds, train: bool = False,
+                 positions=None, segment_ids=None):
         fused = self.eh_proj(jnp.concatenate(
             [self.enorm(hidden), self.hnorm(embeds)], axis=-1))
-        return self.final_norm(self.block(fused, train=train))
+        return self.final_norm(self.block(
+            fused, train=train, positions=positions, segment_ids=segment_ids))
 
 
 @models("causal_transformer")
@@ -535,8 +585,17 @@ class CausalTransformer(nn.Module):
     widens the sharing layers' MLP, needs it.
 
     partial_rotary_factor rotates that fraction of an unwindowed kind's head
-    dims and passes the rest through, which is Gemma 4's global layers; a
-    windowed kind rotates whole.
+    dims and passes the rest through; a windowed kind rotates whole.
+    partial_rotary_type names which published convention the fraction
+    follows, because the two rotate different angles: 'proportional' is
+    Gemma 4's global layers (a head_dim-wide rope cut short), 'default' is
+    Qwen3.5's (a rope of the rotated width alone). The lines of each are
+    cited on `dew.nn.attention.rotary_freqs`. Interleaved mRoPE
+    (Qwen3.5's mrope_section) is the same rotation for text: with one
+    position per token the three grids' angles are equal and the interleave
+    reads the same value from each, so text-only input reduces exactly to
+    this partial rope (difference 0.0 against the reference's
+    apply_interleaved_mrope) and the image-grid positions are not modelled.
 
     `mixer` names the per-layer token mixer as a value from the `mixers`
     registry, one frozen dataclass per kind carrying the reference's field
@@ -550,8 +609,10 @@ class CausalTransformer(nn.Module):
     `num_nextn_predict_layers` stacks that many multi-token-prediction
     depths after the final norm, each an `MTPBlock` with the model-level
     mixer and a dense feed-forward; 0 is a plain decoder and leaves the
-    tree unchanged. A depth predicts one token further out, so depth d
-    scores what follows position p + d.
+    tree unchanged. Depth d pairs the previous depth's state at position p
+    with the embedding of the token at p + d and scores what follows p + d
+    (arXiv 2412.19437, section 2.2), so each depth is one position shorter
+    than the last.
     """
     vocab_size: int
     emb_features: int = 512
@@ -564,6 +625,7 @@ class CausalTransformer(nn.Module):
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
     partial_rotary_factor: Optional[float] = None  # None: every dim rotates
+    partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
     kinds: Optional[Mapping[str, LayerKind]] = None  # what each named kind does
     norm_eps: float = 1e-5
@@ -574,6 +636,7 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
     tie_embeddings: bool = True
@@ -719,12 +782,14 @@ class CausalTransformer(nn.Module):
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
             attention_scale=self.attention_scale,
+            output_gate=self.output_gate,
             dtype=self.dtype,
             precision=self.precision,
             attention_impl=self.attention_impl,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             partial_rotary_factor=(None if kind.window is not None
-                                   else self.partial_rotary_factor))
+                                   else self.partial_rotary_factor),
+            partial_rotary_type=self.partial_rotary_type)
 
     def setup(self):
         types = self.per_layer_types
@@ -753,6 +818,10 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "partial_rotary_factor must be within (0, 1], "
                 f"got {self.partial_rotary_factor}")
+        if self.partial_rotary_type not in ('proportional', 'default'):
+            raise ValueError(
+                "partial_rotary_type names the convention of a partial rotary, "
+                f"'proportional' or 'default', got {self.partial_rotary_type!r}")
         sparse = self.sparse_layers
         outside = sorted(index for index in sparse
                          if not 0 <= index < self.num_layers)
@@ -794,11 +863,24 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
         mixture = self.mixture
+        # The shared branch is the dense feed-forward at the mixture's shared
+        # width, handed to the sparse layer as a factory the way the block
+        # takes its own slots.
+        shared = None if mixture is None or not mixture.shared_features else (
+            functools.partial(
+                GatedMLP,
+                hidden_features=mixture.shared_features,
+                out_features=self.emb_features,
+                activation=self.mlp,
+                dtype=self.dtype,
+                precision=self.precision))
         routed = None if mixture is None else functools.partial(
             SparseMLP,
             num_experts=mixture.experts,
             top_k=mixture.top_k,
-            hidden_features=self.hidden_features,
+            hidden_features=(self.hidden_features
+                             if mixture.expert_features is None
+                             else mixture.expert_features),
             out_features=self.emb_features,
             activation=self.mlp,
             score_function=mixture.score_function,
@@ -806,6 +888,7 @@ class CausalTransformer(nn.Module):
             expert_groups=mixture.groups,
             groups_per_token=mixture.groups_per_token,
             expert_bias=mixture.bias,
+            shared=shared,
             dtype=self.dtype,
             precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
@@ -878,7 +961,8 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_logits(x, tokens, train=train)
+            self.mtp_hidden_states(x, tokens, train=train, positions=positions,
+                                   segment_ids=segment_ids)
         return self._logits(x)
 
     def _logits(self, x):
@@ -897,23 +981,43 @@ class CausalTransformer(nn.Module):
             logits = cap * jnp.tanh(logits / cap)
         return logits
 
-    def mtp_logits(self, hidden, tokens, train: bool = False):
-        """One `[B, S, vocab]` fp32 logits array per prediction depth.
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False,
+                          positions=None, segment_ids=None):
+        """One `[B, S - d, D]` final-normed state array per prediction depth d.
 
-        Depth d reads the previous hidden states and the token embeddings
-        and scores what follows each position d tokens out, through the
-        shared head. Empty without prediction depths.
+        Depth d reads the previous depth's states at positions p and the
+        embeddings of the tokens at p + d, the sequence one shorter per
+        depth, so its state at p is what scores the token after p + d
+        through the shared head (`mtp_logits`, or a chunked loss over
+        `head_weight`). `positions` and `segment_ids` are the main forward's,
+        sliced with the states, so a packed batch keeps its documents apart
+        in the depths too. Empty without prediction depths; a sequence with
+        no position d tokens out raises.
 
         A plain init of the main forward holds these depths too: `__call__`
         reaches them while initializing, so the tree does not depend on which
         method built it.
         """
+        if self.mtp and tokens.shape[1] <= len(self.mtp):
+            raise ValueError(
+                f"{len(self.mtp)} prediction depths need more than "
+                f"{len(self.mtp)} tokens, got {tokens.shape[1]}")
         embeds = self.embed_tokens(tokens)
-        depth_logits = []
-        for block in self.mtp:
-            hidden = block(hidden, embeds, train=train)
-            depth_logits.append(self._logits(hidden))
-        return depth_logits
+        states = []
+        for depth, block in enumerate(self.mtp, start=1):
+            hidden = block(
+                hidden[:, :-1], embeds[:, depth:], train=train,
+                positions=None if positions is None else positions[:, :-depth],
+                segment_ids=None if segment_ids is None else segment_ids[:, :-depth])
+            states.append(hidden)
+        return states
+
+    def mtp_logits(self, hidden, tokens, train: bool = False,
+                   positions=None, segment_ids=None):
+        """One `[B, S - d, vocab]` fp32 logits array per prediction depth d:
+        the depth states of `mtp_hidden_states` through the shared head."""
+        return [self._logits(state) for state in self.mtp_hidden_states(
+            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids)]
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None):

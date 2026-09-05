@@ -3,15 +3,18 @@ and the expert mesh axis.
 
 The parity fixtures come from transformers 5.16.1 through
 tools/moe_reference.py: `MixtralSparseMoeBlock` for softmax routing and the
-block output, and the router of `DeepseekV3MoE` for sigmoid scores, the
-selection bias and the group limit. Everything runs at fp32 on CPU, and each
-parity test states its tolerance and the largest difference observed.
+block output, `DeepseekV3MoE` for sigmoid scores, the selection bias, the
+group limit and the shared expert, and DeepSeek V4's router and experts for
+sqrt(softplus) scores and the swiglu limit. Everything runs at fp32 on CPU,
+and each parity test states its tolerance and the largest difference
+observed.
 
 Slot order inside a token's top-k carries no meaning: the reference calls
 `torch.topk(sorted=False)` and both implementations sum over the k slots, so
 the comparisons sort each token's slots by expert id first.
 """
 
+import functools
 import json
 import os
 import subprocess
@@ -217,6 +220,144 @@ def test_the_expert_block_reproduces_the_mixtral_block_output():
     # contribution into a zeroed buffer while the ragged path sums a token's
     # k slots, so the two differ in summation order alone.
     assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < 2e-5
+
+
+def deepseek_block(shared: bool = True) -> SparseMLP:
+    """`DeepseekV3MoE` as a SparseMLP: its router, experts and shared branch."""
+    config = CONFIG["deepseek"]
+    width = config["moe_intermediate_size"]
+    return SparseMLP(
+        num_experts=config["n_routed_experts"],
+        top_k=config["num_experts_per_tok"],
+        hidden_features=width, out_features=config["hidden_size"],
+        score_function='sigmoid',
+        routed_scaling_factor=config["routed_scaling_factor"],
+        expert_groups=config["n_group"], groups_per_token=config["topk_group"],
+        expert_bias=True,
+        shared=None if not shared else functools.partial(
+            GatedMLP, hidden_features=width * config["n_shared_experts"],
+            out_features=config["hidden_size"]))
+
+
+def deepseek_variables(tensors, shared: bool = True) -> dict:
+    config = CONFIG["deepseek"]
+    variables = sparse_variables(tensors, config["n_routed_experts"])
+    variables["moe"] = {"gate": {"e_score_correction_bias": jnp.asarray(
+        tensors["mlp.gate.e_score_correction_bias"])}}
+    if shared:
+        variables["params"]["shared_experts"] = {
+            projection: {"kernel": jnp.asarray(
+                tensors[f"mlp.shared_experts.{projection}.weight"].T)}
+            for projection in ("gate_proj", "up_proj", "down_proj")}
+    return variables
+
+
+def test_the_expert_block_reproduces_the_deepseek_block_output():
+    """`DeepseekV3MoE` end to end: the group-limited router, the routed
+    experts scaled by 2.5, and the shared expert every token takes, summed.
+
+    Tolerance 2e-5; largest observed difference 7.63e-06 at fp32 on CPU, on
+    outputs that reach 34.9, the same summation-order spread as Mixtral's.
+    """
+    tensors = fixture("deepseek")
+    output = deepseek_block().apply(deepseek_variables(tensors),
+                                    jnp.asarray(tensors["hidden"]))
+    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) < 2e-5
+
+
+def test_deepseek_parity_needs_the_shared_branch():
+    """The mutation: the same block without its shared expert is the routed
+    sum alone, which the reference output is not."""
+    tensors = fixture("deepseek")
+    output = deepseek_block(shared=False).apply(
+        deepseek_variables(tensors, shared=False), jnp.asarray(tensors["hidden"]))
+    assert np.max(np.abs(np.asarray(output) - tensors["block_output"])) > 0.1
+
+
+def v4_router(**overrides) -> Router:
+    config = CONFIG["deepseek_v4"]
+    settings = dict(score_function='sqrtsoftplus',
+                    routed_scaling_factor=config["routed_scaling_factor"],
+                    expert_bias=True)
+    settings.update(overrides)
+    return Router(num_experts=config["num_local_experts"],
+                  in_features=config["hidden_size"],
+                  top_k=config["num_experts_per_tok"], **settings)
+
+
+def test_router_reproduces_the_deepseek_v4_sqrt_softplus_choice():
+    """`DeepseekV4TopKRouter`: sqrt(softplus) scores, the selection bias,
+    renormalise, scale.
+
+    Tolerance 1e-6; largest observed difference 1.19e-07 at fp32 on CPU.
+    """
+    tensors = fixture("deepseek_v4")
+    hidden = jnp.asarray(tensors["hidden"])
+    weights, indices = v4_router().apply(router_variables(tensors, bias=True), hidden)
+
+    theirs_indices, theirs_weights = by_expert(
+        tensors["router_indices"], tensors["router_weights"])
+    ours_indices, ours_weights = by_expert(
+        indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
+    assert np.array_equal(ours_indices, theirs_indices)
+    assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
+
+
+def test_v4_parity_needs_the_sqrt_softplus():
+    """A sigmoid over the same logits renormalises to other gate values."""
+    tensors = fixture("deepseek_v4")
+    hidden = jnp.asarray(tensors["hidden"])
+    weights, indices = v4_router(score_function='sigmoid').apply(
+        router_variables(tensors, bias=True), hidden)
+    _, theirs_weights = by_expert(tensors["router_indices"], tensors["router_weights"])
+    _, ours_weights = by_expert(
+        indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
+    assert np.max(np.abs(ours_weights - theirs_weights)) > 0.01
+
+
+def v4_experts(swiglu_limit) -> ExpertMLP:
+    config = CONFIG["deepseek_v4"]
+    return ExpertMLP(num_experts=config["num_local_experts"],
+                     hidden_features=config["intermediate_size"],
+                     out_features=config["hidden_size"], swiglu_limit=swiglu_limit)
+
+
+def test_the_experts_reproduce_the_deepseek_v4_clamped_output():
+    """`DeepseekV4Experts` on the router's choice: the gate capped at
+    swiglu_limit from above and the up projection on both sides, then silu.
+
+    Tolerance 2e-5; largest observed difference 4.77e-07 at fp32 on CPU, on
+    outputs that reach 3.1; without the clamp the same weights are off by 25.
+    """
+    tensors = fixture("deepseek_v4")
+    config = CONFIG["deepseek_v4"]
+    variables = {"params": sparse_variables(
+        tensors, config["num_local_experts"])["params"]["experts"]}
+    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, config["hidden_size"])
+    output = v4_experts(config["swiglu_limit"]).apply(
+        variables, hidden, jnp.asarray(tensors["router_weights"]),
+        jnp.asarray(tensors["router_indices"]))
+    assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) < 2e-5
+
+
+def test_v4_parity_needs_the_clamp():
+    """The unclamped experts on the same weights disagree, so the limit is
+    what the fixture tests."""
+    tensors = fixture("deepseek_v4")
+    config = CONFIG["deepseek_v4"]
+    variables = {"params": sparse_variables(
+        tensors, config["num_local_experts"])["params"]["experts"]}
+    hidden = jnp.asarray(tensors["hidden"]).reshape(-1, config["hidden_size"])
+    output = v4_experts(None).apply(
+        variables, hidden, jnp.asarray(tensors["router_weights"]),
+        jnp.asarray(tensors["router_indices"]))
+    assert np.max(np.abs(np.asarray(output) - tensors["experts_output"])) > 0.1
+
+
+def test_a_swiglu_limit_that_clamps_nothing_is_rejected():
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        v4_experts(0.0).init(jax.random.key(0), jnp.zeros((4, 16)),
+                             jnp.ones((4, 2)), jnp.zeros((4, 2), jnp.int32))
 
 
 # --------------------------------------------------------------------------
@@ -467,6 +608,34 @@ def test_the_expert_leaves_hold_every_expert_of_the_reference_layout():
     assert variables["params"]["layers_0"]["mlp"]["gate"]["kernel"].shape == (32, 8)
     dense = variables["params"]["layers_1"]["mlp"]
     assert dense["gate_proj"]["kernel"].shape == (32, 64)
+
+
+def test_the_mixture_sizes_the_experts_and_the_shared_branch_apart():
+    """DeepSeek's layout: routed experts at moe_intermediate_size, one dense
+    shared MLP at n_shared_experts times that, and the dense layers at the
+    model's own width, each a leaf where the checkpoint's tensor lands."""
+    model = decoder(emb_features=32, mixture=Mixture(
+        experts=8, top_k=2, layers=(0,), expert_features=24, shared_features=48))
+    variables = model.init(jax.random.key(0), jnp.zeros((2, SEQ_LEN), jnp.int32))
+    mlp = variables["params"]["layers_0"]["mlp"]
+
+    assert mlp["experts"]["gate_proj"]["kernel"].shape == (8, 32, 24)
+    assert mlp["experts"]["down_proj"]["kernel"].shape == (8, 24, 32)
+    assert mlp["shared_experts"]["gate_proj"]["kernel"].shape == (32, 48)
+    assert mlp["shared_experts"]["up_proj"]["kernel"].shape == (32, 48)
+    assert mlp["shared_experts"]["down_proj"]["kernel"].shape == (48, 32)
+    assert variables["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"].shape == (32, 64)
+    logits = model.apply(variables, jnp.zeros((2, SEQ_LEN), jnp.int32))
+    assert bool(jnp.all(jnp.isfinite(logits)))
+
+
+@pytest.mark.parametrize("mixture, message", [
+    (dict(experts=8, expert_features=0), "expert_features"),
+    (dict(experts=8, shared_features=-1), "shared_features"),
+])
+def test_a_misconfigured_width_is_rejected(mixture, message):
+    with pytest.raises(ValueError, match=message):
+        Mixture(**mixture)
 
 
 def test_an_expert_layer_and_a_dense_layer_agree_at_one_expert():

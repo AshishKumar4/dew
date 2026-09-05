@@ -22,6 +22,16 @@ Tolerances and the differences actually observed, fp32 on CPU:
   tiny config with every Gemma 4 gap at once: partial rotary, mixed head
   dims, double-wide MLP, KV sharing, per-layer inputs and the values norm.
   The logit cap is absent because the text path never reads it.
+- deepseek-v3-tiny : max |logit difference| 4.4e-06, tolerance 1e-4. MLA
+  with q and kv LoRA, the released YaRN spelling, a dense layer over a
+  routed one with a shared expert, the group limit and the balancing bias.
+- deepseek-v32-tiny: max |logit difference| 3.6e-06, tolerance 1e-4. The
+  same over the sparse indexer; the dense mixer on the same weights differs
+  from the fixture by 3.8, so the fixture is the sparse model.
+- qwen35-tiny : max |logit difference| 9.1e-05, tolerance 5e-4, on logits of
+  magnitude 6.8. Three gated delta net layers and one gated attention layer
+  with a sliced quarter-head rope; the delta net's own numbers are in
+  tests/test_linear_attention.py.
 """
 
 import json
@@ -42,6 +52,7 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
+DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -161,17 +172,19 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
         translate_config(factor_only)
 
 
-@pytest.mark.parametrize("name", TINY)
-def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
-    """Same paths, same shapes, same dtypes as a freshly initialised model."""
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+def test_translated_weights_are_exactly_the_models_variables(name, rng):
+    """Same collections, same paths, same shapes, same dtypes as a freshly
+    initialised model: `params` for every family, and the `moe` collection
+    DeepSeek's routers keep their bias in."""
     config = translate_config(fixture_config(name))
     built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
     model = models.build('causal_transformer', **built)
-    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
 
     from dew.interop.hf_decoders import _load_shards
-    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config)['params'])
+    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config))
 
     assert set(loaded) == set(initialised)
     for path, leaf in loaded.items():
@@ -179,7 +192,7 @@ def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY)
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
@@ -321,8 +334,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
         expected['.'.join(path)] = (tuple(reversed(shape))
                                     if path[-1] == 'kernel' else shape)
 
-    tree = jax.eval_shape(
-        lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    tree = jax.eval_shape(lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32)))
     initialised = {path: leaf.shape for path, leaf in flat_tree(tree).items()}
 
     assert initialised == expected
@@ -751,3 +763,346 @@ def test_a_gemma3_pattern_keeps_its_last_layer():
     config = fixture_config("gemma3-1b")
 
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
+
+
+def test_the_router_bias_lands_in_the_moe_collection():
+    """DeepSeek's `e_score_correction_bias` is router state a training step
+    moves, not a weight, and `Router` keeps it in the `moe` collection. The
+    checkpoint names it `model.layers.N.mlp.gate.e_score_correction_bias`,
+    six dot-separated parts, one fewer than the per-expert tensors the map
+    also reads under `mlp`; a map that counts it as seven falls through to
+    the params map and refuses the name. Its leaf is the checkpoint's tensor
+    and the loaded model selects on it: zeroing the bias moves the logits by
+    2.1 on deepseek-v3-tiny.
+    """
+    from dew.interop.hf_decoders import _dew_path, _load_shards
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    config = translate_config(fixture_config("deepseek-v3-tiny"))
+    tensors = _load_shards(directory)
+    name = 'model.layers.1.mlp.gate.e_score_correction_bias'
+    assert _dew_path(name, config) == (
+        'moe', 'layers_1', 'mlp', 'gate', 'e_score_correction_bias')
+
+    variables = translate_weights(tensors, config)
+    assert set(flat_tree(variables['moe'])) == {
+        'layers_1.mlp.gate.e_score_correction_bias'}
+    assert np.array_equal(
+        variables['moe']['layers_1']['mlp']['gate']['e_score_correction_bias'],
+        tensors[name])
+    assert not [path for path in flat_tree(variables['params'])
+                if path.endswith('e_score_correction_bias')]
+
+    model, loaded, _ = fp32_decoder(directory)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    zeroed = {**loaded, 'moe': jax.tree.map(jnp.zeros_like, loaded['moe'])}
+    moved = float(np.max(np.abs(np.asarray(model.apply(loaded, ids))
+                                - np.asarray(model.apply(zeroed, ids)))))
+    assert moved > 1.0, moved
+
+
+def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
+    """The tree check holds every collection to account, so a checkpoint
+    that drops the balancing bias fails naming the leaf instead of loading
+    a router at zeros."""
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import save_hf_layout
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    tensors = _load_shards(directory)
+    del tensors['model.layers.1.mlp.gate.e_score_correction_bias']
+    save_hf_layout(tensors, fixture_config("deepseek-v3-tiny"), str(tmp_path))
+
+    with pytest.raises(ValueError, match=r"missing \['moe\.layers_1\.mlp\.gate\.e_score_correction_bias'\]"):
+        fp32_decoder(tmp_path)
+
+
+def test_deepseek_configs_translate_field_by_field():
+    """The V3 config becomes the mla mixer record with the released YaRN
+    spelling and the mixture DeepseekV3MoE builds: a dense first layer, eight
+    sigmoid-scored experts in four groups with two per token, top-4 scaled
+    by 2.5, the balancing bias, and one shared expert of the routed width.
+    V3.2 adds the indexer's three fields and names its sparse layer kind."""
+    v3 = translate_config(fixture_config("deepseek-v3-tiny"))
+    v32 = translate_config(fixture_config("deepseek-v32-tiny"))
+
+    assert v3['mixer'] == {
+        'kind': 'mla', 'q_lora_rank': 8, 'kv_lora_rank': 8,
+        'qk_nope_head_dim': 8, 'qk_rope_head_dim': 8, 'v_head_dim': 8,
+        'rope_interleave': True,
+        'yarn': {'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 40.0,
+                 'original_max_position_embeddings': 4096, 'beta_fast': 32.0,
+                 'beta_slow': 1.0, 'mscale': 1.0, 'mscale_all_dim': 1.0,
+                 'truncate': True, 'attention_factor': None},
+        'index_topk': None, 'index_n_heads': None, 'index_head_dim': None,
+    }
+    assert v3['mixture'] == {
+        'experts': 8, 'top_k': 4, 'layers': (1,), 'score_function': 'sigmoid',
+        'scaling': 2.5, 'groups': 4, 'groups_per_token': 2, 'bias': True,
+        'shared_features': 16, 'expert_features': 16,
+    }
+    assert v3['head_dim'] == 16 and v3['scale_after_cast'] and not v3['qk_norm']
+    assert v3['layer_types'] == ('full_attention', 'full_attention')
+
+    assert v32['mixer'] == {**v3['mixer'], 'index_topk': 4, 'index_n_heads': 8,
+                            'index_head_dim': 16}
+    assert v32['mixture'] == v3['mixture']
+    assert v32['layer_types'] == ('deepseek_sparse_attention',) * 2
+
+
+def test_the_v32_fixture_is_the_sparse_model():
+    """The dense mixer on deepseek-v32-tiny's weights differs from the
+    fixture by 3.8, so the parity above covers the indexer's selection; a
+    generator that lost the eager mask fold again would fail here."""
+    directory = FIXTURES / "deepseek-v32-tiny"
+    _, variables, built = fp32_decoder(directory)
+    dense = models.build('causal_transformer', **{
+        **built, 'mixer': {**built['mixer'], 'index_topk': None,
+                           'index_n_heads': None, 'index_head_dim': None}})
+    params = {layer: ({**block, 'self_attn': {name: leaf for name, leaf
+                                              in block['self_attn'].items()
+                                              if name != 'indexer'}}
+                      if layer.startswith('layers_') else block)
+              for layer, block in variables['params'].items()}
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+
+    logits = np.asarray(dense.apply({**variables, 'params': params}, ids))
+    assert float(np.max(np.abs(logits - np.load(directory / "logits.npy")))) > 1.0
+
+
+@pytest.mark.parametrize("name", DEEPSEEK)
+def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
+    """The writer covers the three attention families; a model with the mla
+    mixer is refused naming the mixer, and one with routed experts on
+    standard attention naming the mixture, instead of writing a checkpoint
+    without their tensors."""
+    model, variables, _ = fp32_decoder(FIXTURES / name)
+    with pytest.raises(ValueError, match="a mixer other than attention"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+    config = translate_config(fixture_config(name))
+    routed = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**config, "mixer": None, "head_dim": None,
+                               "layer_types": None, "kinds": {}},
+        dtype="float32", attention_impl="reference"))
+    variables = routed.init(rng, jnp.ones((1, 4), jnp.int32))
+    with pytest.raises(ValueError, match="a model with a mixture"):
+        save_pretrained_decoder(routed, variables, str(tmp_path))
+
+
+# --------------------------------------------------------------------------
+# Qwen3.5: gated delta net layers, a gated attention, a sliced partial rotary
+# --------------------------------------------------------------------------
+
+QWEN35_REAL = FIXTURES / "qwen35-0.8b"
+
+
+def qwen35_real_config():
+    """The released Qwen/Qwen3.5-0.8B config's text decoder; the repo's own
+    config.json is the multimodal wrapper around it."""
+    return json.loads((QWEN35_REAL / "config.json").read_text())["text_config"]
+
+
+def test_qwen35_config_translates_field_by_field():
+    """The tiny hybrid: three linear_attention layers carrying the delta
+    net's geometry as the kind's record, one full_attention layer riding
+    the model's gated attention, the (1 + w) norms, a quarter-head rope in
+    the 'default' convention, and the reference's rope_theta."""
+    config = translate_config(fixture_config("qwen35-tiny"))
+
+    assert config["layer_types"] == ("linear_attention",) * 3 + ("full_attention",)
+    assert config["kinds"] == {"linear_attention": {"mixer": {
+        "kind": "gated_delta_net", "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4, "linear_key_head_dim": 12,
+        "linear_value_head_dim": 16, "linear_conv_kernel_dim": 4}}}
+    assert config["output_gate"] and config["qk_norm"] and config["scale_offset"]
+    assert not config["scale_after_cast"] and "sandwich_norms" not in config
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["partial_rotary_type"] == "default"
+    assert config["rope_theta"] == 1000000.0
+    assert config["head_dim"] == 32 and config["num_kv_heads"] == 2
+    assert config["tie_embeddings"] and config["mlp"] == "swiglu"
+
+
+def test_the_real_qwen35_0_8b_config_translates():
+    """Qwen/Qwen3.5-0.8B's text_config, field for field: 24 layers in the
+    3:1 pattern, 16 key and value heads of 128 in the delta net, 8 query
+    and 2 key/value heads of 256 in the attention, a 64-dim rope at theta
+    1e7, tied embeddings, and the MTP and mRoPE fields mapping to nothing
+    because the reference's text forward reads none of them."""
+    config = translate_config(qwen35_real_config())
+
+    assert config["num_layers"] == 24
+    assert config["layer_types"].count("full_attention") == 6
+    assert config["layer_types"][3::4] == ("full_attention",) * 6
+    assert config["kinds"]["linear_attention"]["mixer"] == {
+        "kind": "gated_delta_net", "linear_num_key_heads": 16,
+        "linear_num_value_heads": 16, "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4}
+    assert config["num_heads"] == 8 and config["num_kv_heads"] == 2
+    assert config["head_dim"] == 256 and config["emb_features"] == 1024
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["partial_rotary_type"] == "default"
+    assert config["rope_theta"] == 10000000.0
+    assert config["output_gate"] and config["tie_embeddings"]
+    assert config["max_seq_len"] == 8192
+
+
+def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
+    """The partial rotary convention, pinned to the reference's numbers: on
+    the real config's head_dim 256 and factor 0.25 the reference builds a
+    64-dim rope with exponents over 64 (Qwen3_5TextRotaryEmbedding.
+    compute_default_rope_parameters, modeling_qwen3_5.py:117-124), 32
+    inverse frequencies with no zero tail. Gemma 4's proportional reading
+    of the same factor puts the exponents over 256, whose frequencies
+    differ from these by up to 4.7e-01, so a translation that guessed the
+    convention would rotate every position by different angles. Largest
+    observed cosine difference at 5 positions 6.3e-08."""
+    from dew.nn.attention import rotary_freqs
+
+    config = translate_config(qwen35_real_config())
+    inv_freq = np.load(QWEN35_REAL / "inv_freq.npy")
+    assert inv_freq.shape == (32,)
+    rot_dim = int(config["head_dim"] * config["partial_rotary_factor"])
+    assert rot_dim == 64
+
+    positions = np.arange(5)
+    cos, _ = rotary_freqs(jnp.asarray(positions), config["head_dim"], config["rope_theta"],
+                          rot_dim=rot_dim, partial_rotary_type=config["partial_rotary_type"])
+    assert cos.shape == (5, 32)
+    assert float(np.max(np.abs(np.asarray(cos) - np.cos(positions[:, None] * inv_freq[None])))) < 1e-6
+
+    proportional, _ = rotary_freqs(jnp.asarray(positions), config["head_dim"], config["rope_theta"],
+                                   rot_dim=rot_dim, partial_rotary_type="proportional")
+    assert proportional.shape == (5, 128)
+    assert not np.allclose(np.asarray(proportional)[:, :32],
+                           np.cos(positions[:, None] * inv_freq[None]), atol=1e-2)
+
+
+def test_qwen35_logits_match_the_reference_implementation():
+    """Full-model parity on the tiny hybrid: the delta net layers, the gated
+    attention with its sliced quarter-head rope (the reference applies its
+    interleaved mRoPE to text-only positions, which is this rope exactly),
+    the (1 + w) norms and the tied head. Largest observed max |logit
+    difference| 9.1e-05 on logits of magnitude 6.8, tolerance 5e-4, every
+    argmax equal. Translating the rope as Gemma 4's proportional convention
+    instead moves the logits by 7.8e-01."""
+    directory = FIXTURES / "qwen35-tiny"
+    model, variables, _ = fp32_decoder(directory)
+    ids = np.load(directory / "input_ids.npy")
+    reference = np.load(directory / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_qwen35_weights_are_exactly_the_models_param_tree(rng):
+    """The linear_attn tensors land under self_attn with the checkpoint's
+    leaf names, the doubled q_proj fits the gated attention, and nothing is
+    left over or missing."""
+    from dew.interop.hf_decoders import _load_shards
+
+    config = translate_config(fixture_config("qwen35-tiny"))
+    built = with_precision("causal_transformer", dict(config),
+                           dtype="float32", attention_impl="reference")
+    model = models.build("causal_transformer", **built)
+    expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
+    loaded = flat_tree(translate_weights(
+        _load_shards(FIXTURES / "qwen35-tiny"), config)["params"])
+
+    assert set(loaded) == set(expected)
+    assert {name: leaf.shape for name, leaf in loaded.items()} == {
+        name: leaf.shape for name, leaf in expected.items()}
+    assert loaded["layers_0.self_attn.conv1d.weight"].shape == (112, 1, 4)
+    assert loaded["layers_3.self_attn.q_proj.kernel"].shape == (64, 2 * 4 * 32)
+
+
+def test_a_qwen35_config_without_layer_types_derives_the_reference_pattern():
+    """Qwen3_5TextConfig fills the pattern from full_attention_interval
+    (configuration_qwen3_5.py:112-117); the expected pattern comes from the
+    reference class, not from a copy of the rule."""
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    config = {**fixture_config("qwen35-tiny"), "num_hidden_layers": 6,
+              "full_attention_interval": 3}
+    del config["layer_types"]
+
+    derived = translate_config(config)["layer_types"]
+
+    reference = Qwen3_5TextConfig(**{**config, "layer_types": None}).layer_types
+    assert derived == tuple(reference)
+    assert derived == ("linear_attention", "linear_attention", "full_attention") * 2
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("attn_output_gate", False, "attn_output_gate"),
+    ("layer_types", ["mamba"] * 4, "linear_attention or full_attention"),
+    ("rope_parameters", {"rope_type": "yarn", "rope_theta": 1e6, "factor": 4.0},
+     "rope_type 'yarn'"),
+    ("rope_parameters", {"rope_type": "default", "rope_theta": 1e6, "factor": 4.0},
+     "scaling fields"),
+])
+def test_a_qwen35_field_with_no_counterpart_is_refused(field, value, message):
+    """Every knob the 5.16.1 reference cannot honour or dew cannot express
+    names itself: the attention gate is never off in the reference, a
+    Qwen3.5 layer is linear or full attention, and rope is plain."""
+    config = {**fixture_config("qwen35-tiny"), field: value}
+    with pytest.raises(ValueError, match=message):
+        translate_config(config)
+
+
+def test_the_qwen35_wrapper_config_is_refused_by_name():
+    """Qwen/Qwen3.5-0.8B's config.json is the multimodal wrapper; the text
+    decoder is its text_config and the weights sit under
+    model.language_model.*, so the wrapper refuses like Gemma's."""
+    with pytest.raises(ValueError, match="text_config"):
+        translate_config(json.loads((QWEN35_REAL / "config.json").read_text()))
+
+
+def test_the_mtp_weights_of_a_qwen35_checkpoint_are_dropped_like_the_reference_drops_them():
+    """The released checkpoints carry mtp.* tensors that the reference lists
+    in _keys_to_ignore_on_load_unexpected (modeling_qwen3_5.py:807), so no
+    reference forward reads them and they map to nothing; any other
+    unfamiliar name still raises."""
+    config = translate_config(fixture_config("qwen35-tiny"))
+    tensors = {"mtp.layers.0.self_attn.q_proj.weight": np.zeros((8, 64), np.float32)}
+    assert translate_weights(tensors, config) == {"params": {}}
+    with pytest.raises(ValueError, match="unknown tensor name"):
+        translate_weights({"model.layers.0.linear_attn.nope.weight": np.zeros((4,), np.float32)},
+                          config)
+
+
+def test_export_refuses_the_qwen35_features(tmp_path):
+    """Neither the gate, the delta net kind nor the partial rotary has a
+    place in the three exported families."""
+    model, variables, _ = fp32_decoder(FIXTURES / "qwen35-tiny")
+    with pytest.raises(ValueError, match="output_gate"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
+    """The loaded weights through the cache: a prefill and single-token
+    steps against the parallel forward, every argmax equal. Largest
+    observed logit difference 1.3e-05."""
+    directory = FIXTURES / "qwen35-tiny"
+    model, variables, _ = fp32_decoder(directory, max_seq_len=16)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    full = model.apply(variables, ids)
+
+    cache = model.apply(variables, ids.shape[0], method=type(model).init_cache,
+                        mutable=["cache"])[1]["cache"]
+    logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
+                                  decode=True, mutable=["cache"])
+    steps = [logits[:, -1]]
+    for position in range(4, ids.shape[1]):
+        logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
+                                      decode=True, mutable=["cache"])
+        steps.append(logits[:, -1])
+    incremental = jnp.stack(steps, axis=1)
+
+    difference = float(jnp.abs(full[:, 3:] - incremental).max())
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
