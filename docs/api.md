@@ -59,7 +59,7 @@ The public modules and the names each exports. This page is written by
 | `dew.nn` |  |
 | `dew.nn.backbones` | `Unet`, `UViT`, `SimpleUDiT`, `SimpleDiT`, `SimpleMMDiT`, `HierarchicalMMDiT`, `HybridSSMAttentionDiT`, `CausalTransformer`, `VideoDiT`, `UNet3D` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
-| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `SparseMLP`, `calculate_load_balance_updates` |
+| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `SparseMLP`, `calculate_load_balance_updates`, `deepseek_v2_aux_loss` |
 | `dew.nn.text_encoders` | `CLIP`, `CLIPAttention`, `CLIPEncoderLayer`, `CLIPMLP`, `CLIPModel`, `CLIPTextModel`, `CLIPTextTransformer`, `CLIPTowerOutput`, `CLIPVisionTransformer`, `T5Block`, `T5DenseGatedGeluDense`, `T5DenseReluDense`, `T5EncoderModel`, `T5EncoderTransformer`, `T5LayerNorm`, `T5SelfAttention`, `quick_gelu`, `translate_clip_config`, `translate_clip_weights`, `translate_config`, `translate_t5_config`, `translate_t5_weights`, `translate_vision_config`, `translate_weights` |
 | `dew.nn.sharding` | `declared_axes`, `is_heuristic`, `logical_axes`, `parameter_path` |
 

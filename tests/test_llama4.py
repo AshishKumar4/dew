@@ -8,6 +8,7 @@ parity test states its tolerance and the largest difference observed.
 """
 
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -27,10 +28,11 @@ def fixture(name: str) -> dict:
         return {key: np.asarray(value) for key, value in data.items()}
 
 
-def attention(**overrides) -> Llama4Attention:
-    settings = dict(emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS,
-                    head_dim=HEAD_DIM, max_seq_len=32, rope_theta=500000.0,
-                    floor_scale=4.0, attn_scale=0.1)
+def attention(**overrides: Any) -> Llama4Attention:
+    settings: dict[str, Any] = dict(
+        emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM, max_seq_len=32, rope_theta=500000.0,
+        floor_scale=4.0, attn_scale=0.1)
     settings.update(overrides)
     return Llama4Attention(**settings)
 
@@ -91,7 +93,7 @@ def test_decode_matches_prefill_on_both_rules():
     for settings in (dict(use_rope=True, attention_chunk_size=4), dict(use_rope=False)):
         module = attention(**settings)
         variables = attention_variables(tensors)
-        whole = module.apply(variables, hidden)
+        whole = jnp.asarray(module.apply(variables, hidden))
         # The first decode call allocates the cache without writing it.
         state = {**module.init(jax.random.key(0), hidden[:, :1], decode=True), **variables}
         steps = []
@@ -142,5 +144,5 @@ def test_input_scaling_reaches_the_router_gradient():
                        score_function="sigmoid", normalize_weights=False, scale_inputs=True)
     hidden = jax.random.normal(jax.random.PRNGKey(0), (2, 5, HIDDEN))
     variables = module.init(jax.random.PRNGKey(1), hidden)
-    grads = jax.grad(lambda v: jnp.square(module.apply(v, hidden)).sum())(variables)
+    grads = jax.grad(lambda v: jnp.square(jnp.asarray(module.apply(v, hidden))).sum())(variables)
     assert float(jnp.abs(grads["params"]["gate"]["kernel"]).max()) > 0
