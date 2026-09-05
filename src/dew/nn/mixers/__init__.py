@@ -2,19 +2,18 @@
 
 A mixer is the per-layer token interaction a `DecoderBlock` holds as
 `self_attn`: any module with the `(x, decode=..., positions=...,
-segment_ids=...) -> x` signature. Today's grouped-query causal attention is
-the `attention` kind; MLA, gated delta rule and the other frontier mixers
-register beside it, each as a frozen dataclass value carrying the reference's
-field names.
+segment_ids=...) -> x` signature. Grouped-query causal attention is the
+`attention` kind; MLA, the gated delta rule and the other mixers register
+beside it, each as a frozen dataclass value carrying the reference's field
+names.
 
-The backbone names one value on its `mixer` field, None for today's
-attention, and a kind builds its own `DecoderBlock` factory from a
-`MixerContext`: the layer geometry the backbone owns (heads, head dims, the
-kind-resolved rotary base, the window, the KV-sharing slot) plus the run's
-dtype and kernel choices. Geometry is stated once, here, so a new kind reads
-what it needs without the backbone growing a branch per kind: the one
-dispatch is `mixer.build(ctx)`, and a second switch on the kind anywhere else
-is a bug.
+The backbone names one value on its `mixer` field, None for attention, and
+a kind builds its own `DecoderBlock` factory from a `MixerContext`: the
+layer geometry the backbone owns (heads, head dims, the kind-resolved rotary
+base, the window, the KV-sharing slot) plus the run's dtype and kernel
+choices. Geometry is stated once, here, so a new kind reads what it needs
+without the backbone growing a branch per kind. The one dispatch is
+`mixer.build(ctx)`.
 """
 
 from __future__ import annotations
@@ -43,8 +42,8 @@ class MixerContext:
     on a windowed kind (partial rotary belongs to the full-sequence kinds),
     and `kv_shared` with `kv_store_key` mark a layer that reads another
     layer's keys and values. A kind's own record (LoRA ranks, head splits, a
-    yarn scaling) lives on the kind's value, not here: this is what the
-    backbone configures, that is what the reference names.
+    yarn scaling) lives on the kind's value; this holds what the backbone
+    configures.
     """
 
     emb_features: int
@@ -54,7 +53,7 @@ class MixerContext:
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
-    """The kind-resolved rotary base: a kind's yarn record transforms this, never replaces it."""
+    """The kind-resolved rotary base; a kind's yarn record transforms this rather than replacing it."""
     rope_scaling: Optional[RopeScaling] = None
     """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
@@ -102,12 +101,11 @@ class MixerBase:
     value and the layer's context into the `DecoderBlock` factory, the
     `Callable[..., nn.Module]` the block calls with `name='self_attn'`.
 
-    The backbone types its `mixer` field as this base, not as the registry
-    union: a union of members that register over time cannot be spelled
-    before they exist, and the checker rejects a late-bound name in type
-    position. Records still dispatch on their kind through `mixers.build`,
-    and `mixers.union` stays the live union for config introspection and a
-    tyro subcommand per kind.
+    The backbone types its `mixer` field as this base rather than the
+    registry union, because a union of members that register over time
+    cannot be spelled before they exist. Records still dispatch on their kind
+    through `mixers.build`, and `mixers.union` is the live union for config
+    introspection and a tyro subcommand per kind.
     """
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
@@ -119,7 +117,7 @@ class MixerBase:
 @mixers("attention")
 @dataclasses.dataclass(frozen=True)
 class AttentionMixer(MixerBase):
-    """Today's grouped-query causal attention: no fields of its own.
+    """Grouped-query causal attention: no fields of its own.
 
     Every dial is the model's (heads, norms, bias, scale, kernel), read from
     the context, so this value only selects the kind. A record names it with
@@ -127,9 +125,9 @@ class AttentionMixer(MixerBase):
     """
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        # Imported here, not at module scope: the backbone imports this
-        # package for the registry, so importing the backbone back at scope
-        # would be a cycle. By the time a layer builds, both are loaded.
+        # The backbone imports this package for the registry, so importing it
+        # back at module scope would be a cycle; by the time a layer builds,
+        # both are loaded.
         from dew.nn.backbones.causal_transformer import CausalSelfAttention
 
         return functools.partial(
@@ -170,11 +168,11 @@ class AttentionMixer(MixerBase):
 def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
     """A `{"kind": ..., ...fields}` record as the kind value it names.
 
-    The one place a record becomes a mixer: the backbone's `__post_init__`
-    and anything else that takes a mixer from a config call this, so
-    `mixer={"kind": "mla", ...}` from a CLI and the dataclass from code meet
-    in the same `mixers.build`. A record without a kind, or one naming
-    nothing registered, raises naming what it wanted.
+    This is the one place a record becomes a mixer. The backbone's
+    `__post_init__` and anything else that takes a mixer from a config call
+    it, so `mixer={"kind": "mla", ...}` from a CLI and the dataclass from
+    code meet in the same `mixers.build`. A record without a kind, or one
+    naming nothing registered, raises.
     """
     fields = dict(record)
     try:

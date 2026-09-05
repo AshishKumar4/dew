@@ -1,8 +1,7 @@
 """Mixture of experts: the router, and the experts as one grouped matmul.
 
 Patterned on MaxText's `RoutedMoE` (`maxtext src/maxtext/layers/moe.py:419`,
-Apache 2.0), which is 3731 lines of NNX reading about forty fields off a config
-object. What ports is the math: top-k selection (`:751` `get_topk`), DeepSeek's
+Apache 2.0). The math ported is top-k selection (`:751` `get_topk`), DeepSeek's
 group-limited routing, which selects on the biased scores and gates on the
 unbiased ones (`:881-908` `deepseek_routing`), its weight scaling
 (`:835-841`), the aux-loss-free bias update (`:238-261`, lifted below), and the
@@ -63,7 +62,7 @@ def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
     its choices, `[B, S, K]`. The released `MoEGate` computes f_i as the
     fraction of routed slots expert i took, times E, and P_i as its mean
     score; `seq_aux` takes both per sequence and averages the sequences,
-    which is what every released V2 config sets. The result is already
+    as every released V2 config sets. The result is already
     scaled by `alpha`, the config's aux_loss_alpha, and one term per
     sparse layer adds to the loss.
     """
@@ -104,19 +103,18 @@ class Router(nn.Module):
     """Which experts a token goes to, and with what weight: `[..., k]` of each.
 
     The gate projection runs in fp32 whatever dtype the activations carry,
-    which is where DeepSeek's router runs
-    (`modeling_deepseek_v3.py:146`) and what every frontier config asks for.
+    as DeepSeek's router does (`modeling_deepseek_v3.py:146`).
 
     `expert_bias` is DeepSeek's aux-loss-free balancing bias
     (`e_score_correction_bias`, arXiv 2408.15664), kept in fp32 in the `moe`
-    collection. It enters the selection and nothing else: a token's weights are
-    gathered from the unbiased scores, so moving the bias changes which experts
-    a token uses without changing what they contribute. Nothing here writes it,
-    which is also true of the reference: transformers holds it in an
-    `nn.Buffer` and MaxText hands the update back to its caller
-    (`layers/moe.py:965-972`). `calculate_load_balance_updates` is that update,
-    and a step that applies it owns the write. Gradients cannot reach the bias
-    either, since it feeds `jax.lax.top_k`'s integer indices and nothing else.
+    collection. It enters the selection only: a token's weights are gathered
+    from the unbiased scores, so moving the bias changes which experts a token
+    uses without changing what they contribute. Nothing here writes it;
+    transformers holds it in an `nn.Buffer` and MaxText hands the update back
+    to its caller (`layers/moe.py:965-972`). `calculate_load_balance_updates`
+    is that update, and the step that applies it owns the write. Gradients
+    cannot reach the bias either, since it feeds only `jax.lax.top_k`'s
+    integer indices.
 
     `expert_groups` above one is DeepSeek's node limit: experts are cut into
     that many groups, each group is scored by its two best experts, and a token
@@ -240,14 +238,13 @@ class ExpertLinear(nn.Module):
     already sorted by expert.
 
     `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on, which is what both grouped matmuls take.
+    1, and so on, the form both grouped matmuls take.
     `implementation` picks between them, the seam
     `dew.nn.attention.scaled_dot_product_attention` has:
 
     - 'xla': `jax.lax.ragged_dot`, which lowers on every backend.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`). tokamax is not a dependency of
-      Dew, so its import is inside the branch that needs it.
+      kernels (`maxtext layers/moe.py:1633`).
     """
     num_experts: int
     in_features: int
@@ -261,9 +258,8 @@ class ExpertLinear(nn.Module):
             raise ValueError(
                 f"implementation must be one of {list(GROUPED_MATMULS)}, got "
                 f"{self.implementation!r}")
-        # fan_in per expert, not over the stack: with the expert dimension as a
-        # batch axis every expert initialises exactly like the matching
-        # nn.Dense of a dense MLP.
+        # With the expert dimension as a batch axis, fan_in is per expert and
+        # every expert initialises like the matching nn.Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
             nn.initializers.variance_scaling(
