@@ -19,24 +19,23 @@ from jax.experimental import multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.data.dataset import Checkpointable
-from dew.nn.sharding import LogicalAxes, declared_axes
+from dew.nn.sharding import (
+    DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LogicalAxes,
+    declared_axes,
+)
 from dew.objectives.base import Batch, Variables
-
-DATA_AXIS = 'data'
-FSDP_AXIS = 'fsdp'
-EXPERT_AXIS = 'expert'
-TENSOR_AXIS = 'tensor'
-SEQUENCE_AXIS = 'sequence'
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
 # expert axis, a width the rules redirect takes tensor, everything else
-# takes fsdp. The data and sequence axes split the batch and never place a
-# parameter, which `Layout` refuses a rule for.
+# takes fsdp. The data and sequence axes split the batch, and the stage axis
+# holds the pipeline's stages of the layer stack; none of the three ever
+# places a parameter, which `Layout` refuses a rule for.
 PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 
-# The batch's rows split across every axis but sequence, whichever they sit
-# on; the sequence dimension splits over the sequence axis. Only parameters
-# distinguish the axes further.
+# The batch's rows split across every axis but sequence and stage, whichever
+# they sit on; the sequence dimension splits over the sequence axis. Every
+# stage sees the whole batch, since the pipeline hands its microbatches from
+# stage to stage itself. Only parameters distinguish the axes further.
 BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS), SEQUENCE_AXIS)
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
@@ -84,6 +83,28 @@ class MeshSpec:
     """Devices a redirected width is split over; 1 keeps every width on fsdp."""
     sequence: int = 1
     """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
+    stage: int = 1
+    """Pipeline stages the layer stack is split into, each on its own devices; 1
+    runs the stack whole on every device."""
+    microbatches: Optional[int] = None
+    """Microbatches a step feeds through the stages, a multiple of `stage`; None
+    is one per stage, the smallest schedule. A stage runs one microbatch while
+    the next runs the one before it, so more microbatches shrink the idle
+    time at either end of the step and cost nothing but the loop's length."""
+
+    def __post_init__(self):
+        if self.stage < 1:
+            raise ValueError(f"stage counts pipeline stages, got {self.stage}")
+        if self.microbatches is None:
+            return
+        if self.stage == 1:
+            raise ValueError(
+                f"microbatches ({self.microbatches}) feed the stage axis, and "
+                "stage is 1; set stage above 1 or leave microbatches unset")
+        if self.microbatches < self.stage or self.microbatches % self.stage:
+            raise ValueError(
+                f"microbatches must be a positive multiple of stage "
+                f"({self.stage}), got {self.microbatches}")
 
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
@@ -104,32 +125,34 @@ def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxis
 
 
 def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
-    """Five-axis device mesh: parameters shard over 'fsdp', 'expert' and
-    'tensor', batches over all five with their sequence dimension on 'sequence'.
+    """Six-axis device mesh: parameters shard over 'fsdp', 'expert' and
+    'tensor', batches over the first four with their sequence dimension on
+    'sequence', and the layer stack over 'stage'.
 
     An MoE layer's expert dimension is the one dimension no dense model has,
     and splitting it is what expert parallelism is, so it gets its own axis
-    rather than competing with the model's widths for 'fsdp'. The tensor
+    and does not compete with the model's widths for 'fsdp'. The tensor
     axis is where a run's rules redirect a width when one card cannot hold
-    it; the sequence axis is where long sequences split. Sizes of 1
-    degenerate to plain data parallelism, so the same code path serves every
-    topology without a flag. Axes are Auto so GSPMD infers the collectives
-    rather than us writing them by hand.
+    it; the sequence axis is where long sequences split; the stage axis is
+    where a decoder's layers split into pipeline stages, each stage on its
+    own devices. Sizes of 1 degenerate to plain data parallelism, so the
+    same code path serves every topology without a flag. Axes are Auto so
+    GSPMD infers the collectives.
     """
     devices = list(devices) if devices is not None else jax.devices()
-    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence
+    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
     if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
             or spec.sequence < 1 or len(devices) % sharded):
         raise ValueError(
             f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
-            f"{spec.tensor} times sequence {spec.sequence} must be a positive "
-            f"divisor of device count {len(devices)}")
+            f"{spec.tensor} times sequence {spec.sequence} times stage "
+            f"{spec.stage} must be a positive divisor of device count {len(devices)}")
     return jax.make_mesh(
-        (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence),
-        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS),
+        (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
+         spec.stage),
+        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS),
         devices=devices,
-        axis_types=(AxisType.Auto, AxisType.Auto, AxisType.Auto, AxisType.Auto,
-                    AxisType.Auto),
+        axis_types=(AxisType.Auto,) * 6,
     )
 
 
@@ -188,12 +211,13 @@ class Layout:
     `rules` map the logical axes the modules declare (`dew.nn.sharding`) onto
     the parameter axes of the mesh, in precedence order; an axis of size 1
     shards nothing, so the same table serves every topology. A rule onto the
-    data or the sequence axis is refused: those split the batch, and a
-    parameter placed on either would be gathered on every use. Below
-    `min_shard` elements a parameter costs more in collectives than it saves
-    in memory, so it stays replicated. `tolerance` is the fraction of
-    shardable parameter elements a layout may leave replicated before
-    `check` refuses it.
+    data, sequence or stage axis is refused: the first two split the batch,
+    and a parameter placed on either would be gathered on every use; the
+    stage axis holds the layer stack's pipeline stages, which the decoder
+    places itself from the stored tree. Below `min_shard` elements a
+    parameter costs more in collectives than it saves in memory, so it stays
+    replicated. `tolerance` is the fraction of shardable parameter elements
+    a layout may leave replicated before `check` refuses it.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
@@ -209,8 +233,8 @@ class Layout:
             if outside:
                 raise ValueError(
                     f"rule {name!r} places a parameter on {outside}; parameters "
-                    f"split over {list(PARAMETER_AXES)}, and the data and sequence "
-                    f"axes split the batch")
+                    f"split over {list(PARAMETER_AXES)}, the data and sequence "
+                    f"axes split the batch, and the stage axis holds the pipeline")
         object.__setattr__(self, "rules", rules)
 
     def shardings(self, mesh: Mesh, tree: Any) -> Placement:
