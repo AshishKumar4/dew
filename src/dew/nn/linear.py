@@ -353,16 +353,31 @@ class GatedDeltaNet(nn.Module):
         conv_input = jnp.moveaxis(
             jnp.concatenate([query, key, value], axis=-1).astype(jnp.float32),
             2, 1)  # [B, D, S], the conv's channel-major layout
+        recurrent = None
         if decode:
+            # The first decode-mode call only allocates, the way
+            # open_kv_cache's is: init_cache's dummy token must not consume
+            # a position or leave state behind.
+            allocated = self.has_variable('cache', 'recurrent_state')
             conv_state = self.variable(
                 'cache', 'conv_state', jnp.zeros,
                 (B, self.conv_features, self.conv_kernel - 1), jnp.float32)
+            recurrent = self.variable(
+                'cache', 'recurrent_state', jnp.zeros,
+                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                jnp.float32)
+            if not allocated:
+                # Allocation only: the caller's first real forward, not this
+                # call, starts the state.
+                mixed = causal_conv1d(conv_input, self._conv_taps())
+                out = jnp.zeros((B, S, self.value_features), self.dtype)
+                return self.out_proj(out)
             history = jnp.concatenate([conv_state.value, conv_input], axis=2)
             # The next step sees the last K-1 columns of this one.
             conv_state.value = history[:, :, -(self.conv_kernel - 1):]
             # The whole history goes through the same conv, so a multi-token
-            # prefill against a fresh cache and a single-token step land in
-            # one code path; the columns after the new ones are dropped.
+            # prefill against a live cache and a single-token step land in
+            # one code path; only the new columns' outputs are kept.
             mixed = causal_conv1d(history, self._conv_taps())[..., -S:]
         else:
             mixed = causal_conv1d(conv_input, self._conv_taps())
@@ -380,12 +395,6 @@ class GatedDeltaNet(nn.Module):
         query = l2norm(query)
         key = l2norm(key)
 
-        recurrent = None
-        if decode:
-            recurrent = self.variable(
-                'cache', 'recurrent_state', jnp.zeros,
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                jnp.float32)
         out, final = (recurrent_gated_delta_rule(
                           query, key, value, g, beta,
                           None if recurrent is None else recurrent.value)

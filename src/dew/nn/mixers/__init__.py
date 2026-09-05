@@ -69,6 +69,13 @@ class MixerContext:
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
     force_fp32_for_softmax: bool = True
+    output_gate: bool = False
+    """The attention's output gate (Qwen3.5's attn_output_gate), where the
+    kind's projection doubles its query and gates the branch."""
+    gate_activation: str = 'sigmoid'
+    """The gate's activation where a family names one (qwen4_exp's
+    output_gate_type: 'sigmoid' or 'silu'); qwen3_5 applies sigmoid in the
+    attention and silu in the delta net's norm."""
 
 
 class MixerBase:
@@ -129,6 +136,8 @@ class AttentionMixer(MixerBase):
             sliding_window=ctx.sliding_window,
             attention_bias=ctx.attention_bias,
             attention_scale=ctx.attention_scale,
+            output_gate=ctx.output_gate,
+            gate_activation=ctx.gate_activation,
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
@@ -162,3 +171,5 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
             f"mixer {kind!r} built {type(built).__name__}, which is not a "
             "mixer value")
     return built
+
+from . import gated_delta_net  # noqa: E402,F401  (registers the kind)
