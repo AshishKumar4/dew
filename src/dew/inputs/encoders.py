@@ -4,7 +4,7 @@ An encoder tokenizes on the host, in the data workers or before a sampling
 call, and encodes on device as a pure function of explicit parameters. The
 parameters are a leaf of the objective's tree, placed by the trainer's layout
 like any other, so a frozen tower's weights arrive at the compiled step as
-arguments and never as constants baked into it.
+arguments rather than as constants baked into it.
 
 An encoder is rebuilt from a run's record by `rebuild(name, fields)`, where
 `fields` is what `to_json` wrote.
@@ -44,7 +44,7 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """Load the tower named `checkpoint`; the one call that opens files.
 
         Whatever else a checkpoint needs is a keyword field with a default,
-        which is what `to_json` records and the registry rebuilds from.
+        the fields `to_json` records and the registry rebuilds from.
         """
 
     @abstractmethod
