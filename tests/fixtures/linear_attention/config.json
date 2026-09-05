@@ -1,0 +1,9 @@
+{
+  "hidden_size": 64,
+  "rms_norm_eps": 1e-06,
+  "linear_conv_kernel_dim": 4,
+  "linear_key_head_dim": 12,
+  "linear_value_head_dim": 16,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 4
+}

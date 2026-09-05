@@ -16,20 +16,14 @@ inference share.
 
 import hashlib
 import json
-import os
 import re
 
 import jax
 import tyro
 
-import dew.io
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.registry import datasets, presets
-from dew.training import (Checkpoints, Trainer, TrainState, WandbTracker,
-                          build_optimizer, prepare_process, run_timestamp)
-
-# HF tokenizers fork a thread pool; grain's workers fork the process.
-os.environ['TOKENIZERS_PARALLELISM'] = "false"
+from dew.training import TrainState, prepare_process, run_timestamp
 
 DEFAULT_EXPERIMENT_NAME = ("dataset-{dataset}/image_size-{image_size}/batch-{batch_size}/"
                            "schd-{preset}/arch-{architecture}/lr-{learning_rate}")
@@ -77,65 +71,19 @@ def main(config: DiffusionRunConfig) -> TrainState:
     objective = config.build()
     data = config.data.load(batch=config.trainer.batch_size,
                             tokenize=objective.inputs.tokenize)
-    steps = config.trainer.total_steps(data)
     fields = config.model_fields(objective.autoencoder)
 
-    run_config = config.to_dict()
     # hash() is randomized per process; identical configs must map to the same
     # experiment
     arguments_hash = hashlib.sha256(
-        json.dumps(run_config, sort_keys=True).encode()).hexdigest()[:16]
+        json.dumps(config.to_dict(), sort_keys=True).encode()).hexdigest()[:16]
     summary = run_summary(config, fields, arguments_hash)
-    name = experiment_name(config, summary)
-    print("Experiment_Name:", name)
-    directory = os.path.join(config.trainer.checkpoint_dir, name)
-
-    tracker = None
-    if config.trainer.wandb is not None:
-        tracker = WandbTracker(
-            config.trainer.wandb.project, name, entity=config.trainer.wandb.entity,
-            offline=config.trainer.wandb.offline,
-            config={"run_config": run_config, "model": fields, "arguments": summary,
-                    "dataset": {"name": summary["dataset"], "records": data.records,
-                                "steps_per_epoch": data.steps_per_epoch},
-                    "steps": steps})
-
-    checkpoints = Checkpoints(directory, keep=config.trainer.keep)
-    if jax.process_index() == 0:
-        config.save(checkpoints.directory)
-    trainer = Trainer(
-        objective, build_optimizer(config.optim, steps),
-        key=jax.random.key(config.trainer.seed),
-        mesh=config.trainer.mesh,
-        layout=config.trainer.layout,
-        accumulation=config.trainer.accumulation,
-        dynamic_scale=config.trainer.dynamic_scale,
-        checkpoints=checkpoints,
-        tracker=tracker,
-        profile=config.trainer.profile,
-    )
-    print(f"Training on {summary['dataset']} for {steps} steps "
-          f"({data.steps_per_epoch} steps per epoch)")
-    state = trainer.fit(
-        data, steps=steps,
-        log_every=config.trainer.log_every,
-        eval_every=config.trainer.eval_interval(data),
-        checkpoint_every=config.trainer.checkpoint_interval(data),
+    return config.train(
+        objective, data, name=experiment_name(config, summary),
         metrics=config.build_eval_metrics(),
-    )
-    if tracker is not None:
-        step = checkpoints.latest
-        if step is None:
-            raise RuntimeError(
-                f"fit returned with no checkpoint under {checkpoints.directory}; "
-                "a trainer with a checkpointer writes the step its run ends on")
-        dew.io.publish(checkpoints.path(step), artifact_name(name), tracker=tracker)
-    return state
-
-
-def artifact_name(name: str) -> str:
-    """The run name as a W&B artifact name, which allows no slashes."""
-    return re.sub(r"[^\w.-]", "-", name)
+        summary={"model": fields, "arguments": summary,
+                 "dataset": {"name": summary["dataset"], "records": data.records,
+                             "steps_per_epoch": data.steps_per_epoch}})
 
 
 if __name__ == '__main__':
