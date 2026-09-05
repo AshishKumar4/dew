@@ -14,7 +14,10 @@ import importlib.util
 import json
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
@@ -202,3 +205,55 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
     assert all(np.isfinite(first.losses))
     assert first.losses[-1] < first.losses[0]
     assert all(0.0 <= accuracy <= 1.0 for accuracy in first.token_accuracy)
+
+
+# ---------------------------------------------------------------------------
+# tools/benchmark_lm_head.py
+# ---------------------------------------------------------------------------
+
+def test_lm_head_variant_names_parse_as_documented():
+    """A name is the head, an optional chunk count and optional suffixes:
+    the rows docs/research/lm-head.md ran, plus both suffixes at once."""
+    tool = load("benchmark_lm_head")
+    parsed = {text: tool.parse_variant(text) for text in
+              ("baseline", "stored4", "stored8", "remat4", "stored4-noacc", "remat8-noacc-fp32")}
+
+    assert [(v.head, v.chunks, v.accuracy, v.states_dtype.name) for v in parsed.values()] == [
+        ("baseline", 4, True, "bfloat16"),
+        ("stored", 4, True, "bfloat16"),
+        ("stored", 8, True, "bfloat16"),
+        ("remat", 4, True, "bfloat16"),
+        ("stored", 4, False, "bfloat16"),
+        ("remat", 8, False, "float32"),
+    ]
+    for bad in ("chunked4", "stored4-fast", "stored-8"):
+        with pytest.raises(ValueError):
+            tool.parse_variant(bad)
+
+
+def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
+    """stored and remat are the baseline head rearranged into vocabulary
+    tiles, so on one small case all three agree on the loss, the top-1
+    accuracy and both gradients. The vocabulary of 12 does not split into
+    4 equal tiles, so the short last tile is on the path."""
+    tool = load("benchmark_lm_head")
+    key = jax.random.PRNGKey(0)
+    states = jax.random.normal(key, (2, 3, 8), jnp.float32)
+    table = jax.random.normal(jax.random.fold_in(key, 1), (12, 8), jnp.float32)
+    targets = jnp.array([[0, 5, 11], [3, 11, 4]], jnp.int32)
+    variant = tool.parse_variant("stored4-fp32")
+
+    outputs = {}
+    for name in ("baseline", "stored", "remat"):
+        head = tool.HEADS[name]
+        (loss, accuracy), (d_states, d_table) = jax.value_and_grad(
+            lambda s, t: head(s, t, targets, variant), argnums=(0, 1), has_aux=True)(states, table)
+        outputs[name] = (float(loss), float(accuracy), np.asarray(d_states), np.asarray(d_table))
+
+    reference = outputs["baseline"]
+    for name in ("stored", "remat"):
+        loss, accuracy, d_states, d_table = outputs[name]
+        assert loss == pytest.approx(reference[0], abs=1e-5), name
+        assert accuracy == reference[1], name
+        np.testing.assert_allclose(d_states, reference[2], atol=1e-5, err_msg=name)
+        np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
