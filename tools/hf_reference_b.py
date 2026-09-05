@@ -158,7 +158,8 @@ def llama4_tiny_config() -> Llama4TextConfig:
         vocab_size=96, hidden_size=32, intermediate_size=48, intermediate_size_mlp=64,
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
         num_local_experts=4, num_experts_per_tok=2, interleave_moe_layer_step=2,
-        attention_chunk_size=4, max_position_embeddings=64, rope_theta=500000.0,
+        attention_chunk_size=4, max_position_embeddings=64,
+        rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
         floor_scale=4, attn_scale=0.1, use_qk_norm=True, rms_norm_eps=1e-5,
         tie_word_embeddings=False)
 
