@@ -179,3 +179,26 @@ def test_optimizer_curve_arms_share_the_model_and_the_batches(tmp_path):
     assert curves["adamw"]["tokens"] == 3 * 8 * 8
     assert curves["adamw"]["corpus_tokens"] == json.loads(
         (tokens / "meta.json").read_text())["train_tokens"]
+
+
+# ---------------------------------------------------------------------------
+# tools/lm_step_parity.py
+# ---------------------------------------------------------------------------
+
+def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
+    """Two runs are comparable only if one run is repeatable: the same seed
+    and the same batch give the same losses to the last bit. On one fixed
+    batch the loss also has to fall, which a loop feeding fresh random
+    tokens each step would not show."""
+    tool = load("lm_step_parity")
+    config = dict(vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
+                  mlp_features=32, max_seq_len=8)
+
+    first = tool.run(config, batch=8, seq=8, steps=4)
+    second = tool.run(config, batch=8, seq=8, steps=4)
+
+    assert len(first.losses) == len(first.token_accuracy) == 4
+    assert first == second
+    assert all(np.isfinite(first.losses))
+    assert first.losses[-1] < first.losses[0]
+    assert all(0.0 <= accuracy <= 1.0 for accuracy in first.token_accuracy)
