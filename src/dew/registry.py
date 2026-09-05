@@ -153,10 +153,10 @@ def _value_type(annotation: Any) -> Any:
 
     A container of values is not itself a value, so `Mapping[str, LayerKind]`
     answers None and its entries are walked instead. A union of several
-    values names no single one either — a mixer's `{"kind": ...}` record
-    stays a record for the owner to dispatch on its kind — so only a union
+    values names no single one either (a mixer's `{"kind": ...}` record
+    stays a record for the owner to dispatch on its kind), so only a union
     with one value answers it, which is what `Optional[Mixture]` is. This is
-    the same opaque treatment `_entry_type` and `RunConfig._rebuild` already
+    the same opaque treatment `entry_types` and `dew.config`'s record rebuild
     give a multi-member union.
     """
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
@@ -170,13 +170,35 @@ def _value_type(annotation: Any) -> Any:
     return members[0] if len(members) == 1 else None
 
 
-def _entry_type(annotation: Any) -> Any:
-    """What one entry of an annotated container holds."""
-    arguments = [a for a in typing.get_args(annotation) if a is not Ellipsis]
-    if typing.get_origin(annotation) in (Union, types.UnionType):
-        arguments = [a for a in arguments if a is not type(None)]
-        return _entry_type(arguments[0]) if len(arguments) == 1 else None
-    return arguments[-1] if arguments else None
+def _unwrapped(annotation: Any) -> Any:
+    """`annotation` with an Optional looked through; a union of several
+    members says nothing about its entries and answers None."""
+    if typing.get_origin(annotation) not in (Union, types.UnionType):
+        return annotation
+    members = [a for a in typing.get_args(annotation) if a is not type(None)]
+    return members[0] if len(members) == 1 else None
+
+
+def entry_types(annotation: Any, count: int) -> list[Any]:
+    """The annotation of each of the `count` entries of an annotated
+    container: a fixed tuple's per-position types, otherwise its one element
+    type repeated (a mapping's value type, a sequence's element). None is an
+    unannotated entry, which takes its value as given."""
+    annotation = _unwrapped(annotation)
+    arguments = typing.get_args(annotation)
+    if typing.get_origin(annotation) is tuple and Ellipsis not in arguments:
+        if len(arguments) != count:
+            raise ValueError(f"{annotation} takes {len(arguments)} entries, got {count}")
+        return list(arguments)
+    element = next((a for a in reversed(arguments) if a is not Ellipsis), None)
+    return [element] * count
+
+
+def wants_tuple(annotation: Any) -> bool:
+    """Whether a container annotation declares a tuple, which a record's
+    list becomes; JSON has no tuple, and a frozen value with a list in a
+    tuple field is unhashable and unequal to the one that was written."""
+    return typing.get_origin(_unwrapped(annotation)) is tuple
 
 
 def from_record(annotation: Any, value: Any) -> Any:
@@ -193,9 +215,9 @@ def from_record(annotation: Any, value: Any) -> Any:
             # A record with no value class behind it, such as one of the unets'
             # per-stage attention settings: entries are walked and the dtype
             # rule below still applies by name.
-            return {key: resolve_dtype(item) if key == "dtype"
-                    else from_record(_entry_type(annotation), item)
-                    for key, item in value.items()}
+            entries = entry_types(annotation, len(value))
+            return {key: resolve_dtype(item) if key == "dtype" else from_record(entry, item)
+                    for entry, (key, item) in zip(entries, value.items())}
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
@@ -204,7 +226,9 @@ def from_record(annotation: Any, value: Any) -> Any:
         return held(**{key: _field_value(held, key, item)
                        for key, item in value.items()})
     if isinstance(value, (list, tuple)):
-        return type(value)(from_record(_entry_type(annotation), item) for item in value)
+        entries = entry_types(annotation, len(value))
+        items = [from_record(entry, item) for entry, item in zip(entries, value)]
+        return tuple(items) if wants_tuple(annotation) else type(value)(items)
     return value
 
 

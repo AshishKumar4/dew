@@ -62,13 +62,6 @@ class JepaRunConfig(RunConfig):
     probe_label_key: str = 'label'
     knn_k: int = 20
 
-    def __post_init__(self):
-        # A record's pairs arrive as lists from a run's json; the objective
-        # and the mask read them as the pairs the fields declare.
-        for name in ("target_scale", "target_aspect", "momentum"):
-            low, high = getattr(self, name)
-            object.__setattr__(self, name, (float(low), float(high)))
-
 
 def sample_field(config: JepaRunConfig) -> Field:
     """The batch field the encoder reads, at the resolution the data comes in."""
