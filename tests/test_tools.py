@@ -1,7 +1,7 @@
 """The scripts under tools/ that no other test imports and runs.
 
-Each is loaded from its file, the way tests/test_data.py loads
-av_benchmark.py, and run on a case small enough for CPU in seconds. A
+Each is loaded from its file, the way tests/test_benchmark_data.py loads
+benchmark_data.py, and run on a case small enough for CPU in seconds. A
 reference generator writes its tiny fixture into a temporary directory and
 the result is compared with what is committed, so a generator that drifts
 from its fixture, or a library upgrade that changes the reference, shows up
@@ -100,3 +100,22 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
         (committed / "prompts.json").read_text())
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
     assert_same_arrays(tmp_path / "reference.npz", committed / "reference.npz")
+
+
+# ---------------------------------------------------------------------------
+# tools/t5_reference.py
+# ---------------------------------------------------------------------------
+
+def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
+    """tiny/ regenerates byte for byte: the prompts, the config the loader
+    builds the encoder from (decoder_start_token_id included, as every
+    published T5 config carries it), the full state dict and the reference
+    hidden states."""
+    load("t5_reference").main(["--out", str(tmp_path)])
+
+    written, committed = tmp_path / "tiny", FIXTURES / "t5" / "tiny"
+    for name in ("prompts.json", "config.json"):
+        assert json.loads((written / name).read_text()) == json.loads(
+            (committed / name).read_text()), name
+    assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
+    assert_same_arrays(written / "reference.npz", committed / "reference.npz")
