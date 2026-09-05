@@ -300,6 +300,71 @@ def test_sliding_attention_decode_matches_the_full_sequence(rng):
     assert jnp.allclose(full[:, 5:], incremental, atol=1e-4)
 
 
+def hybrid(**overrides):
+    """Qwen3.5's stack at toy size: three gated-delta-net layers, one gated
+    full-attention layer with a partial rotary."""
+    return tiny(num_layers=4, num_kv_heads=2, head_dim=8, output_gate=True,
+                partial_rotary_factor=0.5,
+                layer_types=('linear_attention',) * 3 + ('full_attention',),
+                kinds={'linear_attention': {'mixer': {
+                    'kind': 'gated_delta_net', 'linear_num_key_heads': 2,
+                    'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+                    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}},
+                **overrides)
+
+
+def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
+    """The test that catches a wrong recurrent state: a prefill of four
+    tokens and eight single-token steps, every layer's state riding the
+    flax cache collection (the delta net's recurrent memory and conv tail,
+    the attention's KV cache), against the same twelve tokens scored at
+    once. Largest observed logit difference 5.1e-06 on logits of magnitude
+    3.1, every argmax equal. A delta net that stops writing its memory back
+    (`recurrent.value = final` dropped) moves the logits by 3.8e+00."""
+    model = hybrid()
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    full = model.apply(params, ids)
+
+    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+    assert set(cache['layers_0']['self_attn']) == {'recurrent_state', 'conv_state'}
+    assert set(cache['layers_3']['self_attn']) == {'cached_key', 'cached_value', 'cache_index'}
+    assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
+
+    incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:])
+
+    difference = float(jnp.abs(full[:, 3:] - incremental).max())
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+
+
+def test_a_hybrid_decode_step_reads_the_conv_tail_it_left(rng):
+    """The conv state is the one piece of decode state a fresh sequence
+    would pad with zeros: a step fed the tail of zeros instead of the
+    last K-1 columns computes a different token. Stated as the property:
+    the tail after a prefill is the last K-1 columns of what the prefill
+    projected, and zeroing it moves the next step's logits."""
+    model = hybrid()
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
+                        mutable=['cache'])[1]['cache']
+    _, mutated = model.apply({**params, 'cache': cache}, ids[:, :4],
+                             decode=True, mutable=['cache'])
+    tail = mutated['cache']['layers_0']['self_attn']['conv_state']
+    assert tail.shape[-1] == 3 and jnp.any(tail)
+
+    kept, _ = model.apply({**params, 'cache': mutated['cache']}, ids[:, 4:5],
+                          decode=True, mutable=['cache'])
+    zeroed = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if 'conv_state' in jax.tree_util.keystr(path) else leaf,
+        mutated['cache'])
+    reset, _ = model.apply({**params, 'cache': zeroed}, ids[:, 4:5],
+                           decode=True, mutable=['cache'])
+    assert not jnp.allclose(kept, reset, atol=1e-4)
+
+
 def test_gemma_flags_scale_the_embeddings_and_cap_the_logits(rng):
     """embedding_scale, the (1 + w) norms, geglu and the tanh softcap are the
     Gemma switches; with the cap on, no logit can leave (-cap, cap)."""

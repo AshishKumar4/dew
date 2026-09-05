@@ -65,10 +65,19 @@ class MixerContext:
     attention_bias: bool = False
     attention_scale: Optional[float] = None
     partial_rotary_factor: Optional[float] = None
+    partial_rotary_type: str = 'proportional'
+    """Which convention the partial rotary follows, 'proportional' (Gemma 4)
+    or 'default' (Qwen3.5); `dew.nn.attention.rotary_freqs` cites both."""
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
     force_fp32_for_softmax: bool = True
+    output_gate: bool = False
+    """The attention's output gate (Qwen3.5's attn_output_gate), where the
+    kind's projection doubles its query and a sigmoid of the second half
+    gates the branch. The delta net's own gate activation is a field of its
+    kind (qwen4_exp's output_gate_type), which is the only gate a reference
+    varies."""
 
 
 class MixerBase:
@@ -129,11 +138,13 @@ class AttentionMixer(MixerBase):
             sliding_window=ctx.sliding_window,
             attention_bias=ctx.attention_bias,
             attention_scale=ctx.attention_scale,
+            output_gate=ctx.output_gate,
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
             force_fp32_for_softmax=ctx.force_fp32_for_softmax,
-            partial_rotary_factor=ctx.partial_rotary_factor)
+            partial_rotary_factor=ctx.partial_rotary_factor,
+            partial_rotary_type=ctx.partial_rotary_type)
 
 
 def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
@@ -162,3 +173,9 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
             f"mixer {kind!r} built {type(built).__name__}, which is not a "
             "mixer value")
     return built
+
+
+# The kind modules register where they are defined; this hub imports them,
+# one line per kind module, alphabetical.
+from . import gated_delta_net  # noqa: E402,F401  (registers the kind)
+from .. import mla  # noqa: E402,F401  (registers the kind)

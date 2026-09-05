@@ -55,10 +55,20 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("mlp", FSDP_AXIS),
     ("modulation", FSDP_AXIS),
     ("attention", FSDP_AXIS),
+    # The gated delta net's projected width (keys, values and their gate),
+    # placed like the attention's: the width over the model dimension.
+    ("linear", FSDP_AXIS),
     ("embed", FSDP_AXIS),
     ("head_dim", FSDP_AXIS),
     ("heads", FSDP_AXIS),
     ("kv", FSDP_AXIS),
+    # The latent widths multi-head latent attention compresses through and
+    # the sparse indexer's head dim: model-width-like, so they ride fsdp for
+    # now. That is a real choice, not a default: there is no tensor axis
+    # today, and one must not silently re-place these when it lands.
+    ("index", FSDP_AXIS),
+    ("kvlora", FSDP_AXIS),
+    ("qlora", FSDP_AXIS),
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
     ("batch", None),
