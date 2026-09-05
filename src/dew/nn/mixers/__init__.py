@@ -12,8 +12,8 @@ a kind builds its own `DecoderBlock` factory from a `MixerContext`: the
 layer geometry the backbone owns (heads, head dims, the kind-resolved rotary
 base, the window, the KV-sharing slot) plus the run's dtype and kernel
 choices. Geometry is stated once, here, so a new kind reads what it needs
-without the backbone growing a branch per kind. The one dispatch is
-`mixer.build(ctx)`.
+without the backbone growing a branch per kind. The backbone builds every
+mixer through `mixer.build(ctx)`.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from dew.nn.attention import RopeScaling
 from dew.registry import Registry
 
 mixers: Registry[type] = Registry("mixer")
-"""Each token-mixer kind by name: the value class, not the module."""
+"""Each token-mixer kind under its registered name: the value class, not the module."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,7 +53,7 @@ class MixerContext:
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
-    """The kind-resolved rotary base; a kind's yarn record transforms this rather than replacing it."""
+    """The kind-resolved rotary base; a kind's yarn record transforms it."""
     rope_scaling: Optional[RopeScaling] = None
     """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
@@ -101,10 +101,10 @@ class MixerBase:
     value and the layer's context into the `DecoderBlock` factory, the
     `Callable[..., nn.Module]` the block calls with `name='self_attn'`.
 
-    The backbone types its `mixer` field as this base rather than the
-    registry union, because a union of members that register over time
-    cannot be spelled before they exist. Records still dispatch on their kind
-    through `mixers.build`, and `mixers.union` is the live union for config
+    The backbone types its `mixer` field as this base, not the registry
+    union, because a union of members that register over time cannot be
+    spelled before they exist. Records still dispatch on their kind through
+    `mixers.build`, and `mixers.union` is the live union for config
     introspection and a tyro subcommand per kind.
     """
 
@@ -168,11 +168,10 @@ class AttentionMixer(MixerBase):
 def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
     """A `{"kind": ..., ...fields}` record as the kind value it names.
 
-    This is the one place a record becomes a mixer. The backbone's
-    `__post_init__` and anything else that takes a mixer from a config call
-    it, so `mixer={"kind": "mla", ...}` from a CLI and the dataclass from
-    code meet in the same `mixers.build`. A record without a kind, or one
-    naming nothing registered, raises.
+    The backbone's `__post_init__` and anything else that takes a mixer from
+    a config call it, so `mixer={"kind": "mla", ...}` from a CLI and the
+    dataclass from code meet in the same `mixers.build`. A record without a
+    kind, or one naming nothing registered, raises ValueError.
     """
     fields = dict(record)
     try:

@@ -13,13 +13,12 @@ latents, as the V3 reference does; the V3.2 reference caches the expanded
 keys and values instead, so the sparse variant does that too.
 
 The rotary head rotates interleaved pairs (even/odd slices, one frequency
-each) rather than the rotate-half convention `apply_rotary` implements, so
-the pairwise rotation lives here next to its only caller. YaRN scaling,
-which both released DeepSeek configs ask for, reshapes the inverse
-frequencies and multiplies the attention scale; the frequency ramp is the
-reference's `_compute_yarn_parameters` and the scale multiplier its
-`yarn_apply_mscale`, both with `dim` at the rope width, which is where
-DeepSeek points `config.head_dim`.
+each), not the rotate-half pairs `apply_rotary` rotates, so the pairwise
+rotation lives here next to its only caller. YaRN scaling, which both
+released DeepSeek configs ask for, reshapes the inverse frequencies and
+multiplies the attention scale; the frequency ramp is the reference's
+`_compute_yarn_parameters` and the scale multiplier its `yarn_apply_mscale`,
+both with `dim` at the rope width, where DeepSeek points `config.head_dim`.
 """
 
 import dataclasses
@@ -95,7 +94,7 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
     low, high = max(low, 0), min(high, dim - 1)
     span = high - low
     if span == 0:
-        # The reference nudges a degenerate bound rather than dividing by zero.
+        # The reference nudges a degenerate bound to keep the division finite.
         span = 0.001
     ramp = jnp.clip((jnp.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
     return inv_interpolation * ramp + inv_extrapolation * (1 - ramp)
@@ -159,7 +158,7 @@ def apply_rotary_interleave(x, freqs_cos, freqs_sin):
     Pairs `(x0, x1), (x2, x3), ...` each rotate by one frequency
     (`modeling_deepseek_v3.apply_rotary_pos_emb_interleave`): the even and
     odd slices turn against the first half of the cos/sin, and the halves
-    stack real over imaginary rather than interleaving back. Query and key
+    stack real over imaginary without interleaving back. Query and key
     take the same layout, so the dot product keeps the complex structure.
     """
     if freqs_cos.ndim == 3:
@@ -238,10 +237,10 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys,
                         max_seq_len):
     """Fixed-size expanded K/V cache for the sparse variant.
 
-    The V3.2 reference caches the expanded keys and values rather than the
-    latents, so decode reads them back instead of re-expanding the whole
-    history every step. Same declare/append shape as `open_latent_cache`,
-    with the indexer's keys alongside.
+    The V3.2 reference caches the expanded keys and values, not the latents,
+    so decode reads them back without re-expanding the whole history every
+    step. Same declare/append shape as `open_latent_cache`, with the
+    indexer's keys alongside.
     """
     if max_seq_len is None:
         raise ValueError(
