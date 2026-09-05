@@ -61,7 +61,7 @@ The public modules and the names each exports. This page is written by
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
 | `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `SparseMLP`, `calculate_load_balance_updates` |
 | `dew.nn.text_encoders` | `CLIP`, `CLIPAttention`, `CLIPEncoderLayer`, `CLIPMLP`, `CLIPModel`, `CLIPTextModel`, `CLIPTextTransformer`, `CLIPTowerOutput`, `CLIPVisionTransformer`, `T5Block`, `T5DenseGatedGeluDense`, `T5DenseReluDense`, `T5EncoderModel`, `T5EncoderTransformer`, `T5LayerNorm`, `T5SelfAttention`, `quick_gelu`, `translate_clip_config`, `translate_clip_weights`, `translate_config`, `translate_t5_config`, `translate_t5_weights`, `translate_vision_config`, `translate_weights` |
-| `dew.nn.sharding` | `declared_axes`, `is_heuristic`, `logical_axes`, `parameter_path` |
+| `dew.nn.sharding` | `declared_axes`, `is_heuristic`, `logical_axes`, `parameter_path`, `sequence_shards` |
 
 ## Inputs and data
 
@@ -75,5 +75,5 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.eval` | `ImageMetric`, `frames`, `clip`, `clip_score`, `fid`, `frechet_distance`, `peak_signal_noise_ratio`, `psnr`, `structural_similarity`, `ssim` |
-| `dew.interop` | `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
+| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
 | `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |
