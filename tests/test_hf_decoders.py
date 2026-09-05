@@ -9,6 +9,8 @@ whose logits are committed, so the comparison runs in CI without a download.
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - mistral-tiny: max |logit difference| 6.44e-06, tolerance 1e-4.
+- qwen2-tiny  : max |logit difference| 8.39e-06, tolerance 1e-4, logits up to
+  6.7; biased q/k/v over a bias-free o_proj, with a window from layer 1 on.
 - mixtral-tiny: max |logit difference| 2.32e-06, tolerance 1e-4, logits up
   to 4.4 in magnitude; the released per-expert w1/w2/w3 tensors stack.
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
@@ -55,7 +57,7 @@ from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny")
+TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("mixtral-tiny",)
 TORCH_VENV = Path("/tmp/hfref/bin/python")
@@ -133,6 +135,33 @@ def test_released_mistral_v03_config_translates_every_computational_field():
     }
 
 
+def test_released_qwen2_0_5b_config_translates_every_computational_field():
+    """Qwen2-0.5B ships use_sliding_window false with a sliding_window of
+    131072, so every layer attends the whole sequence."""
+    assert translate_config(fixture_config("qwen2-0.5b")) == {
+        'vocab_size': 151936, 'emb_features': 896, 'num_layers': 24,
+        'num_heads': 14, 'num_kv_heads': 2, 'head_dim': 64, 'mlp': 'swiglu',
+        'mlp_features': 4864, 'max_seq_len': 8192, 'rope_theta': 1e6,
+        'layer_types': ('full_attention',) * 24, 'kinds': {},
+        'norm_eps': 1e-6, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': True, 'o_proj_bias': False, 'tie_embeddings': True,
+    }
+
+
+def test_qwen2_loads_its_projection_biases_and_no_o_proj_bias():
+    """The split dial in the loaded tree: zeroing the q/k/v biases moves the
+    reference logits, and o_proj has no bias leaf to zero."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'qwen2-tiny')
+    ids = np.load(FIXTURES / 'qwen2-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'qwen2-tiny' / 'logits.npy')
+    attention = variables['params']['layers_0']['self_attn']
+    assert 'bias' not in attention['o_proj']
+    unbiased = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == 'bias' else leaf,
+        variables)
+    assert np.max(np.abs(np.asarray(model.apply(unbiased, ids)) - reference)) > 0.1
+
+
 def test_released_mixtral_8x7b_config_translates_every_computational_field():
     config = translate_config(fixture_config("mixtral-8x7b"))
     assert config['mixture'] == {'experts': 8, 'top_k': 2}
@@ -186,7 +215,7 @@ def test_the_real_gemma3_1b_config_translates():
 
 @pytest.mark.parametrize("field, value, message", [
     ('model_type', 'mamba', "model_type 'mamba'"),
-    ('model_type', 'qwen2', "o_proj does not"),
+
     ('attn_logit_softcapping', 50.0, "attn_logit_softcapping"),
     ('use_bidirectional_attention', True, "use_bidirectional_attention"),
     ('hidden_activation', 'relu', "hidden_act 'relu'"),

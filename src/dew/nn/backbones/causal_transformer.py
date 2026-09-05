@@ -195,7 +195,8 @@ class CausalSelfAttention(nn.Module):
     kv_shared: bool = False
     kv_store_key: Optional[str] = None
     sliding_window: Optional[int] = None
-    attention_bias: bool = False  # q/k/v/o biases, as config.attention_bias in HF
+    attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
+    o_proj_bias: Optional[bool] = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
     attention_sinks: bool = False
     yarn: Optional[YarnScaling] = None
@@ -221,7 +222,8 @@ class CausalSelfAttention(nn.Module):
         if not self.kv_shared:
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj')
+        self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
+            self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
         if self.qk_norm:
             norm = functools.partial(
                 RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
@@ -646,7 +648,8 @@ class CausalTransformer(nn.Module):
     sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
     qk_norm: bool = True
     v_norm: bool = False                     # Gemma 4's scale-free values norm
-    attention_bias: bool = False             # q/k/v/o biases (Qwen2-style)
+    attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
+    o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
     attention_sinks: bool = False
     yarn: Optional[YarnScaling] = None
@@ -797,6 +800,7 @@ class CausalTransformer(nn.Module):
             kv_store_key=layer_type,
             sliding_window=kind.window,
             attention_bias=self.attention_bias,
+            o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
             attention_sinks=self.attention_sinks,
             yarn=self.yarn,
