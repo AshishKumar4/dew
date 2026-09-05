@@ -183,26 +183,45 @@ def open_kv_cache(module: nn.Module, key, max_seq_len):
     return index + jnp.arange(length), append
 
 
-def cudnn_supports(query, key) -> Optional[str]:
-    """Why the fused cudnn kernel cannot take this call, or None if it can.
+def _pad_rows(x, rows: int):
+    """`x` with `rows` zero rows appended on its sequence axis, [B, S, H, D]."""
+    return x if rows == 0 else jnp.pad(x, ((0, 0), (0, rows), (0, 0), (0, 0)))
 
-    One rule: cudnn's flash kernel has no backward pass for an odd query or
-    key length, and jax raises NotImplementedError from inside the gradient.
-    The check sees shapes, not the trace, so every call of an odd length is
-    refused, forward-only ones included: single-token decode has q_len 1 and
-    leaves cudnn for xla, which costs the fused kernel's speed and changes no
-    numbers (both run the softmax in fp32). 77 CLIP text tokens are odd,
-    which is every cross-attention call in this repo.
 
-    The other cudnn limits (head_dim a multiple of 8 and at most 128 before
-    Hopper) fail the forward pass too, so they cannot silently ruin a run and
-    are left to jax's own error.
+def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
+    """jax's cudnn flash attention over any sequence length.
+
+    cudnn's kernel has no backward pass for an odd query or key length (jax
+    raises NotImplementedError from inside the gradient, so a run found out at
+    its first training step), and 77 CLIP text tokens are odd, as is every
+    concatenated text-plus-image sequence. One zero row of padding makes the
+    length even: a padded query row's output is sliced off, so nothing reads
+    it, and a padded key is hidden by the kernel's own padding mask
+    (key_value_seq_lengths), so every real query attends to exactly the keys
+    it had. The arithmetic on the real rows is the fused kernel's, in fp32
+    like the xla path's, which is what tests/test_kernels.py pins.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    if q_len % 2 or kv_len % 2:
-        return ("has no backward pass for odd sequence lengths, got "
-                f"{q_len} and {kv_len}")
-    return None
+    q_pad, kv_pad = q_len % 2, kv_len % 2
+    if q_pad or kv_pad:
+        query = _pad_rows(query, q_pad)
+        key, value = _pad_rows(key, kv_pad), _pad_rows(value, kv_pad)
+        # Masks and biases broadcast over [B, H, Q, K]; only the last two
+        # dimensions grow, and a padded query row or key column sees nothing.
+        def pad_tail(x, fill):
+            return jnp.pad(x, ((0, 0),) * (x.ndim - 2) + ((0, q_pad), (0, kv_pad)),
+                           constant_values=fill)
+        mask = None if mask is None else pad_tail(mask, False)
+        bias = None if bias is None else pad_tail(bias, 0)
+    kv_lengths = None if kv_pad == 0 else jnp.full(key.shape[:1], kv_len, jnp.int32)
+    # A left window of l means the l+1 most recent keys on both the xla and
+    # the cudnn path, which is the window this function counts.
+    out = jax.nn.dot_product_attention(
+        query, key, value, bias=bias, mask=mask, is_causal=causal,
+        key_value_seq_lengths=kv_lengths,
+        local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
+        implementation='cudnn')
+    return out[:, :q_len] if q_pad else out
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
@@ -218,17 +237,15 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     - None: flax reference attention (einsum + softmax). The only path that
       reads dtype, precision and force_fp32_for_softmax; the portable default.
-    - 'auto': on a gpu backend 'cudnn' for the shapes cudnn supports and
-      'xla' for the rest (`cudnn_supports`), 'xla' anywhere else. Resolved per
-      trace, so a config logged as 'auto' still runs on the next machine, and
-      per call, since one model can hold both a shape cudnn takes and a shape
-      it does not.
+    - 'auto': 'cudnn' on a gpu backend, 'xla' anywhere else. Resolved per
+      trace, so a config logged as 'auto' still runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
       whatever the inputs are. A dtype that asks for anything other than the
       inputs' own dtype is rejected rather than silently dropped, as are the
-      other two.
+      other two. cudnn takes any sequence length (`cudnn_attention` pads an
+      odd one), and only bf16 or fp16 inputs.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -261,8 +278,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
     if implementation == 'auto':
-        implementation = ('cudnn' if jax.default_backend() == 'gpu'
-                          and cudnn_supports(query, key) is None else 'xla')
+        implementation = 'cudnn' if jax.default_backend() == 'gpu' else 'xla'
 
     requested = {str(getattr(p, 'name', p)).upper()
                  for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
@@ -286,18 +302,20 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
             f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
             "the reference implementation (attention_impl 'reference').")
 
-    if implementation in ('xla', 'cudnn'):
-        if implementation == 'cudnn' and query.dtype not in (jnp.bfloat16, jnp.float16):
+    if implementation == 'cudnn':
+        if query.dtype not in (jnp.bfloat16, jnp.float16):
             raise ValueError(
                 "cudnn attention needs bf16 or fp16 inputs, the query is "
                 f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
                 "keep this precision.")
+        return cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
+    if implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
         return jax.nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, is_causal=causal,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
-            implementation=implementation)
+            implementation='xla')
     if implementation == 'tpu':
         from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
         heads = query.shape[-2]
