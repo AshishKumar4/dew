@@ -111,6 +111,27 @@ def tiny_qwen2() -> Qwen2ForCausalLM:
     return Qwen2ForCausalLM(config)
 
 
+# Llama 3.1's released ramp: factor 8 off 8192 positions, smoothing between
+# wavelengths 8192 / 4 and 8192 / 1. The tiny fixture keeps the ramp and
+# shrinks the pretraining context so that, at head_dim 16 and base 5e5, the
+# smoothing band holds frequencies of the tiny table rather than lying
+# beyond all of them.
+LLAMA3_ROPE = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+               "high_freq_factor": 4.0, "original_max_position_embeddings": 64}
+
+
+def tiny_llama31() -> LlamaForCausalLM:
+    """The llama-tiny shape under Llama 3.1's rope_scaling, so a load that
+    applied plain rope at rope_theta fails the parity."""
+    config = LlamaConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+        tie_word_embeddings=False, rope_theta=5e5, max_position_embeddings=512,
+        rope_scaling=dict(LLAMA3_ROPE), rms_norm_eps=1e-5, hidden_act="silu"))
+    torch.manual_seed(0)
+    return LlamaForCausalLM(config)
+
+
 def tiny_mixtral() -> MixtralForCausalLM:
     config = MixtralConfig.from_dict(dict(
         hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
@@ -366,6 +387,8 @@ def main() -> None:
     write_tiny("gemma-tiny", tiny_gemma())
     write_tiny("gemma2-tiny", tiny_gemma2())
     write_tiny("llama-tiny", tiny_llama())
+    write_tiny("llama31-tiny", tiny_llama31())
+    write_released_config("llama-3.1-8b", "unsloth/Llama-3.1-8B")
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
     write_tiny("qwen2-tiny", tiny_qwen2())

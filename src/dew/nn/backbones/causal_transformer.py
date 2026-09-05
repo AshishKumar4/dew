@@ -33,8 +33,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import (
-    RMSNorm, apply_rotary, causal_attention_mask, open_kv_cache, rotary_freqs,
-    scaled_dot_product_attention,
+    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask, open_kv_cache,
+    rotary_freqs, scaled_dot_product_attention,
 )
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
@@ -62,19 +62,23 @@ class LayerKind:
     window: Optional[int] = None
     """Keys a layer of this kind attends, its own included; None attends all."""
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
+    rope_scaling: Optional[RopeScaling] = None
+    """This kind's llama3 ramp or its record; None rides the model's."""
     head_dim: Optional[int] = None
     mixer: Optional[MixerBase] = None
     """This kind's mixer value or its record; None is the model's mixer."""
 
     def __post_init__(self):
-        # A kind's mixer arrives as a value from code and as a record from a
-        # config, like the model's own; anything else is neither.
+        # A kind's mixer and ramp arrive as values from code and as records
+        # from a config, like the model's own; anything else is neither.
         if isinstance(self.mixer, Mapping):
             object.__setattr__(self, "mixer", mixer_from_record(self.mixer))
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"a kind's mixer is a mixer value, its record, or None, "
                 f"not {self.mixer!r}")
+        if isinstance(self.rope_scaling, Mapping):
+            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,6 +94,7 @@ class ResolvedKind:
 
     window: Optional[int]
     rope_theta: float
+    rope_scaling: Optional[RopeScaling]
     head_dim: int
     mixer: Optional[MixerBase]
 
@@ -187,6 +192,7 @@ class CausalSelfAttention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
+    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp over the base frequencies
     qk_norm: bool = True
     qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
     v_norm: bool = False
@@ -322,7 +328,7 @@ class CausalSelfAttention(nn.Module):
             positions = jnp.asarray(positions)
         freqs_cos, freqs_sin = rotary_freqs(
             positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-            partial_rotary_type=self.partial_rotary_type)
+            partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -661,6 +667,7 @@ class CausalTransformer(nn.Module):
     mlp_features: Optional[int] = None       # None: four times emb_features
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
+    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp, unless a kind states its own
     partial_rotary_factor: Optional[float] = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
@@ -704,6 +711,8 @@ class CausalTransformer(nn.Module):
         # a notebook writes.
         if isinstance(self.mixture, Mapping):
             object.__setattr__(self, "mixture", Mixture(**self.mixture))
+        if isinstance(self.rope_scaling, Mapping):
+            object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
         if self.kinds is not None:
             # Frozen, because a module's fields are static to jit and a plain
             # dict cannot be hashed.
@@ -748,6 +757,7 @@ class CausalTransformer(nn.Module):
         return ResolvedKind(
             window=kind.window,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
+            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             mixer=kind.mixer)
 
@@ -813,6 +823,7 @@ class CausalTransformer(nn.Module):
             max_seq_len=self.max_seq_len,
             causal=self.causal,
             rope_theta=kind.rope_theta,
+            rope_scaling=kind.rope_scaling,
             qk_norm=self.qk_norm,
             qk_norm_scope=self.qk_norm_scope,
             v_norm=self.v_norm,

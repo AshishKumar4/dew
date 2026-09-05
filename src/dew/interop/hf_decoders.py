@@ -85,59 +85,123 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
-def _rope_theta(entry: Optional[Mapping[str, Any]], field: str) -> Optional[float]:
-    """One rope base frequency out of a rope_parameters entry, if it names one.
+_LLAMA3_FIELDS: Tuple[str, ...] = ('factor', 'low_freq_factor', 'high_freq_factor',
+                                   'original_max_position_embeddings')
 
-    Only plain rope ('default' or 'none') maps; a scaled variant changes what
-    the model computes, so the caller refuses it with the field named. 'type'
-    is the older spelling of rope_type and transformers still reads it
-    (modeling_rope_utils.py:785, 839). Plain rope takes no field beyond those
-    two and rope_theta, which is what its validator accepts
+
+@dataclass(frozen=True)
+class _Rope:
+    """One rope entry as read: its base and, for a llama3 entry, the ramp
+    record under the reference's names. `theta` is None where the entry
+    names no base of its own."""
+
+    theta: Optional[float] = None
+    scaling: Optional[Dict[str, Any]] = None
+
+
+def _rope_entry(entry: Optional[Mapping[str, Any]], field: str) -> _Rope:
+    """One rope_parameters entry, if it names a base or a ramp.
+
+    Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
+    variant changes what the model computes, so it refuses with the field
+    named. 'type' is the older spelling of rope_type and transformers still
+    reads it (modeling_rope_utils.py:785, 839). Plain rope takes no field
+    beyond those two and rope_theta, which is what its validator accepts
     (modeling_rope_utils.py:850-857), so a 'factor' or an
-    'original_max_position_embeddings' names a scaling whatever the type says.
+    'original_max_position_embeddings' names a scaling whatever the type
+    says; llama3 takes exactly its four (modeling_rope_utils.py:987-995).
     """
     if entry is None:
-        return None
+        return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    theta = entry.get('rope_theta')
+    theta = None if theta is None else float(theta)
+    if rope_type == 'llama3':
+        missing = sorted(set(_LLAMA3_FIELDS) - set(entry))
+        extra = sorted(set(entry) - set(_LLAMA3_FIELDS) - {'rope_type', 'type', 'rope_theta'})
+        if missing or extra:
+            _refuse(f"{field} (rope_type 'llama3') fields",
+                    f"the llama3 ramp reads exactly {list(_LLAMA3_FIELDS)}; "
+                    f"missing {missing}, unexpected {extra}")
+        return _Rope(theta, {
+            'rope_type': 'llama3',
+            'factor': float(entry['factor']),
+            'low_freq_factor': float(entry['low_freq_factor']),
+            'high_freq_factor': float(entry['high_freq_factor']),
+            'original_max_position_embeddings': int(entry['original_max_position_embeddings']),
+        })
     if rope_type not in ('default', 'none'):
         _refuse(f"{field} (rope_type {rope_type!r})",
-                "the backbone applies plain rotary positions at rope_theta")
+                "the backbone applies plain rotary positions at rope_theta, "
+                "or Llama 3.1's llama3 ramp over them")
     scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta'})
     if scaling:
         _refuse(f"{field} scaling fields {scaling}",
                 "the backbone applies plain rotary positions at rope_theta")
-    theta = entry.get('rope_theta')
-    return None if theta is None else float(theta)
+    return _Rope(theta)
 
 
-def _rope(hf_config: Mapping[str, Any], used: set) -> Tuple[float, Optional[float]]:
-    """(rope_theta, rope_local_theta) from any of the three HF spellings.
+def _rope_theta(entry: Optional[Mapping[str, Any]], field: str) -> Optional[float]:
+    """One plain rope base frequency; a llama3 entry refuses where only plain
+    rope has a place (the DeepSeek and Gemma 4 readers)."""
+    rope = _rope_entry(entry, field)
+    if rope.scaling is not None:
+        _refuse(f"{field} (rope_type 'llama3')",
+                "this family's rotary positions take no llama3 ramp")
+    return rope.theta
 
-    Old configs carry flat rope_theta, gemma3 text configs add
-    rope_local_base_freq, new configs nest per-layer-type rope_parameters.
-    rope_scaling, when present, is the old name for the same thing.
+
+@dataclass(frozen=True)
+class _Ropes:
+    """What the shared rope readers hand a family: the model's base and
+    ramp, and the sliding kind's own where a config states one.
+    `full_only` marks a nested config whose sliding entry names no ramp
+    while the full one does, so the ramp is the full kind's alone."""
+
+    theta: float
+    scaling: Optional[Dict[str, Any]] = None
+    local_theta: Optional[float] = None
+    local_scaling: Optional[Dict[str, Any]] = None
+    full_only: bool = False
+
+
+def _rope(hf_config: Mapping[str, Any], used: set) -> _Ropes:
+    """The rope of any of the three HF spellings.
+
+    Old configs carry flat rope_theta with rope_scaling beside it, gemma3
+    text configs add rope_local_base_freq, new configs nest per-layer-type
+    rope_parameters. A nested config's full_attention entry is the model's
+    rope and its sliding_attention entry the sliding kind's, base and ramp
+    alike (OLMo 3 puts its rope_scaling on full_attention alone,
+    configuration_olmo3.py:110-113).
     """
     used.update(('rope_theta', 'rope_local_base_freq', 'rope_parameters', 'rope_scaling'))
     rope_parameters = hf_config.get('rope_parameters')
 
     if isinstance(rope_parameters, Mapping) and 'rope_theta' not in rope_parameters:
-        theta = (_rope_theta(rope_parameters.get('full_attention'),
-                             'rope_parameters.full_attention') or 10000.0)
-        local = (_rope_theta(rope_parameters.get('sliding_attention'),
-                             'rope_parameters.sliding_attention') or theta)
-        return theta, (None if local == theta else local)
+        full = _rope_entry(rope_parameters.get('full_attention'), 'rope_parameters.full_attention')
+        sliding = _rope_entry(rope_parameters.get('sliding_attention'),
+                              'rope_parameters.sliding_attention')
+        theta = full.theta or 10000.0
+        local = sliding.theta or theta
+        return _Ropes(theta, full.scaling, None if local == theta else local,
+                      None if sliding.scaling == full.scaling else sliding.scaling,
+                      full_only=full.scaling is not None and sliding.scaling is None)
 
-    # Flat spellings: either field may carry the base frequency, and either
-    # may carry a scaling type, which _rope_theta refuses when it is not plain.
-    theta = None
+    # Flat spellings: either field may carry the base frequency and the
+    # ramp; transformers prefers rope_scaling when both are present
+    # (convert_rope_params_to_dict), so it is read last.
+    theta, scaling = None, None
     for field in ('rope_parameters', 'rope_scaling'):
         entry = hf_config.get(field)
         if isinstance(entry, Mapping):
-            theta = _rope_theta(entry, field) or theta
+            rope = _rope_entry(entry, field)
+            theta = rope.theta or theta
+            scaling = rope.scaling or scaling
     if theta is None:
         theta = float(hf_config.get('rope_theta', 10000.0))
     local = hf_config.get('rope_local_base_freq')
-    return theta, (None if local is None else float(local))
+    return _Ropes(theta, scaling, None if local is None else float(local))
 
 
 def _specified_layer_types(hf_config: Mapping[str, Any], used: set[str],
@@ -442,10 +506,15 @@ def _qwen35_rope(hf_config: Mapping[str, Any]) -> Tuple[float, float]:
 
 def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
                  layer_types: Optional[Tuple[str, ...]] = None,
-                 rope: Optional[Tuple[float, Optional[float]]] = None,
+                 rope: Optional[_Ropes] = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
                  tie_embeddings: bool = False) -> Dict[str, Any]:
-    """The shared projection geometry and decoder fields."""
+    """The shared projection geometry and decoder fields.
+
+    A ramp both kinds share is the model's; a ramp the full layers alone
+    carry (OLMo 3's spelling) lands on the full kind, because a kind's None
+    rides the model's value and cannot turn a ramp off.
+    """
     hidden = int(hf_config['hidden_size'])
     heads = int(hf_config['num_attention_heads'])
     kv_heads = hf_config.get('num_key_value_heads')
@@ -459,7 +528,8 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
         _refuse(f"hidden_act {activation!r}",
                 f"the gated MLP supports {sorted(_ACTIVATIONS)}")
 
-    rope_theta, rope_local_theta = (_rope(hf_config, used) if rope is None else rope)
+    ropes = _rope(hf_config, used) if rope is None else rope
+    rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
     layer_types = _specified_layer_types(hf_config, used, layer_types)
     sliding_window = hf_config.get('sliding_window')
     used.add('sliding_window')
@@ -503,6 +573,13 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
 
+    if ropes.scaling is not None:
+        if ropes.full_only and 'sliding_attention' in layer_types:
+            config['kinds'].setdefault('full_attention', {})['rope_scaling'] = ropes.scaling
+        else:
+            config['rope_scaling'] = ropes.scaling
+    if ropes.local_scaling is not None:
+        config['kinds']['sliding_attention']['rope_scaling'] = ropes.local_scaling
     return config
 
 
@@ -592,18 +669,21 @@ def _olmo3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
     (modeling_olmo3.py:259-266, the sandwich pair without the input pair),
     q/k RMSNorms over the whole projection before the head split
     (:162-163, :178-179), three sliding layers to one full
-    (configuration_olmo3.py:96-98), and one rope base for both kinds. The
-    reference applies `rope_scaling` to its full-attention layers alone
-    (configuration_olmo3.py:110-113); the released checkpoints carry a YaRN
-    there, which the attention has no per-kind ramp for yet, so a config
-    that scales refuses with the entry named rather than loading plain rope
-    under it."""
+    (configuration_olmo3.py:96-98), and one rope base for both kinds. A flat
+    `rope_scaling` is the full-attention layers' alone, which is where the
+    reference moves it (configuration_olmo3.py:110-113), so a llama3 ramp
+    lands on the full kind; the released checkpoints carry a YaRN there,
+    which the attention has no per-kind ramp for, so that entry refuses by
+    name rather than loading plain rope under it."""
     layers = int(hf_config['num_hidden_layers'])
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
+    ropes = _rope(hf_config, used)
+    if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
+        ropes = dataclasses.replace(ropes, full_only=True)
     config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
-                          scale_after_cast=False)
+                          scale_after_cast=False, rope=ropes)
     config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
     return config
 
@@ -663,7 +743,7 @@ def _gemma3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
 def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     layer_types = _gemma_layer_types(hf_config, used, last_full=True)
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
-                          tie_embeddings=True, layer_types=layer_types, rope=(10000.0, None))
+                          tie_embeddings=True, layer_types=layer_types, rope=_Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
     hidden, heads, kv_heads = config['emb_features'], config['num_heads'], config['num_kv_heads']
@@ -751,7 +831,7 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
 def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
                      sparse: bool = False) -> Dict[str, Any]:
     rope_theta, yarn = _deepseek_rope(hf_config, used)
-    config = _base_config(hf_config, used, rope=(rope_theta, None))
+    config = _base_config(hf_config, used, rope=_Ropes(rope_theta))
     layer_types = config['layer_types']
     model_type = hf_config['model_type']
     layers = int(hf_config['num_hidden_layers'])
@@ -846,7 +926,7 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
         for index in range(int(hf_config['num_hidden_layers']))))
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
-                          layer_types=layer_types, rope=(10000.0, None))
+                          layer_types=layer_types, rope=_Ropes(10000.0))
     # The reference's attention always chunks a doubled q_proj into the
     # query and a sigmoid gate on the branch (modeling_qwen3_5.py:644-646,
     # 670-673, 701), whatever the config's attn_output_gate says: the
@@ -1371,6 +1451,18 @@ def _export_config(model) -> Dict[str, Any]:
         config['rope_theta'] = model.rope_theta
     if sliding is not None and sliding.window is not None:
         config['sliding_window'] = sliding.window
+    # The ramp writes in the flat spelling every family that reads one
+    # accepts (rope_scaling beside rope_theta, as Llama 3.1 ships it); a
+    # ramp that differs between kinds has that spelling in no reference
+    # this exports, so it is refused naming the kinds.
+    ramps = {kind: model.kind_of(kind).rope_scaling for kind in set(types)}
+    if len(set(ramps.values())) > 1:
+        raise ValueError(
+            f"rope_scaling differs between layer kinds ({sorted(ramps)}), which "
+            "no exported family spells; the model cannot be written back")
+    ramp = model.kind_of(types[0]).rope_scaling
+    if ramp is not None:
+        config['rope_scaling'] = dataclasses.asdict(ramp)
     config.update(family.export_fields(model))
     return {key: value for key, value in config.items() if value is not None}
 
