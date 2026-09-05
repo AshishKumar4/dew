@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
-from .encoders import Audio, CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
+from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -112,5 +112,4 @@ class InputSpec:
 
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "Audio", "CharTable", "rebuild",
-           "unit_range"]
+           "CharTable", "rebuild", "unit_range"]
