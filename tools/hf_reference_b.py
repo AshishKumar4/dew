@@ -15,19 +15,37 @@ What lands in tests/fixtures/hf:
 - deepseek-v2-tiny/: DeepSeek V2 Lite at toy width, softmax routing under
   group_limited_greedy with no renormalisation, the shared expert and a
   dense first layer, MLA without the query LoRA.
-- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/: released configs only.
+- glm4-moe-tiny/: GLM 4.5 at toy width, biased q/k/v over a bias-free
+  o_proj, the q/k norms of GLM 4.6, a half rotary, a dense first layer over
+  a routed one with the balancing bias and a shared expert, scaled by 1.5,
+  and one MTP depth under the released names (model.layers.2.*). transformers
+  builds no depth, so its logits (mtp_logits.npy) come from the depth's own
+  tensors composed the way the engines that run the released weights do:
+  eh_proj over enorm(embeddings) and hnorm(hidden) in that order, one
+  Glm4MoeDecoderLayer, shared_head.norm, then the trunk's head.
+- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/: released
+  configs only.
 """
 
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
-from transformers import DeepseekV2Config, DeepseekV2ForCausalLM
+from safetensors.numpy import load_file, save_file
+from transformers import (
+    DeepseekV2Config, DeepseekV2ForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM,
+)
+from transformers.masking_utils import create_causal_mask
+from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
-from hf_reference import DEEPSEEK_YARN, write_released_config, write_tiny  # noqa: E402
+from hf_reference import (  # noqa: E402
+    DEEPSEEK_YARN, FIXTURES, scatter_weights, write_released_config, write_tiny,
+)
+from moe_reference import expert_tensors  # noqa: E402
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
@@ -50,12 +68,82 @@ def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
     return DeepseekV2ForCausalLM(config)
 
 
+def tiny_glm4_moe() -> Glm4MoeForCausalLM:
+    config = Glm4MoeConfig.from_dict(dict(
+        vocab_size=256, hidden_size=32, intermediate_size=48, moe_intermediate_size=16,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        partial_rotary_factor=0.5, use_qk_norm=True, attention_bias=True,
+        n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=1, n_group=1,
+        topk_group=1, routed_scaling_factor=1.5, norm_topk_prob=True,
+        first_k_dense_replace=1, num_nextn_predict_layers=1, max_position_embeddings=64,
+        rope_theta=1e6, rms_norm_eps=1e-5, tie_word_embeddings=False))
+    torch.manual_seed(0)
+    return Glm4MoeForCausalLM(config)
+
+
+class Glm4MoeMTP(torch.nn.Module):
+    """One GLM MTP depth as vLLM's Glm4MoeMultiTokenPredictorLayer composes it."""
+
+    def __init__(self, config: Glm4MoeConfig) -> None:
+        super().__init__()
+        self.enorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = torch.nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.block = Glm4MoeDecoderLayer(config, layer_idx=config.num_hidden_layers)
+        self.shared_head_norm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, model: Glm4MoeForCausalLM, hidden: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        fused = self.eh_proj(torch.cat(
+            [self.enorm(model.model.embed_tokens(ids)), self.hnorm(hidden)], dim=-1))
+        positions = torch.arange(fused.shape[1])[None]
+        mask = create_causal_mask(config=model.config, inputs_embeds=fused, attention_mask=None,
+                                  past_key_values=None, position_ids=positions)
+        out = self.block(fused, attention_mask=mask, position_ids=positions,
+                         position_embeddings=model.model.rotary_emb(fused, positions))
+        return model.lm_head(self.shared_head_norm(out))
+
+
+def write_glm4_moe_mtp(name: str, model: Glm4MoeForCausalLM, seed: int = 2026) -> None:
+    """The depth's tensors into the fixture checkpoint, and its reference logits."""
+    directory = FIXTURES / name
+    depth = Glm4MoeMTP(model.config).eval()
+    scatter_weights(depth, seed)
+    # The layer's submodules sit behind a class decorator that hides them
+    # from a checker, so the routed block's parts are read by name.
+    experts = depth.block.get_submodule("mlp.experts")
+    bias = depth.block.get_buffer("mlp.gate.e_score_correction_bias")
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
+    with torch.no_grad():
+        bias.copy_(torch.linspace(-0.4, 0.4, model.config.n_routed_experts))
+        hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+        logits = depth(model, hidden[:, :-1], ids[:, 1:])
+    prefix = f"model.layers.{model.config.num_hidden_layers}."
+    tensors = load_file(str(directory / "model.safetensors"))
+    for tensor_name, tensor in depth.state_dict().items():
+        if tensor_name.startswith("block.mlp.experts."):
+            continue
+        released = tensor_name.replace("block.", "").replace("shared_head_norm", "shared_head.norm")
+        tensors[prefix + released] = tensor.to(torch.float32).numpy()
+    for tensor_name, tensor in expert_tensors(experts).items():
+        tensors[prefix + tensor_name] = tensor
+    tensors[prefix + "embed_tokens.weight"] = tensors["model.embed_tokens.weight"]
+    tensors[prefix + "shared_head.head.weight"] = tensors["lm_head.weight"]
+    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
+    print(f"{directory}: depth {prefix}* with {len(tensors)} tensors, "
+          f"mtp logits {tuple(logits.shape)}")
+
+
 def main() -> None:
     write_tiny("gpt-oss-tiny", tiny_gpt_oss())
     write_tiny("deepseek-v2-tiny", tiny_deepseek_v2())
+    glm = tiny_glm4_moe()
+    write_tiny("glm4-moe-tiny", glm)
+    write_glm4_moe_mtp("glm4-moe-tiny", glm)
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")
+    write_released_config("glm-4.5-air", "zai-org/GLM-4.5-Air")
 
 
 if __name__ == "__main__":

@@ -1441,3 +1441,109 @@ def test_a_kimi_k2_checkpoint_loads_as_the_deepseek_v3_it_is(tmp_path):
     from dew.interop.hf_decoders import _export_config
     assert _export_config(model)["model_type"] == "deepseek_v3"
 
+
+
+# --------------------------------------------------------------------------
+# GLM 4.5: a half rotary over biased GQA, DeepSeek V3 routing, an MTP depth
+# --------------------------------------------------------------------------
+
+GLM4_MOE = FIXTURES / "glm4-moe-tiny"
+
+
+def test_glm4_moe_config_translates_field_by_field():
+    config = translate_config(fixture_config("glm4-moe-tiny"))
+
+    assert config["attention_bias"] and config["o_proj_bias"] is False
+    assert config["qk_norm"] and config["scale_after_cast"]
+    assert config["partial_rotary_factor"] == 0.5 and config["partial_rotary_type"] == "default"
+    assert config["rope_theta"] == 1e6 and config["head_dim"] == 8
+    assert config["mixture"] == {
+        "experts": 8, "top_k": 2, "layers": (1,), "scaling": 1.5, "shared_features": 16,
+        "expert_features": 16, "score_function": "sigmoid", "groups": 1,
+        "groups_per_token": 1, "bias": True}
+    assert config["num_nextn_predict_layers"] == 1
+
+
+def test_the_real_glm_4_5_air_config_translates():
+    """zai-org/GLM-4.5-Air: 46 layers with one dense, 128 sigmoid-scored
+    experts with 8 per token, one shared expert of 1408, 96 query and 8
+    key/value heads of 128 with biased q/k/v and a bias-free o_proj, a half
+    rotary at theta 1e6, no q/k norms, and one MTP depth."""
+    config = translate_config(fixture_config("glm-4.5-air"))
+
+    assert config["num_layers"] == 46 and config["mixture"]["layers"] == tuple(range(1, 46))
+    assert config["mixture"]["experts"] == 128 and config["mixture"]["top_k"] == 8
+    assert config["mixture"]["shared_features"] == 1408 and config["mixture"]["bias"]
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (96, 8, 128)
+    assert config["attention_bias"] and config["o_proj_bias"] is False
+    assert not config["qk_norm"]
+    assert config["partial_rotary_factor"] == 0.5 and config["rope_theta"] == 1e6
+    assert config["num_nextn_predict_layers"] == 1 and config["vocab_size"] == 151552
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("rope_scaling", {"rope_type": "yarn", "factor": 4.0}, "plain rotary"),
+    ("norm_topk_prob", False, "norm_topk_prob=False"),
+    ("topk_method", "greedy", "topk_method 'greedy'"),
+])
+def test_a_glm4_moe_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("glm4-moe-tiny"), field: value})
+
+
+def test_glm4_moe_logits_match_the_reference_implementation():
+    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
+    difference| 3.3e-06 with identical argmax."""
+    model, variables, _ = fp32_decoder(GLM4_MOE)
+    ids = np.load(GLM4_MOE / "input_ids.npy")
+    reference = np.load(GLM4_MOE / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
+    """The checkpoint's model.layers.2.* depth loads as mtp_0 with the
+    trunk's routing and computes what the engines running the released
+    weights compute (tools/hf_reference_b.py Glm4MoeMTP): tolerance 1e-4,
+    observed max |logit difference| 3.2e-06 with identical argmax. Swapping
+    the two norms, the order today's from-scratch code had, disagrees."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model, variables, _ = fp32_decoder(GLM4_MOE)
+    ids = jnp.asarray(np.load(GLM4_MOE / "input_ids.npy"), jnp.int32)
+    reference = np.load(GLM4_MOE / "mtp_logits.npy")
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 16)
+    assert "mtp_0" in variables["moe"]
+
+    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+    swapped = {**variables, "params": {**variables["params"], "mtp_0": {
+        **depth, "enorm": depth["hnorm"], "hnorm": depth["enorm"]}}}
+    other = np.asarray(model.apply(swapped, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+    assert float(np.max(np.abs(other - reference))) > 1e-2
+
+
+def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
+    """The depth shares the trunk's embedding and head; a checkpoint whose
+    copies differ would load as a model computing something else."""
+    from safetensors.numpy import load_file, save_file
+
+    tensors = load_file(str(GLM4_MOE / "model.safetensors"))
+    tensors["model.layers.2.shared_head.head.weight"] = tensors["lm_head.weight"] * 1.5
+    directory = tmp_path / "glm"
+    directory.mkdir()
+    save_file(tensors, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(fixture_config("glm4-moe-tiny")))
+    with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
+        fp32_decoder(directory)
+

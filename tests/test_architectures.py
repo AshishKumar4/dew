@@ -207,6 +207,16 @@ CASES = [
                     "norm_topk_prob": False, "groups": 4, "groups_per_token": 2,
                     "group_score": "max", "expert_features": 16, "shared_features": 32},
     }, seq_len=SEQ_LEN, label="deepseek_v2"),
+    # GLM 4.5's stack at toy width: biased q/k/v over a bias-free o_proj, a
+    # half rotary, DeepSeek V3 routing with a shared expert on the last
+    # layer, and one MTP depth that routes like it.
+    Case("causal_transformer", {
+        **LM, "attention_bias": True, "o_proj_bias": False, "qk_norm": False,
+        "head_dim": 8, "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
+        "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
+                    "bias": True, "expert_features": 16, "shared_features": 16},
+        "num_nextn_predict_layers": 1,
+    }, seq_len=SEQ_LEN, label="glm4_moe"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,

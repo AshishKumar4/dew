@@ -251,3 +251,28 @@ def test_mtp_weight_needs_depths_and_a_positive_weight():
         LMObjective(tiny(), SEQ, mtp_weight=0.3)
     with pytest.raises(ValueError, match="positive weight"):
         LMObjective(tiny(num_nextn_predict_layers=1), SEQ, mtp_weight=0.0)
+
+
+def test_a_routed_depth_balances_only_when_the_depths_run():
+    """A depth routes like the trunk's last layer, so its balancing bias
+    moves with the load its router saw; without mtp_weight the depth never
+    runs, observes no load, and its bias stays where it was."""
+    model = tiny(num_nextn_predict_layers=1, num_kv_heads=4,
+                 mixture={"experts": 4, "top_k": 2, "score_function": "sigmoid", "bias": True})
+    batch = token_batch()
+    still = LMObjective(model, SEQ, balance_rate=0.1)
+    params = still.init(jax.random.key(0))
+    _, aux = still.loss(params, batch, step_at())
+    assert aux.variables is not None
+    moved = aux.variables["moe"]
+    assert jnp.array_equal(moved["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
+                           params["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"])
+    assert not jnp.array_equal(moved["layers_1"]["mlp"]["gate"]["e_score_correction_bias"],
+                               params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
+
+    _, aux = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3).loss(params, batch, step_at())
+    assert aux.variables is not None
+    assert not jnp.array_equal(
+        aux.variables["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
+        params["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"])
+
