@@ -257,3 +257,96 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
         assert accuracy == reference[1], name
         np.testing.assert_allclose(d_states, reference[2], atol=1e-5, err_msg=name)
         np.testing.assert_allclose(d_table, reference[3], atol=1e-5, err_msg=name)
+
+
+# ---------------------------------------------------------------------------
+# tools/benchmark_step.py
+# ---------------------------------------------------------------------------
+
+TINY_LM = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+           "mlp_features": 32, "max_seq_len": 8}
+
+
+def test_step_benchmark_keeps_the_cases_it_measured_when_a_later_one_fails(tmp_path):
+    """A sweep writes --json-out after every case, so a case that cannot be
+    built loses nothing measured before it: the file holds the finished row,
+    and only that row."""
+    tool = load("benchmark_step")
+    out = tmp_path / "rows.json"
+    good = tool.Case("causal_transformer", dict(TINY_LM), batch_size=8, seq_len=8,
+                     fsdp_min_param_size=256)
+    bad = tool.Case("no_such_architecture")
+    config = tool.BenchmarkConfig(cases=[good, bad], warmup=1, steps=2, json_out=str(out))
+
+    with pytest.raises(KeyError, match="no model named 'no_such_architecture'"):
+        tool.run(config)
+
+    rows = json.loads(out.read_text())
+    assert [row["architecture"] for row in rows] == ["causal_transformer"]
+    (row,) = rows
+    assert row["measured_steps"] == 2 and row["finite"] and np.isfinite(row["loss"])
+    assert row["samples_per_sec"] == pytest.approx(8 / (row["ms_per_step"] / 1e3), rel=1e-2)
+
+
+def test_step_benchmark_overrides_reach_only_the_cases_they_apply_to():
+    """--frames resizes the video cases and leaves an image model's rank
+    alone; --packed-documents packs the language models and nobody else;
+    --batch-size reaches every case."""
+    tool = load("benchmark_step")
+    cases = tool.build_cases(tool.BenchmarkConfig(
+        preset="small", frames=4, packed_documents=2, batch_size=2))
+
+    by_name = {}
+    for case in cases:
+        by_name.setdefault(case.architecture, []).append(case)
+    assert {c.frames for c in by_name["video_dit"] + by_name["unet_3d"]} == {4}
+    assert {c.frames for c in by_name["simple_dit"] + by_name["unet"]} == {0}
+    assert {c.packed_documents for c in by_name["causal_transformer"]} == {2}
+    assert all(c.packed_documents == 0 for c in cases if not c.is_lm)
+    assert {c.batch_size for c in cases} == {2}
+
+
+def test_step_benchmark_refuses_a_case_it_cannot_name():
+    """An architecture outside the preset and a JSON field outside Case are
+    both errors before anything compiles."""
+    tool = load("benchmark_step")
+    with pytest.raises(ValueError, match="no_such"):
+        tool.build_cases(tool.BenchmarkConfig(preset="cpu-smoke", architectures=["no_such"]))
+    with pytest.raises(ValueError, match="bogus"):
+        tool.cases_from_json('[{"architecture": "unet", "bogus": 1}]')
+    with pytest.raises(ValueError, match="JSON list"):
+        tool.cases_from_json('{"architecture": "unet"}')
+
+
+def test_step_benchmark_packed_rows_restart_positions_at_every_document():
+    """A row of 17 tokens packed as 4 documents is three of 5 and one of 2:
+    the segment ids count the documents from 1 and the positions count from
+    0 inside each, which is what the packed loader's mask and RoPE read."""
+    tool = load("benchmark_step")
+    case = tool.Case("causal_transformer", dict(TINY_LM), batch_size=2, seq_len=16,
+                     packed_documents=4)
+
+    batch = next(tool.batches(case))
+
+    assert batch["text"].shape == (2, 17) and batch["text"].max() < 64
+    for row in range(2):
+        assert batch["text_segment_ids"][row].tolist() == [1] * 5 + [2] * 5 + [3] * 5 + [4] * 2
+        assert batch["text_positions"][row].tolist() == [0, 1, 2, 3, 4] * 3 + [0, 1]
+
+
+def test_step_benchmark_table_shows_each_column_in_its_unit():
+    """FLOPs print as GFLOP, utilisation as a percentage, bytes as GiB, a
+    parameter count with separators, and a value the backend did not report
+    as n/a."""
+    tool = load("benchmark_step")
+    row = {"architecture": "simple_dit", "batch_size": 8, "fsdp_size": 1, "expert_size": 1,
+           "params": 1234567, "ms_per_step": 5.55, "p10_ms": 3.9, "p50_ms": 4.2,
+           "p90_ms": 4.4, "samples_per_sec": 1435.7, "flops_per_step": 2.5e9,
+           "utilization": 0.4321, "peak_device_bytes": 3 * 2 ** 30}
+
+    table = tool.format_table([row, {**row, "utilization": None, "peak_device_bytes": None}])
+
+    lines = table.splitlines()
+    assert lines[2].split() == ["simple_dit", "8", "1", "1", "1,234,567", "5.5", "3.9", "4.2",
+                                "4.4", "1435.7", "2.5", "43.2", "3.00"]
+    assert lines[3].split()[-2:] == ["n/a", "n/a"]
