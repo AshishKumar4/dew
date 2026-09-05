@@ -49,7 +49,7 @@ from transformers import (
     GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
-    Qwen3MoeConfig, Qwen3MoeForCausalLM,
+    Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -144,6 +144,19 @@ def tiny_qwen3_moe() -> Qwen3MoeForCausalLM:
         vocab_size=128, max_position_embeddings=64, rope_theta=1e6))
     torch.manual_seed(0)
     return Qwen3MoeForCausalLM(config)
+
+
+def tiny_olmo3() -> Olmo3ForCausalLM:
+    """Four layers, so the reference's own 3:1 sliding-to-full pattern picks
+    one full layer; the q/k norms over the whole projection with grouped
+    heads (so a per-head norm cannot pass) and the post-norm block."""
+    config = Olmo3Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=128, vocab_size=256,
+        sliding_window=4, max_position_embeddings=64, rope_theta=5e5,
+        rms_norm_eps=1e-6))
+    torch.manual_seed(0)
+    return Olmo3ForCausalLM(config)
 
 
 def tiny_gemma() -> GemmaForCausalLM:
@@ -357,6 +370,8 @@ def main() -> None:
     write_tiny("mixtral-tiny", tiny_mixtral())
     write_tiny("qwen2-tiny", tiny_qwen2())
     write_tiny("qwen3-moe-tiny", tiny_qwen3_moe())
+    write_tiny("olmo3-tiny", tiny_olmo3())
+    write_released_config("olmo-3-7b", "allenai/Olmo-3-1025-7B")
     write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
     write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
     write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
