@@ -137,23 +137,34 @@ def tiny_deepseek_v3() -> DeepseekV3ForCausalLM:
     return DeepseekV3ForCausalLM(config)
 
 
+# The v32 fixture's weights come from this seed rather than the family's
+# 1234. The indexer scores a key at zero whenever every head's query-key
+# agreement is negative (the relu), and torch.topk and jax.lax.top_k break
+# an exact tie at the top-k boundary differently, so a fixture with a tie
+# on any row compares two selections rather than two implementations. At
+# two heads a quarter of the keys score zero and no seed in 3000 clears
+# every row by more than 3.6e-3; at eight heads seed 202 keeps the fourth
+# and fifth scores of every row of both layers at least 0.0217 apart.
+DEEPSEEK_V32_SEED = 202
+
+
 def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
-    """The V3 shape with the sparse indexer: two heads of width 16 over the
-    rope width of 8, keeping four of the twelve keys."""
+    """The V3 shape with the sparse indexer: eight heads of width 16 over
+    the rope width of 8, keeping four of the twelve keys."""
     config = DeepseekV32Config(
-        **DEEPSEEK_TINY, index_topk=4, index_n_heads=2, index_head_dim=16)
+        **DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16)
     torch.manual_seed(0)
     return DeepseekV32ForCausalLM(config)
 
 
-def scatter_weights(model: torch.nn.Module) -> None:
+def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
     A freshly constructed model leaves the RMSNorm scales at their identity
     value, and a fixture whose norms are all ones or all zeros would pass a
     parity test that had the (1 + w) offset backwards.
     """
-    generator = torch.Generator().manual_seed(1234)
+    generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, tensor in model.named_parameters():
             noise = torch.randn(tensor.shape, generator=generator) * 0.05
@@ -175,10 +186,10 @@ def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).numpy()
 
 
-def write_tiny(name: str, model: torch.nn.Module) -> None:
+def write_tiny(name: str, model: torch.nn.Module, seed: int = 1234) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    scatter_weights(model)
+    scatter_weights(model, seed)
     model = model.to(torch.float32)
     model.save_pretrained(directory, safe_serialization=True)
 
@@ -260,7 +271,7 @@ def main() -> None:
     write_tiny("gemma3-tiny", tiny_gemma3())
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
-    write_tiny("deepseek-v32-tiny", tiny_deepseek_v32())
+    write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)

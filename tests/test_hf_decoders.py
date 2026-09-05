@@ -22,6 +22,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
   tiny config with every Gemma 4 gap at once: partial rotary, mixed head
   dims, double-wide MLP, KV sharing, per-layer inputs and the values norm.
   The logit cap is absent because the text path never reads it.
+- deepseek-v3-tiny : max |logit difference| 4.4e-06, tolerance 1e-4. MLA
+  with q and kv LoRA, the released YaRN spelling, a dense layer over a
+  routed one with a shared expert, the group limit and the balancing bias.
+- deepseek-v32-tiny: max |logit difference| 3.6e-06, tolerance 1e-4. The
+  same over the sparse indexer; the dense mixer on the same weights differs
+  from the fixture by 3.8, so the fixture is the sparse model.
 """
 
 import json
@@ -42,6 +48,7 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
+DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -161,17 +168,19 @@ def test_a_rope_scaling_spelled_the_old_way_is_refused():
         translate_config(factor_only)
 
 
-@pytest.mark.parametrize("name", TINY)
-def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
-    """Same paths, same shapes, same dtypes as a freshly initialised model."""
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
+def test_translated_weights_are_exactly_the_models_variables(name, rng):
+    """Same collections, same paths, same shapes, same dtypes as a freshly
+    initialised model: `params` for every family, and the `moe` collection
+    DeepSeek's routers keep their bias in."""
     config = translate_config(fixture_config(name))
     built = with_precision('causal_transformer', dict(config),
                                    dtype='float32', attention_impl='reference')
     model = models.build('causal_transformer', **built)
-    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
 
     from dew.interop.hf_decoders import _load_shards
-    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config)['params'])
+    loaded = flat_tree(translate_weights(_load_shards(FIXTURES / name), config))
 
     assert set(loaded) == set(initialised)
     for path, leaf in loaded.items():
@@ -179,7 +188,7 @@ def test_translated_weights_are_exactly_the_models_param_tree(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY)
+@pytest.mark.parametrize("name", TINY + DEEPSEEK)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
@@ -321,8 +330,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
         expected['.'.join(path)] = (tuple(reversed(shape))
                                     if path[-1] == 'kernel' else shape)
 
-    tree = jax.eval_shape(
-        lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32))['params'])
+    tree = jax.eval_shape(lambda: model.init(rng, jnp.zeros((1, 4), jnp.int32)))
     initialised = {path: leaf.shape for path, leaf in flat_tree(tree).items()}
 
     assert initialised == expected
@@ -753,9 +761,6 @@ def test_a_gemma3_pattern_keeps_its_last_layer():
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
 
 
-DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
-
-
 def test_the_router_bias_lands_in_the_moe_collection():
     """DeepSeek's `e_score_correction_bias` is router state a training step
     moves, not a weight, and `Router` keeps it in the `moe` collection. The
@@ -806,3 +811,66 @@ def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match=r"missing \['moe\.layers_1\.mlp\.gate\.e_score_correction_bias'\]"):
         fp32_decoder(tmp_path)
+
+
+def test_deepseek_configs_translate_field_by_field():
+    """The V3 config becomes the mla mixer record with the released YaRN
+    spelling and the mixture DeepseekV3MoE builds: a dense first layer, eight
+    sigmoid-scored experts in four groups with two per token, top-4 scaled
+    by 2.5, the balancing bias, and one shared expert of the routed width.
+    V3.2 adds the indexer's three fields and names its sparse layer kind."""
+    v3 = translate_config(fixture_config("deepseek-v3-tiny"))
+    v32 = translate_config(fixture_config("deepseek-v32-tiny"))
+
+    assert v3['mixer'] == {
+        'kind': 'mla', 'q_lora_rank': 8, 'kv_lora_rank': 8,
+        'qk_nope_head_dim': 8, 'qk_rope_head_dim': 8, 'v_head_dim': 8,
+        'rope_interleave': True,
+        'yarn': {'rope_type': 'yarn', 'rope_theta': 10000.0, 'factor': 40.0,
+                 'original_max_position_embeddings': 4096, 'beta_fast': 32.0,
+                 'beta_slow': 1.0, 'mscale': 1.0, 'mscale_all_dim': 1.0,
+                 'truncate': True, 'attention_factor': None},
+        'index_topk': None, 'index_n_heads': None, 'index_head_dim': None,
+    }
+    assert v3['mixture'] == {
+        'experts': 8, 'top_k': 4, 'layers': (1,), 'score_function': 'sigmoid',
+        'scaling': 2.5, 'groups': 4, 'groups_per_token': 2, 'bias': True,
+        'shared_features': 16, 'expert_features': 16,
+    }
+    assert v3['head_dim'] == 16 and v3['scale_after_cast'] and not v3['qk_norm']
+    assert v3['layer_types'] == ('full_attention', 'full_attention')
+
+    assert v32['mixer'] == {**v3['mixer'], 'index_topk': 4, 'index_n_heads': 8,
+                            'index_head_dim': 16}
+    assert v32['mixture'] == v3['mixture']
+    assert v32['layer_types'] == ('deepseek_sparse_attention',) * 2
+
+
+def test_the_v32_fixture_is_the_sparse_model():
+    """The dense mixer on deepseek-v32-tiny's weights differs from the
+    fixture by 3.8, so the parity above covers the indexer's selection; a
+    generator that lost the eager mask fold again would fail here."""
+    directory = FIXTURES / "deepseek-v32-tiny"
+    _, variables, built = fp32_decoder(directory)
+    dense = models.build('causal_transformer', **{
+        **built, 'mixer': {**built['mixer'], 'index_topk': None,
+                           'index_n_heads': None, 'index_head_dim': None}})
+    params = {layer: ({**block, 'self_attn': {name: leaf for name, leaf
+                                              in block['self_attn'].items()
+                                              if name != 'indexer'}}
+                      if layer.startswith('layers_') else block)
+              for layer, block in variables['params'].items()}
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+
+    logits = np.asarray(dense.apply({**variables, 'params': params}, ids))
+    assert float(np.max(np.abs(logits - np.load(directory / "logits.npy")))) > 1.0
+
+
+@pytest.mark.parametrize("name", DEEPSEEK)
+def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path):
+    """The writer covers the three attention families; a model with the mla
+    mixer or routed experts set is refused naming both instead of writing
+    a checkpoint without their tensors."""
+    model, variables, _ = fp32_decoder(FIXTURES / name)
+    with pytest.raises(ValueError, match="mixer or mixture"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
