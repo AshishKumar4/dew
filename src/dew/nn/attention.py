@@ -14,6 +14,7 @@ import functools
 import math
 from .blocks import kernel_init
 from .sharding import logical_axes
+from .attention_sinks import attention_with_sinks
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -231,7 +232,8 @@ def cudnn_supports(query, key) -> Optional[str]:
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
-                                 causal=False, sliding_window=None, mask=None, bias=None):
+                                 causal=False, sliding_window=None, mask=None, bias=None,
+                                 sinks=None):
     """The one attention kernel path for every attention module.
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
@@ -267,9 +269,22 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     mask argument, so an explicit mask rides in there as an additive bias.
     `bias` is an additive float array broadcastable to [B, H, Q, K], added to
     the logits on every path; T5's relative position table travels in it.
+    `sinks` holds one learned, value-free logit per query head. The reference
+    and xla paths include it in the denominator; auto chooses xla, and the
+    fused cudnn and tpu kernels refuse it.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+    if sinks is not None:
+        if implementation not in (None, 'auto', 'xla'):
+            raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
+        if causal or sliding_window is not None:
+            structural = causal_attention_mask(
+                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+            mask = structural if mask is None else jnp.logical_and(mask, structural)
+        return attention_with_sinks(
+            query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
+            precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
 
     if implementation is None:
         heads = query.shape[-2]
