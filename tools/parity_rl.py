@@ -29,8 +29,8 @@ reference reads; every number written here comes from the reference's own
 arithmetic.
 """
 
+import argparse
 import importlib.util
-import os
 import sys
 import types
 from pathlib import Path
@@ -167,6 +167,8 @@ def registering(*_):
 def compile_reference(name, path):
     """Compile a reference file under its own module name, imports stubbed."""
     spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{path} is not a Python source file; is the clone checked out?")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     parent, _, leaf = name.rpartition(".")
@@ -293,6 +295,13 @@ def write_surrogate(verl, tunix_common):
     def tensor(x):
         return torch.tensor(np.asarray(x), dtype=torch.float32)
 
+    def gradient(x: torch.Tensor) -> np.ndarray:
+        """The gradient a backward pass left on a leaf, which is the point
+        of running the reference under autograd."""
+        if x.grad is None:
+            raise RuntimeError("the reference loss did not reach the log-probabilities")
+        return x.grad.numpy()
+
     config = ActorConfig(EPSILON_LOW, EPSILON_LOW, EPSILON_HIGH, DUAL_CLIP)
     mask = tensor(SURROGATE_MASK)
     # verl broadcasts the per-completion advantage over the sequence itself.
@@ -317,7 +326,7 @@ def write_surrogate(verl, tunix_common):
         loss_agg_mode="token-mean", config=config)
     loss.backward()
     written["verl_clipped_loss"] = loss.detach().numpy()
-    written["verl_clipped_grad"] = log_probs.grad.numpy()
+    written["verl_clipped_grad"] = gradient(log_probs)
     written["verl_clipped_pg_clipfrac"] = np.asarray(metrics["actor/pg_clipfrac"], np.float32)
     written["verl_clipped_pg_clipfrac_lower"] = np.asarray(
         metrics["actor/pg_clipfrac_lower"], np.float32)
@@ -329,7 +338,7 @@ def write_surrogate(verl, tunix_common):
         loss_agg_mode="token-mean", config=config)
     loss.backward()
     written["verl_gspo_loss"] = loss.detach().numpy()
-    written["verl_gspo_grad"] = log_probs.grad.numpy()
+    written["verl_gspo_grad"] = gradient(log_probs)
     written["verl_gspo_pg_clipfrac"] = np.asarray(metrics["actor/pg_clipfrac"], np.float32)
 
     log_probs = leaf(LOG_PROBS)
@@ -338,7 +347,7 @@ def write_surrogate(verl, tunix_common):
     penalty.backward()
     written["verl_k3_kl"] = kl.detach().numpy()
     written["verl_k3_penalty"] = penalty.detach().numpy()
-    written["verl_k3_grad"] = log_probs.grad.numpy()
+    written["verl_k3_grad"] = gradient(log_probs)
     written["verl_k3_kl_extreme"] = verl.kl_penalty_forward(
         tensor(EXTREME_LOG_PROBS), tensor(EXTREME_REF_LOG_PROBS), "k3").detach().numpy()
 
@@ -353,16 +362,20 @@ def write_surrogate(verl, tunix_common):
     return written
 
 
-def main():
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", type=Path, default=FIXTURES)
+    out = parser.parse_args(argv).out
     verl = load_verl()
     tunix, tunix_common = load_tunix()
 
-    os.makedirs(FIXTURES, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     for name, written in (("advantage", write_advantage(verl, tunix)),
                           ("surrogate", write_surrogate(verl, tunix_common))):
-        path = FIXTURES / f"{name}.npz"
+        path = out / f"{name}.npz"
         np.savez(path, **written)
-        print(f"{path}: {os.path.getsize(path) / 1e3:.1f} kB")
+        print(f"{path}: {path.stat().st_size / 1e3:.1f} kB")
         for key, array in sorted(written.items()):
             print(f"  {key}: {np.asarray(array).shape} {np.asarray(array).dtype}")
 
