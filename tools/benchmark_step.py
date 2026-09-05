@@ -48,7 +48,7 @@ from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
 from dew.registry import with_precision
 from dew.telemetry.devices import apply_xla_flags
-from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
+from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
@@ -421,7 +421,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         synced.append((time.perf_counter() - step_start) * 1e3)
     p10, p50, p90 = np.percentile(synced, [10, 50, 90])
 
-    flops = compiled_flops(compiled)
+    flops = trainer.flops_per_step
     step_time = elapsed / config.steps
     utilization = model_flops_utilization(flops, step_time)
     peak = device_peak_bytes()
