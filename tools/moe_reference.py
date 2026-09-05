@@ -35,30 +35,58 @@ that merge so the fixture is in the layout a translation into Dew reads.
 import argparse
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.mixtral.configuration_mixtral import MixtralConfig
-from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from transformers.models.mixtral.modeling_mixtral import MixtralExperts, MixtralSparseMoeBlock
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "moe"
 
 BATCH, LENGTH, HIDDEN = 2, 5, 16
 EXPERT_HIDDEN = 24
 
-MIXTRAL = dict(
-    hidden_size=HIDDEN, intermediate_size=EXPERT_HIDDEN, num_local_experts=8,
-    num_experts_per_tok=2, hidden_act="silu", router_jitter_noise=0.0)
+
+class MixtralFields(TypedDict):
+    """The `MixtralConfig` fields the block is built from, as config.json lists them."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_local_experts: int
+    num_experts_per_tok: int
+    hidden_act: str
+    router_jitter_noise: float
+
+
+class DeepseekFields(TypedDict):
+    """The `DeepseekV3Config` fields the router is built from, as config.json lists them."""
+
+    hidden_size: int
+    moe_intermediate_size: int
+    n_routed_experts: int
+    num_experts_per_tok: int
+    n_group: int
+    topk_group: int
+    norm_topk_prob: bool
+    routed_scaling_factor: float
+    n_shared_experts: int
+    hidden_act: str
+
+
+MIXTRAL: MixtralFields = {
+    "hidden_size": HIDDEN, "intermediate_size": EXPERT_HIDDEN, "num_local_experts": 8,
+    "num_experts_per_tok": 2, "hidden_act": "silu", "router_jitter_noise": 0.0}
 
 # n_group of 4 over 8 experts leaves two per group, and topk_group of 2 makes
 # four of the eight reachable, which is exactly the top_k: a wrong group mask
 # changes which experts a token gets rather than only their order.
-DEEPSEEK = dict(
-    hidden_size=HIDDEN, moe_intermediate_size=EXPERT_HIDDEN, n_routed_experts=8,
-    num_experts_per_tok=4, n_group=4, topk_group=2, norm_topk_prob=True,
-    routed_scaling_factor=2.5, n_shared_experts=1, hidden_act="silu")
+DEEPSEEK: DeepseekFields = {
+    "hidden_size": HIDDEN, "moe_intermediate_size": EXPERT_HIDDEN, "n_routed_experts": 8,
+    "num_experts_per_tok": 4, "n_group": 4, "topk_group": 2, "norm_topk_prob": True,
+    "routed_scaling_factor": 2.5, "n_shared_experts": 1, "hidden_act": "silu"}
 
 
 def hidden_states() -> torch.Tensor:
@@ -78,10 +106,14 @@ def scatter_weights(module: torch.nn.Module, seed: int) -> None:
             tensor.copy_(torch.randn(tensor.shape, generator=generator) * 0.5)
 
 
-def expert_tensors(experts: torch.nn.Module) -> dict:
-    """The fused expert parameters back in their per-expert checkpoint names."""
-    gate_up = experts.gate_up_proj.detach().to(torch.float32).numpy()
-    down = experts.down_proj.detach().to(torch.float32).numpy()
+def expert_tensors(experts: MixtralExperts) -> dict[str, np.ndarray]:
+    """The fused expert parameters back in their per-expert checkpoint names.
+
+    `MixtralExperts` sits behind a class decorator that hides its attributes
+    from a checker, so the two parameters are read by name.
+    """
+    gate_up = experts.get_parameter("gate_up_proj").detach().to(torch.float32).numpy()
+    down = experts.get_parameter("down_proj").detach().to(torch.float32).numpy()
     width = gate_up.shape[1] // 2
     tensors = {}
     for index in range(gate_up.shape[0]):
@@ -136,10 +168,10 @@ def write_deepseek(directory: Path) -> None:
           f"{arrays['router_indices'][:4].tolist()}")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=FIXTURES)
-    out = parser.parse_args().out
+    out = parser.parse_args(argv).out
     out.mkdir(parents=True, exist_ok=True)
 
     (out / "config.json").write_text(
