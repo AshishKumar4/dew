@@ -110,8 +110,10 @@ def _zone_cache() -> dict[str, str]:
         return {}
     try:
         return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
+    except ValueError as error:
+        raise ValueError(
+            f"{path} is not the JSON zone cache dew-tpu writes ({error}); delete it "
+            "and the next command rebuilds it") from None
 
 
 def cached_zone(name: str) -> str | None:
