@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 import jax
 import jax.numpy as jnp
 
+from dew.objectives.base import Variables
+
 
 class AutoEncoder(ABC):
     """An encoder and decoder pair a latent diffusion model trains behind.
@@ -26,7 +28,7 @@ class AutoEncoder(ABC):
 
     latent_shift: float = 0.0
     latent_scale: float = 1.0
-    params: Any = None
+    params: Variables
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,

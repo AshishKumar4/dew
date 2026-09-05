@@ -1,13 +1,10 @@
 """
 Flax VAE (Stable Diffusion AutoencoderKL) modules, vendored from
-huggingface/diffusers v0.29.2 `src/diffusers/models/vae_flax.py` (Apache-2.0).
-
-Vendored because diffusers removed all Flax/JAX support upstream
-(huggingface/diffusers#14169), which would have broken our latent diffusion
-path on any fresh install. Only the plain linen modules are kept; the
-diffusers ConfigMixin/FlaxModelMixin machinery is replaced by
-`load_pretrained_vae` below, which pulls the config and msgpack weights
-straight from the HuggingFace Hub.
+huggingface/diffusers v0.29.2 `src/diffusers/models/vae_flax.py` (Apache-2.0),
+since diffusers ships no Flax modules any more (huggingface/diffusers#14169).
+Only the plain linen modules are kept; `load_pretrained_vae` below reads the
+config and the weights from the Hub or a directory in place of the diffusers
+ConfigMixin/FlaxModelMixin machinery.
 """
 
 import json
@@ -807,11 +804,5 @@ def _read_vae_weights(directory: Path) -> dict:
             "nor diffusion_pytorch_model.safetensors")
     from dew.interop import load_params
 
-    def flatten(tree, prefix=""):
-        flat = {}
-        for name, child in tree.items():
-            key = f"{prefix}.{name}" if prefix else name
-            flat.update(flatten(child, key) if isinstance(child, dict) else {key: child})
-        return flat
-
-    return translate_vae_weights(flatten(load_params(safetensors)))
+    # A diffusers name has no '/', so load_params hands the flat table back.
+    return translate_vae_weights(load_params(safetensors))
