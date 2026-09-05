@@ -383,23 +383,12 @@ class ModulatedBlock(nn.Module):
             f"2D fusion requires a square patch grid; got S={S} which is not a "
             f"perfect square.")
 
-        # Index arrays are constant at JIT time so computing both directions is free
         scan_fwd = scan_indices(self.scan_order, H_P, W_P)
-        if scan_fwd is not None:
-            scan_inv = inverse_permutation(scan_fwd, S)
-            ssm_rm = ssm_output[:, scan_inv, :]
-        else:
-            ssm_rm = ssm_output
-
-        y_2d = ssm_rm.reshape(B, H_P, W_P, F)
-        y_fused_2d = self.spatial_fusion(y_2d)
-        y_fused_rm = y_fused_2d.reshape(B, S, F)
-
-        if scan_fwd is not None:
-            y_fused = y_fused_rm[:, scan_fwd, :]
-        else:
-            y_fused = y_fused_rm
-        return y_fused
+        if scan_fwd is None:
+            return self.spatial_fusion(ssm_output.reshape(B, H_P, W_P, F)).reshape(B, S, F)
+        row_major = ssm_output[:, inverse_permutation(scan_fwd), :]
+        fused = self.spatial_fusion(row_major.reshape(B, H_P, W_P, F)).reshape(B, S, F)
+        return fused[:, scan_fwd, :]
 
     @nn.compact
     def __call__(self, x, conditioning, freqs_cis, train: bool = False):
