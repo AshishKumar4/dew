@@ -120,10 +120,9 @@ class Trainer:
         step: Callable[[Objective, optax.GradientTransformation], StepFn] | None = None,
         profile: Profile | None = None,
     ):
-        """`accumulation` is the one owner of gradient accumulation: the
-        optimizer is wrapped in `optax.MultiSteps` here, and the EMA runs on
-        the update clock that wrapper defines. `step` replaces the compiled
-        step's body with `step(objective, optimizer)`, the one place for an
+        """`accumulation` wraps the optimizer in `optax.MultiSteps` here, and
+        the EMA runs on the update clock that wrapper defines. `step` replaces
+        the compiled step's body with `step(objective, optimizer)`, for an
         update that is not one loss (a GAN's alternating optimizers); it then
         owns the step counter, the EMA and the `Aux.variables` write-back,
         with `ema_update` and `write_back` at hand."""
@@ -297,7 +296,7 @@ class Trainer:
         4.9 ms for 1067 leaves, one CPU core of an i9-12900K), while jit
         dispatches through its C++ cache. The FLOP count still comes off the
         ahead-of-time executable: jit lowers through the same cache, so the
-        first call finds that compilation instead of running its own.
+        first call finds that compilation and compiles nothing.
         """
         body = self._step_body()
         shardings = self.shardings(state)
@@ -358,15 +357,16 @@ class Trainer:
         train = DevicePrefetchIterator(source, mesh, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
         train_step = None
-        # Rebound once the step is compiled, so the first tick measures steps
-        # rather than the compile.
+        # Rebound once the step is compiled, so the first tick measures steps,
+        # not the compile.
         last_log_time = time.time()
         last_saved = current if checkpoints is not None and current else None
         interval_loss, interval_steps = jnp.zeros((), jnp.float32), 0
         steps_since_log = 0
         # Both counters live on device so the loop never blocks on a result.
         # `worst_bad_run` remembers the longest streak of non-finite losses
-        # seen since the last host check, which is what decides whether to stop.
+        # seen since the last host check; `_check_finite` reads it to decide
+        # whether to stop.
         bad_run = jnp.zeros((), jnp.int32)
         worst_bad_run = jnp.zeros((), jnp.int32)
         tracing, traced, seen = False, 0, 0
@@ -405,8 +405,8 @@ class Trainer:
                 self._check_finite(worst_bad_run, current)
                 worst_bad_run = jnp.zeros((), jnp.int32)
                 if process_zero:
-                    # The one place per interval where waiting on the device
-                    # is justified: the numbers below are meaningless without it.
+                    # The interval's numbers need the loss on the host, so
+                    # this is where the loop waits on the device.
                     loss.block_until_ready()
                     now = time.time()
                     scalars = {"train/step": current, "train/loss": float(loss),
@@ -525,7 +525,7 @@ class Trainer:
         print(f"Wrote profile for {traced} steps to {profile.directory}")
 
     def _check_finite(self, worst_bad_run, step: int):
-        """Fail a diverged run loudly rather than papering over it.
+        """Raise RuntimeError once the loss has been non-finite for BAD_LOSS_STEPS steps.
 
         Deferred to the logging cadence so the step loop never synchronises;
         detection is late by at most that many steps, never missed.
