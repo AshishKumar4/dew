@@ -53,9 +53,9 @@ class Aux:
     """What a loss reports beside its scalar."""
     metrics: dict[str, jax.Array]
     variables: Variables | None = None
-    """Non-parameter collections to write back into the state, whole: the MoE
-    balancing bias, batch statistics, sown values. The `params` collection is
-    the optimizer's and cannot be written this way."""
+    """Non-parameter collections to write back into the state as a whole: the
+    MoE balancing bias, batch statistics, sown values. The `params` collection
+    is the optimizer's and cannot be written this way."""
 
 
 def everything(path: Path) -> bool:
@@ -70,8 +70,8 @@ def under(*prefix: str) -> PathFilter:
 def select(tree: Variables, keep: PathFilter) -> Variables:
     """The subtree of `tree` whose leaves `keep` accepts, with the same nesting.
 
-    A branch that keeps no leaf is dropped rather than left empty, so the
-    result is what the EMA stores and what `merge` puts back.
+    A branch that keeps no leaf is dropped, so the result is what the EMA
+    stores and what `merge` puts back.
     """
     def prune(node, path):
         if isinstance(node, Mapping):
@@ -100,9 +100,9 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
 class EMASpec:
     """Which leaves of the variables the EMA copy tracks, and how fast.
 
-    decay is a step-indexed schedule rather than a constant because momentum
-    ramps are load-bearing for some objectives (I-JEPA anneals 0.996 to 1.0).
-    The step it reads is the count of completed optimizer updates.
+    decay is a step-indexed schedule, since momentum ramps matter for some
+    objectives (I-JEPA anneals 0.996 to 1.0). The step it reads is the count
+    of completed optimizer updates.
     """
     decay: optax.Schedule
     select: PathFilter = everything
@@ -119,8 +119,8 @@ class Objective(ABC):
 
     @abstractmethod
     def init(self, key: jax.Array) -> Variables:
-        """The whole variables tree, every collection, from one key. Pure: the
-        trainer traces it once for shapes and once for values."""
+        """The whole variables tree, every collection, from one key. Pure, so
+        the trainer traces it once for shapes and once for values."""
 
     @abstractmethod
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux]:

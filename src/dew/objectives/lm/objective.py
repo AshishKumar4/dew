@@ -5,19 +5,18 @@ ids, the model sees all but the last, and the targets are the same row shifted
 by one; the causal mask lives in the backbone, so nothing here has to know how
 the model keeps the future out of a prediction.
 
-Cross entropy is computed in float32 even when the model runs in bfloat16: a
+Cross entropy is computed in float32 even when the model runs in bfloat16. A
 bf16 logsumexp over a large vocabulary loses enough precision to move the loss
 and, through it, the gradient. It is also computed one vocabulary chunk at a
 time, because the full `[tokens, vocab]` logits tensor is the largest thing in
 a step and every pass over it costs bandwidth; `chunked` holds the arithmetic
-and the reason. Padding is excluded only when the run names the pad id,
-because packed token files have no padding and masking out a real id would
-quietly drop those tokens from the average.
+and the reason. Padding is excluded only when the run names the pad id.
+Packed token files have no padding, and masking out a real id would drop
+those tokens from the average.
 
 Evaluation returns the teacher-forced per-token scores, which `perplexity`
 reduces over a whole pass with the token counts, and, when asked for, the text
-the model writes from a fixed prompt, which is the only part of a training
-curve a human can read.
+the model writes from a fixed prompt.
 """
 
 from __future__ import annotations
@@ -81,8 +80,8 @@ def balance(moe: Variables, routing: Variables, rate: float
     """The `moe` collection with every router's bias moved against its load,
     and the load itself.
 
-    `routing` is what the routers sowed under the `router` collection, the
-    top-k expert indices at the module path the bias lives under. DeepSeek's
+    `routing` carries what the routers sowed under the `router` collection,
+    the top-k expert indices at the module path the bias lives under. DeepSeek's
     update (arXiv 2408.15664) raises the bias of an expert below the average
     load and lowers it above, by `rate` a step. The load is reported as the
     busiest and the idlest expert's share of the routed tokens, averaged over
@@ -151,7 +150,7 @@ class LMObjective(Objective):
         `pretrained` is a variables dict to start from instead of a fresh
         init, as dew.interop.hf_decoders.load_pretrained_decoder returns for a
         Hugging Face checkpoint. The trainer takes its whole initial state
-        from `init`, so this is where continued pretraining begins.
+        from `init`, so continued pretraining starts here.
 
         `balance_rate` moves each sparse layer's routing bias against its
         load by this much every step (DeepSeek's aux-loss-free balancing);
@@ -165,7 +164,7 @@ class LMObjective(Objective):
         nothing.
 
         `mtp_weight`
-        (arXiv 2412.19437, eq. 24): the training loss adds that times the
+        (arXiv 2412.19437, eq. 24). The training loss adds that times the
         mean over the model's prediction depths of each depth's cross
         entropy, so the model needs `num_nextn_predict_layers` above zero.
         Unset leaves the term out and the depths untrained."""
@@ -217,7 +216,7 @@ class LMObjective(Objective):
         sowed when `routing` asked for it, and the prediction depths' losses
         and weights when `depths` asked for them.
 
-        A packed batch carries `segment_ids` for the same rows: the last token
+        A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
         transition is dropped from the loss and the accuracy, and the model
         reads the per-document `positions` for its rotary angles.
@@ -228,7 +227,7 @@ class LMObjective(Objective):
                 f"so the targets can be the shifted input, got {tokens.shape[-1]}")
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
         # Only a packed batch names these, and only a model that packs takes
-        # them: an unpacked run calls the model exactly as it always did.
+        # them. An unpacked run calls the model without them.
         packing = {}
         if positions is not None:
             packing["positions"] = positions[:, :-1]
@@ -278,7 +277,7 @@ class LMObjective(Objective):
         weights = (jnp.ones_like(targets, dtype) if self.pad_id is None
                    else (targets != self.pad_id).astype(dtype))
         if segment_ids is not None:
-            # A target counts only inside a document: the first token of the
+            # A target counts only inside a document. The first token of the
             # next packed document, the padding after the last one (segment 0,
             # which the seg==seg comparison alone would keep), and every
             # cross-boundary transition drop out of loss and accuracy alike.
@@ -331,7 +330,7 @@ class LMObjective(Objective):
                     "balance_rate moves the routers' balancing bias, so the model "
                     "needs a mixture with bias=True")
             moe = params["moe"]
-            # A depth the step never ran observed no load, so its bias stays.
+            # A depth the step never ran observed no load, so its bias is left alone.
             ran = {name: bias for name, bias in moe.items()
                    if self.mtp_weight is not None or not name.startswith("mtp_")}
             balanced, load = balance(ran, routing, rate)
@@ -352,7 +351,7 @@ class LMObjective(Objective):
         scores = TokenScores(losses=losses, weights=weights)
         if self.samples is None:
             return scores
-        # Deferred: a run that writes no text pulls in no sampler.
+        # Deferred, so a run that writes no text pulls in no sampler.
         from dew.sampling.text import generate
 
         generated = generate(
@@ -380,7 +379,7 @@ class Perplexity:
 
     Every batch weighs by its own count of counted targets, so a packed or
     padded pass whose batches differ in size is scored per token, and a batch
-    with no counted target contributes nothing rather than a zero.
+    with no counted target contributes nothing.
     """
 
     name = "perplexity"

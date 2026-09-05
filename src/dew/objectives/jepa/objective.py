@@ -4,22 +4,21 @@ Predict the representation of masked target blocks from the representation of
 the visible context, in latent space. Three moving parts:
 
   - the context encoder sees only the context tokens and is trained;
-  - the target encoder sees the whole image and is not: it is the EMA of the
-    context encoder, so it lives in the trainer's EMA copy rather than in a
-    parameter subtree of its own, and its branch is stop_gradient'd;
+  - the target encoder sees the whole image and is the EMA of the context
+    encoder. It has no parameter subtree of its own and lives in the
+    trainer's EMA copy, and its branch is stop_gradient'd;
   - the predictor maps context embeddings plus target positions to the target
     representations.
 
-Targets are layer-normalized (no learned affine) before the L2 loss, which is
-what keeps the scale of the prediction problem fixed as the encoder drifts.
-The paper's L2 is used rather than the reference implementation's smooth-L1:
-the LN already bounds the target scale, so there are no outliers for smooth-L1
-to protect against, and L2 keeps the loss directly comparable to the paper.
+Targets are layer-normalized (no learned affine) before the L2 loss, which
+keeps the scale of the prediction problem fixed as the encoder drifts. The
+loss is the paper's L2. The reference implementation uses smooth-L1. The LN
+already bounds the target scale, so L2 has no outliers to absorb and stays
+directly comparable to the paper.
 
-The characteristic failure is silent: both encoders quietly agree on a
-constant and the loss goes to zero. representation_health is reported on every
-step so that collapse is visible in the training curves rather than at the end
-of a probe run.
+The characteristic failure is silent. Both encoders can agree on a constant
+and the loss goes to zero. representation_health is reported on every step so
+that collapse shows in the training curves, before a probe run.
 """
 
 from __future__ import annotations
@@ -46,14 +45,13 @@ LABEL_KEY = "label"
 def representation_health(z) -> Dict[str, jax.Array]:
     """Collapse telemetry for pooled embeddings [B, D].
 
-    repr_std is the per-dimension standard deviation across the batch: it goes
+    repr_std is the per-dimension standard deviation across the batch. It goes
     to zero exactly when the encoder stops distinguishing inputs. repr_cov_offdiag
     is the RMS magnitude of the off-diagonal covariance, which rises when the
-    dimensions become redundant (dimensional collapse) even while repr_std holds.
+    dimensions become redundant (dimensional collapse) while repr_std holds.
 
-    Both are computed in fp32 so that a run's compute dtype does not set the
-    noise floor of the drift they exist to show, and so bf16 and fp32 runs
-    read off the same curves.
+    Both are computed in fp32. A run's compute dtype then does not set the
+    noise floor of the drift, and bf16 and fp32 runs read off the same curves.
     """
     batch_size, dim = z.shape
     z = z.astype(jnp.float32)
@@ -70,8 +68,8 @@ def normalize_targets(x, epsilon: float = 1e-6):
     """Feature-wise layer norm with no learned affine.
 
     Applied to the target encoder's output so the prediction problem keeps a
-    fixed scale as the encoder drifts, and so shrinking the representation is
-    not a way to lower the loss.
+    fixed scale as the encoder drifts. Shrinking the representation then does
+    not lower the loss.
     """
     mean = jnp.mean(x, axis=-1, keepdims=True)
     variance = jnp.var(x, axis=-1, keepdims=True)
@@ -129,10 +127,11 @@ class JepaObjective(Objective):
         return features
 
     def _target_params(self, step: Step):
-        """The target encoder's parameters: the EMA copy of the context encoder.
+        """The target encoder's parameters, the EMA copy of the context
+        encoder.
 
         The objective declares an EMASpec, so the trainer always hands it an
-        EMA tree; without one there is no target branch to run.
+        EMA tree. Without one there is no target branch to run.
         """
         if step.ema is None:
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
@@ -145,7 +144,7 @@ class JepaObjective(Objective):
         context_idx, target_idx = self.mask.sample(mask_key, batch_size)
         num_targets = self.mask.num_targets
 
-        # Target branch: the whole view through the EMA encoder, no gradient
+        # The target branch reads the whole view through the EMA encoder, without gradients.
         full = normalize_targets(self.encode(self._target_params(step), data))
         # [B, (T,) S, F] -> [B, M, (T,) n_tgt, F]
         frame_axis = (1,) if self.is_video else ()
@@ -157,7 +156,7 @@ class JepaObjective(Objective):
             params["params"][CONTEXT_ENCODER], data, context_idx,
             train=True, rngs={"dropout": dropout_key})
 
-        # Each target block is predicted from the same context: fold the block
+        # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
         repeated = jnp.repeat(context, num_targets, axis=0)
         predictions = self.predictor.apply(
