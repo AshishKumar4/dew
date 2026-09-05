@@ -146,9 +146,8 @@ class Gcloud:
         if self.dry_run:
             emit(shlex.join(argv))
             return Result(tuple(argv), 0)
-        # Popen as a context manager closes the pipe it opened; leaving that
-        # to the collector leaked one file per streamed command, which a
-        # fanout over a pod does once per worker.
+        # Popen as a context manager closes the pipe it opened; left to the
+        # collector, a fanout over a pod leaks one file per worker.
         with subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             bufsize=1,

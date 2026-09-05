@@ -86,12 +86,12 @@ def _project(gcloud: Gcloud, cfg: config.TpuConfig) -> str:
 def _zone(gcloud: Gcloud, cfg: config.TpuConfig, name: str, wanted: str | None) -> str:
     """The zone a TPU lives in: the flag, or the first zone that answers for it.
 
-    The cache is where the search starts, not a substitute for it: a TPU
-    deleted and recreated elsewhere would otherwise leave every command asking
-    the old zone until the cache file was edited by hand.
+    The cache only orders the search. A TPU deleted and recreated elsewhere
+    would otherwise leave every command asking the old zone until the cache
+    file was edited by hand.
     """
     if wanted:
-        # Not cached: an unverified flag would send every later command astray.
+        # An unverified flag is not cached; it would send every later command astray.
         return wanted
     cached = config.cached_zone(name)
     if gcloud.dry_run:

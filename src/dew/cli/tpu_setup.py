@@ -1,17 +1,17 @@
 """The scripts dew-tpu runs on the workers.
 
-The setup script is rendered, not checked in: the Python version, the extras
-and the source mode are its parameters. Every step is guarded, so a second run
-re-creates nothing, but the two `uv pip install` lines resolve against PyPI
-each time: a jax[tpu] or dew-ml release since the last run is installed.
-`setup --version` pins the dew-ml side.
+The setup script is rendered from the Python version, the extras and the
+source mode. Every step is guarded, so a second run re-creates nothing, but
+the two `uv pip install` lines resolve against PyPI each time: a jax[tpu] or
+dew-ml release since the last run is installed. `setup --version` pins the
+dew-ml side.
 """
 
 from __future__ import annotations
 
 import shlex
 
-#: Paths the remote side owns. The commands agree on these and nothing else.
+#: Paths the remote side owns, and the only thing the commands agree on.
 VENV = "$HOME/dew-venv"
 ENV_FILE = "$HOME/.dew-env"
 RUNS = "dew-runs"
