@@ -45,6 +45,8 @@ from typing import TypedDict
 
 import numpy as np
 import torch
+from transformers.models.deepseek_v2.configuration_deepseek_v2 import DeepseekV2Config
+from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2TopkRouter
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -87,6 +89,19 @@ class DeepseekFields(TypedDict):
     hidden_act: str
 
 
+class DeepseekV2Fields(TypedDict):
+    """The `DeepseekV2Config` fields the router is built from, as config.json lists them."""
+
+    hidden_size: int
+    n_routed_experts: int
+    num_experts_per_tok: int
+    n_group: int
+    topk_group: int
+    topk_method: str
+    norm_topk_prob: bool
+    routed_scaling_factor: float
+
+
 class DeepseekV4Fields(TypedDict):
     """The `DeepseekV4Config` fields the router and experts are built from, as config.json lists them."""
 
@@ -112,7 +127,15 @@ DEEPSEEK: DeepseekFields = {
     "num_experts_per_tok": 4, "n_group": 4, "topk_group": 2, "norm_topk_prob": True,
     "routed_scaling_factor": 2.5, "n_shared_experts": 1, "hidden_act": "silu"}
 
-# V4 sizes its experts by intermediate_size. A limit of 1.0 against weights
+# V2's group limit scores a group by its best expert alone and takes the
+# softmax mass unnormalised; four of eight experts reachable is the top_k
+# again, so the group rule decides the choice.
+DEEPSEEK_V2: DeepseekV2Fields = {
+    "hidden_size": HIDDEN, "n_routed_experts": 8, "num_experts_per_tok": 4,
+    "n_group": 4, "topk_group": 2, "topk_method": "group_limited_greedy",
+    "norm_topk_prob": False, "routed_scaling_factor": 2.5}
+
+# V4 sizes its experts by intermediate_size.
 # of scale 0.5 over 16 inputs clamps most gate and up values, which is what
 # makes the clamp observable at this size.
 DEEPSEEK_V4: DeepseekV4Fields = {
@@ -207,6 +230,25 @@ def write_deepseek(directory: Path) -> None:
           f"{arrays['router_indices'][:4].tolist()}")
 
 
+def write_deepseek_v2(directory: Path) -> None:
+    # The config validates the head geometry the router never reads.
+    router = DeepseekV2TopkRouter(DeepseekV2Config(**DEEPSEEK_V2, num_attention_heads=2))
+    scatter_weights(router, seed=25)
+    router.eval()
+    states = hidden_states()
+    with torch.no_grad():
+        _, weights, indices = router(states)
+    arrays = {
+        "hidden": states.to(torch.float32).numpy(),
+        "mlp.gate.weight": router.weight.detach().to(torch.float32).numpy(),
+        "router_weights": weights.to(torch.float32).numpy(),
+        "router_indices": indices.to(torch.int32).numpy(),
+    }
+    np.savez(directory / "deepseek_v2.npz", allow_pickle=False, **arrays)
+    print(f"deepseek_v2.npz: {len(arrays)} arrays, indices[:4]="
+          f"{arrays['router_indices'][:4].tolist()}")
+
+
 def write_deepseek_v4(directory: Path) -> None:
     # The modeling code reads the experts' width and count under the names
     # config.json carries, `intermediate_size` and `num_local_experts`; the
@@ -261,9 +303,11 @@ def main(argv: list[str] | None = None) -> None:
 
     (out / "config.json").write_text(
         json.dumps({"mixtral": MIXTRAL, "deepseek": DEEPSEEK,
-                    "deepseek_v4": DEEPSEEK_V4}, indent=2) + "\n")
+                    "deepseek_v2": DEEPSEEK_V2, "deepseek_v4": DEEPSEEK_V4},
+                   indent=2) + "\n")
     write_mixtral(out)
     write_deepseek(out)
+    write_deepseek_v2(out)
     write_deepseek_v4(out)
     size = sum(path.stat().st_size for path in out.iterdir())
     print(f"{out}: {size / 1e3:.0f} kB, {sorted(p.name for p in out.iterdir())}")

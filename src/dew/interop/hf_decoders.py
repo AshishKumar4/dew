@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 
 import numpy as np
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
@@ -329,25 +329,14 @@ def _deepseek_rope(hf_config: Mapping[str, Any], used: set
 
 def _deepseek_mixture(hf_config: Mapping[str, Any], layers: int,
                       used: set) -> Dict[str, Any]:
-    """The mixture record out of a DeepSeek MoE config.
+    """The mixture record out of a DeepSeek V3 MoE config.
 
-    The first `first_k_dense_replace` layers stay dense and the rest route;
-    transformers never reads `moe_layer_freq`, so anything but every layer
-    past the dense ones refuses, since the reference would build something
-    else. `norm_topk_prob: false` has no Mixture knob yet and refuses with
-    the field named rather than renormalising behind the config's back.
+    The reference selects on the biased sigmoid scores inside the best
+    groups, each scored by its two best experts, and renormalises;
+    `norm_topk_prob: false` would leave the weights unnormalised, which the
+    V3 reference never does, so it refuses naming the field.
     """
-    used.update(('n_routed_experts', 'num_local_experts',
-                 'num_experts_per_tok', 'routed_scaling_factor',
-                 'norm_topk_prob', 'n_group', 'topk_group',
-                 'n_shared_experts', 'moe_intermediate_size',
-                 'first_k_dense_replace', 'moe_layer_freq', 'topk_method',
-                 'scoring_func', 'mlp_layer_types'))
-    experts = hf_config.get('n_routed_experts',
-                            hf_config.get('num_local_experts'))
-    if experts is None:
-        _refuse("n_routed_experts",
-                "a DeepSeek MoE layer needs its expert count")
+    used.update(('norm_topk_prob', 'topk_method', 'scoring_func'))
     scoring = hf_config.get('scoring_func', 'sigmoid')
     if scoring != 'sigmoid':
         _refuse(f"scoring_func {scoring!r}",
@@ -355,13 +344,78 @@ def _deepseek_mixture(hf_config: Mapping[str, Any], layers: int,
                 "this family's reference scores sigmoid")
     if hf_config.get('norm_topk_prob', True) is not True:
         _refuse("norm_topk_prob=False",
-                "the mixture always renormalises the top-k weights; a knob "
-                "not to is what this field would need")
+                "DeepseekV3TopkRouter always renormalises the top-k weights")
     method = hf_config.get('topk_method')
     if method is not None and method != 'noaux_tc':
         _refuse(f"topk_method {method!r}",
                 "the reference selects with the bias and the group limit, "
                 "which is what noaux_tc names")
+    return {
+        **_deepseek_layout(hf_config, layers, used),
+        'score_function': 'sigmoid',
+        'groups': int(hf_config.get('n_group') or 1),
+        'groups_per_token': int(hf_config.get('topk_group') or 1),
+        'bias': True,
+    }
+
+
+def _deepseek_v2_mixture(hf_config: Mapping[str, Any], layers: int,
+                         used: set) -> Dict[str, Any]:
+    """The mixture record out of a DeepSeek V2 MoE config.
+
+    `DeepseekV2TopkRouter` softmaxes the logits, selects greedily or inside
+    the best groups scored by their best expert, and never renormalises: it
+    reads no `norm_topk_prob`, so the released `false` translates and a
+    `true` refuses rather than loading a model the reference does not run.
+    """
+    used.update(('norm_topk_prob', 'topk_method', 'scoring_func'))
+    scoring = hf_config.get('scoring_func', 'softmax')
+    if scoring != 'softmax':
+        _refuse(f"scoring_func {scoring!r}", "DeepseekV2TopkRouter softmaxes its logits")
+    if hf_config.get('norm_topk_prob', False):
+        _refuse("norm_topk_prob=True",
+                "DeepseekV2TopkRouter never renormalises the top-k weights")
+    method = hf_config.get('topk_method', 'greedy')
+    if method not in ('greedy', 'group_limited_greedy'):
+        _refuse(f"topk_method {method!r}",
+                "DeepseekV2TopkRouter selects greedy or group_limited_greedy")
+    groups = int(hf_config.get('n_group') or 1)
+    per_token = int(hf_config.get('topk_group') or 1)
+    if method == 'greedy' and (groups, per_token) != (1, 1):
+        _refuse(f"n_group {groups} with topk_method 'greedy'",
+                "the greedy selection ignores the groups")
+    return {
+        **_deepseek_layout(hf_config, layers, used),
+        'score_function': 'softmax',
+        'norm_topk_prob': False,
+        'groups': groups,
+        'groups_per_token': per_token,
+        'group_score': 'max',
+    }
+
+
+def _deepseek_layout(hf_config: Mapping[str, Any], layers: int,
+                     used: set) -> Dict[str, Any]:
+    """The expert counts, widths and sparse layers every DeepSeek MoE shares.
+
+    The first `first_k_dense_replace` layers stay dense and the rest route;
+    transformers never reads `moe_layer_freq`, so anything but every layer
+    past the dense ones refuses, since the reference would build something
+    else. `aux_loss_alpha` and `seq_aux` shape the training loss alone and
+    no forward pass reads them; a run sets them on LMObjective, whose
+    `aux_loss_alpha` and `seq_aux` compute V2's balance loss.
+    """
+    used.update(('n_routed_experts', 'num_local_experts',
+                 'num_experts_per_tok', 'routed_scaling_factor',
+                 'n_group', 'topk_group',
+                 'n_shared_experts', 'moe_intermediate_size',
+                 'first_k_dense_replace', 'moe_layer_freq', 'mlp_layer_types',
+                 'aux_loss_alpha', 'seq_aux'))
+    experts = hf_config.get('n_routed_experts',
+                            hf_config.get('num_local_experts'))
+    if experts is None:
+        _refuse("n_routed_experts",
+                "a DeepSeek MoE layer needs its expert count")
     freq = hf_config.get('moe_layer_freq')
     if freq is not None and freq != 1:
         _refuse(f"moe_layer_freq {freq!r}",
@@ -392,11 +446,7 @@ def _deepseek_mixture(hf_config: Mapping[str, Any], layers: int,
         'experts': int(experts),
         'top_k': int(hf_config['num_experts_per_tok']),
         'layers': sparse,
-        'score_function': 'sigmoid',
         'scaling': float(hf_config.get('routed_scaling_factor', 1.0)),
-        'groups': int(hf_config.get('n_group') or 1),
-        'groups_per_token': int(hf_config.get('topk_group') or 1),
-        'bias': True,
         'shared_features': shared_features,
         'expert_features': int(hf_config['moe_intermediate_size']),
     }
@@ -640,7 +690,9 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
 
 
 def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
-                     sparse: bool = False) -> Dict[str, Any]:
+                     sparse: bool = False,
+                     mixture: Callable[[Mapping[str, Any], int, set], Dict[str, Any]]
+                     = _deepseek_mixture) -> Dict[str, Any]:
     rope_theta, yarn = _deepseek_rope(hf_config, used)
     config = _base_config(hf_config, used, rope=(rope_theta, None))
     layer_types = config['layer_types']
@@ -724,7 +776,7 @@ def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
             'index_head_dim': (None if index is None
                                else index['index_head_dim']),
         },
-        mixture=_deepseek_mixture(hf_config, layers, used),
+        mixture=mixture(hf_config, layers, used),
     )
     return config
 
@@ -1422,6 +1474,11 @@ def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
     return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
 
 
+def _mixture_value(fields: Mapping[str, Any]) -> Optional[Mixture]:
+    mixture = fields['mixture']
+    return Mixture(**mixture) if isinstance(mixture, Mapping) else mixture
+
+
 def _every_layer_windowed(fields: Mapping[str, Any]) -> bool:
     kinds = fields['kinds'] or {}
     windows = {name: (kind.window if isinstance(kind, LayerKind) else kind.get('window'))
@@ -1439,6 +1496,16 @@ _FAMILY_ENTRIES = (
                   lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
                                   and mixer.index_topk is not None),
                   'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}),
+    DecoderFamily(('deepseek_v2',), partial(_deepseek_config, mixture=_deepseek_v2_mixture),
+                  lambda fields: (isinstance(_mixer_value(fields), MLAMixer)
+                                  and (mixture := _mixture_value(fields)) is not None
+                                  and not mixture.bias),
+                  'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}),
+    # Kimi K2 is DeepSeek V3's computation under its own model_type and
+    # tokenizer, so a Dew model never names it: what it computes exports as
+    # deepseek_v3, which transformers loads with the same modeling code.
+    DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
+                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
