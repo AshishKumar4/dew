@@ -62,8 +62,8 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
     the checkpoint, or already widened, since every fp8 value is exact in
     fp32), `scale_inv` is [ceil(rows / block), ceil(cols / block)], and
     element (i, j) comes out as float32(weight[i, j]) * scale_inv[i // block,
-    j // block], one fp32 multiply, which is what makes the result equal to
-    the reference bit for bit.
+    j // block], one fp32 multiply; the result equals the reference bit for
+    bit.
     """
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(

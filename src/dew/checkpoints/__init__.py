@@ -6,7 +6,7 @@ counters are the loop's business and are rebuilt on resume.
 
 Beside the persistent directory a run may keep a local checkpoint on every
 host, written more often, so a preempted pod resumes from its own disks
-rather than from storage. That is orbax's emergency checkpointing
+instead of from storage. That is orbax's emergency checkpointing
 (orbax.checkpoint.experimental.emergency), whose local checkpoints are built
 here from the same pieces it uses, an `ArrayHandler` with no primary host
 and no replica dedup so every process writes every shard it holds. Its
@@ -113,8 +113,8 @@ class Checkpoints:
     directory of its own, so the same path serves a pod and a single host
     running several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
-    local checkpoint restores onto the placement it was written with and
-    nothing else, since no process holds another process's shards; the
+    local checkpoint restores onto the placement it was written with, since
+    no process holds another process's shards; the
     persistent checkpoint restores onto any mesh, as before.
     """
 
@@ -159,8 +159,8 @@ class Checkpoints:
     def _open_local(self) -> ocp.CheckpointManager:
         if self._local_manager is None:
             # No primary host: every process writes its own metadata, and
-            # every shard it holds rather than one copy per replica, which is
-            # what makes each process's directory complete for its devices.
+            # every shard it holds, one copy per process, so each process's
+            # directory is complete for its devices.
             # Only device arrays are registered, because orbax writes a host
             # array from process 0 alone whatever the options say; the
             # position table rides as a replicated device array instead. The
@@ -238,8 +238,8 @@ class Checkpoints:
     def save_local(self, step: int, state: Any, position: bytes | None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it. The placement
-        rides along, so a resume onto another one is refused rather than
-        read shard by shard from directories that do not hold them."""
+        rides along; a resume onto another one raises before reading shards
+        from directories that do not hold them."""
         item = self._item(state, position)
         written = placement(item)
         if position is not None:
@@ -307,7 +307,7 @@ class Checkpoints:
             if 'position' in stored:
                 # The table's shape depends on the process count and the
                 # iterator's position, so it comes from the checkpoint's own
-                # metadata rather than from the template. A local checkpoint
+                # metadata, not from the template. A local checkpoint
                 # holds it as a device array, replicated like the step.
                 item['position'] = jax.tree.map(
                     lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),

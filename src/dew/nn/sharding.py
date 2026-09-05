@@ -97,8 +97,8 @@ def sequence_shards() -> int:
     """How many ways the mesh in context splits the sequence axis, 1 with no
     mesh or no such axis.
 
-    The trainer runs its compiled step under `jax.set_mesh`, which is what
-    puts the mesh in context while the step traces; a model called outside
+    The trainer runs its compiled step under `jax.set_mesh`, so the mesh is
+    in context while the step traces; a model called outside
     it sees whole sequences.
     """
     mesh = jax.sharding.get_abstract_mesh()

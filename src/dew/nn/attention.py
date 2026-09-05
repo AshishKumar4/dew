@@ -320,11 +320,11 @@ def stripe(x, shards: int, axis: int = 1):
     [0, 1, 2, 3, 4, 5, 6, 7] becomes [0, 1, 6, 7, 2, 3, 4, 5], the order
     MaxText's reorder_sequence writes (src/maxtext/utils/maxtext_utils.py).
 
-    Written as a reshape, two slices, a flip and a stack rather than as a
-    gather with the permutation, because GSPMD lowers these to
+    Written as a reshape, two slices, a flip and a stack, not as a gather
+    with the permutation: GSPMD lowers these to
     collective-permutes of the chunks that change shard, half of the rows,
-    where a gather along a split axis all-gathers the whole array on every
-    device (measured in tests/test_sequence_parallel.py).
+    and a gather along a split axis to an all-gather of the whole array on
+    every device (measured in tests/test_sequence_parallel.py).
     """
     axis %= x.ndim
     length = x.shape[axis]
@@ -361,12 +361,12 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     the tensor axis stays there. A
     causal call, a windowed one and a masked one reorder the queries with
     `stripe` so each shard holds equal causal work, carry the queries'
-    positions into the mask (`causal_attention_mask` reads positions, which
-    is what keeps the mask and the rotary angles the caller already applied
-    exact under the reorder) and put the output back in sequence order with
+    positions into the mask (`causal_attention_mask` reads positions, so the
+    mask and the rotary angles the caller already applied stay exact under
+    the reorder) and put the output back in sequence order with
     `unstripe`. A call with no mask at all has equal work on every row and
-    keeps its order. The kernels then see an explicit mask rather than their
-    causal flag, since causality by row index no longer holds.
+    keeps its order. Under the reorder the kernels see an explicit mask, not
+    their causal flag: a striped row's position is in the mask, not its index.
     """
     mesh = jax.sharding.get_abstract_mesh()
     rows = tuple(axis for axis in mesh.axis_names
