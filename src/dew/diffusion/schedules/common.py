@@ -49,8 +49,8 @@ class GeneralizedNoiseScheduler(NoiseScheduler):
     """The variance exploding family of Karras et al. 2022 ("Elucidating the
     Design Space of Diffusion-Based Generative Models").
 
-    alpha is 1 and the model input is scaled by the paired preconditioning
-    instead. Every member conditions the model on c_noise = log(sigma) / 4
+    alpha is 1, and the paired preconditioning scales the model input.
+    Every member conditions the model on c_noise = log(sigma) / 4
     and weights the loss with lambda(sigma) = (sigma^2 + sigma_data^2) /
     (sigma sigma_data)^2 (Eq. 8 of the paper), written in a form that needs
     no epsilon guard; a subclass places the sigmas along t and inverts that

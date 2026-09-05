@@ -3,11 +3,11 @@
 `advantage` turns rewards into advantages, `surrogate` turns log-probabilities
 and advantages into a scalar loss. Neither knows about a model, an objective,
 the trainer or a batch dict, so an objective composes them and this package
-stays testable on fixed tensors.
+is testable on fixed tensors.
 
 The import arrow points one way. `dew.rl` may read `dew`; nothing under `dew`
-outside `dew.rl` and `dew.objectives.rl` may read `dew.rl`, which is what keeps
-the split into a separate distribution a directory move
+outside `dew.rl` and `dew.objectives.rl` may read `dew.rl`. That one-way arrow
+keeps the split into a separate distribution a directory move
 (`docs/design/plan.md`, section 5.1). tests/test_rl_imports.py walks the tree
 and fails when either half of that stops being true.
 

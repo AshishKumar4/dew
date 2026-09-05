@@ -10,10 +10,9 @@ import os
 def apply_xla_flags(flags: str | None) -> None:
     """Append flags to XLA_FLAGS, which XLA reads when it initializes a backend.
 
-    Appended rather than assigned: the environment may already carry flags
-    (CI sets the host device count), and a run's own flags should add to them
-    rather than replace them. Only useful before the first JAX call, which is
-    why `dew.training.prepare_process` is the one caller.
+    The flags are appended because the environment may already carry some
+    (CI sets the host device count). Only useful before the first JAX call;
+    `dew.training.prepare_process` calls it there.
     """
     if not flags:
         return

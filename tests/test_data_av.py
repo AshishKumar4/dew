@@ -5,7 +5,7 @@ Every frame of the synthesized clip is a flat grey of five times its index,
 and the audio under frame f is the constant sample 100 f, so a clip that
 comes back says which frames it holds and which frames its audio is under.
 The clip is muxed losslessly (ffv1 video, PCM audio at the reader's rate),
-so the audio has to come back sample-exact, not just aligned. The reader
+so the audio has to come back sample-exact, beyond aligned. The reader
 needs moviepy, which is the `av` extra, and its bundled ffmpeg writes the
 fixture, so nothing here depends on a binary on PATH.
 """

@@ -130,14 +130,14 @@ the dew rows of `docs/benchmarks.md` and the table above:
 | simple_dit | 7.02 | 9.28 | 8.39 | 1.19x faster |
 | causal_transformer | 88.78 | 81.50 | 72.46 | 0.82x, torch faster by 18% |
 
-Last week's 0.95x set the parity harness's fixed-batch decoder row (75.70)
+Last week's 0.95x set the parity benchmark's fixed-batch decoder row (75.70)
 against torch's 72.18. Today's dew row is the benchmark's own prefetching
 loop at 88.78. Of the 13 ms between them, 1.9 are the chunked head, 3.8
 are the decoder's own changes since `6b0f119`, and the remaining 7.6 are
-the distance between that harness's fixed-batch row and this tool's loop
-at the same commit (`6b0f119` reruns at 83.26 here today). The DiT gained:
-1.16x last week, 1.19x now, with torch's SDPA row 0.4 ms slower than a
-week ago on the newer torch.
+the distance between that fixed-batch row and this tool's loop at the same
+commit (`6b0f119` reruns at 83.26 here today). The DiT gained: 1.16x last
+week, 1.19x now, with torch's SDPA row 0.4 ms slower than a week ago on
+the newer torch.
 
 ## The attention kernels
 
@@ -163,7 +163,7 @@ wrt q, k and v, in milliseconds.
 The reference and xla paths materialize the S x S logits, so they run out of
 16 GiB at S=4096 and are 3 to 12 times slower than the fused kernel
 everywhere they fit. cudnn is the kernel for a GPU run, forward and
-backward, which is why `'auto'` reaches for it wherever it can.
+backward, and `'auto'` picks it wherever it can.
 
 ## Odd sequence lengths on cudnn
 
@@ -190,7 +190,7 @@ both one ulp). Leaving the pad key unmasked moves the q9/kv7 output by
 the shape and fails it.
 
 What it is worth, `--warmup 3 --steps 50` on the small preset, `'xla'`
-(the kernel 'auto' used to pick for these shapes) against `'auto'`:
+(the kernel these shapes ran on before the padding) against `'auto'`:
 
 | architecture | shapes | xla ms/step | cudnn ms/step | xla peak GiB | cudnn peak GiB | loss at the end, xla / cudnn |
 |---|---|---:|---:|---:|---:|---|
@@ -239,8 +239,8 @@ run that wants the unet flag can pass `--trainer.xla-flags`.
 
 Two flags are worth knowing about for a different reason:
 
-- `--xla_gpu_autotune_level=4` changes nothing anywhere, which is how you
-  learn it is already the default in this build.
+- `--xla_gpu_autotune_level=4` changes nothing anywhere: it is already the
+  default in this build.
 - `--xla_gpu_enable_command_buffer=` (command buffers off) is the only
   configuration that is reliably slower, 17.90 against 17.38 on the unet
   over four runs, and slower on the other two as well. Command buffers are on
@@ -279,7 +279,7 @@ step (23%) does not scale with the batch and 0.84 ms per sample does. Command
 buffers are worth 1.4% at batch 16 and nothing at batch 64.
 
 These rows carried a utilisation column when they were measured, reading 1.7%,
-and that number was the counter rather than the card: XLA's `cost_analysis()`
+and that number was the counter's, not the card's: XLA's `cost_analysis()`
 cannot see inside the cuDNN convolution calls the backend emits, and it
 undercounted this model 22.5 times. Counted off the optimized HLO the unet
 runs at 40.5% of peak, which `docs/benchmarks.md` reports.

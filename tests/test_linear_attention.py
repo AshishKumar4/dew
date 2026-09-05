@@ -103,9 +103,9 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
 
 
 def test_an_initial_state_is_carried_by_both_forms(reference):
-    """Starting from a memory rather than zeros, which is what every decode
-    step past the first does, matches the reference started from the same
-    memory: 4.5e-07 chunked, 8.9e-08 recurrent on the output."""
+    """Starting from a memory, as every decode step past the first does,
+    matches the reference started from the same memory: 4.5e-07 chunked,
+    8.9e-08 recurrent on the output."""
     initial = jnp.asarray(reference["rule.initial_state"])
 
     out, state = chunk_gated_delta_rule(*operands(reference), initial)

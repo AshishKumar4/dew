@@ -112,7 +112,7 @@ class TextToImage:
 
 # The pipeline (by identity), the step count, the solver and the guidance
 # are compile-time constants, so a second call with the same settings runs
-# the compiled loop instead of tracing it again.
+# the compiled loop without tracing again.
 @functools.partial(jax.jit, static_argnames=("pipe", "steps", "sampler", "guidance"))
 def _run(pipe: TextToImage, params, given, null, x_T, key, *, steps, sampler, guidance):
     denoise = pipe.process.denoiser(pipe.model, params, given,

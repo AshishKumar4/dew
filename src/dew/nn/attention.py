@@ -13,6 +13,7 @@ from flax.linen.dtypes import promote_dtype
 import functools
 import math
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+from .attention_sinks import attention_with_sinks
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -37,9 +38,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
 
     query_positions are absolute: jnp.arange(T) for a plain forward pass, and
     the cache slots the queries occupy when decoding against a KV cache, where
-    a query's row index is no longer its position. sliding_window=w narrows the
-    mask to the w most recent keys (the query itself plus the w-1 before it),
-    which is what a sliding attention layer means.
+    a query's row index and its position differ. sliding_window=w narrows the
+    mask to the w most recent keys (the query itself plus the w-1 before it).
     """
     q_pos = jnp.asarray(query_positions)[:, None]
     k_pos = jnp.arange(kv_len)[None, :]
@@ -165,8 +165,8 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
 
     With rot_dim None both are the full rotation and the type is moot.
     `rope_scaling` is Llama 3.1's ramp over the base frequencies, applied
-    before a proportional rope pads its zero-frequency tail, which is where
-    the reference applies it (`dim = head_dim * partial_rotary_factor`).
+    before a proportional rope pads its zero-frequency tail, as the reference
+    does (`dim = head_dim * partial_rotary_factor`).
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -229,7 +229,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len):
     The writer advances the index by the number of tokens written, so one code
     path covers a whole-prompt prefill and the single-token steps after it. The
     first call only allocates: a freshly initialised model hands back a zeroed
-    cache at index 0 rather than one with a dummy token in slot 0.
+    cache at index 0.
     """
     shards = sequence_shards()
     if shards > 1:
@@ -287,7 +287,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     it, and a padded key is hidden by the kernel's own padding mask
     (key_value_seq_lengths), so every real query attends to exactly the keys
     it had. The arithmetic on the real rows is the fused kernel's, in fp32
-    like the xla path's, which is what tests/test_kernels.py pins.
+    like the xla path's; tests/test_kernels.py pins the equality.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     q_pad, kv_pad = q_len % 2, kv_len % 2
@@ -441,7 +441,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
                                  causal=False, sliding_window=None, mask=None, bias=None,
-                                 softcap=None):
+                                 sinks=None, softcap=None):
     """The one attention kernel path for every attention module.
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
@@ -450,8 +450,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     change with the implementation, so checkpoints are interchangeable across
     hardware:
 
-    - None: flax reference attention (einsum + softmax). The only path that
-      reads dtype, precision and force_fp32_for_softmax; the portable default.
+    - None: flax reference attention (einsum + softmax), the portable default
+      and the only path that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
       inputs, a head dimension that is a multiple of 8 and at most 128, no
       softcap), 'xla' anywhere else. Resolved per trace, so a config logged
@@ -459,24 +459,27 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
-      whatever the inputs are. A dtype that asks for anything other than the
-      inputs' own dtype is rejected rather than silently dropped, as are the
-      other two. cudnn takes any sequence length (`cudnn_attention` pads an
-      odd one), and only bf16 or fp16 inputs.
+      whatever the inputs are. A dtype other than the inputs' own raises a
+      ValueError, and so do a HIGH or HIGHEST precision and
+      force_fp32_for_softmax=False. cudnn takes any sequence length
+      (`cudnn_attention` pads an odd one), and only bf16 or fp16 inputs.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
 
-    causal restricts query i to keys 0..i, top-left aligned exactly as jax's
-    is_causal is; sliding_window=w narrows that to the w most recent keys. Both
+    causal restricts query i to keys 0..i, top-left aligned like jax's
+    is_causal; sliding_window=w narrows that to the w most recent keys. Both
     are structural, over the row index, so decoding against a KV cache passes
     `mask` instead (built by causal_attention_mask over the cache slots): a
     step's single query sits at the cache index, not at row 0. The fused
-    kernels take causality and the window as flags rather than a materialized
-    mask, which is where their memory win comes from; the TPU kernel has no
-    mask argument, so an explicit mask rides in there as an additive bias.
+    kernels take causality and the window as flags, which saves the memory of
+    a materialized mask; the TPU kernel has no mask argument, so an explicit
+    mask rides in there as an additive bias.
     `bias` is an additive float array broadcastable to [B, H, Q, K], added to
     the logits on every path; T5's relative position table travels in it.
+    `sinks` holds one learned, value-free logit per query head. The reference
+    and xla paths include it in the denominator; auto chooses xla, and the
+    fused cudnn and tpu kernels refuse it.
 
     Under a mesh in context whose sequence axis is above one, the call runs
     through `sequence_parallel_attention`: the queries split over that axis,
@@ -488,12 +491,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `softcapped_attention` under both the reference and the xla
     implementation, honouring dtype, precision and force_fp32_for_softmax the
     way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
-    refuse it by name rather than dropping the cap.
+    raise a ValueError that names the implementation.
     """
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-        softcap=softcap)
+        sinks=sinks, softcap=softcap)
     shards = sequence_shards()
     if shards > 1:
         return sequence_parallel_attention(
@@ -505,10 +508,25 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation=None,
-                     causal=False, sliding_window=None, mask=None, bias=None, softcap=None):
+                     causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
+                     softcap=None):
     """`scaled_dot_product_attention`'s kernel dispatch over whole sequences."""
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+    if sinks is not None:
+        if implementation not in (None, 'auto', 'xla'):
+            raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
+        if softcap is not None:
+            raise ValueError(
+                "attention sinks and a logit softcap have no reference that "
+                "combines them, so the sink path takes no softcap")
+        if causal or sliding_window is not None:
+            structural = causal_attention_mask(
+                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+            mask = structural if mask is None else jnp.logical_and(mask, structural)
+        return attention_with_sinks(
+            query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
+            precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
 
     if implementation == 'auto':
         implementation = 'cudnn' if cudnn_runs(query, softcap) else 'xla'
@@ -684,7 +702,7 @@ class NormalAttention(nn.Module):
         causal, mask = self.causal, None
         if decode:
             # Position lives in the cache slot now, not in the row index, so
-            # causality travels as a mask rather than the kernels' flag.
+            # causality travels as a mask over the slots.
             positions, append = open_kv_cache(self, key, self.max_seq_len)
             key, value = append(key, value)
             mask = causal_attention_mask(positions, key.shape[-3])
@@ -721,8 +739,8 @@ class FlaxGEGLU(nn.Module):
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FlaxFeedForward(nn.Module):
     """GEGLU then a linear layer back to `dim`, diffusers' `FlaxFeedForward`.
-    The names `net_0` and `net_2` are the indices the reference's Sequential
-    gives the two layers, which is what its checkpoints carry."""
+    The checkpoint keys `net_0` and `net_2` are the indices the reference's
+    Sequential gives the two layers."""
 
     dim: int
     dtype: Optional[Dtype] = jnp.float32
@@ -742,7 +760,7 @@ class BasicTransformerBlock(nn.Module):
     """Self-attention, cross-attention over `context`, feed-forward, each
     pre-normed with a residual. `use_cross_only` drops the self-attention;
     `only_pure_attention` runs the cross-attention alone with no norm and no
-    residual, which is how the UNets' stages attend by default."""
+    residual; the UNets' stages use it by default."""
     query_dim: int
     heads: int = 4
     dim_head: int = 64
@@ -792,16 +810,15 @@ class Stage:
     """One resolution stage's attention in a UNet, or `None` for a stage that
     has none.
 
-    Every field is a `TransformerBlock` dial, so a stage names what it changes
-    and nothing else. `dim_head` is not here: the block's head width is the
+    Every field is a `TransformerBlock` dial. The block's head width is the
     stage's channel count divided by `heads`, which the unet knows and a
-    config does not. `dew.registry.from_record` builds one from a record at
+    config does not, so there is no `dim_head` field. `dew.registry.from_record` builds one from a record at
     the build boundary, so a stage still arrives as `{"heads": 8}` from a
     command line or a run record, and a misspelled field raises there.
 
-    `dtype` is float32 and not the model's, which is what `with_precision`
-    exists to write into every stage. `precision` is the one field whose None
-    means "the model's".
+    `dtype` defaults to float32; `with_precision` writes the model's dtype
+    into every stage. `precision` is the one field whose None means "the
+    model's".
     """
 
     heads: int

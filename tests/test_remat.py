@@ -1,7 +1,7 @@
 """Rematerialization must be invisible to everything except memory use.
 
-Same parameter tree, same forward values, same gradients - otherwise --remat
-would silently invalidate checkpoints or change what a run converges to.
+Same parameter tree, same forward values, same gradients: a difference in
+any of them would invalidate checkpoints or change what a run converges to.
 """
 
 import jax

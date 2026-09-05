@@ -71,8 +71,8 @@ def test_the_rl_package_imports_no_trainer_no_data_and_no_objective():
 
 
 def test_nothing_outside_the_rl_packages_imports_dew_rl():
-    """`dew.objectives.rl` is the one place the arrow may be followed, because
-    an RL objective is what composes these functions."""
+    """Only `dew.objectives.rl` imports `dew.rl`, because an RL objective is
+    what composes these functions."""
     allowed = (RL, OBJECTIVES_RL)
     offenders = {}
     for path in python_files(PACKAGE):

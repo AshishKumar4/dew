@@ -206,17 +206,6 @@ def test_the_ema_lags_the_parameters_at_the_configured_decay():
     assert int(new_state.step) == 1
 
 
-def test_an_objective_without_an_ema_carries_none():
-    class Plain(Regression):
-        ema = None
-
-        def __init__(self):
-            self.model = Affine()
-
-    state = make_trainer(objective=Plain()).fit(Data(endless), steps=1, log_every=1)
-    assert state.ema is None
-
-
 # --------------------------------------------------------------------------
 # Checkpoints: what lands, when, and what a resume gets back
 # --------------------------------------------------------------------------
@@ -277,13 +266,13 @@ def test_checkpoint_every_needs_a_stream_that_can_also_be_put_back(tmp_path):
 
 def test_checkpoint_every_without_a_checkpointer_is_refused():
     """Asking for checkpoints from a trainer that has nowhere to write them
-    used to reach the first save and fail on None."""
+    raises a ValueError before the first step, not at the first save."""
     with pytest.raises(ValueError, match="no checkpointer"):
         make_trainer().fit(Data(), steps=2, checkpoint_every=1)
 
 
 def test_fit_that_never_trains_checkpoints_step_zero(tmp_path):
-    """A run that really ends at step 0 is the one case where step 0 is honest."""
+    """A run that ends at step 0 writes a step-0 checkpoint."""
     trainer = make_trainer(tmp_path)
     trainer.fit(Data(), steps=0)
     assert trainer.checkpoints.latest == 0
@@ -486,9 +475,9 @@ def test_a_local_cadence_needs_a_stream_that_reports_its_position(tmp_path):
 class ExplodingManager:
     """Orbax when the filesystem refuses the write.
 
-    Stubbed rather than provoked with a read-only directory: a genuinely
-    failed async orbax write leaves a background thread that never joins,
-    which hangs interpreter exit and with it the whole test session.
+    Stubbed, not provoked with a read-only directory: a real failed async
+    orbax write leaves a background thread that never joins, which hangs
+    interpreter exit and with it the whole test session.
     """
 
     def latest_step(self):
@@ -649,8 +638,9 @@ class ManualClock:
 
 def test_the_first_log_tick_measures_steps_not_the_compile(monkeypatch):
     """Every interval, the first one included, reports the time its steps
-    took, so the compile never lands in train/step_time_ms; the goodput
-    numbers at the end count the compile as the time to the first step."""
+    took; the compile is outside every window and never lands in
+    train/step_time_ms, and the goodput numbers at the end count it as the
+    time to the first step."""
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()

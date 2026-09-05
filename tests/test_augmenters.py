@@ -231,7 +231,7 @@ def test_the_default_augmentation_is_flip_jitter(kind, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------------
-# Seeding: augmentation follows the record rng, nothing else
+# Seeding: augmentation follows the record rng alone
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
@@ -313,9 +313,9 @@ class Flowers(OxfordFlowers):
 def _by_record(spec, worker_count):
     """label -> (image, caption) for every record of one epoch.
 
-    Keyed by label rather than compared batch for batch: grain gives each
-    worker its own slice of the index stream, so batch composition follows
-    worker_count while record content must not.
+    Keyed by label, not compared batch for batch: grain gives each worker its
+    own slice of the index stream, so batch composition follows worker_count
+    while record content must not.
     """
     data = dataclasses.replace(spec, loading=Loading(workers=worker_count, threads=1,
                                                     read_buffer=1, worker_buffer=1)).load(

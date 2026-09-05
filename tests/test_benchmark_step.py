@@ -3,9 +3,8 @@
 The tool is the reproduction command behind every number in
 docs/benchmarks.md and docs/performance.md, and it calls the trainer's
 internals (`compile`, `shardings`, `device_mesh`, `DevicePrefetchIterator`)
-rather than `fit`. A rename on that surface broke it once without any test
-noticing (`batch_sharding` left the trainer in 128a903 and the tool kept
-calling it), so one cpu-smoke case runs here, end to end, on every suite run.
+directly, without `fit`, so one cpu-smoke case runs here, end to end, on
+every suite run.
 """
 
 import importlib.util

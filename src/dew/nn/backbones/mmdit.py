@@ -300,7 +300,7 @@ class HierarchicalMMDiT(nn.Module):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.
 
-    Raster order only - the merge/expand grid reshapes assume row-major token
+    Raster order only: the merge/expand grid reshapes assume row-major token
     order, so a hilbert scan would scramble the neighborhoods being merged.
     """
     output_channels: int = 3

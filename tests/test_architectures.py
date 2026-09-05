@@ -1,10 +1,9 @@
 """Every registered architecture, trained through the trainer, on both meshes.
 
 test_models.py proves each architecture has a working forward pass, and
-test_parallelism.py proves the trainer's sharding on one tiny DiT. Between
-them nothing else puts the other architectures' real parameter trees through
-`Trainer.fit`, so an architecture could be unshardable, or silently never
-sharded, and only a production run would find out.
+test_parallelism.py proves the trainer's sharding on one tiny DiT. This file
+puts the other architectures' real parameter trees through `Trainer.fit`,
+where an unshardable or unsharded architecture shows.
 
 Each case trains two steps on the simulated 8-device CPU mesh, once as pure
 data parallelism (8x1) and once as data x fsdp (2x4), and checks what only a
@@ -51,10 +50,11 @@ GRID = (RES // PATCH, RES // PATCH)
 # same global batch.
 BATCH = 8
 # These models hold thousands of parameters, orders below the production shard
-# threshold, so lower it or "fsdp on" would mean "everything replicated".
+# threshold, so the threshold is lowered; at the production value "fsdp on"
+# would replicate everything.
 TINY_SHARD = 256
-# Enough to run the sampler loop end to end and nothing more: sample quality
-# is not what a two-step run can be about.
+# Enough to run the sampler loop end to end: sample quality is not what a
+# two-step run can be about.
 SAMPLER_STEPS = 2
 # 2x2 target blocks on the 4x4 grid, which leaves 8 context tokens.
 MASK = multi_block_mask(GRID, num_targets=2, scale=(0.2, 0.3))
@@ -175,6 +175,15 @@ CASES = [
     # feed-forward go through the same run.
     Case("causal_transformer", {**LM, "mixture": {"experts": 8, "top_k": 2, "layers": (1,)}},
          seq_len=SEQ_LEN, label="moe"),
+    # GPT OSS at toy width: sink attention on both kinds, the fused biased
+    # experts on every layer, and YaRN over grouped-query heads.
+    Case("causal_transformer", {
+        **LM, "mlp": "swigluoai", "attention_sinks": True, "qk_norm": False,
+        "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4}},
+        "yarn": {"factor": 4.0, "original_max_position_embeddings": 8, "truncate": False},
+        "mixture": {"experts": 8, "top_k": 2},
+    }, seq_len=SEQ_LEN, label="gpt_oss"),
     # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
     # indexer on every layer, and the routed layer with the balancing bias,
     # the group limit and a shared expert.
@@ -187,6 +196,68 @@ CASES = [
                     "groups": 4, "groups_per_token": 2, "bias": True,
                     "expert_features": 16, "shared_features": 16},
     }, seq_len=SEQ_LEN, label="mla"),
+    # DeepSeek V2 Lite's stack at toy width: the mla mixer without the query
+    # LoRA, and a routed layer under softmax group-limited routing scored by
+    # the best expert, unnormalised, with a shared expert and no bias.
+    Case("causal_transformer", {
+        **LM, "head_dim": 16,
+        "mixer": {"kind": "mla", "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                  "qk_rope_head_dim": 8, "v_head_dim": 8},
+        "mixture": {"experts": 8, "top_k": 4, "layers": (1,), "score_function": "softmax",
+                    "norm_topk_prob": False, "groups": 4, "groups_per_token": 2,
+                    "group_score": "max", "expert_features": 16, "shared_features": 32},
+    }, seq_len=SEQ_LEN, label="deepseek_v2"),
+    # GLM 4.5's stack at toy width: biased q/k/v over a bias-free o_proj, a
+    # half rotary, DeepSeek V3 routing with a shared expert on the last
+    # layer, and one MTP depth that routes like it.
+    Case("causal_transformer", {
+        **LM, "attention_bias": True, "o_proj_bias": False, "qk_norm": False,
+        "head_dim": 8, "partial_rotary_factor": 0.5, "partial_rotary_type": "default",
+        "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
+                    "bias": True, "expert_features": 16, "shared_features": 16},
+        "num_nextn_predict_layers": 1,
+    }, seq_len=SEQ_LEN, label="glm4_moe"),
+    # Llama 4's stack at toy width: chunked rotated layers around a global
+    # layer under the llama4 kind, the routed layers scaling their inputs.
+    Case("causal_transformer", {
+        **LM, "head_dim": 8, "qk_norm": False,
+        "layer_types": ("chunked_attention", "full_attention"),
+        "kinds": {"chunked_attention": {"mixer": {
+                      "kind": "llama4", "use_rope": True, "attention_chunk_size": 4,
+                      "floor_scale": 4.0}},
+                  "full_attention": {"mixer": {"kind": "llama4", "use_rope": False,
+                                               "floor_scale": 4.0}}},
+        "mixture": {"experts": 8, "top_k": 1, "every": 2, "score_function": "sigmoid",
+                    "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
+                    "shared_features": 16},
+    }, seq_len=SEQ_LEN, label="llama4"),
+    # Gemma 4's 26B-A4B at toy width: the routed branch beside every layer's
+    # dense MLP, the global layer reading its values off the keys with its
+    # own head dim and key/value count, and the per-layer output scalar.
+    Case("causal_transformer", {
+        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
+        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
+        "embedding_scale": True, "attention_scale": 1.0, "partial_rotary_factor": 0.25,
+        "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4},
+                  "full_attention": {"head_dim": 16, "num_kv_heads": 1}},
+        "attention_k_eq_v": True, "layer_scalar": True,
+        "mixture": {"experts": 8, "top_k": 2, "expert_features": 16, "parallel": True},
+    }, seq_len=SEQ_LEN, label="gemma4_moe"),
+    # Gemma 3n at toy width: three copies of the residual stream under
+    # AltUp, the LAuReL block, gaussian top-k on the first layer, widths
+    # that differ per layer, per-layer inputs and the last layer sharing the
+    # first's keys and values.
+    Case("causal_transformer", {
+        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
+        "mlp_features": (48, 64), "activation_sparsity_pattern": (0.95, 0.0),
+        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
+        "embedding_scale": True, "attention_scale": 1.0, "final_logit_softcap": 30.0,
+        "layer_types": ("sliding_attention", "sliding_attention"),
+        "kinds": {"sliding_attention": {"window": 4, "rope_theta": 1e4}},
+        "altup": {"num_inputs": 3}, "laurel_rank": 8,
+        "per_layer_input_dim": 8, "num_kv_shared_layers": 1,
+    }, seq_len=SEQ_LEN, label="gemma3n"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,
@@ -344,9 +415,9 @@ def test_every_matrix_parameter_is_declared_or_listed_as_heuristic():
 
 
 def test_every_declared_name_is_carried_by_a_parameter():
-    """A renamed module has to break its declaration, not silently stop
-    matching it: every declared suffix and every heuristic pattern names some
-    parameter of some registered model."""
+    """A renamed module has to break its declaration: every declared suffix
+    and every heuristic pattern names some parameter of some registered
+    model."""
     modules = {parameter_path(path)[:-1] for path, _ in every_leaf()}
     unmatched = [key for key in DECLARED
                  if not any(module[-len(key):] == key for module in modules)]
@@ -520,7 +591,7 @@ def test_architecture_trains_under_fsdp(case, tmp_path):
 @pytest.mark.parametrize("fsdp_size", [2, 4, 8])
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsdp_size):
-    """Each architecture on a 2, 4 and 8 wide fsdp axis, not just the 4 above.
+    """Each architecture on a 2, 4 and 8 wide fsdp axis, beyond the 4 above.
 
     Three properties at once, because they share one derivation. The layout
     has to be reproducible, or two processes deriving it would disagree and
@@ -552,8 +623,7 @@ def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsd
 
 
 # One named parameter per case whose spec the declarations decide, written
-# out rather than derived, so a declaration that stops matching a module
-# shows up here.
+# out by hand, so a declaration that stops matching a module shows up here.
 NAMED_LEAF = {
     "causal_transformer": (("embed_tokens", "embedding"), P("fsdp")),
     "simple_dit": (("dit_block_0", "attention", "to_q", "kernel"), P("fsdp")),

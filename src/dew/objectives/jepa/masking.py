@@ -7,12 +7,12 @@ construction, against the static patch grid:
 
   - the block area is fixed to the value inside the configured scale range that
     admits the most (height, width) factorizations within the aspect ratio
-    range, so each sample still draws a genuinely different block shape and
+    range, so each sample draws a genuinely different block shape and
     position, and every target block has exactly the same token count;
   - the context is a uniformly random subset of the complement of the target
     union, sized S - num_targets * area. That size is always available (the
     union is at most num_targets disjoint blocks), and when the blocks happen
-    to overlap the context simply drops the surplus rather than changing shape.
+    to overlap the context drops the surplus and keeps its shape.
 
 Indices refer to positions in the scan-ordered token sequence that
 PatchSequenceEmbed produces, and come out sorted so that an SSM mixer scans

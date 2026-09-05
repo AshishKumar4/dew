@@ -10,9 +10,9 @@ after every input file, so the packed loader can treat each file as one
 document; meta.json then records the id under `eos_id`.
 
 The corpus is processed one line-bounded chunk at a time: tokens are encoded,
-written and dropped, so a corpus larger than memory costs disk, never RAM.
-Chunks carry their partial last line forward, so a BPE merge never spans a
-chunk boundary and the ids match a whole-corpus encode.
+written and dropped, so a corpus larger than memory costs disk, and RAM
+stays at one chunk. Chunks carry their partial last line forward, so every
+BPE merge sees its whole line and the ids match a whole-corpus encode.
 
 Usage:
     python tools/tokenize_text.py --input data/raw --out data/tokens \

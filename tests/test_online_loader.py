@@ -108,8 +108,8 @@ def _refuse_to_fork(*args, **kwargs):
 # ---------------------------------------------------------------------------------
 
 def test_slow_fetching_waits_instead_of_fabricating_samples(monkeypatch, stop, capsys):
-    """A queue timeout waits rather than handing back zeros captioned "Timeout
-    occurred while waiting for sample", which would train as data."""
+    """A queue timeout waits; a batch of zeros captioned "Timeout occurred
+    while waiting for sample" would train as data."""
     def slow(rows, sink, **kwargs):
         for index in range(BATCH):
             stop.wait(SLOW)
@@ -162,7 +162,7 @@ def test_an_exhausted_fetcher_stops_iteration(monkeypatch):
 
     with pytest.raises(StopIteration):
         next(stream)
-    # and it stays stopped rather than blocking on the empty queue
+    # and it stays stopped: a second call does not block on the empty queue
     with pytest.raises(StopIteration):
         next(stream)
 
@@ -222,8 +222,8 @@ def test_a_kept_image_is_fitted_into_the_square_and_padded_white():
 
 
 def test_a_fetched_image_reaches_the_queue_as_a_sample(tmp_path, monkeypatch):
-    """What a worker does with one url, run here rather than in a worker, which
-    holds no copy of a patched fetch. Of that path only the request header
+    """What a worker does with one url, run in this process, which holds the
+    patched fetch a worker would not. Of that path only the request header
     comes from HF datasets, which the streaming extra owns."""
     monkeypatch.setattr(online_loader, "_user_agent", lambda: "dew-tests")
     path = tmp_path / "3.png"
@@ -417,11 +417,11 @@ def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeyp
 
 
 def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
-    """The one thing that does end the stream: nothing left to wait for.
+    """A gone fetcher ends the stream.
 
     The spec leaves the stream's queue timeout at a minute, so the wait
     before it looks at the fetcher is shortened here. What is under test is
-    that the wait ends in StopIteration rather than in a batch of zeros.
+    that the wait ends in StopIteration, not in a batch of zeros.
     """
     def exhausted(rows, sink, **kwargs):
         for index in range(4):
@@ -443,7 +443,7 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
 
 class Mean(Objective):
     """One scalar fitted to the batch mean: the smallest objective that reads a
-    batch, so what is under test is the streaming data path and nothing else."""
+    batch, so what is under test is the streaming data path alone."""
 
     ema = None
 
@@ -483,7 +483,7 @@ def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch, stop):
 
 
 def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, stop, tmp_path):
-    """And the other half: the refusal is by name, before any training."""
+    """And the other half: a ValueError naming checkpoint_every, before any training."""
     data = _online_spec(monkeypatch, 24, 6, stop).load(batch=8)
 
     with pytest.raises(ValueError, match=r"checkpoint_every=None"):

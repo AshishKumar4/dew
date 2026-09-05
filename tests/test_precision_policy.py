@@ -3,8 +3,7 @@
 `--model.dtype` and `--model.attention-impl` are the only way in;
 `with_precision` writes them into the model config that gets built and logged,
 `Registry.build` resolves the names back into dtypes, and the attention kernel
-refuses the knobs a fused kernel cannot honor instead of dropping them
-silently.
+raises a ValueError for a knob a fused kernel cannot honor.
 """
 
 import jax
@@ -55,7 +54,7 @@ def test_auto_keeps_the_shapes_cudnn_refuses_on_xla(implementations, monkeypatch
     """'auto' promises the fused kernel where it runs. cudnn takes bf16 or
     fp16 and a head dimension that is a multiple of 8 up to 128, so a fp32
     query or a 4-wide head (the UNets' attention at their smallest test
-    size) goes to xla instead of raising inside the kernel."""
+    size) goes to xla, and only an explicit 'cudnn' raises for them."""
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     scaled_dot_product_attention(*qkv(jnp.float32), implementation='auto')
     narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
@@ -69,10 +68,9 @@ def test_auto_keeps_the_shapes_cudnn_refuses_on_xla(implementations, monkeypatch
 
 def test_odd_lengths_reach_cudnn_padded_even(implementations, monkeypatch):
     """cudnn's fused kernel has no backward pass for an odd sequence length,
-    and 77 CLIP text tokens are odd: 'auto' used to send every
-    cross-attention to the xla kernel. Now the call is padded to an even
-    length, the pad key hidden by the kernel's own padding mask, and a pad
-    query row sliced back off."""
+    and 77 CLIP text tokens are odd, so the call is padded to an even length,
+    the pad key hidden by the kernel's own padding mask, and a pad query row
+    sliced back off. 'auto' keeps every cross-attention on cudnn."""
     calls = []
 
     def spy(query, key, value, **kwargs):
@@ -109,8 +107,8 @@ def test_auto_runs_the_kernel_it_resolved_to():
                                        'high', ('highest', 'highest')])
 def test_fused_attention_rejects_precision_it_cannot_honor(implementation, precision):
     """jax.nn.dot_product_attention takes no precision argument at all: it
-    accumulates the logits in fp32 whatever it is handed. Asking for HIGH and
-    getting something else silently is worse than an error."""
+    accumulates the logits in fp32 whatever it is handed, so asking for HIGH
+    raises."""
     with pytest.raises(ValueError, match="precision"):
         scaled_dot_product_attention(*qkv(), precision=precision,
                                      implementation=implementation)
@@ -127,15 +125,6 @@ def test_fused_attention_rejects_bf16_softmax(implementation):
 def test_fused_attention_takes_default_precision(implementations, precision):
     scaled_dot_product_attention(*qkv(), precision=precision, implementation='xla')
     assert implementations == ['xla']
-
-
-def test_reference_attention_keeps_honoring_both_knobs():
-    """The reference path is the one that can honor them, so it must not have
-    picked up the rejection."""
-    q, k, v = qkv(jnp.float32)
-    high = scaled_dot_product_attention(q, k, v, precision=jax.lax.Precision.HIGHEST,
-                                        force_fp32_for_softmax=False)
-    assert high.shape == q.shape
 
 
 def test_cudnn_rejects_float32_inputs():

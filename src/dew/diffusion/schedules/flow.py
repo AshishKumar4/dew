@@ -51,7 +51,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
         # The flow models were trained on the shifted time times 1000, so that
         # is what a trained one reads. SimpleDiT's embedder is EDM's random
         # Fourier features (blocks.FourierEmbedding), which take an input of
-        # order one and do not ask for the DiT sinusoidal range; the factor
-        # stays because changing it changes what every trained flow model is
-        # conditioned on.
+        # order one and need nothing in the DiT sinusoidal range; the factor
+        # is there because changing it changes what every trained flow model
+        # is conditioned on.
         return self.shift_timesteps(jnp.asarray(t, jnp.float32)) * 1000

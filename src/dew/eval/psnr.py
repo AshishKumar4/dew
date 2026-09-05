@@ -1,6 +1,6 @@
 """PSNR in pure jax, batched over images and video.
 
-Both functions accept (B, H, W, C) or (B, T, H, W, C): video is flattened
+Both functions accept (B, H, W, C) or (B, T, H, W, C). Video is flattened
 to (B*T, H, W, C) and every frame scores independently.
 """
 

@@ -129,9 +129,9 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
     case: reference and xla agree with it, and 'auto' resolves a softcapped
     call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), while cudnn and tpu refuse by name.
-    A cap of 2 on logits of order 10 changes the weights by a wide margin,
-    so an uncapped path cannot pass."""
+    an 8-wide head, a gpu backend), while cudnn and tpu raise a ValueError
+    naming the implementation. A cap of 2 on logits of order 10 changes the
+    weights by a wide margin; an uncapped path fails the comparison."""
     query, key, value = (jax.random.normal(k, (1, 6, 2, 8)) * 3
                          for k in jax.random.split(rng, 3))
     scaled = np.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(8)
@@ -602,7 +602,7 @@ def test_attention_scale_defaults_to_the_head_dim_scale(rng):
 
 def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
     """transformers hands query_pre_attn_scalar ** -0.5 to the attention call
-    as a float (modeling_gemma3.py:318, 376), so the scale itself never rounds.
+    as a float (modeling_gemma3.py:318, 376), and the scale itself is unrounded.
 
     Gemma 3 27B asks for scalar 168 on head_dim 128, where the ratio to the
     kernel's own 1/sqrt(head_dim) is 0.872872 and bf16 holds it as 0.871094.
@@ -771,7 +771,7 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
 
     # Rewriting the padded tail cannot move a real token's logits, and the
-    # padded rows themselves stay finite rather than dividing by an empty
+    # padded rows themselves stay finite: no query divides by an empty
     # softmax.
     padded = ids.at[:, 5:].set((ids[:, 5:] + 11) % VOCAB)
     changed = model.apply(params, padded, positions=positions,
@@ -835,7 +835,7 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
         positions=positions, segment_ids=segment_ids)
     moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
     # Five tokens of reach, but the second document starts at 6, so the token
-    # at 1 moves 1..5 and stops there rather than running into 6.
+    # at 1 moves 1..5 and stops there, short of 6.
     assert [int(index) for index in jnp.where(moved)[0]] == list(
         range(flipped, flipped + 5))
 

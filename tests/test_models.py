@@ -55,8 +55,8 @@ def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architect
     Attention is permutation-equivariant and the MLP is per token, so on the
     same weights the two orders must agree once each is unpermuted back to the
     image: the sincos signal has to be permuted with the tokens, the rotation
-    has to stay off, and the inverse permutation has to be the inverse. A
-    non-square grid, so a transposed permutation cannot pass."""
+    has to stay off, and the inverse permutation has to be the inverse. The
+    grid is non-square, which a transposed permutation fails on."""
     x = jax.random.normal(rng, (2, 16, 32, 3))
     temb = jnp.ones((2,))
     textcontext = text(features=64)
@@ -148,8 +148,8 @@ def test_dropout_is_active_in_train_mode(rng):
 
 def test_mmdit_is_dual_stream(rng):
     """Text must participate in the token sequence: zeroing the text context
-    must change the image output through joint attention, not just through
-    the pooled conditioning vector."""
+    must change the image output through joint attention, beyond the change
+    through the pooled conditioning vector."""
     model = SimpleMMDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
     x, temb, textcontext = small_inputs(rng)
     params = model.init(rng, x, temb, textcontext)
@@ -180,8 +180,8 @@ def test_attention_impl_parity(rng):
 
 def test_fused_attention_rejects_a_dtype_it_cannot_honor(rng):
     """The fused kernels compute in the inputs' dtype, so a dtype asking for
-    anything else is refused rather than silently dropped, as precision and
-    the softmax flag already are. The reference path keeps honoring it."""
+    anything else raises ValueError, as a HIGH precision and a False softmax
+    flag already do. The reference path keeps honoring it."""
     from dew.nn.attention import scaled_dot_product_attention
     query = jax.random.normal(rng, (2, 8, 4, 16), jnp.bfloat16)
     key = jax.random.normal(jax.random.fold_in(rng, 1), (2, 8, 4, 16), jnp.bfloat16)
@@ -201,7 +201,7 @@ def open_the_gates(params, key, scale=0.5):
     frame's own prediction by 5e-7. A test of information flow has to open the
     gates and the head first, and only those. The head follows a LayerNorm,
     whose output sums to zero over features, so its kernel is set to random
-    values rather than a constant, which would cancel to nothing."""
+    values; a constant kernel would cancel to nothing."""
     def open_(path, value):
         name = jax.tree_util.keystr(path)
         if "ada_proj" in name and "kernel" in name:
@@ -305,8 +305,9 @@ def test_non_symmetric_attention_configs_init(rng):
 
 
 def test_a_stage_with_an_unknown_field_is_refused():
-    """Design rule 6: an unknown field raises, so a misspelled dial cannot
-    leave the dial it meant at its default in silence."""
+    """Design rule 6: an unknown field raises ValueError naming it, so a
+    misspelled dial fails at build and the dial it meant is never left at
+    its default."""
     stages = [None, {"heads": 2, "use_projeciton": True}]
     with pytest.raises(ValueError, match="use_projeciton"):
         models.build("unet", feature_depths=(8, 16), attention_configs=stages,
@@ -328,7 +329,7 @@ def test_a_stage_record_builds_the_value():
 def test_a_stage_names_the_dials_the_block_supports(rng):
     """Every `TransformerBlock` dial a stage names reaches the block the unet
     builds from it: `use_linear_attention` and `norm_epsilon` each change the
-    output when set, so the unet cannot drop one on the way."""
+    output when set."""
     x = jax.random.normal(rng, (2, 16, 16, 3))
     temb = jnp.ones((2,))
     context = text(features=64)
@@ -346,9 +347,9 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
 
 
 def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
-    """The run's dtype and the fused-kernel softmax reach into every stage,
-    which is what `with_precision` exists for, whether the stage is a value
-    or the record of one from a logged config."""
+    """The run's dtype and the fused-kernel softmax reach into every stage
+    through `with_precision`, whether the stage is a value or the record of
+    one from a logged config."""
     from dew.registry import with_precision
 
     record, value = ({"heads": 2}, Stage(heads=2))
@@ -372,8 +373,8 @@ def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
 
 def test_a_block_pattern_and_a_ratio_together_are_refused():
     """`block_pattern` names every layer's mixer and `ssm_attention_ratio`
-    names them by ratio; set together they would have to disagree in silence,
-    so the hybrid DiT refuses the pair and takes either alone."""
+    names them by ratio; the hybrid DiT raises ValueError on the pair and
+    takes either alone."""
     model = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                                   block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
     with pytest.raises(ValueError, match="ssm_attention_ratio"):

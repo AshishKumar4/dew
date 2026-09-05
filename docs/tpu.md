@@ -115,8 +115,8 @@ WORKER  DEVICES  LOCAL  CHECK
 1       16       8      ok
 ```
 
-A worker that reports 8 instead of 16 fails the command, which is what you want
-before spending an hour on a run that cannot see half its chips.
+A worker that reports 8 instead of 16 fails the command, before an hour goes
+into a run that cannot see half its chips.
 
 ### 4. Run something everywhere
 
@@ -191,8 +191,8 @@ dew-tpu spawn sweep 3 --type v5e-8 -- python recipes/lm/train.py
 ```
 
 Three independent v5e-8 TPUs, created in parallel, each set up and each running
-the command detached. Output from the three interleaves, tagged by name, and
-the summary comes at the end (excerpt):
+the command detached. Output from the three interleaves, each line tagged
+with its TPU's name, and the summary comes at the end (excerpt):
 
 ```
 [sweep-0] create
@@ -252,7 +252,7 @@ that instead, which is the only way the node goes away for good.
 | `delete NAME` | `delete NAME`, which also removes a queued resource. |
 | `start NAME` / `stop NAME` | `start NAME` / `stop NAME`. These now do something. |
 | `list [--zone Z]` | `list [--zone Z]`, with health, worker count and spot in the table. |
-| `ssh NAME` | `ssh NAME [--worker N] [-L PORT]`. You name the ports instead of getting ten of them. |
+| `ssh NAME` | `ssh NAME [--worker N] [-L PORT]`. You name the ports to forward. |
 | `update-ssh-config NAME` | Gone. gcloud manages the keys, so nothing writes to your `~/.ssh/config`. |
 | `copy-github-key NAME` | Gone. Use `ssh -A` through `ssh NAME -- -A`, or `copy NAME ~/.ssh/key ~/.ssh/key`. |
 | `attach-disk NAME DISK` | `create NAME --disk DISK`. Attaching to a live TPU is a `gcloud compute tpus tpu-vm attach-disk` away. |

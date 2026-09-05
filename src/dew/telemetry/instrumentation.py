@@ -1,6 +1,6 @@
 """Step FLOP measurement, MFU accounting and the persistent compilation cache.
 
-The FLOP count is read off the optimized HLO rather than out of XLA's
+The FLOP count is read off the optimized HLO, not out of XLA's
 `cost_analysis()`. Cost analysis reports only the operations the compiler can
 see arithmetic in, and a GPU backend hands its matmuls and convolutions to
 cuBLAS and cuDNN custom calls, whose arithmetic it cannot see. Measured on
@@ -20,8 +20,8 @@ import jax
 
 # Dense bf16 peak of one JAX device, keyed by the start of the string
 # `jax.devices()[0].device_kind` reports, and read by `peak_flops` with the
-# longest matching key. Only used to turn measured FLOPs into a utilisation
-# fraction; hardware the table does not name skips MFU.
+# longest matching key. Its only use is turning measured FLOPs into a
+# utilisation fraction; hardware the table does not name skips MFU.
 #
 # TPU kinds are the ones jax's own test_util.is_device_tpu matches: `TPU v2`
 # to `TPU v4`, `TPU v5 lite` for v5e, `TPU v5` for v5p, `TPU v6 lite` for
@@ -250,8 +250,8 @@ def _instruction_flops(instruction: _Instruction,
     """The multiply-add work of one instruction, and zero for anything else.
 
     Only the matmuls and convolutions count. Everything the compiler leaves
-    elementwise - the optimizer, the EMA, normalization, the softmax, the loss
-    reductions - is memory-bound work that a FLOP utilisation figure is not
+    elementwise (the optimizer, the EMA, normalization, the softmax, the loss
+    reductions) is memory-bound work that a FLOP utilisation figure is not
     about, which is the convention this repo's benchmarks state
     (docs/research/benchmark-parity.md:44-48).
     """
@@ -284,10 +284,9 @@ def _call_counts(instruction: _Instruction) -> Dict[str, float]:
 
     A loop body runs once per iteration, which XLA states as
     `known_trip_count` whenever the length is known, and every `jax.lax.scan`
-    is such a loop. An unknown trip count becomes infinite rather than one: a
-    body counted once when it runs a hundred times is a wrong MFU, not an
-    approximate one, and an infinite count leaves the caller to report nothing.
-    A conditional runs one of its branches, so counting every branch bounds it.
+    is such a loop. An unknown trip count becomes infinite, and the caller
+    then reports no count. A conditional runs one of its branches, so
+    counting every branch bounds it.
     """
     counts = {name: 1.0 for name in _CALLS.findall(instruction.attributes)}
     branches = _BRANCHES.search(instruction.attributes)
@@ -343,8 +342,8 @@ def _merged_call_counts(computation: _Computation) -> Dict[str, float]:
 def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
     """FLOPs for one call of an executable that is already compiled.
 
-    Reading the count off the executable the loop actually runs costs nothing;
-    compiling a second one to ask the same question costs a full XLA compile.
+    Reading the count off the executable the loop runs costs nothing, where
+    `step_flops` pays a compile.
 
     Every matmul and convolution in the optimized module counts once per time
     the module runs it, whether it is a `dot`, a `convolution`, or one of the
@@ -352,7 +351,7 @@ def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
     backend hands them to. Backward passes count because they are in there;
     remat counts the forward it recomputes twice, because the card runs it
     twice. None comes back when the module contains a loop whose length XLA
-    does not state, since the count would be the body's rather than the run's.
+    does not state, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
     return None if text is None else hlo_flops(text)
@@ -377,11 +376,11 @@ def hlo_flops(text: str) -> Optional[float]:
 def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> Optional[float]:
     """FLOPs for one call of a jitted function, straight from the compiler.
 
-    Measured rather than derived from a hand-written parameter-count formula, so
-    it stays honest across architectures, remat and gradient accumulation.
+    Measured, so architectures, remat and gradient accumulation are counted
+    as compiled, with no parameter-count formula.
 
-    Compiles the function, which the caller has usually already paid for: hold
-    on to the compiled executable and use compiled_flops instead.
+    Compiles the function; a caller that already holds the compiled
+    executable uses `compiled_flops`.
     """
     return compiled_flops(jitted.lower(*args, **kwargs).compile())
 
@@ -392,8 +391,8 @@ def model_flops_utilization(
     """Fraction of one device's dense peak achieved by its executable.
 
     The optimized module is the program one device runs under SPMD, so its
-    shapes are per-device and the denominator is one device's peak, not the
-    whole mesh's.
+    shapes are per-device and the denominator is one device's peak rather
+    than the mesh's.
     """
     if not flops_per_step or step_time <= 0:
         return None
@@ -406,8 +405,8 @@ def model_flops_utilization(
 def default_compilation_cache_dir() -> str:
     """Where compiled executables go unless a run names somewhere else.
 
-    Under the user's cache home, which is where a directory that can be deleted
-    at any moment belongs: not in the repo and not next to the checkpoints.
+    Under the user's cache home, where a directory that can be deleted at any
+    moment belongs.
     """
     home = os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache')
     return os.path.expanduser(os.path.join(home, 'dew', 'xla'))

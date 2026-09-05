@@ -4,7 +4,7 @@ One `Registry` per kind: `models`, `presets`, `samplers`, `datasets`,
 `encoders`, `metrics`, `objectives`. A registry is a decorator, a mapping and
 an attribute view over the same table, so `models["simple_dit"]`,
 `models.SimpleDiT` and the class are one object. A name or a field the table
-does not know raises; nothing is dropped or guessed.
+does not know raises.
 
 The registries are empty at import. Each member registers itself where it is
 defined, so importing a package fills its table and the registry module
@@ -39,11 +39,10 @@ class Registry(Mapping[str, T], Generic[T]):
 
     def __init__(self, kind: str):
         self.kind = kind
-        # Registration is where a member's kind is promised, not checked: a
-        # decorator has no base class to test against, and it has to hand back
-        # the class it decorated (`DiffusionObjective`, not `Objective`) so a
-        # caller's checker keeps the concrete type. The table is untyped here
-        # and typed on the way out, which is the one place `T` is asserted.
+        # A decorator has no base class to test the member against, and it
+        # hands back the class it decorated so a caller's checker keeps the
+        # concrete type (`DiffusionObjective`, not `Objective`). The table is
+        # untyped here and typed on the way out.
         self._members: dict[str, Any] = {}
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
@@ -100,12 +99,11 @@ class Registry(Mapping[str, T], Generic[T]):
     def build(self, name: str, /, **fields: Any) -> Any:
         """Construct the member called `name` from keyword fields.
 
-        A field the member has no declaration for is an error, since dropping
-        it would build something other than what was asked for. Fields arrive
-        from JSON as often as from code, so a field whose declared type is a
-        value builds from a record here, at the one boundary where a logged
-        config becomes an object: `models.build("m", attention={"heads": 8})`
-        and `models.build("m", attention=Attention(heads=8))` agree.
+        A field the member does not declare is an error. Fields arrive from
+        JSON as often as from code, so a field whose declared type is a value
+        builds from a record here, where a logged config becomes an object:
+        `models.build("m", attention={"heads": 8})` and
+        `models.build("m", attention=Attention(heads=8))` agree.
         """
         member = self[name]
         return member(**self._declared_fields(name, member, fields))
@@ -155,7 +153,7 @@ def _value_type(annotation: Any) -> Any:
     answers None and its entries are walked instead. A union of several
     values names no single one either (a mixer's `{"kind": ...}` record
     stays a record for the owner to dispatch on its kind), so only a union
-    with one value answers it, which is what `Optional[Mixture]` is. This is
+    with one value answers it, as `Optional[Mixture]` does. This is
     the same opaque treatment `entry_types` and `dew.config`'s record rebuild
     give a multi-member union.
     """
@@ -206,15 +204,15 @@ def from_record(annotation: Any, value: Any) -> Any:
     describes, and anything already built is left alone.
 
     Containers are walked, so a mapping of records and a tuple of records
-    build their values too, which is what keeps a model config a dict from
-    the command line all the way to the module.
+    build their values too, and a model config is a dict from the command
+    line all the way to the module.
     """
     if isinstance(value, Mapping):
         held = _value_type(annotation)
         if held is None:
             # A record with no value class behind it, such as one of the unets'
-            # per-stage attention settings: entries are walked and the dtype
-            # rule below still applies by name.
+            # per-stage attention settings: entries are walked and a "dtype"
+            # entry resolves the same way as a dtype field.
             entries = entry_types(annotation, len(value))
             return {key: resolve_dtype(item) if key == "dtype" else from_record(entry, item)
                     for entry, (key, item) in zip(entries, value.items())}
@@ -233,7 +231,7 @@ def from_record(annotation: Any, value: Any) -> Any:
 
 
 def _field_value(member: Any, field: str, value: Any) -> Any:
-    """One field on its way into `member`: a dtype by name, a value from a record."""
+    """One field on its way into `member`: a dtype from its name, a value from a record."""
     if field == "dtype":
         return resolve_dtype(value)
     return from_record(_declared_type(member, field), value)

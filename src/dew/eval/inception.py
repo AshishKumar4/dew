@@ -11,9 +11,9 @@ import flax.linen as nn
 from typing import Callable, Optional, Sequence, Tuple, Union, Any
 from . import utils
 
-# The FID feature extractor's weights: the jax-fid pickle, mirrored on the Hub
-# so a revision and a digest can be pinned. The bytes are byte-identical to
-# what this metric has always used, so no reported FID moves.
+# The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
+# with a pinned revision and digest. The bytes are byte-identical to the
+# jax-fid file.
 FID_WEIGHTS_REPO = 'hayden-donnelly/inception-v3-fid'
 FID_WEIGHTS_FILE = 'inception_v3_fid.pickle'
 FID_WEIGHTS_REVISION = 'ccb3ff416ff491ae7fd964c5e7c01d12ab7c48bf'
@@ -483,8 +483,8 @@ class BatchNorm(nn.Module):
     """BatchNorm Module.
     Taken from: https://github.com/google/flax/blob/master/flax/linen/normalization.py
     Attributes:
-        use_running_average: if True, the statistics stored in batch_stats
-                             will be used instead of computing the batch statistics on the input.
+        use_running_average: if True, normalize with the statistics stored in
+                             batch_stats; if False, with the input's own batch statistics.
     axis: the feature or non-batch axis of the input.
     momentum: decay rate for the exponential moving average of the batch statistics.
     epsilon: a small float added to variance to avoid dividing by zero.
@@ -495,8 +495,8 @@ class BatchNorm(nn.Module):
                since the scaling will be done by the next layer.
     bias_init: initializer for bias, by default, zero.
     scale_init: initializer for scale, by default, one.
-    axis_name: the axis name used to combine batch statistics from multiple
-               devices. See `jax.pmap` for a description of axis names (default: None).
+    axis_name: the axis name over which batch statistics from multiple
+               devices are combined. See `jax.pmap` for a description of axis names (default: None).
     axis_index_groups: groups of axis indices within that named axis
                        representing subsets of devices to reduce over (default: None). For
                        example, `[[0, 1], [2, 3]]` would independently batch-normalize over
@@ -529,8 +529,8 @@ class BatchNorm(nn.Module):
         to exist.
         Args:
             x: the input to be normalized.
-            use_running_average: if true, the statistics stored in batch_stats
-                                 will be used instead of computing the batch statistics on the input.
+            use_running_average: if true, normalize with the statistics stored in
+                                 batch_stats; if false, with the input's own batch statistics.
         Returns:
             Normalized inputs (the same shape as inputs).
         """

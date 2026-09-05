@@ -1,7 +1,7 @@
 """One reverse step each, from t to t_next, given the model's denoising at t.
 
-A solver is a value: what it needs between steps travels in its state,
-which `init` builds from x_T and `step` threads through `sample`'s scan. The
+A solver is a value. What it needs between steps travels in its state;
+`init` builds it from x_T and `step` threads it through `sample`'s scan. The
 rates of the sampling schedule come from `process`; a solver that needs
 another evaluation of the model (Heun's corrector, RK4's stages) calls
 `denoise`. A solver that integrates dx / dsigma = eps says so by refusing a
@@ -29,9 +29,8 @@ class Solver(Protocol[StateT]):
     """A step of a sampler, and whatever it carries between steps.
 
     `StateT` is that carried value: nothing for a one-step solver, the
-    previous model output for a multi-step one. It is a type parameter rather
-    than an attribute so a solver's own state type is checked at its call
-    sites.
+    previous model output for a multi-step one. It is a type parameter, so a
+    solver's own state type is checked at its call sites.
     """
 
     def init(self, x) -> StateT: ...
@@ -110,8 +109,8 @@ class DDIM:
 @samplers("euler")
 @dataclass(frozen=True)
 class Euler:
-    """The DDIM update written as an Euler step of the probability flow ODE:
-    on a variance exploding schedule it is dx/dsigma = eps."""
+    """The DDIM update written as an Euler step of the probability flow ODE.
+    On a variance exploding schedule it is dx/dsigma = eps."""
 
     def init(self, x):
         return ()
@@ -128,7 +127,7 @@ class Euler:
 @dataclass(frozen=True)
 class EulerAncestral:
     """Euler with the ancestral noise injection of k-diffusion
-    (`get_ancestral_step`, eta 1): the step goes down to sigma_down and
+    (`get_ancestral_step`, eta 1). The step goes down to sigma_down, and
     sigma_up of fresh noise brings the marginal back to sigma_s. Integrates a
     `GeneralizedNoiseScheduler`."""
 
@@ -162,7 +161,7 @@ class Heun:
         x_euler = x + dx_0 * dt
 
         denoised_next, _ = denoise(x_euler, t_next)
-        # When sigma reaches 0 there is no derivative there, so the step stays
+        # When sigma reaches 0 there is no derivative there, so the step is
         # the Euler one.
         safe_sigma_s = jnp.where(sigma_s > 0, sigma_s, 1.0)
         dx_1 = (x_euler - x_0_coeff * denoised_next) / safe_sigma_s

@@ -1,8 +1,8 @@
 """Process setup every recipe runs before it builds anything.
 
 rlimits, the XLA flags, the compilation cache, the JAX distributed pool and
-the env vars wandb and the tokenizers read are the same in every recipe:
-library wiring, not recipe behavior. The recipes call this once at the top of
+the env vars wandb and the tokenizers read are the same in every recipe.
+That makes them library wiring, and the recipes call this once at the top of
 main().
 """
 
@@ -36,15 +36,15 @@ def prepare_process(wandb: Wandb | None = None,
 
     jax.distributed.initialize() finds the coordinator from the environment on
     TPU pods and Slurm/GKE clusters. On a machine with no cluster environment
-    it raises the one ValueError below, which is the single-host signature;
-    every other failure means a pod run would otherwise continue on one host,
-    so it propagates. multi_host=True requires the pool, multi_host=False
-    never asks for it.
+    it raises a ValueError naming the missing coordinator address, the
+    single-host signature. Every other failure propagates, since a pod run
+    would otherwise continue on one host. multi_host=True requires the pool,
+    multi_host=False never asks for it.
 
     xla_flags reaches XLA through the environment, which it reads when it
     opens a backend, so this call has to come before the first JAX call in the
-    process. That is what makes it a recipe's first line and why a library
-    user, who never runs a recipe, sets XLA_FLAGS themselves.
+    process. That makes it a recipe's first line. A library user, who never
+    runs a recipe, sets XLA_FLAGS in the environment.
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -68,15 +68,14 @@ def prepare_process(wandb: Wandb | None = None,
         else:
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
-            # One collective while the processes are still in lockstep, which
-            # they are only here: initialize() returns on every process once
-            # the last one has connected. On CPU, collectives rendezvous
-            # through the coordinator with a 30 second deadline, and the
-            # first one otherwise falls inside orbax's checkpoint-manager
-            # barrier in the trainer, by which time the processes are as far
-            # apart as a wandb init and their model builds. A process that
-            # arrives late dies in gloo rather than in anything the run can
-            # report.
+            # One collective while the processes are still in lockstep;
+            # initialize() returns on every process once the last one has
+            # connected. On CPU, collectives rendezvous through the coordinator
+            # with a 30 second deadline. Without this the first collective would
+            # fall inside orbax's checkpoint-manager barrier in the trainer, by
+            # which time the processes are as far apart as a wandb init and
+            # their model builds, and a process that arrives late dies in gloo
+            # before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
     print(f"Number of devices: {jax.device_count()}")
 
@@ -86,6 +85,6 @@ def run_timestamp() -> str:
 
     A default run name carries it, and the name is the checkpoint directory
     every process writes into, so a process that read its own clock a second
-    later would write into a directory of its own.
+    later would write into a different directory.
     """
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))

@@ -10,8 +10,7 @@ condition (`text:None` for an unconditional run) and the autoencoder
 (`autoencoder:stable-diffusion-autoencoder`). Architecture kwargs go through
 --model.config as one JSON object, straight to the registry. The run spec is
 `dew.objectives.diffusion.DiffusionRunConfig`, saved as run.json next to the
-checkpoints, and `config.build()` is the one construction training and
-inference share.
+checkpoints, and training and inference both build from `config.build()`.
 """
 
 import hashlib

@@ -33,8 +33,8 @@ What lands:
 - tests/fixtures/hf/qwen35-0.8b/: no weights. config.json is the released
   config of Qwen/Qwen3.5-0.8B, the smallest checkpoint of the family, and
   its text decoder is what the translation is tested on. inv_freq.npy is
-  the rotary inverse frequencies the reference builds from that config,
-  which is how the test pins the partial rotary convention without torch.
+  the rotary inverse frequencies the reference builds from that config;
+  the test pins the partial rotary convention against it without torch.
 """
 
 import argparse

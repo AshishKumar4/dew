@@ -1,6 +1,6 @@
 """Tokenizers for language-model data: utf-8 bytes, or any HF tokenizer.
 
-`import dew.data` stays cheap: neither class imports `transformers` at module
+`import dew.data` stays cheap. Neither class imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
 tokenizer on first use, so a host without the hub cache still imports
 `dew.data.text` (and everything that re-exports it) fine.
@@ -12,9 +12,9 @@ from typing import List
 
 
 class ByteTokenizer:
-    """Vocabulary 256: one id per utf-8 byte of the text.
+    """Vocabulary 256, one id per utf-8 byte of the text.
 
-    Trains nothing and downloads nothing, which makes it the default for
+    It trains nothing and downloads nothing, which makes it the default for
     small corpora and for tests; its decode is the inverse of its encode on
     any unicode input, so a generated sequence rounds back to text byte for
     byte.
@@ -37,7 +37,7 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    """A huggingface tokenizer, loaded by name on first use.
+    """A huggingface tokenizer, loaded from its hub name on first use.
 
     Lazy loading keeps `import dew.data.text` (and `import dew.data`) from
     paying for `transformers` and any hub lookup a caller never asked for.

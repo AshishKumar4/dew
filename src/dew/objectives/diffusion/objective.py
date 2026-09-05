@@ -36,9 +36,9 @@ VALIDATION_SAMPLES = 4
 
 
 def check_solver(process, sampler) -> None:
-    """One abstract solver step, so a solver that refuses the process's
-    schedule says so when the objective is built and not at the first
-    validation pass, an epoch in."""
+    """One abstract solver step, run when the objective is built. A solver
+    that refuses the process's schedule fails there, before the first
+    validation pass an epoch in."""
     x = jnp.zeros((1, 1), jnp.float32)
     t = jnp.ones((1,), jnp.float32)
     key = jax.ShapeDtypeStruct((2,), jnp.uint32)
@@ -113,9 +113,8 @@ class DiffusionObjective(Objective):
             key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
         state = {**variables, "encoders": encoders}
         if self.autoencoder is not None:
-            # The frozen weights are state, like the encoders': an argument to
-            # the compiled step that the layout places, not a constant baked
-            # into it.
+            # The frozen weights are state, like the encoders'. They ride in
+            # as an argument to the compiled step for the layout to place.
             state["autoencoder"] = self.autoencoder.params
         return state
 
@@ -132,7 +131,7 @@ class DiffusionObjective(Objective):
             data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
         count = data.shape[0]
 
-        # Conditioning dropout: a row drawn for the unconditional branch reads
+        # Conditioning dropout. A row drawn for the unconditional branch reads
         # the unconditional value in every one of its conditions.
         dropped = jax.random.bernoulli(drop_key, self.unconditional_prob, (count,))
         tokens = {keyword: batch[condition.field]
@@ -177,9 +176,9 @@ class DiffusionObjective(Objective):
         """`VALIDATION_SAMPLES` samples from the batch's conditions, with the
         averaged weights when the run keeps them, seeded by the step's key.
 
-        The captions are decoded on the host, so the tokens come home first:
-        on a pool the batch is a global array this process holds one shard of,
-        and the gather is a collective every process makes here.
+        The captions are decoded on the host, so the tokens come home first.
+        On a pool the batch is a global array this process holds one shard
+        of, and the gather is a collective every process makes here.
         """
         params = params if step.ema is None else step.ema
         count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])

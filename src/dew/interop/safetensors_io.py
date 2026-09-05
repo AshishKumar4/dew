@@ -5,8 +5,8 @@ tensors. The two meet at the '/'-joined path, the same naming the Hugging Face
 checkpoints use, so a tree written here opens in anything that reads
 safetensors and a file read back keeps its nesting.
 
-Only the container is handled here. No leaf is renamed, transposed or cast:
-the names on disk are the module names in the tree.
+Only the container is handled here. No leaf is renamed, transposed or cast.
+The names on disk are the module names in the tree.
 """
 
 import json
@@ -86,7 +86,7 @@ def save_hf_layout(params, config: Dict[str, Any], directory) -> None:
     """Write model.safetensors and config.json into `directory`.
 
     That pair is what a Hugging Face style loader looks for. The config is
-    written as given: dew does not translate its own config vocabulary into
+    written as given. Dew does not translate its own config vocabulary into
     anyone else's.
     """
     os.makedirs(directory, exist_ok=True)

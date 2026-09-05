@@ -19,8 +19,7 @@ class StableDiffusionVAE(AutoEncoder):
     latent space, so the same class carries SD1's four channels and the
     sixteen of SD3.5 and Flux; those newer configs also set `use_quant_conv`
     and `use_post_quant_conv` false, and then there are no such layers to
-    apply. `params` overrides the loaded weights, which is how a test mutates
-    one.
+    apply. `params` overrides the loaded weights.
     """
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
@@ -99,8 +98,8 @@ class StableDiffusionVAE(AutoEncoder):
         self.decode_single_frame = jax.jit(decode_single_frame)
 
         # The latent geometry, from the shape one frame takes through the
-        # encoder. It is the weights' own shape, so it is read here and not on
-        # every call, and from the trace alone: nothing runs at construction.
+        # encoder. It is the weights' own shape, read once here from the trace
+        # alone, so nothing runs at construction.
         frame = jax.ShapeDtypeStruct((1, 128, 128, config["in_channels"]), dtype)
         latent = jax.eval_shape(encode_single_frame, params, frame)
         self._downscale_factor = frame.shape[1] // latent.shape[1]

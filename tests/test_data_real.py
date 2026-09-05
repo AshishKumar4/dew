@@ -1,4 +1,4 @@
-"""One real dataset, loaded from its spec exactly as a recipe does.
+"""One real dataset, loaded from its spec the way a recipe loads it.
 
 Every other data test stubs the source: they check the registries, the
 transforms and the split logic, but nothing has ever taken a real TFDS

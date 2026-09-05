@@ -143,7 +143,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     the loaded weights and the run spec written back.
 
     The checkpoint decides the architecture, so what the run builds is its
-    one layer of width 16 rather than the recipe's defaults.
+    one layer of width 16, not the recipe's defaults.
     """
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -161,9 +161,8 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
-    """Zero steps hold exactly what the checkpoint carries, which is what
-    makes the load a continuation rather than a fresh init of the same
-    shape."""
+    """Zero steps hold what the checkpoint carries, leaf for leaf: the load
+    is a continuation, not a fresh init of the same shape."""
     from dew.interop.hf_decoders import load_pretrained_decoder
 
     recipe = load_recipe()
@@ -240,7 +239,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
     """--mtp-weight reaches the objective: with the term on, a prediction
     depth's fused projection ends two steps somewhere else than the same run
     without it, whose depth sees no gradient; and the flag on a model
-    without depths is refused by name."""
+    without depths raises a ValueError naming num_nextn_predict_layers."""
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     deep = ('{"emb_features": 16, "num_layers": 1, "num_heads": 2, '

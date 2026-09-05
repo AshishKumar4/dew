@@ -52,6 +52,28 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
   tests/test_linear_attention.py.
+- gpt-oss-tiny: max |logit difference| 2.5e-06, tolerance 1e-4. Sink
+  attention on a sliding and a full layer, YaRN over grouped-query heads,
+  the biased router and the clamped interleaved experts; the block's own
+  numbers are in tests/test_attention_sinks.py and tests/test_gpt_oss.py.
+- deepseek-v2-tiny: max |logit difference| 2.3e-06, tolerance 1e-4. MLA
+  without a query LoRA, V2's softmax router under group_limited_greedy and
+  no renormalisation; the router's numbers are in tests/test_deepseek_v2.py.
+- glm4-moe-tiny: max |logit difference| 3.3e-06 on the trunk and 3.2e-06 on
+  the MTP depth, tolerance 1e-4. Biased q/k/v, a half rotary, DeepSeek V3
+  routing with a shared expert, one MTP depth composed as the engines run it.
+- llama4-tiny : max |logit difference| 3.5e-06, tolerance 1e-4. Chunked
+  rotated local layers around a global layer with temperature tuning, the
+  routed layers scaling their inputs; the mixer's numbers are in
+  tests/test_llama4.py.
+- gemma4-moe-tiny: max |logit difference| 4.9e-06, tolerance 1e-4. The
+  routed branch beside every layer's dense MLP, the global layer reading its
+  values off one key/value head of 16, and the per-layer scalars; the
+  branch's numbers are in tests/test_gemma4_moe.py.
+- gemma3n-tiny: max |logit difference| 4.2e-06, tolerance 1e-4. Three
+  copies of the residual stream under AltUp, the LAuReL block, gaussian
+  top-k on the first two layers, widths of 48 and 64, per-layer inputs and
+  one sharing layer; the blocks' numbers are in tests/test_gemma3n.py.
 """
 
 import dataclasses
@@ -69,6 +91,7 @@ from dew.interop.hf_decoders import (
     load_pretrained_decoder, save_pretrained_decoder, translate_config,
     translate_weights,
 )
+from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -128,8 +151,8 @@ def test_a_multimodal_gemma3_config_is_refused():
     """Only a text decoder maps, and no published multimodal Gemma 3 has a
     text_config that would: gemma-3-4b, 12b and 27b all carry rope_scaling
     {'rope_type': 'linear', 'factor': 8}, which the field map refuses. So the
-    refusal names the model_type instead of loading the text half of a
-    checkpoint whose vision tower nothing here runs."""
+    refusal names the model_type; the text half of a checkpoint whose vision
+    tower nothing here runs stays unloaded."""
     wrapped = {'model_type': 'gemma3', 'text_config': fixture_config("gemma3-tiny"),
                'vision_config': {'hidden_size': 8}, 'mm_tokens_per_image': 256,
                'boi_token_index': 255999, 'eoi_token_index': 256000,
@@ -512,7 +535,8 @@ def test_a_ramp_the_reference_puts_on_one_kind_lands_on_that_kind():
     (configuration_olmo3.py:110-113) and leaves the sliding layers plain, and
     a nested rope_parameters may state the same directly. Both land on the
     full kind, not the model, since a kind's None rides the model's ramp and
-    could not turn one off. A ramp with a field missing refuses by name."""
+    could not turn one off. A ramp with a field missing raises a ValueError
+    naming the field."""
     ramp = {'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
             'high_freq_factor': 4.0, 'original_max_position_embeddings': 8192}
     flat = {**fixture_config("olmo-3-7b"), 'rope_scaling': ramp}
@@ -658,10 +682,10 @@ def biased_qwen3(rng):
 
 
 def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
-    """attention_bias is one flag for all four projections, which is what
+    """attention_bias is one flag for all four projections, the flag
     Qwen3Attention builds from config.attention_bias (modeling_qwen3.py:225-236)
     and Gemma3Attention from the same field (modeling_gemma3.py:322-333), so a
-    biased qk_norm model is exportable rather than a refusal."""
+    biased qk_norm model exports."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
 
@@ -678,8 +702,8 @@ def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
 def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
     """No weights: the 311 names and shapes of Qwen3-0.6B against our tree.
 
-    This is the check that a config translation and a key map stay honest
-    about a checkpoint nobody wants to download in CI.
+    This is the check that a config translation and a key map fit a
+    checkpoint nobody wants to download in CI.
     """
     from dew.interop.hf_decoders import _dew_path
 
@@ -844,8 +868,9 @@ def test_the_e2b_shaped_config_translates_every_gap():
 
 def test_the_real_e2b_config_translates():
     """google/gemma-4-E2B's text_config translates field for field: partial
-    rotary 0.25, head dims 192 and 512, sharing 20 layers, per-layer inputs
-    of 256, the double-wide MLP, scale 1.0 and softcap 30."""
+    rotary 0.25, head dims 256 and 512 (the checkpoint's sliding q_proj is
+    8 heads of 256, its full one 8 of 512), sharing 20 layers, per-layer
+    inputs of 256, the double-wide MLP, scale 1.0 and softcap 30."""
     e2b = Path(
         "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
         "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
@@ -854,7 +879,8 @@ def test_the_real_e2b_config_translates():
     config = translate_config(json.loads(e2b.read_text()).get("text_config"))
 
     assert config["partial_rotary_factor"] == 0.25
-    assert config["head_dim"] == 192
+    assert config["head_dim"] == 256
+    assert config["num_kv_heads"] == 1
     assert config["kinds"]["full_attention"] == {"head_dim": 512}
     assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
     assert config["num_kv_shared_layers"] == 20
@@ -866,13 +892,12 @@ def test_the_real_e2b_config_translates():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("attention_k_eq_v", True),
-    ("enable_moe_block", True),
     ("hidden_act", "relu"),
+    ("use_bidirectional_attention", "all"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
-    """Every gemma4 knob Dew cannot express names itself instead of loading
-    a model that computes something else."""
+    """Every gemma4 knob Dew cannot express raises a ValueError naming the
+    field, and no model is built."""
     config = gemma4_config("gemma4-ple")
     config[field] = value
     with pytest.raises(ValueError, match=field):
@@ -910,42 +935,69 @@ def test_a_multimodal_wrapper_config_is_refused_by_name(model_type):
     assert "text_config" in str(raised.value)
     assert "model.language_model" in str(raised.value)
 
-    # The decoder underneath it still translates, which is what the message says.
+    # The decoder underneath it still translates, as the message says.
     assert translate_config(wrapper["text_config"])["num_kv_shared_layers"] == 2
 
 
 def test_a_wrapper_shaped_config_of_an_unknown_family_is_refused_as_one():
     """A config with a text_config and a model_type this has never heard of
-    is the same shape of thing, so it gets the same answer rather than the
-    bare family list."""
+    is the same shape of thing, so it gets the same answer, with no bare
+    family list."""
     with pytest.raises(ValueError, match="multimodal wrapper"):
         translate_config({"model_type": "someone_elses_vlm",
                           "text_config": gemma4_config("gemma4-ple")})
 
 
-@pytest.mark.parametrize("field", ["num_global_key_value_heads", "per_layer_config"])
-def test_a_per_layer_key_value_head_count_is_refused(field):
-    """The reference lets a layer kind carry its own key/value head count
-    (Gemma4TextAttention reads layer_config.num_key_value_heads). The
-    backbone has one count for the model, so a config that varies it is
-    refused by name instead of building a model whose K/V width is wrong and
-    failing later on a shape."""
-    config = gemma4_config("gemma4-e2b")
-    model_kv = config["num_key_value_heads"]
-    if field == "num_global_key_value_heads":
-        config[field] = model_kv + 1
-    else:
-        config[field] = {"1": {"head_dim": 32, "num_key_value_heads": model_kv + 1}}
+@pytest.mark.parametrize("spelling", ["per_layer_config", "global_absent", "global_ungated"])
+def test_the_full_layers_geometry_is_read_the_way_the_reference_reads_it(spelling):
+    """The reference lets the full layers carry their own head dim and
+    key/value head count (Gemma4TextAttention reads layer_config), which a
+    transformers-written config spells per layer and a released one as
+    global_head_dim and num_global_key_value_heads. Gemma4TextConfig builds
+    the per-layer entries from the global pair only when the per_layer_config
+    key is absent, and takes the count only under attention_k_eq_v; the
+    expected geometry comes from the reference class, not a copy of the
+    rule."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
-    with pytest.raises(ValueError, match=field) as raised:
-        translate_config(config)
-    assert "key/value head count" in str(raised.value)
-    assert str(model_kv) in str(raised.value)
+    config = gemma4_config("gemma4-e2b")
+    if spelling == "per_layer_config":
+        config["per_layer_config"] = {"1": {"head_dim": 32, "num_key_value_heads": 1}}
+    else:
+        del config["per_layer_config"]
+        config.update(global_head_dim=32, num_global_key_value_heads=1,
+                      attention_k_eq_v=spelling == "global_ungated")
+    full = config["layer_types"].index("full_attention")
+    reference = Gemma4TextConfig(**config).per_layer_config[full]
+
+    translated = translate_config(config)
+    kind = translated["kinds"]["full_attention"]
+    assert kind["head_dim"] == reference.head_dim == 32
+    assert kind.get("num_kv_heads", translated["num_kv_heads"]) == reference.num_key_value_heads
+    assert ("num_kv_heads" in kind) == (spelling != "global_absent")
+
+
+def test_a_config_with_the_per_layer_key_ignores_the_global_pair_as_the_reference_does():
+    """With per_layer_config present, even empty, the reference reads
+    global_head_dim and num_global_key_value_heads nowhere: the full layers
+    keep the model's geometry, which the released E2B relies on."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    config = gemma4_config("gemma4-ple")
+    config.update(global_head_dim=32, num_global_key_value_heads=1, attention_k_eq_v=True)
+    full = config["layer_types"].index("full_attention")
+    reference = Gemma4TextConfig(**config).per_layer_config[full]
+    assert reference.head_dim == config["head_dim"]
+
+    translated = translate_config(config)
+    assert "full_attention" not in translated["kinds"]
+    assert translated["head_dim"] == config["head_dim"]
 
 
 def test_a_per_layer_count_equal_to_the_models_still_translates():
-    """Only a count that differs is a refusal: the reference fills
-    per_layer_config with the model's own value for every layer."""
+    """A count equal to the model's leaves the kind with its head dim alone:
+    the reference fills per_layer_config with the model's own value for
+    every layer, so nothing varies."""
     config = gemma4_config("gemma4-e2b")
     config["per_layer_config"] = {
         "1": {"head_dim": 32, "num_key_value_heads": config["num_key_value_heads"]}}
@@ -957,7 +1009,7 @@ def test_a_per_layer_count_equal_to_the_models_still_translates():
 def test_gemma4_checkpoints_load_through_the_translator(name):
     """The full load path on a gemma4 checkpoint: translate, weights, build,
     shape check. Sharing layers own no K/V leaves and the per-layer table
-    lands, which is what _check_tree enforces leaf for leaf."""
+    lands; _check_tree enforces both leaf for leaf."""
     directory = FIXTURES / name
     model, variables, _ = fp32_decoder(directory)
     assert model.v_norm and model.attention_scale == 1.0
@@ -1081,7 +1133,7 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
 
 def test_export_refuses_the_new_features(tmp_path, rng):
     """The three exported families have neither, so a model with any of them
-    set is refused instead of silently dropping its leaves."""
+    set raises a ValueError naming the feature, and no leaves are dropped."""
     config = translate_config(gemma4_config("gemma4-kvshare"))
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="xla"))
@@ -1168,8 +1220,8 @@ def test_the_router_bias_lands_in_the_moe_collection():
 
 def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
     """The tree check holds every collection to account, so a checkpoint
-    that drops the balancing bias fails naming the leaf instead of loading
-    a router at zeros."""
+    that drops the balancing bias fails naming the leaf, and no router loads
+    at zeros."""
     from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -1238,9 +1290,8 @@ def test_the_v32_fixture_is_the_sparse_model():
 @pytest.mark.parametrize("name", DEEPSEEK)
 def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
     """The writer covers the three attention families; a model with the mla
-    mixer is refused naming the mixer, and one with routed experts on
-    standard attention naming the mixture, instead of writing a checkpoint
-    without their tensors."""
+    mixer raises naming the mixer, and one with routed experts on standard
+    attention raises naming the mixture. Neither writes a checkpoint."""
     model, variables, _ = fp32_decoder(FIXTURES / name)
     with pytest.raises(ValueError, match="a mixer other than attention"):
         save_pretrained_decoder(model, variables, str(tmp_path))
@@ -1472,3 +1523,769 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     difference = float(jnp.abs(full[:, 3:] - incremental).max())
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+
+
+# --------------------------------------------------------------------------
+# GPT OSS: attention sinks, biased interleaved experts, YaRN over GQA
+# --------------------------------------------------------------------------
+
+GPT_OSS = FIXTURES / "gpt-oss-tiny"
+
+
+def test_gpt_oss_config_translates_field_by_field():
+    config = translate_config(fixture_config("gpt-oss-tiny"))
+
+    assert config["mlp"] == "swigluoai" and config["attention_sinks"]
+    assert config["layer_types"] == ("sliding_attention", "full_attention")
+    assert config["kinds"] == {"sliding_attention": {"window": 4}}
+    assert config["mixture"] == {"experts": 4, "top_k": 2}
+    assert config["yarn"]["factor"] == 4.0 and config["yarn"]["truncate"] is False
+    assert config["rope_theta"] == 150000.0 and config["attention_bias"]
+    assert not config["qk_norm"] and not config["scale_after_cast"]
+
+
+def test_the_real_gpt_oss_20b_config_translates():
+    """openai/gpt-oss-20b, released with MXFP4 experts: 24 alternating
+    layers, 64 query and 8 key/value heads of 64, 32 experts with 4 per
+    token, YaRN factor 32 over 4096 positions, and the sliding window 128."""
+    config = translate_config(fixture_config("gpt-oss-20b"))
+
+    assert config["num_layers"] == 24 and config["layer_types"][:2] == (
+        "sliding_attention", "full_attention")
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (64, 8, 64)
+    assert config["mixture"] == {"experts": 32, "top_k": 4}
+    assert config["kinds"] == {"sliding_attention": {"window": 128}}
+    assert config["yarn"]["factor"] == 32.0
+    assert config["yarn"]["original_max_position_embeddings"] == 4096
+    assert config["vocab_size"] == 201088 and config["max_seq_len"] == 8192
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("swiglu_limit", 3.0, "swiglu_limit"),
+    ("quantization_config", {"quant_method": "awq"}, "quantization_config"),
+    ("output_router_logits", True, "output_router_logits"),
+])
+def test_a_gpt_oss_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("gpt-oss-tiny"), field: value})
+
+
+def test_gpt_oss_logits_match_the_reference_implementation():
+    """fp32 parity through xla sink attention: tolerance 1e-4, observed
+    max |logit difference| 2.5e-06 with identical argmax."""
+    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
+                                                  attention_impl="xla")
+    ids = np.load(GPT_OSS / "input_ids.npy")
+    reference = np.load(GPT_OSS / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    flat = flat_tree(variables["params"])
+    assert flat["layers_0.self_attn.sinks"].shape == (4,)
+    assert flat["layers_1.mlp.experts.gate_up_proj_bias"].shape == (4, 128)
+
+
+def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
+    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
+                                                  attention_impl="xla")
+    export = tmp_path / "gpt-oss"
+    save_pretrained_decoder(model, variables, export)
+    again, reloaded, _ = load_pretrained_decoder(str(export), dtype="float32",
+                                                 attention_impl="xla")
+    assert again == model
+    for path, leaf in flat_tree(reloaded["params"]).items():
+        assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(variables["params"])[path])), path
+
+
+def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
+    """The released layout: uint8 blocks and scales in place of the expert
+    matrices. Loading them must give the logits of the fixture whose
+    experts are those exact bf16 values, so the packed checkpoint is
+    written from the fixture's own weights."""
+    from safetensors.numpy import load_file, save_file
+
+    tensors = load_file(str(GPT_OSS / "model.safetensors"))
+    packed = {}
+    for name, tensor in tensors.items():
+        if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
+            packed[name] = tensor
+            continue
+        rounded = jnp.asarray(tensor, jnp.bfloat16).astype(jnp.float32)
+        blocks, scales = quantize_mxfp4(np.asarray(rounded))
+        packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
+        tensors[name] = np.asarray(dequantize_mxfp4(jnp.asarray(blocks), jnp.asarray(scales))
+                                   .astype(jnp.float32))
+    directory = tmp_path / "packed"
+    directory.mkdir()
+    save_file(packed, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(
+        {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
+
+    model, variables, _ = load_pretrained_decoder(str(directory), dtype="float32",
+                                                  attention_impl="xla")
+    expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
+    for path, leaf in flat_tree(variables["params"]).items():
+        assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
+
+
+def quantize_mxfp4(matrix):
+    """[expert, input, output] fp32 into the released blocks and scales.
+
+    Every value is scaled to a representable E2M1 magnitude by a shared
+    power-of-two exponent per 32 inputs. The test pins the sign nibble order
+    and the transpose back to the input axis.
+    """
+    values = np.ascontiguousarray(matrix.transpose(0, 2, 1))
+    groups = values.reshape(values.shape[0], values.shape[1], -1, 32)
+    magnitude = np.max(np.abs(groups), axis=-1, keepdims=True)
+    exponent = np.where(magnitude > 0, np.floor(np.log2(np.maximum(magnitude, 1e-30))) - 2, 0)
+    scaled = groups / np.exp2(exponent)
+    table = np.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)
+    codes = np.abs(scaled[..., None] - table).argmin(-1) + 8 * (scaled < 0)
+    blocks = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    return blocks, (exponent[..., 0] + 127).astype(np.uint8)
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
+                    reason="DEW_NETWORK_TESTS=1 downloads openai/gpt-oss-20b")
+def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
+    """The released MXFP4 checkpoint through the loader against transformers'
+    own dequantized bf16 forward at the same prompt. Tolerance on the top-32
+    logits 5e-2 for bf16 accumulation over 24 layers; the argmax must agree
+    everywhere. The largest observed difference is not recorded here: the
+    test needs the download."""
+    import torch
+    from transformers import AutoTokenizer, GptOssForCausalLM
+
+    prompt = "The Cascade Range runs from northern California through Oregon"
+    ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
+        prompt, return_tensors="np")["input_ids"].astype(np.int32)
+    model, variables, _ = load_pretrained_decoder(
+        "openai/gpt-oss-20b", dtype="bfloat16", attention_impl="xla",
+        max_seq_len=int(ids.shape[1]))
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
+
+    reference = GptOssForCausalLM.from_pretrained("openai/gpt-oss-20b", dtype=torch.bfloat16)
+    reference.eval()
+    reference.set_attn_implementation("eager")
+    with torch.no_grad():
+        theirs = reference(input_ids=torch.from_numpy(ids.astype(np.int64))).logits[0].float().numpy()
+
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(theirs, axis=-1))
+    top_ids = np.argsort(-theirs, axis=-1)[:, :32]
+    difference = float(np.max(np.abs(np.take_along_axis(logits, top_ids, axis=-1)
+                                     - np.take_along_axis(theirs, top_ids, axis=-1))))
+    assert difference < 5e-2, f"max |top-32 logit difference| {difference:.3e}"
+
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V2 and Kimi K2: the V2 router under MLA, and V3 under Kimi's name
+# --------------------------------------------------------------------------
+
+DEEPSEEK_V2 = FIXTURES / "deepseek-v2-tiny"
+
+
+def test_deepseek_v2_config_translates_field_by_field():
+    """The tiny V2: MLA without the query LoRA, YaRN with the 0.707 mscales,
+    a dense first layer over a softmax router under group_limited_greedy
+    that never renormalises, and two shared experts of width 16."""
+    config = translate_config(fixture_config("deepseek-v2-tiny"))
+
+    assert config["mixer"]["kind"] == "mla" and config["mixer"]["q_lora_rank"] is None
+    assert config["mixer"]["yarn"]["mscale"] == 0.707
+    assert config["mixture"] == {
+        "experts": 8, "top_k": 4, "layers": (1,), "scaling": 2.5, "shared_features": 32,
+        "expert_features": 16, "score_function": "softmax", "norm_topk_prob": False,
+        "groups": 4, "groups_per_token": 2, "group_score": "max"}
+    assert config["head_dim"] == 16 and config["scale_after_cast"]
+
+
+def test_the_real_deepseek_v2_lite_config_translates():
+    """deepseek-ai/DeepSeek-V2-Lite: 27 layers with one dense, 64 experts
+    with 6 per token under greedy selection, two shared experts of 1408,
+    kv_lora_rank 512 with no query LoRA, YaRN factor 40 at mscale 0.707."""
+    config = translate_config(fixture_config("deepseek-v2-lite"))
+
+    assert config["num_layers"] == 27 and config["mixture"]["layers"] == tuple(range(1, 27))
+    assert config["mixture"]["experts"] == 64 and config["mixture"]["top_k"] == 6
+    assert config["mixture"]["shared_features"] == 2816
+    assert config["mixture"]["groups"] == 1 and config["mixture"]["group_score"] == "max"
+    assert config["mixture"]["norm_topk_prob"] is False
+    assert config["mixer"]["kv_lora_rank"] == 512 and config["mixer"]["q_lora_rank"] is None
+    assert config["mixer"]["yarn"]["factor"] == 40.0
+    assert config["mixer"]["yarn"]["mscale_all_dim"] == 0.707
+    assert config["vocab_size"] == 102400 and config["head_dim"] == 192
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("norm_topk_prob", True, "norm_topk_prob=True"),
+    ("topk_method", "noaux_tc", "topk_method 'noaux_tc'"),
+    ("scoring_func", "sigmoid", "scoring_func 'sigmoid'"),
+])
+def test_a_deepseek_v2_field_the_reference_does_not_run_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("deepseek-v2-tiny"), field: value})
+
+
+def test_deepseek_v2_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
+    with identical argmax."""
+    model, variables, _ = fp32_decoder(DEEPSEEK_V2)
+    ids = np.load(DEEPSEEK_V2 / "input_ids.npy")
+    reference = np.load(DEEPSEEK_V2 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    assert "moe" not in variables, "V2 keeps no balancing bias"
+
+
+def test_the_real_kimi_k2_config_translates():
+    """moonshotai/Kimi-K2-Instruct is DeepSeek V3's computation: 61 layers
+    with one dense, 384 sigmoid-scored experts with 8 per token in one
+    group, scaled by 2.827, one shared expert, MLA with the 1536 query LoRA,
+    YaRN factor 32 at theta 50000, under a 163840-token vocabulary."""
+    config = translate_config(fixture_config("kimi-k2"))
+
+    assert config["vocab_size"] == 163840 and config["num_layers"] == 61
+    assert config["mixture"]["experts"] == 384 and config["mixture"]["top_k"] == 8
+    assert config["mixture"]["scaling"] == 2.827 and config["mixture"]["bias"]
+    assert config["mixture"]["groups"] == 1 and config["mixture"]["shared_features"] == 2048
+    assert config["mixer"]["q_lora_rank"] == 1536
+    assert config["mixer"]["yarn"]["factor"] == 32.0 and config["rope_theta"] == 50000.0
+
+
+def test_a_kimi_k2_checkpoint_loads_as_the_deepseek_v3_it_is(tmp_path):
+    """The V3 tiny fixture under Kimi's model_type and Kimi's extra fields
+    reaches the same logits, and exports back under deepseek_v3."""
+    directory = tmp_path / "kimi"
+    directory.mkdir()
+    for path in (FIXTURES / "deepseek-v3-tiny").iterdir():
+        if path.name != "config.json":
+            (directory / path.name).write_bytes(path.read_bytes())
+    (directory / "config.json").write_text(json.dumps({
+        **fixture_config("deepseek-v3-tiny"), "model_type": "kimi_k2",
+        "aux_loss_alpha": 0.001, "seq_aux": True, "num_nextn_predict_layers": 0}))
+
+    model, variables, _ = fp32_decoder(directory)
+    reference = np.load(FIXTURES / "deepseek-v3-tiny" / "logits.npy")
+    ids = np.load(FIXTURES / "deepseek-v3-tiny" / "input_ids.npy")
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    assert float(np.max(np.abs(logits - reference))) < 1e-4
+    from dew.interop.hf_decoders import _export_config
+    assert _export_config(model)["model_type"] == "deepseek_v3"
+
+
+
+# --------------------------------------------------------------------------
+# GLM 4.5: a half rotary over biased GQA, DeepSeek V3 routing, an MTP depth
+# --------------------------------------------------------------------------
+
+GLM4_MOE = FIXTURES / "glm4-moe-tiny"
+
+
+def test_glm4_moe_config_translates_field_by_field():
+    config = translate_config(fixture_config("glm4-moe-tiny"))
+
+    assert config["attention_bias"] and config["o_proj_bias"] is False
+    assert config["qk_norm"] and config["scale_after_cast"]
+    assert config["partial_rotary_factor"] == 0.5 and config["partial_rotary_type"] == "default"
+    assert config["rope_theta"] == 1e6 and config["head_dim"] == 8
+    assert config["mixture"] == {
+        "experts": 8, "top_k": 2, "layers": (1,), "scaling": 1.5, "shared_features": 16,
+        "expert_features": 16, "score_function": "sigmoid", "groups": 1,
+        "groups_per_token": 1, "bias": True}
+    assert config["num_nextn_predict_layers"] == 1
+
+
+def test_the_real_glm_4_5_air_config_translates():
+    """zai-org/GLM-4.5-Air: 46 layers with one dense, 128 sigmoid-scored
+    experts with 8 per token, one shared expert of 1408, 96 query and 8
+    key/value heads of 128 with biased q/k/v and a bias-free o_proj, a half
+    rotary at theta 1e6, no q/k norms, and one MTP depth."""
+    config = translate_config(fixture_config("glm-4.5-air"))
+
+    assert config["num_layers"] == 46 and config["mixture"]["layers"] == tuple(range(1, 46))
+    assert config["mixture"]["experts"] == 128 and config["mixture"]["top_k"] == 8
+    assert config["mixture"]["shared_features"] == 1408 and config["mixture"]["bias"]
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (96, 8, 128)
+    assert config["attention_bias"] and config["o_proj_bias"] is False
+    assert not config["qk_norm"]
+    assert config["partial_rotary_factor"] == 0.5 and config["rope_theta"] == 1e6
+    assert config["num_nextn_predict_layers"] == 1 and config["vocab_size"] == 151552
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("rope_scaling", {"rope_type": "yarn", "factor": 4.0}, "plain rotary"),
+    ("norm_topk_prob", False, "norm_topk_prob=False"),
+    ("topk_method", "greedy", "topk_method 'greedy'"),
+])
+def test_a_glm4_moe_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("glm4-moe-tiny"), field: value})
+
+
+def test_glm4_moe_logits_match_the_reference_implementation():
+    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
+    difference| 3.3e-06 with identical argmax."""
+    model, variables, _ = fp32_decoder(GLM4_MOE)
+    ids = np.load(GLM4_MOE / "input_ids.npy")
+    reference = np.load(GLM4_MOE / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
+    """The checkpoint's model.layers.2.* depth loads as mtp_0 with the
+    trunk's routing and computes what the engines running the released
+    weights compute (tools/hf_reference_b.py Glm4MoeMTP): tolerance 1e-4,
+    observed max |logit difference| 3.2e-06 with identical argmax. Swapping
+    the two norms, the order today's from-scratch code had, disagrees."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model, variables, _ = fp32_decoder(GLM4_MOE)
+    ids = jnp.asarray(np.load(GLM4_MOE / "input_ids.npy"), jnp.int32)
+    reference = np.load(GLM4_MOE / "mtp_logits.npy")
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 16)
+    assert "mtp_0" in variables["moe"]
+
+    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+    swapped = {**variables, "params": {**variables["params"], "mtp_0": {
+        **depth, "enorm": depth["hnorm"], "hnorm": depth["enorm"]}}}
+    other = np.asarray(model.apply(swapped, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+    assert float(np.max(np.abs(other - reference))) > 1e-2
+
+
+def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
+    """The depth shares the trunk's embedding and head; a checkpoint whose
+    copies differ would load as a model computing something else."""
+    from safetensors.numpy import load_file, save_file
+
+    tensors = load_file(str(GLM4_MOE / "model.safetensors"))
+    tensors["model.layers.2.shared_head.head.weight"] = tensors["lm_head.weight"] * 1.5
+    directory = tmp_path / "glm"
+    directory.mkdir()
+    save_file(tensors, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(fixture_config("glm4-moe-tiny")))
+    with pytest.raises(ValueError, match="shared_head.head.weight differs from lm_head.weight"):
+        fp32_decoder(directory)
+
+
+
+# --------------------------------------------------------------------------
+# Llama 4 (text): iRoPE with chunked local layers, input-scaled experts
+# --------------------------------------------------------------------------
+
+LLAMA4 = FIXTURES / "llama4-tiny"
+
+
+def test_llama4_config_translates_field_by_field():
+    """The tiny text config: three chunked rotated layers and one global
+    layer, each kind naming the llama4 mixer under its own rule, the dense
+    layers at intermediate_size_mlp and the routed layers 1 and 3 with a
+    shared expert at intermediate_size, sigmoid weights on the inputs."""
+    config = translate_config(fixture_config("llama4-tiny"))
+
+    assert config["layer_types"] == ("chunked_attention",) * 3 + ("full_attention",)
+    rule = {"kind": "llama4", "use_qk_norm": True, "attn_temperature_tuning": True,
+            "floor_scale": 4.0, "attn_scale": 0.1}
+    assert config["kinds"] == {
+        "full_attention": {"mixer": {**rule, "use_rope": False}},
+        "chunked_attention": {"mixer": {**rule, "use_rope": True, "attention_chunk_size": 4}}}
+    assert config["mixture"] == {
+        "experts": 4, "top_k": 2, "score_function": "sigmoid", "norm_topk_prob": False,
+        "scale_inputs": True, "expert_features": 48, "shared_features": 48, "layers": (1, 3)}
+    assert config["mlp_features"] == 64 and not config["qk_norm"]
+    assert config["rope_theta"] == 500000.0 and config["scale_after_cast"]
+
+
+def test_the_real_llama_4_scout_text_config_translates():
+    """meta-llama/Llama-4-Scout-17B-16E's text_config, from a mirror: 48
+    layers with every fourth global, 40 query and 8 key/value heads of 128,
+    16 experts with one per token on every layer beside a shared expert of
+    8192, dense layers of 16384, chunks of 8192 with temperature tuning at
+    floor_scale 8192, and the llama3 ramp at theta 500000 on the rotated
+    layers."""
+    config = translate_config(fixture_config("llama-4-scout")["text_config"])
+
+    assert config["num_layers"] == 48
+    assert config["layer_types"][:4] == ("chunked_attention",) * 3 + ("full_attention",)
+    assert config["layer_types"].count("full_attention") == 12
+    assert (config["num_heads"], config["num_kv_heads"], config["head_dim"]) == (40, 8, 128)
+    assert config["mixture"] == {
+        "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
+        "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
+    assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
+    local = config["kinds"]["chunked_attention"]["mixer"]
+    assert local["attention_chunk_size"] == 8192 and local["floor_scale"] == 8192.0
+    assert config["rope_theta"] == 500000.0
+    assert config["rope_scaling"] == {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+
+
+def test_a_llama4_wrapper_config_is_refused_by_name():
+    """meta-llama/Llama-4-Scout-17B-16E's config.json wraps the text decoder
+    beside a vision tower; the text_config alone is what translates."""
+    with pytest.raises(ValueError, match="model_type 'llama4'"):
+        translate_config(fixture_config("llama-4-scout"))
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("layer_types", ["full_attention"] * 4, "disagrees with no_rope_layers"),
+    ("router_jitter_noise", 0.1, "router_jitter_noise"),
+    ("output_router_logits", True, "output_router_logits"),
+    ("no_rope_layers", [1, 1, 2, 0], "no_rope_layers"),
+])
+def test_a_llama4_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("llama4-tiny"), field: value})
+
+
+def test_llama4_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
+    with identical argmax. The fused expert kernels arrive split in place."""
+    model, variables, _ = fp32_decoder(LLAMA4)
+    ids = np.load(LLAMA4 / "input_ids.npy")
+    reference = np.load(LLAMA4 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    experts = variables["params"]["layers_1"]["mlp"]["experts"]
+    assert experts["gate_proj"]["kernel"].shape == (4, 32, 48)
+    assert experts["down_proj"]["kernel"].shape == (4, 48, 32)
+    assert "shared_experts" in variables["params"]["layers_1"]["mlp"]
+    assert "experts" not in variables["params"]["layers_0"]["mlp"]
+
+
+def test_llama4_export_is_refused_by_name(tmp_path):
+    model, variables, _ = fp32_decoder(LLAMA4)
+    with pytest.raises(ValueError, match="a mixer other than attention"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4's routed size: the parallel experts, keys as values, layer scalars
+# ---------------------------------------------------------------------------
+
+GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
+
+
+def test_gemma4_moe_config_translates_field_by_field():
+    """The 26B-A4B shape at toy width: enable_moe_block names the parallel
+    mixture of four experts with two per token at width 16, attention_k_eq_v
+    lands as a field with the global kind's own head dim and single
+    key/value head, and every layer carries its output scalar."""
+    config = translate_config(fixture_config("gemma4-moe-tiny"))
+
+    assert config["mixture"] == {"experts": 4, "top_k": 2, "expert_features": 16,
+                                 "parallel": True}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert config["num_kv_heads"] == 2 and config["head_dim"] == 8
+    assert config["kinds"]["full_attention"] == {"head_dim": 16, "num_kv_heads": 1}
+    assert config["kinds"]["sliding_attention"] == {"window": 4, "rope_theta": 10000.0}
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["mlp"] == "geglu" and config["mlp_features"] == 48
+
+
+def test_the_real_gemma_4_26b_a4b_text_config_translates():
+    """google/gemma-4-26B-A4B's text_config, from a mirror: 30 layers in the
+    5:1 pattern, 16 query heads of 256 with 8 key/value heads on the sliding
+    layers and 2 of 512 reading their values off the keys on the global ones,
+    128 experts with 8 per token at width 704 beside a dense MLP of 2112, a
+    quarter rotary at theta 1e6 over a local theta of 1e4, and softcap 30."""
+    config = translate_config(fixture_config("gemma4-26b-a4b")["text_config"])
+
+    assert config["num_layers"] == 30
+    assert config["layer_types"].count("sliding_attention") == 25
+    assert config["layer_types"][-1] == "full_attention"
+    assert config["emb_features"] == 2816 and config["vocab_size"] == 262144
+    assert config["num_heads"] == 16 and config["num_kv_heads"] == 8
+    assert config["head_dim"] == 256
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 2}
+    assert config["kinds"]["sliding_attention"] == {"window": 1024, "rope_theta": 10000.0}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert config["mixture"] == {"experts": 128, "top_k": 8, "expert_features": 704,
+                                 "parallel": True}
+    assert config["mlp_features"] == 2112 and config["mlp"] == "geglu"
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["rope_theta"] == 1000000.0
+    assert config["final_logit_softcap"] == 30.0
+    assert config["v_norm"] and not config["use_double_wide_mlp"]
+    assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
+
+
+def test_the_real_gemma_4_31b_text_config_translates():
+    """The dense 31B, from the local hub cache: 60 layers, 32 query heads of
+    256 with 16 key/value heads, the global layers reading their values off 4
+    key/value heads of 512, no routed branch and no per-layer inputs."""
+    path = Path(
+        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-31B"
+        "/snapshots/5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89/config.json")
+    if not path.exists():
+        pytest.skip("the 31B config is a local hub cache read, not a download")
+    config = translate_config(json.loads(path.read_text())["text_config"])
+
+    assert config["num_layers"] == 60
+    assert config["num_heads"] == 32 and config["num_kv_heads"] == 16
+    assert config["head_dim"] == 256
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 4}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert "mixture" not in config
+    assert config["per_layer_input_dim"] is None
+
+
+def test_gemma4_moe_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
+    with identical argmax. The fused expert kernels arrive split in place,
+    the global layer holds no v_proj, and every layer holds its scalar."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    ids = np.load(GEMMA4_MOE / "input_ids.npy")
+    reference = np.load(GEMMA4_MOE / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    params = variables["params"]
+    experts = params["layers_0"]["moe"]["experts"]
+    assert experts["gate_proj"]["kernel"].shape == (4, 32, 16)
+    assert experts["down_proj"]["kernel"].shape == (4, 16, 32)
+    assert params["layers_0"]["moe"]["router"]["per_expert_scale"].shape == (4,)
+    assert "v_proj" not in params["layers_2"]["self_attn"]
+    assert params["layers_2"]["self_attn"]["k_proj"]["kernel"].shape == (32, 16)
+    assert all(params[f"layers_{index}"]["layer_scalar"].shape == (1,) for index in range(3))
+
+
+def test_the_layer_scalars_are_what_the_parity_tests():
+    """The fixture's scalars are the reference's ones, so the parity above
+    cannot tell a model that reads them from one that ignores them; a model
+    fed other scalars disagrees with it, so the tree's leaf is live."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
+    reference = np.load(GEMMA4_MOE / "logits.npy")
+    params = dict(variables["params"])
+    for index in range(3):
+        params[f"layers_{index}"] = {**params[f"layers_{index}"],
+                                     "layer_scalar": jnp.full((1,), 0.5, jnp.float32)}
+    logits = np.asarray(model.apply({"params": params}, ids))
+    assert float(np.max(np.abs(logits - reference))) > 1e-3
+
+
+def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
+    """The same weights under a config with the flag off raise on the
+    global layer's missing v_proj leaf; no value projection the checkpoint
+    never had is loaded."""
+    directory = tmp_path / "gemma4"
+    directory.mkdir()
+    (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(
+        {**fixture_config("gemma4-moe-tiny"), "attention_k_eq_v": False}))
+    with pytest.raises(ValueError, match="layers_2.self_attn.v_proj.kernel"):
+        fp32_decoder(directory)
+
+
+def test_a_routed_gemma4_without_its_expert_fields_is_refused():
+    config = fixture_config("gemma4-moe-tiny")
+    del config["moe_intermediate_size"]
+    with pytest.raises(ValueError, match="moe_intermediate_size"):
+        translate_config(config)
+
+
+def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
+    """The 26B-A4B repo's config.json is the multimodal wrapper; its text
+    half alone is what translates."""
+    with pytest.raises(ValueError, match="multimodal wrapper"):
+        translate_config(fixture_config("gemma4-26b-a4b"))
+
+
+def test_gemma4_moe_export_is_refused_by_name(tmp_path):
+    """The values norm every Gemma 4 carries is refused before the routed
+    branch is reached, and by the field's name."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    with pytest.raises(ValueError, match="v_norm"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Gemma 3n: AltUp's residual copies, LAuReL, activation sparsity, per-layer widths
+# ---------------------------------------------------------------------------
+
+GEMMA3N = FIXTURES / "gemma3n-tiny"
+
+
+def test_gemma3n_config_translates_field_by_field():
+    """The tiny config: three residual copies with the clip and the output
+    scale, a LAuReL rank of 8, sparsity on the first two of four layers,
+    widths of 48 and 64, per-layer inputs of 8, the last layer sharing K/V,
+    and the sliding kind on its own rope base."""
+    config = translate_config(fixture_config("gemma3n-tiny"))
+
+    assert config["altup"] == {"num_inputs": 3, "active_idx": 0, "coef_clip": 120.0,
+                               "correct_scale": True}
+    assert config["laurel_rank"] == 8
+    assert config["activation_sparsity_pattern"] == (0.95, 0.95, 0.0, 0.0)
+    assert config["mlp_features"] == (48, 48, 64, 64) and config["mlp"] == "geglu"
+    assert config["per_layer_input_dim"] == 8 and config["per_layer_input_vocab"] == 64
+    assert config["num_kv_shared_layers"] == 1
+    assert config["layer_types"] == ("sliding_attention", "sliding_attention",
+                                     "full_attention", "sliding_attention")
+    assert config["kinds"] == {"sliding_attention": {"window": 4, "rope_theta": 10000.0}}
+    assert config["rope_theta"] == 1000000.0
+    assert config["v_norm"] and config["sandwich_norms"] and config["embedding_scale"]
+    assert config["attention_scale"] == 1.0 and config["final_logit_softcap"] == 30.0
+    assert config["head_dim"] == 8 and config["num_kv_heads"] == 2
+
+
+def test_the_real_gemma_3n_e2b_text_config_translates():
+    """google/gemma-3n-E2B's text_config, from a mirror: 30 layers with
+    every fifth full and the last 10 sharing K/V, 8 query and 2 key/value
+    heads of 256 over a hidden size of 2048, one width of 8192 (the list is
+    uniform), sparsity 0.95 on the first 10 layers, four residual copies,
+    LAuReL rank 64, per-layer inputs of 256 from a table of 262144 rows
+    under a vocabulary of 262400, and softcap 30."""
+    config = translate_config(fixture_config("gemma-3n-e2b")["text_config"])
+
+    assert config["num_layers"] == 30
+    assert config["layer_types"].count("full_attention") == 6
+    assert config["layer_types"][4] == "full_attention"
+    assert config["emb_features"] == 2048 and config["vocab_size"] == 262400
+    assert config["num_heads"] == 8 and config["num_kv_heads"] == 2
+    assert config["head_dim"] == 256
+    assert config["mlp_features"] == 8192 and config["mlp"] == "geglu"
+    assert config["activation_sparsity_pattern"] == (0.95,) * 10 + (0.0,) * 20
+    assert config["altup"] == {"num_inputs": 4, "active_idx": 0, "coef_clip": 120.0,
+                               "correct_scale": True}
+    assert config["laurel_rank"] == 64
+    assert config["per_layer_input_dim"] == 256 and config["per_layer_input_vocab"] == 262144
+    assert config["num_kv_shared_layers"] == 10
+    assert config["kinds"] == {"sliding_attention": {"window": 512, "rope_theta": 10000.0}}
+    assert config["rope_theta"] == 1000000.0
+    assert config["final_logit_softcap"] == 30.0
+    assert "mixture" not in config and "rope_scaling" not in config
+
+
+def test_a_gemma3n_config_without_its_lists_takes_the_reference_defaults():
+    """Gemma3nTextConfig fills every fifth layer full, expands one width
+    to every layer and puts sparsity 0.95 on the first ten layers of a
+    deeper model; the expected values come from the reference class."""
+    from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
+
+    config = fixture_config("gemma3n-tiny")
+    for field in ("layer_types", "activation_sparsity_pattern", "rope_parameters"):
+        del config[field]
+    config.update(num_hidden_layers=12, intermediate_size=48, num_kv_shared_layers=2)
+    reference = Gemma3nTextConfig(**config)
+
+    translated = translate_config(config)
+    assert translated["layer_types"] == tuple(reference.layer_types or ())
+    assert isinstance(reference.activation_sparsity_pattern, list)
+    assert translated["activation_sparsity_pattern"] == tuple(reference.activation_sparsity_pattern)
+    assert translated["mlp_features"] == 48 and reference.intermediate_size == [48] * 12
+    assert translated["kinds"]["sliding_attention"]["rope_theta"] == 10000.0
+    assert translated["rope_theta"] == 1000000.0
+
+
+def test_gemma3n_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.2e-06
+    with identical argmax. The copies' projections, each layer's AltUp and
+    LAuReL leaves and the sharing layer's missing K/V are what the tree
+    holds."""
+    model, variables, _ = fp32_decoder(GEMMA3N)
+    ids = np.load(GEMMA3N / "input_ids.npy")
+    reference = np.load(GEMMA3N / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    params = variables["params"]
+    assert {name for name in params if name.startswith("altup")} == {
+        "altup_projections_0", "altup_projections_1",
+        "altup_unembed_projections_0", "altup_unembed_projections_1"}
+    assert params["layers_0"]["altup"]["prediction_coefs"]["kernel"].shape == (3, 9)
+    assert params["layers_0"]["laurel"]["linear_left"]["kernel"].shape == (32, 8)
+    assert params["layers_2"]["mlp"]["gate_proj"]["kernel"].shape == (32, 64)
+    assert "k_proj" not in params["layers_3"]["self_attn"]
+
+
+def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
+    """The stream of copies rides the decode path: a prefill and single-token
+    steps through the KV cache agree with the whole sequence."""
+    model, variables, _ = fp32_decoder(GEMMA3N, max_seq_len=16)
+    ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
+    full = model.apply(variables, ids)
+    state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
+    steps = []
+    for position in range(ids.shape[1]):
+        step, state = model.apply(
+            {**variables, "cache": state["cache"]}, ids[:, position:position + 1],
+            decode=True, mutable=["cache"])
+        steps.append(step)
+    incremental = jnp.concatenate(steps, axis=1)
+    difference = float(jnp.max(jnp.abs(incremental - full)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("activation_sparsity_pattern", [0.95, 0.0], "one fraction per layer"),
+    ("rope_scaling", {"rope_type": "linear", "factor": 2.0}, "rope_type 'linear'"),
+    ("altup_num_inputs", 1, "altup_num_inputs"),
+    ("altup_active_idx", 3, "altup_active_idx"),
+    ("hidden_activation", "relu", "hidden_act"),
+])
+def test_a_gemma3n_field_with_no_counterpart_is_refused(field, value, message):
+    """A rope_scaling beside the nested rope_parameters lands on the full
+    layers as Gemma3nTextConfig folds it, and a type the rotary table cannot
+    express raises there with the field's name."""
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("gemma3n-tiny"), field: value})
+
+
+def test_a_llama3_rope_scaling_beside_nested_rope_parameters_lands_on_the_full_layers():
+    """The fold Gemma3nTextConfig applies: the ramp reaches the full kind
+    alone, the sliding kind keeps its plain rope."""
+    config = {**fixture_config("gemma3n-tiny"), "rope_scaling": {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 32}}
+    translated = translate_config(config)
+    assert translated["kinds"]["full_attention"]["rope_scaling"]["factor"] == 8.0
+    assert "rope_scaling" not in translated["kinds"]["sliding_attention"]
+    assert "rope_scaling" not in translated
+
+
+def test_a_gemma3n_wrapper_config_is_refused_by_name():
+    """The E2B repo's config.json wraps the text decoder beside vision and
+    audio towers; the text_config alone is what translates."""
+    with pytest.raises(ValueError, match="multimodal wrapper"):
+        translate_config(fixture_config("gemma-3n-e2b"))
+
+
+def test_gemma3n_export_is_refused_by_name(tmp_path):
+    model, variables, _ = fp32_decoder(GEMMA3N)
+    with pytest.raises(ValueError, match="v_norm"):
+        save_pretrained_decoder(model, variables, str(tmp_path))

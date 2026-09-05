@@ -20,9 +20,9 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     compact `__call__` so every block here is the model's own submodule.
 
     `temporal(x, name)`, when given, runs after the residual blocks of every
-    level, which is where the video UNet mixes across frames; the spatial
-    blocks and their names are the same either way, which is what lets a 2D
-    checkpoint inflate into the 3D model.
+    level; the video UNet mixes across frames there. The spatial blocks and
+    their names are the same either way, which lets a 2D checkpoint inflate
+    into the 3D model.
     """
     temb = FourierEmbedding(features=model.emb_features)(temb)
     temb = TimeProjection(features=model.emb_features)(temb)

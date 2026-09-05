@@ -1,10 +1,10 @@
 """Where a run's numbers and artifacts go.
 
 A `Tracker` is the one capability the trainer logs through. `WandbTracker`
-renders each artifact type with a `functools.singledispatch` function, which
-is the whole mechanism by which objectives return typed values and the
-tracker draws them: a new artifact type registers a renderer, nothing else
-changes. wandb is imported when the first value is logged, not before.
+renders each artifact type with a `functools.singledispatch` function.
+Objectives return typed values and the tracker draws them through that
+function. A new artifact type registers a renderer. wandb is imported when
+the first value is logged.
 """
 
 from __future__ import annotations
@@ -26,12 +26,12 @@ class Tracker(Protocol):
 
 
 def _home(array: jax.Array | np.ndarray) -> np.ndarray:
-    """`array` as numpy, refusing a shard of a global array.
+    """`array` as numpy. A shard of a global array is refused.
 
     A tracker draws on process zero alone, and completing a global array needs
     every process, so an artifact arrives here already brought home by
-    `dew.artifacts.host`. Refusing names the missing call instead of hanging in
-    a collective one process entered by itself.
+    `dew.artifacts.host`. The refusal names the missing call instead of
+    hanging in a collective one process entered by itself.
     """
     if isinstance(array, jax.Array) and not array.is_fully_addressable:
         raise ValueError(
@@ -50,8 +50,8 @@ Payload: TypeAlias = dict[str, object]
 
 @functools.singledispatch
 def render(value: object) -> Payload | None:
-    """The wandb payload for one artifact, or None for a type nothing draws
-    (a metric reads it instead)."""
+    """The wandb payload for one artifact. A type no renderer draws returns
+    None, and a metric reads it instead."""
     return None
 
 @render.register
@@ -88,9 +88,9 @@ def _(value: TextSamples) -> Payload | None:
 def _(value: Representations) -> Payload | None:
     import wandb
 
-    # The per-dimension spread across the batch: the collapse view of a
-    # representation, which goes to zero when the encoder stops telling
-    # inputs apart.
+    # The per-dimension spread across the batch, the collapse view of a
+    # representation. It goes to zero when the encoder stops telling inputs
+    # apart.
     spread = np.std(_home(value.features).astype(np.float32), axis=0)
     return {"val/representation_std": wandb.Histogram(spread.tolist())}
 
