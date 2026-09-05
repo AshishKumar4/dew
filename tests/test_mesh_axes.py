@@ -157,7 +157,7 @@ def run_losses(mesh, layout, steps):
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
         mesh=mesh, layout=layout, tracker=RecordingTracker())
     trainer.fit(Data(token_batches), steps=steps, log_every=1)
-    return [entry["train/loss"] for entry in trainer.tracker.scalars]
+    return [entry["train/loss"] for entry in trainer.tracker.scalars if "train/loss" in entry]
 
 
 def dense_layout():
