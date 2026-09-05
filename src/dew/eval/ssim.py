@@ -1,7 +1,9 @@
 """SSIM in pure jax (Wang et al. 2004), batched over images and video.
 
 Standard parameters: 11x11 gaussian window, sigma 1.5, means taken over
-channels after per-channel SSIM. No scipy/skimage dependency.
+channels after per-channel SSIM. No scipy/skimage dependency;
+`tests/test_metrics.py` states the tolerance against the filtered equations
+and the difference observed.
 """
 
 import jax
@@ -9,8 +11,8 @@ import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
 from dew.registry import metrics
-from .common import ImageMetric, frames, paired
-from .psnr import _as_frame_batch
+from .common import ImageMetric, paired
+from .psnr import frame_batch
 
 # Standard SSIM constants for the 11x11/sigma-1.5 gaussian window
 _K1 = 0.01
@@ -68,23 +70,14 @@ def structural_similarity(
     data_range: float,
     per_example: bool = False,
 ) -> jnp.ndarray:
-    """Structural similarity (Wang et al. 2004) with standard parameters.
+    """SSIM (Wang et al. 2004) per frame, an 11x11 gaussian window of sigma
+    1.5 on each channel and the channels averaged.
 
-    SSIM is computed per channel with an 11x11 gaussian window (sigma 1.5)
-    and averaged over channels and frames.
-
-    Args:
-        predictions: (B, H, W, C) images or (B, T, H, W, C) video.
-        targets: same shape as predictions.
-        data_range: dynamic range of the signal (2.0 for [-1, 1] inputs).
-        per_example: return the per-frame scores instead of the mean.
-
-    Returns:
-        Scalar score, or (B,) per-frame scores when per_example is set.
-        Identical inputs give 1.0.
+    `data_range` is the dynamic range of the signal, 2.0 for [-1, 1] inputs.
+    The mean over frames comes back unless `per_example` asks for the (N,)
+    per-frame scores. Identical inputs give 1.0.
     """
-    pred, _ = _as_frame_batch(predictions)
-    targ, _ = _as_frame_batch(targets)
+    pred, targ = frame_batch(predictions), frame_batch(targets)
     # vmap over frames then channels: each (H, W) plane is scored independently,
     # giving (N, C) which collapses to one score per frame
     per_channel = jax.vmap(
