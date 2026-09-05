@@ -314,6 +314,19 @@ VARIANTS = [
     Case("causal_transformer", {**LM, "sandwich_norms": True, "pre_norms": False,
                                 "qk_norm": True, "qk_norm_scope": "projection"},
          seq_len=SEQ_LEN, label="olmo3"),
+    # Llama 3.1's ramp, on the model and on the full kind alone (OLMo 3's
+    # placement): a value from a record at both seams, no leaf added.
+    Case("causal_transformer", {**LM, "rope_scaling": {
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0, "original_max_position_embeddings": 8}},
+         seq_len=SEQ_LEN, label="llama31"),
+    Case("causal_transformer", {
+        **LM, "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4},
+                  "full_attention": {"rope_scaling": {
+                      "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                      "high_freq_factor": 4.0, "original_max_position_embeddings": 8}}}},
+        seq_len=SEQ_LEN, label="kind_ramp"),
 ]
 
 

@@ -27,6 +27,7 @@ from typing import Optional
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.attention import RopeScaling
 from dew.registry import Registry
 
 mixers: Registry[type] = Registry("mixer")
@@ -54,6 +55,8 @@ class MixerContext:
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base: a kind's yarn record transforms this, never replaces it."""
+    rope_scaling: Optional[RopeScaling] = None
+    """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'
     """Where the q/k RMSNorm applies: 'head' norms each head after the split
@@ -135,6 +138,7 @@ class AttentionMixer(MixerBase):
             max_seq_len=ctx.max_seq_len,
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
+            rope_scaling=ctx.rope_scaling,
             qk_norm=ctx.qk_norm,
             qk_norm_scope=ctx.qk_norm_scope,
             v_norm=ctx.v_norm,
