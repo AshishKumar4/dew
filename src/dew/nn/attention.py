@@ -1,18 +1,15 @@
-"""
-Some Code ported from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_flax.py
-"""
+"""Attention: the one kernel path, the KV cache, and the blocks the UNets
+use, the latter ported from diffusers' attention_flax.py."""
 
 import dataclasses
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Dict, Callable, Sequence, Any, Union, Tuple, Optional
+from typing import Optional
 from flax.typing import Dtype, PrecisionLike
-import einops
 import functools
 import math
-from .blocks import kernel_init
 from .sharding import logical_axes
 
 def repeat_kv_heads(x, num_heads: int):
@@ -333,14 +330,15 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     ("to_out_0",): ("heads", "head_dim", "embed"),
 })
 class NormalAttention(nn.Module):
-    """
-    Simple implementation of the normal attention.
+    """Multi-head attention over a `[B, S, C]` or `[B, H, W, C]` input.
 
     causal makes it a decoder attention (query i sees keys 0..i). decode=True
     on a call runs it against a fixed-size KV cache instead, allocated at
     max_seq_len: the first call writes the whole prompt, later calls append one
     token each. Neither flag touches the param tree, so a model trained without
-    either reloads into a decoding one unchanged.
+    either reloads into a decoding one unchanged. `freqs_cis` rotates the
+    queries and keys of a self-attention call (`rotary_freqs` gives the pair);
+    None leaves them unrotated.
     """
     query_dim: int
     heads: int = 4
@@ -348,7 +346,6 @@ class NormalAttention(nn.Module):
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     use_bias: bool = True
-    # kernel_init: Callable = kernel_init(1.0)
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
     attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
@@ -356,14 +353,12 @@ class NormalAttention(nn.Module):
     max_seq_len: Optional[int] = None  # KV cache length, required to decode
 
     def setup(self):
-        inner_dim = self.dim_head * self.heads
         dense = functools.partial(
             nn.DenseGeneral,
-            features=[self.heads, self.dim_head], 
-            axis=-1, 
-            precision=self.precision, 
-            use_bias=self.use_bias, 
-            # kernel_init=self.kernel_init, 
+            features=[self.heads, self.dim_head],
+            axis=-1,
+            precision=self.precision,
+            use_bias=self.use_bias,
             dtype=self.dtype
         )
         self.query = dense(name="to_q")
@@ -375,19 +370,16 @@ class NormalAttention(nn.Module):
             self.k_norm = nn.RMSNorm(dtype=self.dtype, name="k_norm")
 
         self.proj_attn = nn.DenseGeneral(
-            self.query_dim, 
-            axis=(-2, -1), 
-            precision=self.precision, 
-            use_bias=self.use_bias, 
-            dtype=self.dtype, 
+            self.query_dim,
+            axis=(-2, -1),
+            precision=self.precision,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
             name="to_out_0",
-            # kernel_init=self.kernel_init
-            # kernel_init=jax.nn.initializers.xavier_uniform()
         )
 
     @nn.compact
-    def __call__(self, x, context=None, decode: bool = False):
-        # x has shape [B, H, W, C]
+    def __call__(self, x, context=None, decode: bool = False, freqs_cis=None):
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
@@ -401,6 +393,10 @@ class NormalAttention(nn.Module):
         if self.qk_norm:
             query = self.q_norm(query)
             key = self.k_norm(key)
+        if freqs_cis is not None:
+            freqs_cos, freqs_sin = freqs_cis
+            query = apply_rotary(query, freqs_cos, freqs_sin)
+            key = apply_rotary(key, freqs_cos, freqs_sin)
 
         causal, mask = self.causal, None
         if decode:
@@ -421,21 +417,11 @@ class NormalAttention(nn.Module):
         return proj
 
 class FlaxGEGLU(nn.Module):
-    r"""
-    Flax implementation of a Linear layer followed by the variant of the gated linear unit activation function from
-    https://arxiv.org/abs/2002.05202.
-
-    Parameters:
-        dim (:obj:`int`):
-            Input hidden states dimension
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
-    """
+    """A linear layer into the gated linear unit of Shazeer 2020
+    (https://arxiv.org/abs/2002.05202): half the projection gates the other
+    half through GELU. The hidden width is four times `dim`."""
 
     dim: int
-    dropout: float = 0.0
     dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
@@ -447,33 +433,19 @@ class FlaxGEGLU(nn.Module):
         hidden_states = self.proj(hidden_states)
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
         return hidden_linear * nn.gelu(hidden_gelu)
-    
+
+
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FlaxFeedForward(nn.Module):
-    r"""
-    Flax module that encapsulates two Linear layers separated by a non-linearity. It is the counterpart of PyTorch's
-    [`FeedForward`] class, with the following simplifications:
-    - The activation function is currently hardcoded to a gated linear unit from:
-    https://arxiv.org/abs/2002.05202
-    - `dim_out` is equal to `dim`.
-    - The number of hidden dimensions is hardcoded to `dim * 4` in [`FlaxGELU`].
-
-    Parameters:
-        dim (:obj:`int`):
-            Inner hidden states dimension
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
-    """
+    """GEGLU then a linear layer back to `dim`, diffusers' `FlaxFeedForward`.
+    The names `net_0` and `net_2` are the indices the reference's Sequential
+    gives the two layers, which is what its checkpoints carry."""
 
     dim: int
     dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
 
     def setup(self):
-        # The second linear layer needs to be called
-        # net_2 for now to match the index of the Sequential layer
         self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision)
         self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
 
@@ -482,68 +454,53 @@ class FlaxFeedForward(nn.Module):
         hidden_states = self.net_2(hidden_states)
         return hidden_states
 
+
 class BasicTransformerBlock(nn.Module):
-    # Has self and cross attention
+    """Self-attention, cross-attention over `context`, feed-forward, each
+    pre-normed with a residual. `use_cross_only` drops the self-attention;
+    `only_pure_attention` runs the cross-attention alone with no norm and no
+    residual, which is how the UNets' stages attend by default."""
     query_dim: int
     heads: int = 4
     dim_head: int = 64
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     use_bias: bool = True
-    # kernel_init: Callable = kernel_init(1.0)
     use_cross_only:bool = False
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-4
     attention_impl: Optional[str] = None
-    
+
     def setup(self):
-        attenBlock = NormalAttention
-            
-        self.attention1 = attenBlock(
-         query_dim=self.query_dim,
-            heads=self.heads,
-            dim_head=self.dim_head,
-            name=f'Attention1',
-            precision=self.precision,
-            use_bias=self.use_bias,
-            dtype=self.dtype,
-            # kernel_init=self.kernel_init,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            attention_impl=self.attention_impl
-        )
-        self.attention2 = attenBlock(
+        attention = functools.partial(
+            NormalAttention,
             query_dim=self.query_dim,
             heads=self.heads,
             dim_head=self.dim_head,
-            name=f'Attention2',
             precision=self.precision,
             use_bias=self.use_bias,
             dtype=self.dtype,
-            # kernel_init=self.kernel_init,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            attention_impl=self.attention_impl
+            attention_impl=self.attention_impl,
         )
-        
+        self.attention1 = attention(name='Attention1')
+        self.attention2 = attention(name='Attention2')
+
         self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.precision)
         self.norm1 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm2 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm3 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        
+
     @nn.compact
     def __call__(self, hidden_states, context=None):
         if self.only_pure_attention:
             return self.attention2(hidden_states, context)
-        
-        # self attention
+
         if not self.use_cross_only:
             hidden_states = hidden_states + self.attention1(self.norm1(hidden_states))
-        
-        # cross attention
         hidden_states = hidden_states + self.attention2(self.norm2(hidden_states), context)
-        # feed forward
         hidden_states = hidden_states + self.ff(self.norm3(hidden_states))
-        
         return hidden_states
 
 
@@ -552,20 +509,16 @@ class Stage:
     """One resolution stage's attention in a UNet, or `None` for a stage that
     has none.
 
-    Every field is a `TransformerBlock` dial, defaulted exactly as the dict
-    read it replaced defaulted it, so a stage names what it changes and
-    nothing else and no default moved. `dim_head` is not here: the block's
-    head width is the stage's channel count divided by `heads`, which the
-    unet knows and a config does not.
-
-    It replaces a dict read with `.get`, which accepted a misspelled dial and
-    quietly left it at its default; `dew.registry.from_record` builds one from
-    a record at the build boundary, so a stage still arrives as
-    `{"heads": 8}` from a command line or a run record.
+    Every field is a `TransformerBlock` dial, so a stage names what it changes
+    and nothing else. `dim_head` is not here: the block's head width is the
+    stage's channel count divided by `heads`, which the unet knows and a
+    config does not. `dew.registry.from_record` builds one from a record at
+    the build boundary, so a stage still arrives as `{"heads": 8}` from a
+    command line or a run record, and a misspelled field raises there.
 
     `dtype` is float32 and not the model's, which is what `with_precision`
     exists to write into every stage. `precision` is the one field whose None
-    means "the model's", as the dict read's default did.
+    means "the model's".
     """
 
     heads: int
@@ -581,7 +534,26 @@ class Stage:
     precision: PrecisionLike = None
 
 
+def stage_attention(stage: Stage, channels: int, attention_impl: Optional[str],
+                    precision: PrecisionLike, name: str) -> "TransformerBlock":
+    """The block a UNet stage's `Stage` describes, at the stage's channel
+    count; a stage that names no precision takes the model's."""
+    return TransformerBlock(
+        heads=stage.heads, dim_head=channels // stage.heads, dtype=stage.dtype,
+        attention_impl=attention_impl, use_projection=stage.use_projection,
+        use_self_and_cross=stage.use_self_and_cross,
+        precision=stage.precision or precision,
+        only_pure_attention=stage.only_pure_attention,
+        force_fp32_for_softmax=stage.force_fp32_for_softmax,
+        norm_inputs=stage.norm_inputs, explicitly_add_residual=stage.explicitly_add_residual,
+        use_linear_attention=stage.use_linear_attention, norm_epsilon=stage.norm_epsilon,
+        name=name)
+
+
 class TransformerBlock(nn.Module):
+    """A `BasicTransformerBlock` behind an optional projection into and out of
+    `heads * dim_head`, dense (`use_linear_attention`) or a 1x1 convolution.
+    Without the projection the block runs at the input width."""
     heads: int = 4
     dim_head: int = 32
     use_linear_attention: bool = True
@@ -592,7 +564,6 @@ class TransformerBlock(nn.Module):
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
     attention_impl: Optional[str] = None
-    # kernel_init: Callable = kernel_init(1.0)
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
@@ -603,30 +574,28 @@ class TransformerBlock(nn.Module):
         C = x.shape[-1]
         if self.norm_inputs:
             x = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
-        if self.use_projection == True:
+        if self.use_projection:
             if self.use_linear_attention:
-                projected_x = nn.Dense(features=inner_dim, 
-                                       use_bias=False, precision=self.precision, 
-                                    #    kernel_init=self.kernel_init,
-                                       dtype=self.dtype, name=f'project_in')(x)
+                projected_x = nn.Dense(features=inner_dim,
+                                       use_bias=False, precision=self.precision,
+                                       dtype=self.dtype, name='project_in')(x)
             else:
                 projected_x = nn.Conv(
                     features=inner_dim, kernel_size=(1, 1),
-                    # kernel_init=self.kernel_init,
                     strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name=f'project_in_conv',
+                    precision=self.precision, name='project_in_conv',
                 )(x)
         else:
             projected_x = x
             inner_dim = C
-            
+
         context = projected_x if context is None else context
 
         projected_x = BasicTransformerBlock(
             query_dim=inner_dim,
             heads=self.heads,
             dim_head=self.dim_head,
-            name=f'Attention',
+            name='Attention',
             precision=self.precision,
             use_bias=False,
             dtype=self.dtype,
@@ -635,25 +604,20 @@ class TransformerBlock(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon
-            # kernel_init=self.kernel_init
         )(projected_x, context)
-        
-        if self.use_projection == True:
+
+        if self.use_projection:
             if self.use_linear_attention:
-                projected_x = nn.Dense(features=C, precision=self.precision, 
-                                       dtype=self.dtype, use_bias=False, 
-                                    #    kernel_init=self.kernel_init,
-                                       name=f'project_out')(projected_x)
+                projected_x = nn.Dense(features=C, precision=self.precision,
+                                       dtype=self.dtype, use_bias=False,
+                                       name='project_out')(projected_x)
             else:
                 projected_x = nn.Conv(
                     features=C, kernel_size=(1, 1),
-                    # kernel_init=self.kernel_i nit,
                     strides=(1, 1), padding='VALID', use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name=f'project_out_conv',
+                    precision=self.precision, name='project_out_conv',
                 )(projected_x)
-                
+
         if self.only_pure_attention or self.explicitly_add_residual:
             projected_x = x + projected_x
-            
-        out = projected_x
-        return out
+        return projected_x

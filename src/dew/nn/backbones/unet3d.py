@@ -17,8 +17,8 @@ from typing import Callable, Optional, Sequence
 from functools import partial
 
 from ..blocks import ConvLayer, Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
-from ..attention import Stage, TransformerBlock
-from ..vit import RotaryEmbedding, RoPEAttention
+from ..attention import NormalAttention, Stage, TransformerBlock, rotary_freqs
+from ..dit import ROPE_THETA
 from dew.registry import models
 from ..sharding import logical_axes
 
@@ -45,18 +45,15 @@ class TemporalBlock(nn.Module):
         h = h.transpose(0, 2, 1, 3).reshape(B * H * W, frames, C)
 
         h = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(h)
-        rope = RotaryEmbedding(
-            dim=C // self.heads, max_seq_len=1024, dtype=self.dtype, name="temporal_rope")
-        h = RoPEAttention(
+        h = NormalAttention(
             query_dim=C,
             heads=self.heads,
             dim_head=C // self.heads,
             dtype=self.dtype,
             precision=self.precision,
             use_bias=True,
-            rope_emb=rope,
             name="temporal_attention",
-        )(h, freqs_cis=rope(frames))
+        )(h, freqs_cis=rotary_freqs(jnp.arange(frames), C // self.heads, ROPE_THETA))
         # zero-init gate: identity at init, so inflation preserves the 2D model
         h = nn.Dense(
             features=C, dtype=self.dtype, precision=self.precision,
