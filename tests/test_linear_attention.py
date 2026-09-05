@@ -168,7 +168,7 @@ def layer_params(reference):
         "in_proj_b": {"kernel": leaf("in_proj_b.weight").T},
         "in_proj_a": {"kernel": leaf("in_proj_a.weight").T},
         "out_proj": {"kernel": leaf("out_proj.weight").T},
-        "conv1d": {"kernel": leaf("conv1d.weight")},
+        "conv1d": {"weight": leaf("conv1d.weight")},
         "norm": {"weight": leaf("norm.weight")},
         "A_log": leaf("A_log"),
         "dt_bias": leaf("dt_bias"),
