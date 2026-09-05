@@ -126,9 +126,13 @@ CALLS = {
     "causal": dict(causal=True),
     "window": dict(causal=True, sliding_window=5),
     "packed": dict(mask=packed_mask(jnp.asarray(packed_batch()["text_segment_ids"][:, :-1]))),
-    # T5's relative position table: a full [1, H, Q, K] bias, whose query
-    # rows have to follow the reorder while its key columns stay whole.
-    "bias": dict(bias=jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))),
+    # Query-broadcast rows must survive the reorder without being expanded.
+    "broadcast_mask": dict(
+        causal=True, mask=(jnp.arange(SEQ_LEN) < SEQ_LEN // 2)[None, None, None, :]),
+    "broadcast_bias": dict(
+        causal=True, bias=jnp.linspace(-4.0, 4.0, SEQ_LEN)[None, None, None, :]),
+    "bias": dict(causal=True,
+                 bias=jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))),
     "full": dict(),
 }
 
