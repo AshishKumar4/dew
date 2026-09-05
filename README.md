@@ -64,7 +64,7 @@ state = trainer.fit(data, steps=50 * data.steps_per_epoch)
 
 Each is a Flax module, registered under a name so a config file can build it: `models.build("simple_dit", patch_size=4, ...)`. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads unchanged on a TPU.
 
-Language model checkpoints load from Hugging Face. Llama 3, Qwen 3, Qwen 3.5 (the gated delta net and full attention hybrid) and the Gemma 3 and 4 text decoders translate and match the reference logits; DeepSeek V3 and V3.2 (multi-head latent attention) are in progress.
+Language model checkpoints load from Hugging Face. Llama 3, Qwen 3, Qwen 3.5 (the gated delta net and full attention hybrid), DeepSeek V3 and V3.2 (multi-head latent attention, the sparse indexer, shared experts and the balancing bias) and the Gemma 3 and 4 text decoders translate and match the reference logits.
 
 ## The parts
 
@@ -167,7 +167,7 @@ trainer = Trainer(objective, optimizer, key=key, mesh=MeshSpec(fsdp=1), accumula
 
 On a TPU pod every host runs the same script, the data pipeline shards records by process, and a `gs://` checkpoint directory writes the shards to a bucket, which is the shared storage a resume across hosts needs. `docs/tpu.md` is the walkthrough, and `dew-tpu` creates a slice and starts a recipe on it.
 
-Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the hardware (`attention_impl="auto"`). The parallelism today is data, FSDP and expert sharding; tensor, sequence and pipeline axes are on the roadmap.
+Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the hardware (`attention_impl="auto"`). The mesh has five axes: data, FSDP and expert sharding today, a tensor axis a run's rules can redirect a width onto, and a sequence axis that splits token rows; attention that computes across the sequence axis, and pipeline stages, are on the roadmap.
 
 ## Data
 
@@ -284,9 +284,9 @@ To work on dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The goal is to train the way the large labs train and to run what they release, on the same trainer.
 
-**Architecture parity.** Multi-head latent attention and multi-token prediction for DeepSeek V3 and V3.2, and from them Kimi K2; GLM 4.5 and 5; gpt-oss with its attention sinks; Mixtral and Llama 4; the per-layer input embeddings and KV sharing Gemma 4 uses at its larger sizes; diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
+**Architecture parity.** Everything MaxText trains: Gemma 1 and 2, Mistral and Mixtral, Qwen 2 and Qwen 3 MoE, OLMo 3, DeepSeek V2 and Kimi K2 on the latent attention that landed, GLM 4.5 and 5, gpt-oss with its attention sinks, Llama 4, the Gemma 4 mixture-of-experts sizes and Gemma 3n; then the vision towers of Gemma 4, Llama 4 and Qwen 3.5; diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
 
-**Systems.** Tensor, sequence and pipeline parallelism as further mesh axes; expert-parallel training; FP8 with fine-grained scaling and MXFP4 weight loading; the Muon and MuonClip optimizers; long context through RoPE scaling and sequence packing; multi-host checkpointing and goodput measurement; scan over layers for compile time at depth.
+**Systems.** Attention that shards the sequence over the sequence axis, and pipeline stages over the stage axis; int8 and FP8 training with fine-grained scaling, and MXFP4 and FP8 weight loading; the MuonClip optimizer; emergency checkpointing and goodput measurement; scan over layers for compile time at depth.
 
 **Post-training.** A clean story for SFT and reinforcement learning that fits the same objective-and-trainer seam, rather than a second framework beside it.
 
