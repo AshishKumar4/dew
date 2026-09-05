@@ -55,6 +55,9 @@ class MixerContext:
     rope_theta: float = 10000.0
     """The kind-resolved rotary base: a kind's yarn record transforms this, never replaces it."""
     qk_norm: bool = True
+    qk_norm_scope: str = 'head'
+    """Where the q/k RMSNorm applies: 'head' norms each head after the split
+    (Qwen3, the Gemmas), 'projection' the whole projection before it (OLMo 3)."""
     v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
@@ -131,6 +134,7 @@ class AttentionMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             qk_norm=ctx.qk_norm,
+            qk_norm_scope=ctx.qk_norm_scope,
             v_norm=ctx.v_norm,
             norm_eps=ctx.norm_eps,
             scale_offset=ctx.scale_offset,

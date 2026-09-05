@@ -21,6 +21,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
 - qwen3-moe-tiny: max |logit difference| 2.86e-06, tolerance 1e-4, logits up
   to 4.1; one routed layer of three between two dense ones, with
   norm_topk_prob off (renormalising moves the logits by 0.38).
+- olmo3-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
+  6.2; the post-norm block, q/k norms over the whole projection and three
+  sliding layers to one full (per-head norms of the same scale miss by 0.1).
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -66,7 +69,7 @@ from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
-        "gemma-tiny", "gemma2-tiny")
+        "gemma-tiny", "gemma2-tiny", "olmo3-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
@@ -231,6 +234,72 @@ def test_norm_topk_prob_off_keeps_the_raw_softmax_weights():
     renormalised = model.clone(mixture=dataclasses.replace(model.mixture, norm_topk_prob=True))
     assert np.max(np.abs(np.asarray(renormalised.apply(variables, ids)) - reference)) > 0.1
 
+
+def test_olmo3_config_translates_to_the_post_norm_block():
+    """The tiny fixture's config: three sliding layers to one full at one
+    base, no pre-norms with the output pair on, and q/k norms over the
+    whole projection. A config without layer_types takes the reference's
+    own 3:1 pattern (configuration_olmo3.py:96-98)."""
+    config = translate_config(fixture_config("olmo3-tiny"))
+    assert config['layer_types'] == ('sliding_attention',) * 3 + ('full_attention',)
+    assert config['sandwich_norms'] and not config['pre_norms']
+    assert config['qk_norm'] and config['qk_norm_scope'] == 'projection'
+    assert not config['scale_after_cast'] and config['rope_theta'] == 5e5
+    assert config['kinds'] == {'sliding_attention': {'window': 4}}
+
+    from transformers import Olmo3Config
+
+    bare = {**fixture_config("olmo3-tiny"), 'num_hidden_layers': 6}
+    del bare['layer_types']
+    reference = Olmo3Config(**{**bare, 'layer_types': None}).layer_types
+    assert reference is not None
+    assert translate_config(bare)['layer_types'] == tuple(reference)
+
+
+def test_olmo3_norms_the_whole_projection_and_no_input():
+    """The loaded tree carries a q_norm of heads * head_dim and no pre-norm
+    leaves. Normed per head instead, with each head taking its slice of the
+    same scale (what a loader that split the projection's norm across heads
+    would compute), the logits leave the reference by more than 0.1: the
+    RMS over 16 dims is not the RMS over 64, so the scope is load-bearing."""
+    model, variables, _ = fp32_decoder(FIXTURES / 'olmo3-tiny')
+    ids = np.load(FIXTURES / 'olmo3-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'olmo3-tiny' / 'logits.npy')
+    attention = variables['params']['layers_0']['self_attn']
+    assert attention['q_norm']['scale'].shape == (model.num_heads * model.features_per_head,)
+    assert attention['k_norm']['scale'].shape == (model.kv_heads * model.features_per_head,)
+    assert 'input_layernorm' not in variables['params']['layers_0']
+
+    per_head = model.clone(qk_norm_scope='head')
+    width = model.features_per_head
+    sliced = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf[:width] if path[-2].key in ('q_norm', 'k_norm') else leaf,
+        variables)
+    difference = np.max(np.abs(np.asarray(per_head.apply(sliced, ids)) - reference))
+    assert difference > 0.1
+
+
+def test_the_released_olmo_3_7b_config_refuses_its_full_layer_yarn_by_name():
+    """allenai/Olmo-3-1025-7B carries a rope_scaling of type yarn that the
+    reference applies to its full-attention layers alone
+    (configuration_olmo3.py:110-113). The attention has no per-kind ramp,
+    so the entry is refused naming it, and the rest of the config
+    translates field for field once it is gone."""
+    released = fixture_config("olmo-3-7b")
+    with pytest.raises(ValueError, match="rope_scaling \\(rope_type 'yarn'\\)"):
+        translate_config(released)
+    del released['rope_scaling']
+    config = translate_config(released)
+    assert config == {
+        'vocab_size': 100278, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 32, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 11008, 'max_seq_len': 8192, 'rope_theta': 5e5,
+        'layer_types': (('sliding_attention',) * 3 + ('full_attention',)) * 8,
+        'kinds': {'sliding_attention': {'window': 4096}},
+        'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': True,
+        'attention_bias': False, 'tie_embeddings': False,
+        'sandwich_norms': True, 'pre_norms': False, 'qk_norm_scope': 'projection',
+    }
 
 def test_mistral_window_changes_the_reference_logits():
     model, variables, _ = fp32_decoder(FIXTURES / 'mistral-tiny')

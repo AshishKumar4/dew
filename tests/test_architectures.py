@@ -265,6 +265,11 @@ VARIANTS = [
     Case("causal_transformer", {**LM, "qk_norm": True, "mixture": {
         "experts": 8, "top_k": 2, "layers": (1,), "norm_topk_prob": False,
         "expert_features": 32}}, seq_len=SEQ_LEN, label="qwen3_moe"),
+    # OLMo 3's block: no input norms, the output pair on, and one q/k norm
+    # over the whole projection, whose scale is heads * head_dim wide.
+    Case("causal_transformer", {**LM, "sandwich_norms": True, "pre_norms": False,
+                                "qk_norm": True, "qk_norm_scope": "projection"},
+         seq_len=SEQ_LEN, label="olmo3"),
 ]
 
 
