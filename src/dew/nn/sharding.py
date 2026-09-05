@@ -41,10 +41,11 @@ EXPERT_AXIS = 'expert'
 FSDP_AXIS = 'fsdp'
 TENSOR_AXIS = 'tensor'
 SEQUENCE_AXIS = 'sequence'
-"""The axes of the mesh `dew.training.build_mesh` builds. They are named here
-because the attention seam reads two of them off the mesh in context: the
-sequence axis it splits its queries over, and the tensor axis, which holds
-a width and never a row."""
+STAGE_AXIS = 'stage'
+"""The axes of a mesh `dew.training.build_mesh` builds. They are named here
+because the attention seam reads three of them off the mesh in context: the
+sequence axis it splits its queries over, and the tensor and stage axes,
+which hold a width and a pipeline stage and never a row."""
 
 DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
