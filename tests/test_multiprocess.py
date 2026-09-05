@@ -401,8 +401,8 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     assert np.isfinite(pool[0]["losses"]).all(), "the pool diverged"
     assert pool[0]["losses"] == pool[1]["losses"], "the processes disagreed with each other"
     assert pool[0]["mesh_shape"]["stage"] == 2
-    np.testing.assert_allclose(pool[0]["losses"], piped, **PARITY)
-    np.testing.assert_allclose(pool[0]["losses"], whole, **PARITY)
+    np.testing.assert_allclose(pool[0]["losses"], piped, rtol=PARITY["rtol"], atol=PARITY["atol"])
+    np.testing.assert_allclose(pool[0]["losses"], whole, rtol=PARITY["rtol"], atol=PARITY["atol"])
     assert pool[0]["sharding"]["fully_addressable"] == [False]
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            worker.params_dict(whole_state.params))
