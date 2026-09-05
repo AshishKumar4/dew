@@ -1,17 +1,16 @@
-import jax
-import jax.numpy as jnp
+"""The Stable Diffusion AutoencoderKL behind the `AutoEncoder` seam. The
+modules are the vendored diffusers ones in vae.py; the weights are the
+checkpoint's."""
+
 from functools import partial
 
+import jax
+import jax.numpy as jnp
 from flax import linen as nn
+
 from .api import AutoEncoder
 from .vae import FlaxEncoder, FlaxDecoder, load_pretrained_vae
 
-"""
-This module contains an Autoencoder implementation which uses the Stable Diffusion VAE model from the HuggingFace model hub.
-The actual model was not trained by me. I have only implemented the wrapper (and vendored the diffusers Flax modules
-in vae.py, as diffusers dropped Flax support upstream) to make it compatible with our library.
-All credits for the model go to the developers of Stable Diffusion VAE and for the modules to the Diffusers library.
-"""
 
 class StableDiffusionVAE(AutoEncoder):
     """A pretrained AutoencoderKL behind the `AutoEncoder` seam.
@@ -74,7 +73,6 @@ class StableDiffusionVAE(AutoEncoder):
         # the SD defaults.
         self.latent_shift = config.get("shift_factor", 0.0) if latent_shift is None else latent_shift
         self.latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
-        print(f"Latent shift: {self.latent_shift}, latent scale: {self.latent_scale}")
 
         def encode_single_frame(params, x, rngkey=None):
             latents = enc.apply({"params": params['encoder']}, x, deterministic=True)
@@ -100,12 +98,13 @@ class StableDiffusionVAE(AutoEncoder):
         self.encode_single_frame = jax.jit(encode_single_frame)
         self.decode_single_frame = jax.jit(decode_single_frame)
 
-        # The latent geometry, from one frame through the encoder. It is the
-        # weights' own shape, so it is read here and not on every call.
-        dummy_input = jnp.ones((1, 128, 128, config["in_channels"]), dtype=dtype)
-        dummy_latents = self.encode_single_frame(params, dummy_input)
-        self.__downscale_factor__ = dummy_input.shape[1] // dummy_latents.shape[1]
-        self.__latent_channels__ = dummy_latents.shape[-1]
+        # The latent geometry, from the shape one frame takes through the
+        # encoder. It is the weights' own shape, so it is read here and not on
+        # every call, and from the trace alone: nothing runs at construction.
+        frame = jax.ShapeDtypeStruct((1, 128, 128, config["in_channels"]), dtype)
+        latent = jax.eval_shape(encode_single_frame, params, frame)
+        self._downscale_factor = frame.shape[1] // latent.shape[1]
+        self._latent_channels = latent.shape[-1]
 
     def encode_batch(self, params, x, key=None):
         return self.encode_single_frame(params, x, key)
@@ -115,24 +114,19 @@ class StableDiffusionVAE(AutoEncoder):
 
     @property
     def downscale_factor(self) -> int:
-        """Returns the downscale factor for the encoder."""
-        return self.__downscale_factor__
-    
+        return self._downscale_factor
+
     @property
     def latent_channels(self) -> int:
-        """Returns the number of channels in the latent space."""
-        return self.__latent_channels__
-    
+        return self._latent_channels
+
     @property
     def name(self) -> str:
-        """Get the name of the autoencoder model."""
         return "stable_diffusion"
-    
+
     def serialize(self):
-        """Serialize the model to a dictionary format."""
         return {
             "modelname": self.modelname,
             "revision": self.revision,
             "dtype": str(self.dtype),
         }
-    
