@@ -29,8 +29,8 @@ from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch, train_s
 def token_files(path: str | None, name: str) -> tuple[str, str]:
     """`(train.bin, val.bin)` of a tokenized directory, both required.
 
-    Reading train.bin in val.bin's place scored the validation pass on the
-    windows the model trains on.
+    Reading train.bin in val.bin's place would score the validation pass on
+    the windows the model trains on.
     """
     if not path:
         raise ValueError(f"{name} needs path= set to the directory tools/tokenize_text.py wrote")
@@ -82,7 +82,7 @@ class TokenWindows(DatasetSpec):
 
 
 def chunk_counts(lengths, chunk_len: int):
-    """Chunks of at most `chunk_len` tokens each of `lengths` is cut into."""
+    """How many chunks of at most `chunk_len` tokens each entry of `lengths` is cut into."""
     return -(-np.asarray(lengths, np.int64) // chunk_len)
 
 
@@ -94,8 +94,8 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
     segment in the packed row, which keeps attention inside the chunk and RoPE
     running from the chunk's own 0.
 
-    The chunk table is built once from the document lengths, so a record costs
-    one memmap slice rather than a walk over the documents before it.
+    The chunk table is built once from the document lengths. A record then
+    costs one memmap slice.
     """
 
     def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
@@ -118,9 +118,8 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
     def __getitem__(self, index: int) -> Batch: ...
 
     def __getitem__(self, index):
-        # grain's conventions: a slice is the sharding and windowing API
-        # (ds[shard::count]), and an index past the end wraps, which is what
-        # makes `repeat` a length change rather than a copy.
+        # grain's slice is the sharding and windowing API (ds[shard::count]),
+        # and an index past the end wraps, so `repeat` is a length change.
         if isinstance(index, slice):
             return self.slice(index)
         index = index % len(self)
@@ -142,17 +141,17 @@ class PackedTokens(DatasetSpec):
     packer adds to the first bin with room, and every emitted window carries
     `text_segment_ids` (which document each token is from, 0 for padding) and
     `text_positions` (the token's position inside its document), so the model
-    can stop attention and the loss at document boundaries. This is grain's
-    `Dataset` API rather than `DataLoader` for the reason grain gives for
-    switching: packing. Documents are sliced per process before packing,
-    since sharding after it would have every process pack the same ones.
+    can stop attention and the loss at document boundaries. This uses grain's
+    `Dataset` API, which supports packing. Documents are sliced per process
+    before packing. Sharding after it would have every process pack the same
+    ones.
 
     `records` counts window-sized chunks, the upper bound on the windows a
     pass over the split yields and the count a run has before it packs
-    anything: every emitted window holds at least one chunk, the bound is
+    anything. Every emitted window holds at least one chunk, the bound is
     tight once documents reach the window, and which chunks share a window
-    depends on the shuffle. Counting documents instead reported zero steps
-    for a corpus of fewer documents than a batch. `val_batches` bounds a
+    depends on the shuffle. Counting documents would report zero steps for a
+    corpus of fewer documents than a batch. `val_batches` bounds a
     validation pass; None scores all of val.bin.
     """
 
@@ -174,9 +173,9 @@ class PackedTokens(DatasetSpec):
         per_process = local_batch(batch)
         window = self.seq_len + 1
 
-        # One source per split, reused by its loader: finding the boundaries
-        # reads the whole file, and a run rebuilding it per epoch would read a
-        # multi-gigabyte train.bin again for a table it already has.
+        # One source per split, reused by its loader. Finding the boundaries
+        # reads the whole file, so rebuilding it per epoch would read a
+        # multi-gigabyte train.bin again for a table the run already has.
         train_source = TokenDocumentSource(train_bin)
         val_source = TokenDocumentSource(val_bin)
 
@@ -189,7 +188,7 @@ class PackedTokens(DatasetSpec):
             reads = chunks.repeat(epochs).to_iter_dataset()
             if self.loading.workers:
                 # The workers read documents, and the packer stays behind them
-                # in this process: grain runs a whole pipeline per worker, so
+                # in this process. Grain runs a whole pipeline per worker, so
                 # packing inside them would fill bins from one worker's slice
                 # of the documents and make the windows depend on worker_count.
                 reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(

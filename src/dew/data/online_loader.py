@@ -45,8 +45,8 @@ CAPTION_COLUMNS = ("caption", "CAPTION", "text", "TEXT", "txt")
 MAX_ASPECT = 2.4
 
 Sample = tuple[np.ndarray, str]
-"""What a worker queues for a url that yielded an image: the pixels at the
-stream's size and the row's caption. A dropped url is queued as the url."""
+"""The pixels at the stream's size and the row's caption, queued for a url
+that yielded an image. A dropped url is queued as the url."""
 
 # The fetcher's worker processes are started without forking this one. This
 # loader runs inside a training process, and os.fork carries over only the
@@ -79,9 +79,9 @@ def load_rows(sources: Sequence[str]) -> Dataset:
 
 @lru_cache(maxsize=1)
 def _user_agent() -> str:
-    """The agent HF `datasets` advertises, which its own url-fetching example
-    sends, resolved on the first fetch so importing this module needs no
-    `datasets`."""
+    """The user agent HF `datasets` advertises, resolved on the first fetch so
+    importing this module needs no `datasets`. It is the agent the library's
+    own url-fetching example sends."""
     try:
         from datasets.utils.file_utils import get_datasets_user_agent
     except ImportError as exc:
@@ -115,10 +115,10 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
 def decode_pixels(data: bytes) -> np.ndarray | None:
     """`data` as the array PIL decodes it to, or None when it is no image.
 
-    The bytes are whatever the open internet returned, and PIL reports a bad
+    The bytes are whatever the open internet returned. PIL reports a bad
     file as OSError, SyntaxError, ValueError, its own DecompressionBombError
-    or a struct.error depending on which header is broken, so this is the
-    one place a broad except is the honest statement of what can happen.
+    or a struct.error depending on which header is broken, so the except here
+    covers all of them.
     """
     try:
         return np.asarray(PIL.Image.open(io.BytesIO(data)))
@@ -188,9 +188,8 @@ def columns(shard: Mapping[str, Sequence[str]]) -> tuple[Sequence[str], Sequence
 
 # The sample queue each pool worker inherited through the Pool initializer. A
 # multiprocessing.Queue can only cross a process boundary while the process is
-# being created, so handing it to pool.map as an argument raised "Queue objects
-# should only be shared between processes through inheritance" before the pool
-# had fetched anything.
+# being created, so handing it to pool.map as an argument raises "Queue objects
+# should only be shared between processes through inheritance".
 _worker_sink: multiprocessing.queues.Queue | None = None
 
 
@@ -200,13 +199,13 @@ def _init_worker(sink: multiprocessing.queues.Queue) -> None:
 
 
 def _fetch_shard(shard: Mapping[str, Sequence[str]], fetch: Fetch, threads: int) -> None:
-    """Pool entry point: fetch every row of one shard onto this worker's queue."""
+    """Fetch every row of one shard onto this worker's queue."""
     if _worker_sink is None:
         raise RuntimeError("the fetch pool's worker was started without a queue")
     urls, captions = columns(shard)
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        # Reading the results is what raises a worker thread's exception
-        # here; an unread executor.map swallows it.
+        # Reading the results raises a worker thread's exception here. An
+        # unread executor.map would swallow it.
         for _ in pool.map(partial(fetch_one, sink=_worker_sink, fetch=fetch), urls, captions):
             pass
 
@@ -216,9 +215,8 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
     """Walk `rows` forever, `workers` processes fetching a shard each with
     `threads` threads, and reshuffle between passes.
 
-    Every row belongs to one shard: the bounds split len(rows) evenly, so a
-    row past an even split is the last shard's tail rather than a row no
-    pass ever fetches.
+    Every row belongs to one shard. The bounds split len(rows) evenly, so a
+    row past an even split is the last shard's tail.
     """
     bounds = [index * len(rows) // workers for index in range(workers + 1)]
     with _WORKER_CONTEXT.Pool(workers, initializer=_init_worker, initargs=(sink,)) as pool:
@@ -232,10 +230,10 @@ class ImageStream:
     """Endless batches of fetched images, `{"image": uint8 [batch, size, size, 3],
     "caption": [batch] str}`.
 
-    A batch is `batch` samples the fetchers really produced. A quiet queue is
-    not a batch: while the fetcher lives the stream keeps waiting, and once
-    it is gone iteration ends, or raises the fetcher's own exception if it
-    died of one. `dropped` counts the urls the workers threw away. The
+    A batch is `batch` samples the fetchers really produced, and a quiet queue
+    is no batch. While the fetcher lives the stream keeps waiting. Once it is
+    gone iteration ends, or raises the fetcher's own exception if it died of
+    one. `dropped` counts the urls the workers threw away. The
     fetchers run at most `prefetch` batches ahead. There is no position to
     report, so a run over this stream cannot checkpoint.
     """
@@ -251,8 +249,7 @@ class ImageStream:
         self._waiting_logged = False
         fetch = Fetch(size=size, min_size=min_size, timeout=timeout, retries=retries)
 
-        # The fetcher's exception is kept rather than printed and forgotten:
-        # __next__ re-raises it instead of waiting on a queue nobody fills.
+        # The fetcher's exception is kept for `__next__` to re-raise.
         def produce() -> None:
             try:
                 fetch_rows(rows, self.samples, workers=workers, threads=threads, fetch=fetch)
@@ -283,8 +280,8 @@ class ImageStream:
         return {"image": np.stack(images), CAPTION: np.asarray(captions)}
 
     def _check_fetcher(self) -> None:
-        """Raise when there is nothing left to wait for; a live fetcher is
-        only slow, and its samples are worth more than zeros."""
+        """Raise when there is nothing left to wait for. A live fetcher is
+        only slow."""
         if self.fetcher.is_alive():
             if not self._waiting_logged:
                 self._waiting_logged = True
