@@ -24,6 +24,119 @@ gnome-remote-desktop-daemon, the desktop itself), at 210 MHz and 30 W at rest
 and 2760 MHz and 120-220 W under load. An XLA flag is read once when a
 backend opens, so every flag configuration ran in a fresh process.
 
+## Where a step's time goes, 2026-09-05
+
+```
+JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.8 \
+    python tools/benchmark_step.py --preset small --architectures <arch> \
+    --warmup 3 --steps 30 --profile-dir /tmp/dew-trace --profile-steps 5
+```
+
+The traced window is read back by `tools/benchmark_step.py` itself: busy
+is the union of every kernel interval on the device's streams, kernels are
+counted per step, and kernel time is summed per category from the kernel
+names. dew at `9886c20`, the tree before the cudnn padding below.
+
+| architecture | ms/step | device busy | kernels/step | gemm | elementwise | reduce | convert | attention | copy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| simple_dit | 7.0 | 100% in steady state | 532 | 3.29 | 0.69 | 1.19 | 0.79 | 0.69 | 0.16 |
+| causal_transformer | 88.8 | 100% | 282 | 63.3 | 13.3 | 7.6 | 0.8 | 1.8 | 0.7 |
+
+The trace reports 81.6% busy for the DiT over its five steps because the
+profiler's start costs the first two steps 3 ms gaps each; the step-to-step
+interval settles at 6.9 ms, which is the kernel time, so the device is not
+idle between steps once the loop is running. The DiT's reductions are the
+bias gradients of every Dense (the q, k and v projections' 6-by-64 biases
+cost three full passes over the activation gradient per layer, 0.25 ms a
+step) and the norm statistics; its converts are XLA's own split-K partial
+sums in fp32 and the per-use casts of the fp32 parameters to bf16 (0.15 ms
+of the 0.79). The decoder's gemm time is the fp32 (TF32) vocabulary head:
+two cutlass `s1688gemm` kernels at 12.9 and 12.5 ms and four Triton tiles of
+3.2 ms for the third product, against a 12.8 ms floor per product at the
+49.5 TFLOP/s TF32 ceiling measured in `docs/research/benchmark-parity.md`.
+
+### The host's budget per step
+
+What the host spends per step on simple_dit, from the trace's host plane
+and from timing the dispatch loop with the device deliberately left
+behind. The device step is 6.9 ms.
+
+| host work per step | ms | how measured |
+|---|---:|---|
+| XLA thunk execution inside PjRt Execute | 3.3 | `GpuExecutable::ExecuteThunks` on the host plane; 2.4 of it is three CUDA-graph launches |
+| Python in `jax.stages.Compiled.__call__` before Execute | 1.8 | `$stages.py __call__` 6.7 ms against `PjRtCApiLoadedExecutable::Execute` 5.0 ms |
+| placing a fresh batch (`shard_batch`) | 0.25 | 200 calls timed in isolation, image plus tokens |
+| the loop with a fixed device batch | 5.0 | dispatch loop time, 100 steps, device 27 steps behind |
+| the loop with a fresh batch per step | 6.5 | same, device 7 steps behind |
+| the loop with XLA command buffers off | 7.3 | `--xla_gpu_enable_command_buffer=`; wall 7.46 ms/step, the host is now the step |
+
+So on the smallest step the host is at 94% of the device with a fresh
+batch every step, and 106% without command buffers. Two things follow.
+The `Compiled.__call__` Python (4.5 us a leaf, 396 leaves here, more on a
+mesh) is why `Trainer.compile` returns the jitted step since `de6b22c`:
+wall time on this card does not move, host time drops by 1.8 ms a step.
+And the 1.5 ms a fresh batch costs over a fixed one is the command buffer
+being updated for the new buffer addresses; it caps how far the loop runs
+ahead (7 steps against 27) and would be the wall clock on a faster card or
+a smaller model. It does not come from the placement itself (0.25 ms) nor
+from freeing the consumed batch (keeping every batch alive changes
+nothing under the default preallocation), and prefetch depth 2, 8 and 32
+measure the same. No fix is adopted: the addresses are the runtime's.
+
+Waiting on the device every step, the other way to lose this, costs 45%:
+the same simple_dit loop with `block_until_ready` after each step runs at
+10.3 ms against 7.1. The trainer's loop never waits between logging ticks,
+and the peak allocation does not grow with how far the loop runs ahead
+(0.823 GiB at 27 steps ahead, 0.819 in lockstep; 3.499 against 3.495 GiB
+for hierarchical_mmdit).
+
+### Antipatterns audited
+
+Read across `src/dew` and measured on the small preset. The classes are
+the owner's nine; a row names the cost it found and what was done.
+
+| class | site | what was measured | verdict |
+|---|---|---|---|
+| 1 sync in hot paths | `training/trainer.py` `fit`, per-step `loss.astype`, `interval_loss + loss`, `jnp.where(finite, ...)`, `bad_run + 1`, `jnp.maximum` | `jax_log_compiles` over a 50-step fit: five one-op executables compiled and dispatched eagerly every step, no host sync; wall cost not measured | left, reported to the trainer's owner as a candidate |
+| 1 sync in hot paths | `jax.stages.Compiled.__call__` in `Trainer.compile` | 1.8 ms/step of Python at 396 leaves (table above) | fixed on main in `de6b22c` (jit dispatch) |
+| 2 recompilation | `Trainer.fit` with evaluation every 25 of 50 steps, diffusion and LM objectives | one `jit(step)`, one `jit(initial_state)`, one evaluation executable (`_sample_impl`, `scored`); no per-step or per-eval retrace | none found |
+| 3 baked constants | the compiled step's optimized HLO | simple_dit: 20 constants, 0.19 MiB, the largest the 2D sincos table bf16[256, 384]; causal_transformer: none | none found; the encoder's table moved into the state before this pass |
+| 4 dtype churn | HLO dots by output dtype and the trace's convert kernels | simple_dit: 65 bf16 dots, 40 fp32 outputs that are XLA split-K partials and the fp32 `final_proj`; parameter casts 0.15 ms/step; decoder: the fp32 head by design | none found in dew's code; XLA's split-K choice is the card's |
+| 5 redundant work | `nn/attention.py` odd-length routing to the xla kernel | hierarchical_mmdit 33.9 to 20.9 ms, simple_mmdit 12.9 to 11.0, peaks 3.50 to 1.85 and 1.43 to 1.08 GiB | fixed, `3b67135` |
+| 5 redundant work | `objectives/lm` head chunking at its default of 4 | 1.9 ms/step (2.2%) against one chunk, for 1.2 GiB | reported to the LM lane with the sweep in `docs/benchmarks.md` |
+| 5 redundant work | `objectives/diffusion/objective.py:141`, `null = self.encode(...)` every step | a frozen encoder's forward on the unconditional tokens, once per step, inside the step; free with the table encoder used here, a text tower's forward at batch 1 with CLIP; not measured with CLIP | reported to the diffusion lane |
+| 6 data path | `DevicePrefetchIterator` depth, `shard_batch` cost, main-thread placement | 0.15 to 0.25 ms/step waiting for a batch at depth 2, 8 and 32; placement 0.25 ms; the loop is bounded by dispatch, not the transfer | none found |
+| 7 sharding | the compiled step's `input_output_alias` | every state leaf aliased (396 of 396 on simple_dit, 143 of 143 on the decoder): donation happens | none found; collectives on a mesh not measured this pass |
+| 8 compile time | `Trainer.compile` | one compile per fit (class 2 row); the FLOP count reads the same executable | none found; the persistent cache was not timed this pass |
+| 9 memory | peak against the state, run-ahead against lockstep | simple_dit 0.82 GiB peak on a 303 MiB state, unchanged by run-ahead; hierarchical_mmdit 3.50 GiB on 847 MiB, 1.65 GiB of it the xla attention's fp32 logits | fixed by the class-5 row |
+
+Not run this pass, so nothing is claimed about them: the
+`jax_default_matmul_precision` settings (`bfloat16` would change the fp32
+head's numerics and is refused by the precision rule regardless), remat
+on a step that fits in memory, XLA flags beyond command buffers, and the
+cost of the class-1 eager scalars.
+
+### Against PyTorch today
+
+`tools/benchmark_torch.py` rerun in a fresh venv, torch 2.14.0+cu130 with
+cuDNN 9.24 (last week was 2.11.0+cu128 with 9.19), `--mode compile
+--warmup 20 --steps 100`, the small presets, one process per row, against
+the dew rows of `docs/benchmarks.md` and the table above:
+
+| case | dew ms/step | torch compile, reference attention | torch compile, SDPA cudnn | dew against the best torch row |
+|---|---:|---:|---:|---:|
+| simple_dit | 7.02 | 9.28 | 8.39 | 1.19x faster |
+| causal_transformer | 88.78 | 81.50 | 72.46 | 0.82x, torch faster by 18% |
+
+Last week's 0.95x set the parity harness's fixed-batch decoder row (75.70)
+against torch's 72.18. Today's dew row is the benchmark's own prefetching
+loop at 88.78. Of the 13 ms between them, 1.9 are the chunked head, 3.8
+are the decoder's own changes since `6b0f119`, and the remaining 7.6 are
+the distance between that harness's fixed-batch row and this tool's loop
+at the same commit (`6b0f119` reruns at 83.26 here today). The DiT gained:
+1.16x last week, 1.19x now, with torch's SDPA row 0.4 ms slower than a
+week ago on the newer torch.
+
 ## The attention kernels
 
 `tools/benchmark_attention.py`, bf16, batch chosen so query tokens times
