@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import pytest
 from flax import linen as nn
 
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
 from dew.registry import models
 
