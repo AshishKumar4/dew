@@ -52,7 +52,7 @@ indices = jnp.asarray([[0, 3], [1, 3], [2, 3]], jnp.int32)
 update = calculate_load_balance_updates(indices, num_experts=8, rate=0.001)
 ```
 
-It is `+rate` for every expert below the average load, `-rate` for every expert above it. `LMObjective(balance_rate=...)` applies it every step and hands the moved bias back to the trainer through `Aux.variables`, the channel for a collection a step updates without a gradient; under the compiled step the load count is global, so the bias stays one replicated value on every shard. A mixture routes on the scores alone unless it asks for the bias, `mixture={"experts": 8, "bias": True}`, which is what a DeepSeek checkpoint needs. The mixture also carries the rest of the router's choices: `score_function`, `scaling`, `groups` and `groups_per_token`.
+It is `+rate` for every expert below the average load, `-rate` for every expert above it. `LMObjective(balance_rate=...)` applies it every step and hands the moved bias back to the trainer through `Aux.variables`, the channel for a collection a step updates without a gradient; under the compiled step the load count is global, so the bias stays one replicated value on every shard. A mixture routes on the scores alone unless it asks for the bias with `mixture={"experts": 8, "bias": True}`; a DeepSeek checkpoint sets it. The mixture also carries the rest of the router's choices: `score_function`, `scaling`, `groups` and `groups_per_token`.
 
 ## The grouped matmul
 
