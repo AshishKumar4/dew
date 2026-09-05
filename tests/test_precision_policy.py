@@ -51,18 +51,34 @@ def test_auto_resolves_to_cudnn_on_gpu(implementations, monkeypatch):
     assert implementations == ['cudnn']
 
 
-def test_auto_leaves_cudnn_for_the_shapes_it_cannot_train(implementations, monkeypatch):
+def test_odd_lengths_reach_cudnn_padded_even(implementations, monkeypatch):
     """cudnn's fused kernel has no backward pass for an odd sequence length,
-    and 77 CLIP text tokens are odd: with 'auto' meaning plain cudnn, every
-    cross-attending model raised NotImplementedError on its first training
-    step."""
+    and 77 CLIP text tokens are odd: 'auto' used to send every
+    cross-attention to the xla kernel. Now the call is padded to an even
+    length, the pad key hidden by the kernel's own padding mask, and a pad
+    query row sliced back off."""
+    calls = []
+
+    def spy(query, key, value, **kwargs):
+        calls.append((query.shape[1], key.shape[1], kwargs["key_value_seq_lengths"]))
+        implementations.append(kwargs.get("implementation"))
+        return query
+
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    monkeypatch.setattr(jax.nn, "dot_product_attention", spy)
     query = jnp.ones((1, 256, 2, 8), jnp.bfloat16)
     context = jnp.ones((1, 77, 2, 8), jnp.bfloat16)
 
-    scaled_dot_product_attention(query, context, context, implementation='auto')
+    cross = scaled_dot_product_attention(query, context, context, implementation='auto')
+    back = scaled_dot_product_attention(context, query, query, implementation='auto')
     scaled_dot_product_attention(query, query, query, implementation='auto')
-    assert implementations == ['xla', 'cudnn']
+
+    assert implementations == ['cudnn', 'cudnn', 'cudnn']
+    assert cross.shape == (1, 256, 2, 8) and back.shape == (1, 77, 2, 8)
+    (q_len, kv_len, lengths), (q_back, kv_back, none), (q_self, kv_self, none_self) = calls
+    assert (q_len, kv_len) == (256, 78) and lengths.tolist() == [77]
+    assert (q_back, kv_back) == (78, 256) and none is None
+    assert (q_self, kv_self) == (256, 256) and none_self is None
 
 
 def test_auto_runs_the_kernel_it_resolved_to():

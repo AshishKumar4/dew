@@ -50,45 +50,46 @@ The reference and xla paths materialize the S x S logits, so they run out of
 everywhere they fit. cudnn is the kernel for a GPU run, forward and
 backward, which is why `'auto'` reaches for it wherever it can.
 
-## Which kernel 'auto' picks
+## Odd sequence lengths on cudnn
 
 cudnn's fused kernel has no backward pass for an odd query or key length. The
-forward pass takes any length, so this only appears at the first training
+forward pass takes any length, so this only appeared at the first training
 step, as `NotImplementedError: Unsupported sequence length Q 333, KV 333`
 out of jax. 77 CLIP text tokens are odd, and so is 256+77 concatenated.
 
-Before this wave `attention_impl='auto'` meant plain cudnn on a GPU, so six
-of the twelve architectures in the small preset could not train on this card
-at their default settings. `'auto'` now picks cudnn only for the shapes
-cudnn supports and xla for the rest (`dew.nn.attention.cudnn_supports`),
-per call rather than per run, since one model holds both kinds of shape.
-Explicit `'cudnn'` still raises. A run that names a kernel gets that kernel.
+Until 2026-09-05 `'auto'` sent those shapes to the xla kernel, which
+materializes the [B, H, Q, K] logits and their probabilities in fp32 and
+keeps them for the backward pass. `cudnn_attention` now pads an odd length
+to an even one instead: one zero row on the query, sliced off the output,
+and one zero key hidden by the kernel's own padding mask
+(`key_value_seq_lengths`), so every real query attends to exactly the keys
+it had. `'auto'` is cudnn on every shape on a GPU, and an explicit
+`'cudnn'` takes any length too. The check is
+`tests/test_kernels.py::test_cudnn_trains_odd_lengths_and_agrees_with_xla`:
+at q1024/kv77, q9/kv7 and q333/kv333 causal, outputs and the three input
+gradients agree with the xla kernel to within two bf16 ulps of their scale,
+which is also how far the two kernels sit apart at an even length (q256:
+1.6e-2 at scale 2.9 on the output, 7.8e-2 at scale 15.6 on the gradients,
+both one ulp). Leaving the pad key unmasked moves the q9/kv7 output by
+0.26 at scale 2.4 and fails the test; leaving the pad query row in changes
+the shape and fails it.
 
-Where 'auto' lands, at the small preset's shapes:
+What it is worth, `--warmup 3 --steps 50` on the small preset, `'xla'`
+(the kernel 'auto' used to pick for these shapes) against `'auto'`:
 
-| architecture | cudnn | xla |
-|---|---|---|
-| simple_dit, simple_udit, hybrid_dit | q256/kv256 | |
-| uvit | q334/kv334 | |
-| video_dit | q8/kv8, q256/kv256 | |
-| causal_transformer | q512/kv512 | |
-| unet, unet_3d | | q256/kv77, q1024/kv77 |
-| simple_mmdit | | q333/kv333 |
-| hierarchical_mmdit | | q141, q333, q1101 |
-| jepa_encoder | q130/kv130 | q193/kv193 |
-| jepa_video_encoder | q8/kv8, q130/kv130 | q193/kv193 |
+| architecture | shapes | xla ms/step | cudnn ms/step | xla peak GiB | cudnn peak GiB | loss at the end, xla / cudnn |
+|---|---|---:|---:|---:|---:|---|
+| hierarchical_mmdit | q141, q333, q1101 | 33.86 | 20.86 | 3.50 | 1.85 | 0.551035 / 0.551038 |
+| simple_mmdit | q333/kv333 | 12.86 | 11.01 | 1.43 | 1.08 | 0.584398 / 0.584407 |
+| unet | q256/kv77, q1024/kv77 | 16.30 | 16.13 | 0.78 | 0.71 | 0.597518 / 0.597516 |
 
-The rerouting costs the affected models the fused kernel's speed and memory,
-which is the price of training at all. It changes no numbers: a fixed-seed
-20-step loss trajectory under `'auto'` is bitwise identical to the same run
-under the kernel 'auto' selected, both for a rerouted model (simple_mmdit,
-max delta 0.0) and for one that stays on cudnn (simple_dit, max delta 0.0).
-
-The rule reads shapes, so it applies to a forward-only call as well. Decode
-asks for one query position at a time, so sampling from a language model
-runs on xla where it used to run on cudnn. Both kernels accumulate the
-logits and run the softmax in fp32, so the samples are the same; the speed
-of that path was not measured.
+The 1101-token stage's xla attention kept its fp32 logits and probabilities
+for the backward pass; that is where the 1.65 GiB and the 13 ms went. The
+unet's attention is a small part of its step, so it gains little. The
+losses are after 103 steps on one fixed batch and differ in the sixth
+digit, which is the two kernels' bf16 rounding compounded by Adam. Decode
+asks for one query position at a time, an odd length, and now runs on
+cudnn with the cache mask as an additive bias; its speed was not measured.
 
 ## XLA flags
 
