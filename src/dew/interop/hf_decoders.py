@@ -28,8 +28,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, NoReturn, Optional, Tuple
 
+import ml_dtypes
 import numpy as np
 
+from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
 from dew.registry import models, with_precision
@@ -1017,7 +1019,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     return variables
 
 
-_DTYPES = {'F32': np.float32, 'F16': np.float16}
+# An fp8 weight widens to fp32 exactly, and its block scales are applied by
+# `dequantize_checkpoint` once every shard is read.
+_DTYPES = {'F32': np.float32, 'F16': np.float16, 'F8_E4M3': ml_dtypes.float8_e4m3fn}
 
 
 def _read_shard(path: Path) -> Dict[str, np.ndarray]:
@@ -1098,7 +1102,7 @@ def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
     if max_seq_len is not None:
         config['max_seq_len'] = int(max_seq_len)
 
-    tensors = _load_shards(directory)
+    tensors = dequantize_checkpoint(_load_shards(directory), fp8_block(hf_config))
     variables = translate_weights(tensors, config)
 
     built = with_precision('causal_transformer', config,
