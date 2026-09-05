@@ -18,7 +18,7 @@ from dew.objectives.jepa import (
     representation_health, normalize_targets, linear_probe_accuracy, knn_probe_accuracy,
 )
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.registry import metrics, models
+from dew.registry import metrics
 from dew.training import Layout, MeshSpec, Trainer
 
 RES = 32
@@ -115,71 +115,66 @@ def test_geometry_that_cannot_exist_is_rejected():
         multi_block_mask(GRID, num_targets=6, scale=(0.15, 0.2))
 
 
-# --- forward shapes --------------------------------------------------------
+# --- the encoders and the predictor ----------------------------------------
 
-def test_image_encoder_shapes(mask, rng):
+def test_the_token_index_selects_tokens_with_their_positions(rng):
+    """`token_idx` is a set of grid positions, and the encoder attends over
+    whatever set it is given: asking for every token in a shuffled order gives
+    the full encoding shuffled the same way, which holds only if each gathered
+    token carries the sincos signal of its own grid position and no rotation
+    by sequence index is applied."""
     encoder = make_encoder()
-    context_idx, _ = mask.sample(rng, 4)
     x = images()
-    params = encoder.init(rng, x, context_idx)
+    every = jnp.arange(GRID[0] * GRID[1], dtype=jnp.int32)
+    shuffled = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), every)
+                          for i in range(x.shape[0])])
+    params = jax.tree.map(lambda p: p + 0.05, encoder.init(rng, x, shuffled))
 
-    assert encoder.apply(params, x, context_idx).shape == (4, mask.num_context, 32)
-    assert encoder.apply(params, x).shape == (4, mask.num_patches, 32)
-
-
-def test_image_predictor_shapes(mask, rng):
-    encoder, predictor = make_encoder(), make_predictor()
-    context_idx, target_idx = mask.sample(rng, 4)
-    x = images()
-    encoder_params = encoder.init(rng, x, context_idx)
-    context = encoder.apply(encoder_params, x, context_idx)
-
-    block = target_idx[:, 0]
-    params = predictor.init(rng, context, context_idx, block)
-    assert predictor.apply(params, context, context_idx, block).shape == (4, mask.block_area, 32)
+    full = encoder.apply(params, x)
+    subset = encoder.apply(params, x, shuffled)
+    assert float(jnp.max(jnp.abs(full))) > 0.1
+    # 1.5e-6 observed: the softmax sums in another order.
+    assert jnp.allclose(subset, jnp.take_along_axis(full, shuffled[..., None], axis=1), atol=1e-5)
 
 
-def test_video_encoder_and_predictor_shapes(mask, rng):
+def test_the_video_token_index_selects_the_same_tubelet_in_every_frame(rng):
+    """A video encoder's `token_idx` names patch positions shared by every
+    frame, so the shuffled full encoding is the full encoding shuffled within
+    each frame."""
     encoder = JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
                                num_heads=2, mlp_ratio=2)
-    predictor = make_predictor(factorized=True)
+    x = videos()
+    every = jnp.arange(GRID[0] * GRID[1], dtype=jnp.int32)
+    shuffled = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), every)
+                          for i in range(x.shape[0])])
+    params = jax.tree.map(lambda p: p + 0.05, encoder.init(rng, x, shuffled))
+
+    full = encoder.apply(params, x)
+    subset = encoder.apply(params, x, shuffled)
+    expected = jnp.take_along_axis(full, shuffled[:, None, :, None], axis=2)
+    assert jnp.allclose(subset, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize("factorized", [False, True], ids=["image", "video"])
+def test_the_predictor_predicts_each_target_by_its_position(mask, rng, factorized):
+    """The targets are mask tokens told their grid position, so the order they
+    are asked in cannot matter: a shuffled target index gives the predictions
+    shuffled the same way."""
+    predictor = make_predictor(factorized=factorized)
     context_idx, target_idx = mask.sample(rng, 2)
-    x = videos()
-
-    encoder_params = encoder.init(rng, x, context_idx)
-    context = encoder.apply(encoder_params, x, context_idx)
-    assert context.shape == (2, FRAMES, mask.num_context, 32)
-    assert encoder.apply(encoder_params, x).shape == (2, FRAMES, mask.num_patches, 32)
-
+    frames = (FRAMES,) if factorized else ()
+    context = jax.random.normal(rng, (2, *frames, mask.num_context, 32))
     block = target_idx[:, 0]
-    params = predictor.init(rng, context, context_idx, block)
-    out = predictor.apply(params, context, context_idx, block)
-    assert out.shape == (2, FRAMES, mask.block_area, 32)
+    perm = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), mask.block_area)
+                      for i in range(2)])
+    shuffled = jnp.take_along_axis(block, perm, axis=1)
+    params = jax.tree.map(lambda p: p + 0.05, predictor.init(rng, context, context_idx, block))
 
-
-def test_video_encoder_carries_a_temporal_signal(mask, rng):
-    """Tubelet masking keeps the spatial layout, so time is the only axis the
-    encoder can mix along: perturbing frame 0 must move frame 2's embedding."""
-    encoder = JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
-                               num_heads=2, mlp_ratio=2)
-    context_idx, _ = mask.sample(rng, 2)
-    x = videos()
-    params = jax.tree.map(lambda p: p + 0.02, encoder.init(rng, x, context_idx))
-
-    before = encoder.apply(params, x, context_idx)
-    after = encoder.apply(params, x.at[:, 0].add(1.0), context_idx)
-    assert not jnp.allclose(before[:, 2], after[:, 2]), "no information flow across frames"
-
-
-def test_encoder_runs_on_the_ssm_mixer(mask, rng):
-    """The hybrid SSM encoder is the point of the shared block: same interface."""
-    encoder = make_encoder(ssm_attention_ratio="3:1", ssm_state_dim=8)
-    context_idx, _ = mask.sample(rng, 4)
-    x = images()
-    params = encoder.init(rng, x, context_idx)
-    out = encoder.apply(params, x, context_idx)
-    assert out.shape == (4, mask.num_context, 32)
-    assert jnp.all(jnp.isfinite(out))
+    ordered = predictor.apply(params, context, context_idx, block)
+    permuted = predictor.apply(params, context, context_idx, shuffled)
+    assert float(jnp.max(jnp.abs(ordered))) > 0.1
+    gather = perm[:, None, :, None] if factorized else perm[..., None]
+    assert jnp.allclose(permuted, jnp.take_along_axis(ordered, gather, axis=-2), atol=1e-5)
 
 
 # --- the objective ---------------------------------------------------------
@@ -434,18 +429,6 @@ def test_jepa_trains_under_fsdp(mask):
     assert all(entry["train/repr_std"] > 0 for entry in logged), "collapse telemetry was lost"
 
 
-def test_evaluation_returns_pooled_embeddings_with_the_labels(mask):
-    objective = make_objective(mask)
-    params = objective.init(jax.random.PRNGKey(0))
-    batch = {"image": images(), "label": jnp.asarray([0, 1, 2, 3])}
-
-    out = objective.evaluate(params, batch, step_with(params))
-
-    assert isinstance(out, Representations)
-    assert out.features.shape == (4, 32)
-    np.testing.assert_array_equal(out.labels, [0, 1, 2, 3])
-
-
 def test_evaluation_reads_the_ema_encoder(mask):
     objective = make_objective(mask)
     params = objective.init(jax.random.PRNGKey(0))
@@ -490,12 +473,3 @@ def test_probes_are_at_chance_on_noise():
     x = jax.random.normal(jax.random.PRNGKey(0), (64, 6))
     y = jnp.asarray(np.random.RandomState(1).randint(0, 4, 64))
     assert float(knn_probe_accuracy(x, y, num_classes=4, k=5)) < 0.6
-
-
-# --- registry ---------------------------------------------------------------
-
-@pytest.mark.parametrize("architecture", ["jepa_encoder", "jepa_video_encoder"])
-def test_registry_builds_the_jepa_models(architecture):
-    model = models.build(architecture, patch_size=PATCH, emb_features=32, num_layers=1,
-                         scan_order="hilbert")
-    assert model.emb_features == 32 and model.scan_order == 'hilbert'

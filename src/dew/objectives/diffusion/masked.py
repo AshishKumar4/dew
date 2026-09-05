@@ -14,7 +14,7 @@ weights, which is the text a reader can judge.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +29,9 @@ from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
+if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
 TEXT_KEY = "text"
 
 
@@ -40,13 +43,13 @@ class MaskedDiffusionObjective(Objective):
 
     def __init__(
         self,
-        model,
+        model: CausalTransformer,
         process: DiscreteProcess,
         seq_len: int,
         *,
         head_chunks: int = 4,
         ema_decay: float = 0.999,
-        sampler=Unmask(),
+        sampler: Unmask = Unmask(),
         steps: int = 64,
         samples: int = 4,
         decode: Optional[Callable[[Sequence[int]], str]] = None,

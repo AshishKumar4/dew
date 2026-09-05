@@ -30,6 +30,7 @@ from typing import Dict, Tuple
 import jax
 import jax.numpy as jnp
 import optax
+from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
@@ -89,8 +90,8 @@ class JepaObjective(Objective):
 
     def __init__(
         self,
-        encoder,
-        predictor,
+        encoder: nn.Module,
+        predictor: nn.Module,
         mask: MultiBlockMask,
         sample: Field,
         momentum: Tuple[float, float] = (0.996, 1.0),
@@ -121,9 +122,11 @@ class JepaObjective(Objective):
         return {"params": {CONTEXT_ENCODER: encoder["params"],
                            PREDICTOR: predictor["params"]}}
 
-    def encode(self, encoder_params, data, token_idx=None, train=False, rngs=None):
-        return self.encoder.apply({"params": encoder_params}, data, token_idx,
-                                  train=train, rngs=rngs)
+    def encode(self, encoder_params, data, token_idx=None, train=False, rngs=None) -> jax.Array:
+        features = self.encoder.apply({"params": encoder_params}, data, token_idx,
+                                      train=train, rngs=rngs)
+        assert not isinstance(features, tuple)  # no mutable collections were asked for
+        return features
 
     def _target_params(self, step: Step):
         """The target encoder's parameters: the EMA copy of the context encoder.
@@ -163,7 +166,9 @@ class JepaObjective(Objective):
             jnp.repeat(context_idx, num_targets, axis=0),
             target_idx.reshape(batch_size * num_targets, -1),
             train=True, rngs={"dropout": dropout_key},
-        ).reshape(targets.shape)
+        )
+        assert not isinstance(predictions, tuple)  # no mutable collections were asked for
+        predictions = predictions.reshape(targets.shape)
 
         loss = jnp.mean(
             (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2)

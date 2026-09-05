@@ -21,15 +21,13 @@ class IdentityAutoEncoder(AutoEncoder):
     def __init__(self, latent_shift=0.0, latent_scale=1.0):
         self.latent_shift = latent_shift
         self.latent_scale = latent_scale
+        self.params = {}
 
     def encode_batch(self, params, x, key=None):
         return x
 
     def decode_batch(self, params, z):
         return z
-
-    def serialize(self):
-        return {}
 
 
 def test_latent_normalization_defaults_to_the_identity(rng):
