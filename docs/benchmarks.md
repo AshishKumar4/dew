@@ -115,7 +115,7 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \
 ```
 
 Tiny models on the simulated 8-device CPU mesh, for checking the tool itself
-rather than the hardware. `tests/test_architectures.py` runs one case of this
+rather than the hardware. `tests/test_benchmark_step.py` runs one case of this
 preset so the tool cannot rot against the trainer internals it drives.
 Utilisation and peak memory come back `null`: there is no published peak
 FLOP/s for a CPU and no allocator counter behind it.
