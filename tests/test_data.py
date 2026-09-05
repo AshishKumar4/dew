@@ -1,21 +1,17 @@
-"""Data layer tests: the registry, the Dataset contract, lazy imports, AV decoding.
+"""Data layer tests: the registry, the Dataset contract, lazy imports, the
+video specs and the determinism of what a record becomes.
 
-The shared environment has no HF `datasets`, decord, pyav, moviepy or
-video_reader, which is the point of several of these tests: the grain paths and
-`import dew.data` must not need them. Anything that genuinely requires an
-optional dependency skips.
+`import dew.data` and the grain paths must not need the optional extras,
+which is the point of several of these tests. Anything that genuinely
+requires an optional dependency skips.
 """
 
 import dataclasses
-import hashlib
-import importlib.util
 import itertools
 import json
 import os
-import shutil
 import subprocess
 import sys
-import wave
 from pathlib import Path
 
 import cv2
@@ -31,7 +27,6 @@ from dew.data import Loading, images, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
-from dew.data.sources.audio_utils import _read_wav_mono, read_audio_ffmpeg
 from dew.data.sources.av_utils import choose_clip_start
 from dew.registry import datasets
 
@@ -80,7 +75,7 @@ def test_a_dataset_records_no_augmentation_mode_in_the_environment():
 
 
 # ---------------------------------------------------------------------------------
-# Lazy imports: the data layer must not drag in HF datasets / opencv / decord
+# Lazy imports: the data layer must not drag in HF datasets, opencv or moviepy
 # ---------------------------------------------------------------------------------
 
 def test_importing_dew_data_pulls_in_no_heavy_dependencies():
@@ -93,7 +88,7 @@ def test_importing_dew_data_pulls_in_no_heavy_dependencies():
     probe = (
         "import sys, dew.data;"
         "heavy = [m for m in ('datasets', 'cv2', 'albumentations', 'tensorflow_datasets',"
-        " 'decord', 'transformers', 'dew.data.online_loader', 'dew.inputs', 'dew.diffusion',"
+        " 'moviepy', 'transformers', 'dew.data.online_loader', 'dew.inputs', 'dew.diffusion',"
         " 'dew.sampling', 'wandb') if m in sys.modules];"
         "assert not heavy, heavy;"
         "from dew.registry import datasets;"
@@ -348,85 +343,6 @@ def test_each_process_reads_its_own_slice_of_the_validation_split(monkeypatch):
 
 
 # ---------------------------------------------------------------------------------
-# WAV decoding
-# ---------------------------------------------------------------------------------
-
-SAMPLE_RATE = 16000
-NUM_SAMPLES = 1000
-
-
-def _write_wav(path, samples, sample_rate=SAMPLE_RATE, channels=1, sample_width=2):
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(channels)
-        wav_file.setsampwidth(sample_width)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(samples.tobytes())
-
-
-def _tone(num_samples=NUM_SAMPLES):
-    return (np.sin(np.linspace(0, 40, num_samples)) * 20000).astype("<i2")
-
-
-def test_wav_decode_excludes_the_riff_header(tmp_path):
-    """A flat int16 read of the file counts the 44-byte header as 22 samples."""
-    samples = _tone()
-    path = tmp_path / "tone.wav"
-    _write_wav(path, samples)
-
-    audio = _read_wav_mono(str(path))
-
-    assert len(audio) == NUM_SAMPLES
-    assert len(np.fromfile(path, np.int16)) == NUM_SAMPLES + 22  # what the flat read gives
-    assert audio.dtype == np.float32
-    np.testing.assert_allclose(audio, samples / 32768.0, atol=1e-7)
-
-
-def test_wav_decode_averages_stereo_to_mono(tmp_path):
-    left = _tone()
-    right = -left
-    interleaved = np.empty(2 * NUM_SAMPLES, dtype="<i2")
-    interleaved[0::2], interleaved[1::2] = left, right
-    path = tmp_path / "stereo.wav"
-    _write_wav(path, interleaved, channels=2)
-
-    audio = _read_wav_mono(str(path))
-
-    assert len(audio) == NUM_SAMPLES
-    np.testing.assert_allclose(audio, np.zeros(NUM_SAMPLES), atol=1e-7)
-
-
-def test_wav_decode_rejects_unsupported_sample_widths(tmp_path):
-    path = tmp_path / "24bit.wav"
-    _write_wav(path, np.zeros(3 * NUM_SAMPLES, dtype=np.uint8), sample_width=3)
-    with pytest.raises(ValueError, match="sample width"):
-        _read_wav_mono(str(path))
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs the ffmpeg binary")
-def test_read_audio_ffmpeg_returns_the_exact_sample_count(tmp_path):
-    samples = _tone()
-    path = tmp_path / "tone.wav"
-    _write_wav(path, samples)
-
-    audio, sample_rate = read_audio_ffmpeg(str(path), target_sr=SAMPLE_RATE)
-
-    assert sample_rate == SAMPLE_RATE
-    assert audio.dtype == np.float32
-    assert len(audio) == NUM_SAMPLES
-    np.testing.assert_allclose(audio, samples / 32768.0, atol=1e-4)
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs the ffmpeg binary")
-def test_read_audio_ffmpeg_honours_start_and_duration(tmp_path):
-    _write_wav(tmp_path / "tone.wav", _tone())
-
-    audio, _ = read_audio_ffmpeg(str(tmp_path / "tone.wav"), start_time=0.01,
-                                 duration=0.02, target_sr=SAMPLE_RATE)
-
-    assert len(audio) == int(0.02 * SAMPLE_RATE)
-
-
-# ---------------------------------------------------------------------------------
 # Clip sampling uses a local RNG
 # ---------------------------------------------------------------------------------
 
@@ -520,61 +436,45 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
 
 
 def test_voxceleb2_records_flow_through_the_audio_video_transform(tmp_path, monkeypatch):
-    """End to end with the AV reader and audio model stubbed out: the parts that
-    need decord/pyav/wav2vec2 weights are exactly the parts we fake."""
+    """End to end with the reader stubbed and the audio model's extractor
+    built here, so its weights are the only thing not real. The extractor
+    takes the padded waveform whole and normalises it as one clip, which is
+    what the audio condition receives; handed the rows instead, wav2vec2's
+    extractor read each frame's 640 samples as a clip of its own and the
+    record kept the first, a frame of padding."""
+    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
+
     _voxceleb_tree(tmp_path)
     spec = VoxCeleb2(path=str(tmp_path), prompt_template="a video of {identity}",
                      frame_size=32, frames=4, audio_padding=1)
     records = spec.source()
-
     frame_samples = 640
     seen = {}
 
-    def fake_read_av_random_clip(video_path, num_frames, audio_frame_padding, random_seed):
+    def fake_read_av_random_clip(video_path, *, num_frames, audio_padding, seed):
         seen.update(video_path=video_path, num_frames=num_frames,
-                    audio_frame_padding=audio_frame_padding, random_seed=random_seed)
-        padded = num_frames + 2 * audio_frame_padding
-        full_audio = np.zeros((padded, frame_samples), dtype=np.float32)
-        framewise = np.zeros((1, num_frames, 1, frame_samples), dtype=np.float32)
+                    audio_padding=audio_padding, seed=seed)
+        padded = num_frames + 2 * audio_padding
+        audio = np.linspace(-0.5, 0.5, padded * frame_samples, dtype=np.float32)
         # Native resolution differs from frame_size, so the resize must happen
-        frames = np.zeros((num_frames, 96, 48, 3), dtype=np.uint8)
-        return framewise, full_audio, frames
-
-    class FakeAudioProcessor:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __call__(self, audio):
-            return {"input_values": np.asarray(audio)[None, ...]}
+        return np.zeros((num_frames, 96, 48, 3), np.uint8), audio.reshape(padded, frame_samples)
 
     monkeypatch.setattr(av_utils, "read_av_random_clip", fake_read_av_random_clip)
-    monkeypatch.setattr(video, "AutoAudioProcessor", FakeAudioProcessor)
+    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
+                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
 
     batch = video.AudioVideoTransform(spec).random_map(records[0], np.random.default_rng(0))
 
     assert seen["video_path"] == records[0]["video_path"]
-    assert seen["num_frames"] == 4 and seen["audio_frame_padding"] == 1
-    assert batch["video"].shape == (4, 32, 32, 3)          # resized to frame_size
+    assert seen["num_frames"] == 4 and seen["audio_padding"] == 1
+    assert seen["seed"] == int(np.random.default_rng(0).integers(0, 2**32 - 1))
+    assert batch["video"].shape == (4, 32, 32, 3)
     assert batch["caption"] == "a video of id00012"
-    assert batch["audio"]["full_audio"].shape == (6, frame_samples)
-    assert batch["audio"]["framewise_audio"].shape == (1, 4, 1, frame_samples)
-    assert batch["audio"]["input_values"].shape == (6, frame_samples)
-
-
-# ---------------------------------------------------------------------------------
-# Moved scripts
-# ---------------------------------------------------------------------------------
-
-def test_av_benchmark_script_imports_against_the_real_av_utils():
-    """The script imports only names av_utils defines."""
-    script = REPO_ROOT / "tools" / "av_benchmark.py"
-    spec = importlib.util.spec_from_file_location("av_benchmark_under_test", script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    assert callable(module.benchmark_av_reading)
-    assert callable(module.read_av_improved)
-    assert not (REPO_ROOT / "src" / "dew" / "data" / "sources" / "av_example.py").exists()
+    waveform = batch["audio"]["full_audio"]
+    assert waveform.shape == (6, frame_samples) and waveform[0, 0] == -0.5
+    flat = waveform.reshape(-1)
+    normalised = (flat - flat.mean()) / np.sqrt(flat.var() + 1e-7)
+    assert np.allclose(batch["audio"]["input_values"], normalised, atol=1e-5)
 
 
 def keep_captions(captions):

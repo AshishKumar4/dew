@@ -4,9 +4,10 @@ A record is a video file and a caption; the transform reads `frames` frames
 from a random offset with the audio around them, resizes the frames and
 featurises the audio for the audio model. Records leave as
 `{"video": uint8 [frames, size, size, 3], "caption": str, "audio": {...}}`,
-with the audio model's own feature keys next to the raw waveforms;
+where the audio dict holds the audio model's own feature keys next to
+`full_audio`, the padded waveform cut into one row per frame;
 `load(tokenize=)` is where a run's condition reads the captions. The AV
-readers and the audio processor are imported on use.
+reader and the audio processor are imported on use.
 """
 
 from __future__ import annotations
@@ -44,30 +45,26 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 
     def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
-        # cv2 comes in with the reader, on the first record rather than on import.
+        # moviepy comes in with the reader, on the first record rather than on import.
         from .sources.av_utils import read_av_random_clip
-        framewise_audio, full_audio, frames = read_av_random_clip(
-            element["video_path"],
-            num_frames=self.spec.frames,
-            audio_frame_padding=self.spec.audio_padding,
-            random_seed=int(rng.integers(0, 2**32 - 1)),
-        )
+        frames, audio = read_av_random_clip(
+            element["video_path"], num_frames=self.spec.frames,
+            audio_padding=self.spec.audio_padding, seed=int(rng.integers(0, 2**32 - 1)))
         size = self.spec.frame_size
         if frames.shape[1] != size or frames.shape[2] != size:
             import cv2
             frames = np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
                                for frame in frames])
-        # Key names differ per audio model, so the processor's output passes
-        # through untouched.
-        features = self.audio(full_audio)
+        # The extractor takes one waveform and hands back a batch of one;
+        # given the rows it would read each frame's 640 samples as a clip
+        # of its own. Key names differ per audio model, so its output
+        # passes through untouched.
+        features = self.audio(audio.reshape(-1))
         return {
             "video": frames,
             CAPTION: element["caption"],
-            "audio": {
-                **{key: value[0] for key, value in features.items()},
-                "full_audio": full_audio,
-                "framewise_audio": framewise_audio,
-            },
+            "audio": {**{key: value[0] for key, value in features.items()},
+                      "full_audio": audio},
         }
 
 
