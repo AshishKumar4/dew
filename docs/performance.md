@@ -73,8 +73,10 @@ behind. The device step is 6.9 ms.
 So on the smallest step the host is at 94% of the device with a fresh
 batch every step, and 106% without command buffers. Two things follow.
 The `Compiled.__call__` Python (4.5 us a leaf, 396 leaves here, more on a
-mesh) is why `Trainer.compile` returns the jitted step since `de6b22c`:
-wall time on this card does not move, host time drops by 1.8 ms a step.
+mesh) is why `Trainer.compile` returns the jitted step since `de6b22c`
+(wrapped in the mesh context since the sequence axis landed, 32 us a
+dispatch either way on the i9-12900K): wall time on this card does not
+move, host time drops by 1.8 ms a step.
 And the 1.5 ms a fresh batch costs over a fixed one is the command buffer
 being updated for the new buffer addresses; it caps how far the loop runs
 ahead (7 steps against 27) and would be the wall clock on a faster card or
@@ -97,7 +99,7 @@ the owner's nine; a row names the cost it found and what was done.
 
 | class | site | what was measured | verdict |
 |---|---|---|---|
-| 1 sync in hot paths | `training/trainer.py` `fit`, per-step `loss.astype`, `interval_loss + loss`, `jnp.where(finite, ...)`, `bad_run + 1`, `jnp.maximum` | `jax_log_compiles` over a 50-step fit: five one-op executables compiled and dispatched eagerly every step, no host sync; wall cost not measured | left, reported to the trainer's owner as a candidate |
+| 1 sync in hot paths | `training/trainer.py` `fit`, per-step `loss.astype`, `interval_loss + loss`, `jnp.where(finite, ...)`, `bad_run + 1`, `jnp.maximum` | `jax_log_compiles` over a 50-step fit: five one-op executables compiled and dispatched eagerly every step, no host sync; 176 us a step on the CPU backend of the i9-12900K | fixed on `systems/parallelism`: one jitted `bookkeep`, 37 us a step, a Regression fit from 756 to 702 us a step |
 | 1 sync in hot paths | `jax.stages.Compiled.__call__` in `Trainer.compile` | 1.8 ms/step of Python at 396 leaves (table above) | fixed on main in `de6b22c` (jit dispatch) |
 | 2 recompilation | `Trainer.fit` with evaluation every 25 of 50 steps, diffusion and LM objectives | one `jit(step)`, one `jit(initial_state)`, one evaluation executable (`_sample_impl`, `scored`); no per-step or per-eval retrace | none found |
 | 3 baked constants | the compiled step's optimized HLO | simple_dit: 20 constants, 0.19 MiB, the largest the 2D sincos table bf16[256, 384]; causal_transformer: none | none found; the encoder's table moved into the state before this pass |
