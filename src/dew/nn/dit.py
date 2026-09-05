@@ -10,6 +10,7 @@ module owns the sandwich; the model files just arrange blocks.
 """
 
 import inspect
+import math
 
 import jax
 import jax.numpy as jnp
@@ -18,17 +19,20 @@ from flax import struct
 from typing import Optional, Sequence
 from flax.typing import Dtype, PrecisionLike
 
+from .attention import NormalAttention, rotary_freqs
 from .blocks import FourierEmbedding, TimeProjection
 from .sharding import logical_axes
-from .vit import PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams, unpatchify
 from .ssm import S5Layer, BidirectionalS5Layer, SpatialFusionConv
 from .scan_orders import (
     hilbert_indices, inverse_permutation, hilbert_patchify, hilbert_unpatchify,
-    zigzag_indices, zigzag_patchify,
+    zigzag_indices, zigzag_patchify, unpatchify,
     build_2d_sincos_pos_embed,
 )
 
 SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
+
+# The rotary base every model here rotates with, RoFormer's.
+ROPE_THETA = 10000.0
 
 
 @struct.dataclass
@@ -80,6 +84,53 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
     return (unit * (num_layers // len(unit) + 1))[:num_layers]
 
 
+class PatchEmbedding(nn.Module):
+    """Non-overlapping `patch_size` patches through one convolution, as a
+    row-major token sequence `[B, H_P * W_P, embedding_dim]`."""
+    patch_size: int
+    embedding_dim: int
+    dtype: Optional[Dtype] = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, x):
+        batch, height, width, channels = x.shape
+        assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
+
+        x = nn.Conv(features=self.embedding_dim,
+                    kernel_size=(self.patch_size, self.patch_size),
+                    strides=(self.patch_size, self.patch_size),
+                    dtype=self.dtype,
+                    precision=self.precision)(x)
+        return jnp.reshape(x, (batch, -1, self.embedding_dim))
+
+
+@logical_axes({("ada_proj",): ("embed", "modulation")})
+class AdaLNParams(nn.Module):
+    """The six adaLN-Zero modulation vectors of one block, `[B, 1, 6 * features]`,
+    from the conditioning vector.
+
+    SiLU then a zero-init projection, as in the DiT paper: without the
+    nonlinearity every block's modulation would be an affine map of the same
+    shared vector, and the zero init makes every block the identity at start.
+    """
+    features: int
+    dtype: Optional[Dtype] = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, conditioning):
+        if conditioning.ndim == 2:
+            conditioning = jnp.expand_dims(conditioning, axis=1)
+        return nn.Dense(
+            features=6 * self.features,
+            dtype=self.dtype,
+            precision=self.precision,
+            kernel_init=nn.initializers.zeros,
+            name="ada_proj"
+        )(nn.silu(conditioning))
+
+
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")},
               heuristic=(("hilbert_projection",),))
 class PatchSequenceEmbed(nn.Module):
@@ -105,7 +156,8 @@ class PatchSequenceEmbed(nn.Module):
                 name="patch_embed",
             )
         else:
-            # Raw patch extraction + Dense instead of the Conv-based embedding
+            # The patches arrive already permuted, so a dense projection of
+            # the raw pixels replaces the strided convolution.
             self.scan_proj = nn.Dense(
                 features=self.emb_features,
                 dtype=self.dtype,
@@ -129,7 +181,6 @@ class PatchSequenceEmbed(nn.Module):
         else:
             tokens = self.patch_embed(x)
 
-        # Fixed 2D sincos position embedding (order-invariant spatial signal)
         pos_embed = scan_ordered_pos_embed(
             self.emb_features, H_P, W_P, self.scan_order)
         tokens = tokens + jnp.asarray(pos_embed, dtype=tokens.dtype)[None, :, :]
@@ -206,8 +257,7 @@ class PatchSequenceOutput(nn.Module):
 
         if inv_idx is not None:
             return hilbert_unpatchify(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
-        return unpatchify(x_out, channels=self.output_channels,
-                          H_P=H // self.patch_size, W_P=W // self.patch_size)
+        return unpatchify(x_out, self.patch_size, H, W, self.output_channels)
 
 
 def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
@@ -239,10 +289,10 @@ def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
 class ModulatedBlock(nn.Module):
     """adaLN-Zero modulated residual block with a pluggable token mixer.
 
-    mixer='attention' gives the standard DiT block (RoPE attention);
-    mixer='ssm' replaces attention with a bidirectional S5 scan, optionally
-    followed by Spatial-Mamba style 2D state fusion. freqs_cis is unused by
-    the SSM mixer but kept in the interface so blocks are interchangeable.
+    mixer='attention' gives the standard DiT block, rotated by the `freqs_cis`
+    a call passes (None leaves the tokens unrotated); mixer='ssm' replaces
+    attention with a bidirectional S5 scan, optionally followed by
+    Spatial-Mamba style 2D state fusion, and ignores freqs_cis.
 
     modulated=False drops the adaLN-Zero conditioning path entirely, leaving a
     plain pre-norm residual block with learned affine norms - the ViT block a
@@ -250,7 +300,6 @@ class ModulatedBlock(nn.Module):
     """
     features: int
     num_heads: int
-    rope_emb: Optional[RotaryEmbedding] = None
     mixer: str = 'attention'
     modulated: bool = True
     mlp_ratio: int = 4
@@ -286,7 +335,7 @@ class ModulatedBlock(nn.Module):
             dtype=self.dtype, name="norm2")
 
         if self.mixer == 'attention':
-            self.attention = RoPEAttention(
+            self.attention = NormalAttention(
                 query_dim=self.features,
                 heads=self.num_heads,
                 dim_head=self.features // self.num_heads,
@@ -296,7 +345,6 @@ class ModulatedBlock(nn.Module):
                 qk_norm=self.qk_norm,
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
-                rope_emb=self.rope_emb,
             )
         else:
             ssm_cls = BidirectionalS5Layer if self.bidirectional_ssm else S5Layer
@@ -329,30 +377,18 @@ class ModulatedBlock(nn.Module):
         """Un-permute scan-ordered SSM output to a 2D grid, fuse, re-permute back."""
         B, S, F = ssm_output.shape
         # square patch grid; S is a static python int at trace time
-        import math
         H_P = math.isqrt(S)
         W_P = H_P
         assert H_P * W_P == S, (
             f"2D fusion requires a square patch grid; got S={S} which is not a "
             f"perfect square.")
 
-        # Index arrays are constant at JIT time so computing both directions is free
         scan_fwd = scan_indices(self.scan_order, H_P, W_P)
-        if scan_fwd is not None:
-            scan_inv = inverse_permutation(scan_fwd, S)
-            ssm_rm = ssm_output[:, scan_inv, :]
-        else:
-            ssm_rm = ssm_output
-
-        y_2d = ssm_rm.reshape(B, H_P, W_P, F)
-        y_fused_2d = self.spatial_fusion(y_2d)
-        y_fused_rm = y_fused_2d.reshape(B, S, F)
-
-        if scan_fwd is not None:
-            y_fused = y_fused_rm[:, scan_fwd, :]
-        else:
-            y_fused = y_fused_rm
-        return y_fused
+        if scan_fwd is None:
+            return self.spatial_fusion(ssm_output.reshape(B, H_P, W_P, F)).reshape(B, S, F)
+        row_major = ssm_output[:, inverse_permutation(scan_fwd), :]
+        fused = self.spatial_fusion(row_major.reshape(B, H_P, W_P, F)).reshape(B, S, F)
+        return fused[:, scan_fwd, :]
 
     @nn.compact
     def __call__(self, x, conditioning, freqs_cis, train: bool = False):
@@ -371,7 +407,7 @@ class ModulatedBlock(nn.Module):
         residual = x
         x_modulated = self.norm1(x) * (1 + scale_attn) + shift_attn
         if self.mixer == 'attention':
-            mixer_output = self.attention(x_modulated, context=None, freqs_cis=freqs_cis)
+            mixer_output = self.attention(x_modulated, freqs_cis=freqs_cis)
         else:
             mixer_output = self.ssm(x_modulated)
             if self.use_2d_fusion:
@@ -396,17 +432,11 @@ class ModulatedBlock(nn.Module):
         return x
 
 
-def identity_rope_freqs(seq_len: int, dim: int, dtype: Dtype = jnp.float32):
-    """RoPE frequencies that rotate by nothing, for sequences whose 1D index is
-    not a position (scan orders other than raster, masked token subsets)."""
-    shape = (seq_len, dim // 2)
-    return jnp.ones(shape, dtype=dtype), jnp.zeros(shape, dtype=dtype)
-
-
-def neutralized_rope_freqs(rope: RotaryEmbedding, seq_len: int, scan_order: str):
-    """RoPE frequencies for the sequence, neutralized to identity for
-    hilbert/zigzag scans where the 1D index is not a 2D position (the 2D
-    sincos embedding already carries position there)."""
+def rope_for_scan(seq_len: int, head_dim: int, scan_order: str):
+    """RoPE frequencies for a token sequence in `scan_order`: the rotation at
+    every index for raster, where the index is a position, and None for the
+    hilbert and zigzag orders, where it is not (the 2D sincos embedding
+    carries position there)."""
     if scan_order != 'raster':
-        return identity_rope_freqs(seq_len, rope.dim)
-    return rope(seq_len=seq_len)
+        return None
+    return rotary_freqs(jnp.arange(seq_len), head_dim, ROPE_THETA)

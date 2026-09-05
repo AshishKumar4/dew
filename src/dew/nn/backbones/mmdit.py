@@ -1,15 +1,11 @@
 """
 MM-DiT (SD3-style multi-modal DiT) and a hierarchical variant.
 
-The block is a true dual-stream MM-DiT: text and image tokens keep separate
+The block is a dual-stream MM-DiT: text and image tokens keep separate
 qkv/mlp/modulation weights and mix through a single joint attention over the
-concatenated sequence. The previous implementation mean-pooled the text into
-the adaLN vector (text never entered the token sequence) and ran attention
-and MLP in parallel off one norm, which roughly halved the effective depth -
-it was a text-modulated DiT, not an MM-DiT.
+concatenated sequence.
 """
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional, Sequence, Literal
@@ -17,11 +13,10 @@ import einops
 from flax.typing import Dtype, PrecisionLike
 
 from ..dit import (
-    PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    neutralized_rope_freqs, remat_block,
+    ROPE_THETA, AdaLNParams, PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
+    rope_for_scan, remat_block,
 )
-from ..attention import scaled_dot_product_attention
-from ..vit import RotaryEmbedding, AdaLNParams, apply_rotary_embedding
+from ..attention import apply_rotary, rotary_freqs, scaled_dot_product_attention
 from dew.registry import models
 from ..sharding import logical_axes
 
@@ -115,12 +110,8 @@ class MMDiTBlock(nn.Module):
         # RoPE carries 2D position for image tokens only
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
-            q_i = einops.rearrange(q_i, 'b s h d -> b h s d')
-            k_i = einops.rearrange(k_i, 'b s h d -> b h s d')
-            q_i = apply_rotary_embedding(q_i, freqs_cos, freqs_sin)
-            k_i = apply_rotary_embedding(k_i, freqs_cos, freqs_sin)
-            q_i = einops.rearrange(q_i, 'b h s d -> b s h d')
-            k_i = einops.rearrange(k_i, 'b h s d -> b s h d')
+            q_i = apply_rotary(q_i, freqs_cos, freqs_sin)
+            k_i = apply_rotary(k_i, freqs_cos, freqs_sin)
 
         q = jnp.concatenate([q_t, q_i], axis=1)
         k = jnp.concatenate([k_t, k_i], axis=1)
@@ -185,8 +176,6 @@ class SimpleMMDiT(nn.Module):
         self.txt_embed = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="txt_embed")
-        self.rope = RotaryEmbedding(
-            dim=self.emb_features // self.num_heads, max_seq_len=4096, dtype=self.dtype)
         self.blocks = [
             remat_block(MMDiTBlock, self.remat)(
                 features=self.emb_features,
@@ -219,7 +208,8 @@ class SimpleMMDiT(nn.Module):
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = neutralized_rope_freqs(self.rope, img.shape[1], self.scan_order)
+        freqs_cis = rope_for_scan(img.shape[1], self.emb_features // self.num_heads,
+                                  self.scan_order)
 
         for block in self.blocks:
             img, txt = block(img, txt, cond_emb, freqs_cis, train)
@@ -229,39 +219,29 @@ class SimpleMMDiT(nn.Module):
 
 @logical_axes({}, heuristic=(("projection",),))
 class PatchMerging(nn.Module):
-    """
-    Merges a group of patches into a single patch with increased feature dimensions.
-    Used in the hierarchical structure to reduce spatial resolution and increase channels.
-    """
+    """Merges each 2x2 group of patches into one token of `out_features`,
+    halving the grid on the way down: a Swin-style layer norm over the
+    concatenated group, then a projection."""
     out_features: int
-    merge_size: int = 2  # Default 2x2 patch merging
+    merge_size: int = 2
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
-    norm_epsilon: float = 1e-5  # Add norm for stability like in Swin Transformer
+    norm_epsilon: float = 1e-5
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        # x shape: [B, H*W, C]
         B, L, C = x.shape
         assert L == H_patches * \
             W_patches, f"Input length {L} doesn't match {H_patches}*{W_patches}"
         assert H_patches % self.merge_size == 0 and W_patches % self.merge_size == 0, f"Patch dimensions ({H_patches}, {W_patches}) not divisible by merge size {self.merge_size}"
 
-        # Reshape to [B, H, W, C]
         x = x.reshape(B, H_patches, W_patches, C)
-
-        # Merge patches - rearrange to group nearby patches
         merged = einops.rearrange(
             x,
             'b (h p1) (w p2) c -> b h w (p1 p2 c)',
             p1=self.merge_size, p2=self.merge_size
         )
-
-        # Apply LayerNorm before projection (common practice)
-        norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
-        merged = norm(merged) # Apply norm on [B, H/p, W/p, p*p*C]
-
-        # Project to new dimension
+        merged = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
             features=self.out_features,
             dtype=self.dtype,
@@ -269,7 +249,6 @@ class PatchMerging(nn.Module):
             name="projection"
         )(merged)
 
-        # Flatten back to sequence
         new_H = H_patches // self.merge_size
         new_W = W_patches // self.merge_size
         merged = merged.reshape(B, new_H * new_W, self.out_features)
@@ -278,46 +257,36 @@ class PatchMerging(nn.Module):
 
 @logical_axes({}, heuristic=(("projection",),))
 class PatchExpanding(nn.Module):
-    """
-    Expands patches to increase spatial resolution.
-    Used in the hierarchical structure decoder path.
-    """
+    """Expands each token into a 2x2 group of `out_features` tokens, doubling
+    the grid on the way up: a projection to the group's width, a layer norm,
+    then the rearrangement."""
     out_features: int
-    expand_size: int = 2  # Default 2x2 patch expansion
+    expand_size: int = 2
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
-    norm_epsilon: float = 1e-5 # Add norm for stability
+    norm_epsilon: float = 1e-5
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        # x shape: [B, H*W, C]
         B, L, C = x.shape
         assert L == H_patches * W_patches, f"Input length {L} doesn't match {H_patches}*{W_patches}"
 
-        # Project to expanded dimension first
         expanded_features = self.expand_size * self.expand_size * self.out_features
         x = nn.Dense(
             features=expanded_features,
             dtype=self.dtype,
             precision=self.precision,
             name="projection"
-        )(x) # Shape [B, L, P*P*C_out]
+        )(x)
+        x = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
 
-        # Apply LayerNorm after projection
-        norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
-        x = norm(x)
-
-        # Reshape to spatial grid before rearranging
         x = x.reshape(B, H_patches, W_patches, expanded_features)
-
-        # Rearrange to expand spatial dims
         expanded = einops.rearrange(
             x,
             'b h w (p1 p2 c) -> b (h p1) (w p2) c',
             p1=self.expand_size, p2=self.expand_size, c=self.out_features
         )
 
-        # Flatten back to sequence
         new_H = H_patches * self.expand_size
         new_W = W_patches * self.expand_size
         expanded = expanded.reshape(B, new_H * new_W, self.out_features)
@@ -377,12 +346,6 @@ class HierarchicalMMDiT(nn.Module):
         self.txt_embeds = [
             nn.Dense(features=self.emb_features[i], dtype=self.dtype,
                      precision=self.precision, name=f"txt_embed_stage{i}")
-            for i in range(num_stages)
-        ]
-        self.ropes = [
-            RotaryEmbedding(
-                dim=self.emb_features[i] // self.num_heads[i],
-                max_seq_len=4096, dtype=self.dtype, name=f"rope_stage_{i}")
             for i in range(num_stages)
         ]
 
@@ -462,7 +425,9 @@ class HierarchicalMMDiT(nn.Module):
         H_P, W_P = H // self.base_patch_size, W // self.base_patch_size
         skips = {}
         for stage in range(num_stages):
-            freqs_cis = self.ropes[stage](seq_len=img.shape[1])
+            freqs_cis = rotary_freqs(
+                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
+                ROPE_THETA)
             txt = txts[stage]
             for block in self.encoder_blocks[stage]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)
@@ -474,7 +439,9 @@ class HierarchicalMMDiT(nn.Module):
         for i, stage in enumerate(range(num_stages - 2, -1, -1)):
             img, H_P, W_P = self.patch_expanders[i](img, H_P, W_P)
             img = self.fusion_layers[i](jnp.concatenate([img, skips[stage]], axis=-1))
-            freqs_cis = self.ropes[stage](seq_len=img.shape[1])
+            freqs_cis = rotary_freqs(
+                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
+                ROPE_THETA)
             txt = txts[stage]
             for block in self.decoder_blocks[i]:
                 img, txt = block(img, txt, conds[stage], freqs_cis, train)

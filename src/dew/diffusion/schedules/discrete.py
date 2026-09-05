@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .common import NoiseScheduler
 
@@ -14,15 +15,11 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     times the x_0 error) is exactly an unweighted x_0 loss.
     """
 
-    def __init__(self, timesteps: int, beta_start: float, beta_end: float, schedule_fn,
+    def __init__(self, betas: np.ndarray,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
-        self.T = timesteps
-        betas = schedule_fn(timesteps, beta_start, beta_end)
-        alphas = 1 - betas
-        alpha_cumprod = jnp.cumprod(alphas, axis=0)
+        self.T = len(betas)
+        alpha_cumprod = jnp.cumprod(1 - betas, axis=0)
 
-        self.betas = jnp.array(betas, dtype=jnp.float32)
-        self.alphas = alphas.astype(jnp.float32)
         self.alpha_cumprod = alpha_cumprod.astype(jnp.float32)
         self.sqrt_alpha_cumprod = jnp.sqrt(alpha_cumprod).astype(jnp.float32)
         self.sqrt_one_minus_alpha_cumprod = jnp.sqrt(1 - alpha_cumprod).astype(jnp.float32)

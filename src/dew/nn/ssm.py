@@ -1,7 +1,6 @@
 """
 S5 state-space layers (diagonal SSM with associative_scan, HiPPO init) and the
-Spatial-Mamba style 2D state fusion conv. Extracted from ssm_dit.py so the
-shared DiT block can use them without importing the full hybrid model.
+Spatial-Mamba style 2D state fusion conv, the SSM mixer of `ModulatedBlock`.
 """
 
 import jax

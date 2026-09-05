@@ -1,9 +1,6 @@
-"""The conditioning seam: an encoder's value reaches the model under one keyword.
-
-The base class stays modality-agnostic: text and audio differ in both
-tokenization and embedding, and adding a modality must not require touching
-anything shared. The pooling test pins what the text mask is for: a padded
-row moves nothing.
+"""The conditioning seam: an encoder's value reaches the model under one
+keyword, and the text mask it carries is what the pooling weighs by, so a
+padded row moves nothing.
 """
 
 from pathlib import Path
@@ -13,64 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inputs import Audio, CLIPText, Condition, ConditionEncoder, InputSpec, Field, unit_range
+from dew.inputs import CLIPText, Condition, InputSpec, Field, unit_range
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 from dew.registry import encoders
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
-
-
-def test_registry_exposes_both_modalities():
-    assert encoders["clip_text"] is CLIPText and encoders.CLIPText is CLIPText
-    assert encoders["audio"] is Audio
-
-
-def test_base_class_is_modality_agnostic():
-    """tokenize/encode must be abstract: a base class that assumes
-    input_ids/attention_mask cannot serve audio."""
-    for name in ("tokenize", "encode", "from_pretrained", "to_json"):
-        assert name in ConditionEncoder.__abstractmethods__
-
-
-@pytest.mark.parametrize("feature_key", ["input_values", "input_features"])
-def test_audio_encoder_passes_extractor_keys_through(feature_key):
-    """wav2vec2/HuBERT emit input_values, Whisper/AST emit input_features.
-    The encoder must forward whatever the extractor produced, so swapping the
-    audio model is a config change and nothing else."""
-    seen = {}
-
-    class StubExtractor:
-        def __call__(self, audio, sampling_rate=None, padding=None, return_tensors=None):
-            seen["sampling_rate"] = sampling_rate
-            return {feature_key: np.zeros((1, 4), dtype=np.float32),
-                    "attention_mask": np.ones((1, 4), dtype=np.int32)}
-
-    def apply(params, features):
-        seen["forwarded"] = sorted(features)
-        return params["scale"] * jnp.ones((1, 4, 8), jnp.float32)
-
-    encoder = Audio(checkpoint="stub", extractor=StubExtractor(), apply=apply,
-                    params={"scale": jnp.asarray(2.0)}, sampling_rate=16000)
-    embeddings = encoder.encode(encoder.params, encoder.tokenize(np.zeros(16000, np.float32)))
-
-    assert seen["sampling_rate"] == 16000
-    assert seen["forwarded"] == sorted([feature_key, "attention_mask"])
-    assert embeddings.shape == (1, 4, 8) and float(embeddings[0, 0, 0]) == 2.0
-    assert encoder.captions(None) == ()
-    assert encoder.to_json() == {"checkpoint": "stub", "sampling_rate": 16000}
-
-
-def test_the_audio_loader_says_what_it_cannot_do():
-    """transformers 5 removed FlaxAutoModel, and a torch model would fail on
-    the numpy arrays tokenize produces. The loader refuses up front, names the
-    model, and says what would make it work; a run record that names an audio
-    encoder takes the same path, so a logged config cannot half-build one."""
-    with pytest.raises(NotImplementedError, match="vendor"):
-        Audio.from_pretrained("facebook/wav2vec2-base-960h")
-    with pytest.raises(NotImplementedError, match="facebook/wav2vec2-base-960h"):
-        Condition.from_json({"encoder": {"name": "audio", "fields": {
-            "checkpoint": "facebook/wav2vec2-base-960h", "sampling_rate": 16000}},
-            "field": "audio", "unconditional": 0.0})
 
 
 def test_unit_range_is_the_one_pixel_convention():

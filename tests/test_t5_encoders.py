@@ -121,6 +121,25 @@ def test_every_translated_leaf_is_load_bearing(path):
     assert difference > TOLERANCE, f"zeroed {'.'.join(path)} still matches: {difference:.3e}"
 
 
+def test_the_name_map_takes_the_encoder_and_refuses_the_rest():
+    """The decoder, the lm_head and the encoder's tied copy of the embedding
+    are not this tower and translate to nothing; a name the map cannot
+    explain raises, so a renamed upstream layout cannot load half a tower."""
+    from dew.nn.text_encoders import translate_t5_weights
+
+    beside_the_encoder = {
+        "encoder.embed_tokens.weight": np.zeros((4, 2), np.float32),
+        "decoder.block.0.layer.0.SelfAttention.q.weight": np.zeros((2, 2), np.float32),
+        "lm_head.weight": np.zeros((4, 2), np.float32),
+    }
+    assert translate_t5_weights(beside_the_encoder) == {}
+    with pytest.raises(ValueError, match="encoder.block.0.layer.0.SelfAttention.qkv"):
+        translate_t5_weights({"encoder.block.0.layer.0.SelfAttention.qkv.weight":
+                              np.zeros((2, 2), np.float32)})
+    with pytest.raises(ValueError, match="encoder.pooler.weight"):
+        translate_t5_weights({"encoder.pooler.weight": np.zeros((2, 2), np.float32)})
+
+
 @pytest.mark.network
 def test_the_real_checkpoint_matches_the_reference():
     """t5-small's encoder, fp32, from the checkpoint's own safetensors,
