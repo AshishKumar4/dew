@@ -24,6 +24,7 @@ from dew.artifacts import Representations
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.sharding import DECLARED, logical_axes
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import (
@@ -276,6 +277,18 @@ def test_a_declared_axis_that_cannot_name_a_parameter_is_an_error():
         "kernel": jax.ShapeDtypeStruct((8, 8, 8), jnp.float32)}}}
     with pytest.raises(ValueError, match="q_proj"):
         Layout(min_shard=1).shardings(build_mesh(MeshSpec(fsdp=2)), variables)
+
+
+def test_a_declaration_that_names_one_axis_twice_is_refused_where_it_is_written():
+    """flax assigns a mesh axis to a logical name at most once per array, so
+    a kernel declared ("embed", "embed") cannot be placed: the refusal has to
+    come at the decorator, not from Layout.shardings on the first sharded
+    mesh a run builds (the eh_proj declaration shipped that way)."""
+    with pytest.raises(ValueError, match="twice"):
+        @logical_axes({("fused_proj",): ("embed", "embed")})
+        class Fused(nn.Module):
+            pass
+    assert ("fused_proj",) not in DECLARED
 
 
 def test_rule_override_changes_only_declared_axes():
