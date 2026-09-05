@@ -111,8 +111,8 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
     return {**config.model.fields(), "max_seq_len": max_seq_len, "vocab_size": vocab_size}
 
 
-def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
-                    meta: dict):
+def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
+                    max_seq_len: int, meta: dict):
     """The decoder a --pretrained run continues, its variables and the fields
     it was built from.
 
@@ -126,28 +126,28 @@ def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
     """
     from dew.interop.hf_decoders import load_pretrained_decoder
 
-    overridden = sorted(set(config.model.config) - {"max_seq_len"})
+    overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
         raise ValueError(
             f"--model.config carries {overridden}, which the checkpoint at "
-            f"{config.pretrained} decides. Only max_seq_len is still a choice.")
+            f"{pretrained} decides. Only max_seq_len is still a choice.")
 
     model, variables, fields = load_pretrained_decoder(
-        config.pretrained,
-        dtype=config.model.dtype, attention_impl=config.model.attention_impl,
-        max_seq_len=config.model.config.get("max_seq_len", max_seq_len))
-    expected = checkpoint_tokenizer(config.pretrained)
+        pretrained,
+        dtype=model_config.dtype, attention_impl=model_config.attention_impl,
+        max_seq_len=model_config.config.get("max_seq_len", max_seq_len))
+    expected = checkpoint_tokenizer(pretrained)
     if meta["tokenizer"] != expected:
         raise ValueError(
             f"the token files were written with {meta['tokenizer']}, and "
-            f"{config.pretrained} expects {expected}. Retokenize with "
+            f"{pretrained} expects {expected}. Retokenize with "
             f"--tokenizer {expected}.")
     # A decoder's embedding table is usually padded past the tokenizer's ids
     # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
     # requirement, not matching the count.
     if model.vocab_size < vocab_size:
         raise ValueError(
-            f"{config.pretrained} has room for {model.vocab_size} ids and the "
+            f"{pretrained} has room for {model.vocab_size} ids and the "
             f"token files use {vocab_size}")
     return model, variables, fields
 
@@ -229,7 +229,8 @@ def main(config: LmRunConfig) -> TrainState:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        model, pretrained, fields = load_pretrained(config, vocab_size, context, meta)
+        model, pretrained, fields = load_pretrained(
+            config.pretrained, config.model, vocab_size, context, meta)
     objective = LMObjective(
         model,
         config.data.seq_len,
