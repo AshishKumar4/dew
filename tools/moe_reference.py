@@ -32,7 +32,7 @@ What lands in tests/fixtures/moe:
   block without it disagrees.
 
 The expert weights are written under `mlp.experts.N.gate_proj.weight` and its
-siblings, which is what the checkpoints hold: transformers 5.16.1 merges those
+siblings, the names the checkpoints hold: transformers 5.16.1 merges those
 into one `mlp.experts.gate_up_proj` tensor while loading
 (`transformers/core_model_loading.py:1545`), gate rows first, and this undoes
 that merge so the fixture is in the layout a translation into Dew reads.
@@ -121,7 +121,7 @@ MIXTRAL: MixtralFields = {
 
 # n_group of 4 over 8 experts leaves two per group, and topk_group of 2 makes
 # four of the eight reachable, which is exactly the top_k: a wrong group mask
-# changes which experts a token gets rather than only their order.
+# changes which experts a token gets, beyond their order.
 DEEPSEEK: DeepseekFields = {
     "hidden_size": HIDDEN, "moe_intermediate_size": EXPERT_HIDDEN, "n_routed_experts": 8,
     "num_experts_per_tok": 4, "n_group": 4, "topk_group": 2, "norm_topk_prob": True,
@@ -135,9 +135,9 @@ DEEPSEEK_V2: DeepseekV2Fields = {
     "n_group": 4, "topk_group": 2, "topk_method": "group_limited_greedy",
     "norm_topk_prob": False, "routed_scaling_factor": 2.5}
 
-# V4 sizes its experts by intermediate_size.
-# of scale 0.5 over 16 inputs clamps most gate and up values, which is what
-# makes the clamp observable at this size.
+# V4 sizes its experts by intermediate_size. A limit of 1.0 against weights
+# of scale 0.5 over 16 inputs clamps most gate and up values, so the clamp
+# is observable at this size.
 DEEPSEEK_V4: DeepseekV4Fields = {
     "hidden_size": HIDDEN, "intermediate_size": EXPERT_HIDDEN, "num_local_experts": 8,
     "num_experts_per_tok": 4, "scoring_func": "sqrtsoftplus", "swiglu_limit": 1.0,
@@ -166,7 +166,7 @@ def expert_tensors(experts: torch.nn.Module) -> dict[str, np.ndarray]:
 
     Every experts module here (Mixtral, DeepSeek V3 and V4) sits behind a
     class decorator that hides its attributes from a checker, so the two
-    parameters are read by name.
+    parameters are fetched by their paths.
     """
     gate_up = experts.get_parameter("gate_up_proj").detach().to(torch.float32).numpy()
     down = experts.get_parameter("down_proj").detach().to(torch.float32).numpy()

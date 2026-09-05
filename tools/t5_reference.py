@@ -52,9 +52,10 @@ TINY_PROMPTS = [
 def tiny_tokenizer() -> T5Tokenizer:
     """A T5 tokenizer over single characters, a few kilobytes of vocabulary.
 
-    The tokenizer splits words into characters when no longer piece matches,
-    so the printable ASCII characters plus the word-start marker tokenize any
-    of the prompts below. No extra ids: the tiny model has no sentinel use.
+    The tokenizer falls back to single characters where no multi-character
+    piece matches, so the printable ASCII characters plus the word-start
+    marker tokenize any of the prompts below. No extra ids: the tiny model
+    has no sentinel use.
     """
     pieces = ["<pad>", "</s>", "<unk>", "\u2581"]
     pieces += list(string.ascii_lowercase + string.digits + string.punctuation)

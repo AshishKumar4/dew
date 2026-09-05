@@ -93,7 +93,7 @@ class Case:
     packed_documents: int = 0
     """Set for language models: documents packed into every row, with the
     segment ids and positions the packed loader emits; 0 feeds a fixed
-    window, which is what a stream of tokens gives."""
+    window, the form a stream of tokens gives."""
     head_chunks: int | None = None
     """For language models, the vocabulary slices the loss scores a batch in;
     None is the objective's own default."""
@@ -171,8 +171,8 @@ def cpu_smoke_cases() -> list[Case]:
 def small_cases(dtype: str) -> list[Case]:
     """Every registry architecture at a size that fits one 16 GB card in bf16.
 
-    Sized so the whole sweep is minutes rather than hours: real token counts
-    (256 image tokens at 64px/patch 4) and real widths, but few layers.
+    Sized so the whole sweep takes minutes: real token counts (256 image
+    tokens at 64px/patch 4) and real widths, but few layers.
     """
     dit: dict[str, object] = {"patch_size": 4, "emb_features": 384, "num_layers": 6,
                               "num_heads": 6, "mlp_ratio": 4}
@@ -393,7 +393,7 @@ def parameter_count(params) -> int:
 # A kernel's category from the tokens of its name, first match wins: XLA
 # names its fusions after the ops they hold (`loop_convert_fusion`,
 # `input_add_reduce_fusion`, `gemm_fusion_dot`), cuDNN and cuBLAS after the
-# kernel family. Tokens rather than substrings, so `convert` is not `conv`.
+# kernel family. Whole tokens, not substrings, so `convert` is not `conv`.
 KERNEL_CATEGORIES = (
     ("attention", ("sdpa", "fmha", "flash")),
     ("conv", ("conv", "fprop", "dgrad", "wgrad", "implicit")),
@@ -494,8 +494,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         state, scale, loss, _, finite = compiled(state, scale, next(source))
         return state, scale, loss, finite
 
-    # At least one warm step, so the timed window never holds the first
-    # dispatch of the executable.
+    # At least one warm step, so the first dispatch of the executable is
+    # outside the timed window.
     state, scale, loss, is_finite = step(state, scale)
     for _ in range(config.warmup - 1):
         state, scale, loss, is_finite = step(state, scale)

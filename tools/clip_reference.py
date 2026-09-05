@@ -89,8 +89,8 @@ def tiny_tokenizer() -> CLIPTokenizer:
     merges every character stays its own token, so a vocabulary of the
     printable ASCII characters and their word-final forms tokenizes any of the
     prompts below without reaching for the unknown token. bos is 0 and eos 1,
-    both smaller than every character token, which is what makes the pooled row
-    of the eos branch differ from the row the argmax branch would take.
+    both smaller than every character token, so the pooled row of the eos
+    branch differs from the row the argmax branch would take.
     """
     characters = string.ascii_lowercase + string.digits + string.punctuation
     vocab = {"<|startoftext|>": 0, "<|endoftext|>": 1}
