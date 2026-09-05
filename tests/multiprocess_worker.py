@@ -570,9 +570,69 @@ def mode_tracked(args) -> dict:
             "step": int(as_numpy(state.step))}
 
 
+SEQ_LEN = 15
+VOCAB = 64
+
+
+def token_batch() -> np.ndarray:
+    """The global token batch the pipeline runs train on: BATCH rows of
+    SEQ_LEN + 1 ids."""
+    return np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)
+
+
+def pipeline_trainer(stage: int, microbatches, fsdp: int):
+    """A four-layer decoder on the stage axis, the same model and seed on
+    every topology."""
+    import jax
+    import optax
+    import dew.nn.backbones.causal_transformer  # registers the model built below
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec, Trainer
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
+                         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+    return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage, microbatches=microbatches),
+                   layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
+
+
+def pipeline_losses(trainer, rows, steps: int):
+    """`steps` steps of the compiled step over this process's `rows` of the
+    token batch, with the losses and the final parameters."""
+    from dew.training.distributed import shard_batch
+
+    state, _, _ = trainer.place()
+    batch = shard_batch(trainer.device_mesh, {"text": rows})
+    compiled = trainer.compile(state, batch)
+    losses = []
+    for _ in range(steps):
+        state, _, loss, _, _ = compiled(state, None, batch)
+        losses.append(float(loss))
+    return losses, state
+
+
+def mode_pipeline(args) -> dict:
+    """`--steps` steps of a two-stage pipeline in the pool: each process
+    holds its rows of the batch and half of every stage's devices."""
+    import jax
+
+    rows = BATCH // args.processes
+    mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
+    trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
+    losses, state = pipeline_losses(trainer, mine, args.steps)
+    dump_params(args.out.with_suffix(".npz"), state.params)
+    return {
+        "process_index": jax.process_index(),
+        "losses": losses,
+        "sharding": sharding_facts(state.params),
+        "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
-         "tracked": mode_tracked}
+         "tracked": mode_tracked, "pipeline": mode_pipeline}
 
 
 def parse_args(argv=None):
@@ -583,6 +643,8 @@ def parse_args(argv=None):
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--process-id", type=int, default=0)
     parser.add_argument("--fsdp-size", type=int, default=1)
+    parser.add_argument("--stage-size", type=int, default=1)
+    parser.add_argument("--microbatches", type=int)
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
     parser.add_argument("--steps", type=int, default=1)

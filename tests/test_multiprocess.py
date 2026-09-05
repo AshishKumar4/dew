@@ -208,7 +208,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["device_count"] == DEVICES
         assert report["local_device_count"] == DEVICES // 2
         assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
-                                        "tensor": 1, "sequence": 1}
+                                        "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == DEVICES
         assert report["mesh_process_indices"] == [0, 1]
 
@@ -221,7 +221,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
         assert report["process_index"] == index
         assert report["local_device_count"] == DEVICES // 4
         assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
-                                        "tensor": 1, "sequence": 1}
+                                        "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
 
@@ -380,6 +380,34 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
                            worker.params_dict(state.params))
 
 
+@pytest.mark.distributed
+def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
+    """A two-stage pipeline over a pool of two processes, each holding half
+    of every stage's devices, against this process running the same twenty
+    steps on the eight devices itself, pipelined and whole. Largest observed
+    difference on CPU: 4.8e-07 for the losses and 2.9e-06 for the
+    parameters, against a tolerance of rtol 2e-4 and atol 2e-5.
+    """
+    steps = 20
+    pool = run_pool("pipeline", tmp_path / "pool", 2, fsdp_size=2, stage_size=2,
+                    microbatches=4, steps=steps)
+
+    piped, piped_state = worker.pipeline_losses(
+        worker.pipeline_trainer(2, 4, 2), worker.token_batch(), steps)
+    whole, whole_state = worker.pipeline_losses(
+        worker.pipeline_trainer(1, None, 4), worker.token_batch(), steps)
+
+    assert len(pool[0]["losses"]) == steps
+    assert np.isfinite(pool[0]["losses"]).all(), "the pool diverged"
+    assert pool[0]["losses"] == pool[1]["losses"], "the processes disagreed with each other"
+    assert pool[0]["mesh_shape"]["stage"] == 2
+    np.testing.assert_allclose(pool[0]["losses"], piped, **PARITY)
+    np.testing.assert_allclose(pool[0]["losses"], whole, **PARITY)
+    assert pool[0]["sharding"]["fully_addressable"] == [False]
+    assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
+                           worker.params_dict(whole_state.params))
+
+
 # --------------------------------------------------------------------------
 # Checkpoints between topologies
 # --------------------------------------------------------------------------
@@ -422,7 +450,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     expected = dumped_params(tmp_path / "single.json")
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
-        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1}
+        assert report["mesh_shape"] == {"data": 2, "expert": 1, "fsdp": 4, "tensor": 1, "sequence": 1, "stage": 1}
         assert report["sharding"]["fully_addressable"] == [False]
         assert largest_difference(
             dumped_params(tmp_path / "pool" / f"process{index}.json"), expected) == 0.0
