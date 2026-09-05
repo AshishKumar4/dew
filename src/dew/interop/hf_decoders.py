@@ -502,6 +502,13 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     return config
 
 
+def _mistral_config(hf_config, used):
+    layers = int(hf_config['num_hidden_layers'])
+    window = hf_config.get('sliding_window')
+    return _base_config(hf_config, used, layer_types=(
+        'full_attention' if window is None else 'sliding_attention',) * layers)
+
+
 def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     return _base_config(hf_config, used, qk_norm=True,
                         layer_types=_qwen_layer_types(hf_config, used))
@@ -1320,6 +1327,10 @@ _FAMILY_ENTRIES = (
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
     DecoderFamily(('qwen3',), _qwen3_config, lambda model: model.qk_norm,
                   'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
+    DecoderFamily(('mistral',), _mistral_config,
+                  lambda model: all(model.kind_of(kind).window is not None
+                                    for kind in model.per_layer_types),
+                  'mistral', 'MistralForCausalLM', lambda model: {}),
     DecoderFamily(('llama',), _base_config, lambda model: True,
                   'llama', 'LlamaForCausalLM', lambda model: {}),
 )

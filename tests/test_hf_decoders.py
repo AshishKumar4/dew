@@ -8,6 +8,7 @@ whose logits are committed, so the comparison runs in CI without a download.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
+- mistral-tiny: max |logit difference| 6.44e-06, tolerance 1e-4.
 - qwen3-tiny  : max |logit difference| 8.3e-06, tolerance 1e-4
 - gemma3-tiny : max |logit difference| 3.3e-06, tolerance 1e-4
 - llama-tiny  : max |logit difference| 6.1e-06, tolerance 1e-4 (untied head,
@@ -51,7 +52,7 @@ from dew.interop.hf_decoders import (
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny")
+TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
@@ -114,6 +115,27 @@ def test_a_multimodal_gemma3_config_is_refused():
 
     with pytest.raises(ValueError, match="model_type 'gemma3'"):
         translate_config(wrapped)
+
+
+def test_released_mistral_v03_config_translates_every_computational_field():
+    # v0.3 deliberately disables the window; the tiny fixture exercises it.
+    assert translate_config(fixture_config("mistral-7b-v0.3")) == {
+        'vocab_size': 32768, 'emb_features': 4096, 'num_layers': 32,
+        'num_heads': 32, 'num_kv_heads': 8, 'head_dim': 128, 'mlp': 'swiglu',
+        'mlp_features': 14336, 'max_seq_len': 8192, 'rope_theta': 1e6,
+        'layer_types': ('full_attention',) * 32, 'kinds': {},
+        'norm_eps': 1e-5, 'scale_after_cast': True, 'qk_norm': False,
+        'attention_bias': False, 'tie_embeddings': False,
+    }
+
+
+def test_mistral_window_changes_the_reference_logits():
+    model, variables, _ = fp32_decoder(FIXTURES / 'mistral-tiny')
+    ids = np.load(FIXTURES / 'mistral-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'mistral-tiny' / 'logits.npy')
+    unwindowed = model.clone(kinds={}, layer_types=('full_attention',) * model.num_layers)
+    difference = np.max(np.abs(np.asarray(unwindowed.apply(variables, ids)) - reference))
+    assert difference > 0.1
 
 
 def test_the_real_gemma3_1b_config_translates():
@@ -742,6 +764,7 @@ def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Gemma4TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived.count("sliding_attention") == 11
     assert derived[-1] == "full_attention"
@@ -1033,6 +1056,7 @@ def test_a_qwen35_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Qwen3_5TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived == ("linear_attention", "linear_attention", "full_attention") * 2
 

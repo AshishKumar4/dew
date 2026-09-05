@@ -46,7 +46,7 @@ from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3ForCausalLM, Gemma3TextConfig, LlamaConfig, LlamaForCausalLM,
-    Qwen3Config, Qwen3ForCausalLM,
+    Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
@@ -71,11 +71,11 @@ BATCH, LENGTH = 2, 12
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
-    config = Qwen3Config(
+    config = Qwen3Config.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
         tie_word_embeddings=True, rope_theta=1e6, max_position_embeddings=64,
-        rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu")
+        rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return Qwen3ForCausalLM(config)
 
@@ -87,17 +87,26 @@ def tiny_llama() -> LlamaForCausalLM:
     what CausalSelfAttention's one flag means, so a biased fixture is the
     test that the bias path loads.
     """
-    config = LlamaConfig(
+    config = LlamaConfig.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
         tie_word_embeddings=False, rope_theta=5e5, max_position_embeddings=64,
-        rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu")
+        rms_norm_eps=1e-5, attention_bias=True, mlp_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return LlamaForCausalLM(config)
 
 
+def tiny_mistral() -> MistralForCausalLM:
+    config = MistralConfig.from_dict(dict(
+        hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+        sliding_window=4, max_position_embeddings=64, rope_theta=10000.0))
+    torch.manual_seed(0)
+    return MistralForCausalLM(config)
+
+
 def tiny_gemma3() -> Gemma3ForCausalLM:
-    config = Gemma3TextConfig(
+    config = Gemma3TextConfig.from_dict(dict(
         hidden_size=64, num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         num_attention_heads=4, num_key_value_heads=1, head_dim=32,
@@ -105,7 +114,7 @@ def tiny_gemma3() -> Gemma3ForCausalLM:
         vocab_size=256, tie_word_embeddings=True, rope_theta=1e6,
         rope_local_base_freq=1e4, final_logit_softcapping=30.0,
         max_position_embeddings=64, rms_norm_eps=1e-6,
-        hidden_activation="gelu_pytorch_tanh")
+        hidden_activation="gelu_pytorch_tanh"))
     torch.manual_seed(0)
     return Gemma3ForCausalLM(config)
 
@@ -132,7 +141,7 @@ DEEPSEEK_TINY = dict(
 
 
 def tiny_deepseek_v3() -> DeepseekV3ForCausalLM:
-    config = DeepseekV3Config(**DEEPSEEK_TINY, rope_interleave=True)
+    config = DeepseekV3Config.from_dict(dict(DEEPSEEK_TINY, rope_interleave=True))
     torch.manual_seed(0)
     return DeepseekV3ForCausalLM(config)
 
@@ -151,8 +160,8 @@ DEEPSEEK_V32_SEED = 202
 def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
     """The V3 shape with the sparse indexer: eight heads of width 16 over
     the rope width of 8, keeping four of the twelve keys."""
-    config = DeepseekV32Config(
-        **DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16)
+    config = DeepseekV32Config.from_dict(dict(
+        DEEPSEEK_TINY, index_topk=4, index_n_heads=8, index_head_dim=16))
     torch.manual_seed(0)
     return DeepseekV32ForCausalLM(config)
 
@@ -178,7 +187,7 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
-def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
+def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
     model.eval()
     model.set_attn_implementation("eager")
     with torch.no_grad():
@@ -186,11 +195,11 @@ def reference_logits(model: torch.nn.Module, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).numpy()
 
 
-def write_tiny(name: str, model: torch.nn.Module, seed: int = 1234) -> None:
+def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
-    model = model.to(torch.float32)
+    model = model.float()
     model.save_pretrained(directory, safe_serialization=True)
 
     ids = np.random.RandomState(7).randint(
@@ -260,6 +269,15 @@ def write_gemma3_config(directory: Path) -> None:
           f"{config['num_hidden_layers']} layers, {len(config)} fields")
 
 
+def write_released_config(name: str, repo: str) -> None:
+    """Download only the released config, never checkpoint weights."""
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    source = Path(hf_hub_download(repo, "config.json"))
+    (directory / "config.json").write_text(source.read_text())
+    (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-real", action="store_true",
@@ -270,6 +288,8 @@ def main() -> None:
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
     write_tiny("llama-tiny", tiny_llama())
+    write_tiny("mistral-tiny", tiny_mistral())
+    write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
 
