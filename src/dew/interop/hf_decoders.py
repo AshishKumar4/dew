@@ -506,16 +506,26 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     return config
 
 
+def _softmax_mixture(hf_config: Mapping[str, Any], used: set[str],
+                     experts: int, **fields: Any) -> Dict[str, Any]:
+    """The Mixtral-style mixture: a softmax over the experts, the top k, and
+    the renormalisation the family's `norm_topk_prob` says (Mixtral always
+    renormalises, modeling_mixtral.py:109; Qwen3-MoE reads the field,
+    modeling_qwen3_moe.py:263-264). The router's aux loss coefficient and
+    logit output are training-time knobs the forward pass never reads."""
+    used.update(('num_experts_per_tok', 'output_router_logits',
+                 'router_aux_loss_coef'))
+    return {'experts': experts, 'top_k': int(hf_config['num_experts_per_tok']),
+            **fields}
+
+
 def _mixtral_config(hf_config, used):
     config = _mistral_config(hf_config, used)
-    used.update(('num_local_experts', 'num_experts_per_tok', 'output_router_logits',
-                 'router_aux_loss_coef', 'router_jitter_noise'))
+    used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    config['mixture'] = {
-        'experts': int(hf_config['num_local_experts']),
-        'top_k': int(hf_config['num_experts_per_tok']),
-    }
+    config['mixture'] = _softmax_mixture(
+        hf_config, used, int(hf_config['num_local_experts']))
     return config
 
 
@@ -537,6 +547,44 @@ def _qwen2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
 def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     return _base_config(hf_config, used, qk_norm=True,
                         layer_types=_qwen_layer_types(hf_config, used))
+
+
+def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """The Qwen3 block with a routed feed-forward on the layers
+    decoder_sparse_step and mlp_only_layers pick (modeling_qwen3_moe.py:
+    309-313): every decoder_sparse_step-th layer counting from one, minus
+    the listed ones, which stay dense at intermediate_size. The routed
+    experts are moe_intermediate_size wide. Its window rule is not Qwen3's:
+    with use_sliding_window every layer is windowed and max_window_layers is
+    never read (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149).
+    The expert count is `num_experts`, with `num_local_experts` its alias
+    (attribute_map), which is how transformers 5.16.1 writes it back."""
+    layers = int(hf_config['num_hidden_layers'])
+    used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
+    windowed = (hf_config.get('use_sliding_window', False)
+                and hf_config.get('sliding_window') is not None)
+    layer_types = _specified_layer_types(hf_config, used, (
+        'sliding_attention' if windowed else 'full_attention',) * layers)
+    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
+    used.update(('num_experts', 'num_local_experts', 'decoder_sparse_step',
+                 'mlp_only_layers', 'norm_topk_prob', 'moe_intermediate_size'))
+    experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
+    if experts is None:
+        _refuse("num_experts", "a qwen3_moe layer needs its expert count")
+    step = int(hf_config.get('decoder_sparse_step', 1))
+    if step < 1:
+        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
+    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
+    sparse = tuple(index for index in range(layers)
+                   if (index + 1) % step == 0 and index not in dense)
+    if not sparse:
+        _refuse("mlp_only_layers with decoder_sparse_step",
+                "together they leave no routed layer, which is a dense qwen3 model")
+    config['mixture'] = _softmax_mixture(
+        hf_config, used, int(experts), layers=sparse,
+        norm_topk_prob=bool(hf_config.get('norm_topk_prob', False)),
+        expert_features=int(hf_config['moe_intermediate_size']))
+    return config
 
 
 def _gemma_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
@@ -1430,6 +1478,9 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('gemma',), _gemma_config,
                   lambda fields: bool(fields['embedding_scale']),
                   'gemma', 'GemmaForCausalLM', lambda model: {}),
+    DecoderFamily(('qwen3_moe',), _qwen3_moe_config,
+                  lambda fields: bool(fields['qk_norm'] and fields['mixture'] is not None),
+                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export),
     DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields['qk_norm']),
                   'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
     DecoderFamily(('qwen2',), _qwen2_config,
