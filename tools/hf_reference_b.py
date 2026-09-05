@@ -23,8 +23,21 @@ What lands in tests/fixtures/hf:
   tensors composed the way the engines that run the released weights do:
   eh_proj over enorm(embeddings) and hnorm(hidden) in that order, one
   Glm4MoeDecoderLayer, shared_head.norm, then the trunk's head.
-- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/: released
-  configs only.
+- llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
+  interleaved rope and the L2 q/k norm around one global layer with
+  temperature tuning, every other layer routed with the shared expert.
+- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, llama-4-scout/:
+  released configs only. Llama-4-Scout is gated, so its config comes from
+  a mirror and drops the mirror's own marker key.
+
+What lands in tests/fixtures/llama4, the block-level references the
+primitive tests read before the family loads:
+
+- attention.npz: one `Llama4TextAttention` as a local layer (rope, L2
+  norm, chunk 4) and as a global layer (no rope, temperature tuning at
+  floor_scale 4) on the same random weights and hidden states.
+- moe.npz: one `Llama4TextMoe` on random weights, its output and the
+  per-expert tensors the checkpoint layout carries fused.
 """
 
 import sys
@@ -35,9 +48,13 @@ import torch
 from safetensors.numpy import load_file, save_file
 from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM,
+    Llama4TextConfig,
 )
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4ForCausalLM, Llama4TextAttention, Llama4TextMoe, Llama4TextRotaryEmbedding,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -134,12 +151,81 @@ def write_glm4_moe_mtp(name: str, model: Glm4MoeForCausalLM, seed: int = 2026) -
           f"mtp logits {tuple(logits.shape)}")
 
 
+LLAMA4_TINY = dict(
+    vocab_size=96, hidden_size=32, intermediate_size=48, intermediate_size_mlp=64,
+    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+    num_local_experts=4, num_experts_per_tok=2, interleave_moe_layer_step=2,
+    attention_chunk_size=4, max_position_embeddings=64, rope_theta=500000.0,
+    floor_scale=4, attn_scale=0.1, use_qk_norm=True, rms_norm_eps=1e-5,
+    tie_word_embeddings=False)
+
+
+def tiny_llama4() -> Llama4ForCausalLM:
+    """Every fourth layer global, so the pattern holds one of each kind;
+    floor_scale 4 makes the temperature bite inside twelve positions."""
+    torch.manual_seed(0)
+    return Llama4ForCausalLM(Llama4TextConfig(**LLAMA4_TINY))
+
+
+def write_llama4_blocks(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    config = Llama4TextConfig(**LLAMA4_TINY)
+    config._attn_implementation = "eager"
+    generator = torch.Generator().manual_seed(41)
+    hidden = torch.randn(2, 12, config.hidden_size, generator=generator)
+    positions = torch.arange(12)[None]
+    rotary = Llama4TextRotaryEmbedding(config)
+    arrays = {"hidden": hidden.numpy()}
+    # Layer 0 rotates and chunks, layer 3 is the global layer of the pattern.
+    for name, index in (("local", 0), ("global", 3)):
+        attention = Llama4TextAttention(config, layer_index := index).eval()
+        scatter_weights(attention, seed=42)
+        mask_builder = create_chunked_causal_mask if index == 0 else create_causal_mask
+        with torch.no_grad():
+            mask = mask_builder(config=config, inputs_embeds=hidden, attention_mask=None,
+                                past_key_values=None, position_ids=positions)
+            output, _ = attention(hidden, rotary(hidden, positions), mask)
+        arrays[f"{name}_output"] = output.numpy()
+        if name == "local":
+            arrays.update({f"self_attn.{tensor_name}": tensor.detach().numpy()
+                           for tensor_name, tensor in attention.named_parameters()})
+        assert attention.layer_idx == layer_index
+    np.savez(directory / "attention.npz", allow_pickle=False, **arrays)
+
+    moe = Llama4TextMoe(config).eval()
+    scatter_weights(moe, seed=43)
+    with torch.no_grad():
+        output, _ = moe(hidden)
+    arrays = {"hidden": hidden.numpy(), "output": output.numpy()}
+    arrays.update({f"feed_forward.{tensor_name}": tensor.detach().numpy()
+                   for tensor_name, tensor in moe.named_parameters()})
+    np.savez(directory / "moe.npz", allow_pickle=False, **arrays)
+    print(f"{directory}: attention and moe blocks, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_llama4_scout_config() -> None:
+    """meta-llama/Llama-4-Scout-17B-16E is gated; the mirror carries the
+    identical config plus its own marker, which is dropped."""
+    from huggingface_hub import hf_hub_download
+    import json
+
+    directory = FIXTURES / "llama-4-scout"
+    directory.mkdir(parents=True, exist_ok=True)
+    config = json.loads(Path(hf_hub_download("unsloth/Llama-4-Scout-17B-16E", "config.json")).read_text())
+    config["text_config"].pop("for_llm_compressor", None)
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({"repo": "unsloth/Llama-4-Scout-17B-16E"}) + "\n")
+
+
 def main() -> None:
     write_tiny("gpt-oss-tiny", tiny_gpt_oss())
     write_tiny("deepseek-v2-tiny", tiny_deepseek_v2())
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
     write_glm4_moe_mtp("glm4-moe-tiny", glm)
+    write_tiny("llama4-tiny", tiny_llama4())
+    write_llama4_blocks(FIXTURES.parent / "llama4")
+    write_llama4_scout_config()
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")

@@ -303,6 +303,12 @@ class ExpertMLP(nn.Module):
     (`modeling_deepseek_v4.py`, `DeepseekV4Experts._apply_gate`): the gate is
     capped at the limit from above and the up projection on both sides, which
     bounds what one expert can add. None is the plain gated MLP.
+
+    `scale_inputs` is Llama 4's placement of the routing weight: each
+    token's input to an expert is multiplied by its weight and the expert
+    outputs are summed unweighted (`modeling_llama4.py`,
+    `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
+    weighted sum of outputs because the gate is not linear.
     """
     num_experts: int
     hidden_features: int
@@ -310,6 +316,7 @@ class ExpertMLP(nn.Module):
     activation: str = 'swiglu'
     implementation: str = 'xla'
     swiglu_limit: Optional[float] = None
+    scale_inputs: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -345,6 +352,8 @@ class ExpertMLP(nn.Module):
         order = jnp.argsort(experts)
         group_sizes = jnp.bincount(experts, length=self.num_experts)
         grouped = tokens[order // top_k]
+        if self.scale_inputs:
+            grouped = grouped * weights.reshape(-1)[order][:, None].astype(grouped.dtype)
 
         gate = self.gate_proj(grouped, group_sizes)
         up = self.up_proj(grouped, group_sizes)
@@ -355,6 +364,8 @@ class ExpertMLP(nn.Module):
         expert_out = self.down_proj(gate * up, group_sizes)
 
         per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
+        if self.scale_inputs:
+            return jnp.sum(per_slot.astype(jnp.float32), axis=-2).astype(expert_out.dtype)
         combined = jnp.einsum(
             '...ke,...k->...e', per_slot.astype(jnp.float32),
             weights.astype(jnp.float32), precision=self.precision)
@@ -400,6 +411,7 @@ class SparseMLP(nn.Module):
     group_score: str = 'top2'
     expert_bias: bool = False
     swiglu_limit: Optional[float] = None
+    scale_inputs: bool = False
     shared: Optional[Callable[..., nn.Module]] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -419,6 +431,7 @@ class SparseMLP(nn.Module):
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
             implementation=self.implementation, swiglu_limit=self.swiglu_limit,
+            scale_inputs=self.scale_inputs,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.shared is not None:
             self.shared_experts = self.shared(name='shared_experts')
