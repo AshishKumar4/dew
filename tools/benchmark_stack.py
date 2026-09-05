@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Compile time and step time of the decoder's layer stack, by depth.
+"""Compile time and step time of the decoder's layer stack, by depth and by
+how the stack runs: the plain loop, flax's scan over runs of like layers,
+and the pipeline over the stage axis.
 
 Every case trains a causal_transformer of the given depth at one small width
 through the real Trainer step (the objective, the sharding and the donated
@@ -8,7 +10,9 @@ and the executables XLA built for it are counted from jax's own compile log.
 
 Usage:
     PYTHONPATH=src python tools/benchmark_stack.py
-    PYTHONPATH=src python tools/benchmark_stack.py --depths 24 48 --steps 20
+    PYTHONPATH=src python tools/benchmark_stack.py --depths 24 48 --scan True
+    XLA_FLAGS=--xla_force_host_platform_device_count=8 PYTHONPATH=src \\
+        python tools/benchmark_stack.py --fsdp 4 --stage 2 --microbatches 4
     JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 PYTHONPATH=src \\
         python tools/benchmark_stack.py --dtype bfloat16 --attention-impl cudnn
 """
@@ -44,6 +48,11 @@ class StackConfig:
     """Which depths and modes to time, and how."""
 
     depths: list[int] = field(default_factory=lambda: [24, 48])
+    scan: list[bool] = field(default_factory=lambda: [False, True])
+    """The scan_layers settings to time at every depth."""
+    stage: int = 1
+    """Pipeline stages; above 1 the stack runs as a pipeline over the stage axis."""
+    microbatches: int | None = None
     fsdp: int = 1
     steps: int = 20
     warmup: int = 2
@@ -70,13 +79,14 @@ def build_trainer(case: Case, config: StackConfig) -> Trainer:
         attention_impl=config.attention_impl))
     return Trainer(
         LMObjective(model, case.seq_len), optax.adam(1e-4), key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=config.fsdp),
+        mesh=MeshSpec(fsdp=config.fsdp, stage=config.stage, microbatches=config.microbatches),
         layout=Layout(min_shard=2 ** 8), checkpoints=None, tracker=None)
 
 
-def measure(depth: int, config: StackConfig, counter: CompileCounter) -> dict:
+def measure(depth: int, scan: bool, config: StackConfig, counter: CompileCounter) -> dict:
     """One case: build, compile the step, time it, and count its compilations."""
-    case = Case(architecture="causal_transformer", config={**WIDTH, "num_layers": depth},
+    case = Case(architecture="causal_transformer",
+                config={**WIDTH, "num_layers": depth, "scan_layers": scan},
                 dtype=config.dtype, batch_size=BATCH, seq_len=SEQ_LEN)
     trainer = build_trainer(case, config)
     source = DevicePrefetchIterator(batches(case), trainer.device_mesh)
@@ -92,7 +102,10 @@ def measure(depth: int, config: StackConfig, counter: CompileCounter) -> dict:
         state, _, loss, _, _ = compiled(state, None, next(source))
         return state, loss
 
-    for _ in range(config.warmup):
+    # One warm step before the timed window; the first dispatch of the
+    # executable stays outside it.
+    state, loss = step(state)
+    for _ in range(config.warmup - 1):
         state, loss = step(state)
     loss.block_until_ready()
     started = time.perf_counter()
@@ -102,6 +115,9 @@ def measure(depth: int, config: StackConfig, counter: CompileCounter) -> dict:
     elapsed = time.perf_counter() - started
     return {
         "depth": depth,
+        "scan_layers": scan,
+        "stage": config.stage,
+        "microbatches": config.microbatches,
         "fsdp": config.fsdp,
         "params": parameter_count(state.params),
         "compile_seconds": round(compile_seconds, 2),
@@ -118,14 +134,15 @@ def main(config: StackConfig) -> list[dict]:
     logging.getLogger("jax._src.interpreters.pxla").addHandler(counter)
     rows = []
     for depth in config.depths:
-        # The trainer narrates the state and the shapes; the numbers are what
-        # this tool prints.
-        with contextlib.redirect_stdout(io.StringIO()):
-            row = measure(depth, config, counter)
-        rows.append(row)
-        print(f"depth {depth}: compile {row['compile_seconds']} s in "
-              f"{row['compilations']} compilation(s), {row['ms_per_step']} ms/step, "
-              f"loss {row['loss']:.4f}")
+        for scan in config.scan:
+            # The trainer narrates the state and the shapes; the numbers are
+            # what this tool prints.
+            with contextlib.redirect_stdout(io.StringIO()):
+                row = measure(depth, scan, config, counter)
+            rows.append(row)
+            print(f"depth {depth} scan_layers {scan} stage {config.stage}: compile "
+                  f"{row['compile_seconds']} s in {row['compilations']} compilation(s), "
+                  f"{row['ms_per_step']} ms/step, loss {row['loss']:.4f}")
     if config.json_out:
         with open(config.json_out, "w") as handle:
             json.dump(rows, handle, indent=2)
