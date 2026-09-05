@@ -27,7 +27,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import (
-    DEFAULT_RULES, DevicePrefetchIterator, batch_sharding, parameter_spec, shard_batch,
+    DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch,
 )
 from dew.training.optim import OPTIMIZER_MAP
 
@@ -400,7 +400,7 @@ def test_build_mesh_axes():
 def test_shard_batch_splits_across_all_devices():
     mesh = build_mesh(MeshSpec(fsdp=2))
     batch = {"image": np.zeros((jax.device_count(), 4), np.float32)}
-    sharded = shard_batch(batch_sharding(mesh), batch)["image"]
+    sharded = shard_batch(mesh, batch)["image"]
     assert len(sharded.addressable_shards) == jax.device_count()
     assert sharded.addressable_shards[0].data.shape == (1, 4)
 
@@ -408,7 +408,7 @@ def test_shard_batch_splits_across_all_devices():
 def test_prefetch_iterator_preserves_order_and_terminates():
     mesh = build_mesh()
     source = ({"x": np.full((jax.device_count(), 2), i, np.float32)} for i in range(5))
-    it = DevicePrefetchIterator(source, batch_sharding(mesh), depth=2)
+    it = DevicePrefetchIterator(source, mesh, depth=2)
     seen = [float(np.asarray(b["x"])[0, 0]) for b in it]
     assert seen == [0.0, 1.0, 2.0, 3.0, 4.0]
     with pytest.raises(StopIteration):
@@ -422,7 +422,7 @@ def test_prefetch_iterator_surfaces_source_errors():
         yield {"x": np.zeros((jax.device_count(), 2), np.float32)}
         raise ValueError("source exploded")
 
-    it = DevicePrefetchIterator(broken(), batch_sharding(mesh), depth=2)
+    it = DevicePrefetchIterator(broken(), mesh, depth=2)
     next(it)
     with pytest.raises(ValueError, match="source exploded"):
         next(it)
@@ -440,13 +440,13 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
         worker_count=0,
     )
     mesh = build_mesh()
-    it = DevicePrefetchIterator(iter(loader), batch_sharding(mesh), depth=2)
+    it = DevicePrefetchIterator(iter(loader), mesh, depth=2)
     next(it)
     next(it)
     state = it.source_state
     expected = np.asarray(next(it))
 
-    resumed = DevicePrefetchIterator(iter(loader), batch_sharding(mesh), depth=2,
+    resumed = DevicePrefetchIterator(iter(loader), mesh, depth=2,
                                      source_state=state)
     assert np.array_equal(np.asarray(next(resumed)), expected)
 
@@ -467,13 +467,13 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()
-    it = DevicePrefetchIterator(data.train(), batch_sharding(mesh), depth=2)
+    it = DevicePrefetchIterator(data.train(), mesh, depth=2)
     next(it)
     state = it.source_state
     expected = np.asarray(next(it)["text"])
     assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
 
-    resumed = DevicePrefetchIterator(data.train(), batch_sharding(mesh), depth=2,
+    resumed = DevicePrefetchIterator(data.train(), mesh, depth=2,
                                      source_state=state)
     assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
 
@@ -754,9 +754,9 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     assert position is not None, "iterator position was never captured"
 
     mesh = build_mesh()
-    resumed = DevicePrefetchIterator(grain_image_loader(), batch_sharding(mesh),
+    resumed = DevicePrefetchIterator(grain_image_loader(), mesh,
                                      source_state=position)
-    fresh = DevicePrefetchIterator(grain_image_loader(), batch_sharding(mesh))
+    fresh = DevicePrefetchIterator(grain_image_loader(), mesh)
     for _ in range(3):
         next(fresh)
     np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),

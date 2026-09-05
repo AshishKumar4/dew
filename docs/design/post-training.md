@@ -129,7 +129,7 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 ```
 
-`Trainer(..., rollout=None)` is exactly today's loop. When one is given, the trainer calls it between `batch = next(train)` and the compiled step (`dew/training/trainer.py:362, :373`) and reshards the result with `shard_batch(self.batch_sharding, ...)`.
+`Trainer(..., rollout=None)` is exactly today's loop. When one is given, the trainer calls it between `batch = next(train)` and the compiled step (`dew/training/trainer.py:362, :373`) and reshards the result with `shard_batch(mesh, ...)`.
 
 **Why not the `step=` seam.** `Trainer.step` replaces the compiled step's body and is documented as the one place for an update that is not one loss (`dew/training/trainer.py:117-126`). It runs inside `jit` and owns the counter, the EMA and the write-back. A rollout is the opposite kind of thing: it produces the batch the step then consumes, it may post to a vLLM server, and it cannot be traced. Putting it in the step body would either force generation inside `jit` or smuggle a host callback into a compiled function. Two seams, two kinds of work, and the design says which is which.
 

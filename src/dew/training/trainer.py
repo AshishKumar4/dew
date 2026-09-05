@@ -27,11 +27,12 @@ from termcolor import colored
 
 from dew.artifacts import host
 from dew.checkpoints import Checkpoints
+from dew.data.dataset import Checkpointable
 from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
 from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.training.distributed import (
-    Checkpointable, DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_sharding,
-    batch_shardings, build_mesh, minimum_across_processes, shard_batch,
+    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
+    minimum_across_processes, shard_batch,
 )
 from dew.training.state import TrainState
 from dew.training.tracker import Tracker
@@ -171,11 +172,6 @@ class Trainer:
         """The mesh `MeshSpec` describes over this process pool's devices,
         built on first use."""
         return build_mesh(self.mesh)
-
-    @property
-    def batch_sharding(self) -> NamedSharding:
-        """How a global batch is placed: split over every device."""
-        return batch_sharding(self.device_mesh)
 
     def shardings(self, state: TrainState) -> Placement:
         """The layout's placement of `state`, leaf for leaf."""
@@ -339,7 +335,6 @@ class Trainer:
         position are written.
         """
         mesh = self.device_mesh
-        sharding = self.batch_sharding
         process_zero = jax.process_index() == 0
         state, shardings, position = self.place()
         current = int(state.step)
@@ -359,7 +354,7 @@ class Trainer:
                 f"written without the data position would replay the data on "
                 f"resume. Train it with checkpoint_every=None "
                 f"(--trainer.checkpoint-every None)")
-        train = DevicePrefetchIterator(source, sharding, source_state=position)
+        train = DevicePrefetchIterator(source, mesh, source_state=position)
         scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
         compiled = None
         # Rebound the moment the executable exists, so the first tick measures
@@ -481,7 +476,6 @@ class Trainer:
         """
         if data.val is None:
             return {}
-        sharding = self.batch_sharding
         process_zero = jax.process_index() == 0
         info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
                     ema=with_ema(state.params, state.ema))
@@ -499,7 +493,7 @@ class Trainer:
                 raise RuntimeError(
                     "the validation pass agreed a batch was available and this "
                     "process has none")
-            batch = shard_batch(sharding, batch)
+            batch = shard_batch(mesh, batch)
             produced = self.objective.evaluate(state.params, batch, info)
             produced = (() if produced is None
                         else produced if isinstance(produced, tuple) else (produced,))
