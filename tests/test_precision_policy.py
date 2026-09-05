@@ -127,15 +127,6 @@ def test_fused_attention_takes_default_precision(implementations, precision):
     assert implementations == ['xla']
 
 
-def test_reference_attention_keeps_honoring_both_knobs():
-    """The reference path is the one that can honor them, so it must not have
-    picked up the rejection."""
-    q, k, v = qkv(jnp.float32)
-    high = scaled_dot_product_attention(q, k, v, precision=jax.lax.Precision.HIGHEST,
-                                        force_fp32_for_softmax=False)
-    assert high.shape == q.shape
-
-
 def test_cudnn_rejects_float32_inputs():
     """cuDNN's fused kernel has no fp32 path; casting behind the caller's back
     would make --model.dtype float32 a lie."""

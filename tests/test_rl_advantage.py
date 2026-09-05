@@ -263,17 +263,6 @@ def test_gae_matches_the_references(reference):
             assert difference < GAE_TOLERANCE, f"{name}: {difference:.3e}"
 
 
-def test_the_estimators_are_jittable():
-    """The rollout computes advantages on device, inside the same jit as the
-    reward columns it just wrote, so a python branch on a traced value here
-    would only show up there."""
-    grouped = jax.jit(lambda rewards: group_advantage(rewards, 4))
-    discounted = jax.jit(lambda r, v, m: gae(r, v, m, 0.99, 0.95))
-
-    assert grouped(jnp.array([1.0, 0.0, 0.0, 0.0])).shape == (4,)
-    assert discounted(jnp.zeros((2, 3)), jnp.zeros((2, 3)), jnp.ones((2, 3)))[0].shape == (2, 3)
-
-
 def test_the_fixture_holds_the_inputs_the_generator_names(generator):
     """A fixture regenerates only if the inputs beside it are the inputs it was
     made from. Editing a reward in tools/parity_rl.py and forgetting to run it

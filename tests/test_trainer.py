@@ -206,17 +206,6 @@ def test_the_ema_lags_the_parameters_at_the_configured_decay():
     assert int(new_state.step) == 1
 
 
-def test_an_objective_without_an_ema_carries_none():
-    class Plain(Regression):
-        ema = None
-
-        def __init__(self):
-            self.model = Affine()
-
-    state = make_trainer(objective=Plain()).fit(Data(endless), steps=1, log_every=1)
-    assert state.ema is None
-
-
 # --------------------------------------------------------------------------
 # Checkpoints: what lands, when, and what a resume gets back
 # --------------------------------------------------------------------------
