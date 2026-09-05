@@ -435,7 +435,8 @@ class Trainer:
         # The interval's loss and both bad-loss counters live on device, so the
         # loop never blocks on a result, and move together in one dispatch.
         # `worst_bad_run` remembers the longest streak of non-finite losses
-        # seen since the last host check, which is what decides whether to stop.
+        # seen since the last host check; the host check reads it to decide
+        # whether to stop.
         book = fresh_book()
         tracing, traced, seen = False, 0, 0
         loss = None
