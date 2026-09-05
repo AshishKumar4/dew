@@ -11,9 +11,9 @@ import flax.linen as nn
 from typing import Callable, Optional, Sequence, Tuple, Union, Any
 from . import utils
 
-# The FID feature extractor's weights: the jax-fid pickle, mirrored on the Hub
-# so a revision and a digest can be pinned. The bytes are byte-identical to
-# what this metric has always used, so no reported FID moves.
+# The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
+# with a pinned revision and digest. The bytes are byte-identical to the
+# jax-fid file.
 FID_WEIGHTS_REPO = 'hayden-donnelly/inception-v3-fid'
 FID_WEIGHTS_FILE = 'inception_v3_fid.pickle'
 FID_WEIGHTS_REVISION = 'ccb3ff416ff491ae7fd964c5e7c01d12ab7c48bf'

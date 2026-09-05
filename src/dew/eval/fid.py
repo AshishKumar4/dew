@@ -13,7 +13,7 @@ from .common import ImageMetric
 @functools.lru_cache(maxsize=None)
 def _get_inception():
     """The pool3 feature extractor and its parameters, loaded once per
-    process: the FID InceptionV3 is about 90 MB of weights, and every metric
+    process. The FID InceptionV3 is about 90 MB of weights, and every metric
     built from this module shares the copy."""
     from .inception import InceptionV3
     print("[metrics] Loading InceptionV3 FID weights (cached for reuse)...")
@@ -23,9 +23,8 @@ def _get_inception():
 
 
 def _sqrtm(product):
-    """`sqrtm` without its singularity warning: a singular product is the
-    case the finiteness check in `frechet_distance` handles, so the warning
-    is noise."""
+    """`sqrtm` without its singularity warning. A singular product is the
+    case the finiteness check in `frechet_distance` handles."""
     from scipy import linalg
 
     with warnings.catch_warnings():
@@ -36,7 +35,7 @@ def _sqrtm(product):
 def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     """Frechet distance between two multivariate gaussians.
 
-    Runs on the host through scipy: the matrix square root of the covariance
+    Runs on the host through scipy. The matrix square root of the covariance
     product has no jax equivalent, and FID is computed once per validation
     batch so the transfer is irrelevant.
     """
@@ -45,11 +44,11 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     sigma_a, sigma_b = np.atleast_2d(sigma_a), np.atleast_2d(sigma_b)
 
     # sqrtm's result is complex when rounding leaves the product with a
-    # negative eigenvalue; the imaginary part is that noise.
+    # negative eigenvalue; the imaginary part is rounding noise.
     covmean = _sqrtm(sigma_a.dot(sigma_b))
     if not np.isfinite(covmean).all():
-        # Singular product covariance, nudge the diagonal as in the reference
-        # implementations rather than returning a nan
+        # Singular product covariance. Nudge the diagonal as the reference
+        # implementations do.
         offset = np.eye(sigma_a.shape[0]) * eps
         covmean = _sqrtm((sigma_a + offset).dot(sigma_b + offset))
     if np.iscomplexobj(covmean):
@@ -69,7 +68,7 @@ def _get_activations():
     """The jitted pool3 feature extractor, built on first use.
 
     Building it loads the ~90MB weights, so it happens here rather than in
-    the factory: constructing the metric opens nothing.
+    the factory. Constructing the metric opens nothing.
     """
     model, params = _get_inception()
 
@@ -78,8 +77,8 @@ def _get_activations():
         # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
         features = model.apply(params, resized, train=False)
-        # apply returns the output alone unless mutable collections were asked
-        # for, and none were.
+        # apply returns the output alone, since no mutable collections are
+        # asked for.
         assert not isinstance(features, tuple)
         return features.reshape(features.shape[0], -1)
 
@@ -90,9 +89,9 @@ def _get_activations():
 def fid(field: str = "image") -> ImageMetric:
     """FID between the sampled images and the batch's, lower is better.
 
-    Per-batch FID is noisy at typical validation batch sizes and is only
-    meaningful as a relative trend across checkpoints, not as a headline number
-    comparable to published FID-50k.
+    Per-batch FID is noisy at typical validation batch sizes, so read it as a
+    relative trend across checkpoints. It does not compare with published
+    FID-50k.
     """
 
     def measure(artifact, batch):
