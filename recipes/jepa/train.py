@@ -51,9 +51,9 @@ class JepaRunConfig(RunConfig):
     predictor: JsonDict = field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
     num_target_blocks: int = 4
-    target_scale: list[float] = field(default_factory=lambda: [0.15, 0.2])
-    target_aspect: list[float] = field(default_factory=lambda: [0.75, 1.5])
-    momentum: list[float] = field(default_factory=lambda: [0.996, 1.0])
+    target_scale: tuple[float, float] = (0.15, 0.2)
+    target_aspect: tuple[float, float] = (0.75, 1.5)
+    momentum: tuple[float, float] = (0.996, 1.0)
     """Target-encoder EMA momentum, ramped over momentum_steps."""
     momentum_steps: Optional[int] = None
     """Defaults to the full training run."""
@@ -61,6 +61,13 @@ class JepaRunConfig(RunConfig):
     """Number of classes for the frozen-encoder probes."""
     probe_label_key: str = 'label'
     knn_k: int = 20
+
+    def __post_init__(self):
+        # A record's pairs arrive as lists from a run's json; the objective
+        # and the mask read them as the pairs the fields declare.
+        for name in ("target_scale", "target_aspect", "momentum"):
+            low, high = getattr(self, name)
+            object.__setattr__(self, name, (float(low), float(high)))
 
 
 def sample_field(config: JepaRunConfig) -> Field:
@@ -128,8 +135,8 @@ def main(config: JepaRunConfig) -> TrainState:
     mask = multi_block_mask(
         grid,
         num_targets=config.num_target_blocks,
-        scale=tuple(config.target_scale),
-        aspect=tuple(config.target_aspect),
+        scale=config.target_scale,
+        aspect=config.target_aspect,
     )
     print(f"Mask geometry: {mask.block_area} tokens per target block "
           f"({mask.block_shapes}), {mask.num_context} context tokens of {mask.num_patches}")
@@ -139,7 +146,7 @@ def main(config: JepaRunConfig) -> TrainState:
         predictor=predictor,
         mask=mask,
         sample=sample,
-        momentum=tuple(config.momentum),
+        momentum=config.momentum,
         momentum_steps=config.momentum_steps or steps,
         label_key=config.probe_label_key,
     )
