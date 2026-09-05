@@ -10,11 +10,14 @@ built from.
 
 Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. Entries cover llama, mistral, mixtral, qwen2, qwen3, gemma3_text,
-gemma4_text, qwen3_5_text (the hybrid of gated delta net layers and gated
-full-attention layers, whose linear_attn layers land on the gated_delta_net
-mixer kind), deepseek_v3 and deepseek_v32. A multimodal wrapper config is
-refused rather than loading its text half. DeepSeek loads
+vocabulary. Entries cover llama (Llama 2, 3 and 3.1's rope_scaling),
+mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
+gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3_5_text
+(the hybrid of gated delta net layers and gated full-attention layers, whose
+linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
+glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32.
+A multimodal wrapper config is refused rather than loading its text half.
+DeepSeek loads
 through the MLA mixer with DeepSeek's MoE sizing, and its released
 checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
 translation builds the base model the weights describe. A config field that
@@ -1893,7 +1896,6 @@ def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
 def _mixture_value(fields: Mapping[str, Any]) -> Optional[Mixture]:
     mixture = fields['mixture']
     return Mixture(**mixture) if isinstance(mixture, Mapping) else mixture
-
 
 def _every_layer_windowed(fields: Mapping[str, Any]) -> bool:
     kinds = fields['kinds'] or {}
