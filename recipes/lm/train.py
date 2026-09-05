@@ -20,7 +20,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import jax
 import tyro
@@ -38,6 +38,14 @@ os.environ['TOKENIZERS_PARALLELISM'] = "false"
 
 DEFAULT_MODEL_CONFIG = {"emb_features": 512, "num_layers": 8, "num_heads": 8}
 
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, a Union of the registered specs, and
+    # a type checker cannot read a variable in a type expression. Statically
+    # the field holds the two token datasets __post_init__ lets through.
+    TokenSpec = TokenWindows | PackedTokens
+else:
+    TokenSpec = datasets.union
+
 
 @dataclass(frozen=True)
 class LmRunConfig(RunConfig):
@@ -45,7 +53,7 @@ class LmRunConfig(RunConfig):
 
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("causal_transformer", dict(DEFAULT_MODEL_CONFIG)))
-    data: datasets.union = field(default_factory=TokenWindows)
+    data: TokenSpec = field(default_factory=TokenWindows)
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
             learning_rate=6e-4, learning_rate_peak=6e-4, learning_rate_end=6e-5,
@@ -73,16 +81,16 @@ class LmRunConfig(RunConfig):
                 "data:token-windows or data:packed-tokens")
 
 
-def read_meta(path: Optional[str]) -> dict:
-    """The tokenizer and vocabulary the token files were written with."""
+def token_directory(path: Optional[str]) -> Path:
+    """The directory tools/tokenize_text.py wrote, which --data.path names."""
     if not path:
         raise ValueError("--data.path is the token directory tools/tokenize_text.py wrote")
-    meta_path = Path(path) / "meta.json"
-    if not meta_path.is_file():
+    directory = Path(path)
+    if not (directory / "meta.json").is_file():
         raise FileNotFoundError(
-            f"{meta_path} is missing: --data.path is the token directory that "
-            "tools/tokenize_text.py wrote, not a dataset name")
-    return json.loads(meta_path.read_text())
+            f"{directory / 'meta.json'} is missing: --data.path is the token directory "
+            "that tools/tokenize_text.py wrote, not a dataset name")
+    return directory
 
 
 def context_length(config: LmRunConfig, samples: Optional[Samples]) -> int:
@@ -103,8 +111,8 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
     return {**config.model.fields(), "max_seq_len": max_seq_len, "vocab_size": vocab_size}
 
 
-def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
-                    meta: dict):
+def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
+                    max_seq_len: int, meta: dict):
     """The decoder a --pretrained run continues, its variables and the fields
     it was built from.
 
@@ -118,28 +126,28 @@ def load_pretrained(config: LmRunConfig, vocab_size: int, max_seq_len: int,
     """
     from dew.interop.hf_decoders import load_pretrained_decoder
 
-    overridden = sorted(set(config.model.config) - {"max_seq_len"})
+    overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
         raise ValueError(
             f"--model.config carries {overridden}, which the checkpoint at "
-            f"{config.pretrained} decides. Only max_seq_len is still a choice.")
+            f"{pretrained} decides. Only max_seq_len is still a choice.")
 
     model, variables, fields = load_pretrained_decoder(
-        config.pretrained,
-        dtype=config.model.dtype, attention_impl=config.model.attention_impl,
-        max_seq_len=config.model.config.get("max_seq_len", max_seq_len))
-    expected = checkpoint_tokenizer(config.pretrained)
+        pretrained,
+        dtype=model_config.dtype, attention_impl=model_config.attention_impl,
+        max_seq_len=model_config.config.get("max_seq_len", max_seq_len))
+    expected = checkpoint_tokenizer(pretrained)
     if meta["tokenizer"] != expected:
         raise ValueError(
             f"the token files were written with {meta['tokenizer']}, and "
-            f"{config.pretrained} expects {expected}. Retokenize with "
+            f"{pretrained} expects {expected}. Retokenize with "
             f"--tokenizer {expected}.")
     # A decoder's embedding table is usually padded past the tokenizer's ids
     # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
     # requirement, not matching the count.
     if model.vocab_size < vocab_size:
         raise ValueError(
-            f"{config.pretrained} has room for {model.vocab_size} ids and the "
+            f"{pretrained} has room for {model.vocab_size} ids and the "
             f"token files use {vocab_size}")
     return model, variables, fields
 
@@ -195,7 +203,9 @@ def main(config: LmRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
 
-    meta = read_meta(config.data.path)
+    tokens = token_directory(config.data.path)
+    # The tokenizer and vocabulary the token files were written with.
+    meta = json.loads((tokens / "meta.json").read_text())
     if config.tokenizer != meta['tokenizer']:
         # Decoding with a different tokenizer than the ids were written with
         # produces text that says nothing about the model.
@@ -205,7 +215,7 @@ def main(config: LmRunConfig) -> TrainState:
     vocab_size = int(meta['vocab_size'])
 
     data = config.data.load(batch=config.trainer.batch_size)
-    if data.steps_per_epoch < 1:
+    if not data.steps_per_epoch:
         raise ValueError(
             f"{data.records} training windows do not fill one batch of "
             f"{config.trainer.batch_size}, so an epoch is no steps at all: read "
@@ -219,7 +229,8 @@ def main(config: LmRunConfig) -> TrainState:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        model, pretrained, fields = load_pretrained(config, vocab_size, context, meta)
+        model, pretrained, fields = load_pretrained(
+            config.pretrained, config.model, vocab_size, context, meta)
     objective = LMObjective(
         model,
         config.data.seq_len,
@@ -230,7 +241,7 @@ def main(config: LmRunConfig) -> TrainState:
     )
 
     name = config.trainer.name or (
-        f"lm-{Path(config.data.path).name}/seq-{config.data.seq_len}/"
+        f"lm-{tokens.name}/seq-{config.data.seq_len}/"
         f"emb-{model.emb_features}/layers-{model.num_layers}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
@@ -274,8 +285,12 @@ def main(config: LmRunConfig) -> TrainState:
     )
     print(f"Training finished in {time.time() - start:.0f}s")
     if tracker is not None:
-        dew.io.publish(checkpoints.path(checkpoints.latest), re.sub(r"[^\w.-]", "-", name),
-                       tracker=tracker)
+        step = checkpoints.latest
+        if step is None:
+            raise RuntimeError(
+                f"fit returned with no checkpoint under {checkpoints.directory}; "
+                "a trainer with a checkpointer writes the step its run ends on")
+        dew.io.publish(checkpoints.path(step), re.sub(r"[^\w.-]", "-", name), tracker=tracker)
     return state
 
 
