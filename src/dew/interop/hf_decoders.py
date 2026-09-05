@@ -805,49 +805,38 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
                           tie_embeddings=True, layer_types=layer_types, rope=_Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
-    hidden, heads, kv_heads = config['emb_features'], config['num_heads'], config['num_kv_heads']
-    if hf_config.get('attention_k_eq_v'):
-        _refuse("attention_k_eq_v=True",
-                "the backbone always projects its own values")
-    if hf_config.get('enable_moe_block'):
-        _refuse("enable_moe_block=True",
-                "the parallel MoE branch has no counterpart here")
-    used.update(('attention_k_eq_v', 'enable_moe_block'))
-    # The full layers may override the head dim; the sliding ones use
-    # hidden // heads, so that is the model's and the override lands on
-    # the full kind.
-    sliding_dim = hidden // heads
-    if hidden % heads:
-        _refuse(f"hidden_size {hidden}",
-                f"it does not divide into {heads} heads")
-    full_dim = sliding_dim
-    entries = hf_config.get('per_layer_config') or {}
-    model_kv = heads if kv_heads is None else int(kv_heads)
-    for entry in (entries.values() if isinstance(entries, Mapping) else entries):
-        if not isinstance(entry, Mapping):
-            continue
-        if entry.get('head_dim') is not None:
-            full_dim = int(entry['head_dim'])
-        # The reference gives a layer kind its own key/value head count as
-        # well as its own head dim (modeling_gemma4.py,
-        # Gemma4TextAttention reads layer_config.num_key_value_heads).
-        # The backbone has one count for the model, so a config that
-        # varies it is refused rather than built at the wrong K/V width.
-        if (entry.get('num_key_value_heads') is not None
-                and int(entry['num_key_value_heads']) != model_kv):
-            _refuse(f"per_layer_config num_key_value_heads "
-                    f"{int(entry['num_key_value_heads'])}",
-                    f"the backbone has one key/value head count for the "
-                    f"model, which this config sets to {model_kv}")
-    global_kv = hf_config.get('num_global_key_value_heads')
-    if global_kv is not None and int(global_kv) != model_kv:
-        _refuse(f"num_global_key_value_heads {int(global_kv)}",
-                f"the backbone has one key/value head count for the model, "
-                f"which this config sets to {model_kv}")
-    if hf_config.get('global_head_dim') is not None:
-        full_dim = int(hf_config['global_head_dim'])
-    used.update(('per_layer_config', 'global_head_dim',
-                 'num_global_key_value_heads'))
+    sliding_dim, kv_heads = config['head_dim'], config['num_kv_heads']
+    k_eq_v = bool(hf_config.get('attention_k_eq_v', False))
+    used.update(('attention_k_eq_v', 'enable_moe_block', 'per_layer_config',
+                 'global_head_dim', 'num_global_key_value_heads'))
+    # Every layer reads its geometry from per_layer_config
+    # (modeling_gemma4.py, Gemma4TextAttention reads layer_config), whose
+    # entries the sliding layers leave at the model's head_dim and
+    # num_key_value_heads. Where the config carries no per_layer_config key
+    # at all, configuration_gemma4.py builds the full layers' entries from
+    # global_head_dim (512 unless named) and, under attention_k_eq_v alone,
+    # num_global_key_value_heads; a config that carries the key, null or
+    # filled, has those two fields read by nothing, and the released E2B is
+    # one (its global q_proj is 8 heads of 256, not of the 512 it names).
+    full_dim, full_kv = sliding_dim, kv_heads
+    if 'per_layer_config' in hf_config:
+        entries = hf_config['per_layer_config'] or {}
+        for entry in (entries.values() if isinstance(entries, Mapping) else entries):
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get('head_dim') is not None:
+                full_dim = int(entry['head_dim'])
+            if entry.get('num_key_value_heads') is not None:
+                stated = int(entry['num_key_value_heads'])
+                if full_kv != kv_heads and stated != full_kv:
+                    _refuse("per_layer_config num_key_value_heads",
+                            f"the full layers name both {full_kv} and {stated}")
+                full_kv = stated
+    else:
+        full_dim = int(hf_config.get('global_head_dim', 512))
+        global_kv = hf_config.get('num_global_key_value_heads')
+        if global_kv is not None and k_eq_v:
+            full_kv = int(global_kv)
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
     entries = hf_config.get('rope_parameters') or {}
@@ -880,9 +869,24 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
         config['final_logit_softcap'] = float(softcap)
-    # MoE sizing keys with the branch off: refused above when it is on.
+    if full_kv != kv_heads:
+        config['kinds'].setdefault('full_attention', {})['num_kv_heads'] = full_kv
+    # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
+    # reference initialises to one, so the tree always holds it.
+    config.update(attention_k_eq_v=k_eq_v, layer_scalar=True)
     used.update(('moe_intermediate_size', 'expert_intermediate_size',
                  'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
+    if hf_config.get('enable_moe_block'):
+        # The 26B-A4B: every layer routes beside its dense MLP.
+        for field in ('num_experts', 'top_k_experts', 'moe_intermediate_size'):
+            if hf_config.get(field) is None:
+                _refuse("enable_moe_block=True", f"the routed branch needs {field}")
+        config['mixture'] = {
+            'experts': int(hf_config['num_experts']),
+            'top_k': int(hf_config['top_k_experts']),
+            'expert_features': int(hf_config['moe_intermediate_size']),
+            'parallel': True,
+        }
 
     return config
 
@@ -1050,8 +1054,12 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse(f"model_type {model_type!r}",
                 f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
 
-    if hf_config.get('use_bidirectional_attention', False):
-        _refuse("use_bidirectional_attention=True", "the backbone is causal")
+    # Gemma 4 spells the flag 'vision' for its image tokens alone, which
+    # leaves the text decoder causal (configuration_gemma4.py, only 'all'
+    # clears is_causal); True and 'all' change what the decoder computes.
+    bidirectional = hf_config.get('use_bidirectional_attention', False)
+    if bidirectional and bidirectional != 'vision':
+        _refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     if hf_config.get('mlp_bias'):
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
@@ -1888,6 +1896,52 @@ def _kind_mixers(fields: Mapping[str, Any]) -> list[MixerBase]:
     return found
 
 
+def _gemma4_prepare(tensors: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """The routed branch's fused experts into dew's stacked `[E, in, out]` kernels.
+
+    `Gemma4TextExperts` holds `gate_up_proj` as `[E, 2 * expert, hidden]` with
+    the gate in the first rows and `down_proj` as `[E, hidden, expert]`, each
+    expert a torch Linear's `[out, in]`.
+    """
+    prepared: Dict[str, np.ndarray] = {}
+    for name, tensor in tensors.items():
+        if name.endswith('.experts.gate_up_proj'):
+            width = tensor.shape[1] // 2
+            stem = name[:-len('gate_up_proj')]
+            prepared[stem + 'gate_proj'] = np.swapaxes(tensor[:, :width], 1, 2)
+            prepared[stem + 'up_proj'] = np.swapaxes(tensor[:, width:], 1, 2)
+        elif name.endswith('.experts.down_proj'):
+            prepared[name] = np.swapaxes(tensor, 1, 2)
+        else:
+            prepared[name] = tensor
+    return prepared
+
+
+# Gemma 4's routed branch, named for what each norm normalises, as the
+# block's own sandwich norms are.
+_GEMMA4_MOE: Dict[Tuple[str, ...], Tuple[str, ...]] = {
+    ('router', 'proj', 'weight'): ('moe', 'router', 'proj', 'kernel'),
+    ('router', 'scale'): ('moe', 'router', 'scale'),
+    ('router', 'per_expert_scale'): ('moe', 'router', 'per_expert_scale'),
+    ('post_feedforward_layernorm_1', 'weight'): ('moe', 'mlp_branch_norm', 'scale'),
+    ('pre_feedforward_layernorm_2', 'weight'): ('moe', 'experts_input_norm', 'scale'),
+    ('post_feedforward_layernorm_2', 'weight'): ('moe', 'experts_output_norm', 'scale'),
+    ('layer_scalar',): ('layer_scalar',),
+}
+
+
+def _gemma4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    parts = name.split('.')
+    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+        tail = tuple(parts[3:])
+        layer = ('params', f'layers_{parts[2]}')
+        if tail in _GEMMA4_MOE:
+            return (*layer, *_GEMMA4_MOE[tail])
+        if len(tail) == 2 and tail[0] == 'experts' and tail[1] in _MOE_SHARED:
+            return (*layer, 'moe', 'experts', tail[1], 'kernel')
+    return _dew_path(name, config)
+
+
 def _mixer_value(fields: Mapping[str, Any]) -> Optional[MixerBase]:
     mixer = fields['mixer']
     return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
@@ -1948,7 +2002,8 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('gemma4_text',), _gemma4_config,
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),
-                  'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True),
+                  'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True,
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare),
     DecoderFamily((_GEMMA,), _gemma3_config,
                   lambda fields: bool(fields['sandwich_norms'] and fields['qk_norm']),
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),

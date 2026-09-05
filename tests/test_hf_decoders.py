@@ -52,6 +52,24 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
   tests/test_linear_attention.py.
+- gpt-oss-tiny: max |logit difference| 2.5e-06, tolerance 1e-4. Sink
+  attention on a sliding and a full layer, YaRN over grouped-query heads,
+  the biased router and the clamped interleaved experts; the block's own
+  numbers are in tests/test_attention_sinks.py and tests/test_gpt_oss.py.
+- deepseek-v2-tiny: max |logit difference| 2.3e-06, tolerance 1e-4. MLA
+  without a query LoRA, V2's softmax router under group_limited_greedy and
+  no renormalisation; the router's numbers are in tests/test_deepseek_v2.py.
+- glm4-moe-tiny: max |logit difference| 3.3e-06 on the trunk and 3.2e-06 on
+  the MTP depth, tolerance 1e-4. Biased q/k/v, a half rotary, DeepSeek V3
+  routing with a shared expert, one MTP depth composed as the engines run it.
+- llama4-tiny : max |logit difference| 3.5e-06, tolerance 1e-4. Chunked
+  rotated local layers around a global layer with temperature tuning, the
+  routed layers scaling their inputs; the mixer's numbers are in
+  tests/test_llama4.py.
+- gemma4-moe-tiny: max |logit difference| 4.9e-06, tolerance 1e-4. The
+  routed branch beside every layer's dense MLP, the global layer reading its
+  values off one key/value head of 16, and the per-layer scalars; the
+  branch's numbers are in tests/test_gemma4_moe.py.
 """
 
 import dataclasses
@@ -845,8 +863,9 @@ def test_the_e2b_shaped_config_translates_every_gap():
 
 def test_the_real_e2b_config_translates():
     """google/gemma-4-E2B's text_config translates field for field: partial
-    rotary 0.25, head dims 192 and 512, sharing 20 layers, per-layer inputs
-    of 256, the double-wide MLP, scale 1.0 and softcap 30."""
+    rotary 0.25, head dims 256 and 512 (the checkpoint's sliding q_proj is
+    8 heads of 256, its full one 8 of 512), sharing 20 layers, per-layer
+    inputs of 256, the double-wide MLP, scale 1.0 and softcap 30."""
     e2b = Path(
         "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
         "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
@@ -855,7 +874,8 @@ def test_the_real_e2b_config_translates():
     config = translate_config(json.loads(e2b.read_text()).get("text_config"))
 
     assert config["partial_rotary_factor"] == 0.25
-    assert config["head_dim"] == 192
+    assert config["head_dim"] == 256
+    assert config["num_kv_heads"] == 1
     assert config["kinds"]["full_attention"] == {"head_dim": 512}
     assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
     assert config["num_kv_shared_layers"] == 20
@@ -867,9 +887,8 @@ def test_the_real_e2b_config_translates():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("attention_k_eq_v", True),
-    ("enable_moe_block", True),
     ("hidden_act", "relu"),
+    ("use_bidirectional_attention", "all"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value):
     """Every gemma4 knob Dew cannot express names itself instead of loading
@@ -924,29 +943,56 @@ def test_a_wrapper_shaped_config_of_an_unknown_family_is_refused_as_one():
                           "text_config": gemma4_config("gemma4-ple")})
 
 
-@pytest.mark.parametrize("field", ["num_global_key_value_heads", "per_layer_config"])
-def test_a_per_layer_key_value_head_count_is_refused(field):
-    """The reference lets a layer kind carry its own key/value head count
-    (Gemma4TextAttention reads layer_config.num_key_value_heads). The
-    backbone has one count for the model, so a config that varies it is
-    refused by name instead of building a model whose K/V width is wrong and
-    failing later on a shape."""
-    config = gemma4_config("gemma4-e2b")
-    model_kv = config["num_key_value_heads"]
-    if field == "num_global_key_value_heads":
-        config[field] = model_kv + 1
-    else:
-        config[field] = {"1": {"head_dim": 32, "num_key_value_heads": model_kv + 1}}
+@pytest.mark.parametrize("spelling", ["per_layer_config", "global_absent", "global_ungated"])
+def test_the_full_layers_geometry_is_read_the_way_the_reference_reads_it(spelling):
+    """The reference lets the full layers carry their own head dim and
+    key/value head count (Gemma4TextAttention reads layer_config), which a
+    transformers-written config spells per layer and a released one as
+    global_head_dim and num_global_key_value_heads. Gemma4TextConfig builds
+    the per-layer entries from the global pair only when the per_layer_config
+    key is absent, and takes the count only under attention_k_eq_v; the
+    expected geometry comes from the reference class, not a copy of the
+    rule."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
-    with pytest.raises(ValueError, match=field) as raised:
-        translate_config(config)
-    assert "key/value head count" in str(raised.value)
-    assert str(model_kv) in str(raised.value)
+    config = gemma4_config("gemma4-e2b")
+    if spelling == "per_layer_config":
+        config["per_layer_config"] = {"1": {"head_dim": 32, "num_key_value_heads": 1}}
+    else:
+        del config["per_layer_config"]
+        config.update(global_head_dim=32, num_global_key_value_heads=1,
+                      attention_k_eq_v=spelling == "global_ungated")
+    full = config["layer_types"].index("full_attention")
+    reference = Gemma4TextConfig(**config).per_layer_config[full]
+
+    translated = translate_config(config)
+    kind = translated["kinds"]["full_attention"]
+    assert kind["head_dim"] == reference.head_dim == 32
+    assert kind.get("num_kv_heads", translated["num_kv_heads"]) == reference.num_key_value_heads
+    assert ("num_kv_heads" in kind) == (spelling != "global_absent")
+
+
+def test_a_config_with_the_per_layer_key_ignores_the_global_pair_as_the_reference_does():
+    """With per_layer_config present, even empty, the reference reads
+    global_head_dim and num_global_key_value_heads nowhere: the full layers
+    keep the model's geometry, which the released E2B relies on."""
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    config = gemma4_config("gemma4-ple")
+    config.update(global_head_dim=32, num_global_key_value_heads=1, attention_k_eq_v=True)
+    full = config["layer_types"].index("full_attention")
+    reference = Gemma4TextConfig(**config).per_layer_config[full]
+    assert reference.head_dim == config["head_dim"]
+
+    translated = translate_config(config)
+    assert "full_attention" not in translated["kinds"]
+    assert translated["head_dim"] == config["head_dim"]
 
 
 def test_a_per_layer_count_equal_to_the_models_still_translates():
-    """Only a count that differs is a refusal: the reference fills
-    per_layer_config with the model's own value for every layer."""
+    """A count equal to the model's leaves the kind with its head dim alone:
+    the reference fills per_layer_config with the model's own value for
+    every layer, so nothing varies."""
     config = gemma4_config("gemma4-e2b")
     config["per_layer_config"] = {
         "1": {"head_dim": 32, "num_key_value_heads": config["num_key_value_heads"]}}
@@ -1934,3 +1980,147 @@ def test_llama4_export_is_refused_by_name(tmp_path):
     with pytest.raises(ValueError, match="a mixer other than attention"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4's routed size: the parallel experts, keys as values, layer scalars
+# ---------------------------------------------------------------------------
+
+GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
+
+
+def test_gemma4_moe_config_translates_field_by_field():
+    """The 26B-A4B shape at toy width: enable_moe_block names the parallel
+    mixture of four experts with two per token at width 16, attention_k_eq_v
+    lands as a field with the global kind's own head dim and single
+    key/value head, and every layer carries its output scalar."""
+    config = translate_config(fixture_config("gemma4-moe-tiny"))
+
+    assert config["mixture"] == {"experts": 4, "top_k": 2, "expert_features": 16,
+                                 "parallel": True}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert config["num_kv_heads"] == 2 and config["head_dim"] == 8
+    assert config["kinds"]["full_attention"] == {"head_dim": 16, "num_kv_heads": 1}
+    assert config["kinds"]["sliding_attention"] == {"window": 4, "rope_theta": 10000.0}
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["mlp"] == "geglu" and config["mlp_features"] == 48
+
+
+def test_the_real_gemma_4_26b_a4b_text_config_translates():
+    """google/gemma-4-26B-A4B's text_config, from a mirror: 30 layers in the
+    5:1 pattern, 16 query heads of 256 with 8 key/value heads on the sliding
+    layers and 2 of 512 reading their values off the keys on the global ones,
+    128 experts with 8 per token at width 704 beside a dense MLP of 2112, a
+    quarter rotary at theta 1e6 over a local theta of 1e4, and softcap 30."""
+    config = translate_config(fixture_config("gemma4-26b-a4b")["text_config"])
+
+    assert config["num_layers"] == 30
+    assert config["layer_types"].count("sliding_attention") == 25
+    assert config["layer_types"][-1] == "full_attention"
+    assert config["emb_features"] == 2816 and config["vocab_size"] == 262144
+    assert config["num_heads"] == 16 and config["num_kv_heads"] == 8
+    assert config["head_dim"] == 256
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 2}
+    assert config["kinds"]["sliding_attention"] == {"window": 1024, "rope_theta": 10000.0}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert config["mixture"] == {"experts": 128, "top_k": 8, "expert_features": 704,
+                                 "parallel": True}
+    assert config["mlp_features"] == 2112 and config["mlp"] == "geglu"
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["rope_theta"] == 1000000.0
+    assert config["final_logit_softcap"] == 30.0
+    assert config["v_norm"] and not config["use_double_wide_mlp"]
+    assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
+
+
+def test_the_real_gemma_4_31b_text_config_translates():
+    """The dense 31B, from the local hub cache: 60 layers, 32 query heads of
+    256 with 16 key/value heads, the global layers reading their values off 4
+    key/value heads of 512, no routed branch and no per-layer inputs."""
+    path = Path(
+        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-31B"
+        "/snapshots/5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89/config.json")
+    if not path.exists():
+        pytest.skip("the 31B config is a local hub cache read, not a download")
+    config = translate_config(json.loads(path.read_text())["text_config"])
+
+    assert config["num_layers"] == 60
+    assert config["num_heads"] == 32 and config["num_kv_heads"] == 16
+    assert config["head_dim"] == 256
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 4}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert "mixture" not in config
+    assert config["per_layer_input_dim"] is None
+
+
+def test_gemma4_moe_logits_match_the_reference_implementation():
+    """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
+    with identical argmax. The fused expert kernels arrive split in place,
+    the global layer holds no v_proj, and every layer holds its scalar."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    ids = np.load(GEMMA4_MOE / "input_ids.npy")
+    reference = np.load(GEMMA4_MOE / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    params = variables["params"]
+    experts = params["layers_0"]["moe"]["experts"]
+    assert experts["gate_proj"]["kernel"].shape == (4, 32, 16)
+    assert experts["down_proj"]["kernel"].shape == (4, 16, 32)
+    assert params["layers_0"]["moe"]["router"]["per_expert_scale"].shape == (4,)
+    assert "v_proj" not in params["layers_2"]["self_attn"]
+    assert params["layers_2"]["self_attn"]["k_proj"]["kernel"].shape == (32, 16)
+    assert all(params[f"layers_{index}"]["layer_scalar"].shape == (1,) for index in range(3))
+
+
+def test_the_layer_scalars_are_what_the_parity_tests():
+    """The fixture's scalars are the reference's ones, so the parity above
+    cannot tell a model that reads them from one that ignores them; a model
+    fed other scalars disagrees with it, so the tree's leaf is live."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
+    reference = np.load(GEMMA4_MOE / "logits.npy")
+    params = dict(variables["params"])
+    for index in range(3):
+        params[f"layers_{index}"] = {**params[f"layers_{index}"],
+                                     "layer_scalar": jnp.full((1,), 0.5, jnp.float32)}
+    logits = np.asarray(model.apply({"params": params}, ids))
+    assert float(np.max(np.abs(logits - reference))) > 1e-3
+
+
+def test_a_global_layer_without_k_eq_v_needs_its_v_proj(tmp_path):
+    """The same weights under a config with the flag off are refused on the
+    global layer's missing v_proj leaf rather than loaded with a value
+    projection the checkpoint never had."""
+    directory = tmp_path / "gemma4"
+    directory.mkdir()
+    (directory / "model.safetensors").symlink_to(GEMMA4_MOE / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(
+        {**fixture_config("gemma4-moe-tiny"), "attention_k_eq_v": False}))
+    with pytest.raises(ValueError, match="layers_2.self_attn.v_proj.kernel"):
+        fp32_decoder(directory)
+
+
+def test_a_routed_gemma4_without_its_expert_fields_is_refused():
+    config = fixture_config("gemma4-moe-tiny")
+    del config["moe_intermediate_size"]
+    with pytest.raises(ValueError, match="moe_intermediate_size"):
+        translate_config(config)
+
+
+def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
+    """The 26B-A4B repo's config.json is the multimodal wrapper; its text
+    half alone is what translates."""
+    with pytest.raises(ValueError, match="multimodal wrapper"):
+        translate_config(fixture_config("gemma4-26b-a4b"))
+
+
+def test_gemma4_moe_export_is_refused_by_name(tmp_path):
+    """The values norm every Gemma 4 carries is refused before the routed
+    branch is reached, and by the field's name."""
+    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    with pytest.raises(ValueError, match="v_norm"):
+        save_pretrained_decoder(model, variables, str(tmp_path))

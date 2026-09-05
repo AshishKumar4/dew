@@ -62,6 +62,9 @@ class MixerContext:
     """Where the q/k RMSNorm applies: 'head' norms each head after the split
     (Qwen3, the Gemmas), 'projection' the whole projection before it (OLMo 3)."""
     v_norm: bool = False
+    k_eq_v: bool = False
+    """Gemma 4's attention_k_eq_v on this layer: no value projection, the
+    values are the raw keys under the values norm."""
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
@@ -142,6 +145,7 @@ class AttentionMixer(MixerBase):
             qk_norm=ctx.qk_norm,
             qk_norm_scope=ctx.qk_norm_scope,
             v_norm=ctx.v_norm,
+            k_eq_v=ctx.k_eq_v,
             norm_eps=ctx.norm_eps,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,

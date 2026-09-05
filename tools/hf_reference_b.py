@@ -26,9 +26,19 @@ What lands in tests/fixtures/hf:
 - llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
   interleaved rope and the L2 q/k norm around one global layer with
   temperature tuning, every other layer routed with the shared expert.
-- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, llama-4-scout/:
-  released configs only. Llama-4-Scout is gated, so its config comes from
-  a mirror and drops the mirror's own marker key.
+- gemma4-moe-tiny/: Gemma 4's 26B-A4B shape at toy width, the routed
+  branch beside every layer's dense MLP under Gemma4TextRouter, global
+  layers reading their values off the keys with fewer key/value heads and
+  a wider head, and the per-layer output scalar.
+- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, llama-4-scout/,
+  gemma4-26b-a4b/: released configs only. Llama-4-Scout and gemma-4-26B-A4B
+  are gated, so their configs come from mirrors and drop the mirror's own
+  marker key.
+
+The gemma4-ple, gemma4-kvshare and gemma4-e2b fixtures predate the
+persistent layer_scalar buffer transformers 5.16.1 saves, so
+add_layer_scalars writes the ones the reference initialises into them; the
+logits are unchanged.
 
 What lands in tests/fixtures/llama4, the block-level references the
 primitive tests read before the family loads:
@@ -38,6 +48,13 @@ primitive tests read before the family loads:
   floor_scale 4) on the same random weights and hidden states.
 - moe.npz: one `Llama4TextMoe` on random weights, its output and the
   per-expert tensors the checkpoint layout carries fused.
+
+What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
+
+- moe.npz: one `Gemma4TextDecoderLayer` feed-forward half on random
+  weights: the residual it reads, the dense MLP's output, the router's
+  weights and choices, and the summed branch output before the block's
+  post_feedforward_layernorm.
 """
 
 import sys
@@ -47,10 +64,11 @@ import numpy as np
 import torch
 from safetensors.numpy import load_file, save_file
 from transformers import (
-    DeepseekV2Config, DeepseekV2ForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM,
-    Llama4TextConfig,
+    DeepseekV2Config, DeepseekV2ForCausalLM, Gemma4TextConfig, Glm4MoeConfig,
+    Glm4MoeForCausalLM, Llama4TextConfig,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
+from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM, Gemma4TextDecoderLayer
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
 from transformers.models.llama4.modeling_llama4 import (
     Llama4ForCausalLM, Llama4TextAttention, Llama4TextMoe, Llama4TextRotaryEmbedding,
@@ -205,9 +223,70 @@ def write_llama4_blocks(directory: Path) -> None:
     print(f"{directory}: attention and moe blocks, {sorted(p.name for p in directory.iterdir())}")
 
 
+def gemma4_moe_tiny_config() -> Gemma4TextConfig:
+    """Two sliding layers around a global one: the global kind keeps one
+    key/value head of 16 while the sliding kind keeps two of 8, and every
+    layer routes two of four experts of width 16 beside its dense MLP."""
+    return Gemma4TextConfig.from_dict(dict(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8, global_head_dim=16,
+        num_global_key_value_heads=1, attention_k_eq_v=True, enable_moe_block=True,
+        num_experts=4, top_k_experts=2, moe_intermediate_size=16, sliding_window=4,
+        hidden_size_per_layer_input=0, num_kv_shared_layers=0, max_position_embeddings=64,
+        rms_norm_eps=1e-6, final_logit_softcapping=30.0, tie_word_embeddings=True,
+        rope_parameters={"full_attention": {"rope_type": "proportional", "rope_theta": 1e6,
+                                            "partial_rotary_factor": 0.25},
+                         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}}))
+
+
+def tiny_gemma4_moe() -> Gemma4ForCausalLM:
+    torch.manual_seed(0)
+    return Gemma4ForCausalLM(gemma4_moe_tiny_config())
+
+
+def write_gemma4_moe_block(directory: Path) -> None:
+    """The feed-forward half of a routed Gemma 4 layer, run the way the
+    layer runs it (modeling_gemma4.py, Gemma4TextDecoderLayer.forward)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    layer = Gemma4TextDecoderLayer(gemma4_moe_tiny_config(), layer_idx=0).eval()
+    scatter_weights(layer, seed=44)
+    generator = torch.Generator().manual_seed(45)
+    residual = torch.randn(2, 6, layer.hidden_size, generator=generator)
+    with torch.no_grad():
+        mlp_out = layer.mlp(layer.pre_feedforward_layernorm(residual))
+        flat = residual.reshape(-1, layer.hidden_size)
+        probabilities, weights, indices = layer.router(flat)
+        routed = layer.experts(layer.pre_feedforward_layernorm_2(flat), indices, weights)
+        output = (layer.post_feedforward_layernorm_1(mlp_out)
+                  + layer.post_feedforward_layernorm_2(routed.reshape(residual.shape)))
+    arrays = {"hidden": residual.numpy(), "mlp_out": mlp_out.numpy(),
+              "router_probabilities": probabilities.numpy(),
+              "router_weights": weights.numpy(), "router_indices": indices.numpy(),
+              "output": output.numpy()}
+    for prefix in ("router", "experts", "pre_feedforward_layernorm_2",
+                   "post_feedforward_layernorm_1", "post_feedforward_layernorm_2"):
+        arrays.update({f"{prefix}.{tensor_name}": tensor.detach().numpy()
+                       for tensor_name, tensor in getattr(layer, prefix).named_parameters()})
+    np.savez(directory / "moe.npz", allow_pickle=False, **arrays)
+    print(f"{directory}: moe block, {sorted(arrays)}")
+
+
+def add_layer_scalars(name: str) -> None:
+    """The ones of the reference's layer_scalar buffer into an older fixture."""
+    directory = FIXTURES / name
+    tensors = load_file(str(directory / "model.safetensors"))
+    layers = {int(tensor_name.split(".")[2]) for tensor_name in tensors
+              if tensor_name.startswith("model.layers.")}
+    for index in layers:
+        tensors[f"model.layers.{index}.layer_scalar"] = np.ones((1,), np.float32)
+    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+
+
 def write_llama4_scout_config() -> None:
-    """meta-llama/Llama-4-Scout-17B-16E is gated; the mirror carries the
-    identical config plus its own marker, which is dropped."""
+    """meta-llama/Llama-4-Scout-17B-16E and google/gemma-4-26B-A4B are gated;
+    the mirrors carry the identical configs plus their own marker, which is
+    dropped."""
     from huggingface_hub import hf_hub_download
     import json
 
@@ -217,6 +296,12 @@ def write_llama4_scout_config() -> None:
     config["text_config"].pop("for_llm_compressor", None)
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     (directory / "source.json").write_text(json.dumps({"repo": "unsloth/Llama-4-Scout-17B-16E"}) + "\n")
+    directory = FIXTURES / "gemma4-26b-a4b"
+    directory.mkdir(parents=True, exist_ok=True)
+    config = json.loads(Path(hf_hub_download("unsloth/gemma-4-26B-A4B-it", "config.json")).read_text())
+    config.pop("unsloth_fixed", None)
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({"repo": "unsloth/gemma-4-26B-A4B-it"}) + "\n")
 
 
 def main() -> None:
@@ -228,6 +313,10 @@ def main() -> None:
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_llama4_scout_config()
+    write_tiny("gemma4-moe-tiny", tiny_gemma4_moe())
+    write_gemma4_moe_block(FIXTURES.parent / "gemma4")
+    for name in ("gemma4-ple", "gemma4-kvshare", "gemma4-e2b"):
+        add_layer_scalars(name)
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")

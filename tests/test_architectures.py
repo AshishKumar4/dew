@@ -231,6 +231,19 @@ CASES = [
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
     }, seq_len=SEQ_LEN, label="llama4"),
+    # Gemma 4's 26B-A4B at toy width: the routed branch beside every layer's
+    # dense MLP, the global layer reading its values off the keys with its
+    # own head dim and key/value count, and the per-layer output scalar.
+    Case("causal_transformer", {
+        **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
+        "sandwich_norms": True, "qk_norm": True, "v_norm": True,
+        "embedding_scale": True, "attention_scale": 1.0, "partial_rotary_factor": 0.25,
+        "layer_types": ("sliding_attention", "full_attention"),
+        "kinds": {"sliding_attention": {"window": 4},
+                  "full_attention": {"head_dim": 16, "num_kv_heads": 1}},
+        "attention_k_eq_v": True, "layer_scalar": True,
+        "mixture": {"experts": 8, "top_k": 2, "expert_features": 16, "parallel": True},
+    }, seq_len=SEQ_LEN, label="gemma4_moe"),
     # Qwen3.5's stack: gated delta net layers on the linear_attention kind,
     # one gated full-attention layer with the sliced partial rotary. The
     # delta net's projections are wide enough to cross the shard threshold,
