@@ -917,6 +917,12 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
                                positions=positions, segment_ids=segment_ids)
+        if self.is_initializing() and self.mtp:
+            # Flax creates a parameter where a call first reaches it, and the
+            # main forward never enters the prediction depths. Reaching them
+            # here, during init only, makes the model's tree the model's
+            # business: a plain init holds every depth.
+            self.mtp_logits(x, tokens, train=train)
         return self._logits(x)
 
     def _logits(self, x):
@@ -942,11 +948,9 @@ class CausalTransformer(nn.Module):
         and scores what follows each position d tokens out, through the
         shared head. Empty without prediction depths.
 
-        Flax initializes the setups a call reaches, so a plain init of the
-        main forward leaves these depths uninitialized: initialize with a
-        method running both paths, `method=lambda m, x: (m(x),
-        m.mtp_logits(m.hidden_states(x), x))`, which is the one tree the
-        trainer and the checks below hold.
+        A plain init of the main forward holds these depths too: `__call__`
+        reaches them while initializing, so the tree does not depend on which
+        method built it.
         """
         embeds = self.embed_tokens(tokens)
         depth_logits = []
