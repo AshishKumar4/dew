@@ -383,10 +383,11 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     q_len, kv_len = query.shape[-3], key.shape[-3]
     query = constrain(stripe(query, shards), split)
 
-    def rows_in_order(x):
-        """A mask or bias with its query rows in the striped order; a row that
-        broadcasts over the queries is the same in any order."""
-        return None if x is None or x.shape[-2] != q_len else stripe(x, shards, axis=-2)
+    def rows_in_order(x: jax.Array | None) -> jax.Array | None:
+        # A broadcast query row has the same value in either order.
+        if x is not None and x.ndim >= 2 and x.shape[-2] == q_len:
+            return stripe(x, shards, axis=-2)
+        return x
 
     mask, bias = rows_in_order(mask), rows_in_order(bias)
     if causal or sliding_window is not None:
