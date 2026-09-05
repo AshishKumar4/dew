@@ -797,8 +797,10 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         # runs in fp32) and the layers after it keep fp32, so the carry
         # enters in the dtype one layer returns; at fp32 nothing changes.
         first_input = None if inputs is None else inputs[:, :, 0, :]
+        assert group.scope is not None
         output = jax.eval_shape(lambda: group.apply(
             jax.tree.map(lambda leaf: leaf[0], group.variables), x, mutable=True,
+            rngs={name: rng.as_jax_rng() for name, rng in group.scope.rngs.items()},
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             kv_store=store, per_layer_input=first_input)[0])
         scanned = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
