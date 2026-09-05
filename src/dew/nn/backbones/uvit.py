@@ -1,18 +1,14 @@
-# simple_vit.py
-
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Callable, Any, Optional, Tuple, Literal
-from .unet import FourierEmbedding, TimeProjection, ConvLayer, kernel_init
-from ..attention import TransformerBlock
-from dew.nn.backbones.unet import FourierEmbedding, TimeProjection, ConvLayer, kernel_init, ResidualBlock
-import einops
+from typing import Callable, Optional, Literal
 from flax.typing import Dtype, PrecisionLike
 from functools import partial
-from ..scan_orders import hilbert_indices, inverse_permutation, hilbert_patchify, hilbert_unpatchify
-from ..vit import unpatchify, PatchEmbedding, RotaryEmbedding, RoPEAttention, AdaLNParams
-from ..dit import ModulatedBlock, remat_block, masked_mean
+
+from ..attention import TransformerBlock, rotary_freqs
+from ..blocks import FourierEmbedding, TimeProjection, ConvLayer
+from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
+from ..dit import ROPE_THETA, PatchEmbedding, ModulatedBlock, remat_block, masked_mean
 from dew.registry import models
 from ..sharding import logical_axes
 
@@ -231,7 +227,7 @@ class UViT(nn.Module):
             x_image = hilbert_unpatchify(
                 x_patches_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
         else:
-            x_image = unpatchify(x_patches_out, channels=self.output_channels)
+            x_image = unpatchify(x_patches_out, self.patch_size, H, W, self.output_channels)
 
         if self.add_residualblock_output:
             x_image = jnp.concatenate(
@@ -241,8 +237,6 @@ class UViT(nn.Module):
             x_image = self.final_norm_conv(x_image)
             x_image = self.activation(x_image)
             x_image = self.final_conv2(x_image)
-        else:
-            pass
 
         return x_image
 
@@ -306,31 +300,8 @@ class SimpleUDiT(nn.Module):
             name="text_proj"
         )
 
-        max_patches = (512 // self.patch_size)**2
-        self.rope = RotaryEmbedding(
-            dim=self.emb_features // self.num_heads,
-            max_seq_len=max_patches,
-            dtype=self.dtype,
-            name="rope_emb"
-        )
-
-        self.down_blocks = [
-            remat_block(ModulatedBlock, self.remat)(
-                features=self.emb_features,
-                num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                attention_impl=self.attention_impl,
-                norm_epsilon=self.norm_epsilon,
-                rope_emb=self.rope,
-                name=f"down_block_{i}"
-            ) for i in range(half_layers)
-        ]
-
-        self.mid_block = remat_block(ModulatedBlock, self.remat)(
+        block = partial(
+            remat_block(ModulatedBlock, self.remat),
             features=self.emb_features,
             num_heads=self.num_heads,
             mlp_ratio=self.mlp_ratio,
@@ -338,11 +309,11 @@ class SimpleUDiT(nn.Module):
             dtype=self.dtype,
             precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-                attention_impl=self.attention_impl,
+            attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon,
-            rope_emb=self.rope,
-            name="mid_block"
         )
+        self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
+        self.mid_block = block(name="mid_block")
 
         self.up_dense = [
              nn.DenseGeneral(
@@ -352,21 +323,7 @@ class SimpleUDiT(nn.Module):
                  name=f"up_dense_{i}"
              ) for i in range(half_layers)
         ]
-        self.up_blocks = [
-            remat_block(ModulatedBlock, self.remat)(
-                features=self.emb_features,
-                num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                attention_impl=self.attention_impl,
-                norm_epsilon=self.norm_epsilon,
-                rope_emb=self.rope,
-                name=f"up_block_{i}"
-            ) for i in range(half_layers)
-        ]
+        self.up_blocks = [block(name=f"up_block_{i}") for i in range(half_layers)]
 
         self.final_norm = nn.LayerNorm(
             epsilon=self.norm_epsilon, dtype=self.dtype, name="final_norm")
@@ -404,18 +361,22 @@ class SimpleUDiT(nn.Module):
             text_emb = self.text_proj(textcontext.hidden.astype(self.dtype))
             cond_emb = cond_emb + masked_mean(text_emb, textcontext.mask)
 
+        # The sequence index is the raster position, which is what the
+        # rotation encodes; a hilbert scan gets the same rotation by index.
+        freqs_cis = rotary_freqs(jnp.arange(num_patches), self.emb_features // self.num_heads,
+                                 ROPE_THETA)
         skips = []
         for i in range(self.num_layers // 2):
-            x_seq = self.down_blocks[i](x_seq, cond_emb, None, train)
+            x_seq = self.down_blocks[i](x_seq, cond_emb, freqs_cis, train)
             skips.append(x_seq)
 
-        x_seq = self.mid_block(x_seq, cond_emb, None, train)
+        x_seq = self.mid_block(x_seq, cond_emb, freqs_cis, train)
 
         for i in range(self.num_layers // 2):
             skip_conn = skips.pop()
             x_seq = jnp.concatenate([x_seq, skip_conn], axis=-1)
             x_seq = self.up_dense[i](x_seq)
-            x_seq = self.up_blocks[i](x_seq, cond_emb, None, train)
+            x_seq = self.up_blocks[i](x_seq, cond_emb, freqs_cis, train)
 
         x_out = self.final_norm(x_seq)
         x_out = self.final_proj(x_out)
@@ -424,6 +385,6 @@ class SimpleUDiT(nn.Module):
             assert hilbert_inv_idx is not None, "Hilbert inverse index missing"
             x_image = hilbert_unpatchify(x_out, hilbert_inv_idx, self.patch_size, H, W, self.output_channels)
         else:
-            x_image = unpatchify(x_out, channels=self.output_channels)
+            x_image = unpatchify(x_out, self.patch_size, H, W, self.output_channels)
 
         return x_image.astype(jnp.float32)
