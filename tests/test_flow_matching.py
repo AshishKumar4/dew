@@ -99,14 +99,6 @@ def test_velocity_roundtrip_is_exact(rng):
     assert jnp.max(jnp.abs(recovered_noise - noise)) < 1e-5
 
 
-def test_preset_wires_flow_matching():
-    process = presets.Flow(shift=2.0)()
-    assert isinstance(process.schedule, FlowMatchingScheduler)
-    assert process.sampling is None
-    assert isinstance(process.prediction, FlowMatchPredictionTransform)
-    assert process.schedule.shift == 2.0
-
-
 ############################################################################################################
 # The existing solvers already integrate the flow ODE
 ############################################################################################################

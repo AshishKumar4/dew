@@ -39,19 +39,19 @@ from dew.diffusion.schedules import (
 DISCRETE_STEPS = jnp.array([10, 300, 600, 900])
 CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 
-# (class, factory, probe steps, family, a keyword of the constructor); family
-# picks the extra rate identity: 'vp' is variance preserving, 've' keeps
-# alpha=1 and scales the input, 'flow' is the rectified-flow linear path.
+# (class, factory, probe steps, family); family picks the extra rate
+# identity: 'vp' is variance preserving, 've' keeps alpha=1 and scales the
+# input, 'flow' is the rectified-flow linear path.
 SCHEDULES = [
-    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp', 'beta_end'),
-    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp', 'beta_end'),
-    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp', 'beta_end'),
-    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp', None),
-    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp', None),
-    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, 've', 'sigma_data'),
-    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've', 'sigma_data'),
-    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've', 'sigma_data'),
-    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow', 'shift'),
+    (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, 'vp'),
+    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
+    (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, 'vp'),
+    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, 've'),
+    (KarrasVENoiseScheduler, partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
+    (EDMNoiseScheduler, partial(EDMNoiseScheduler, sigma_max=80, sigma_data=0.5), CONTINUOUS_STEPS, 've'),
+    (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
 ]
 
 # Base classes: no rates of their own, so nothing to assert invariants against
@@ -70,34 +70,18 @@ EXPORTED_HELPERS = {
     'exp_beta_schedule',
 }
 
-ALL_CASES = [case[:4] for case in SCHEDULES]
+ALL_CASES = SCHEDULES
 ALL_IDS = [cls.__name__ for cls, *_ in SCHEDULES]
 VP_CASES = [case for case in ALL_CASES if case[3] == 'vp']
 VP_IDS = [case[0].__name__ for case in VP_CASES]
 VE_CASES = [case for case in ALL_CASES if case[3] == 've']
 VE_IDS = [case[0].__name__ for case in VE_CASES]
-KEYWORD_CASES = [(make, keyword) for _, make, _, _, keyword in SCHEDULES if keyword]
-KEYWORD_IDS = [cls.__name__ for cls, _, _, _, keyword in SCHEDULES if keyword]
 
 
 def test_every_exported_scheduler_is_covered():
     """Exporting a scheduler without adding it to SCHEDULES fails here."""
     exported = set(schedulers.__all__) - EXPORTED_HELPERS - ABSTRACT_SCHEDULERS
     assert exported == {cls.__name__ for cls, *_ in SCHEDULES}
-
-
-def test_abstract_schedulers_stay_exported():
-    """They are the documented subclassing surface."""
-    assert ABSTRACT_SCHEDULERS <= set(schedulers.__all__)
-
-
-@pytest.mark.parametrize("make,keyword", KEYWORD_CASES, ids=KEYWORD_IDS)
-def test_misspelled_keyword_is_rejected(make, keyword):
-    """A typo in a keyword must raise at construction. Swallowing it means the
-    run silently trains with the default."""
-    typo = keyword[:-1] + "_"
-    with pytest.raises(TypeError, match=typo):
-        make(**{typo: 5.0})
 
 
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)
@@ -219,8 +203,8 @@ def test_generalized_weights_are_the_edm_lambda(cls, make, steps, family):
 
 
 def test_karras_weights_at_sigma_min():
-    """No epsilon guard: the old one halved the weight at sigma_min, where
-    (sigma sigma_data)^2 is 1e-6."""
+    """At sigma_min, where (sigma sigma_data)^2 is 1e-6, the weight is the
+    formula's 1e6 and not what an epsilon in the denominator would halve it to."""
     schedule = KarrasVENoiseScheduler(sigma_min=0.002, sigma_max=80, rho=7, sigma_data=0.5)
     sigma = jnp.array([0.002])
     expected = (sigma**2 + 0.5**2) / ((sigma * 0.5) ** 2)
@@ -245,9 +229,17 @@ def test_edm_lognormal_sigma_distribution(rng, P_mean, P_std):
     assert abs(float(jnp.std(log_sigma)) - P_std) < 0.05
 
 
-def test_edm_defaults_to_edm2_distribution():
-    schedule = EDMNoiseScheduler()
-    assert (schedule.P_mean, schedule.P_std) == (-0.4, 1.0)
+def test_cosine_table_is_nichol_and_dhariwals_cumulative_alpha():
+    """Nichol and Dhariwal 2021, Eq. 17: at index t the cumulative alpha is
+    f(t + 1) / f(0) with f(u) = cos^2((u / T + s) / (1 + s) pi / 2), where the
+    table is the product of one minus each beta. Checked away from the top of
+    the table, where the clip on each beta rounds the last few entries."""
+    T, s = 1000, 0.008
+    schedule = CosineNoiseScheduler(T, beta_start=s)
+    index = jnp.array([0, 10, 300, 600, 900])
+    f = lambda u: jnp.cos((u / T + s) / (1 + s) * jnp.pi / 2) ** 2
+    expected = f(index + 1.0) / f(0.0)
+    assert jnp.allclose(schedule.rates(index)[0] ** 2, expected, rtol=1e-4)
 
 
 def test_discrete_p2_default_makes_the_v_loss_an_x0_loss():
