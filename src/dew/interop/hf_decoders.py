@@ -16,7 +16,7 @@ gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3
 (the hybrid of gated delta net layers and gated full-attention layers, whose
 linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
 glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32.
-A multimodal wrapper config is refused rather than loading its text half.
+A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek loads
 through the MLA mixer with DeepSeek's MoE sizing, and its released
 checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
@@ -52,7 +52,8 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 DEFAULT_MAX_SEQ_LEN = 8192
 
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
-# are the three the covered families use; anything else is refused by name.
+# are the three the covered families use; anything else raises a ValueError
+# naming the value.
 # 'gelu' is torch's erf gelu (ACT2FN['gelu']), which Gemma's released config
 # names, and 'gelu_pytorch_tanh' the approximation the later Gemmas name.
 _ACTIVATIONS = {'silu': 'swiglu', 'gelu_pytorch_tanh': 'geglu', 'gelu': 'geglu_exact'}
@@ -67,7 +68,7 @@ _DEEPSEEK = ('deepseek_v3', 'deepseek_v32')
 # A multimodal repo's config.json is a wrapper whose model_type names the
 # whole model and whose text_config holds the decoder. Its own weights live
 # under model.language_model.*, next to vision and audio towers this has no
-# counterpart for, so the wrapper is refused by name.
+# counterpart for, so the wrapper raises a ValueError naming its model_type.
 _WRAPPERS = ('gemma3', 'gemma4', 'gemma4_unified', 'gemma3n', 'qwen3_5', 'llama4')
 
 # The gated delta net's own geometry, the config's names and the mixer kind's.
@@ -330,12 +331,11 @@ def _yarn_record(entry: Mapping[str, Any], field: str, theta: float,
     """The mixer's yarn record out of a YaRN rope entry.
 
     Keeps the reference's names; the mixer's YarnScaling is built from these
-    keys. An explicit
-    `attention_factor` rides along (the reference scales cos/sin by it
-    instead of deriving one), while a partial rotary inside a YaRN entry
-    has no counterpart in the mixer's full-width ramp and refuses. A
-    missing factor falls back the way the reference does, to the context
-    ratio off the original length.
+    keys. An explicit `attention_factor` rides along (the reference scales
+    cos/sin by it and derives none), while a partial rotary inside a YaRN
+    entry has no counterpart in the mixer's full-width ramp and raises a
+    ValueError. A missing factor falls back the way the reference does, to
+    the context ratio off the original length.
     """
     unknown = sorted(set(entry) - _YARN_FIELDS)
     if unknown:
@@ -703,7 +703,7 @@ def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str,
     With use_sliding_window every layer is windowed and max_window_layers is
     never read (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149).
     The expert count is `num_experts`, with `num_local_experts` its alias
-    (attribute_map), which is how transformers 5.16.1 writes it back."""
+    (attribute_map), the name transformers 5.16.1 writes it back under."""
     layers = int(hf_config['num_hidden_layers'])
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
     windowed = (hf_config.get('use_sliding_window', False)
@@ -738,11 +738,11 @@ def _olmo3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
     q/k RMSNorms over the whole projection before the head split
     (:162-163, :178-179), three sliding layers to one full
     (configuration_olmo3.py:96-98), and one rope base for both kinds. A flat
-    `rope_scaling` is the full-attention layers' alone, which is where the
-    reference moves it (configuration_olmo3.py:110-113), so a llama3 ramp
-    lands on the full kind; the released checkpoints carry a YaRN there,
-    which the attention has no per-kind ramp for, so that entry refuses by
-    name."""
+    `rope_scaling` is the full-attention layers' alone, where the reference
+    moves it (configuration_olmo3.py:110-113), so a llama3 ramp lands on the
+    full kind; the released checkpoints carry a YaRN there, which the
+    attention has no per-kind ramp for, so that entry raises a ValueError
+    naming the field."""
     layers = int(hf_config['num_hidden_layers'])
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
@@ -1051,8 +1051,8 @@ def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
     # DeepSeek-V3 and 92425 on V3.2-Exp, none of them MTP) and
     # transformers builds no MTP module, so the field describes nothing
     # the weights hold and the base model is what loads. Weight
-    # translation refuses mtp.* tensors, so a checkpoint that ships them
-    # fails here instead of loading without them.
+    # translation raises on mtp.* tensors, so a checkpoint that ships them
+    # fails at load.
     # The fp8 scales name the stored dtype. dew loads the dequantized
     # weights, and the reader names an unreadable dtype where it meets one.
     # ep_size is a runtime parallel hint.
@@ -1221,15 +1221,15 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
     """One HF tensor name into its path in a CausalTransformer's variables.
 
     The first name is the collection: `params` for a weight, `moe` for
-    DeepSeek's balancing bias. That bias is router state a training step moves
-    rather than a parameter, so it lands where `Router` keeps it. None means
+    DeepSeek's balancing bias. That bias is router state a training step
+    moves, not a parameter, so it lands where `Router` keeps it. None means
     the tensor has no place in the tree: the tied lm_head a checkpoint
     carries as a copy of the embedding or the mtp.* weights of a Qwen3.5
     checkpoint, which the reference itself drops on load
     (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected). No
     forward pass of the reference reads them. A name the map cannot explain
-    at all raises, so an unfamiliar checkpoint fails here instead of loading
-    a model with half its weights.
+    at all raises ValueError with the tensor name, so an unfamiliar
+    checkpoint fails at load.
     """
     parts = hf_name.split('.')
     if (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
@@ -2084,7 +2084,7 @@ _FAMILY_ENTRIES = (
                                   and not mixture.bias),
                   'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}),
     # Kimi K2 is DeepSeek V3's computation under its own model_type and
-    # tokenizer, so a Dew model never names it. What it computes exports as
+    # tokenizer, so no Dew model names it. What it computes exports as
     # deepseek_v3, which transformers loads with the same modeling code.
     DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
