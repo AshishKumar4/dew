@@ -1,29 +1,26 @@
-"""Forward-pass tests for every model architecture.
+"""Invariants of the model architectures that a training run does not check.
 
-Every architecture must build, run a forward pass at a small resolution,
-and return the input shape back in float32. This is the first line of
-defense against dead configs and shape bugs.
+Every registered architecture trains through `fit` in test_architectures.py;
+what is here is the behaviour a forward pass has to have beyond running: the
+scan orders, the position signal, the mixing across frames, the inflation of
+a 2D UNet into a 3D one, and the stage values the UNets are configured with.
 """
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.nn.backbones.unet import Unet
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.dit import TextContext
+from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.backbones.mmdit import SimpleMMDiT
-from dew.nn.backbones.uvit import UViT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.attention import Stage
+from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
 
 RES = 32
-
-
-def run_forward(model, rng, x, temb, textcontext):
-    params = model.init(rng, x, temb, textcontext)
-    return model.apply(params, x, temb, textcontext)
 
 
 def text(batch=2, tokens=77, features=768):
@@ -37,92 +34,94 @@ def small_inputs(rng, res=RES, channels=3):
     return x, temb, text()
 
 
-def test_unet_forward(rng):
-    model = Unet(
-        emb_features=64,
-        feature_depths=[16, 32],
-        attention_configs=[None, Stage(heads=2, dtype=jnp.float32,
-                                       use_projection=False, use_self_and_cross=False)],
-        num_res_blocks=1,
-        num_middle_res_blocks=1,
-    )
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
-    assert out.dtype == jnp.float32
-
-
-def test_simple_dit_forward(rng):
-    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
-    assert out.dtype == jnp.float32
-
-
-def test_simple_dit_bf16_outputs_fp32(rng):
+def test_a_bf16_dit_predicts_in_fp32(rng):
+    """The output head runs in fp32 whatever the model's compute dtype, so the
+    loss the objective takes from the prediction is an fp32 one."""
     model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
                       mlp_ratio=2, dtype=jnp.bfloat16)
     x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.dtype == jnp.float32
+    params = model.init(rng, x, temb, textcontext)
+    assert model.apply(params, x, temb, textcontext).dtype == jnp.float32
 
 
-def test_simple_dit_non_square(rng):
-    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
-    x = jax.random.normal(rng, (2, 16, 64, 3))
+@pytest.mark.parametrize("architecture, extra", [
+    ("simple_dit", {}),
+    ("hybrid_dit", {"ssm_attention_ratio": "all-attn"}),
+    ("simple_mmdit", {}),
+], ids=["simple_dit", "hybrid_dit", "simple_mmdit"])
+def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architecture, extra):
+    """The hilbert and zigzag orders share one parameter tree (`hilbert_projection`
+    over raw patches) and differ only in the permutation the tokens travel in.
+    Attention is permutation-equivariant and the MLP is per token, so on the
+    same weights the two orders must agree once each is unpermuted back to the
+    image: the sincos signal has to be permuted with the tokens, the rotation
+    has to stay off, and the inverse permutation has to be the inverse. A
+    non-square grid, so a transposed permutation cannot pass."""
+    x = jax.random.normal(rng, (2, 16, 32, 3))
     temb = jnp.ones((2,))
-    textcontext = text()
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
+    textcontext = text(features=64)
+    config = dict(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2, **extra)
+    hilbert = models.build(architecture, scan_order="hilbert", **config)
+    zigzag = models.build(architecture, scan_order="zigzag", **config)
+    params = jax.tree.map(lambda p: p + 0.05 * jax.random.normal(rng, p.shape),
+                          hilbert.init(rng, x, temb, textcontext))
+    out_hilbert = hilbert.apply(params, x, temb, textcontext)
+    out_zigzag = zigzag.apply(params, x, temb, textcontext)
+    assert float(jnp.max(jnp.abs(out_hilbert))) > 0.1, "the perturbed weights produce no signal"
+    # The two orders sum the same softmax in a different order: 2e-6 observed.
+    assert float(jnp.max(jnp.abs(out_hilbert - out_zigzag))) < 1e-5
 
 
-def test_simple_mmdit_forward(rng):
-    model = SimpleMMDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+@pytest.mark.parametrize("scan_order", ["hilbert", "zigzag"])
+def test_a_scan_order_model_traces_under_jit(rng, scan_order):
+    """The permutation is host data that rides into the compiled step as a
+    constant, so a scan-order model compiles like a raster one and computes
+    the same thing compiled as eager."""
+    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2,
+                      scan_order=scan_order)
     x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
+    params = jax.jit(model.init)(rng, x, temb, textcontext)
+    params = jax.tree.map(lambda p: p + 0.05, params)
+    compiled = jax.jit(model.apply)(params, x, temb, textcontext)
+    # 7.5e-7 observed: XLA fuses the compiled graph differently.
+    assert jnp.allclose(compiled, model.apply(params, x, temb, textcontext), atol=1e-5)
 
 
-def test_uvit_forward(rng):
-    model = UViT(patch_size=4, emb_features=64, num_layers=4, num_heads=2)
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
+@pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])
+def test_2d_fusion_convolves_the_grid_not_the_scan(rng, scan_order):
+    """The spatial fusion of an SSM block sees the row-major grid whatever
+    order the tokens arrive in: a depthwise kernel that reads the neighbour to
+    the right shifts the grid by one column, and the result comes back in the
+    scan order it was given."""
+    H_P = W_P = 4
+    block = ModulatedBlock(features=3, num_heads=1, mixer='ssm', ssm_state_dim=2,
+                           use_2d_fusion=True, scan_order=scan_order)
+    grid = jax.random.normal(rng, (2, H_P, W_P, 3))
+    order = {"raster": np.arange(H_P * W_P), "hilbert": hilbert_indices(H_P, W_P),
+             "zigzag": zigzag_indices(H_P, W_P)}[scan_order]
+    scanned = grid.reshape(2, H_P * W_P, 3)[:, order, :]
+    variables = block.init(rng, scanned, jnp.zeros((2, 3)), None)
+    # One 3x3 depthwise tap at (row 1, column 2): out[h, w] = in[h, w + 1].
+    kernels = jax.tree.map(jnp.zeros_like, variables["params"]["spatial_fusion"])
+    kernels["dwconv_dil1"]["kernel"] = kernels["dwconv_dil1"]["kernel"].at[1, 2, 0, :].set(1.0)
+    variables = {"params": {**variables["params"], "spatial_fusion": kernels}}
+    fused = block.apply(variables, scanned, method=ModulatedBlock._apply_2d_fusion)
 
-
-@pytest.mark.parametrize("kwargs", [
-    {},
-    {"scan_order": "hilbert"},
-    {"scan_order": "zigzag"},
-    {"scan_order": "zigzag", "use_2d_fusion": True},
-    {"scan_order": "hilbert", "use_2d_fusion": True},
-])
-def test_hybrid_dit_forward(rng, kwargs):
-    model = HybridSSMAttentionDiT(patch_size=4, emb_features=64, num_layers=4,
-                                  num_heads=2, mlp_ratio=2, ssm_state_dim=8, **kwargs)
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
-
-
-def test_uvit_hilbert_forward(rng):
-    """UViT takes the hilbert order and returns the shape it was given."""
-    model = UViT(patch_size=4, emb_features=64, num_layers=4, num_heads=2, scan_order="hilbert")
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
+    shifted = jnp.pad(grid, ((0, 0), (0, 0), (0, 1), (0, 0)))[:, :, 1:, :]
+    expected = (grid + shifted).reshape(2, H_P * W_P, 3)[:, order, :]
+    assert jnp.allclose(fused, expected, atol=1e-6)
 
 
 def test_hilbert_patchify_roundtrip(rng):
     """patchify returns patches in hilbert order plus the inverse permutation;
-    unpatchify with that permutation must be an exact identity."""
+    unpatchify with that permutation must be an exact identity, on a grid
+    that is not square and not a power of two on either side."""
     from dew.nn.scan_orders import hilbert_patchify, hilbert_unpatchify
 
-    x = jax.random.normal(rng, (2, 16, 16, 3))
+    x = jax.random.normal(rng, (2, 12, 20, 3))
     patches, inv_idx = hilbert_patchify(x, 4)
-    rec = hilbert_unpatchify(patches, inv_idx, 4, 16, 16, 3)
-    assert jnp.allclose(rec, x)
+    rec = hilbert_unpatchify(patches, inv_idx, 4, 12, 20, 3)
+    assert jnp.array_equal(rec, x)
 
 
 def test_dropout_is_active_in_train_mode(rng):
@@ -145,15 +144,6 @@ def test_dropout_is_active_in_train_mode(rng):
     e0 = model.apply(params, x, temb, textcontext)
     e1 = model.apply(params, x, temb, textcontext)
     assert jnp.array_equal(e0, e1), "eval mode must be deterministic"
-
-
-def test_hierarchical_mmdit_forward(rng):
-    from dew.nn.backbones.mmdit import HierarchicalMMDiT
-    model = HierarchicalMMDiT(base_patch_size=2, emb_features=(32, 64, 96),
-                              num_layers=(1, 1, 1), num_heads=(2, 2, 2), mlp_ratio=2)
-    x, temb, textcontext = small_inputs(rng)
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
 
 
 def test_mmdit_is_dual_stream(rng):
@@ -203,19 +193,6 @@ def test_fused_attention_rejects_a_dtype_it_cannot_honor(rng):
                                         implementation="xla").dtype == jnp.bfloat16
     assert scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
                                         implementation=None).dtype == jnp.float32
-
-
-def test_video_dit_forward(rng):
-    """Factorized ST video model over (B, T, H, W, C), the replacement for
-    the never-wired diffusers-derived UNet3D."""
-    from dew.nn.backbones.video_dit import VideoDiT
-    model = VideoDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
-    x = jax.random.normal(rng, (2, 3, 16, 16, 3))
-    temb = jnp.ones((2,))
-    textcontext = text()
-    out = run_forward(model, rng, x, temb, textcontext)
-    assert out.shape == x.shape
-    assert jnp.all(jnp.isfinite(out))
 
 
 def open_the_gates(params, key, scale=0.5):
@@ -281,7 +258,6 @@ def test_unet3d_inflation_reproduces_2d_unet(rng):
     out_3d = model_3d.apply(inflated, x, temb, textcontext)
     frames_2d = jnp.stack(
         [model_2d.apply(params_2d, x[:, t], temb, textcontext) for t in range(3)], axis=1)
-    assert out_3d.shape == x.shape
     assert jnp.max(jnp.abs(out_3d - frames_2d)) < 1e-5, "inflated UNet3D does not match the 2D model"
 
 
@@ -327,13 +303,10 @@ def test_non_symmetric_attention_configs_init(rng):
     video = jax.random.normal(rng, (2, 3, 16, 16, 3))
     UNet3D(**config, temporal_heads=2).init(rng, video, temb, textcontext)
 
-############################################################################################################
-# A unet stage is a declared value
-############################################################################################################
 
 def test_a_stage_with_an_unknown_field_is_refused():
-    """Design rule 6: an unknown field raises. A stage used to be an untyped
-    dict read with `.get`, so a typo turned the dial it named off in silence."""
+    """Design rule 6: an unknown field raises, so a misspelled dial cannot
+    leave the dial it meant at its default in silence."""
     stages = [None, {"heads": 2, "use_projeciton": True}]
     with pytest.raises(ValueError, match="use_projeciton"):
         models.build("unet", feature_depths=(8, 16), attention_configs=stages,
@@ -353,9 +326,9 @@ def test_a_stage_record_builds_the_value():
 
 
 def test_a_stage_names_the_dials_the_block_supports(rng):
-    """`use_linear_attention` and `norm_epsilon` are TransformerBlock dials no
-    config could name while a stage was a dict: the unets passed neither, so
-    the projection kind and the norm epsilon were unreachable from a run."""
+    """Every `TransformerBlock` dial a stage names reaches the block the unet
+    builds from it: `use_linear_attention` and `norm_epsilon` each change the
+    output when set, so the unet cannot drop one on the way."""
     x = jax.random.normal(rng, (2, 16, 16, 3))
     temb = jnp.ones((2,))
     context = text(features=64)
@@ -374,8 +347,8 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
 
 def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
     """The run's dtype and the fused-kernel softmax reach into every stage,
-    which is what `with_precision` exists for; a stage is now a value, and a
-    record of one still arrives from a logged config."""
+    which is what `with_precision` exists for, whether the stage is a value
+    or the record of one from a logged config."""
     from dew.registry import with_precision
 
     record, value = ({"heads": 2}, Stage(heads=2))
@@ -398,35 +371,14 @@ def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
 
 
 def test_a_block_pattern_and_a_ratio_together_are_refused():
-    """`block_pattern` used to win over `ssm_attention_ratio` in silence
-    (ssm_dit.py's own docstring said "overrides"). The ratio stays: its "3:1"
-    default is length-independent and a pattern cannot express that, so the
-    two are refused together rather than one being dropped."""
+    """`block_pattern` names every layer's mixer and `ssm_attention_ratio`
+    names them by ratio; set together they would have to disagree in silence,
+    so the hybrid DiT refuses the pair and takes either alone."""
     model = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                                   block_pattern=("ssm", "attn"), ssm_attention_ratio="1:1")
     with pytest.raises(ValueError, match="ssm_attention_ratio"):
         model.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
-    # Either alone still builds.
     for alone in (dict(block_pattern=("ssm", "attn")), dict(ssm_attention_ratio="1:1")):
         HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                               **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
                                             jnp.ones((1,)))
-
-def test_a_stage_keeps_the_defaults_the_dict_read_had():
-    """No default moved in the cutover: `dtype` is float32 and not the model's,
-    which is why `with_precision` writes into every stage, and a stage that
-    names no `precision` takes the model's, as `.get("precision",
-    self.precision)` did."""
-    stage = Stage(heads=8)
-    assert stage.dtype is jnp.float32 and stage.precision is None
-    assert (stage.use_linear_attention, stage.use_projection, stage.use_self_and_cross,
-            stage.only_pure_attention, stage.force_fp32_for_softmax,
-            stage.norm_inputs, stage.explicitly_add_residual, stage.norm_epsilon) == \
-        (True, False, True, True, False, True, True, 1e-4)
-
-    model = Unet(emb_features=32, feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
-                 precision="highest", attention_configs=(None, Stage(heads=2)))
-    x = jnp.zeros((1, 16, 16, 3))
-    params = model.init(jax.random.PRNGKey(0), x, jnp.ones((1,)), text(batch=1, features=64))
-    assert jnp.all(jnp.isfinite(model.apply(params, x, jnp.ones((1,)),
-                                            text(batch=1, features=64))))

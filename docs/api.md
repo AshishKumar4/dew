@@ -48,8 +48,8 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
-| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `SimplifiedEuler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
+| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
 | `dew.sampling.text` | `generate` |
 
 ## Models
@@ -67,7 +67,7 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `Audio`, `CharTable`, `rebuild`, `unit_range` |
+| `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `CharTable`, `rebuild`, `unit_range` |
 | `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Checkpointable`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
 
 ## Evaluation and interop

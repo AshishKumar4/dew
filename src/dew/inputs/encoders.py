@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Mapping, Optional, Self, Sequence, TypeVar
+from typing import Any, Generic, Mapping, Optional, Self, Sequence, TypeVar
 
-import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.typing import Dtype
 
 from dew.nn.dit import TextContext
 from dew.nn.text_encoders import (
@@ -89,9 +89,9 @@ class CLIPText(ConditionEncoder[str]):
 
     checkpoint: str
     transformer: CLIPTextTransformer
-    params: Any
+    params: Variables
     tokenizer: Any
-    dtype: Optional[Any] = None
+    dtype: Optional[Dtype] = None
     revision: Optional[str] = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
@@ -131,47 +131,6 @@ class CLIPText(ConditionEncoder[str]):
                 **({} if self.revision is None else {"revision": self.revision})}
 
 
-@encoders("audio")
-@dataclass(frozen=True, eq=False)
-class Audio(ConditionEncoder[Any]):
-    """Audio conditioning through a Hugging Face feature extractor and a pure
-    `apply(params, features) -> [B, L, D]` over whatever keys the extractor
-    emits (`input_values` for wav2vec2/HuBERT, `input_features` for
-    Whisper/AST), so switching audio models changes nothing here.
-
-    No loader builds the tower: transformers 5 ships no Flax audio models,
-    and a torch one cannot take the numpy arrays `tokenize` produces.
-    `from_pretrained` says so. Until an audio tower is vendored the way
-    `dew.nn.text_encoders` vendors CLIP, an encoder is constructed with an
-    `apply` and `params` of the caller's own.
-    """
-
-    checkpoint: str
-    extractor: Any
-    apply: Callable[[Any, Mapping[str, Any]], jax.Array]
-    params: Any
-    sampling_rate: int
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *,
-                        sampling_rate: int = 16000):
-        raise NotImplementedError(
-            f"no loader can build {checkpoint!r}: transformers 5 ships no Flax audio "
-            "models, and a torch model cannot take the numpy arrays tokenize produces. "
-            "Vendor the audio tower the way dew.nn.text_encoders vendors CLIP, then "
-            "construct Audio with its apply and params and "
-            "AutoFeatureExtractor.from_pretrained(checkpoint) as the extractor")
-
-    def tokenize(self, data: Sequence[Any]) -> dict[str, np.ndarray]:
-        return dict(self.extractor(data, sampling_rate=self.sampling_rate,
-                                   padding=True, return_tensors="np"))
-
-    def encode(self, params, tokens) -> jax.Array:
-        return self.apply(params, tokens)
-
-    def to_json(self) -> dict:
-        return {"checkpoint": self.checkpoint, "sampling_rate": self.sampling_rate}
-
 @encoders("t5")
 @dataclass(frozen=True, eq=False)
 class T5Text(ConditionEncoder[str]):
@@ -186,10 +145,10 @@ class T5Text(ConditionEncoder[str]):
 
     checkpoint: str
     transformer: T5EncoderTransformer
-    params: Any
+    params: Variables
     tokenizer: Any
     max_length: int = 256
-    dtype: Optional[Any] = None
+    dtype: Optional[Dtype] = None
     revision: Optional[str] = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
@@ -274,4 +233,4 @@ class CharTable(ConditionEncoder[str]):
                 "features": self.features, "vocab": self.vocab}
 
 
-__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "Audio", "CharTable", "rebuild"]
+__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "CharTable", "rebuild"]
