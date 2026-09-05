@@ -751,3 +751,58 @@ def test_a_gemma3_pattern_keeps_its_last_layer():
     config = fixture_config("gemma3-1b")
 
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
+
+
+DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
+
+
+def test_the_router_bias_lands_in_the_moe_collection():
+    """DeepSeek's `e_score_correction_bias` is router state a training step
+    moves, not a weight, and `Router` keeps it in the `moe` collection. The
+    checkpoint names it `model.layers.N.mlp.gate.e_score_correction_bias`,
+    six dot-separated parts, one fewer than the per-expert tensors the map
+    also reads under `mlp`; a map that counts it as seven falls through to
+    the params map and refuses the name. Its leaf is the checkpoint's tensor
+    and the loaded model selects on it: zeroing the bias moves the logits by
+    2.1 on deepseek-v3-tiny.
+    """
+    from dew.interop.hf_decoders import _dew_path, _load_shards
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    config = translate_config(fixture_config("deepseek-v3-tiny"))
+    tensors = _load_shards(directory)
+    name = 'model.layers.1.mlp.gate.e_score_correction_bias'
+    assert _dew_path(name, config) == (
+        'moe', 'layers_1', 'mlp', 'gate', 'e_score_correction_bias')
+
+    variables = translate_weights(tensors, config)
+    assert set(flat_tree(variables['moe'])) == {
+        'layers_1.mlp.gate.e_score_correction_bias'}
+    assert np.array_equal(
+        variables['moe']['layers_1']['mlp']['gate']['e_score_correction_bias'],
+        tensors[name])
+    assert not [path for path in flat_tree(variables['params'])
+                if path.endswith('e_score_correction_bias')]
+
+    model, loaded, _ = fp32_decoder(directory)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    zeroed = {**loaded, 'moe': jax.tree.map(jnp.zeros_like, loaded['moe'])}
+    moved = float(np.max(np.abs(np.asarray(model.apply(loaded, ids))
+                                - np.asarray(model.apply(zeroed, ids)))))
+    assert moved > 1.0, moved
+
+
+def test_a_routed_checkpoint_without_its_bias_is_refused(tmp_path):
+    """The tree check holds every collection to account, so a checkpoint
+    that drops the balancing bias fails naming the leaf instead of loading
+    a router at zeros."""
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import save_hf_layout
+
+    directory = FIXTURES / "deepseek-v3-tiny"
+    tensors = _load_shards(directory)
+    del tensors['model.layers.1.mlp.gate.e_score_correction_bias']
+    save_hf_layout(tensors, fixture_config("deepseek-v3-tiny"), str(tmp_path))
+
+    with pytest.raises(ValueError, match=r"missing \['moe\.layers_1\.mlp\.gate\.e_score_correction_bias'\]"):
+        fp32_decoder(tmp_path)
