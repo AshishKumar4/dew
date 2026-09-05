@@ -4,7 +4,7 @@
 and writes as `run.json` next to the checkpoints, and `build()` is the one
 function that turns it into the `DiffusionObjective`. The recipe trains what
 it returns, and `TextToImage.from_run` samples from what it returns for the
-same file, so the two cannot drift.
+same file.
 """
 
 from __future__ import annotations
@@ -47,9 +47,9 @@ else:
 ATTENTION = {"heads": 8}
 
 # Architectures that run the text as a second stream through every block's
-# joint attention. With no text there is no sequence to project, so an
-# unconditional run names something else instead of failing in the first
-# attention softmax over an empty slice.
+# joint attention. With no text there is no sequence to project, so `build`
+# raises for an unconditional run on one of these before the first attention
+# softmax over an empty slice.
 TEXT_STREAM_MODELS = ("simple_mmdit", "hierarchical_mmdit")
 
 # The default unet has attention everywhere but the full-resolution stage,
@@ -188,8 +188,8 @@ class DiffusionRunConfig(RunConfig):
     def build_eval_metrics(self) -> list:
         """Validation metrics for `val_metrics`, each pulling its own weights
         on construction. A video run scores `VideoGrid` against its `video`
-        field, so `psnr` and `ssim` read that grid there and the image-only
-        metrics are refused by name instead of failing in the trainer."""
+        field, so `psnr` and `ssim` read that grid there, and an image-only
+        metric raises a ValueError naming it here, before the trainer."""
         from dew.artifacts import ImageGrid, VideoGrid
 
         video = len(self.sample_field().shape) == 4

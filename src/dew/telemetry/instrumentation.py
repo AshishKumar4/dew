@@ -1,6 +1,6 @@
 """Step FLOP measurement, MFU accounting and the persistent compilation cache.
 
-The FLOP count is read off the optimized HLO rather than out of XLA's
+The FLOP count is read off the optimized HLO, not out of XLA's
 `cost_analysis()`. Cost analysis reports only the operations the compiler can
 see arithmetic in, and a GPU backend hands its matmuls and convolutions to
 cuBLAS and cuDNN custom calls, whose arithmetic it cannot see. Measured on
@@ -20,8 +20,8 @@ import jax
 
 # Dense bf16 peak of one JAX device, keyed by the start of the string
 # `jax.devices()[0].device_kind` reports, and read by `peak_flops` with the
-# longest matching key. Only used to turn measured FLOPs into a utilisation
-# fraction; hardware the table does not name skips MFU.
+# longest matching key. Its only use is turning measured FLOPs into a
+# utilisation fraction; hardware the table does not name skips MFU.
 #
 # TPU kinds are the ones jax's own test_util.is_device_tpu matches: `TPU v2`
 # to `TPU v4`, `TPU v5 lite` for v5e, `TPU v5` for v5p, `TPU v6 lite` for
@@ -284,9 +284,9 @@ def _call_counts(instruction: _Instruction) -> Dict[str, float]:
 
     A loop body runs once per iteration, which XLA states as
     `known_trip_count` whenever the length is known, and every `jax.lax.scan`
-    is such a loop. An unknown trip count becomes infinite, so the caller
-    reports nothing rather than an MFU off by the loop length. A conditional
-    runs one of its branches, so counting every branch bounds it.
+    is such a loop. An unknown trip count becomes infinite, and the caller
+    then reports no count. A conditional runs one of its branches, so
+    counting every branch bounds it.
     """
     counts = {name: 1.0 for name in _CALLS.findall(instruction.attributes)}
     branches = _BRANCHES.search(instruction.attributes)
@@ -351,7 +351,7 @@ def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
     backend hands them to. Backward passes count because they are in there;
     remat counts the forward it recomputes twice, because the card runs it
     twice. None comes back when the module contains a loop whose length XLA
-    does not state, since the count would be the body's rather than the run's.
+    does not state, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
     return None if text is None else hlo_flops(text)
@@ -377,7 +377,7 @@ def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> O
     """FLOPs for one call of a jitted function, straight from the compiler.
 
     Measured, so architectures, remat and gradient accumulation are counted
-    as compiled rather than from a parameter-count formula.
+    as compiled, with no parameter-count formula.
 
     Compiles the function; a caller that already holds the compiled
     executable uses `compiled_flops`.

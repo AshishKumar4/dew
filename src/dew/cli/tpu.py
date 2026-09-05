@@ -300,7 +300,7 @@ class Create(Base):
     spot: bool = False
     """Ask for a spot TPU, which costs less and can be preempted."""
     queued: bool = False
-    """Go through the queued resources API instead of creating directly."""
+    """Create through the queued resources API."""
     version: Version = None
     """Runtime version, or auto to pick it from the accelerator generation."""
     disk: Disk = None

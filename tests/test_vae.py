@@ -38,9 +38,9 @@ def test_latent_normalization_defaults_to_the_identity(rng):
 
 
 def test_the_vae_loader_receives_the_revision(monkeypatch):
-    """`StableDiffusionVAE(revision=...)` used to keep the revision for its
-    record while the loader always read the default, so a non-default run
-    could never rebuild."""
+    """`StableDiffusionVAE(revision=...)` hands the revision to the loader as
+    well as keeping it for its record, so a non-default run rebuilds from
+    the same weights."""
     import dew.nn.autoencoders.sd_vae as sd_vae
     seen = {}
 

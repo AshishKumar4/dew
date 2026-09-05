@@ -3,7 +3,7 @@
 An Arrow-backed `datasets.Dataset` answers `len()` and integer indexing, which
 is the whole of grain's random-access protocol, so the wrapper here is thin. It
 adds the three things grain needs: the `datasets` import happens on the first
-record rather than at import time; rows come back as plain dicts of arrays and
+record, not at import time; rows come back as plain dicts of arrays and
 scalars; and the Arrow table stays out of the pickle that reaches the worker
 processes.
 """
@@ -51,9 +51,9 @@ class HFDatasetSource:
 
     Either hand over a loaded dataset or name a hub dataset and split, which
     `load_dataset` resolves on the first record. The table never travels in
-    the source's pickle. A named dataset reloads by name and split inside the
-    worker, and a dataset handed over in memory is written out once and
-    reopened from there, the way TokenFileSource reopens its memmap.
+    the source's pickle. A named dataset reloads from its name and split
+    inside the worker, and a dataset handed over in memory is written out
+    once and reopened from there, the way TokenFileSource reopens its memmap.
     """
 
     def __init__(self, name: Optional[str] = None, split: str = "train", dataset=None):
@@ -70,8 +70,8 @@ class HFDatasetSource:
 
     def __repr__(self) -> str:
         # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses a state whose repr no longer matches, so this names the
-        # dataset rather than an address, and without touching the table.
+        # refuses a state whose repr differs, so this names the dataset, not
+        # an address, and without touching the table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"cache={self._cache_path!r})")
 

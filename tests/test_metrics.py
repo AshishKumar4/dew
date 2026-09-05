@@ -203,7 +203,7 @@ def test_ssim_matches_the_filtered_equations_of_wang_et_al(rng, data_range):
 
 @pytest.mark.parametrize("metric_fn", [psnr, ssim], ids=['psnr', 'ssim'])
 def test_video_scores_equal_the_flattened_frame_batch(rng, metric_fn):
-    """(B, T, H, W, C) must score exactly as the (B*T, H, W, C) frames do."""
+    """(B, T, H, W, C) scores the same as the (B*T, H, W, C) frames do."""
     key_x, key_noise = jax.random.split(rng)
     video = _ramp_image((2 * 3, 32, 32, 3), key_x).reshape(2, 3, 32, 32, 3)
     degraded = video + 0.1 * jax.random.normal(key_noise, video.shape)
@@ -302,7 +302,7 @@ def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
 
 
 def test_the_registry_names_every_metric_factory():
-    """A run configures metrics by name through `dew.registry.metrics`, so a
+    """A run configures metrics through `dew.registry.metrics`, so a
     factory that loses its decorator is a metric no run can ask for."""
     assert registry['psnr'] is psnr_metric and registry.psnr is psnr_metric
     assert {'fid', 'clip', 'clip_score', 'psnr', 'ssim'} <= set(registry)
@@ -385,8 +385,8 @@ def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
 
 def test_a_metric_pairs_its_samples_with_the_records_they_came_from():
     """An objective samples a fixed few rows of the batch, so psnr and ssim
-    score four samples against a batch of eight rather than failing to
-    broadcast, which is what a diffusion run with --val-metrics psnr did."""
+    score four samples against the four records they came from out of a
+    batch of eight; a broadcast over the eight would fail."""
     key = jax.random.key(0)
     samples = jax.random.uniform(key, (4, 32, 32, 3), minval=-1.0, maxval=1.0)
     batch = {"image": jax.random.randint(key, (8, 32, 32, 3), 0, 256, jnp.uint8)}
@@ -495,8 +495,7 @@ def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
     finite-sample bias, not the distance between the halves, and it falls with
     the sample count on the same photographs: 176 at 16 a side, 89 at 128, 63
     at 256, 41 at 512, while noise stays near 500 throughout. That is why the
-    metric's own docstring calls a per-batch value a trend rather than a
-    headline.
+    metric's own docstring calls a per-batch value a trend, not a headline.
     """
     tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
     from dew.inputs import unit_range

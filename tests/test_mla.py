@@ -271,7 +271,7 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
 
 def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
     """A dial the standard attention reads and this kind would drop raises
-    at build, naming the dial, rather than building a different model."""
+    at build, naming the dial, and no model is built."""
     settings = CONFIG["v3"]
     tokens = jnp.zeros((1, 4), jnp.int32)
     with pytest.raises(ValueError, match="no attention_scale, v_norm"):

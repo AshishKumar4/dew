@@ -3,7 +3,7 @@
 A sibling of the diffusion and JEPA recipes: same trainer, same sharding, same
 checkpoints, and a different objective. The data is not images but the
 `train.bin` / `val.bin` / `meta.json` a tokenizer run wrote, so the recipe
-takes the vocabulary from the data rather than the command line.
+takes the vocabulary from the data, not the command line.
 
     python tools/tokenize_text.py --input data/shakespeare.txt \
         --out data/shakespeare-byte --tokenizer byte
@@ -59,7 +59,7 @@ class LmRunConfig(RunConfig):
     pretrained: Optional[str] = None
     """Hugging Face decoder to continue training: a hub repo id or a local
     directory in that layout. The checkpoint decides the architecture, so
-    --model.config may then carry max_seq_len and nothing else."""
+    --model.config may then carry max_seq_len alone."""
     balance_rate: Optional[float] = None
     """How far a sparse run moves each router's balancing bias against its
     load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
@@ -92,7 +92,7 @@ def context_length(config: LmRunConfig, samples: Optional[Samples]) -> int:
 
     Generation decodes into a cache sized once at build time, so a sampling
     budget longer than the training context is what decides the model's
-    max_seq_len rather than the sequence length being trained on.
+    max_seq_len; the sequence length being trained on is the floor.
     """
     if samples is None:
         return config.data.seq_len

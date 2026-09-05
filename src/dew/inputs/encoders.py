@@ -4,7 +4,7 @@ An encoder tokenizes on the host, in the data workers or before a sampling
 call, and encodes on device as a pure function of explicit parameters. The
 parameters are a leaf of the objective's tree, placed by the trainer's layout
 like any other, so a frozen tower's weights arrive at the compiled step as
-arguments rather than as constants baked into it.
+arguments, not as constants baked into it.
 
 An encoder is rebuilt from a run's record by `rebuild(name, fields)`, where
 `fields` is what `to_json` wrote.
@@ -69,8 +69,8 @@ def rebuild(name: str, fields: Mapping[str, Any]) -> ConditionEncoder[Any]:
     """The named encoder rebuilt from its JSON fields.
 
     A run's record stores the registry name with the keyword fields `to_json`
-    wrote. This is the one place those fields are unpacked dynamically, so
-    each encoder's `from_pretrained` keeps its own concrete signature.
+    wrote. Those fields are unpacked here, so each encoder's
+    `from_pretrained` keeps its own concrete signature.
     """
     return encoders[name].from_pretrained(**fields)
 

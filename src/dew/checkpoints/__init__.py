@@ -1,8 +1,8 @@
 """A run's checkpoints: the train state and the data position, through orbax.
 
 A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
-data iterator can report one, `position`. Nothing else: metrics, the loss
-scale and epoch counters are the loop's business and are rebuilt on resume.
+data iterator can report one, `position`. Metrics, the loss scale and epoch
+counters are the loop's business and are rebuilt on resume.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def gather_positions(position: bytes) -> dict:
     process, 'lengths' the unpadded length of each. A process holds the
     position of its own shard of the data, and orbax writes a host array from
     process 0 alone, so the rows are gathered onto every process before a
-    save. They differ in length, which is why the lengths ride along.
+    save. The rows differ in length, so the lengths ride along.
     """
     lengths = multihost_utils.process_allgather(np.asarray(len(position), np.int64))
     row = np.zeros(int(lengths.max()), np.uint8)
@@ -81,7 +81,7 @@ class Checkpoints:
 
     Constructing one opens nothing; the orbax manager is created on first use.
     The directory keeps the latest `keep` steps, so a resume has something
-    recent, plus the one step with the lowest `loss` metric a save reported.
+    recent, plus the step with the lowest `loss` metric a save reported.
     A save without metrics can never become the best step.
     """
 
@@ -141,9 +141,7 @@ class Checkpoints:
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
         leaves to restore; a leaf's sharding, when set, is where the array is
         placed, so a checkpoint written on one mesh restores onto whatever
-        mesh this run is using. Restoring untyped would silently discard
-        opt_state and reset the step counter (and with it the lr schedule) on
-        every resume. `None` restores every leaf as a host array.
+        mesh this run is using. `None` restores every leaf as a host array.
         """
         manager = self._open()
         if step is None:
@@ -168,8 +166,8 @@ class Checkpoints:
                 item)
             if 'position' in stored:
                 # The table's shape depends on the process count and the
-                # iterator's position, so orbax takes it from the checkpoint
-                # rather than from this placeholder.
+                # iterator's position, so orbax takes it from the checkpoint,
+                # not from this placeholder.
                 item['position'] = {'rows': np.zeros((1, 1), np.uint8),
                                     'lengths': np.zeros((1,), np.int64)}
                 restore_args['position'] = jax.tree.map(

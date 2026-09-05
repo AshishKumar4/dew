@@ -234,8 +234,8 @@ class ImageStream:
     is no batch. While the fetcher lives the stream keeps waiting. Once it is
     gone iteration ends, or raises the fetcher's own exception if it died of
     one. `dropped` counts the urls the workers threw away. The
-    fetchers run at most `prefetch` batches ahead. There is no position to
-    report, so a run over this stream cannot checkpoint.
+    fetchers run at most `prefetch` batches ahead. The stream reports no
+    position, so a run over it does not checkpoint.
     """
 
     def __init__(self, rows: Dataset, *, batch: int, size: int, min_size: int,

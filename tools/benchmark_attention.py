@@ -60,7 +60,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     """One row: implementation x shape x causality, forward and backward.
 
     A kernel that cannot serve the shape is a row with served=False and the
-    reason, which is part of the answer rather than an error. jax raises
+    reason; the row is part of the answer, not an error. jax raises
     NotImplementedError for a shape its cudnn checks refuse, and a
     JaxRuntimeError when the materialized logits do not fit in memory.
     """

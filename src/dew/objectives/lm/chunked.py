@@ -87,8 +87,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     `hidden` is `[..., features]` states in any compute dtype, `head_weight`
     the `[features, vocab]` float32 head, `targets` the `[...]` int32 ids.
     Returns the per-token losses and the argmax prediction, both shaped like
-    `targets`. The caller owns the weighting and the mean, which is where a
-    padding id has to be honored.
+    `targets`. The caller owns the weighting and the mean, and with them the
+    padding id.
 
     `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
     capping a tile and capping the row agree.

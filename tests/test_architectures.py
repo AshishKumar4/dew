@@ -1,10 +1,9 @@
 """Every registered architecture, trained through the trainer, on both meshes.
 
 test_models.py proves each architecture has a working forward pass, and
-test_parallelism.py proves the trainer's sharding on one tiny DiT. Between
-them nothing else puts the other architectures' real parameter trees through
-`Trainer.fit`, so an architecture could be unshardable, or silently never
-sharded, and only a production run would find out.
+test_parallelism.py proves the trainer's sharding on one tiny DiT. This file
+puts the other architectures' real parameter trees through `Trainer.fit`,
+where an unshardable or unsharded architecture shows.
 
 Each case trains two steps on the simulated 8-device CPU mesh, once as pure
 data parallelism (8x1) and once as data x fsdp (2x4), and checks what only a
@@ -51,10 +50,11 @@ GRID = (RES // PATCH, RES // PATCH)
 # same global batch.
 BATCH = 8
 # These models hold thousands of parameters, orders below the production shard
-# threshold, so lower it or "fsdp on" would mean "everything replicated".
+# threshold, so the threshold is lowered; at the production value "fsdp on"
+# would replicate everything.
 TINY_SHARD = 256
-# Enough to run the sampler loop end to end and nothing more: sample quality
-# is not what a two-step run can be about.
+# Enough to run the sampler loop end to end: sample quality is not what a
+# two-step run can be about.
 SAMPLER_STEPS = 2
 # 2x2 target blocks on the 4x4 grid, which leaves 8 context tokens.
 MASK = multi_block_mask(GRID, num_targets=2, scale=(0.2, 0.3))
@@ -415,9 +415,9 @@ def test_every_matrix_parameter_is_declared_or_listed_as_heuristic():
 
 
 def test_every_declared_name_is_carried_by_a_parameter():
-    """A renamed module has to break its declaration, not silently stop
-    matching it: every declared suffix and every heuristic pattern names some
-    parameter of some registered model."""
+    """A renamed module has to break its declaration: every declared suffix
+    and every heuristic pattern names some parameter of some registered
+    model."""
     modules = {parameter_path(path)[:-1] for path, _ in every_leaf()}
     unmatched = [key for key in DECLARED
                  if not any(module[-len(key):] == key for module in modules)]
@@ -591,7 +591,7 @@ def test_architecture_trains_under_fsdp(case, tmp_path):
 @pytest.mark.parametrize("fsdp_size", [2, 4, 8])
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsdp_size):
-    """Each architecture on a 2, 4 and 8 wide fsdp axis, not just the 4 above.
+    """Each architecture on a 2, 4 and 8 wide fsdp axis, beyond the 4 above.
 
     Three properties at once, because they share one derivation. The layout
     has to be reproducible, or two processes deriving it would disagree and
@@ -623,8 +623,7 @@ def test_every_architecture_shards_within_the_tolerance_at_every_width(case, fsd
 
 
 # One named parameter per case whose spec the declarations decide, written
-# out rather than derived, so a declaration that stops matching a module
-# shows up here.
+# out by hand, so a declaration that stops matching a module shows up here.
 NAMED_LEAF = {
     "causal_transformer": (("embed_tokens", "embedding"), P("fsdp")),
     "simple_dit": (("dit_block_0", "attention", "to_q", "kernel"), P("fsdp")),

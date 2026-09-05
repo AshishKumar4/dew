@@ -54,7 +54,7 @@ def test_greedy_generation_follows_the_full_sequence_argmax(rng):
 
 def test_a_pattern_and_its_kinds_from_json_can_generate(rng):
     """A run record hands the pattern as a list and each kind as a record,
-    which is what a config parses to."""
+    the form a config parses to."""
     model = tiny(
         layer_types=["full_attention", "sliding_attention"],
         kinds={"sliding_attention": {"window": 4}},
@@ -188,7 +188,7 @@ def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
     params = model.init(rng, jnp.ones((2, 4), jnp.int32))
     placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
     # The prompt arrives the way a validation batch does, split over the
-    # mesh, which is what the output layout would otherwise follow.
+    # mesh; without the explicit output layout the result would follow it.
     prompt = jax.random.randint(rng, (8, 3), 0, VOCAB)
     prompt = jax.device_put(prompt, batch_shardings(mesh, prompt))
 

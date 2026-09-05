@@ -95,7 +95,7 @@ def hlo_module(*instructions: str) -> str:
 # Recorded from this repo's own GPU: a tied vocabulary projection of a
 # causal_transformer step, a 3x3 UNet convolution in each of the three kinds
 # cuDNN is given, and fused attention forward and backward. Operand shapes are
-# the ones the calls were emitted with, which is where their arithmetic is.
+# the ones the calls were emitted with; the arithmetic is read from them.
 CUBLAS_MATMUL = hlo_module(
     '%lhs = bf16[768,2304]{1,0} parameter(0)',
     '%rhs = bf16[8192,768]{1,0} parameter(1)',
@@ -229,9 +229,9 @@ def test_mfu_uses_the_per_device_flop_count(monkeypatch):
 def test_the_peak_table_resolves_the_names_devices_report(device_kind, peak):
     """`device_kind` is the CUDA device name or the TPU generation string,
     never the bare model: an exact lookup found no H100 or A100 at all, and
-    the PCIe H100 has to resolve to its own figure rather than the SXM's,
-    whose name it also starts with. Hardware the table does not name is
-    None, so the run logs no utilisation rather than a made-up one."""
+    the PCIe H100 has to resolve to its own figure, not the SXM's, whose
+    name it also starts with. Hardware the table does not name is None, and
+    the run then logs no utilisation."""
     from dew.telemetry.instrumentation import peak_flops
     assert peak_flops(device_kind) == peak
 
@@ -377,8 +377,8 @@ def test_no_flops_are_reported_for_a_loop_of_unknown_length():
 
 def test_compiled_flops_returns_none_when_the_compiler_emits_no_text():
     """`Compiled.as_text` returns None when the executable has no HLO to read.
-    Passing that null into the text parser would fail on None rather than
-    reporting nothing, so the executable entry point guards it."""
+    The text parser fails on None, so the executable entry point guards it
+    and reports nothing."""
     class Silent:
         def as_text(self):
             return None
@@ -429,7 +429,7 @@ class RecordingTracker:
 
 
 def test_fit_reports_throughput_to_the_tracker():
-    """The logging tick must actually carry the numbers, not just the loss."""
+    """The logging tick carries the throughput numbers along with the loss."""
     tracker = RecordingTracker()
     make_trainer(tracker=tracker).fit(Data(batches), steps=3, log_every=1)
 

@@ -14,7 +14,7 @@ A recipe is a training entry point: it reads a config, builds the model, the dat
 
 Each recipe subclasses `RunConfig` with the knobs its objective needs. `DiffusionRunConfig` adds `preset` and `sampler`, each a subcommand over its registry (`preset:edm --preset.sigma-data 0.5`, `sampler:heun`), `guidance` (`CFG(scale, interval)`), `sampling_steps`, `unconditional_prob`, `ema_decay`, `text` (the encoder, its checkpoint, the batch field it reads and the unconditional prompt; `None` trains unconditionally), `autoencoder` (the Stable Diffusion VAE for latent diffusion; `None` trains in pixels) and `val_metrics`. `JepaRunConfig` adds `predictor`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes`, `probe_label_key` and `knn_k`. `LmRunConfig` adds `tokenizer`, `ema_decay`, `sample_prompt`, `sample_tokens`, `pretrained` and `balance_rate`.
 
-The run directory is the whole record. `DiffusionRunConfig.build()` is the one function that turns the config into the model, the process and the inputs; the recipe calls it to train and `TextToImage.from_run(directory)` calls it to sample, so what samples is what trained.
+The run directory is the whole record. `DiffusionRunConfig.build()` turns the config into the model, the process and the inputs; the recipe calls it to train and `TextToImage.from_run(directory)` calls it to sample, so what samples is what trained.
 
 ## From the command line
 

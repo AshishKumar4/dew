@@ -172,9 +172,9 @@ class Router(nn.Module):
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
-        # The kernel is the router's own parameter rather than a nested
-        # nn.Dense, so the leaf is `gate/kernel` where a Hugging Face sparse
-        # layer keeps `gate.weight`.
+        # The kernel is the router's own parameter, not a nested nn.Dense, so
+        # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
+        # `gate.weight`.
         self.kernel = self.param(
             'kernel', nn.initializers.lecun_normal(),
             (self.in_features, self.num_experts), jnp.float32)
@@ -271,7 +271,7 @@ class ExpertLinear(nn.Module):
         tokens, kernel = promote_dtype(tokens, self.kernel, dtype=self.dtype)
         if self.implementation == 'tokamax':
             # tokamax is not a dependency (docs/concepts/moe.md), so it is
-            # resolved by name at the call rather than imported statically.
+            # imported at the call.
             tokamax = importlib.import_module('tokamax')
             return tokamax.ragged_dot(
                 tokens, kernel, group_sizes, precision=self.precision,
@@ -288,7 +288,7 @@ class ExpertMLP(nn.Module):
     Tokens are gathered into expert order, the three projections run as grouped
     matmuls over that order, and the results go back to token order and are
     summed with their router weights (`maxtext layers/moe.py:940` `permute` and
-    `:1101` `unpermute`). The gather reads token rows directly rather than a
+    `:1101` `unpermute`). The gather reads token rows directly, without a
     `top_k`-fold copy of them, which is MaxText's `moe_use_direct_token_gather`.
 
     The sum over a token's experts runs in fp32, because that is the dtype the
