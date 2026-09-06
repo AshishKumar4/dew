@@ -421,3 +421,34 @@ def test_tokenized_cancellation_reaches_source_during_finalization():
         consumer.join(5)
     assert not consumer.is_alive()
 
+
+def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
+    owners = []
+    stopped = threading.Event()
+
+    class Source:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise AssertionError("an unstarted producer cannot read")
+
+        def request_stop(self):
+            stopped.set()
+
+        def close(self):
+            assert stopped.is_set()
+            owners.append(threading.get_ident())
+
+    failure = RuntimeError("cannot start new thread")
+
+    def fail_start(thread):
+        raise failure
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError) as caught:
+        with DevicePrefetchIterator(Source(), build_mesh()) as stream:
+            next(stream)
+    assert caught.value is failure
+    assert owners == [threading.get_ident()]
+    stream.close()
