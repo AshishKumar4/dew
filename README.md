@@ -403,7 +403,7 @@ Preparation writes under `TFDS_DATA_DIR`; training receives the **exact prepared
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
-uv pip install --python .venv-tfds-prepare/bin/python tensorflow-datasets==4.9.10 tensorflow==2.21.0
+uv pip install --python .venv-tfds-prepare/bin/python tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy
 export TFDS_DATA_DIR="$HOME/dew-data/tfds-arrayrecord"
 .venv-tfds-prepare/bin/python - <<'PY'
 import os
