@@ -241,12 +241,11 @@ class CausalSelfAttention(nn.Module):
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
         if prefix is not None:
-            # Canvas queries read every cached prefix key and every canvas key,
-            # which is what the reference builds (modeling_diffusion_gemma.py,
-            # create_diffusion_decoder_attention_mask). The cache stays at its
-            # allocated width with zeroed slots past the prefix, so those slots
-            # mask out and no dynamic slice is needed. A sliding layer windows
-            # the same absolute positions its prefill wrote.
+            # Canvas queries read every cached prefix key and every canvas key
+            # (modeling_diffusion_gemma.py, create_diffusion_decoder_attention_mask).
+            # The cache stays at its allocated width with zeroed slots past the
+            # prefix, so those slots mask out and no dynamic slice is needed. A
+            # sliding layer windows the same absolute positions its prefill wrote.
             cached_key = self.get_variable("cache", "cached_key")
             cached_value = self.get_variable("cache", "cached_value")
             alloc = cached_key.shape[-3]
