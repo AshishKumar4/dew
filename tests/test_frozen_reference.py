@@ -15,7 +15,7 @@ import dataclasses
 import json
 
 from flax import linen as nn
-from flax.training import dynamic_scale as dynamic_scale_lib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -126,12 +126,8 @@ def test_unit_decay_returns_the_average_untouched():
 
 
 def poison(state):
-    """The state's parameters with an infinite kernel, ema untouched.
-
-    Every leaf is a fresh buffer: `select` aliases the ema leaves with the
-    params leaves, and the compiled step donates the state, so shared
-    buffers would be donated twice."""
-    params = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), state.params)
+    """Replace a live kernel without changing the aliased frozen reference."""
+    params = dict(state.params)
     collection = dict(params["params"])
     layer = dict(collection["Dense_0"])
     layer["kernel"] = jnp.full_like(layer["kernel"], jnp.inf)

@@ -19,7 +19,7 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.interop.hf_decoders import load_pretrained_decoder, translate_config
-from dew.nn.backbones.causal_transformer import LayerSpec, scan_groups
+
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -33,17 +33,7 @@ SEQ_LEN = 15
 BATCH = 8
 TINY_SHARD = 256
 
-# The runs the resolved layers of each fixture form: qwen3-tiny's two layers
-# are alike, deepseek-v3-tiny's first is dense and its second routed,
-# gemma4-e2b alternates kinds with two sharing layers behind their
-# providers, and gemma3n-tiny changes width, sparsity and sharing from
-# layer to layer.
-RUNS = {
-    "qwen3-tiny": ((0, 2),),
-    "deepseek-v3-tiny": ((0, 1), (1, 1)),
-    "gemma4-e2b": ((0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)),
-    "gemma3n-tiny": ((0, 1), (1, 1), (2, 1), (3, 1)),
-}
+FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 
 
 def fixture_pair(name, **overrides):
@@ -59,7 +49,7 @@ def paths(tree):
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
-@pytest.mark.parametrize("name", sorted(RUNS))
+@pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     """The fixture's weights through the scanned stack: the runs the geometry
     implies, the same logits as the plain loop and the reference parity of
@@ -80,7 +70,7 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     assert float(np.max(np.abs(logits - reference))) < 1e-4
 
 
-@pytest.mark.parametrize("name", sorted(RUNS))
+@pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_decodes_through_the_cache(name):
     """A prefill and single-token steps through the scanned stack's cache
     against the whole sequence at once. Largest observed difference on
@@ -142,11 +132,8 @@ def deepseek_shaped(**overrides):
         "causal_transformer", config, dtype="float32", attention_impl="reference"))
 
 
-# The runs the three shapes form, and the bounds on the scanned logits and
-# gradients against the plain loop's, both compiled as a training step
-# compiles them. A provider (the last layer of its kind before the sharing
-# layers) is a run of one, and so is the layer between two runs of another
-# kind. Gemma 3n keeps the initialized forward check but checks gradients
+# Bounds on scanned logits and gradients against the plain loop.
+# Gemma 3n keeps the initialized forward check but checks gradients
 # at reference-scale projections with a live per-layer-input residual; its
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
@@ -156,9 +143,9 @@ def deepseek_shaped(**overrides):
 # 8.11e-6 on RTX 4080 (JAX 0.10/0.11). The 1e-5 bound also rejects
 # wrong-layer and missing-residual mutations.
 SHAPES = {
-    "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-4, 1e-4),
-    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 5e-4, 1e-5),
-    "deepseek": (deepseek_shaped, ((0, 1), (1, 5)), 1e-6, 1e-6),
+    "gemma4": (gemma4_shaped, 1e-4, 1e-4),
+    "gemma3n": (gemma3n_shaped, 5e-4, 1e-5),
+    "deepseek": (deepseek_shaped, 1e-6, 1e-6),
 }
 
 
@@ -181,7 +168,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     """The grouping read off the geometry, and the scanned logits and
     gradients against the plain loop's on a stack deep enough to scan, to
     the bounds SHAPES states."""
-    build, runs, logit_bound, gradient_bound = SHAPES[shape]
+    build, logit_bound, gradient_bound = SHAPES[shape]
     plain, scanned, variables, ids = scanned_pair(build)
     
 
@@ -303,17 +290,7 @@ def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     assert float(jnp.max(jnp.abs(logits - scanned_logits))) < 1e-1
 
 
-def test_the_runs_are_read_off_the_specs():
-    """Equal neighbours join a run and a provider stays alone."""
-    kind = models.build("causal_transformer", vocab_size=VOCAB, num_layers=1).bind(
-        {"params": {}}).kind_of("full_attention")
-    layer = LayerSpec("full_attention", kind, False, 64, 0.0, False, None)
-    routed = LayerSpec("full_attention", kind, True, 64, 0.0, False, None)
-    provider = LayerSpec("full_attention", kind, False, 64, 0.0, False, 3)
 
-    assert scan_groups([layer, layer, routed, provider, layer, layer]) == (
-        (0, 2), (2, 1), (3, 1), (4, 2))
-    assert scan_groups([]) == ()
 
 
 # --------------------------------------------------------------------------

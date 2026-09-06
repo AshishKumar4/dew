@@ -19,7 +19,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import Aux, Mean, Objective, mean_loss
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
@@ -36,7 +36,7 @@ Each array has shape `(32, 1)`: the first dimension is the batch dimension, and 
 
 A Flax Linen module describes computation. Its variables are separate from the module object. `model.init(key, sample_input)` creates those variables; `model.apply(variables, input)` computes a prediction.
 
-An `Objective` tells Dew how to initialize variables and compute the scalar loss to differentiate:
+An `Objective` defines initialization and the loss statistics to differentiate:
 
 ```python
 class Regression(Objective):
@@ -49,8 +49,10 @@ class Regression(Objective):
 
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
-        mse = jnp.mean((prediction - batch["y"]) ** 2)
-        return mse, Aux(metrics={"mse": mse})
+        errors = (prediction - batch["y"]) ** 2
+        loss = Mean(jnp.sum(errors), jnp.asarray(errors.size))
+        mse, _ = mean_loss(loss)
+        return loss, Aux(metrics={"mse": mse})
 
 
 model = nn.Dense(features=1)
@@ -59,7 +61,7 @@ objective = Regression(model)
 
 `nn.Dense(features=1)` learns a matrix and a bias. For this input shape they represent the line's slope and intercept. The sample passed to `init` defines one input feature; it does not restrict later training to a batch size of one.
 
-`loss` receives the full Flax variables tree, a batch, and a `Step` containing the training step number and random key. This loss is deterministic and does not use `step`. It returns a scalar and `Aux`, which carries training metrics and optional non-parameter updates. Dew differentiates the loss with respect to the `params` collection. The base `Objective` supplies an evaluation method that returns no artifacts, so evaluation is optional here.
+`loss` receives the full Flax variables tree, a batch, and a `Step`. It returns `Mean(total, mass)` and `Aux` training metrics. Dew sums the numerators and masses across an accumulation window before normalizing the gradient. Here the mass counts squared-error elements; it does not weight all objectives by batch size. `step.step` counts accepted microbatches, and `step.key` identifies the consumed attempt. This deterministic objective uses neither.
 
 ## Optimize the parameters
 
@@ -92,7 +94,7 @@ JAX_PLATFORMS=cpu python train.py
 
 The validation run printed a loss of approximately `0.0002` at step 50 and `Final mean squared error: 0.000000` after step 100. Small differences across backends and library versions are expected. The numerical assertion checks the learned relation and tolerates those differences.
 
-`state` is a `TrainState` containing the step, complete variables tree, optimizer state, random key, and optional moving-average variables. Use `state.params` with `model.apply`. This objective does not request an exponential moving average, so `state.averaged` is not available.
+`state.step` counts consumed attempts, `state.microstep` counts accepted microbatches, and `state.updates` counts optimizer commits. `TrainState` also holds variables, optimizer state, the root key, optional EMA, scaler history, and any partial accumulation window. Use `state.params` with `model.apply`. This objective requests no EMA, so `state.averaged` is unavailable.
 
 ## Adapt the example
 

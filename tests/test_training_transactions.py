@@ -12,6 +12,7 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
 from dew.training import Trainer
+from dew.objectives.base import under
 
 
 @struct.dataclass
@@ -24,7 +25,7 @@ class Terms:
 
 
 class Tiny(Objective):
-    ema = EMASpec(optax.constant_schedule(.5))
+    ema = EMASpec(optax.constant_schedule(.5), select=under("params"))
 
     def __init__(self, composite=False):
         self.composite = composite
@@ -35,7 +36,8 @@ class Tiny(Objective):
     def loss(self, variables, batch, step):
         w = variables["params"]["w"]
         noise = jax.random.uniform(step.key, batch["y"].shape) * .03
-        prediction = w + noise + variables["stats"]["seen"] * .01
+        prediction = (w + noise + variables["stats"]["seen"] * .01
+                      + step.ema["stats"]["seen"] * .1 + step.step * .02)
         errors = (prediction - batch["y"]) ** 2
         bad = jax.lax.cond(batch["bad"],
                            lambda x: jnp.sqrt(x - jax.lax.stop_gradient(x)),
@@ -103,7 +105,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
         for attempt, seen in [(0, 0.), (2, 1.)]:
             variables = {"params": {"w": w}, "stats": {"seen": jnp.array(seen)}}
             from dew.objectives import Step
-            info = Step(jnp.asarray(int(seen)), jax.random.fold_in(initial.key, attempt), initial.params)
+            info = Step(jnp.asarray(int(seen)), jax.random.fold_in(initial.key, attempt), variables)
             value, _ = train.objective.loss(variables, data[attempt], info)
             stats.append(value)
         pooled = jax.tree.map(lambda a, b: a + b, *stats)
@@ -233,4 +235,52 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         for depth, (losses, _) in enumerate(scores.depths, 1):
             numerator += .3 / 2 * jnp.sum(losses * roles[:, depth + 1:])
         np.testing.assert_allclose(expected_loss, numerator / jnp.sum(roles[:, 1:]), rtol=1e-6)
+
+
+def test_replay_preserves_half_precision_cotangents_and_integer_support():
+    class Half(Tiny):
+        def loss(self, variables, batch, step):
+            w = variables["params"]["w"]
+            count = jnp.asarray(batch["y"].size)
+            prediction = Mean(((w - 1) ** 2 * count).astype(jnp.float16), count)
+            row = Mean(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
+            return Terms(prediction, row, jnp.zeros(3, jnp.float16),
+                         jnp.zeros(3, jnp.int32), jnp.asarray(0)), Aux({})
+    train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), accumulation=2)
+    initial = train.initial_state()
+    data = batches()[0]
+    step = train.compile(initial, data)
+    state, *_ = step(initial, data)
+    state, *_ = step(state, data)
+    w = initial.params["params"]["w"]
+    expected = w - .1 * (2 * (w - 1) + .2 * (w + 3))
+    # Original fp16 statistic pullbacks round their coefficients to fp16.
+    np.testing.assert_allclose(state.params["params"]["w"], expected, rtol=0, atol=5e-5)
+
+
+def test_local_partial_snapshot_survives_continued_training_and_weight_restore(tmp_path):
+    checkpoints = Checkpoints(str(tmp_path / "persistent"),
+                              local_directory=str(tmp_path / "local"), local_every=1)
+    train = trainer(True, checkpoints=checkpoints)
+    initial = train.initial_state()
+    data = batches()
+    step = train.compile(initial, data[0])
+    prefix, *_ = step(initial, data[0])
+    checkpoints.save_local(1, prefix, b"1")
+    final, *_ = step(prefix, data[1])
+    final, *_ = step(final, data[2])
+    checkpoints.wait()
+    resumed_trainer = trainer(True, checkpoints=checkpoints)
+    restored, _, position = resumed_trainer.place()
+    assert position == b"1"
+    step = resumed_trainer.compile(restored, data[1])
+    resumed, *_ = step(restored, data[1])
+    resumed, *_ = step(resumed, data[2])
+    for want, got in zip(jax.tree.leaves(final), jax.tree.leaves(resumed), strict=True):
+        np.testing.assert_array_equal(got, want)
+    template = {"params": jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.params)}
+    selected, _ = checkpoints.restore(template, 1)
+    for want, got in zip(jax.tree.leaves(prefix.params), jax.tree.leaves(selected["params"]), strict=True):
+        np.testing.assert_array_equal(got, want)
 

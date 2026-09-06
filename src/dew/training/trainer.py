@@ -323,12 +323,17 @@ class Trainer(Generic[Loss, Effects]):
                     with_ema(state.params, state.ema))
         return jax.eval_shape(self.objective.loss, state.params, batch, info)
 
-    def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes):
+    def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, shape_only=False):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
         slots = self.accumulation - 1
+        shape = lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+        trainable = jax.tree.map(shape, state.params["params"])
+        records = jax.tree.map(shape, batch)
+        mutable = (None if shared or aux.variables is None else
+                   jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
 
         def zeros(leaf):
             dtype = jnp.float32 if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
@@ -337,23 +342,28 @@ class Trainer(Generic[Loss, Effects]):
         def buffer(tree):
             return jax.tree.map(lambda x: jnp.zeros((slots, *x.shape), x.dtype), tree)
 
-        mutable = (None if shared or aux.variables is None else
-                   {name: state.params[name] for name in aux.variables})
-        accumulation = Accumulation(
-            gradient=jax.tree.map(zeros, state.params["params"]) if shared else None,
-            mass=jnp.zeros((), jnp.float32),
-            statistics=((jnp.zeros((), jnp.float32),) if shared else
-                        tuple(zeros(x) for x in jax.tree.leaves(stats))),
-            effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
-            qk_stats=jax.tree.map(
-                lambda x: jnp.full(x.shape, -jnp.inf, jnp.float32)
-                if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                _compact_qk(jax.tree.map(zeros, aux.qk_stats))),
-            batches=None if shared else buffer(batch),
-            variables=None if mutable is None else buffer(mutable),
-            attempts=None if shared else jnp.zeros((slots,), jnp.int32),
-            schedules=None if shared else jnp.zeros((slots,), jnp.int32))
-        return dataclasses.replace(state, accumulation=accumulation)
+        def allocate():
+            return Accumulation(
+                gradient=jax.tree.map(zeros, trainable) if shared else None,
+                mass=jnp.zeros((), jnp.float32) if shared else None,
+                statistics=((jnp.zeros((), jnp.float32),) if shared else
+                            tuple(zeros(x) for x in jax.tree.leaves(stats))),
+                effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
+                qk_stats=jax.tree.map(
+                    lambda x: jnp.full(x.shape, -jnp.inf, jnp.float32)
+                    if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
+                    _compact_qk(jax.tree.map(zeros, aux.qk_stats))),
+                batches=None if shared else buffer(records),
+                variables=None if mutable is None else buffer(mutable),
+                attempts=None if shared else jnp.zeros((slots,), jnp.int32))
+
+        pending = jax.eval_shape(allocate)
+        if not shape_only:
+            placement = self.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
+            # Allocate on the final shards, without a replicated window-sized temporary.
+            pending = jax.jit(allocate, out_shardings=placement)()
+        return dataclasses.replace(state, accumulation=pending)
+
 
     def _default_step(self, shapes):
         objective, optimizer, size = self.objective, self.optimizer, self.accumulation
@@ -387,6 +397,9 @@ class Trainer(Generic[Loss, Effects]):
                 effects = tuple(a + b for a, b in zip(previous.effects, effects, strict=True))
                 qk = jax.tree.map(jnp.maximum, previous.qk_stats, qk)
                 if shared:
+                    prior_mass, prior_gradient = previous.mass, previous.gradient
+                    if prior_mass is None or prior_gradient is None:
+                        raise ValueError("checkpoint accumulator does not match shared-mean statistics")
                     if isinstance(stats, Mean):
                         mass, total = stats.mass, stats.total
                     elif isinstance(stats, (jax.Array, float, int)):
@@ -394,11 +407,11 @@ class Trainer(Generic[Loss, Effects]):
                     else:
                         raise TypeError("shared accumulation requires Mean or a scalar")
                     mass = jax.lax.stop_gradient(mass)
-                    total_mass = previous.mass + mass
+                    total_mass = prior_mass + mass
                     denominator = jnp.where(total_mass > 0, total_mass, 1)
                     gradients = jax.tree.map(
-                        lambda old, new: old * (previous.mass / denominator)
-                        + new * (mass / denominator), previous.gradient, gradients)
+                        lambda old, new: old * (prior_mass / denominator)
+                        + new * (mass / denominator), prior_gradient, gradients)
                     numerator = previous.statistics[0] + total
                     pooled = Mean(numerator, total_mass)
                     value, active = mean_loss(pooled)
@@ -412,10 +425,13 @@ class Trainer(Generic[Loss, Effects]):
                     candidate = dataclasses.replace(previous, statistics=pooled_leaves, effects=effects, qk_stats=qk)
 
                     def final_gradient(_):
-                        schedules, attempts = previous.schedules, previous.attempts
-                        assert schedules is not None and attempts is not None
+                        attempts = previous.attempts
+                        assert attempts is not None
                         _, reduce_pullback = jax.vjp(lambda s: objective.reduce_loss(s)[0], pooled)
-                        cotangent = reduce_pullback(factor)[0]
+                        cotangent = jax.tree.map(
+                            lambda cot, leaf: cot.astype(leaf.dtype)
+                            if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
+                            reduce_pullback(factor)[0], stats)
                         combined = jax.tree.map(lambda x: x.astype(jnp.float32) / factor,
                                                 pullback(cotangent)[0])
                         # Each replay reads its original sequential-mutable snapshot.
@@ -424,8 +440,9 @@ class Trainer(Generic[Loss, Effects]):
                             retained = jax.tree.map(lambda x: x[index], previous.batches)
                             variables = state.params if previous.variables is None else {
                                 **state.params, **jax.tree.map(lambda x: x[index], previous.variables)}
-                            original = Step(schedules[index],
-                                            jax.random.fold_in(state.key, attempts[index]), info.ema)
+                            original = Step(state.microstep - fill + index,
+                                            jax.random.fold_in(state.key, attempts[index]),
+                                            with_ema(variables, state.ema))
                             def forward(trainable):
                                 replayed, _ = objective.loss({**variables, "params": trainable}, retained, original)
                                 return replayed
@@ -469,8 +486,7 @@ class Trainer(Generic[Loss, Effects]):
                 def retain(acc):
                     if not shared:
                         acc = dataclasses.replace(acc, batches=jax.tree.map(lambda held, x: held.at[fill].set(x), acc.batches, batch),
-                        attempts=acc.attempts.at[fill].set(state.step),
-                        schedules=acc.schedules.at[fill].set(state.microstep))
+                        attempts=acc.attempts.at[fill].set(state.step))
                         if acc.variables is not None:
                             reads = {name: state.params[name] for name in acc.variables}
                             acc = dataclasses.replace(acc, variables=jax.tree.map(
@@ -500,7 +516,7 @@ class Trainer(Generic[Loss, Effects]):
         mesh = self.device_mesh
         with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
             shapes = None if self.step is not None else self._loss_shape(state, batch)
-            prepared = self._initialize_accumulation(state, batch, shapes)
+            prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
@@ -512,7 +528,8 @@ class Trainer(Generic[Loss, Effects]):
 
             jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
                              out_shardings=(shardings, replicated, replicated, replicated, replicated))
-            prepared = jax.device_put(prepared, shardings)
+            prepared = jax.tree.map(
+                lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             self.flops_per_step = step_flops(jitted, prepared, batch)
 
         def run(current, batch):

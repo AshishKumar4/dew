@@ -3,8 +3,8 @@
 Every recipe wires the same solver: a warmup-cosine schedule when one is
 asked for, weight decay folded into the optimizer's own kwargs, and
 global-norm clipping. That wiring is library behavior, so it lives here and
-the recipes call it. Gradient accumulation is the Trainer's, which wraps the
-solver in `optax.MultiSteps`.
+the recipes call it. The Trainer forms the normalized effective-window
+gradient before calling this solver.
 
 The 'muon' entry is the production parameter-group split the labs converged
 on (docs/research/frontier-training.md:183): AdamW on the embeddings, the
