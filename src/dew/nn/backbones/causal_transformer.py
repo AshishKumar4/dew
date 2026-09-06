@@ -1107,6 +1107,7 @@ class CausalTransformer(nn.Module):
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
+    mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
 
     def __post_init__(self):
@@ -1354,6 +1355,11 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "altup carries a stack of residual copies through the layers and "
                 "the prediction depths read one, so a model has one or the other")
+        mask = self.mask_token_id
+        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
+            raise ValueError(
+                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
+                "model trained on plain next-token prediction")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -1535,9 +1541,12 @@ class CausalTransformer(nn.Module):
                 precision=self.precision, name='lm_head')
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
-                 positions=None, segment_ids=None):
+                 positions=None, segment_ids=None,
+                 input_embeddings=None, embedding_positions=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
-                               positions=positions, segment_ids=segment_ids)
+                               positions=positions, segment_ids=segment_ids,
+                               input_embeddings=input_embeddings,
+                               embedding_positions=embedding_positions)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -1602,14 +1611,19 @@ class CausalTransformer(nn.Module):
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids)]
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None):
+                      positions=None, segment_ids=None,
+                      input_embeddings=None, embedding_positions=None):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
-        A loss that pairs this with `head_weight` scores tokens without ever
         holding the full `[B, S, vocab]` logits tensor. A packed batch passes
         its per-document `positions` and `segment_ids` through to the layers,
         where RoPE and the mask read them.
+
+        A caller that fuses another encoder's outputs passes them as
+        `input_embeddings` with their token positions in
+        `embedding_positions`: both or neither, and the values replace the
+        scaled token embeddings before the layers read them.
         """
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
@@ -1622,6 +1636,7 @@ class CausalTransformer(nn.Module):
             scaled = x * jnp.asarray(math.sqrt(self.emb_features),
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
+        x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
         ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
         if self.altup is not None:
             # The embeddings and, rescaled to their magnitude, each projected
@@ -1871,6 +1886,39 @@ class CausalTransformer(nn.Module):
         context = self.per_layer_projection_norm(
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
+
+    def _scatter_inputs(self, x, tokens, input_embeddings, embedding_positions):
+        """`x` with the fused encoder outputs written at their token positions.
+
+        Both arguments or neither; the shapes are `[B, N, D]` and `[B, N]`
+        against the `[B, S, D]` embeddings, the positions are integers within
+        the sequence, and the values are already in the decoder's scaled
+        space, so they land as they arrive, cast to the stream dtype.
+        """
+        if (input_embeddings is None) != (embedding_positions is None):
+            raise ValueError(
+                "input_embeddings and embedding_positions arrive together: one "
+                "without the other names no replacement")
+        if input_embeddings is None:
+            return x
+        replacements = jnp.asarray(input_embeddings)
+        where = jnp.asarray(embedding_positions)
+        batch, length = tokens.shape
+        if (replacements.ndim != 3 or where.ndim != 2
+                or replacements.shape[0] != batch
+                or where.shape != (batch, replacements.shape[1])
+                or replacements.shape[2] != self.emb_features):
+            raise ValueError(
+                f"input_embeddings is [B, N, D] and embedding_positions [B, N] "
+                f"for [{batch}, {length}, {self.emb_features}] embeddings, got "
+                f"{replacements.shape} and {where.shape}")
+        if not jnp.issubdtype(where.dtype, jnp.integer):
+            raise ValueError(
+                "embedding_positions holds token positions, so an integer "
+                f"dtype, got {where.dtype}")
+        rows = jnp.arange(batch)[:, None]
+        return x.at[rows, where].set(replacements.astype(x.dtype))
+
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in fp32, as the forward multiplies it.
