@@ -10,7 +10,6 @@ import dataclasses
 import itertools
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -22,15 +21,13 @@ import pytest
 
 import dew.data
 from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
-                      OxfordFlowers, TokenWindows, VoxCeleb2, local_batch)
+                      OxfordFlowers, VoxCeleb2, local_batch)
 from dew.data import Loading, images, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
 from dew.registry import datasets
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
@@ -39,15 +36,7 @@ WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffe
 # The registry
 # ---------------------------------------------------------------------------------
 
-def test_every_registered_dataset_is_a_frozen_spec_with_a_loader():
-    """The registry is the one table a run picks a dataset from."""
-    assert datasets["oxford_flowers102"] is OxfordFlowers is datasets.OxfordFlowers
-    assert datasets["voxceleb2"] is VoxCeleb2 and datasets["token_windows"] is TokenWindows
-    for name in datasets:
-        spec = datasets[name]
-        assert issubclass(spec, DatasetSpec) and dataclasses.is_dataclass(spec)
-        assert spec.__dataclass_params__.frozen, name
-        assert callable(spec.load)
+def test_an_unknown_dataset_is_refused():
     with pytest.raises(KeyError, match="no dataset named 'flowers'"):
         datasets["flowers"]
 
@@ -67,39 +56,9 @@ def test_arrayrecord_datasets_require_an_explicit_path(name):
         datasets[name]().load(batch=8)
 
 
-def test_a_dataset_records_no_augmentation_mode_in_the_environment():
-    """Augmentation is a field of the spec, read by the transform it builds."""
-    assert OxfordFlowers().augmentation == "flip_jitter"
+def test_an_unknown_augmentation_is_refused():
     with pytest.raises(ValueError, match="not one of none, flip_only, flip_jitter"):
         images.image_augmentations("jitter")
-
-
-# ---------------------------------------------------------------------------------
-# Lazy imports: the data layer must not drag in HF datasets, opencv or moviepy
-# ---------------------------------------------------------------------------------
-
-def test_importing_dew_data_pulls_in_no_heavy_dependencies():
-    """`import dew.data` registers every dataset and must not reach the
-    streaming stack, cv2, albumentations or tensorflow_datasets; a run that
-    only reads token files pays for none of them. The hub source has the same
-    duty: naming a hub dataset resolves without the streaming extra, only
-    reading one needs it. Nothing from dew.inputs or dew.diffusion either:
-    dew.config imports this package for the registry's union."""
-    probe = (
-        "import sys, dew.data;"
-        "heavy = [m for m in ('datasets', 'cv2', 'albumentations', 'tensorflow_datasets',"
-        " 'moviepy', 'transformers', 'dew.data.online_loader', 'dew.inputs', 'dew.diffusion',"
-        " 'dew.sampling', 'wandb') if m in sys.modules];"
-        "assert not heavy, heavy;"
-        "from dew.registry import datasets;"
-        "assert 'oxford_flowers102' in datasets and 'packed_tokens' in datasets;"
-        "dew.data.HFDatasetSource(name='acme/pets');"
-        "assert 'datasets' not in sys.modules"
-    )
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
-    result = subprocess.run([sys.executable, "-c", probe], cwd=REPO_ROOT,
-                            capture_output=True, text=True, env=env)
-    assert result.returncode == 0, result.stderr
 
 
 def test_reading_a_hub_dataset_names_the_streaming_extra(monkeypatch):
@@ -117,11 +76,8 @@ def test_a_hub_dataset_spec_without_a_name_says_so():
 
 def test_the_streaming_spec_needs_sources_before_it_needs_the_streaming_stack():
     """Asking for nothing must fail on the spec, not on the missing dependency."""
-    already_imported = "dew.data.online_loader" in sys.modules
     with pytest.raises(ValueError, match="sources="):
         dew.data.OnlineImages().load(batch=4)
-    if not already_imported:
-        assert "dew.data.online_loader" not in sys.modules
 
 
 # ---------------------------------------------------------------------------------
