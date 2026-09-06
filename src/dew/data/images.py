@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 import grain.python as pygrain
 import numpy as np
+from etils import epath
 
 from dew.registry import datasets
 
@@ -216,15 +217,48 @@ class ImageDataset(DatasetSpec):
 @datasets("oxford_flowers102")
 @dataclasses.dataclass(frozen=True)
 class OxfordFlowers(ImageDataset):
-    """Oxford Flowers 102 from the TFDS data dir, captioned from its class
-    name through a prompt template the record's rng picks."""
+    """Prepared Oxford Flowers ArrayRecords, captioned from their class names.
 
+    Preparation runs separately. Reading uses TFDS metadata and NumPy image
+    decoding through its read-only builder, without TensorFlow or dataset
+    generation code in the training process.
+    """
+
+    path: str | None = None
+    """Prepared version directory containing dataset_info.json and ArrayRecords."""
     split: str = "all"
-    labels: str = "~/tensorflow_datasets/oxford_flowers102/2.1.1/label.labels.txt"
+    labels: str | None = None
+    """Class-name file override; unset reads label.labels.txt in path."""
 
     def source(self):
+        if not self.path:
+            raise ValueError(
+                "OxfordFlowers needs path= (--data.path) pointing to prepared "
+                "TFDS ArrayRecords. Prepare oxford_flowers102 separately with "
+                "download_and_prepare(file_format='array_record'), then pass "
+                "the builder.data_dir version directory to training.")
+        directory = epath.Path(os.path.expanduser(self.path))
+        if not all((directory / name).is_file()
+                   for name in ("dataset_info.json", "features.json")):
+            raise FileNotFoundError(
+                f"No prepared TFDS metadata at {self.path!r}. Run "
+                "download_and_prepare(file_format='array_record') in a "
+                "separate preparation environment, then set --data.path to "
+                "its builder.data_dir.")
         import tensorflow_datasets as tfds
-        return tfds.data_source("oxford_flowers102", split=self.split, try_gcs=False)
+        builder = tfds.builder_from_directory(directory)
+        if builder.info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
+            raise ValueError(
+                f"Prepared data at {self.path!r} uses {builder.info.file_format}, "
+                "but OxfordFlowers reads ArrayRecords without TensorFlow. "
+                "Prepare file_format='array_record' in a separate directory.")
+        for instruction in builder.info.splits[self.split].file_instructions:
+            if not epath.Path(instruction.filename).is_file():
+                raise FileNotFoundError(
+                    f"Missing prepared ArrayRecord shard {instruction.filename!r}. "
+                    "Copy the complete prepared dataset or rerun preparation "
+                    "outside the training environment.")
+        return builder.as_data_source(self.split)
 
     def record(self, element, rng):
         label = int(element["label"])
@@ -232,7 +266,12 @@ class OxfordFlowers(ImageDataset):
         # A module-global random.choice would key a record's caption to how
         # many workers and processes produced the batch.
         template = PROMPT_TEMPLATES[int(rng.integers(len(PROMPT_TEMPLATES)))]
-        return element["image"], template.format(class_names(self.labels)[label]), label
+        labels = self.labels
+        if labels is None:
+            if self.path is None:
+                raise ValueError("OxfordFlowers captions need labels= or a prepared path=.")
+            labels = os.path.join(self.path, "label.labels.txt")
+        return element["image"], template.format(class_names(labels)[label]), label
 
 
 @datasets("hf_images")
