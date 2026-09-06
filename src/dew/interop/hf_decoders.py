@@ -49,6 +49,7 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
 from dew.registry import models, with_precision
+from dew.nn import vision as vision_nn
 
 CONFIG_FILE = "config.json"
 GENERATION_CONFIG_FILE = "generation_config.json"
@@ -1398,6 +1399,190 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
                 "CausalTransformer has no counterpart, so translating them "
                 "would silently change the model")
     return config
+
+
+def _wrapper_text(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
+    """The wrapper's text_config translated as the decoder it is."""
+    text = hf_config.get("text_config")
+    if not isinstance(text, Mapping):
+        _refuse("text_config",
+                f"a wrapper carries its decoder under text_config, got {text!r}")
+    used.add("text_config")
+    return translate_config(text)
+
+
+def _wrapper_image_id(hf_config: Mapping[str, Any], used: set, *names: str) -> int:
+    """The image token id under either of its spellings."""
+    for name in names:
+        if hf_config.get(name) is not None:
+            used.add(name)
+            return int(hf_config[name])
+    _refuse("image_token_id",
+            f"the image positions are marked by {list(names)}, none is set")
+
+
+def _wrapper_tokens(hf_config: Mapping[str, Any], used: set) -> None:
+    """The wrapper-level keys every multimodal repo carries, marked read."""
+    used.update(("architectures", "tie_word_embeddings", "torch_dtype",
+                 "transformers_version", "initializer_range", "boi_token_id",
+                 "boi_token_index", "eoi_token_id", "eoi_token_index",
+                 "image_token_id", "image_token_index"))
+
+
+def _record_int(record: Mapping[str, object], field: str) -> int:
+    """An int field out of a translated record, naming it when it is not one."""
+    value = record[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} is {value!r}, not an int")
+    return value
+
+
+def _record_float(record: Mapping[str, object], field: str) -> float:
+    """A float field out of a translated record, naming it when it is not one."""
+    value = record[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} is {value!r}, not a number")
+    return float(value)
+
+
+def _gemma3_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
+
+
+    """A Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
+    text = _wrapper_text(hf_config, used)
+    tower = vision_nn.translate_siglip_vision_config(hf_config)
+    used.add("vision_config")
+    mm = hf_config.get("mm_tokens_per_image")
+    used.add("mm_tokens_per_image")
+    projector = vision_nn.translate_gemma_projector_config(
+        tower, text["emb_features"], mm)
+    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    _wrapper_tokens(hf_config, used)
+    return {
+        "model_type": "gemma3",
+        "text_model_type": "gemma3_text",
+        "text": text,
+        "tower": tower,
+        "projector": projector,
+        "image_token_id": image,
+        "tokens_per_image": _record_int(projector, "tokens_per_side") ** 2,
+    }
+
+
+def _llama4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
+    """A Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
+    text = _wrapper_text(hf_config, used)
+    tower = vision_nn.translate_llama4_vision_config(hf_config)
+    used.add("vision_config")
+    projector = vision_nn.translate_llama4_projector_config(
+        tower, text["emb_features"])
+    image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
+    _wrapper_tokens(hf_config, used)
+    grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
+    ratio = _record_float(tower, "pixel_shuffle_ratio")
+    tokens = grid * grid * ratio ** 2
+    if tokens != int(tokens):
+        _refuse(f"pixel_shuffle_ratio {tower['pixel_shuffle_ratio']!r}",
+                f"it leaves {tokens} soft tokens per image, not a whole count")
+    return {
+        "model_type": "llama4",
+        "text_model_type": "llama4_text",
+        "text": text,
+        "tower": tower,
+        "projector": projector,
+        "image_token_id": image,
+        "tokens_per_image": int(tokens),
+    }
+
+
+def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """A multimodal wrapper into its decoder, tower and projector records.
+
+    gemma3 and llama4 wrappers translate: text_config through the decoder map,
+    vision_config into the tower value's fields, and the projector fields
+    beside them, with the image token id and the soft-token count. Anything
+    else refuses naming its model_type: gemma4's gemma4_vision tower (2D
+    position tables, vision rotary, clippable linears, position pooling) has
+    no counterpart here, and neither do gemma3n's or qwen3_5's towers.
+    """
+    model_type = hf_config.get("model_type")
+    used = {"model_type"}
+    if model_type == "gemma3":
+        record = _gemma3_wrapper(hf_config, used)
+    elif model_type == "llama4":
+        record = _llama4_wrapper(hf_config, used)
+    else:
+        vision = hf_config.get("vision_config")
+        tower_type = vision.get("model_type") if isinstance(vision, Mapping) else None
+        if tower_type == "gemma4_vision":
+            _refuse("vision_config (model_type 'gemma4_vision')",
+                    "its 2D position tables, vision rotary, clippable linears and "
+                    "position pooling have no counterpart here; only the wrapper's "
+                    "text_config translates today")
+        _refuse(f"model_type {model_type!r}",
+                "translate_wrapper_config loads the gemma3 and llama4 wrappers; "
+                "any other multimodal wrapper names a tower with no counterpart")
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS
+               - {key for key in hf_config if str(key).startswith("_")})
+    if unknown:
+        _refuse(f"config fields {sorted(unknown)}",
+                "the wrapper has no counterpart, so translating them would "
+                "silently change the model")
+    return record
+
+
+def _wrapper_tower_weights(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+    if kind == "siglip":
+        return vision_nn.translate_siglip_vision_weights(hf_tensors)
+    if kind == "llama4":
+        return vision_nn.translate_llama4_vision_weights(hf_tensors)
+    raise ValueError(f"tower kind {kind!r} has no weight map here")
+
+
+def _wrapper_projector_weights(kind: str,
+                               hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+    """Projector tensors by projector kind."""
+    if kind == "gemma":
+        return vision_nn.translate_gemma_projector_weights(hf_tensors)
+    if kind == "llama4":
+        return vision_nn.translate_llama4_projector_weights(hf_tensors)
+    raise ValueError(f"projector kind {kind!r} has no weight map here")
+
+
+def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
+                              record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Wrapper tensors into language, tower and projector trees, in fp32.
+
+    One leading `model.` comes off every name first, which is the released
+    nesting; what stays routes by prefix. The language half rides the text
+    family's own map, including the top-level tied head copy, and the tower
+    and projector halves ride theirs. A prefix outside the three raises
+    ValueError with the tensor name.
+    """
+    tower_kind = record["tower"]["kind"]
+    projector_kind = record["projector"]["kind"]
+    tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model."}[tower_kind]
+    text_tensors: Dict[str, np.ndarray] = {}
+    tower_tensors: Dict[str, np.ndarray] = {}
+    projector_tensors: Dict[str, np.ndarray] = {}
+    for name, tensor in hf_tensors.items():
+        bare = name[6:] if name.startswith("model.") else name
+        if bare.startswith("language_model."):
+            text_tensors[bare[15:]] = tensor
+        elif bare.startswith(tower_prefix):
+            tower_tensors[bare[len(tower_prefix):]] = tensor
+        elif bare.startswith("multi_modal_projector."):
+            projector_tensors[bare[22:]] = tensor
+        elif bare == "lm_head.weight":
+            text_tensors["lm_head.weight"] = tensor
+        else:
+            raise ValueError(f"unknown tensor name {name!r}")
+    return {
+        "language_model": translate_weights(text_tensors, record["text"]),
+        "tower": {"params": _wrapper_tower_weights(tower_kind, tower_tensors)},
+        "projector": {"params": _wrapper_projector_weights(projector_kind,
+                                                            projector_tensors)},
+    }
 
 
 # Where a layer's norms sit in the two trees. Without the sandwich the names
