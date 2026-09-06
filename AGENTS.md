@@ -1,30 +1,31 @@
 # Working on Dew
 
-Read `CONTRIBUTING.md` first. It is the contract; this file is the checklist an agent runs before, during and after a task. When they disagree, `CONTRIBUTING.md` wins.
+Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing standards. This checklist adds agent workflow rules; it does not duplicate that contract. Follow the user's current scope and approval boundaries.
 
-## Before you write
+## Scope and implementation
 
-- Find the primitive before writing code: `jax.nn.dot_product_attention`, `flax.linen`, `optax`, `orbax`, `grain`, and Google's JAX code (MaxText, tokamax, the `gemma` library). A reimplementation needs a reason a reader can check, written where the code is.
-- Read the seam you are about to touch and the tests that cover it. The seams: models are pure Flax modules; objectives own parameters, loss and validation; the trainer owns the mesh, the compiled step, EMA, checkpoints and logging; data sources produce records and transforms are Grain transforms.
-- Frozen at 1.0, never changed after it without a migration and a converter test: parameter tree leaf names and shapes, the checkpoint layout, wandb metric keys (`train/*`, `val/*`), the `Objective` methods, the Hugging Face parameter layout of `CausalTransformer`. Before 1.0 they change outright, with no converter.
-- Optimizations carry no tradeoffs: no numerics change, no reduced-precision path, nothing observable removed. If a faster version does not match the old one to fp32 tolerance, it is not accepted.
+- Read the affected module, its callers, tests, and relevant design section before editing. Check JAX, Flax, Optax, Orbax, Grain, and the reference implementation for an existing primitive.
+- Preserve checkpoint and reference-layout requirements described in `CONTRIBUTING.md`. Before 1.0, migrate callers together without compatibility shims.
+- Keep code that owns meaningful complexity. Apply the deletion test to helpers; caller count alone does not decide whether a helper belongs.
+- Preserve outputs and precision when optimizing an existing path. Treat requested quantization or approximate methods as explicit features with separate accuracy and performance evidence.
 
-## While you write
+## Parallel work and integration
 
-- Smallest correct change. No dead parameters, no helper used once, no flag nobody sets, no fallback without a demonstrated need, no change narration in comments or docstrings.
-- Ports are reference-identical: same parameter layout, same operation order where numerics depend on it, same dtypes, same defaults, and a parity test against the reference at fp32 with the tolerance and the largest observed difference written in the test. The fixture generator is committed under `tools/`.
-- Commit after every completed step, as `Ashish Kumar Singh <ashishkmr472@gmail.com>`, with a plain conventional message. Never push.
-- Work in your own worktree when others are active. Announce shared-file edits and GPU use on the hub before, not after. The GPU is idle only when `nvidia-smi --query-compute-apps=process_name --format=csv,noheader` shows only `gnome-remote-desktop-daemon`.
+- Give each parallel writer an isolated worktree and clear file ownership. Coordinate shared-file edits and GPU use before starting them. Keep at most four expert/slow sessions active; use no Sonnet models.
+- Inspect GPU processes and current lane ownership before launching GPU work. A process name alone does not establish whether the device is available.
+- Commit completed work as `Ashish Kumar Singh <ashishkmr472@gmail.com>` with a concise conventional commit message. Subagents report commits without pushing. The coordinating agent may push when the user authorizes it; never force-push.
+- Preserve tracked and untracked work before integration. Remove a worktree only after its work is committed, verified, merged, and no process still needs it.
 
-## Tests
+## Verification
 
-- A test is worth keeping only if it would fail on a plausible bug in the thing it names. Assert values, at the seam, through the public interface, with real inputs. No asserting that a function was called or that a shape came back.
-- A bug fix ships with the test that fails before and passes after, both runs shown. A new invariant ships with a mutation that breaks it and the assertion that the mutated code fails.
-- No stubs that return the value the test then checks. Mock only real external boundaries. No `importorskip` on the code under test.
-- Run only the files that cover your seam: `JAX_PLATFORMS=cpu pytest tests/<file> -q -p no:cacheprovider`. The whole suite runs once, at integration.
+- Run the affected test files with pytest's cache enabled. Let the coordinating agent run integration suites; capture complete output and exit status once instead of rerunning a suite to recover failure names.
+- In a worktree, pytest uses its configured source path; run scripts with `PYTHONPATH=src` so they import that worktree. Use the project's environment and commands documented in `CONTRIBUTING.md`.
+- Use small deterministic cases for logic and representative GPU/TPU cases for device behavior. Confirm the test size exercises the intended failure without constructing a production model by accident.
+- For numerical changes, record reference version, inputs, dtype, backend, command, observed error, and the reason for the tolerance. Investigate a failing bound before changing it.
+- A shell pipeline's last command succeeding does not prove tests passed. Stop integration on a failed check; fix and rerun the affected behavior.
 
-## Before you report
+## Reporting
 
-- Every number ships with the command that produced it and the hardware it ran on. Every claim about behaviour ships with the file and line or the command output.
-- Say what you did not do and why. A report that hides a gap costs more than the gap.
-- Plain sentences, no em dashes. Read `CONTRIBUTING.md`'s Writing section before you write prose, a docstring, a comment or a commit message. It names the constructions that are banned, including colon reveals ("Measured, not adopted: where the room is"), binary contrasts, importance puffery, trailing -ing clauses that pretend to explain, negative listing, fake-profound endings, and the words that sell. Tables for comparisons.
+- Distinguish implemented behavior, tested behavior, research findings, and open work. Keep each requested item tracked until its acceptance checks pass or the user defers it.
+- Report benchmark conditions and commands, exact checks run, remaining risks, and blocked prerequisites. Do not infer full framework parity or production readiness from small fixtures or simulated devices.
+- Preserve the author's voice. Use the writing standards in `CONTRIBUTING.md` for docs, comments, commits, and replies.

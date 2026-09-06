@@ -8,7 +8,7 @@ Dew is small on purpose. Every line has to earn its place. These rules apply to 
 - One path. A capability has one implementation, one config field, one registry entry. No fallbacks, flags or compatibility layers without a demonstrated need.
 - The seams are the contract. Models are plain Flax modules that know nothing about training. Objectives own parameters, loss and validation. The trainer owns the mesh, the compiled step, EMA, checkpoints and logging. Data sources produce records; transforms are Grain transforms. A new architecture is a module and a registry entry; a new modality is an objective. If a change needs to cross these lines, the design is wrong, not the lines.
 - Prefer deep modules: a small interface over real complexity. Delete an abstraction if inlining it makes the code clearer.
-- Frozen at 1.0: parameter tree names, the checkpoint layout, wandb metric keys, the Objective methods, and the Hugging Face parameter layout of `CausalTransformer`. Dew is unpublished, so until 1.0 these change outright, with no converter and no compatibility path; from 1.0 on, a change to any of them is a migration, with a converter and a test that loads the old form.
+- Frozen at 1.0: parameter tree names and shapes, the checkpoint layout, wandb metric keys, the Objective methods, and the Hugging Face parameter layout of `CausalTransformer`. Dew is unpublished, so until 1.0 these change outright, with no converter and no compatibility path; from 1.0 on, a change to any of them is a migration, with a converter and a test that loads the old form.
 
 ## Reference parity
 
@@ -21,7 +21,7 @@ Anything that implements a published architecture, schedule, sampler or loss is 
 
 ## Code
 
-- Smallest correct version. No dead parameters, no helper used once, no branch for a case that cannot happen.
+- Keep the smallest correct implementation. Remove dead parameters and unreachable branches. Keep a helper when it owns a coherent operation or hides meaningful complexity, even with one caller.
 - Fix causes, not symptoms. No suppressed warnings, no special-cased inputs, no zero-filled fallbacks.
 - Types are narrow and true. No `Any`, no casts to make a checker quiet. `dew` ships `py.typed`, so a caller's checker reads these annotations: a wrong one is a bug with a wide blast radius. The gate is `uvx pyright@1.1.406 src/dew` from the repository root, where `pyproject.toml` names the environment. A worktree has no `.venv` of its own, so pyright there resolves nothing and invents hundreds of errors in files that are clean; from a worktree, pass the interpreter instead: `uvx pyright@1.1.406 --pythonpath ../../.venv/bin/python src/dew`. Where the untrue type belongs to a dependency without `py.typed`, narrow it with a stub under `stubs/`, the one `stubPath` `pyproject.toml` names, and say which signature the stub declares. CI runs the same command and fails on an error.
 - The venv installs dew editable, so `import dew` from the repository root reads `src/`. A worktree is not the root: run its tests through pytest, whose `pythonpath` puts the worktree's `src/` first, and its scripts with `PYTHONPATH=src`, or they read the main checkout's source and report on the wrong tree.
@@ -33,16 +33,16 @@ Anything that implements a published architecture, schedule, sampler or loss is 
 
 A test is worth keeping only if it would fail on a plausible bug in the thing it names. Before committing one, ask what change to the code would make it go red; if the answer is "none" or "only deleting the function", it is not a test.
 
-- Test the output, not the plumbing. Assert values: a scheduler against its paper's equations, a sampler against an analytic denoiser, a loss against a hand computation on a small case, a model through `fit` on the simulated 8-device mesh, a port against the reference at fp32 with the tolerance and the largest observed difference written in the test. Do not assert that a function was called, that a shape came back, or that a constant equals itself.
+- Test observable behavior through public interfaces: numerical results, state transitions, error handling, shapes, dtypes, and sharding where they are part of the contract. A shape-only assertion does not prove numerical correctness; a mock call or self-equal constant does not prove behavior.
 - Test at the seam where the behaviour lives, through the public interface, with real inputs. Mock only at real external boundaries (network, disk, a service). A stub that returns the value the test then checks proves nothing.
 - Prove the test can fail. A bug fix ships with the test that failed before the fix and passes after, both runs shown in the commit or review. A new invariant ships with a mutation that breaks it (drop a term, flip a comparison, skip a chunk) and the assertion that the mutated code fails.
 - One behaviour per test, named for the behaviour. A test that would need its name changed when the implementation changes is testing the implementation.
-- Deterministic and on CPU. Fixed seeds, no wall-clock timing, no network unless marked. The GPU lane exists for kernels and dtypes, not for logic.
+- Keep tests deterministic with fixed seeds. Run backend-independent logic on CPU and device-specific kernels, precision, and memory behavior on the relevant GPU or TPU. Use small cases for logic; use representative device-sized cases for kernel checks. Keep timing in benchmarks and network access behind its marker.
 - No silent skips. `importorskip` only for an optional dependency, never for the code under test; a test that skips because a module broke is a broken test.
 - Be adversarial. Test the order that breaks things, not the order that works: build a loader after a device exists, resume a run mid-epoch, kill a worker, restore a checkpoint into a different mesh, feed a corpus too small for one batch, feed a split with no boundary. Three bugs shipped because every test used the safe order.
 - Assert the invariant, not the observation. A stream that should end must end (exactly ceil(N/batch) batches, then stop). Records that should be distinct must be distinct. Splits that should be disjoint must be disjoint. Metrics that should reach the tracker must reach it when the stream ends. State the property and let it fail.
 - Multiprocess and multi-device paths are tested with real processes and real meshes: loading.workers above zero with workers actually running, iterator state through a restart, jax.distributed across spawned processes, loss parity between one process and many at the same seed. A single-process simulation of a mesh is necessary and not sufficient.
-- A warning is a failure waiting to be reported. If the suite emits one, either the code is wrong or the warning is noise that should be silenced at its source with a reason. Nothing stays in the tail of a green run.
+- Investigate warnings at their source. Fix our misuse or the dependency defect; record an unresolved upstream warning with its cause. Do not add a filter or exemption to make a failing check pass.
 - Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
 - `tests/test_architectures.py` fails when a registry entry has no training case. Keep it that way.
 
@@ -63,6 +63,14 @@ These constructions are banned, in prose, docstrings, comments and commit messag
 - **Words that sell.** robust, seamless, leverage, utilize, delve, comprehensive, cutting-edge, elevate, harness, streamline, empower, paramount, intricate, transformative, ever-evolving.
 - **Em dashes.** None. Commas, periods and parentheses cover every case.
 - **Formatting decoration.** No emoji in headings, no bold mid-sentence for emphasis, no bullet list where two sentences read better, no heading over a two-sentence section.
+
+## User documentation
+
+- Write for a Python/ML reader new to Dew; state any JAX or Flax prerequisite. Teach a complete workflow before advanced options, and separate tutorials, task guides, explanations, and reference.
+- Use public APIs and explain inputs, shapes, dtypes, randomness, state, outputs, and relevant limits. Keep research history and implementation rationale outside the primary learning path.
+- Run examples from an empty Python namespace in a temporary working directory. Include imports, data setup, dependencies, and every file they read. State expected results and verify any files or metrics the text promises.
+- Label download- or accelerator-dependent examples and report what was not executed. Do not supply hidden test variables or treat syntax-only compilation as execution.
+- Check links and build the documentation. Record implementation defects separately; do not redesign APIs to make an example easier to write.
 
 ## Before a merge
 

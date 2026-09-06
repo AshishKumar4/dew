@@ -1,29 +1,52 @@
-site_name: dew
-site_description: A JAX/Flax framework for training diffusion, JEPA and other large models from scratch
+site_name: Dew
+site_description: Train Flax Linen models with JAX
 repo_url: https://github.com/AshishKumar4/dew
+
+exclude_docs: |
+  /design/
+  /research/
 
 theme:
   name: material
   logo: assets/logo.svg
   favicon: assets/logo.svg
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - toc:
+      permalink: true
 
 nav:
   - Home: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Your first training run: getting-started.md
+  - Task guides:
+      - Writing a custom objective: concepts/objectives.md
+      - Supplying training data: concepts/data.md
+      - Evaluation and tracking: guides/evaluation.md
+      - Resuming training: guides/checkpoints.md
+      - Image diffusion: guides/diffusion.md
+      - Representation learning: guides/representation-learning.md
+      - Training language models: concepts/language_models.md
+      - SFT, DPO, and GRPO: concepts/post_training.md
+      - Training recipes: recipes.md
+      - TPU setup: tpu.md
   - Concepts:
-      - The objectives seam: concepts/objectives.md
       - Distributed training: concepts/distributed.md
-      - The data pipeline: concepts/data.md
-      - Language models: concepts/language_models.md
-  - Design:
-      - The API: design/api.md
-      - Review of main at 102baa4, the API: design/review-api-2026-09-03.md
-      - Review of main at 102baa4, multi-host: design/review-multihost-2026-09-03.md
-      - Dew at scale: design/plan.md
-      - Post-training: design/post-training.md
-  - Recipes: recipes.md
-  - TPUs: tpu.md
-  - Benchmarks: benchmarks.md
-  - API: api.md
-  - Gallery: gallery.md
-  - References: references.md
-  - Coming from FlaxDiff: from-flaxdiff.md
+      - Mixture of experts: concepts/moe.md
+  - Reference:
+      - Capabilities and limitations: reference/support.md
+      - Decoder and vision families: reference/model-families.md
+      - Core API: reference/core-api.md
+      - Module index: api.md
+      - Performance measurements: performance.md
+      - Benchmark results: benchmarks.md
+      - Papers and dependencies: references.md
+  - Examples: gallery.md

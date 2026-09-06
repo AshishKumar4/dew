@@ -1,8 +1,9 @@
-# API
+# Module index
 
-The public modules and the names each exports. This page is written by
-`tools/api_page.py` from the code, and a test keeps them equal; edit the
-`__all__` of a module, not this file.
+For signatures, defaults, and behavior, start with the [core API reference](reference/core-api.md).
+This generated index lists declared exports, or public classes and functions defined
+directly in a module when it has no export list. An empty row does not mean the
+module has no importable names.
 
 
 ## The package
