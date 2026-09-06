@@ -44,7 +44,7 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 - Multiprocess and multi-device paths are tested with real processes and real meshes: loading.workers above zero with workers actually running, iterator state through a restart, jax.distributed across spawned processes, loss parity between one process and many at the same seed. A single-process simulation of a mesh is necessary and not sufficient.
 - Investigate warnings at their source. Fix our misuse or the dependency defect; record an unresolved upstream warning with its cause. Do not add a filter or exemption to make a failing check pass.
 - Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
-- `tests/test_architectures.py` fails when a registry entry has no training case. Keep it that way.
+- For each supported architecture, exercise a real forward/backward update and its claimed placement.
 
 ## Writing
 

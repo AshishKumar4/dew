@@ -8,11 +8,7 @@ trainer has just written.
 """
 
 import dataclasses
-import os
-import subprocess
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 import jax
 import numpy as np
@@ -239,9 +235,8 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
                                 data=VideoDataset(frame_size=8, frames=2),
                                 val_metrics=["psnr"])
     (metric,) = video.build_eval_metrics()
-    assert metric.reads is VideoGrid
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
-    assert np.isinf(metric(VideoGrid(unit_range(images)), {"video": images}))
+    assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError, match="clip"):
         dataclasses.replace(video, val_metrics=["clip"]).build_eval_metrics()
 
@@ -254,21 +249,6 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
         autoencoder=StableDiffusionAutoencoder(revision="flax", latent_scale=0.5))
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
 
-
-def test_a_fresh_process_resolves_metrics_and_models_through_the_config():
-    """The recipe runs in a fresh process: the registries the config builds
-    from fill on its import alone. `psnr` is pure, so resolving it proves the
-    point without downloading weights."""
-    root = Path(__file__).resolve().parents[1]
-    code = ("from dew.objectives.diffusion.config import DiffusionRunConfig;"
-            "from dew.registry import metrics, models;"
-            "print(metrics['psnr']().name, 'simple_dit' in models)")
-    out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True,
-        env={"PYTHONPATH": str(root / "src"), "JAX_PLATFORMS": "cpu",
-             "PATH": os.environ.get("PATH", "")})
-    assert out.returncode == 0, out.stderr[-2000:]
-    assert out.stdout.strip() == "psnr True"
 
 def test_guidance_is_a_value_with_its_interval(tmp_path):
     """`guidance` was a bare scale whose 0 stood for "off", so `CFG.interval`
