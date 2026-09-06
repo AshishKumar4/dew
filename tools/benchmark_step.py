@@ -422,12 +422,11 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     """What the device did during the traced `steps`, from the newest trace
     under `directory`.
 
-    Busy is the union of every kernel's interval across the device's streams,
-    over the window from the first kernel's start to the last one's end, so
-    the fraction is what the card was doing while the loop ran and its
-    complement is the idle the host left it. Kernel milliseconds are summed
-    per category and divided by the steps; streams can overlap, so the sum of
-    categories is an attribution and not a second step timer.
+    Busy is the union of kernel intervals across the traced devices and
+    streams, divided by the earliest-start to latest-end window. For a
+    multi-device trace this measures time when any device ran a kernel,
+    not average utilization across devices. Category timings sum events
+    and can overlap; they are not an additional wall-clock measurement.
     """
     from jax.profiler import ProfileData
 
@@ -453,7 +452,7 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
         else:
             current_end = max(current_end, end)
     busy += current_end - current_start
-    window = kernels[-1][2] - kernels[0][1]
+    window = current_end - kernels[0][1]
     by_category: dict[str, float] = {}
     by_name: dict[str, float] = {}
     for name, start, end in kernels:
@@ -563,9 +562,6 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         "finite": bool(is_finite),
         **timeline,
     }
-    # The state holds every device buffer this case allocated; drop it before
-    # the next case builds its own.
-    del state, compiled, trainer
     return row
 
 

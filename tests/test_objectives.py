@@ -87,3 +87,20 @@ def test_an_objective_needs_init_and_loss():
 
     with pytest.raises(TypeError):
         Incomplete()
+
+
+def test_registered_lm_objective_computes_next_token_loss():
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.registry import objectives
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
+                              num_heads=1, mlp_features=16, max_seq_len=8)
+    registered = objectives.build("lm", model=model, seq_len=4)
+    direct = LMObjective(model, seq_len=4)
+    variables = direct.init(jax.random.key(0))
+    batch = {"text": jnp.array([[0, 1, 2, 3, 4]], dtype=jnp.int32)}
+    step = Step(step=jnp.array(0), key=jax.random.key(1), ema=None)
+    actual, _ = registered.loss(variables, batch, step)
+    expected, _ = direct.loss(variables, batch, step)
+    np.testing.assert_allclose(actual, expected)

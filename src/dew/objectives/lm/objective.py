@@ -143,7 +143,6 @@ def _global_qk_max(qk) -> jax.Array | None:
     return jnp.max(jnp.stack(found)) if found else None
 
 
-@objectives("lm")
 class Scores(NamedTuple):
     """What `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
 
@@ -162,6 +161,7 @@ class Scores(NamedTuple):
     qk: Optional[dict]
 
 
+@objectives("lm")
 class LMObjective(Objective):
     """Shifted cross entropy; evaluation scores tokens and writes text."""
 

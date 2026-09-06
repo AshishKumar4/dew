@@ -47,6 +47,10 @@ jobs:
       run: |
         python - <<'EOF'
         import xml.etree.ElementTree as ET
+        from pathlib import Path
+        if not Path("pytest-report.xml").is_file():
+            print("::notice::No pytest report was produced; inspect earlier CI steps.")
+            raise SystemExit(0)
         root = ET.parse("pytest-report.xml").getroot()
         for case in root.iter("testcase"):
             for kind in ("failure", "error"):
@@ -56,7 +60,7 @@ jobs:
                     print(f"::error title={case.get('classname')}.{case.get('name')}::{(node.get('message') or '')[:400]} || {detail[:600]}")
         EOF
     - name: Upload the test report
-      if: always()
+      if: always() && hashFiles('pytest-report.xml') != ''
       uses: actions/upload-artifact@v4
       with:
         name: pytest-report
