@@ -94,8 +94,10 @@ def measure(depth: int, scan: bool, config: StackConfig, counter: CompileCounter
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
         counter.steps = 0
 
+        initial_batch = next(source)
+        jax.block_until_ready((state, initial_batch))
         started = time.perf_counter()
-        compiled = trainer.compile(state, next(source))
+        compiled = trainer.compile(state, initial_batch)
         compile_seconds = time.perf_counter() - started
 
         def step(state):

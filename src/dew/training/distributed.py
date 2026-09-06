@@ -345,9 +345,12 @@ class DevicePrefetchIterator:
 
     Use as a context manager or call close, including after a bounded loop.
     At most depth batches are queued plus one being read/placed. Source next,
-    checkpoint operations and final close run on the worker. Only an optional
+    checkpoint operations and final close run on the worker. An optional
     thread-safe, nonblocking request_stop hook runs on the closing thread.
-    Arbitrary blocking source code cannot be killed: close reports a timeout.
+    If thread creation itself fails, caller-thread finalization runs before
+    re-raising; no worker has touched the source. That synchronous error path
+    requires a cooperative finalizer. Active-worker close reports a timeout
+    when arbitrary source code cannot be stopped.
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
@@ -371,8 +374,23 @@ class DevicePrefetchIterator:
 
     def _start(self) -> None:
         with self._start_lock:
+            if self._done.is_set():
+                return
             if self._thread.ident is None:
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except RuntimeError as error:
+                    if self._thread.ident is None:
+                        # Thread creation failed before any source operation.
+                        self._stop.set()
+                        try:
+                            request_stop = getattr(self._iterator, "request_stop", None)
+                            if request_stop is not None:
+                                request_stop()
+                        except BaseException as failure:
+                            error.add_note(f"Source cancellation failed: {failure!r}")
+                        self._prefetch()
+                    raise
 
     def _prefetch(self):
         iterator, mesh = self._iterator, self._mesh
@@ -451,7 +469,8 @@ class DevicePrefetchIterator:
             error = failure
         self._discard()
         self._start()  # Even an unused iterator finalizes on its worker.
-        self._thread.join(timeout)
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
         self._discard()
         self._error = None  # Unconsumed speculative errors are discarded too.
         failure = None
