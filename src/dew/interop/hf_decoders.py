@@ -854,6 +854,27 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, Any], used: set[str]) -
     names them.
     """
     config = _gemma4_config(hf_config, used)
+    # The reference builds no v_proj on full layers whatever the config says
+    # (modeling_diffusion_gemma.py, DiffusionGemmaEncoderTextAttention: v_proj
+    # only if the layer slides), so the record always reads values off keys
+    # there; the sliding layers keep their own v_proj.
+    config["attention_k_eq_v"] = True
+    if config.get("mixture") is None and all(
+            hf_config.get(field) is not None
+            for field in ("num_experts", "top_k_experts", "moe_intermediate_size")):
+        # DiffusionGemma names no enable_moe_block flag; a config carrying the
+        # three routed widths routes every layer beside its dense MLP, which
+        # is what its encoder and decoder layers both build.
+        config["mixture"] = {
+            "experts": int(hf_config["num_experts"]),
+            "top_k": int(hf_config["top_k_experts"]),
+            "expert_features": int(hf_config["moe_intermediate_size"]),
+            "parallel": True,
+        }
+    # final_logit_softcapping is a class attribute of the reference text
+    # config, not an instance field a config.json carries; the head always
+    # divides by 30 under tanh.
+    config["final_logit_softcap"] = 30.0
     config.update(causal=False)
     return config
 
@@ -1827,6 +1848,49 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
         node[path[-1]] = leaf
     _stack_experts(variables['params'])
     return variables
+
+
+def translate_denoiser_weights(hf_tensors: Mapping[str, np.ndarray],
+                               config: Mapping[str, Any]) -> Dict[str, Any]:
+    """A DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
+
+    The encoder (`model.encoder.language_model.*`) and the decoder
+    (`model.decoder.*`) share every text weight they have in common, so both
+    prefixes route onto the one family map; where both name a leaf the values
+    must agree, and a checkpoint whose halves differ refuses naming the leaf.
+    The decoder's `self_conditioning.*` rides the module's own map in
+    dew.nn.diffusion_gemma, and `lm_head.weight` lands untied or dropped by
+    the family's tied-head rule. Vision and audio prefixes have no counterpart
+    and raise ValueError with the tensor name.
+    """
+    from dew.nn.diffusion_gemma import translate_weights as translate_sc_weights
+
+    text: Dict[str, np.ndarray] = {}
+    sc: Dict[str, np.ndarray] = {}
+    for name, tensor in hf_tensors.items():
+        if name.startswith("model.encoder.language_model."):
+            text["model." + name[len("model.encoder.language_model."):]] = tensor
+        elif name.startswith("model.decoder."):
+            rest = name[len("model.decoder."):]
+            if rest.startswith("self_conditioning."):
+                sc[rest] = tensor
+            else:
+                text.setdefault("model." + rest, tensor)
+        elif name == "lm_head.weight":
+            text[name] = tensor
+        else:
+            raise ValueError(f"unknown tensor name {name!r}")
+    for name, tensor in hf_tensors.items():
+        if name.startswith("model.decoder."):
+            rest = name[len("model.decoder."):]
+            if not rest.startswith("self_conditioning."):
+                key = "model." + rest
+                if not np.array_equal(np.asarray(text[key]), np.asarray(tensor)):
+                    raise ValueError(
+                        f"{key} differs between the encoder and the decoder, "
+                        "which share their text weights")
+    return {"text": translate_weights(text, config),
+            "self_conditioning": {"params": translate_sc_weights(sc)}}
 
 
 # An fp8 weight widens to fp32 exactly, and its block scales are applied by

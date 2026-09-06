@@ -780,6 +780,90 @@ def write_diffusion_sc_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+DIFFUSION_DENOISER_TEXT = {
+    "model_type": "diffusion_gemma_text",
+    "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "head_dim": 8, "intermediate_size": 64,
+    "vocab_size": 64, "max_position_embeddings": 64, "rms_norm_eps": 1e-6,
+    "hidden_activation": "gelu_pytorch_tanh", "tie_word_embeddings": False,
+    "attention_bias": False, "sliding_window": 8,
+    "layer_types": ["full_attention", "full_attention"],
+    "rope_parameters": {
+        "full_attention": {"rope_type": "proportional",
+                           "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+    "num_experts": 4, "top_k_experts": 2, "moe_intermediate_size": 16,
+    "global_head_dim": 8, "num_global_key_value_heads": 2,
+}
+
+
+def write_diffusion_denoiser_tiny() -> None:
+    """One DiffusionGemma denoise step: the text weights under the released
+    encoder/decoder prefixes, the text config, a fixed prompt, canvas and
+    previous logits, and the fp32 reference logits with and without
+    self-conditioning.
+
+    The reference ties its encoder and decoder text weights, so the fixture
+    copies the encoder's text weights over the decoder's after scattering;
+    the dew tree holds them once. The tied check in the loader refuses a
+    checkpoint that disagrees there.
+    """
+    from safetensors.torch import save_file
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+    )
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+
+    text = DiffusionGemmaTextConfig(**{
+        key: value for key, value in DIFFUSION_DENOISER_TEXT.items()
+        if key != "model_type"})
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=text, vision_config=vision, canvas_length=4,
+        tie_word_embeddings=False))
+    state = model.state_dict()
+    for name in list(state):
+        if name.startswith("model.decoder.layers.") or name in (
+                "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
+            counterpart = name.replace("model.decoder.", "model.encoder.language_model.", 1)
+            state[name].copy_(state[counterpart])
+    model.load_state_dict(state)
+    model = model.float().eval()
+    saved = {name: tensor for name, tensor in model.state_dict().items()
+             if name.startswith("model.encoder.language_model.")
+             or name.startswith("model.decoder.") or name == "lm_head.weight"}
+    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(saved, directory / "model.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(DIFFUSION_DENOISER_TEXT, indent=1) + "\n")
+    prompt = np.array([[2, 5, 7, 9]], np.int32)
+    canvas = np.array([[3, 4, 5, 6]], np.int32)
+    prev = np.random.RandomState(3).randn(1, 4, 64).astype(np.float32)
+    with torch.no_grad():
+        bare = model(input_ids=torch.from_numpy(prompt),
+                     decoder_input_ids=torch.from_numpy(canvas)
+                     ).logits.to(torch.float32).numpy()
+        conditioned = model(
+            input_ids=torch.from_numpy(prompt),
+            decoder_input_ids=torch.from_numpy(canvas),
+            self_conditioning_logits=torch.from_numpy(prev)
+            ).logits.to(torch.float32).numpy()
+    np.save(directory / "prompt.npy", prompt)
+    np.save(directory / "canvas.npy", canvas)
+    np.save(directory / "prev_logits.npy", prev)
+    np.save(directory / "ref_bare.npy", bare)
+    np.save(directory / "ref_conditioned.npy", conditioned)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
 
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
@@ -922,6 +1006,8 @@ def main() -> None:
     write_gemma3_mm_tiny()
     write_llama4_mm_tiny()
     write_diffusion_sc_tiny()
+    write_diffusion_denoiser_tiny()
+    write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 

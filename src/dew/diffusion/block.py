@@ -11,21 +11,23 @@ whose categorical entropy fits an independence bound are accepted while the
 rest are renoised (:343-469). The previous step's tempered logits condition
 the next one through the self-conditioning MLP in dew.nn.diffusion_gemma.
 
-What lives here needs no model: the canvas distribution, the temperature
-schedule, the acceptance rule and the renoise. The denoiser itself, encoder
-cache plus canvas plus self-conditioning, needs a backbone forward that takes
-a cached prefix beside a bidirectional canvas, which CausalTransformer has no
-entry point for today; `sample_canvas` takes it as a callable so the loop is
-testable now and complete when that entry point lands.
+What lives here besides the schedule is the denoiser wiring: `prefill_cache`
+runs the causal encoder over the prompt into a KV cache, and `denoise_logits`
+runs the bidirectional canvas against that cache with self-conditioning
+folded in through the decoder's input-embeddings hook. `sample_canvas` takes
+a denoiser callable so the loop stays testable on its own.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+
+from dew.nn.diffusion_gemma import soft_embeddings
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,56 @@ class BlockProcess:
         """Accepted positions kept, the rest drawn uniform again."""
         fresh = self.noise(key, jnp.shape(accepted))
         return jnp.where(jnp.asarray(mask, bool), accepted, fresh)
+
+
+def prefill_cache(encoder, variables, prompt) -> dict:
+    """The encoder's KV cache after reading the prompt, the prefix the canvas
+    attends to.
+
+    `encoder` is the causal model sharing the denoiser's weights; `variables`
+    its `{'params': ...}` tree. The prompt goes through once in decode mode
+    with a mutable cache, exactly like the sampler's prefill, and what comes
+    back is the cache collection alone.
+    """
+    prompt = jnp.asarray(prompt, jnp.int32)
+    cache = encoder.apply(variables, prompt.shape[0],
+                          method=type(encoder).init_cache,
+                          mutable=["cache"])[1]["cache"]
+    return encoder.apply({**variables, "cache": cache}, prompt, decode=True,
+                         mutable=["cache"])[1]["cache"]
+
+
+def denoise_logits(decoder, sc, variables, sc_variables, cache, canvas,
+                   prev_logits=None):
+    """One canvas step's raw logits: self-conditioning folded in, prefix
+    cached, bidirectional over the canvas.
+
+    `decoder` is the same weights as the encoder with `causal=False`;
+    `variables` carries its params without the cache. The previous step's
+    tempered logits become soft embeddings through the embedding table, or
+    zeros on the first step, and the self-conditioning module folds them into
+    the scaled canvas embeddings the input-embeddings hook carries. The canvas
+    positions continue past the prefix, which is what the reference passes as
+    decoder_position_ids.
+    """
+    canvas = jnp.asarray(canvas, jnp.int32)
+    table = variables["params"]["embed_tokens"]["embedding"]
+    width = table.shape[-1]
+    scaled = (table[canvas].astype(jnp.float32)
+              * jnp.asarray(math.sqrt(width), jnp.float32))
+    if prev_logits is None:
+        soft = jnp.zeros_like(scaled)
+    else:
+        soft = soft_embeddings(prev_logits, table,
+                               math.sqrt(width)).astype(scaled.dtype)
+    conditioned = sc.apply(sc_variables, scaled, soft.astype(scaled.dtype))
+    length = canvas.shape[1]
+    positions = jnp.broadcast_to(jnp.arange(length), canvas.shape)
+    full = {**variables, "cache": cache}
+    out, _ = decoder.apply(full, canvas, decode=True,
+                           input_embeddings=conditioned,
+                           embedding_positions=positions, mutable=["cache"])
+    return out
 
 
 def sample_canvas(key: jax.Array, denoise, shape: Sequence[int], *,
