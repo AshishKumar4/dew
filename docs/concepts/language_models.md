@@ -131,7 +131,7 @@ A checkpoint quantized the way DeepSeek V3 and V3.2 ship, every linear an F8_E4M
 
 A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`use_bidirectional_attention` other than Gemma 4's vision-only spelling, a `mlp_bias`, an activation other than silu or tanh-gelu, a `rope_scaling` the family's reference does not read, DeepSeek V2's `norm_topk_prob` or a `scoring_func` other than softmax, GPT OSS's `router_jitter_noise` or a quantization other than MXFP4, Llama 4's `layer_types` disagreeing with `no_rope_layers`).
 
-A multimodal gemma3 or llama4 repo translates through `translate_wrapper_config` into its decoder, tower and projector records (see below); a gemma4, gemma3n or qwen3_5 wrapper is refused naming its tower, and its `text_config` is what translates on its own. The families still to come are in the README roadmap.
+A multimodal gemma3, llama4, gemma4 or qwen3_5 repo translates through `translate_wrapper_config` into its decoder, tower and projector records (see below); a gemma3n wrapper is refused on its MobileNet-v5 tower, and its `text_config` is what translates on its own. The families still to come are in the README roadmap.
 Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 
 `recipes/lm/train.py --pretrained` continues training one of these:
@@ -198,14 +198,22 @@ logits = denoise_logits(decoder, sc, variables, sc_variables, cache, canvas, Non
 
 ## Multimodal wrappers
 
-A gemma3 or llama4 checkpoint wraps three halves. `translate_wrapper_config`
-turns it into decoder, tower and projector records, and
-`translate_wrapper_weights` routes the released `model.*` nesting into the
-three trees. The towers live in `dew.nn.vision`, a SigLIP trunk sharing CLIP's
-attention for Gemma 3 and a MetaCLIP-style trunk with grid rotary and pixel
-shuffle for Llama 4. Each projector is a registered value built by
-`projector_from_record`: Gemma's averages patch blocks into soft tokens and
-Llama 4's maps the shuffled output to text width.
+A gemma3, llama4, gemma4 or qwen3_5 checkpoint wraps three halves.
+`translate_wrapper_config` turns it into decoder, tower and projector
+records, and `translate_wrapper_weights` routes the released `model.*`
+nesting into the three trees. The towers live in `dew.nn.vision`:
+
+| Wrapper | Tower | Projector | Soft tokens per image |
+| --- | --- | --- | --- |
+| gemma3 | SigLIP trunk sharing CLIP's attention | Block average, norm, map to text width | Fixed by `mm_tokens_per_image` |
+| llama4 | MetaCLIP-style trunk with grid rotary and pixel shuffle | Map of the shuffled output | Fixed by the grid and the shuffle ratio |
+| gemma4 | Patch pixels with summed 2D tables, RMS blocks, position pooler | Scale-free norm and map | Varies with the image resolution |
+| qwen3_5 | NaViT-style patchify with the frame repeated along time, resampled positions, merger reads the trunk | The merger itself | Varies with the image resolution |
+
+Each projector is a registered value built by `projector_from_record`. A
+gemma3n wrapper refuses: its tower is MobileNet-v5, an image classifier with
+no counterpart here. The towers take one still image resolution per call;
+packed batches of mixed resolutions and video frames have no form here.
 
 ```python
 # runs elsewhere: downloads a Gemma 3 multimodal checkpoint from the Hub
