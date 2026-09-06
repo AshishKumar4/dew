@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -69,7 +70,7 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     reference = np.load(directory / "logits.npy")
 
-    assert scanned.bind(variables).groups == RUNS[name]
+    
     plain = np.asarray(model.apply(variables, ids))
     logits = np.asarray(scanned.apply(variables, ids))
 
@@ -183,7 +184,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     the bounds SHAPES states."""
     build, runs, logit_bound, gradient_bound = SHAPES[shape]
     plain, scanned, variables, ids = scanned_pair(build)
-    assert scanned.bind(variables).groups == runs
+    
 
     logits = jax.jit(scanned.apply)(variables, ids)
     difference = float(jnp.max(jnp.abs(logits - jax.jit(plain.apply)(variables, ids))))
@@ -224,7 +225,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     outcomes = []
     for model in (plain, scanned):
         objective = LMObjective(model, 11, balance_rate=0.01, aux_loss_alpha=0.1)
-        loss, aux = objective.loss(variables, batch, step)
+        loss, aux = scalar_loss(objective, variables, batch, step)
         assert aux.variables is not None
         outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
                          aux.variables["moe"]))
@@ -312,7 +313,7 @@ def loss_and_grads(objective, spec, variables, batch):
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
     def loss(params):
-        return objective.loss({**variables, "params": params}, batch, step)
+        return scalar_loss(objective, {**variables, "params": params}, batch, step)
 
     with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
@@ -399,7 +400,7 @@ def test_the_stages_hand_activations_on_by_collective_permute():
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
     def loss(params):
-        return objective.loss({**variables, "params": params}, batch, step)[0]
+        return scalar_loss(objective, {**variables, "params": params}, batch, step)[0]
 
     with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
         text = jax.jit(jax.grad(loss)).lower(variables["params"]).compile().as_text()

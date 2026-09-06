@@ -36,6 +36,7 @@ runs, `caption_projection_dim` is `emb_features` through `txt_embed`,
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -171,7 +172,7 @@ def test_the_compiled_step_carries_no_frozen_weights_as_constants(tmp_path):
                                   encoder.tokenize(PROMPTS))}
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
 
-    closed = jax.make_jaxpr(lambda params, data: objective.loss(params, data, step)[0])(
+    closed = jax.make_jaxpr(lambda params, data: scalar_loss(objective, params, data, step)[0])(
         variables, batch)
     constants = {np.shape(const) for const in closed.consts}
     # Kernels, not biases: a one-dimensional shape collides with the

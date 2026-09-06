@@ -149,10 +149,10 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     state = poison(trainer.initial_state())
     before = frozen_bytes(state)
     batch = next(Counting())
-    scale = dynamic_scale_lib.DynamicScale() if dynamic_scale else None
-    step = trainer.compile(state, batch, scale)
+    
+    step = trainer.compile(state, batch)
 
-    new_state, _, loss, _, finite = step(state, scale, batch)
+    new_state, loss, _, finite, _ = step(state, batch)
 
     assert not bool(finite), "the step should have seen the poison"
     assert not bool(jnp.isfinite(loss)), "the loss should have seen the poison"

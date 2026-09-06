@@ -484,7 +484,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     with DevicePrefetchIterator(batches(case), trainer.device_mesh) as source:
         abstract = jax.eval_shape(trainer.initial_state)
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-        scale = None
+        
 
         initial_batch = next(source)
         jax.block_until_ready((state, initial_batch))
@@ -492,20 +492,20 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         compiled = trainer.compile(state, initial_batch)
         compile_seconds = time.perf_counter() - compile_start
 
-        def step(state, scale):
-            state, scale, loss, _, finite = compiled(state, scale, next(source))
-            return state, scale, loss, finite
+        def step(state):
+            state, loss, _, finite, _ = compiled(state, next(source))
+            return state, loss, finite
 
         # At least one warm step, so the first dispatch of the executable is
         # outside the timed window.
-        state, scale, loss, is_finite = step(state, scale)
+        state, loss, is_finite = step(state)
         for _ in range(config.warmup - 1):
-            state, scale, loss, is_finite = step(state, scale)
+            state, loss, is_finite = step(state)
         loss.block_until_ready()
 
         start = time.perf_counter()
         for _ in range(config.steps):
-            state, scale, loss, is_finite = step(state, scale)
+            state, loss, is_finite = step(state)
         loss.block_until_ready()
         elapsed = time.perf_counter() - start
 
@@ -517,7 +517,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         synced = []
         for _ in range(config.steps):
             step_start = time.perf_counter()
-            state, scale, loss, is_finite = step(state, scale)
+            state, loss, is_finite = step(state)
             loss.block_until_ready()
             synced.append((time.perf_counter() - step_start) * 1e3)
         p10, p50, p90 = np.percentile(synced, [10, 50, 90])
@@ -529,7 +529,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             jax.profiler.start_trace(directory)
             try:
                 for _ in range(config.profile_steps):
-                    state, scale, loss, is_finite = step(state, scale)
+                    state, loss, is_finite = step(state)
                 loss.block_until_ready()
             finally:
                 primary = sys.exception()
