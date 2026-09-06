@@ -273,7 +273,9 @@ def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
     The vocabulary here is 512 wide over 16 tokens, and the head is 32 wide,
     so a `[tokens, vocab]` tensor is unmistakable in the text. The
     full-vocabulary loss below is compiled too, and the grep has to find the
-    tensor in that text first.
+    tensor in that text first. This reads the CPU executable: at this toy
+    size the GPU compiler concatenates the four tiles back into one row, and
+    the GPU evidence is the peak-memory sweep in docs/benchmarks.md.
     """
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
