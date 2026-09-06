@@ -67,26 +67,28 @@ class RouterMoments:
 def router_moments(scores: jax.Array, indices: jax.Array) -> RouterMoments:
     experts = scores.shape[-1]
     return RouterMoments(
-        jnp.sum(scores.astype(jnp.float32), axis=(0, 1)),
+        jnp.sum(scores.astype(jnp.promote_types(scores.dtype, jnp.float32)), axis=(0, 1)),
         jnp.bincount(indices.ravel(), length=experts),
         jnp.asarray(scores.shape[0] * scores.shape[1], jnp.int32), indices.shape[-1])
 
 
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
     """DeepSeek V2 auxiliary loss after all routed positions have pooled."""
-    positions = jax.lax.stop_gradient(stats.positions.astype(jnp.float32))
-    counts = jax.lax.stop_gradient(stats.counts.astype(jnp.float32))
+    scores = stats.scores.astype(jnp.promote_types(stats.scores.dtype, jnp.float32))
+    positions = jax.lax.stop_gradient(stats.positions.astype(scores.dtype))
+    counts = jax.lax.stop_gradient(stats.counts.astype(scores.dtype))
     denominator = jnp.where(positions > 0, positions, 1) ** 2 * stats.top_k
-    return alpha * stats.scores.size * jnp.vdot(counts, stats.scores) / denominator
+    return alpha * scores.size * jnp.vdot(counts, scores) / denominator
 
 
 def sequence_router_losses(scores: jax.Array, indices: jax.Array,
                            alpha: float) -> jax.Array:
     """One DeepSeek V2 load-times-score loss per intact sequence."""
     _, length, experts = scores.shape
-    chosen = jax.nn.one_hot(indices, experts, dtype=jnp.float32)
+    scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
+    chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
     load = jnp.sum(chosen, axis=(1, 2)) / (length * indices.shape[-1] / experts)
-    return jnp.sum(load * jnp.mean(scores.astype(jnp.float32), axis=1), axis=1) * alpha
+    return jnp.sum(load * jnp.mean(scores, axis=1), axis=1) * alpha
 
 
 def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
@@ -120,9 +122,16 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate):
     return load_balance_update(expert_counts, rate)
 
 
-def load_balance_update(counts: jax.Array, rate: float) -> jax.Array:
+def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
     """Bias displacement from accepted selected-slot counts."""
-    return rate * jnp.sign(jnp.sum(counts) / counts.size - counts)
+    if jnp.issubdtype(counts.dtype, jnp.integer):
+        # Compare to the exact mean without float rounding or count multiplication.
+        average, remainder = jnp.divmod(jnp.sum(counts), counts.size)
+        direction = jnp.where(counts > average, -1,
+                              jnp.where((counts < average) | (remainder > 0), 1, 0))
+    else:
+        direction = jnp.sign(jnp.sum(counts) / counts.size - counts)
+    return jnp.asarray(rate) * direction
 
 
 class Router(nn.Module):

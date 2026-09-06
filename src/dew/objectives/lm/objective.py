@@ -89,13 +89,18 @@ def router_counts(moe: Variables, routing: Variables) -> Variables:
         return jnp.bincount(indices.ravel(), length=bias.shape[0])
     return jax.tree_util.tree_map_with_path(count, moe)
 
+def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
+    dtype = jnp.result_type(bias.dtype, rate, jnp.float32)
+    correction = load_balance_update(counts, jnp.asarray(rate, dtype))
+    return (bias.astype(dtype) + correction).astype(bias.dtype)
+
 
 def balance(moe: Variables, routing: Variables, rate: float
             ) -> tuple[Variables, dict[str, jax.Array]]:
     """Bias replacements and load telemetry from one routed batch."""
     counts = router_counts(moe, routing)
     shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
-    balanced = jax.tree.map(lambda bias, count: bias + load_balance_update(count, rate),
+    balanced = jax.tree.map(lambda bias, count: _updated_bias(bias, count, rate),
                             moe, counts)
     return balanced, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
                       "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
@@ -460,7 +465,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         moe = variables["moe"]
         active = {name: moe[name] for name in effects}
         balanced = jax.tree.map(
-            lambda bias, count: bias + load_balance_update(count, rate),
+            lambda bias, count: _updated_bias(bias, count, rate),
             active, effects)
         return {"moe": {**moe, **balanced}}
 
