@@ -69,7 +69,13 @@ def blocks(path: Path) -> list[tuple[int, str]]:
 
 
 def tiny_world(tmp_path):
-    """The objects a snippet assumes exist, at a size that trains in seconds."""
+    """The objects a snippet assumes exist, at a size that trains in seconds.
+
+    The repository's `tests` directory sits in the world at its own path, so
+    a snippet reads a committed fixture the way a reader at the root does,
+    while everything it writes lands in the temporary directory.
+    """
+    (tmp_path / "tests").symlink_to(ROOT / "tests")
     import jax
     import optax
 
