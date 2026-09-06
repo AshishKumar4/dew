@@ -166,10 +166,13 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
                 request_stop()
 
         def close(self) -> None:
-            source, self.source = self.source, None
-            close = getattr(source, "close", None)
-            if close is not None:
-                close()
+            close = getattr(self.source, "close", None)
+            try:
+                if close is not None:
+                    close()
+            finally:
+                # request_stop must still reach a source waiting inside close.
+                self.source = None
 
     class CheckpointableTokenizing(Tokenizing):
         """The same stage over a stream that can report and restore its
