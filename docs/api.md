@@ -18,7 +18,7 @@ The public modules and the names each exports. This page is written by
 
 | Module | Exports |
 | --- | --- |
-| `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Quantization`, `Step`, `Tracker`, `TrainState`, `Trainer`, `WandbTracker`, `apply_quantization`, `build_mesh`, `build_optimizer`, `ema_update`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
+| `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Quantization`, `Rollout`, `Step`, `Tracker`, `TrainState`, `Trainer`, `WandbTracker`, `apply_quantization`, `build_mesh`, `build_optimizer`, `ema_update`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
 | `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `broadcast_from_process_zero`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers`, `scale_by_qk_clip` |
 | `dew.training.quantization` | `Quantization`, `apply_quantization` |
@@ -34,6 +34,7 @@ The public modules and the names each exports. This page is written by
 | `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |
+| `dew.objectives.rl` | `ADVANTAGES_KEY`, `DPOObjective`, `GRPOObjective`, `IDS_KEY`, `OLD_LOG_PROBS_KEY`, `PREFERENCE_IDS_KEY`, `PREFERENCE_MASK_KEY`, `RESPONSE_MASK_KEY`, `REWARDS_KEY`, `Reward`, `SampledRollout` |
 
 ## Diffusion
 
@@ -69,7 +70,7 @@ The public modules and the names each exports. This page is written by
 | Module | Exports |
 | --- | --- |
 | `dew.inputs` | `Field`, `Condition`, `InputSpec`, `ConditionEncoder`, `CLIPText`, `T5Text`, `CharTable`, `rebuild`, `unit_range`, `pixel_field` |
-| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `CC12M`, `CC3M`, `Combined30M`, `CombinedAesthetic`, `CombinedMsml612`, `CombinedOnline`, `Checkpointable`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
+| `dew.data` | `AestheticCoyo`, `AutoAudioProcessor`, `AutoTextTokenizer`, `Batch`, `ByteTokenizer`, `Checkpointable`, `Dataset`, `DatasetSpec`, `DiffusionDB`, `HFDatasetSource`, `HFImages`, `HFTokenizer`, `IDS_KEY`, `ImageDataset`, `Laion12mCoco`, `Laion2bAesthetic`, `LaionaCoco`, `LaionaCocoCoyo`, `Loading`, `LocalVideos`, `MASK_KEY`, `OnlineImages`, `OxfordFlowers`, `PackedTokens`, `PreferencePairs`, `Prompts`, `Role`, `TokenDocumentSource`, `TokenFileSource`, `TokenWindows`, `VideoDataset`, `VoxCeleb2`, `local_batch` |
 
 ## Evaluation and interop
 
@@ -77,4 +78,4 @@ The public modules and the names each exports. This page is written by
 | --- | --- |
 | `dew.eval` | `ImageMetric`, `frames`, `clip`, `clip_score`, `fid`, `frechet_distance`, `peak_signal_noise_ratio`, `psnr`, `structural_similarity`, `ssim` |
 | `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
-| `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |
+| `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `preference_logsigmoid`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |

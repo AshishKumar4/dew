@@ -32,6 +32,7 @@ import numpy as np
 import optax
 
 from dew.artifacts import TextSamples, TokenScores
+from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
 from dew.objectives.base import Aux, EMASpec, Objective, Step, Variables
@@ -141,6 +142,7 @@ class LMObjective(Objective):
         balance_rate: Optional[float] = None,
         aux_loss_alpha: Optional[float] = None,
         seq_aux: bool = True,
+        loss_role: Role | None = None,
         mtp_weight: Optional[float] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
@@ -165,6 +167,11 @@ class LMObjective(Objective):
         released V2 configs carry both under these names. Unset adds
         nothing.
 
+        `loss_role` counts only the targets whose `text_roles` entry matches
+        it, for SFT on the chat data path (`dew.data.chat.Role`); None counts
+        every target the pad and segment weights keep. A batch without the
+        `text_roles` column raises.
+
         `mtp_weight`
         (arXiv 2412.19437, eq. 24). The training loss adds that times the
         mean over the model's prediction depths of each depth's cross
@@ -183,6 +190,7 @@ class LMObjective(Objective):
                 f"got {aux_loss_alpha}; None adds no balance loss")
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
+        self.loss_role = loss_role
         if mtp_weight is not None:
             depths = getattr(model, "num_nextn_predict_layers", 0)
             if depths < 1:
@@ -210,7 +218,7 @@ class LMObjective(Objective):
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
-                     depths: bool = False):
+                     depths: bool = False, roles=None):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns the `[B, seq_len]` losses, the weight of each target (1 where
@@ -221,7 +229,9 @@ class LMObjective(Objective):
         A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
         transition is dropped from the loss and the accuracy, and the model
-        reads the per-document `positions` for its rotary angles.
+        reads the per-document `positions` for its rotary angles. A chat batch
+        carries `roles` for the same rows; with `loss_role` set, only the
+        targets whose role matches keep their weight.
         """
         if tokens.shape[-1] != self.seq_len + 1:
             raise ValueError(
@@ -249,6 +259,14 @@ class LMObjective(Objective):
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
         weights = self._target_weights(targets, segment_ids, losses.dtype)
+        if roles is not None:
+            if roles.shape != tokens.shape:
+                raise ValueError(
+                    f"text_roles has shape {tuple(roles.shape)} for "
+                    f"{tuple(tokens.shape)} ids; the roles align with the input "
+                    "tokens, one per token")
+            if self.loss_role is not None:
+                weights = weights * (roles[:, 1:] == int(self.loss_role))
         correct = (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
@@ -272,6 +290,12 @@ class LMObjective(Objective):
                     targets[:, depth:], segment_ids, losses.dtype, depth)))
         return losses, weights, correct, sown, depth_scores
 
+    def per_token_log_probs(self, params, tokens):
+        """Next-token log-probabilities, negated cross entropies, over a
+        `[B, seq_len + 1]` batch: the `[B, seq_len]` row per token the
+        rollout reads back for `old_log_probs`."""
+        return -self.token_scores(params, tokens)[0]
+
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """1 where a target counts: not padding, and in a packed batch inside
         the document of the state that predicts it, which sits `depth + 1`
@@ -289,6 +313,19 @@ class LMObjective(Objective):
                 & (segment_ids[:, span:] != 0)).astype(dtype)
         return weights
 
+    def _batch_roles(self, batch):
+        """The batch's `text_roles` column, or None on a run that counts
+        every target. A `loss_role` run on a batch without the column
+        raises, naming it."""
+        if self.loss_role is None:
+            return None
+        if ROLES_KEY not in batch:
+            raise ValueError(
+                f"loss_role={self.loss_role.name} counts only "
+                f"{self.loss_role.name.lower()} targets, but the batch carries "
+                f"no {ROLES_KEY} column; train this objective on the chat data path")
+        return jnp.asarray(batch[ROLES_KEY])
+
     def loss(self, params, batch, step: Step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
@@ -298,7 +335,7 @@ class LMObjective(Objective):
             params, tokens, train=True, rngs={"dropout": step.key},
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
-            depths=self.mtp_weight is not None)
+            depths=self.mtp_weight is not None, roles=self._batch_roles(batch))
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -349,7 +386,8 @@ class LMObjective(Objective):
         params = params if step.ema is None else step.ema
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
-        losses, weights = self._scored(params, tokens, segment_ids, positions)
+        losses, weights = self._scored(params, tokens, segment_ids, positions,
+                                       self._batch_roles(batch))
         scores = TokenScores(losses=losses, weights=weights)
         if self.samples is None:
             return scores
@@ -368,9 +406,10 @@ class LMObjective(Objective):
     @functools.cached_property
     def _scored(self):
         """The teacher-forced scores, compiled once per objective."""
-        def scored(params, tokens, segment_ids, positions):
+        def scored(params, tokens, segment_ids, positions, roles):
             losses, weights, _, _, _ = self.token_scores(
-                params, tokens, segment_ids=segment_ids, positions=positions)
+                params, tokens, segment_ids=segment_ids, positions=positions,
+                roles=roles)
             return losses, weights
 
         return jax.jit(scored)
