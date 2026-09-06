@@ -123,6 +123,12 @@ The training step is jitted with explicit `in_shardings` (the state's layout, a 
 
 The interval's loss and a counter of consecutive non-finite losses ride along with the step on device, in one dispatch, and are read on the logging cadence. A streak of `BAD_LOSS_STEPS` (5) stops the run.
 
+## Quantized training
+
+`Quantization` in `dew.training` trains the trunk matmuls in int8 or fp8 through Qwix's quantized-training provider, applied to the built model with `apply_quantization` before the objective ever sees it. The parameter tree keeps fp32 master weights with the same structure, so the checkpoint layout, the sharding derivation, the Muon parameter split and Hugging Face loading are unchanged; the quantization lives in the forward and backward matmuls. The vocabulary head stays fp32 with the rest of Dew's fp32 zones, since its einsum lives in the objective's chunked cross entropy, outside any model method Qwix wraps. `dtype` is the gemm dtype, `patterns` the module-path regexes in Qwix precedence order (`'.*mlp.*'` quantizes the feed-forward blocks and leaves attention in fp32), and the remaining fields are Qwix's finer-grained scaling: `calibration`, `tile_size` for sub-channel tiling, `bwd_qtype` and `bwd_stochastic_rounding` for the backward pass. MaxText's `fp8_full` is refused, since static activation scaling needs a calibration pass Dew has no seam for, and so is `nanoo_fp8`, AMD-only kernels; the per-layer config file is these patterns written inline. Qwix is not a dependency: without the package the call raises naming it, and the tests skip the same way.
+
+On the eight simulated CPU devices an int8 trunk trains to finite loss and matches the plain wrapped loop's loss to 1.6e-03 over two pipeline stages (tests/test_quantization.py). On one RTX 4080 the fp8 trunk compiles and runs, with `f8e4m3fn` converts in the HLO, but the step does not get faster (docs/performance.md).
+
 ## Feeding the devices
 
 `DevicePrefetchIterator(iterator, mesh, depth=2)` runs the host-to-device transfer a few batches ahead of the loop on a background thread. It records the position of the batch it most recently handed out, so a mid-epoch resume lands on the next unseen batch. An exception in the thread is raised on the consumer's side.

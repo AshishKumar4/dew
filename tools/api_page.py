@@ -24,7 +24,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 SECTIONS = {
     "The package": ["dew", "dew.registry", "dew.artifacts", "dew.config"],
     "Training": ["dew.training", "dew.training.distributed", "dew.training.optim",
-                 "dew.training.runtime", "dew.telemetry.instrumentation", "dew.io"],
+                 "dew.training.quantization", "dew.training.runtime",
+                 "dew.telemetry.instrumentation", "dew.io"],
     "Objectives": ["dew.objectives", "dew.objectives.diffusion", "dew.objectives.jepa",
                    "dew.objectives.lm"],
     "Diffusion": ["dew.diffusion", "dew.diffusion.presets", "dew.diffusion.schedules",

@@ -286,7 +286,7 @@ The goal is to train the way the large labs train and to run what they release, 
 
 **Architecture parity.** The decoder families MaxText trains all load; next are the released weights of the largest of them run end to end (gpt-oss-20b's MXFP4 checkpoint through the unpacker is the network-marked test written for it), then the Gemma 4 vision tower and the Qwen 3.5 multimodal wrapper. Landed since: LLaDA and Dream with masked-diffusion training, the DiffusionGemma sampler, the SigLIP and Llama 4 vision towers with the Gemma 3 and Llama 4 wrappers. Each family lands when its logits match the reference implementation on a real checkpoint.
 
-**Systems.** int8 and FP8 training with fine-grained scaling (MXFP4 and FP8 block-scaled checkpoints already load); the MuonClip optimizer; the 1F1B pipeline schedule beside GPipe.
+**Systems.** Quantized training through Qwix in int8 and fp8 (fp8 runs on the RTX 4080 with no step speedup; MXFP4 and FP8 block-scaled checkpoints already load); the MuonClip optimizer, Muon with a per-head QK-Clip; the pipeline stays GPipe, with 1F1B written down as per-stage programs for when memory forces it.
 
 **Post-training.** SFT and reinforcement learning as objectives on the same trainer.
 

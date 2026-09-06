@@ -3,7 +3,7 @@
 Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
 paths and applies them without editing the model: one call wraps the module
 and the matmuls in the wrapped methods' extent run quantized. Dew's version
-of that call is `apply`: a recipe builds its model from the registry as
+of that call is `apply_quantization`: a recipe builds its model from the registry as
 always, then wraps it before the objective ever sees it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
@@ -23,7 +23,7 @@ the reason: static activation scaling (`fp8_full`) needs a calibration pass
 Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
 quantization has no reader here since the cache holds the compute dtype.
 
-Qwix is not a dependency. The import sits inside `apply`, and without the
+Qwix is not a dependency. The import sits inside `apply_quantization`, and without the
 package the call raises naming it, the way the tokamax branch of
 `dew.nn.moe` behaves.
 """
@@ -128,7 +128,7 @@ def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
     return jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
 
 
-def apply(model: nn.Module, spec: Quantization) -> nn.Module:
+def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     """`model` with its trunk matmuls training in `spec`'s dtype.
 
     The returned module is a copy of the same class with the entry methods

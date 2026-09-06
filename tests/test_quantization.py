@@ -20,7 +20,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
-from dew.training.quantization import Quantization, apply
+from dew.training.quantization import Quantization, apply_quantization
 
 VOCAB = 64
 SEQ_LEN = 8
@@ -67,7 +67,7 @@ def test_a_value_that_says_nothing_is_refused():
 
 def test_apply_refuses_a_non_value():
     with pytest.raises(ValueError, match="a Quantization value"):
-        apply(tiny(), {"dtype": "int8"})
+        apply_quantization(tiny(), {"dtype": "int8"})
 
 
 def test_the_value_round_trips_through_json():
@@ -81,7 +81,7 @@ def test_the_value_round_trips_through_json():
 def quantized_forward(spec, **overrides):
     model = tiny(**overrides)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    qmodel = apply(model, spec)
+    qmodel = apply_quantization(model, spec)
     ids = jnp.asarray(token_batch()["text"][:, :SEQ_LEN])
     return model, qmodel, variables, ids
 
@@ -157,7 +157,7 @@ def test_a_scanned_quantized_stack_scores_as_the_plain_one():
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(), scan_layers=True)
-    plain_wrapped = apply(tiny(), Quantization())
+    plain_wrapped = apply_quantization(tiny(), Quantization())
     scanned = jax.jit(qmodel.apply)(variables, ids)
     plain = jax.jit(plain_wrapped.apply)(variables, ids)
     reference = jax.jit(model.apply)(variables, ids)
@@ -174,7 +174,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     pytest.importorskip("qwix")
     model = tiny(num_layers=4)
     variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    qmodel = apply(model, Quantization())
+    qmodel = apply_quantization(model, Quantization())
     rows = np.random.default_rng(0).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
     batch = {"text": rows}
 
