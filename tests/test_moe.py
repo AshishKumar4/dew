@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -919,7 +920,7 @@ def test_balancing_needs_a_router_with_a_bias():
     trainer.objective.balance_rate = 0.01
     params = trainer.initial_state().params
     with pytest.raises(ValueError, match="bias=True"):
-        trainer.objective.loss(params, next(token_batches()),
+        scalar_loss(trainer.objective, params, next(token_batches()),
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
 
 

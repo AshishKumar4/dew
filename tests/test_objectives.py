@@ -2,6 +2,7 @@
 is selected for the EMA and put back."""
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -101,6 +102,6 @@ def test_registered_lm_objective_computes_next_token_loss():
     variables = direct.init(jax.random.key(0))
     batch = {"text": jnp.array([[0, 1, 2, 3, 4]], dtype=jnp.int32)}
     step = Step(step=jnp.array(0), key=jax.random.key(1), ema=None)
-    actual, _ = registered.loss(variables, batch, step)
-    expected, _ = direct.loss(variables, batch, step)
+    actual, _ = scalar_loss(registered, variables, batch, step)
+    expected, _ = scalar_loss(direct, variables, batch, step)
     np.testing.assert_allclose(actual, expected)

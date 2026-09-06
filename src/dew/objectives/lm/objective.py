@@ -27,14 +27,16 @@ from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
+from flax import struct
 import numpy as np
 import optax
 
 from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
-from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
-from dew.objectives.base import Aux, EMASpec, Objective, Step, Variables
+from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
+                        router_moments, sequence_router_losses)
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
 
@@ -77,33 +79,26 @@ def _packing(batch):
             None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
-def balance(moe: Variables, routing: Variables, rate: float
-            ) -> tuple[Variables, dict[str, jax.Array]]:
-    """The `moe` collection with every router's bias moved against its load,
-    and the load itself.
-
-    `routing` carries what the routers sowed under the `router` collection,
-    the top-k expert indices at the module path the bias lives under. DeepSeek's
-    update (arXiv 2408.15664) raises the bias of an expert below the average
-    load and lowers it above, by `rate` a step. The load is reported as the
-    busiest and the idlest expert's share of the routed tokens, averaged over
-    the sparse layers; both read 1 / num_experts for an even router.
-    """
-    heaviest, lightest = [], []
-
-    def update(path, bias):
+def router_counts(moe: Variables, routing: Variables) -> Variables:
+    """Selected-slot counts at each active bias path."""
+    def count(path, bias):
         sown = routing
         for entry in path[:-1]:
             sown = sown[entry.key]
         (indices,) = sown["indices"]
-        share = jnp.bincount(indices.ravel(), length=bias.shape[0]) / indices.size
-        heaviest.append(share.max())
-        lightest.append(share.min())
-        return bias + calculate_load_balance_updates(indices, bias.shape[0], rate)
+        return jnp.bincount(indices.ravel(), length=bias.shape[0])
+    return jax.tree_util.tree_map_with_path(count, moe)
 
-    balanced = jax.tree_util.tree_map_with_path(update, moe)
-    return balanced, {"moe/max_load": jnp.mean(jnp.stack(heaviest)),
-                      "moe/min_load": jnp.mean(jnp.stack(lightest))}
+
+def balance(moe: Variables, routing: Variables, rate: float
+            ) -> tuple[Variables, dict[str, jax.Array]]:
+    """Bias replacements and load telemetry from one routed batch."""
+    counts = router_counts(moe, routing)
+    shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
+    balanced = jax.tree.map(lambda bias, count: bias + load_balance_update(count, rate),
+                            moe, counts)
+    return balanced, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
+                      "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
 
 
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
@@ -162,8 +157,16 @@ class Scores(NamedTuple):
     qk: Optional[dict]
 
 
+@struct.dataclass
+class LMStatistics:
+    """Prediction support and independently normalized router terms."""
+    prediction: Mean
+    sequence: tuple[Mean, ...]
+    global_routers: tuple[RouterMoments, ...]
+
+
 @objectives("lm")
-class LMObjective(Objective):
+class LMObjective(Objective[Mean | LMStatistics, Variables]):
     """Shifted cross entropy, teacher-forced scoring and optional text previews."""
 
     artifact = TokenScores
@@ -339,8 +342,11 @@ class LMObjective(Objective):
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision)
-                depth_scores.append((depth_losses, self._target_weights(
-                    targets[:, depth:], segment_ids, losses.dtype, depth)))
+                depth_weights = self._target_weights(
+                    targets[:, depth:], segment_ids, losses.dtype, depth)
+                if roles is not None and self.loss_role is not None:
+                    depth_weights = depth_weights * (roles[:, depth + 1:] == int(self.loss_role))
+                depth_scores.append((depth_losses, depth_weights))
         return Scores(losses, weights, correct, sown, depth_scores, qk)
 
     def per_token_log_probs(self, params, tokens):
@@ -391,52 +397,72 @@ class LMObjective(Objective):
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats)
         losses, weights, correct, routing, depths, qk = scores
-        # A batch that is entirely padding would divide by zero and take the
-        # whole run down with a nan.
-        counted = jnp.maximum(jnp.sum(weights), 1.0)
-        ce = jnp.sum(losses * weights) / counted
+        mass = jax.lax.stop_gradient(jnp.sum(weights))
+        prediction = Mean(jnp.sum(losses * weights), mass)
+        ce, _ = mean_loss(prediction)
         reported = {"ce": ce, "perplexity": jnp.exp(ce),
-                    "token_accuracy": jnp.sum(correct * weights) / counted}
-        loss = ce
+                    "token_accuracy": jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)}
         if self.mtp_weight is not None:
-            # Each depth's cross entropy over the same count as the main
-            # term, which is the paper's 1/T with the depth's missing tail
-            # positions contributing nothing, averaged over the depths.
-            mtp = jnp.mean(jnp.stack([
-                jnp.sum(depth_losses * depth_weights) / counted
+            # Depths retain the main target denominator and configured depth average.
+            mtp_total = jnp.mean(jnp.stack([
+                jnp.sum(depth_losses * depth_weights)
                 for depth_losses, depth_weights in depths]))
-            reported["mtp_ce"] = mtp
-            loss = ce + self.mtp_weight * mtp
+            reported["mtp_ce"], _ = mean_loss(Mean(mtp_total, mass))
+            prediction = Mean(prediction.total + self.mtp_weight * mtp_total, mass)
+        statistics: Mean | LMStatistics = prediction
         if alpha is not None:
             if not routing:
-                raise ValueError(
-                    "aux_loss_alpha scales the routers' balance loss, so the "
-                    "model needs a mixture")
-            balance_loss = jnp.sum(jnp.stack([
-                deepseek_v2_aux_loss(scores, indices, alpha, self.seq_aux)
-                for scores, indices in _router_scores(routing)]))
-            reported["aux_loss"] = balance_loss
-            loss = loss + balance_loss
-        variables = None
+                raise ValueError("aux_loss_alpha requires a model with a mixture")
+            routers = _router_scores(routing)
+            sequence = tuple(Mean(jnp.sum(sequence_router_losses(s, i, alpha)),
+                                  jnp.asarray(s.shape[0], jnp.int32))
+                             for s, i in routers) if self.seq_aux else ()
+            global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
+            statistics = LMStatistics(prediction, sequence, global_routers)
+            combined, _ = self.reduce_loss(statistics)
+            prediction_loss, _ = mean_loss(prediction)
+            reported["aux_loss"] = combined - prediction_loss
+        effects = None
         if rate is not None:
             if "moe" not in params or routing is None:
-                raise ValueError(
-                    "balance_rate moves the routers' balancing bias, so the model "
-                    "needs a mixture with bias=True")
-            moe = params["moe"]
-            # A depth the step never ran observed no load, so its bias is left alone.
-            ran = {name: bias for name, bias in moe.items()
+                raise ValueError("balance_rate requires a mixture with bias=True")
+            ran = {name: bias for name, bias in params["moe"].items()
                    if self.mtp_weight is not None or not name.startswith("mtp_")}
-            balanced, load = balance(ran, routing, rate)
-            reported.update(load)
-            variables = {"moe": {**moe, **balanced}}
-        stats = None
+            counts = router_counts(ran, routing)
+            shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
+            reported.update({"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
+                             "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))})
+            effects = counts
         if self.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-            stats = qk
-        return loss, Aux(reported, variables, stats)
+        return statistics, Aux(reported, qk_stats=qk, effects=effects)
+
+    def reduce_loss(self, stats: Mean | LMStatistics) -> tuple[jax.Array, jax.Array]:
+        if isinstance(stats, Mean):
+            return mean_loss(stats)
+        value, active = mean_loss(stats.prediction)
+        for term in stats.sequence:
+            auxiliary, supported = mean_loss(term)
+            value, active = value + auxiliary, active | supported
+        for term in stats.global_routers:
+            if self.aux_loss_alpha is None:
+                raise ValueError("global router statistics require aux_loss_alpha")
+            value = value + global_router_loss(term, self.aux_loss_alpha)
+            active = active | (term.positions > 0)
+        return value, active
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        rate = self.balance_rate
+        if rate is None:
+            raise ValueError("router count effects require balance_rate")
+        moe = variables["moe"]
+        active = {name: moe[name] for name in effects}
+        balanced = jax.tree.map(
+            lambda bias, count: bias + load_balance_update(count, rate),
+            active, effects)
+        return {"moe": {**moe, **balanced}}
 
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced scores over the complete batch, using EMA when present."""

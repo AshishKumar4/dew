@@ -10,6 +10,7 @@ of the objective and the trainer together.
 from dataclasses import dataclass
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -141,7 +142,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     batch = make_batch()
     step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None)
 
-    loss, aux = objective.loss(params, batch, step)
+    loss, aux = scalar_loss(objective, params, batch, step)
 
     _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
     x0 = unit_range(batch["image"])

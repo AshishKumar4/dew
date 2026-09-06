@@ -15,6 +15,7 @@ gradient.
 """
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -180,13 +181,13 @@ def test_the_term_is_off_by_default():
     batch = token_batch()
 
     (loss, aux), grads = jax.value_and_grad(
-        lambda p: objective.loss(p, batch, step_at()), has_aux=True)(params)
+        lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True)(params)
 
     assert float(loss) == float(aux.metrics["ce"])
     assert "mtp_ce" not in aux.metrics
     plain = {"params": {key: value for key, value in params["params"].items()
                         if key != "mtp_0"}}
-    plain_loss, _ = LMObjective(tiny(), SEQ).loss(plain, batch, step_at())
+    plain_loss, _ = scalar_loss(LMObjective(tiny(), SEQ), plain, batch, step_at())
     assert float(loss) == pytest.approx(float(plain_loss), rel=1e-6)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"]["mtp_0"]))
 
@@ -203,7 +204,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy():
     tokens = np.asarray(batch[TEXT_KEY])
 
     (loss, aux), grads = jax.value_and_grad(
-        lambda p: objective.loss(p, batch, step_at()), has_aux=True)(params)
+        lambda p: scalar_loss(objective, p, batch, step_at()), has_aux=True)(params)
 
     ce = float(aux.metrics["ce"])
     expected = depth_cross_entropies(model, params, tokens)
@@ -243,7 +244,7 @@ def test_a_packed_batch_keeps_the_depths_inside_their_documents():
     # State at p predicts the target at p + 2: only p = 0, 1 (document 1)
     # and p = 4 (document 2) stay inside a document.
     assert weights.tolist() == [[1, 1, 0, 0, 1, 0, 0]]
-    loss, aux = objective.loss(params, batch, step_at())
+    loss, aux = scalar_loss(objective, params, batch, step_at())
     assert np.isfinite(float(loss)) and float(aux.metrics["mtp_ce"]) > 0
 
 
@@ -263,17 +264,19 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     batch = token_batch()
     still = LMObjective(model, SEQ, balance_rate=0.1)
     params = still.init(jax.random.key(0))
-    _, aux = still.loss(params, batch, step_at())
-    assert aux.variables is not None
-    moved = aux.variables["moe"]
+    _, aux = scalar_loss(still, params, batch, step_at())
+    assert aux.effects is not None
+    moved = still.apply_effects(params, aux.effects)["moe"]
     assert jnp.array_equal(moved["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
                            params["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"])
     assert not jnp.array_equal(moved["layers_1"]["mlp"]["gate"]["e_score_correction_bias"],
                                params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
 
-    _, aux = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3).loss(params, batch, step_at())
-    assert aux.variables is not None
+    running = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3)
+    _, aux = scalar_loss(running, params, batch, step_at())
+    assert aux.effects is not None
+    moved = running.apply_effects(params, aux.effects)["moe"]
     assert not jnp.array_equal(
-        aux.variables["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
+        moved["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"],
         params["moe"]["mtp_0"]["block"]["mlp"]["gate"]["e_score_correction_bias"])
 

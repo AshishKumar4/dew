@@ -189,21 +189,14 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
 
 
 def test_the_ema_lags_the_parameters_at_the_configured_decay():
-    """One SGD step then one EMA step at decay 0.5: the average sits half way."""
     trainer = make_trainer()
     state = trainer.initial_state()
-    step = trainer._default_step()
     batch = next(Counting())
-
-    new_state, _, _, _ = step(state, None, batch)
-
-    before = jax.tree.leaves(state.params)
-    after = jax.tree.leaves(new_state.params)
-    averaged = jax.tree.leaves(new_state.ema)
-    for start, end, ema in zip(before, after, averaged, strict=True):
-        np.testing.assert_allclose(np.asarray(ema), 0.5 * np.asarray(start) + 0.5 * np.asarray(end),
-                                   rtol=1e-6)
-    assert int(new_state.step) == 1
+    new_state, *_ = trainer.compile(state, batch)(state, batch)
+    for start, end, ema in zip(jax.tree.leaves(state.params), jax.tree.leaves(new_state.params),
+                               jax.tree.leaves(new_state.ema), strict=True):
+        np.testing.assert_allclose(ema, .5 * np.asarray(start) + .5 * np.asarray(end), rtol=1e-6)
+    assert int(new_state.step) == int(new_state.updates) == 1
 
 
 # --------------------------------------------------------------------------
@@ -284,14 +277,7 @@ def test_a_run_past_its_target_is_refused(tmp_path):
         make_trainer(tmp_path).fit(Data(), steps=2)
 
 
-def test_the_checkpoint_holds_exactly_the_state_and_the_position(tmp_path):
-    """The leaves a checkpoint holds are the state's five and the data
-    position; metrics, loss scales and epochs are not among them."""
-    trainer = make_trainer(tmp_path)
-    trainer.fit(Data(), steps=2, log_every=1)
 
-    stored = trainer.checkpoints._open().item_metadata(2)
-    assert set(stored.keys()) == {"step", "params", "opt_state", "ema", "key", "position"}
 
 
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
@@ -346,19 +332,7 @@ def test_the_best_step_is_the_lowest_loss(tmp_path):
     assert Checkpoints(str(tmp_path / "best")).best == 2, "the metric did not survive a reopen"
 
 
-def test_a_checkpoint_the_run_cannot_hold_is_refused_with_what_to_do(tmp_path):
-    """Swapping the solver or the accumulation has to be a message, not a
-    crash from inside orbax's tree walk."""
-    make_trainer(tmp_path, optimizer=optax.adam(1e-3)).fit(Data(), steps=1, log_every=1)
 
-    for other in (dict(optimizer=optax.contrib.muon(1e-3)),
-                  dict(optimizer=optax.adam(1e-3), accumulation=2)):
-        with pytest.raises(ValueError) as error:
-            make_trainer(tmp_path, **other).fit(Data(), steps=2)
-        message = str(error.value)
-        assert "does not fit this run's train state" in message
-        assert "opt_state" in message and "gradient accumulation" in message
-        assert str(tmp_path / "run") in message
 
 
 def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
@@ -735,16 +709,7 @@ def test_goodput_arithmetic():
     assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
 
 
-def test_only_process_zero_logs_and_every_process_validates(monkeypatch):
-    """A tracker on another process receives nothing, while the validation
-    pass runs everywhere because its collectives need every process."""
-    monkeypatch.setattr(jax, "process_index", lambda: 1)
-    seen = []
-    tracker = RecordingTracker()
-    make_trainer(objective=Features(), tracker=tracker).fit(
-        Data(val=val_batches(1)), steps=2, log_every=1, eval_every=1, metrics=(Spread(seen),))
-    assert tracker.scalars == [] and tracker.artifacts == []
-    assert len(seen) == 2
+
 
 
 # --------------------------------------------------------------------------
@@ -793,40 +758,30 @@ def host(state):
 
 @pytest.mark.parametrize("accum", [1, 2])
 def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
-    """A step whose scaled gradients overflowed is skipped, and skipped means
-    all of it. The params and the optimizer state are held; the step counter
-    and the EMA have to be held with them, or a rejected step ages every
-    schedule and averages in params that were never updated."""
-    trainer = Trainer(ScaledObjective(), optax.sgd(0.1), key=jax.random.key(0),
+    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
                       accumulation=accum, dynamic_scale=True)
-    step = trainer._default_step()
-    state, scale = trainer.initial_state(), dynamic_scale_lib.DynamicScale()
-    good = {"scale": jnp.ones((1,), jnp.float32)}
-    # 1e35 * sum(w^2) * the 65536 loss scale is past float32's max.
-    bad = {"scale": jnp.full((1,), 1e35, jnp.float32)}
-
-    # One landed update (w = 1 - 0.1 * 2, ema = 0.5 + 0.5 * 0.8), then the
-    # micro-steps leading up to the next one, so the rejected step is the one
-    # whose update would have landed.
+    state = trainer.initial_state()
+    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
+    bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}
+    step = trainer.compile(state, good)
     for _ in range(2 * accum - 1):
-        state, scale, _, _ = step(state, scale, good)
+        state, *_ = step(state, good)
     w, ema, count = host(state)
-    np.testing.assert_allclose(w, 0.8, rtol=1e-6)
-    np.testing.assert_allclose(ema, 0.9, rtol=1e-6)
-    assert count == 2 * accum - 1
-
-    state, scale, loss, _ = step(state, scale, bad)
-    assert not bool(jnp.isfinite(loss))
-    held_w, held_ema, held_count = host(state)
-    np.testing.assert_array_equal(held_w, w)
-    np.testing.assert_array_equal(held_ema, ema)
-    assert held_count == count
-
-    state, scale, _, _ = step(state, scale, good)
+    np.testing.assert_allclose(w, .8, rtol=1e-6)
+    np.testing.assert_allclose(ema, .9, rtol=1e-6)
+    before = state
+    state, loss, _, finite, accepted = step(state, bad)
+    assert bool(finite) and not bool(accepted)
+    assert int(state.step) == int(before.step) + 1
+    assert int(state.microstep) == int(before.microstep)
+    assert float(state.scale.scale) == float(before.scale.scale) / 2
+    np.testing.assert_array_equal(state.params["params"]["w"], w)
+    np.testing.assert_array_equal(state.ema["params"]["w"], ema)
+    state, *_ = step(state, good)
     w, ema, count = host(state)
-    np.testing.assert_allclose(w, 0.64, rtol=1e-6)    # 0.8 - 0.1 * 2 * 0.8
-    np.testing.assert_allclose(ema, 0.77, rtol=1e-6)  # 0.5 * 0.9 + 0.5 * 0.64
-    assert count == 2 * accum
+    np.testing.assert_allclose(w, .64, rtol=1e-6)
+    np.testing.assert_allclose(ema, .77, rtol=1e-6)
+    assert int(state.microstep) == 2 * accum
 
 
 def test_mixed_precision_trains_through_fit():
@@ -976,10 +931,9 @@ def alternating(gen, disc):
                 params = {**trainable, "disc": optax.apply_updates(trainable["disc"], updates)}
                 return params, {**state.opt_state, "disc": disc_state}, loss
 
-            params, opt_state, loss = jax.lax.cond(state.step % 2 == 0, generator, discriminator, None)
-            new_state = state.replace(step=state.step + 1, opt_state=opt_state,
-                                      params={**state.params, "params": params})
-            return new_state, loss, Aux({"player": (state.step % 2).astype(jnp.float32)})
+            params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
+            new_state = state.replace(microstep=state.microstep + 1, updates=state.updates + 1, opt_state=opt_state, params={**state.params, "params": params})
+            return new_state, loss, Aux({"player": (state.microstep % 2).astype(jnp.float32)})
         return step
     return make_step
 

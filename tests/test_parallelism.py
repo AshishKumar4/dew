@@ -9,6 +9,7 @@ not the ones we meant.
 import json
 
 import jax
+from dew.objectives.base import scalar_loss
 from dew.data import Loading
 import jax.numpy as jnp
 import numpy as np
@@ -153,7 +154,7 @@ def reference_losses(trainer, steps):
 
         def loss_fn(trainable):
             from dew.objectives.base import Step
-            return objective.loss({**params, "params": trainable}, batch,
+            return scalar_loss(objective, {**params, "params": trainable}, batch,
                                   Step(step=jnp.zeros((), jnp.int32), key=key, ema=None))
 
         (loss, _), grads = jax.value_and_grad(loss_fn, has_aux=True)(params["params"])
@@ -653,12 +654,14 @@ def make_accumulating(tmp_path=None, accumulation=1):
 
 
 def micro_steps(trainer, count, state=None):
-    """`count` micro-steps of the trainer's own step body, on the host."""
-    step = trainer._default_step()
+    """Run compiled transactions over the deterministic batch stream."""
     state = trainer.initial_state() if state is None else state
     source = batches()
+    batch = next(source)
+    step = trainer.compile(state, batch)
     for _ in range(count):
-        state, _, _, _ = step(state, None, next(source))
+        state, *_ = step(state, batch)
+        batch = next(source)
     return state
 
 
@@ -734,7 +737,7 @@ def test_a_resume_inside_an_accumulation_window_keeps_the_ema_clock(tmp_path):
 
     whole = make_accumulating(tmp_path / "whole", accum).fit(Data(batches), steps=total)
     interrupted = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=cut)
-    assert int(np.asarray(interrupted.opt_state.mini_step)) == 1, "the cut is not mid-window"
+    assert int(interrupted.microstep) % accum == 1, "the cut is not mid-window"
     resumed = make_accumulating(tmp_path / "split", accum).fit(Data(batches), steps=total)
 
     assert int(resumed.step) == int(whole.step) == total
