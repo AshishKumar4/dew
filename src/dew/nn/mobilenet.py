@@ -47,6 +47,13 @@ def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
         name=name)
 
 
+def _gelu(x):
+    # Torch's fused GELU evaluates the polynomial in fp32 for bf16/fp16
+    # inputs. A bf16 polynomial changes its negative tail before rounding.
+    compute = jnp.promote_types(x.dtype, jnp.float32)
+    return jax.nn.gelu(x.astype(compute), approximate=True).astype(x.dtype)
+
+
 class MobileConvNormAct(nn.Module):
     features: int
     kernel: int = 1
@@ -67,7 +74,7 @@ class MobileConvNormAct(nn.Module):
         # RMSNorm has a different fp32-reduction contract.
         x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
                        dtype=self.dtype, name="bn")(x)
-        return jax.nn.gelu(x, approximate=True) if self.activate else x
+        return _gelu(x) if self.activate else x
 
 
 class MobileLayerScale(nn.Module):
@@ -148,7 +155,7 @@ class MobileResidual(nn.Module):
                       precision=self.precision, name="conv_exp")(x)
             x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
                            dtype=self.dtype, name="bn1")(x)
-            x = jax.nn.gelu(x, approximate=True)
+            x = _gelu(x)
             x = _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="conv_pwl")(x)
             x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
@@ -266,16 +273,18 @@ class MobileStage(nn.Module):
         count = sum(len(stage) for stage in _ARCHITECTURE)
         for i, spec in enumerate(_ARCHITECTURE[self.index]):
             features = _divisible(spec.features * self.multiplier)
-            options = dict(
-                padding=self.padding, layer_scale=self.layer_scale,
-                drop_path=self.drop_path_rate * (offset + i) / count,
-                dtype=self.dtype, precision=self.precision, name=f"blocks_{i}")
+            drop_path = self.drop_path_rate * (offset + i) / count
             if spec.kind == "attention":
-                x = MobileAttention(spec, features, attention_impl=self.attention_impl,
-                                    **options)(x, train=train)
+                block = MobileAttention(
+                    spec, features, padding=self.padding, layer_scale=self.layer_scale,
+                    drop_path=drop_path, dtype=self.dtype, precision=self.precision,
+                    attention_impl=self.attention_impl, name=f"blocks_{i}")
             else:
-                x = MobileResidual(spec, features, group_size=self.group_size,
-                                   **options)(x, train=train)
+                block = MobileResidual(
+                    spec, features, group_size=self.group_size, padding=self.padding,
+                    layer_scale=self.layer_scale, drop_path=drop_path, dtype=self.dtype,
+                    precision=self.precision, name=f"blocks_{i}")
+            x = block(x, train=train)
         return x
 
 
