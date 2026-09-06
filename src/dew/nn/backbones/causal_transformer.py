@@ -357,6 +357,7 @@ class DecoderBlock(nn.Module):
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     dropout_rate: float = 0.0
+    remat: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -410,6 +411,32 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  per_layer_input=None):
+        if not self.remat or self.is_initializing() or decode:
+            return self._forward(x, train, decode, positions, segment_ids,
+                                 kv_store, per_layer_input)
+
+        def run(module, x, positions, segment_ids, kv_store, per_layer_input):
+            # Providers write K/V into a dict; scanned consumers only read it.
+            # Return writes explicitly, keeping consumer values out of the
+            # scan result so its tracers cannot replace the outer store.
+            store = None if kv_store is None else dict(kv_store)
+            out = module._forward(x, train, False, positions, segment_ids,
+                                  store, per_layer_input)
+            changed = {} if store is None else {
+                name: value for name, value in store.items()
+                if value is not kv_store.get(name)}
+            return out, changed
+        # Unlike DiT remat_block, this boundary returns the sharing store.
+        # Full-block remat saves no internal dots; train stays a static
+        # closure value and Linen lifts variables and RNGs with the call.
+        out, store = nn.remat(run)(
+            self, x, positions, segment_ids, kv_store, per_layer_input)
+        if kv_store is not None:
+            kv_store.update(store)
+        return out
+
+    def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
+                 kv_store, per_layer_input):
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -485,6 +512,7 @@ class MTPBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     dropout_rate: float = 0.0
+    remat: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -505,6 +533,7 @@ class MTPBlock(nn.Module):
             scale_after_cast=self.scale_after_cast,
                 wiring=self.wiring,
             dropout_rate=self.dropout_rate,
+            remat=self.remat,
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
 
@@ -871,6 +900,10 @@ class CausalTransformer(nn.Module):
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
+    remat: bool = False
+    """Recompute block intermediates in the backward pass, retaining block
+    inputs and any K/V supplied to later layers. Init and cached decode
+    follow the direct block path; stored parameters have the same layout."""
 
     def __post_init__(self):
         if self.layer_types is not None:
@@ -1242,6 +1275,7 @@ class CausalTransformer(nn.Module):
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
                 dropout_rate=self.dropout_rate,
+                remat=self.remat,
                 dtype=self.dtype,
                 precision=self.precision,
                 name=name)
@@ -1278,6 +1312,7 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast,
                 wiring=wiring,
                 dropout_rate=self.dropout_rate,
+                remat=self.remat,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
         if self.altup is not None:
