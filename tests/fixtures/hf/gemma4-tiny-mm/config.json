@@ -1,0 +1,83 @@
+{
+ "model_type": "gemma4",
+ "text_config": {
+  "vocab_size": 64,
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 2,
+  "layer_types": [
+   "sliding_attention",
+   "full_attention"
+  ],
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 8,
+  "sliding_window": 4,
+  "hidden_size_per_layer_input": 0,
+  "num_kv_shared_layers": 0,
+  "max_position_embeddings": 64,
+  "rms_norm_eps": 1e-06,
+  "final_logit_softcapping": 30.0,
+  "tie_word_embeddings": true,
+  "use_bidirectional_attention": "vision",
+  "rope_parameters": {
+   "full_attention": {
+    "rope_type": "proportional",
+    "rope_theta": 1000000.0,
+    "partial_rotary_factor": 0.25
+   },
+   "sliding_attention": {
+    "rope_type": "default",
+    "rope_theta": 10000.0
+   }
+  },
+  "model_type": "gemma4_text"
+ },
+ "vision_config": {
+  "transformers_version": "5.16.1",
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+   "0": "LABEL_0",
+   "1": "LABEL_1"
+  },
+  "label2id": {
+   "LABEL_0": 0,
+   "LABEL_1": 1
+  },
+  "problem_type": null,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 8,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "rms_norm_eps": 1e-06,
+  "max_position_embeddings": 131072,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "rope_parameters": {
+   "rope_type": "default",
+   "rope_theta": 100.0
+  },
+  "pooling_kernel_size": 2,
+  "patch_size": 8,
+  "position_embedding_size": 64,
+  "use_clipped_linears": false,
+  "standardize": true,
+  "initializer_range": 0.02,
+  "_name_or_path": "",
+  "model_type": "gemma4_vision",
+  "output_attentions": false
+ },
+ "audio_config": null,
+ "vision_soft_tokens_per_image": 4,
+ "boi_token_id": 61,
+ "eoi_token_id": 62,
+ "image_token_id": 60
+}
