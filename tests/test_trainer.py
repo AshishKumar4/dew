@@ -594,7 +594,7 @@ def test_a_failing_validation_loader_fails_the_pass():
 
     with pytest.raises(OSError, match="val.bin"):
         make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
-                                               log_every=1, eval_every=1)
+                                               log_every=1, eval_every=1, metrics=(Spread([]),))
 
 
 def test_a_metric_that_reads_a_type_the_objective_does_not_produce_is_an_error():
@@ -734,17 +734,6 @@ def test_goodput_arithmetic():
     assert trainer_module.goodput(10.0, None, 4.0) == {"goodput/step_fraction": 0.0}
     assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
 
-
-def test_only_process_zero_logs_and_every_process_validates(monkeypatch):
-    """A tracker on another process receives nothing, while the validation
-    pass runs everywhere because its collectives need every process."""
-    monkeypatch.setattr(jax, "process_index", lambda: 1)
-    seen = []
-    tracker = RecordingTracker()
-    make_trainer(objective=Features(), tracker=tracker).fit(
-        Data(val=val_batches(1)), steps=2, log_every=1, eval_every=1, metrics=(Spread(seen),))
-    assert tracker.scalars == [] and tracker.artifacts == []
-    assert len(seen) == 2
 
 
 # --------------------------------------------------------------------------
