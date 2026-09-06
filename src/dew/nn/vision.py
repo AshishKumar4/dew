@@ -38,14 +38,10 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.text_encoders import CLIPAttention, MLP
-from dew.registry import Registry
+from dew.registry import projectors, towers
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
-
-
-projectors: Registry[type] = Registry("projector")
-towers: Registry[type] = Registry("tower")
 
 
 class ProjectorBase:

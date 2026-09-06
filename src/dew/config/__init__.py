@@ -37,7 +37,7 @@ from dew.data import Dataset, DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.objectives.base import Metric, Objective
-from dew.registry import Registry, datasets, models, with_precision
+from dew.registry import REGISTRIES, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
@@ -64,9 +64,6 @@ if TYPE_CHECKING:
     DataSpec: TypeAlias = DatasetSpec
 else:
     DataSpec = datasets.union
-
-REGISTRIES: tuple[Registry[Any], ...] = (registry.models, registry.presets, registry.samplers, registry.datasets,
-              registry.encoders, registry.metrics, registry.objectives)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,7 +209,11 @@ def _to_json(value) -> Any:
         held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name))
                   for f in dataclasses.fields(value)}
-        return {"name": held.name_of(type(value)), "fields": fields} if held else fields
+        if held is None:
+            return fields
+        name = held.name_of(type(value))
+        return ({"kind": name, **fields} if held.record == "kind"
+                else {"name": name, "fields": fields})
     if isinstance(value, (list, tuple)):
         return [_to_json(item) for item in value]
     if isinstance(value, Mapping):
@@ -237,8 +238,12 @@ def _rebuild(annotation, value) -> Any:
     whatever type the field declares, so the annotation is Any."""
     held = _registry_for(annotation)
     if held is not None:
-        member = held[value["name"]]
-        return member(**_fields(member, value["fields"]))
+        if held.record == "kind":
+            member = held[value["kind"]]
+            fields = {name: item for name, item in value.items() if name != "kind"}
+        else:
+            member, fields = held[value["name"]], value["fields"]
+        return member(**_fields(member, fields))
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return annotation(**_fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):

@@ -27,10 +27,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RopeScaling
-from dew.registry import Registry
-
-mixers: Registry[type] = Registry("mixer")
-"""Each token-mixer kind under its registered name: the value class, not the module."""
+from dew.registry import mixers
 
 
 @dataclasses.dataclass(frozen=True)
