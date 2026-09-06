@@ -1014,6 +1014,7 @@ def write_gemma4_mm_tiny() -> None:
     np.save(directory / "pixels.npy", system["pixels"])
     np.save(directory / "positions.npy", system["positions"])
     np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
     ids = np.array([[60, 60, 60, 60, 9], [2, 60, 60, 60, 60]], np.int32)
     with torch.no_grad():
         wrapper = Gemma4ForConditionalGeneration(Gemma4Config(
