@@ -656,7 +656,8 @@ def write_gemma3_mm_tiny() -> None:
     for name, tensor in system["projector"].state_dict().items():
         merged[f"model.multi_modal_projector.{name}"] = tensor
     for name, tensor in text.items():
-        merged[f"model.language_model.{name}"] = tensor
+        tail = name[6:] if name.startswith("model.") else name
+        merged[f"model.language_model.{tail}"] = tensor
     merged["lm_head.weight"] = text["model.embed_tokens.weight"].clone()
     directory = FIXTURES / "gemma3-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
@@ -670,14 +671,32 @@ def write_gemma3_mm_tiny() -> None:
         "image_token_index": 202}, indent=1) + "\n")
     np.save(directory / "pixels.npy", system["pixels"])
     np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
+    ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
+    with torch.no_grad():
+        from transformers.models.gemma3.modeling_gemma3 import (
+            Gemma3ForConditionalGeneration,
+        )
+        wrapper = Gemma3ForConditionalGeneration(Gemma3Config(
+            text_config={k: v for k, v in text_config.items()
+                         if k not in ("architectures", "model_type")},
+            vision_config=system["vconf"], mm_tokens_per_image=system["mm_tokens"],
+            boi_token_index=200, eoi_token_index=201, image_token_index=202))
+        wrapper.load_state_dict(
+            {k: v for k, v in merged.items()}, strict=True)
+        wrapper = wrapper.float().eval()
+        logits = wrapper(
+            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
+                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
 def write_llama4_mm_tiny() -> None:
-    """A Llama 4 wrapper fixture, same deal with an untied head: the tiny
-    decoder half keeps its own lm_head, which lands top-level."""
+    """A Llama 4 wrapper fixture: vision halves and decoder half under the
+    released nesting with no model prefix, with the wrapper config, both
+    vision references and the wrapper logits."""
     from safetensors.torch import load_file, save_file
 
     system = llama4_vision_tiny_system(seed=4321)
@@ -685,12 +704,11 @@ def write_llama4_mm_tiny() -> None:
     text_config = json.loads((FIXTURES / "llama4-tiny" / "config.json").read_text())
     merged = {}
     for name, tensor in system["tower"].state_dict().items():
-        merged[f"model.vision_model.{name}"] = tensor
+        merged[f"vision_model.{name}"] = tensor
     for name, tensor in system["projector"].state_dict().items():
-        merged[f"model.multi_modal_projector.{name}"] = tensor
+        merged[f"multi_modal_projector.{name}"] = tensor
     for name, tensor in text.items():
-        merged["lm_head.weight" if name == "lm_head.weight"
-               else f"model.language_model.{name}"] = tensor
+        merged[f"language_model.{name}"] = tensor
     directory = FIXTURES / "llama4-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
@@ -703,6 +721,24 @@ def write_llama4_mm_tiny() -> None:
     np.save(directory / "pixels.npy", system["pixels"])
     np.save(directory / "tower_ref.npy", system["last"])
     np.save(directory / "projector_ref.npy", system["soft"])
+    ids = np.array([[2, 5, 92, 7, 9], [92, 3, 4, 5, 6]], np.int32)
+    with torch.no_grad():
+        from transformers.models.llama4.configuration_llama4 import Llama4Config
+        from transformers.models.llama4.modeling_llama4 import (
+            Llama4ForConditionalGeneration,
+        )
+        wrapper = Llama4ForConditionalGeneration(Llama4Config(
+            text_config={k: v for k, v in text_config.items()
+                         if k not in ("architectures", "model_type")},
+            vision_config=system["vconf"],
+            boi_token_index=90, eoi_token_index=91, image_token_index=92))
+        wrapper.load_state_dict(merged, strict=True)
+        wrapper = wrapper.float().eval()
+        logits = wrapper(
+            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
+                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
