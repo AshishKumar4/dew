@@ -42,3 +42,29 @@ def test_cpu_smoke_case_measures_a_finite_step_through_the_trainer():
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
+
+
+@pytest.mark.parametrize("intervals,busy,window", [
+    ([(0, 10), (2, 3)], 10, 10),
+    ([(0, 4), (2, 6)], 6, 6),
+    ([(0, 2), (4, 6)], 4, 6),
+])
+def test_device_timeline_covers_nested_and_disjoint_kernels(
+    tmp_path, monkeypatch, intervals, busy, window,
+):
+    from types import SimpleNamespace
+    import jax.profiler
+
+    trace = tmp_path / "trace.xplane.pb"
+    trace.touch()
+    events = [SimpleNamespace(name="kernel", start_ns=start * 1_000_000,
+                              end_ns=end * 1_000_000) for start, end in intervals]
+    profile = SimpleNamespace(planes=[SimpleNamespace(
+        name="/device:GPU:0", lines=[SimpleNamespace(events=events)])])
+    monkeypatch.setattr(jax.profiler, "ProfileData", SimpleNamespace(
+        from_file=lambda path: profile))
+
+    row = _benchmark_step().device_timeline(str(tmp_path), steps=1)
+    assert row["device_busy_ms_per_step"] == pytest.approx(busy)
+    assert row["device_window_ms_per_step"] == pytest.approx(window)
+    assert row["device_busy_percent"] == pytest.approx(100 * busy / window)
