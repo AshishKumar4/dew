@@ -29,6 +29,7 @@ dependencies = [
     "tyro",
     "python-dotenv",
     "transformers",
+    "jinja2",
     "huggingface_hub",
     "wandb",
 ]
@@ -42,6 +43,7 @@ test = [
     "pytest",
     "pytest-xdist",
     "safetensors",
+    "torch",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
