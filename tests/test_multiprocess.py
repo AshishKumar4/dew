@@ -894,3 +894,25 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
         assert report["no_consumer"]["evaluation/records"] == 3
     assert reports[0]["local"] == [0, 1, 2]
     assert reports[1]["local"] is None
+
+
+@pytest.mark.distributed
+def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failures(tmp_path):
+    reports = run_pool("builtin_preview_failures", tmp_path, 2, devices=1)
+    for kind in ("lm", "diffusion", "masked"):
+        for phase in ("setup", "generation", "preflight"):
+            for source in (0, 1):
+                case = f"{kind}-{phase}-{source}"
+                local, remote = reports[source][case], reports[1 - source][case]
+                assert local["closed"] and remote["closed"]
+                assert remote["type"] == "RuntimeError"
+                assert f"rank {source}" in remote["error"]
+                if phase == "setup":
+                    assert local["type"] == "AttributeError"
+                elif phase == "generation":
+                    assert local["type"] == "ValueError" and local["original"]
+                else:
+                    assert local["type"] == "RuntimeError" and "deleted" in local["error"]
+        assert reports[0][f"{kind}-healthy"]["drawn"] == 1
+        assert reports[1][f"{kind}-healthy"]["drawn"] == 0
+        assert reports[0][f"{kind}-healthy"]["scores"] == reports[1][f"{kind}-healthy"]["scores"]

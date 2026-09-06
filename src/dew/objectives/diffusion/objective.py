@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
-from dew.artifacts import ImageGrid, VideoGrid, collective_host
+from dew.artifacts import ImageGrid, VideoGrid, agree_process_phase, collective_host
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -181,11 +181,27 @@ class DiffusionObjective(Objective):
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """A separate small draw for display, with root-only caption decoding."""
-        params = params if step.ema is None else step.ema
-        count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-        tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
-                  for keyword, condition in self.inputs.conditions.items()}
-        samples = self._sample(params, tokens, step.key, count=count)
+        error = None
+        prepared = None
+        try:
+            params = params if step.ema is None else step.ema
+            count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
+            raw_tokens = {keyword: batch[condition.field]
+                          for keyword, condition in self.inputs.conditions.items()}
+            prepared = (self._sample, count, raw_tokens)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="diffusion preview setup")
+        error = None
+        samples = tokens = None
+        try:
+            assert prepared is not None
+            sample, count, raw_tokens = prepared
+            tokens = jax.tree.map(lambda value: value[:count], raw_tokens)
+            samples = sample(params, tokens, step.key, count=count)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="diffusion preview generation")
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None

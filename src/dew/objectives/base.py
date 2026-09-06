@@ -151,9 +151,11 @@ class Objective(ABC):
                 scored: Artifacts | None = None) -> Artifacts | None:
         """One display per event, reusing first-batch scoring when available.
 
-        Called on every rank with a separate preview key. Complete all device
-        work and gathers before rank-zero decoding or other host side effects.
-        The trainer coordinates hook errors before any subsequent collective.
+        Called on every rank with a separate preview key. Before an internal
+        collective, coordinate local setup and generation failures with
+        agree_process_phase so every rank reaches the same boundary. Complete
+        all gathers before root-only decoding. The trainer coordinates the
+        hook's final outcome before any subsequent collective.
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
 

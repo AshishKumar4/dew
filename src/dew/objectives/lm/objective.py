@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, TokenScores, collective_host
+from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
@@ -449,18 +449,33 @@ class LMObjective(Objective):
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero."""
-        if self.samples is None:
-            return None
-        from dew.sampling.text import generate
+        error = None
+        settings = prepared = generate_text = prompt = generated = None
+        try:
+            settings = self.samples
+            if settings is not None:
+                from dew.sampling.text import generate as generate_text
 
-        params = params if step.ema is None else step.ema
-        generated = generate(
-            self.model, params, self._prompt, self.samples.max_new_tokens,
-            key=step.key, temperature=self.samples.temperature, top_k=self.samples.top_k)
-        generated, prompt = collective_host((generated, self._prompt), phase="LM preview")
-        if jax.process_index() != 0:
+                params = params if step.ema is None else step.ema
+                prepared = (self.model, self._prompt, settings.max_new_tokens,
+                            settings.temperature, settings.top_k)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="LM preview setup")
+        error = None
+        try:
+            if prepared is not None:
+                model, prompt, max_new_tokens, temperature, top_k = prepared
+                assert generate_text is not None
+                generated = generate_text(model, params, prompt, max_new_tokens,
+                                          key=step.key, temperature=temperature, top_k=top_k)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="LM preview generation")
+        generated, prompt = collective_host((generated, prompt), phase="LM preview")
+        if settings is None or jax.process_index() != 0:
             return None
-        decode = self.samples.decode
+        decode = settings.decode
         return TextSamples(
             tokens=generated,
             prompt=decode(np.asarray(prompt)[0].tolist()),
