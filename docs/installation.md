@@ -21,10 +21,11 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.12
 source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e '.[test,av,tfds,metrics]'
 ```
 
-This development install includes optional data and metric packages so full-source type checking can resolve their imports. CI uses the same extras. Ordinary users can start with the smaller base installation above.
+This development install includes reference-test, optional data, and metric packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI uses the same extras. Ordinary users can start with the smaller base installation above.
 
 ## Check the environment
 
