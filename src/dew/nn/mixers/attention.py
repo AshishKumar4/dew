@@ -189,12 +189,27 @@ class CausalSelfAttention(nn.Module):
         # batch supplies the position inside its document in place of the
         # row index, and RoPE restarts at every boundary.
         append = None
+        prefix = None
         kv_len = key.shape[-3]
         if decode:
-            if not self.causal:
-                raise ValueError("full attention has no KV cache to decode against")
-            if not self.kv_shared:
-                positions, append = open_kv_cache(self, key, self.max_seq_len)
+            if self.causal:
+                if not self.kv_shared:
+                    positions, append = open_kv_cache(self, key, self.max_seq_len)
+            elif self.kv_shared or segment_ids is not None:
+                raise ValueError(
+                    "a bidirectional canvas over a cache shares no keys across "
+                    "layers and packs no segments: a sharing layer owns no "
+                    "cache of its own, and packed positions do not continue "
+                    "past a prefix")
+            elif not self.has_variable("cache", "cached_key"):
+                raise ValueError(
+                    "a bidirectional canvas has no KV cache of its own: prefill "
+                    "the prompt with the causal model first")
+            else:
+                # The encoder's frozen prefix: positions continue past it, and
+                # the decoder never writes it back.
+                prefix = self.get_variable("cache", "cache_index")
+                positions = prefix + jnp.arange(S)
         elif positions is None and not self.kv_shared:
             positions = jnp.arange(S)
         elif not self.kv_shared:
@@ -225,7 +240,32 @@ class CausalSelfAttention(nn.Module):
         causal, mask = self.causal, None
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
-        if self.kv_shared and decode:
+        if prefix is not None:
+            # Canvas queries read every cached prefix key and every canvas key
+            # (modeling_diffusion_gemma.py, create_diffusion_decoder_attention_mask).
+            # The cache stays at its allocated width with zeroed slots past the
+            # prefix, so those slots mask out and no dynamic slice is needed. A
+            # sliding layer windows the same absolute positions its prefill wrote.
+            cached_key = self.get_variable("cache", "cached_key")
+            cached_value = self.get_variable("cache", "cached_value")
+            alloc = cached_key.shape[-3]
+            prefix_index: jax.Array = prefix
+            canvas_pos = prefix_index + jnp.arange(S)
+            positions = canvas_pos
+            valid = jnp.concatenate(
+                [jnp.arange(alloc) < prefix_index, jnp.ones(S, bool)])
+            slot = jnp.concatenate([jnp.arange(alloc), canvas_pos])
+            query_pos = canvas_pos[:, None]
+            key_pos = slot[None, :]
+            canvas_key = jnp.arange(alloc + S)[None, :] >= alloc
+            keep = valid[None, :] & ((key_pos <= query_pos) | canvas_key)
+            if self.sliding_window is not None:
+                keep = keep & (key_pos > query_pos - self.sliding_window)
+            mask = jnp.broadcast_to(keep[None, None], (B, 1, S, alloc + S))
+            key = jnp.concatenate([cached_key, key], axis=-3)
+            value = jnp.concatenate([cached_value, value], axis=-3)
+            causal, window = False, None
+        elif self.kv_shared and decode:
             # No cache of its own: the provider's stashed keys carry the full
             # history, so the mask reads them the way the provider's own
             # decode mask does.

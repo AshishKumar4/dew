@@ -64,7 +64,7 @@ state = trainer.fit(data, steps=50 * data.steps_per_epoch)
 
 Each is a Flax module, registered under a name so a config file can build it: `models.build("simple_dit", patch_size=4, ...)`. Every model takes `dtype` and `attention_impl`, and the parameter tree does not depend on either, so a checkpoint trained with cuDNN attention on a GPU loads unchanged on a TPU.
 
-Language model checkpoints load from Hugging Face and match the reference logits: Llama 2, 3, 3.1 and the Llama 4 text decoder (iRoPE with chunked local layers, input-scaled experts), Mistral, Mixtral, Qwen 2, Qwen 3 and Qwen3-MoE, Qwen 3.5 (the gated delta net and full attention hybrid), Gemma 1, 2, 3, Gemma 3n (AltUp, LAuReL, activation sparsity) and every Gemma 4 text size including the routed 26B-A4B, OLMo 3, gpt-oss (attention sinks, the clamped biased experts, MXFP4 weights unpacked on load), DeepSeek V2 and V2-Lite, DeepSeek V3 and V3.2 (multi-head latent attention, the sparse indexer, shared experts and the balancing bias), Kimi K2, and GLM 4.5 and 5 with their MTP depths.
+Language model checkpoints load from Hugging Face and match the reference logits: Llama 2, 3, 3.1 and the Llama 4 text decoder (iRoPE with chunked local layers, input-scaled experts), Mistral, Mixtral, Qwen 2, Qwen 3 and Qwen3-MoE, Qwen 3.5 (the gated delta net and full attention hybrid), Gemma 1, 2, 3, Gemma 3n (AltUp, LAuReL, activation sparsity) and every Gemma 4 text size including the routed 26B-A4B, OLMo 3, gpt-oss (attention sinks, the clamped biased experts, MXFP4 weights unpacked on load), DeepSeek V2 and V2-Lite, DeepSeek V3 and V3.2 (multi-head latent attention, the sparse indexer, shared experts and the balancing bias), Kimi K2, GLM 4.5 and 5 with their MTP depths, LLaDA and Dream (bidirectional decoders with a mask id, trained by the masked-diffusion objective), and the DiffusionGemma text weights with their block-diffusion sampler. Multimodal wrappers load their three halves for Gemma 3 (SigLIP tower, avg-pool projector) and Llama 4 (MetaCLIP-style tower with pixel shuffle, outer projector).
 
 ## The parts
 
@@ -167,7 +167,7 @@ trainer = Trainer(objective, optimizer, key=key, mesh=MeshSpec(fsdp=1), accumula
 
 On a TPU pod every host runs the same script, the data pipeline shards records by process, and a `gs://` checkpoint directory writes the shards to a bucket, which is the shared storage a resume across hosts needs. `docs/tpu.md` is the walkthrough, and `dew-tpu` creates a slice and starts a recipe on it.
 
-Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the hardware (`attention_impl="auto"`). The mesh has five axes: data, FSDP and expert sharding today, a tensor axis a run's rules can redirect a width onto, and a sequence axis that splits token rows; attention that computes across the sequence axis, and pipeline stages, are on the roadmap.
+Models compute in bf16 with fp32 parameters by default, and attention runs on the fused kernel for the hardware (`attention_impl="auto"`). The mesh has six axes: data, FSDP and expert sharding, a tensor axis a run's rules can redirect a width onto, a sequence axis that splits token rows with attention computing across it, and a stage axis that holds the decoder's pipeline stages. Deep decoders scan over their layers, so compile time stays flat with depth.
 
 ## Data
 
@@ -284,9 +284,9 @@ To work on dew itself, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The goal is to train the way the large labs train and to run what they release, on the same trainer.
 
-**Architecture parity.** The decoder families MaxText trains all load; next are the released weights of the largest of them run end to end (gpt-oss-20b's MXFP4 checkpoint through the unpacker is the network-marked test written for it), then the vision towers of Gemma 4, Llama 4 and Qwen 3.5, and diffusion language models at the open-weight scale. Each family lands when its logits match the reference implementation on a real checkpoint.
+**Architecture parity.** The decoder families MaxText trains all load; next are the released weights of the largest of them run end to end (gpt-oss-20b's MXFP4 checkpoint through the unpacker is the network-marked test written for it), then the Gemma 4 vision tower and the Qwen 3.5 multimodal wrapper. Landed since: LLaDA and Dream with masked-diffusion training, the DiffusionGemma sampler, the SigLIP and Llama 4 vision towers with the Gemma 3 and Llama 4 wrappers. Each family lands when its logits match the reference implementation on a real checkpoint.
 
-**Systems.** Attention that shards the sequence over the sequence axis, and pipeline stages over the stage axis; int8 and FP8 training with fine-grained scaling, and MXFP4 and FP8 weight loading; the MuonClip optimizer; emergency checkpointing and goodput measurement; scan over layers for compile time at depth.
+**Systems.** int8 and FP8 training with fine-grained scaling (MXFP4 and FP8 block-scaled checkpoints already load); the MuonClip optimizer; the 1F1B pipeline schedule beside GPipe.
 
 **Post-training.** SFT and reinforcement learning as objectives on the same trainer.
 

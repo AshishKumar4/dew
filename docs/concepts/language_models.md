@@ -125,9 +125,13 @@ A checkpoint quantized the way DeepSeek V3 and V3.2 ship, every linear an F8_E4M
 | Kimi K2 | `kimi_k2` | DeepSeek V3's computation under its own model_type and tokenizer; what it computes exports as `deepseek_v3` |
 | GLM 4.5, GLM 5 | `glm4_moe` | biased q/k/v over a bias-free o_proj, a half rotary, DeepSeek V3's router with the shared experts and dense first layers, and the MTP depths the checkpoint ships (`num_nextn_predict_layers`), each composed as the serving engines run it |
 | Llama 4 (text) | `llama4_text` | iRoPE: chunked rotated local layers around global layers with no rope and temperature scaling, every interleaved layer routed with a shared expert and the routing weight on the expert input; the released repos are multimodal wrappers whose `text_config` alone translates |
+| LLaDA | `llada` | fully bidirectional Llama block with a reserved mask id (`mask_token_id`); the OLMo-style tensor names remap onto the llama layout with no second table |
+| Dream | `dream`, `Dream` | Qwen2.5-shaped decoder with hard-coded full attention and a mask id, on the qwen2 tensor layout |
+| DiffusionGemma (text) | `diffusion_gemma_text` | the Gemma 4 text weights in decoder mode; the block-diffusion sampler around them lives in `dew.diffusion.block` |
 
-A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`use_bidirectional_attention` other than Gemma 4's vision-only spelling, a `mlp_bias`, an activation other than silu or tanh-gelu, a `rope_scaling` the family's reference does not read, DeepSeek V2's `norm_topk_prob` or a `scoring_func` other than softmax, GPT OSS's `router_jitter_noise` or a quantization other than MXFP4, Llama 4's `layer_types` disagreeing with `no_rope_layers`). A multimodal repo (`gemma3`, `gemma4`, `gemma3n`, `qwen3_5`, `llama4`) is refused as a wrapper; its `text_config` is what translates. The families still to come are in the README roadmap.
+A config field that changes what the model computes and has no counterpart here raises a `ValueError` naming the field (`use_bidirectional_attention` other than Gemma 4's vision-only spelling, a `mlp_bias`, an activation other than silu or tanh-gelu, a `rope_scaling` the family's reference does not read, DeepSeek V2's `norm_topk_prob` or a `scoring_func` other than softmax, GPT OSS's `router_jitter_noise` or a quantization other than MXFP4, Llama 4's `layer_types` disagreeing with `no_rope_layers`).
 
+A multimodal gemma3 or llama4 repo translates through `translate_wrapper_config` into its decoder, tower and projector records (see below); a gemma4, gemma3n or qwen3_5 wrapper is refused naming its tower, and its `text_config` is what translates on its own. The families still to come are in the README roadmap.
 Every family lands with a parity test: `tools/hf_reference.py` writes fixtures under torch and transformers, and `tests/test_hf_decoders.py` compares logits at float32 with the tolerance and the largest observed difference written in the test. Qwen3-0.6B's real weights agree with the reference on the argmax at every position.
 
 `recipes/lm/train.py --pretrained` continues training one of these:
@@ -140,6 +144,89 @@ python recipes/lm/train.py data:token-windows --data.path data/corpus-qwen3 --da
 ```
 
 The checkpoint decides every architecture field, and the token files have to come from the checkpoint's own tokenizer; a `meta.json` written with a different one stops the run.
+
+## Masked diffusion decoders
+
+LLaDA and Dream train masked diffusion. Each row is corrupted by masking a
+fraction of its positions with the reserved mask id, and the loss is the cross
+entropy on the masked positions weighted by the process. The backbone is the
+same `CausalTransformer` with `causal=False`, and the objective is
+`masked_diffusion` in `dew.objectives.diffusion.masked` over the `mdlm`
+process in `dew.diffusion.discrete`.
+
+```python
+# runs elsewhere: downloads a LLaDA checkpoint from the Hub
+from dew.interop import load_pretrained_decoder
+
+model, variables, config = load_pretrained_decoder("GSAI-ML/LLaDA-8B-Base")
+```
+
+`recipes/lm/train.py --objective masked_diffusion --pretrained` with a diffusion
+checkpoint trains one. The checkpoint carries its mask id, so the two flags are
+the whole command.
+
+```bash
+python recipes/lm/train.py data:token-windows --data.path data/corpus-llada --data.seq-len 512 \
+    --pretrained GSAI-ML/LLaDA-8B-Base --objective masked_diffusion --tokenizer GSAI-ML/LLaDA-8B-Base
+```
+
+DiffusionGemma denoises blocks. A uniform random canvas of `canvas_length` ids
+sharpens over `max_steps` steps under a temperature annealed from `t_max` to
+`t_min`, positions whose categorical entropy fits `entropy_bound` are accepted
+and the rest are redrawn, and the previous step's tempered logits condition the
+next one through the self-conditioning MLP in `dew.nn.diffusion_gemma`.
+`BlockProcess` in `dew.diffusion.block` holds the schedule and `sample_canvas`
+runs the loop over a denoiser callable. The wired denoiser is two functions
+beside it: `prefill_cache` runs the causal encoder over the prompt into a KV
+cache, and `denoise_logits` runs the canvas against that cache bidirectionally
+with self-conditioning folded in through the decoder's input-embeddings hook.
+
+```python
+from dew.diffusion.block import BlockProcess
+
+process = BlockProcess(canvas_length=256, vocab_size=262144)
+process.temperature(48)
+```
+
+```python
+# runs elsewhere: needs a translated DiffusionGemma checkpoint for the encoder
+from dew.diffusion.block import denoise_logits, prefill_cache
+
+cache = prefill_cache(encoder, variables, prompt)
+logits = denoise_logits(decoder, sc, variables, sc_variables, cache, canvas, None)
+```
+
+## Multimodal wrappers
+
+A gemma3 or llama4 checkpoint wraps three halves. `translate_wrapper_config`
+turns it into decoder, tower and projector records, and
+`translate_wrapper_weights` routes the released `model.*` nesting into the
+three trees. The towers live in `dew.nn.vision`, a SigLIP trunk sharing CLIP's
+attention for Gemma 3 and a MetaCLIP-style trunk with grid rotary and pixel
+shuffle for Llama 4. Each projector is a registered value built by
+`projector_from_record`: Gemma's averages patch blocks into soft tokens and
+Llama 4's maps the shuffled output to text width.
+
+```python
+# runs elsewhere: downloads a Gemma 3 multimodal checkpoint from the Hub
+from dew.interop.hf_decoders import translate_wrapper_config
+
+record = translate_wrapper_config(wrapper)
+```
+
+A batch carries token ids with image marks beside the pixels. The soft tokens
+land on the marks before the decoder reads them.
+
+```python
+import numpy as np
+
+from dew.nn.vision import merge_soft_tokens
+
+token_embeds = np.zeros((1, 6, 8), np.float32)
+soft_tokens = np.ones((1, 2, 8), np.float32)
+mask = np.array([[False, True, False, True, False, False]])
+merged = merge_soft_tokens(token_embeds, soft_tokens, mask)
+```
 
 ## Running it
 

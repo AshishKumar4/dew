@@ -23,6 +23,7 @@ SEQ = 32
 def load_recipe():
     path = REPO_ROOT / "recipes" / "lm" / "train.py"
     spec = importlib.util.spec_from_file_location("recipe_lm", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -99,7 +100,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     state = recipe.main(config)
 
     data = config.data.load(batch=8)
-    assert int(state.step) == data.steps_per_epoch > 0
+    assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "run")) == config
     assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()
 
@@ -259,3 +260,46 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
     with pytest.raises(ValueError, match="num_nextn_predict_layers"):
         run("dense", "--mtp-weight", "0.3",
             model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}')
+
+
+def test_an_unknown_objective_is_refused():
+    recipe = load_recipe()
+    with pytest.raises(ValueError, match="--objective"):
+        recipe.LmRunConfig(data=TokenWindows(seq_len=64), objective="ctc")
+
+
+def test_the_masked_objective_is_reachable_by_name(tmp_path):
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
+    assert run_config(recipe, tokens, "--objective", "masked_diffusion").objective == \
+        "masked_diffusion"
+
+
+def test_masked_diffusion_without_a_mask_id_is_refused():
+    """The builder reads the id from the run's fields. A run without one
+    raises naming it; id zero would corrupt the wrong token."""
+    from dew.registry import models
+
+    recipe = load_recipe()
+    model = models.build("causal_transformer", vocab_size=256, emb_features=16,
+                         num_layers=1, num_heads=2, max_seq_len=SEQ, causal=False)
+    with pytest.raises(ValueError, match="mask token id"):
+        recipe.build_masked_objective(
+            recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
+                               objective="masked_diffusion"),
+            model, {})
+
+
+def test_masked_diffusion_on_a_causal_model_is_refused():
+    """The objective reads the whole corrupted row, so a causal model names
+    the flag it needs."""
+    from dew.registry import models
+
+    recipe = load_recipe()
+    model = models.build("causal_transformer", vocab_size=256, emb_features=16,
+                         num_layers=1, num_heads=2, max_seq_len=SEQ)
+    with pytest.raises(ValueError, match="causal=False"):
+        recipe.build_masked_objective(
+            recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
+                               objective="masked_diffusion"),
+            model, {"mask_token_id": 5})
