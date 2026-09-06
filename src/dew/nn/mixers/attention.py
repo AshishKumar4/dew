@@ -203,8 +203,8 @@ class CausalSelfAttention(nn.Module):
                     "past a prefix")
             elif not self.has_variable("cache", "cached_key"):
                 raise ValueError(
-                    "a bidirectional canvas decodes against an encoder cache: "
-                    "prefill the prompt with the causal model first")
+                    "a bidirectional canvas has no KV cache of its own: prefill "
+                    "the prompt with the causal model first")
             else:
                 # The encoder's frozen prefix: positions continue past it, and
                 # the decoder never writes it back.
@@ -250,10 +250,13 @@ class CausalSelfAttention(nn.Module):
             cached_key = self.get_variable("cache", "cached_key")
             cached_value = self.get_variable("cache", "cached_value")
             alloc = cached_key.shape[-3]
+            prefix_index: jax.Array = prefix
+            canvas_pos = prefix_index + jnp.arange(S)
+            positions = canvas_pos
             valid = jnp.concatenate(
-                [jnp.arange(alloc) < prefix, jnp.ones(S, bool)])
-            slot = jnp.concatenate([jnp.arange(alloc), positions])
-            query_pos = positions[:, None]
+                [jnp.arange(alloc) < prefix_index, jnp.ones(S, bool)])
+            slot = jnp.concatenate([jnp.arange(alloc), canvas_pos])
+            query_pos = canvas_pos[:, None]
             key_pos = slot[None, :]
             canvas_key = jnp.arange(alloc + S)[None, :] >= alloc
             keep = valid[None, :] & ((key_pos <= query_pos) | canvas_key)
