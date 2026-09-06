@@ -18,7 +18,7 @@ If you are new to the project, start with [getting started](getting-started.md).
 
 Read [objectives](concepts/objectives.md) for the shared training contract, [the diffusion guide](guides/diffusion.md) for the diffusion pieces, and [recipes](recipes.md) for command-line configuration. The [API overview](api.md) lists current modules.
 
-## Start a new run rather than reusing an old directory
+## Start in a new run directory
 
 Dew does not provide a FlaxDiff checkpoint converter or deprecated FlaxDiff import paths. Keep an older run with the source revision, environment, data, and tokenizer or encoder assets that created it. Preserve that environment if you need to inspect or sample its checkpoint.
 

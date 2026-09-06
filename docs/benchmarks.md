@@ -1,9 +1,6 @@
 # Step benchmarks
 
-What one training step costs, per architecture, measured through
-the `Trainer`'s own compiled step, not a hand-written forward
-pass. Reproduce with `tools/benchmark_step.py`; the loader is measured
-separately by `tools/benchmark_data.py`.
+These results measure a complete compiled optimization step through `Trainer` on the hardware, source revisions, and shapes stated for each table. They are historical measurements, not a throughput guarantee for the current checkout. Use `tools/benchmark_step.py` for a new measurement and `tools/benchmark_data.py` to measure input loading separately.
 
 FLOPs are counted off the compiled executable's optimized HLO through
 `dew.telemetry.instrumentation.compiled_flops`: every `dot` and `convolution`,

@@ -2,14 +2,14 @@
 
 A Cloud TPU slice contains accelerator devices attached to one or more worker VMs. For a multi-worker training job, every worker runs the same program and joins the same JAX process pool. Dew's `dew-tpu` command wraps `gcloud`, SSH, and rsync to create a slice, install the environment on its workers, and launch a recipe on all of them.
 
-This guide separates command previews from deployment verification. The resource commands below include `--dry-run`: they print commands instead of creating resources or connecting to workers. A successful preview does not verify cloud permissions, capacity, networking, TPU execution, or distributed training.
+The resource commands below include `--dry-run` and print command previews. They create no cloud resources and make no worker connections. A successful preview does not verify cloud permissions, capacity, networking, TPU execution, or distributed training.
 
 ## Prerequisites and costs
 
 First complete a [local recipe run](recipes.md) and read [distributed training](concepts/distributed.md). Have the following ready before removing a resource command's `--dry-run` flag:
 
 - A Google Cloud project with billing enabled, the Cloud TPU API enabled, and quota for the requested accelerator type in a supported zone. Capacity can still be unavailable when quota exists.
-- An authenticated Google Cloud CLI and permissions to create/delete TPUs, use the worker service account, and access any data or checkpoint buckets. Check the project's IAM policy rather than granting broad permissions to make an error disappear.
+- An authenticated Google Cloud CLI and permissions to create/delete TPUs, use the worker service account, and access data or checkpoint buckets. Diagnose permission errors against the project's IAM policy and grant only the required permissions.
 - SSH access to workers and the local `ssh` and `rsync` programs. Source setup and training run from a Git checkout. The current sync command uses the Google Compute Engine SSH key and disables SSH host-key checking; assess that policy before using it on a sensitive network.
 - Worker network access to the package repositories used by setup, and passwordless sudo for its package and system-limit changes. A private-network deployment needs its own routing and access configuration; this command does not design that network.
 - Dataset files, compatible model/tokenizer files if needed, and a checkpoint location available to every process. Syncing the checkout does not guarantee that ignored datasets or model weights reach the workers.
@@ -81,7 +81,7 @@ For deployment acceptance, run a short recipe with the intended mesh and global 
 
 ## Supply data and preview a training launch
 
-The [recipe walkthrough](recipes.md) creates `/tmp/dew-first-recipe/tokens`. Copy that directory explicitly instead of depending on source sync to include it:
+The [recipe walkthrough](recipes.md) creates `/tmp/dew-first-recipe/tokens`. Copy that directory explicitly:
 
 ```bash
 dew-tpu copy dew-16 /tmp/dew-first-recipe/tokens '~/dew-tokens' \
@@ -113,7 +113,7 @@ dew-tpu status dew-16 --zone us-central2-b --dry-run
 dew-tpu describe dew-16 --zone us-central2-b --dry-run
 ```
 
-`--follow` follows a log; `--worker N` selects a worker. Read failures from all workers, not just worker 0. A launch command returning successfully does not mean its detached training process later completed.
+`--follow` follows a log; `--worker N` selects a worker. Read failures from every worker. A successful launch command does not establish that its detached training process completed.
 
 ## End the allocation deliberately
 

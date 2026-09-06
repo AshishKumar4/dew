@@ -1,10 +1,10 @@
-# GPU performance
+# Performance measurements
 
-What was measured on one RTX 4080, what was adopted, and what was rejected
-with the number that rejected it. `docs/benchmarks.md` is the step table per
-architecture; this file is the evidence behind the kernel and flag defaults.
+This page records experiments on one RTX 4080 at the revisions and settings stated below. Use [step benchmarks](benchmarks.md) for architecture comparisons and [distributed training](concepts/distributed.md) for current configuration behavior. Results at one shape and revision do not establish a universal default or a TPU result.
 
-Every number here comes from one of four harnesses:
+The timeline busy percentages below predate `e5ee70d`, which fixes the measurement window for nested kernel intervals. Those percentages require replay of the original traces before reuse. Synchronized wall-clock step timings are separate measurements and are not invalidated by that arithmetic defect.
+
+The following are command templates; replace angle-bracket fields with the architecture, kernel, and data used for your experiment:
 
 ```
 python tools/benchmark_attention.py --json-out attention.json
