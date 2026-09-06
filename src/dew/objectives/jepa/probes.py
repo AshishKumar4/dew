@@ -11,17 +11,17 @@ job.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 
 from dew.artifacts import Representations
 from dew.registry import metrics
+from dew.eval.common import metric_device
 
 ProbeParams: TypeAlias = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""
@@ -96,17 +96,22 @@ class LinearProbe:
     learning_rate: float = 1e-2
     weight_decay: float = 1e-4
 
-    name = "linear_probe_accuracy"
+    name = "batch_linear_probe_accuracy"
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> float:
-        return float(linear_probe_accuracy(
-            representations.features, representations.labels, self.num_classes,
-            steps=self.steps, learning_rate=self.learning_rate,
-            weight_decay=self.weight_decay))
+    def __call__(self, representations: Representations, batch) -> tuple[float, int]:
+        with metric_device():
+            return float(linear_probe_accuracy(
+                representations.features, representations.labels, self.num_classes,
+                steps=self.steps, learning_rate=self.learning_rate,
+                weight_decay=self.weight_decay)), 1
 
-    def reduce(self, values: Sequence[float]) -> float:
-        return float(np.mean(values))
+    def merge(self, accumulated: tuple[float, int],
+              contribution: tuple[float, int]) -> tuple[float, int]:
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated: tuple[float, int]) -> float:
+        return accumulated[0] / accumulated[1]
 
 
 @dataclass(frozen=True)
@@ -115,15 +120,20 @@ class KnnProbe:
     num_classes: int
     k: int = 20
 
-    name = "knn_probe_accuracy"
+    name = "batch_knn_probe_accuracy"
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> float:
-        return float(knn_probe_accuracy(representations.features, representations.labels,
-                               self.num_classes, k=self.k))
+    def __call__(self, representations: Representations, batch) -> tuple[float, int]:
+        with metric_device():
+            return float(knn_probe_accuracy(representations.features, representations.labels,
+                                           self.num_classes, k=self.k)), 1
 
-    def reduce(self, values: Sequence[float]) -> float:
-        return float(np.mean(values))
+    def merge(self, accumulated: tuple[float, int],
+              contribution: tuple[float, int]) -> tuple[float, int]:
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated: tuple[float, int]) -> float:
+        return accumulated[0] / accumulated[1]
 
 
 @metrics("linear_probe")

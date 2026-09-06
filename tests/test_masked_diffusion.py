@@ -31,8 +31,13 @@ def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=120)(), seq_len=12,
                                         steps=8, samples=4)
-    out = objective.evaluate(
+    out = objective.preview(
         variables, {}, Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None))
     tokens = np.asarray(out.tokens)
     assert tokens.shape == (4, 12) and tokens.dtype == np.int32
     assert bool(((tokens != 120) & (tokens >= 0) & (tokens < 128)).all())
+    scored = objective.evaluate(
+        variables, {"text": np.zeros((7, 12), np.int32)},
+        Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))
+    assert scored.tokens.shape == (7, 12) and scored.texts == ()
+    assert bool((np.asarray(scored.tokens) != 120).all())
