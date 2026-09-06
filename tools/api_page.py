@@ -26,7 +26,7 @@ SECTIONS = {
     "Training": ["dew.training", "dew.training.distributed", "dew.training.optim",
                  "dew.training.runtime", "dew.telemetry.instrumentation", "dew.io"],
     "Objectives": ["dew.objectives", "dew.objectives.diffusion", "dew.objectives.jepa",
-                   "dew.objectives.lm"],
+                   "dew.objectives.lm", "dew.objectives.rl"],
     "Diffusion": ["dew.diffusion", "dew.diffusion.presets", "dew.diffusion.schedules",
                   "dew.diffusion.transforms", "dew.diffusion.discrete"],
     "Sampling": ["dew.sampling", "dew.sampling.solvers", "dew.sampling.text"],
