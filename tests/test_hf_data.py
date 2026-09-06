@@ -96,10 +96,12 @@ def test_a_wrapped_dataset_indexes_like_the_table():
 def test_image_columns_come_back_as_arrays_not_pil_objects():
     """The transforms are numpy and cv2; a PIL image would reach cv2.resize."""
     record = HFDatasetSource(dataset=_table(records=2))[0]
+    expected = np.random.RandomState(0).randint(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
 
     assert isinstance(record["image"], np.ndarray)
     assert record["image"].shape == (IMAGE_SIZE, IMAGE_SIZE, 3)
     assert record["image"].dtype == np.uint8
+    assert np.array_equal(record["image"], expected)
 
 
 def test_a_source_needs_a_name_or_a_dataset():

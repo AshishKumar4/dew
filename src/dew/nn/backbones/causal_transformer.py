@@ -34,16 +34,13 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from ..attention import (
-    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask, open_kv_cache,
-    rotary_freqs, scaled_dot_product_attention,
-)
+from ..attention import RMSNorm, RopeScaling
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
-from ..mla import YarnScaling, mla_rope_freqs
+from ..mla import YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 from dew.registry import models
 
@@ -239,259 +236,6 @@ class Mixture:
                 "or shared branch to set")
 
 
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    ("o_proj",): ("attention", "embed"),
-})
-class CausalSelfAttention(nn.Module):
-    """Causal self-attention with grouped-query heads, rotary positions, qk
-    RMSNorm and a fixed-size KV cache.
-
-    decode=True runs the call against the cache: the first call writes the
-    whole prompt and each later call appends one token, so prefill and decode
-    are one code path. Keys are rotated before they enter the cache, so the
-    rotary positions come from the cache index and not from the row index of
-    the token.
-
-    causal=False is full attention over the sequence, which a masked
-    diffusion model reads the whole corrupted sequence with; there is no
-    cache to decode against then, so decode=True raises.
-
-    kv_shared marks a layer that owns no K/V projections (Gemma 3n/4 style
-    cross-layer KV sharing): it reads the keys, values and their positions
-    that the designated earlier layer of the same layer type stashed in
-    `kv_store`, post rope and post norm, and keeps no cache of its own.
-    """
-    emb_features: int
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-    max_seq_len: int
-    causal: bool = True
-    rope_theta: float = 10000.0
-    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp over the base frequencies
-    qk_norm: bool = True
-    qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
-    v_norm: bool = False
-    norm_eps: float = 1e-5
-    scale_offset: bool = False
-    scale_after_cast: bool = False
-    kv_shared: bool = False
-    kv_store_key: Optional[str] = None
-    sliding_window: Optional[int] = None
-    attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
-    o_proj_bias: Optional[bool] = None  # None follows attention_bias; Qwen2 biases q/k/v only
-    attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
-    attention_sinks: bool = False
-    yarn: Optional[YarnScaling] = None
-    attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
-    k_eq_v: bool = False  # Gemma 4's global layers project no values: the raw keys, values-normed
-    output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
-    partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
-    partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
-    dtype: Optional[Dtype] = None
-    precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
-    force_fp32_for_softmax: bool = True
-
-    def setup(self):
-        dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        # The gate doubles the query projection: the reference chunks its
-        # output in half, one half the query and the other the gate the
-        # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
-        self.q_proj = dense(
-            self.num_heads * self.head_dim * (2 if self.output_gate else 1), name='q_proj')
-        # A sharing layer reads another layer's keys and values, so it owns
-        # no projections or key norm of its own, as the reference skips them
-        # (modeling_gemma4.py, Gemma4TextAttention.__init__).
-        if not self.kv_shared:
-            self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-            if not self.k_eq_v:
-                self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
-            self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
-        if self.qk_norm:
-            if self.qk_norm_scope not in ('head', 'projection'):
-                raise ValueError(
-                    f"qk_norm_scope is 'head' or 'projection', got {self.qk_norm_scope!r}")
-            norm = functools.partial(
-                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-            self.q_norm = norm(name='q_norm')
-            if not self.kv_shared:
-                self.k_norm = norm(name='k_norm')
-        if self.v_norm and not self.kv_shared:
-            # Gemma 4 norms the values with a scale-free RMSNorm before they
-            # are cached or shared (modeling_gemma4.py, Gemma4TextAttention).
-            # The attribute cannot share the field's name, and it holds no
-            # parameters either way.
-            self.values_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
-                                       dtype=self.dtype, name='v_norm')
-
-    def _rot_dim(self) -> int | None:
-        """Head dims the rotary rotates, or None for all of them.
-
-        `partial_rotary_type` says what the fraction means: 'proportional'
-        rotates the first rot_dim dims of a head_dim-wide rope and passes the
-        rest at frequency zero (Gemma 4), 'default' builds a rot_dim-wide rope
-        and leaves the rest unrotated (Qwen3.5); `rotary_freqs` names the
-        reference lines. Both rotate `int(head_dim * factor)` dims.
-        """
-        factor = self.partial_rotary_factor
-        if factor is None:
-            return None
-        rot_dim = int(self.head_dim * factor)
-        if not 0 < factor <= 1 or rot_dim % 2:
-            raise ValueError(
-                f"partial_rotary_factor must rotate an even positive number of "
-                f"head dims, got {factor} of head_dim {self.head_dim}")
-        return rot_dim
-
-    @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
-        B, S, _ = x.shape
-        projected = self.q_proj(x)
-        # OLMo 3 norms the whole projection, one scale of heads * head_dim,
-        # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
-        # and the Gemmas norm each head after it, which the reference marks
-        # "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147).
-        whole = self.qk_norm and self.qk_norm_scope == 'projection'
-        if whole:
-            projected = self.q_norm(projected)
-        gate = None
-        if self.output_gate:
-            # The reference views the doubled output as [.., heads, 2*head_dim]
-            # and chunks it: query, then gate (modeling_qwen3_5.py:670-673).
-            query, gate = jnp.split(
-                projected.reshape(B, S, self.num_heads, 2 * self.head_dim),
-                2, axis=-1)
-        else:
-            query = projected.reshape(B, S, self.num_heads, self.head_dim)
-        if self.kv_shared:
-            # The provider ran earlier in the same forward pass and stashed
-            # its post-norm, post-rope keys and values with their positions,
-            # so there is nothing to project, norm, rotate or cache here.
-            if kv_store is None or self.kv_store_key not in kv_store:
-                raise ValueError(
-                    f"layer shares K/V under {self.kv_store_key!r} but no provider "
-                    "stashed them; the model has to pass one kv_store dict down "
-                    "its layer stack")
-            key, value, positions = kv_store[self.kv_store_key]
-        else:
-            key = self.k_proj(x)
-            # attention_k_eq_v reads the values off the key projection before
-            # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
-            value = (key if self.k_eq_v else self.v_proj(x)).reshape(
-                B, S, self.num_kv_heads, self.head_dim)
-            if whole:
-                key = self.k_norm(key)
-            key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
-            if self.qk_norm and not whole:
-                key = self.k_norm(key)
-            if self.v_norm:
-                value = self.values_norm(value)
-        if self.qk_norm and not whole:
-            query = self.q_norm(query)
-
-        # The cache slot carries position while decoding, so the rotation and
-        # the mask both read it and not the row index of the token. A packed
-        # batch supplies the position inside its document in place of the
-        # row index, and RoPE restarts at every boundary.
-        append = None
-        kv_len = key.shape[-3]
-        if decode:
-            if not self.causal:
-                raise ValueError("full attention has no KV cache to decode against")
-            if not self.kv_shared:
-                positions, append = open_kv_cache(self, key, self.max_seq_len)
-        elif positions is None and not self.kv_shared:
-            positions = jnp.arange(S)
-        elif not self.kv_shared:
-            positions = jnp.asarray(positions)
-        if self.yarn is None:
-            freqs_cos, freqs_sin = rotary_freqs(
-                positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
-        else:
-            if self.partial_rotary_factor is not None or self.rope_scaling is not None:
-                raise ValueError(
-                    "yarn rotates whole heads at its own frequencies, so it takes "
-                    "neither partial_rotary_factor nor rope_scaling")
-            freqs_cos, freqs_sin = mla_rope_freqs(
-                positions, self.head_dim, self.rope_theta, self.yarn)
-        # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-        # query carries the ratio to the scale the checkpoint asks for.
-        query = apply_rotary(
-            query, freqs_cos, freqs_sin,
-            scale=(None if self.attention_scale is None
-                   else self.attention_scale * math.sqrt(self.head_dim)))
-        if not self.kv_shared:
-            key = apply_rotary(key, freqs_cos, freqs_sin)
-            if kv_store is not None and self.kv_store_key is not None:
-                # Post-norm, post-rope, the same tensors the reference hands
-                # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
-                kv_store[self.kv_store_key] = (key, value, positions)
-        causal, mask = self.causal, None
-        implementation = self.attention_impl
-        window = None if decode else self.sliding_window
-        if self.kv_shared and decode:
-            # No cache of its own: the provider's stashed keys carry the full
-            # history, so the mask reads them the way the provider's own
-            # decode mask does.
-            mask = causal_attention_mask(positions, kv_len, self.sliding_window)
-            causal = False
-        elif append is not None:
-            key, value = append(key, value)
-            mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
-            causal = False
-            if kv_store is not None and self.kv_store_key is not None:
-                kv_store[self.kv_store_key] = (key, value, positions)
-        elif segment_ids is not None:
-            # Attention stays inside each packed document: the segment ids
-            # make the mask block-diagonal, padding (segment 0) sees nothing,
-            # and causality (with the layer's window) travels in the same mask
-            # and not as the kernels' flag.
-            segment_ids = jnp.asarray(segment_ids)
-            inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                      & (segment_ids[:, :, None] != 0))[:, None]
-            mask = inside
-            if causal:
-                mask = jnp.logical_and(
-                    inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
-            causal, window = False, None
-            if implementation in ('auto', 'cudnn'):
-                # cuDNN has no mask argument: causality and the window are
-                # flags, and jax hands the kernel a bool mask as an additive
-                # bias of -2**41 in the compute dtype instead
-                # (combine_bias_and_mask in
-                # jax/_src/cudnn/fused_attention_stablehlo.py), which also
-                # makes check_is_flash_attention refuse an odd length while
-                # training. The xla kernel masks by exclusion, on every
-                # backend and with the same fp32 softmax. It costs 83.6 ms
-                # and 5.80 GiB a step where the fixed window on cuDNN costs
-                # 75.8 ms and 4.99 GiB, measured in
-                # docs/concepts/language_models.md.
-                implementation = 'xla'
-
-        attention = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask,
-            sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
-                   if self.attention_sinks else None),
-            softcap=self.attn_logit_softcap)
-        if gate is not None:
-            # The branch multiplies by the sigmoid of its gate, then projects
-            # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
-            attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
-        return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
-
-
 def _gated_activation(activation: str, gate):
     """The gate's nonlinearity by the mlp's name: silu, tanh-approximate gelu
     or the erf gelu (torch's default, ACT2FN['gelu'])."""
@@ -543,6 +287,27 @@ class GatedMLP(nn.Module):
         return self.down_proj(gate * self.up_proj(x))
 
 
+@dataclasses.dataclass(frozen=True)
+class BlockWiring:
+    """How a block norms its two residuals, and whether it scales its output.
+
+    `pre_norms` norms each sublayer's input and `output_norms` its output.
+    The input pair alone is the plain pre-norm block, both pairs Gemma's
+    sandwich block, and the output pair alone OLMo 3's post-norm block
+    (modeling_olmo3.py:249-266), where each sublayer reads the residual
+    stream as it is and its output is normed before it is added. The output
+    pair norms the sublayer outputs and not their inputs, so the input norms
+    keep their names and their places, and a checkpoint without the output
+    pair loads into the same tree minus two leaves per layer. `output_scale`
+    multiplies the block's output by a learned scalar. One wiring serves
+    every layer, so it stays off the per-layer specs the scan groups by.
+    """
+
+    pre_norms: bool = True
+    output_norms: bool = False
+    output_scale: bool = False
+
+
 @logical_axes({
     ("per_layer_input_gate",): ("embed", "mlp"),
     ("per_layer_projection",): ("mlp", "embed"),
@@ -556,13 +321,14 @@ class DecoderBlock(nn.Module):
     What `feedforward` builds lands there as mlp and takes the normalized
     states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share.
 
-    sandwich_norms adds Gemma's second pair of norms, on the output of each
-    sublayer and not on its input; the pre-norms keep their names and their
-    places, so a checkpoint without them loads into the same tree minus two
-    leaves per layer. pre_norms=False drops the input pair, which with the
-    output pair on is OLMo 3's post-norm block (modeling_olmo3.py:249-266):
-    each sublayer reads the residual stream as it is and its output is
-    normed before it is added.
+    `wiring` places the block's norms: the input pair alone is the plain
+    pre-norm block, both pairs Gemma's sandwich block, and the output pair
+    alone OLMo 3's post-norm block (modeling_olmo3.py:249-266), where each
+    sublayer reads the residual stream as it is and its output is normed
+    before it is added. The output pair norms the sublayer outputs and not
+    their inputs, so the input norms keep their names and their places, and
+    a checkpoint without the output pair loads into the same tree minus two
+    leaves per layer.
 
     kv_store threads one dict down the layer stack so a KV-sharing mixer
     reads its provider's keys and values; a mixer without a kv_store keyword
@@ -580,16 +346,14 @@ class DecoderBlock(nn.Module):
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
     emb_features: int
+    wiring: BlockWiring
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
-    sandwich_norms: bool = False
-    pre_norms: bool = True
     per_layer_input_dim: int = 0
     parallel: Optional[Callable[..., nn.Module]] = None
     """A branch summed with the feed-forward's output before its output norm,
     called with the residual and that output (Gemma 4's routed experts)."""
-    layer_scalar: bool = False  # Gemma 4 multiplies each layer's output by a learned scalar
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     dropout_rate: float = 0.0
@@ -600,18 +364,18 @@ class DecoderBlock(nn.Module):
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        if self.pre_norms:
+        if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.pre_norms:
+        if self.wiring.pre_norms:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
         self.mlp = self.feedforward(name='mlp')
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
-        if self.layer_scalar:
+        if self.wiring.output_scale:
             # The reference's layer_scalar buffer, a checkpoint leaf of one
             # value, which the released Gemma 4 checkpoints carry.
             self.output_scalar = self.param('layer_scalar', nn.initializers.ones, (1,), jnp.float32)
@@ -624,7 +388,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_projection')
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         if self.altup is not None:
-            if not self.pre_norms or self.parallel is not None or self.layer_scalar:
+            if not self.wiring.pre_norms or self.parallel is not None or self.wiring.output_scale:
                 raise ValueError(
                     "altup runs Gemma 3n's block, which has its pre-norms and "
                     "neither a parallel branch nor a layer scalar")
@@ -632,11 +396,11 @@ class DecoderBlock(nn.Module):
                 spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision, name='altup')
         if self.laurel_rank is not None:
-            if self.laurel_rank < 1 or not self.pre_norms:
+            if self.laurel_rank < 1 or not self.wiring.pre_norms:
                 raise ValueError(
                     f"laurel_rank is the width of the learned augmented residual "
                     f"over the attention's normed input, got {self.laurel_rank} "
-                    f"with pre_norms={self.pre_norms}")
+                f"with {self.wiring}")
             self.laurel = LaurelBlock(
                 rank=self.laurel_rank, emb_features=self.emb_features,
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
@@ -650,19 +414,19 @@ class DecoderBlock(nn.Module):
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
             x = predictions[altup.active_idx]
-        normed = self.input_layernorm(x) if self.pre_norms else x
+        normed = self.input_layernorm(x) if self.wiring.pre_norms else x
         mixed = self.self_attn(normed,
                                decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}))
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
-        hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
+        hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x)
         if self.parallel is not None:
             hidden = self.moe(x, hidden)
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
         if altup is not None and predictions is not None:
@@ -677,7 +441,7 @@ class DecoderBlock(nn.Module):
             return corrected
         if self.per_layer_input_dim and per_layer_input is not None:
             x = x + self._per_layer_residual(x, per_layer_input)
-        if self.layer_scalar:
+        if self.wiring.output_scale:
             x = x * self.output_scalar.astype(x.dtype)
         return x
 
@@ -716,11 +480,10 @@ class MTPBlock(nn.Module):
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
     emb_features: int
+    wiring: BlockWiring
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
-    sandwich_norms: bool = False
-    pre_norms: bool = True
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -740,8 +503,7 @@ class MTPBlock(nn.Module):
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
-            sandwich_norms=self.sandwich_norms,
-            pre_norms=self.pre_norms,
+                wiring=self.wiring,
             dropout_rate=self.dropout_rate,
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
@@ -1107,6 +869,7 @@ class CausalTransformer(nn.Module):
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
+    mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
 
     def __post_init__(self):
@@ -1354,6 +1117,11 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "altup carries a stack of residual copies through the layers and "
                 "the prediction depths read one, so a model has one or the other")
+        mask = self.mask_token_id
+        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
+            raise ValueError(
+                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
+                "model trained on plain next-token prediction")
 
         self.embed_tokens = nn.Embed(
             num_embeddings=self.vocab_size, features=self.emb_features,
@@ -1446,6 +1214,8 @@ class CausalTransformer(nn.Module):
                 kv_shared=index in sharing,
                 provider=index if index in providers else None)
             for index, layer_type in enumerate(types))
+        wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
+                             output_scale=self.layer_scalar)
 
         def block(index: int, name: str) -> DecoderBlock:
             spec = specs[index]
@@ -1466,11 +1236,9 @@ class CausalTransformer(nn.Module):
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
-                sandwich_norms=self.sandwich_norms,
-                pre_norms=self.pre_norms,
+                wiring=wiring,
                 per_layer_input_dim=ple or 0,
                 parallel=parallel if spec.routed else None,
-                layer_scalar=self.layer_scalar,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
                 dropout_rate=self.dropout_rate,
@@ -1508,8 +1276,7 @@ class CausalTransformer(nn.Module):
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
-                sandwich_norms=self.sandwich_norms,
-                pre_norms=self.pre_norms,
+                wiring=wiring,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
@@ -1535,9 +1302,12 @@ class CausalTransformer(nn.Module):
                 precision=self.precision, name='lm_head')
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
-                 positions=None, segment_ids=None):
+                 positions=None, segment_ids=None,
+                 input_embeddings=None, embedding_positions=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
-                               positions=positions, segment_ids=segment_ids)
+                               positions=positions, segment_ids=segment_ids,
+                               input_embeddings=input_embeddings,
+                               embedding_positions=embedding_positions)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -1602,14 +1372,19 @@ class CausalTransformer(nn.Module):
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids)]
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
-                      positions=None, segment_ids=None):
+                      positions=None, segment_ids=None,
+                      input_embeddings=None, embedding_positions=None):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
-        A loss that pairs this with `head_weight` scores tokens without ever
         holding the full `[B, S, vocab]` logits tensor. A packed batch passes
         its per-document `positions` and `segment_ids` through to the layers,
         where RoPE and the mask read them.
+
+        A caller that fuses another encoder's outputs passes them as
+        `input_embeddings` with their token positions in
+        `embedding_positions`: both or neither, and the values replace the
+        scaled token embeddings before the layers read them.
         """
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
@@ -1622,6 +1397,7 @@ class CausalTransformer(nn.Module):
             scaled = x * jnp.asarray(math.sqrt(self.emb_features),
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
+        x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
         ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
         if self.altup is not None:
             # The embeddings and, rescaled to their magnitude, each projected
@@ -1871,6 +1647,39 @@ class CausalTransformer(nn.Module):
         context = self.per_layer_projection_norm(
             context.reshape(*inputs_embeds.shape[:-1], self.num_layers, ple))
         return (context + table) * jnp.asarray(2.0 ** -0.5, context.dtype)
+
+    def _scatter_inputs(self, x, tokens, input_embeddings, embedding_positions):
+        """`x` with the fused encoder outputs written at their token positions.
+
+        Both arguments or neither; the shapes are `[B, N, D]` and `[B, N]`
+        against the `[B, S, D]` embeddings, the positions are integers within
+        the sequence, and the values are already in the decoder's scaled
+        space, so they land as they arrive, cast to the stream dtype.
+        """
+        if (input_embeddings is None) != (embedding_positions is None):
+            raise ValueError(
+                "input_embeddings and embedding_positions arrive together: one "
+                "without the other names no replacement")
+        if input_embeddings is None:
+            return x
+        replacements = jnp.asarray(input_embeddings)
+        where = jnp.asarray(embedding_positions)
+        batch, length = tokens.shape
+        if (replacements.ndim != 3 or where.ndim != 2
+                or replacements.shape[0] != batch
+                or where.shape != (batch, replacements.shape[1])
+                or replacements.shape[2] != self.emb_features):
+            raise ValueError(
+                f"input_embeddings is [B, N, D] and embedding_positions [B, N] "
+                f"for [{batch}, {length}, {self.emb_features}] embeddings, got "
+                f"{replacements.shape} and {where.shape}")
+        if not jnp.issubdtype(where.dtype, jnp.integer):
+            raise ValueError(
+                "embedding_positions holds token positions, so an integer "
+                f"dtype, got {where.dtype}")
+        rows = jnp.arange(batch)[:, None]
+        return x.at[rows, where].set(replacements.astype(x.dtype))
+
 
     def head_weight(self, params):
         """The `[D, vocab]` head matrix in fp32, as the forward multiplies it.

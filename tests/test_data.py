@@ -412,8 +412,14 @@ def test_voxceleb2_reads_the_requested_split(tmp_path):
     _voxceleb_tree(tmp_path, split="train")
     _voxceleb_tree(tmp_path, split="test", identities=("id00017",))
 
-    assert len(VoxCeleb2(path=str(tmp_path), split="train").source()) == 4
-    assert len(VoxCeleb2(path=str(tmp_path), split="test").source()) == 2
+    train = VoxCeleb2(path=str(tmp_path), split="train").source()
+    test = VoxCeleb2(path=str(tmp_path), split="test").source()
+    assert len(train) == 4
+    assert len(test) == 2
+    assert all(os.sep + "train" + os.sep in record["video_path"] for record in train)
+    assert all(os.sep + "test" + os.sep in record["video_path"] for record in test)
+    assert {record["video_path"] for record in train}.isdisjoint({record["video_path"] for record in test})
+    assert {record["video_path"].split(os.sep)[-3] for record in test} == {"id00017"}
 
 
 def test_voxceleb2_reports_missing_roots_clearly(tmp_path):
