@@ -78,11 +78,11 @@ class DiffusionObjective(Objective):
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params"))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
         check_solver(process, sampler)
-        # The unconditional datum, tokenized once on the host; encoded on
-        # device wherever a branch needs it.
-        self.unconditional_tokens = {
+        # The unconditional datum's value: the encoders are frozen, so one
+        # pass here serves every step and every sample.
+        self.unconditional = self.encode(self.encoder_params(), {
             keyword: condition.encoder.tokenize([condition.unconditional])
-            for keyword, condition in inputs.conditions.items()}
+            for keyword, condition in inputs.conditions.items()})
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     @property
@@ -108,9 +108,8 @@ class DiffusionObjective(Objective):
 
     def init(self, key):
         encoders = self.encoder_params()
-        conditions = self.encode(encoders, self.unconditional_tokens)
         variables = self.model.init(
-            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
+            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **self.unconditional)
         state = {**variables, "encoders": encoders}
         if self.autoencoder is not None:
             # The frozen weights are state, like the encoders'. They ride in
@@ -137,11 +136,10 @@ class DiffusionObjective(Objective):
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         given = self.encode(params["encoders"], tokens)
-        null = self.encode(params["encoders"], self.unconditional_tokens)
         conditions = jax.tree.map(
             lambda value, blank: jnp.where(
                 expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-            given, null)
+            given, self.unconditional)
 
         schedule = self.process.schedule
         t = schedule.sample_t(time_key, count)
@@ -160,10 +158,9 @@ class DiffusionObjective(Objective):
 
     def _sample_impl(self, params, tokens, key, *, count: int):
         given = self.encode(params["encoders"], tokens)
-        null = self.encode(params["encoders"], self.unconditional_tokens)
         variables = self.trainable(params)
         denoise = self.process.denoiser(
-            self.model, variables, given, None if self.guidance is None else null)
+            self.model, variables, given, None if self.guidance is None else self.unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
