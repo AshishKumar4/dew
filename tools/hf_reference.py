@@ -707,6 +707,41 @@ def write_llama4_mm_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+def write_diffusion_sc_tiny() -> None:
+    """The self-conditioning MLP alone: its weights, narrow config, fixed
+    inputs and the fp32 reference output."""
+    from safetensors.torch import save_file
+    from types import SimpleNamespace
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaSelfConditioning,
+    )
+
+    config = SimpleNamespace(
+        hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
+        rms_norm_eps=1e-6)
+    module = DiffusionGemmaSelfConditioning(config)
+    scatter_weights(module, seed=4321)
+    module = module.float().eval()
+    rng = np.random.RandomState(11)
+    embeds = rng.rand(BATCH, 4, 32).astype(np.float32)
+    signal = rng.rand(BATCH, 4, 32).astype(np.float32)
+    with torch.no_grad():
+        ref = module(torch.from_numpy(embeds),
+                     torch.from_numpy(signal)).to(torch.float32).numpy()
+    directory = FIXTURES / "diffusion-gemma-sc-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(module.state_dict(), directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(
+        {"hidden_size": 32, "intermediate_size": 64,
+         "hidden_activation": "gelu_pytorch_tanh", "rms_norm_eps": 1e-6},
+        indent=1) + "\n")
+    np.save(directory / "inputs.npy", embeds)
+    np.save(directory / "signal.npy", signal)
+    np.save(directory / "ref.npy", ref)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
 
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
@@ -848,6 +883,7 @@ def main() -> None:
     write_llama4_vision_tiny()
     write_gemma3_mm_tiny()
     write_llama4_mm_tiny()
+    write_diffusion_sc_tiny()
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 
