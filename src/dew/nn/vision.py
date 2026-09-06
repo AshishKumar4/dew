@@ -7,22 +7,21 @@ The operation order follows transformers 5.16.1
 `models/siglip/modeling_siglip.py` and `models/llama4/modeling_llama4.py`.
 
 The SigLIP trunk is patch convolution with bias, learned position embeddings
-with no class token, pre-norm encoder blocks and a post layer norm. Its
-attention is the same math as CLIP's (biased projections, full attention), so
-the block reuses `CLIPAttention` and only the MLP is new, with the
-config's activation. The Llama 4 trunk is MetaCLIP-style: an unfold patch
-embedding without bias, a class token appended after the patches, learned
-positions, a pre norm, full-attention blocks with a complex rotary over the
-patch grid, a post norm, the class token dropped, and the pixel-shuffle MLP
-inside the tower where the reference keeps it. Each tower's projector
-is a registered value beside it: Gemma's averages each patch block, norms and
-maps to the decoder width, and Llama 4's maps the tower output to the decoder
-width. `merge_soft_tokens` places a row of soft tokens at its image positions.
+with no class token, pre-norm encoder blocks and a post layer norm. Its block
+shares both halves with CLIP's: the attention and the feed-forward
+(`dew.nn.text_encoders`), the MLP carrying the config's activation. The Llama 4
+trunk is MetaCLIP-style: an unfold patch embedding without bias, a class token
+appended after the patches, learned positions, a pre norm, full-attention
+blocks with a complex rotary over the patch grid, a post norm, the class
+token dropped, and the pixel-shuffle MLP inside the tower where the reference
+keeps it. Each tower's projector is a registered value beside it: Gemma's
+averages each patch block, norms and maps to the decoder width, and Llama 4's
+maps the tower output to the decoder width.
 """
 
 import dataclasses
 import functools
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -31,7 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.text_encoders import CLIPAttention
+from dew.nn.text_encoders import CLIPAttention, MLP
 from dew.registry import Registry
 
 PIXEL_VALUES_KEY = "pixel_values"
@@ -118,35 +117,6 @@ def tower_from_record(record: Mapping[str, object]) -> TowerBase:
     return built
 
 
-def _activation(name: str) -> Callable[[jax.Array], jax.Array]:
-    """The reference activation under its HF name."""
-    if name == "gelu_pytorch_tanh":
-        return functools.partial(jax.nn.gelu, approximate=True)
-    if name == "gelu":
-        return functools.partial(jax.nn.gelu, approximate=False)
-    raise ValueError(
-        f"hidden_act {name!r} is not expressible: this tower runs tanh or exact gelu")
-
-
-class SiglipMLP(nn.Module):
-    """Two biased maps with the config's activation between them."""
-
-    hidden_size: int
-    intermediate_size: int
-    hidden_act: str = "gelu_pytorch_tanh"
-    dtype: Optional[Dtype] = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=True,
-                                  dtype=self.dtype, precision=self.precision)
-        self.fc1 = dense(self.intermediate_size, name="fc1")
-        self.fc2 = dense(self.hidden_size, name="fc2")
-
-    def __call__(self, hidden_states):
-        return self.fc2(_activation(self.hidden_act)(self.fc1(hidden_states)))
-
-
 class SiglipEncoderLayer(nn.Module):
     """Pre-norm full attention over pre-norm MLP, both residual.
 
@@ -170,9 +140,9 @@ class SiglipEncoderLayer(nn.Module):
             self.hidden_size, self.num_heads, causal=False, dtype=self.dtype,
             precision=self.precision, name="self_attn")
         self.layer_norm2 = norm(name="layer_norm2")
-        self.mlp = SiglipMLP(self.hidden_size, self.intermediate_size,
-                             self.hidden_act, dtype=self.dtype,
-                             precision=self.precision, name="mlp")
+        self.mlp = MLP(self.hidden_size, self.intermediate_size,
+                       activation=self.hidden_act, dtype=self.dtype,
+                       precision=self.precision, name="mlp")
 
     def __call__(self, hidden_states):
         residual = hidden_states
@@ -394,26 +364,6 @@ class Llama4VisionAttention(nn.Module):
         return self.o_proj(attended.reshape(batch, length, self.hidden_size))
 
 
-class Llama4VisionMLP(nn.Module):
-    """The trunk MLP: biased maps around an exact GELU."""
-
-    hidden_size: int
-    intermediate_size: int
-    dtype: Optional[Dtype] = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=True,
-                                  dtype=self.dtype, precision=self.precision)
-        self.fc1 = dense(self.intermediate_size, name="fc1")
-        self.fc2 = dense(self.hidden_size, name="fc2")
-
-    def __call__(self, hidden_states):
-        # nn.GELU() is the exact erf form, and jax's default is the tanh
-        # approximation, so exactness is spelled out.
-        return self.fc2(jax.nn.gelu(self.fc1(hidden_states), approximate=False))
-
-
 class Llama4VisionEncoderLayer(nn.Module):
     """Pre-norm attention over pre-norm MLP, both residual."""
 
@@ -434,9 +384,9 @@ class Llama4VisionEncoderLayer(nn.Module):
             self.hidden_size, self.num_heads, self.grid, self.rope_theta,
             dtype=self.dtype, precision=self.precision, name="self_attn")
         self.post_attention_layernorm = norm(name="post_attention_layernorm")
-        self.mlp = Llama4VisionMLP(self.hidden_size, self.intermediate_size,
-                                   dtype=self.dtype, precision=self.precision,
-                                   name="mlp")
+        self.mlp = MLP(self.hidden_size, self.intermediate_size,
+                       activation="gelu", dtype=self.dtype,
+                       precision=self.precision, name="mlp")
 
     def __call__(self, hidden_states):
         residual = hidden_states
