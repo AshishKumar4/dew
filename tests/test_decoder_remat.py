@@ -18,6 +18,7 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.sharding import pipeline_microbatches
+from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
@@ -67,7 +68,8 @@ def training_step(model):
     def step(variables, state, tokens, key):
         info = Step(jnp.zeros((), jnp.int32), key, None)
         (loss, aux), grads = jax.value_and_grad(
-            lambda params: objective.loss({**variables, "params": params}, tokens, info),
+            lambda params: scalar_loss(objective, {**variables, "params": params},
+                                       tokens, info),
             has_aux=True)(variables["params"])
         updates, state = optimizer.update(grads, state, variables["params"])
         moved = {**variables, "params": optax.apply_updates(variables["params"], updates),
