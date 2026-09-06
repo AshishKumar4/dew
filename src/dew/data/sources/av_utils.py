@@ -87,7 +87,14 @@ def read_av_random_clip(path: str, *, num_frames: int, audio_padding: int, seed:
         # One frame per index, asked for by its own time. The reader seeks
         # to the first and steps to the rest, where a subclip's iterator
         # enumerates times from a float duration and can come up one short.
-        frames = np.stack([video.get_frame((start + index) / fps) for index in range(num_frames)])
+        decoded: list[np.ndarray] = []
+        for index in range(num_frames):
+            timestamp = (start + index) / fps
+            frame = video.get_frame(timestamp)
+            if frame is None:
+                raise ValueError(f"{path} returned no video frame at {timestamp} seconds")
+            decoded.append(frame)
+        frames = np.stack(decoded)
 
     samples = audio_window(path, (start - audio_padding) / fps, padded_frames / fps, sample_rate)
     needed = padded_frames * samples_per_frame
