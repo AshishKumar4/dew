@@ -60,7 +60,7 @@ class DiffusionObjective(Objective[Mean]):
         *,
         autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
-        ema_decay: float = 0.999,
+        ema_decay: float | None = 0.999,
         sampler: Solver[Any] = DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
         steps: int = 200,
@@ -75,7 +75,8 @@ class DiffusionObjective(Objective[Mean]):
         self.sampler = sampler
         self.guidance = guidance
         self.steps = steps
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params"))
+        self.ema = (None if ema_decay is None else
+                    EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
         check_solver(process, sampler)
         # The unconditional datum's value: the encoders are frozen, so one

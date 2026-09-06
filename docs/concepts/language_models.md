@@ -62,7 +62,7 @@ This command writes `train.bin`, `val.bin`, and `meta.json`. The binary arrays s
 
 The vocabulary loss runs in float32. `head_chunks` controls how many vocabulary slices it scores, with a default of four. Chunking can reduce peak memory but adds work and can be transformed by the backend compiler. The saved memory depends on vocabulary size, sequence length, batch size, and executable; it is not a universal fixed reduction.
 
-`LMObjective` enables EMA by default. Use `state.params` for live variables and `state.averaged` when you deliberately want the moving-average copy. Evaluation reads averaged variables for the built-in objective. Account for that additional copy when estimating device memory.
+`LMObjective` enables EMA by default. Use `state.params` for live variables and `state.averaged` when you deliberately want the moving-average copy. Evaluation reads averaged variables when the objective keeps them. `ema_decay=None` keeps no copy: `state.ema` is None, `state.averaged` raises, previews and evaluation read the live variables, and a checkpoint written with one configuration will not restore into the other.
 
 To measure validation perplexity, provide a validation iterator and set `eval_every`, as shown in [evaluation and tracking](../guides/evaluation.md). With a tracker, `Samples` configures one generated preview per event, separate from complete-batch teacher-forced scoring.
 
