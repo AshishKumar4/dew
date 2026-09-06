@@ -539,10 +539,13 @@ class Spread:
 
     def __call__(self, artifact, batch):
         self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["x"]).shape))
-        return float(jnp.std(artifact.features))
+        return float(jnp.std(artifact.features)), 1
 
-    def reduce(self, values):
-        return float(np.mean(values))
+    def merge(self, accumulated, contribution):
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated):
+        return accumulated[0] / accumulated[1]
 
 
 def test_eval_every_scores_the_validation_split_and_logs_the_artifacts(tmp_path):
@@ -570,8 +573,11 @@ def test_a_failing_metric_fails_the_validation_pass():
         def __call__(self, artifact, batch):
             raise ZeroDivisionError("metric over an empty batch")
 
-        def reduce(self, values):
-            return 0.0
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return accumulated
 
     with pytest.raises(ZeroDivisionError):
         make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,
@@ -599,8 +605,11 @@ def test_a_metric_that_reads_a_type_the_objective_does_not_produce_is_an_error()
         def __call__(self, artifact, batch):
             return 0.0
 
-        def reduce(self, values):
-            return 0.0
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return accumulated
 
     with pytest.raises(ValueError, match="reads str"):
         make_trainer(objective=Features()).fit(Data(val=val_batches(1)), steps=1,

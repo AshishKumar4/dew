@@ -8,8 +8,8 @@ process's NELBO weight, averaged over every position of the batch, which is
 the continuous-time negative ELBO the paper trains. The cross entropy is the
 LM objective's chunked one, which holds one vocabulary slice of logits at a time.
 
-Evaluation unmasks a few rows from the fully masked state with the averaged
-weights, which is the text a reader can judge.
+Evaluation generates one token row per input row for custom text metrics.
+The separate preview hook generates and decodes the configured display count.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples
+from dew.artifacts import TextSamples, host
 from dew.diffusion.discrete import DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Objective, Step
@@ -107,8 +107,17 @@ class MaskedDiffusionObjective(Objective):
         return sample(denoise, x_T, self.steps, solver=self.sampler, key=key)
 
     def evaluate(self, params, batch, step: Step) -> TextSamples:
+        """Generate a batch-sized token population for custom text metrics."""
         params = params if step.ema is None else step.ema
-        tokens = self._sample(params, step.key, count=self.samples)
+        tokens = self._sample(params, step.key, count=batch[TEXT_KEY].shape[0])
+        return TextSamples(tokens=tokens)
+
+    def preview(self, params, batch, step: Step, *, scored=None):
+        """Generate the configured display count, then decode on process zero."""
+        params = params if step.ema is None else step.ema
+        tokens = host(self._sample(params, step.key, count=self.samples))
+        if jax.process_index() != 0:
+            return None
         texts = () if self.decode is None else tuple(
             self.decode(row.tolist()) for row in np.asarray(tokens))
         return TextSamples(tokens=tokens, texts=texts)

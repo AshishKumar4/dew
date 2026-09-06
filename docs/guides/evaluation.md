@@ -40,11 +40,15 @@ The run prints training loss at steps five and ten and validation perplexity at 
 
 ## Artifacts and metrics
 
-`Objective.evaluate` returns structured artifacts. `LMObjective` produces `TokenScores`; diffusion evaluation produces image or video grids; JEPA produces representations. A metric's `reads` property declares the artifact it consumes. The trainer passes that artifact and the corresponding batch to the metric, then calls the metric's reducer over the validation pass.
+`Objective.evaluate` returns scoring artifacts for the complete coordinated batch. `LMObjective` produces teacher-forced `TokenScores`; diffusion produces one generated image or video per real row; JEPA produces representations. Masked diffusion produces batch-sized generated token rows for custom text metrics, without decoding. Those samples are neither teacher-forced perplexity nor held-out NELBO.
 
-Perplexity aggregates weighted loss and target counts. Other metrics can use different reductions. A mean of per-batch diagnostic values is not automatically a dataset-level statistic. In particular, current image previews and batch FID diagnostics do not establish a dataset FID-50k measurement.
+A `Metric[S]` declares `reads`, computes one batch's sufficient statistics with `__call__`, combines them with `merge(accumulated, contribution)`, and reports its scalar with `finalize(accumulated)`. The first contribution initializes the pass. The trainer retains only the accumulator and current contribution; metric instances retain no pass state. An accumulator belongs to one pass, and a metric may merge its owned NumPy buffers in place.
 
-The trainer sends artifacts from the first validation batch to the tracker. This is a display policy, not a guarantee that preview computation only happens once: the current objective evaluation path can regenerate previews for later batches.
+Perplexity sums weighted losses and target weights before exponentiating. Image means weight each image once; video PSNR and SSIM weight each frame once. Paired image metrics and CLIP require equal generated and reference/prompt row counts. FID pools float64 counts, means and centered second moments for the generated and real populations, then computes one distance with unbiased covariances. It requires at least two rows in each population. Its persistent state uses O(D²) memory, independent of the number of batches, plus bounded batch feature and matrix-square-root workspace. A small consumed population does not constitute FID-50k.
+
+JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on its second half. They log the arithmetic mean of batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These diagnostics depend on the batch partition and do not measure a full-dataset probe.
+
+The trainer calls `Objective.preview` once per evaluation event when process zero has a tracker and a coordinated batch exists. LM uses its `Samples` configuration; diffusion draws at most four separate display samples; masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference rather than averaged policy weights. The base preview reuses the first scoring artifacts, retaining JEPA's representation histogram without another encoder pass. Preview draws do not enter scoring metrics. Without metrics, evaluation skips scoring work; without a tracker, it skips preview work.
 
 ## Use a tracker
 
@@ -54,6 +58,10 @@ Training metrics use names under `train/`; reduced validation metrics use `val/`
 
 ## Reproducibility and limits
 
-The current evaluation loop reuses one `Step.key` across validation batches. Repeated unconditional diffusion previews can therefore contain the same samples. Preview generation, scoring cadence, and pass-level generative metrics need separate contracts; these issues are tracked for repair.
+Each event derives its random key from the run key and training step. Scoring batch indices and preview sampling use separate fixed RNG domains. Repeating an event with the same state and batches reproduces its samples, while adding a tracker leaves scoring draws unchanged.
 
-This guide's deterministic token-scoring example does not depend on evaluation sampling. For stochastic evaluation, document the seed, number of distinct generated samples, conditioning data, and reduction method. Do not treat a repeated four-image preview as a larger evaluation set.
+All ranks participate in objective numerical work and global-array gathers. Only process zero computes host metrics, decodes previews and writes tracking output. Host metric kernels use one process-local device. The trainer propagates host failures before the next collective and broadcasts completed scalar results to the other ranks. A dead process, blocked loader or failure inside an in-flight device collective still requires the distributed runtime's timeout and launcher failure handling.
+
+Validation consumes the shortest coordinated shard prefix. If one shard ends before another, remaining local rows do not enter the metrics. The `evaluation/coordinated_batches`, `evaluation/records` and `evaluation/uneven_shards` fields describe the consumed prefix, not necessarily the whole split. The trainer prints the event key alongside those counts. Metric names remain under `val/` and must be unique within a pass. Empty coordinated validation generates no preview and returns no metric values. A nonempty pass with no counted language target raises an error.
+
+Record the seed, consumed generated and real counts, conditioning data, solver, sampling steps, guidance, and feature/preprocessing definition when comparing generative scores. Keep the run configuration with the results.

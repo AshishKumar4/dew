@@ -210,9 +210,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
     assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
 
 
-def test_evaluate_samples_from_the_batch_conditions():
-    """The artifact is `VALIDATION_SAMPLES` images in [-1, 1] captioned with
-    the batch's text, from the averaged weights when the step carries them."""
+def test_scoring_covers_all_conditions_and_preview_decodes_only_its_small_draw():
     objective = make_objective()
     params = objective.init(jax.random.PRNGKey(0))
     batch = make_batch()
@@ -220,12 +218,18 @@ def test_evaluate_samples_from_the_batch_conditions():
 
     artifact = objective.evaluate(params, batch, step)
     assert isinstance(artifact, ImageGrid)
-    assert artifact.images.shape == (VALIDATION_SAMPLES, RES, RES, 3)
-    assert float(artifact.images.min()) >= -1.0 and float(artifact.images.max()) <= 1.0
+    assert artifact.images.shape == (batch[objective.inputs.sample.key].shape[0], RES, RES, 3)
+    assert artifact.captions == ()
+    tokens = {name: batch[condition.field]
+              for name, condition in objective.inputs.conditions.items()}
+    expected = objective._sample(params, tokens, step.key, count=artifact.images.shape[0])
+    np.testing.assert_array_equal(artifact.images, expected)
+    preview = objective.preview(params, batch, step)
     encoder = objective.inputs.conditions["textcontext"].encoder
-    assert artifact.captions == encoder.captions(
+    assert preview.captions == encoder.captions(
         {"input_ids": batch["text"]["input_ids"][:VALIDATION_SAMPLES]})
-    assert len(artifact.captions) == VALIDATION_SAMPLES and artifact.captions[2] == ""
+    assert len(preview.captions) == VALIDATION_SAMPLES and preview.captions[2] == ""
+    assert preview.images.shape == (VALIDATION_SAMPLES, RES, RES, 3)
 
 
 def test_validation_samples_follow_the_step_key():

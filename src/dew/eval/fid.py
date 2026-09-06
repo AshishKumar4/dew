@@ -1,13 +1,17 @@
 import functools
 import warnings
+from dataclasses import dataclass
+
+from numpy.typing import NDArray
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.registry import metrics
-from .common import ImageMetric
+from .common import metric_device
 
 
 @functools.lru_cache(maxsize=None)
@@ -35,9 +39,8 @@ def _sqrtm(product):
 def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     """Frechet distance between two multivariate gaussians.
 
-    Runs on the host through scipy. The matrix square root of the covariance
-    product has no jax equivalent, and FID is computed once per validation
-    batch so the transfer is irrelevant.
+    Runs once per consumed validation pass on the host through scipy. The
+    matrix square root of the covariance product has no JAX equivalent.
     """
 
     mu_a, mu_b = np.atleast_1d(mu_a), np.atleast_1d(mu_b)
@@ -58,9 +61,54 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
     return float(diff.dot(diff) + np.trace(sigma_a) + np.trace(sigma_b) - 2 * np.trace(covmean))
 
 
-def _gaussian_stats(activations):
-    activations = np.asarray(activations, dtype=np.float64)
-    return activations.mean(axis=0), np.cov(activations, rowvar=False)
+@dataclass
+class GaussianStats:
+    """A population's count, float64 mean and centered sum of outer products."""
+
+    count: int
+    mean: NDArray[np.float64]
+    m2: NDArray[np.float64]
+
+    @classmethod
+    def from_features(cls, features, *, population: str) -> "GaussianStats":
+        x = np.asarray(features, dtype=np.float64)
+        if x.ndim != 2 or not np.isfinite(x).all():
+            raise ValueError(f"fid {population}: expected finite [N, D] features")
+        count, width = x.shape
+        mean = x.mean(axis=0) if count else np.zeros(width, dtype=np.float64)
+        centered = x - mean
+        m2 = centered.T @ centered
+        if not np.isfinite(mean).all() or not np.isfinite(m2).all():
+            raise ValueError(f"fid {population}: non-finite feature statistics")
+        return cls(count, mean, m2)
+
+    def merge(self, other: "GaussianStats") -> "GaussianStats":
+        if self.mean.shape != other.mean.shape:
+            raise ValueError("fid: feature dimensions differ between batches")
+        if other.count == 0:
+            return self
+        if self.count == 0:
+            return other
+        count = self.count + other.count
+        delta = other.mean - self.mean
+        self.m2 += other.m2
+        self.m2 += np.outer(delta, delta) * (self.count * other.count / count)
+        self.mean += delta * (other.count / count)
+        self.count = count
+        if not np.isfinite(self.mean).all() or not np.isfinite(self.m2).all():
+            raise ValueError("fid: non-finite pooled feature statistics")
+        return self
+
+    def covariance(self, *, population: str) -> NDArray[np.float64]:
+        if self.count < 2:
+            raise ValueError(f"fid {population}: at least two rows required, got {self.count}")
+        return self.m2 / (self.count - 1)
+
+
+@dataclass
+class FIDStats:
+    generated: GaussianStats
+    real: GaussianStats
 
 
 @functools.lru_cache(maxsize=None)
@@ -85,19 +133,45 @@ def _get_activations():
     return activations
 
 
+@dataclass(frozen=True)
+class FID:
+    """Pooled-population FID with O(D²) pass state and one final distance."""
+
+    field: str = "image"
+    name = "fid"
+    reads = ImageGrid
+    feature_identity = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
+
+    def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
+        with metric_device():
+            activations = _get_activations()
+            generated = GaussianStats.from_features(activations(artifact.images), population="generated")
+            real = GaussianStats.from_features(activations(unit_range(batch[self.field])), population="real")
+        return FIDStats(generated, real)
+
+    def merge(self, accumulated: FIDStats, contribution: FIDStats) -> FIDStats:
+        accumulated.generated = accumulated.generated.merge(contribution.generated)
+        accumulated.real = accumulated.real.merge(contribution.real)
+        return accumulated
+
+    def finalize(self, accumulated: FIDStats) -> float:
+        generated, real = accumulated.generated, accumulated.real
+        if generated.count < 2 or real.count < 2:
+            raise ValueError(
+                "fid generated and real populations require at least two rows each; "
+                f"got generated={generated.count}, real={real.count}")
+        result = frechet_distance(generated.mean, generated.covariance(population="generated"),
+                                  real.mean, real.covariance(population="real"))
+        print(f"FID populations: generated={generated.count}, real={real.count}; "
+              f"features={self.feature_identity}")
+        return result
+
+
 @metrics("fid")
-def fid(field: str = "image") -> ImageMetric:
-    """FID between the sampled images and the batch's, lower is better.
+def fid(field: str = "image") -> FID:
+    """FID of the generated and real populations actually consumed in the pass.
 
-    Per-batch FID is noisy at typical validation batch sizes, so read it as a
-    relative trend across checkpoints. It does not compare with published
-    FID-50k.
+    This is FID-50k only when 50,000 generated and real observations were
+    consumed with the matching feature and preprocessing definition.
     """
-
-    def measure(artifact, batch):
-        activations = _get_activations()
-        mu_gen, sigma_gen = _gaussian_stats(activations(artifact.images))
-        mu_real, sigma_real = _gaussian_stats(activations(unit_range(batch[field])))
-        return frechet_distance(mu_gen, sigma_gen, mu_real, sigma_real)
-
-    return ImageMetric(name="fid", measure=measure)
+    return FID(field)

@@ -1,9 +1,8 @@
 """What an objective's evaluation produces, as typed values.
 
-An objective's `evaluate` returns one of these; a `Tracker` renders it by
-dispatching on the type; a metric is a function of it and the batch. The
-types carry only arrays, so they cross `jit` and say nothing about where
-they will be drawn.
+Objectives return these values from scoring and preview hooks. A metric
+consumes scoring artifacts; a tracker renders previews by type. Array leaves
+cross jit, while optional captions and decoded text remain host metadata.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ class VideoGrid:
 
 @struct.dataclass
 class TextSamples:
-    """Decoded continuations of a prompt, and the token ids they came from."""
+    """Generated token rows, with optional decoded preview text and prompt."""
     tokens: jax.Array
     prompt: str = struct.field(pytree_node=False, default="")
     texts: tuple[str, ...] = struct.field(pytree_node=False, default=())
@@ -57,9 +56,8 @@ class TokenScores:
     weights: jax.Array
 
 
-# `evaluate` returns one artifact or a tuple of them; a tracker renders each
-# by type and a metric picks the type it reads. An LM returns TokenScores
-# every pass and TextSamples when samples are configured.
+# Scoring and preview hooks each return one artifact or a tuple. Metrics
+# pick exactly one scoring artifact by type; previews never satisfy metrics.
 Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
 Artifacts = Artifact | tuple[Artifact, ...]
 

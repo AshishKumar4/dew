@@ -419,8 +419,11 @@ class Batches:
     def __call__(self, artifact, batch):
         return 1.0
 
-    def reduce(self, values):
-        return float(np.sum(values))
+    def merge(self, accumulated, contribution):
+        return accumulated + contribution
+
+    def finalize(self, accumulated):
+        return accumulated
 
 
 def mode_fit(args) -> dict:
@@ -478,11 +481,8 @@ PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the 
 class GlobalMean:
     """A metric that reads a whole batch field with numpy.
 
-    Every shipped image metric pairs its rows with the artifact's, so it only
-    ever reads the leading rows, which come back replicated. A metric is
-    allowed to read the whole field, and on a pool that field is a shard of a
-    global array numpy cannot touch, so this is what pins the contract that
-    the trainer brings the batch home and the number covers the global batch.
+    The trainer gathers every field before metrics run on process zero, so
+    the scalar covers the complete coordinated global batch.
     """
 
     name = "global_mean"
@@ -492,11 +492,15 @@ class GlobalMean:
 
         self.reads = ImageGrid
 
-    def __call__(self, artifact, batch) -> float:
-        return float(np.asarray(batch["image"], np.float64).mean())
+    def __call__(self, artifact, batch) -> tuple[float, int]:
+        values = np.asarray(batch["image"], np.float64)
+        return float(values.sum()), values.size
 
-    def reduce(self, values) -> float:
-        return float(np.mean(values))
+    def merge(self, accumulated, contribution):
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated):
+        return accumulated[0] / accumulated[1]
 
 
 def mode_validate(args) -> dict:
@@ -647,9 +651,119 @@ def mode_pipeline(args) -> dict:
     }
 
 
+def mode_evaluation_contract(args) -> dict:
+    """Tiny all-rank numerical scoring with root-only metrics and previews."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from dew.artifacts import Representations, host
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Trainer
+
+    rank = jax.process_index()
+    events = []
+    closed = []
+
+    class Numerical(Objective):
+        artifact = Representations
+
+        def init(self, key):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, params, batch, step):
+            return jnp.mean((batch["x"] + params["params"]["offset"]) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
+            features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
+                batch["x"], step.key)
+            return Representations(features=features, labels=batch["x"][:, 0])
+
+        def preview(self, params, batch, step, *, scored=None):
+            events.append(["preview", np.asarray(jax.random.key_data(step.key)).tolist()])
+            features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
+                batch["x"], step.key)
+            preview = host(Representations(features=features, labels=batch["x"][:, 0]))
+            if rank == 0 and failure == "preview":
+                raise ValueError("preview decoding failed")
+            return preview
+
+    class Mean:
+        name, reads = "mean", Representations
+
+        def __call__(self, artifact, batch):
+            if rank != 0:
+                raise AssertionError("host metric executed off root")
+            if failure == "metric":
+                raise ValueError("host metric failed")
+            values = np.asarray(artifact.features)
+            assert np.array_equal(artifact.labels, np.arange(8))
+            return float(values.sum()), values.size
+
+        def merge(self, accumulated, contribution):
+            return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+        def finalize(self, accumulated):
+            if failure == "finalize":
+                raise ValueError("metric finalization failed")
+            return accumulated[0] / accumulated[1]
+
+    class Drawing:
+        def log(self, scalars, step):
+            if failure == "log":
+                raise ValueError("tracker logging failed")
+
+        def artifact(self, artifact, step):
+            assert rank == 0
+            if failure == "render":
+                raise ValueError("tracker rendering failed")
+            assert np.shape(artifact.features) == (8, 1)
+
+    def batches():
+        try:
+            count = 0 if failure == "empty" else (
+                1 if failure == "next" or (rank == 0 and failure == "uneven") else 2)
+            for _ in range(count):
+                yield {"x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
+            if failure == "next" and rank == 1:
+                raise OSError("iterator next failed")
+        finally:
+            closed.append(failure)
+
+    def validation():
+        if failure == "construct" and rank == 1:
+            raise OSError("iterator construction failed")
+        return batches()
+
+    objective = Numerical()
+    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
+    state, _, _ = trainer.place()
+    data = Dataset(train=batches, val=validation, records=8, batch=8)
+    results = {}
+    for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
+                    "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
+                    "log", "render", "construct", "next"):
+        events.clear()
+        trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
+        metric = Mean()
+        if failure == "mismatch" and rank == 1:
+            metric.name = "another_metric"
+        scoring = () if failure in ("preview_only", "no_consumer") else (metric,)
+        if failure == "duplicates" and rank == 0:
+            scoring = (metric, metric)
+        try:
+            result = trainer._evaluate(state, data, scoring, trainer.device_mesh, 0)
+            results[failure] = {"scores": result, "events": list(events)}
+        except (ValueError, RuntimeError, OSError) as error:
+            results[failure] = {"error": str(error), "events": list(events)}
+    return {"results": results, "closed": closed}
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
-         "tracked": mode_tracked, "pipeline": mode_pipeline}
+         "tracked": mode_tracked, "pipeline": mode_pipeline,
+         "evaluation_contract": mode_evaluation_contract}
 
 
 def parse_args(argv=None):
