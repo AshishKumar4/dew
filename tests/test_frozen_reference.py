@@ -163,7 +163,9 @@ def test_a_resumed_run_restores_the_frozen_reference(tmp_path):
     """Two steps freeze the reference at init; the checkpoint carries those
     bytes and the resumed run trains on."""
     trainer = make_trainer(tmp_path)
-    initial = frozen_bytes(trainer.initial_state())
+    # The placed init is what fit starts from; the eager init rounds the
+    # random draws differently on a GPU.
+    initial = frozen_bytes(trainer.place()[0])
     trainer.fit(Data(), steps=2, log_every=1)
 
     resumed = make_trainer(tmp_path)
