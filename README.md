@@ -237,16 +237,16 @@ A method can exist at several levels: array-level mathematics, a model component
 
 **Integration work is not released functionality.** FlowGRPO, Gemma 3n vision, rematerialization policies, and revised overflow/accumulation transactions are being implemented or reviewed on development branches. General multi-turn agentic RL, sandbox/tool execution, and a serving system are not complete user workflows in this baseline. GSPO/SAPO, RLVR at scale, newer frontier architectures, and parity with every MaxText/Transformers/Diffusers model are research or implementation targets, not implied by a related primitive. Consult [capabilities and limits](docs/reference/support.md) for the integrated revision you install.
 
-Recent development-branch evidence is narrower than a released workflow:
+Development work remains separate from released functionality:
 
-| Work under integration | Evidence reported for that branch | What it does not establish |
+| Work under integration | Implementation status | Remaining boundary |
 |---|---|---|
-| Gemma 3n vision | A 33×29, 2.14-million-parameter, 84-block GPU comparison: float32 with highest matmul precision, tower maximum difference 2.98e-6 and wrapper difference 4.95e-7 | Default-precision/bfloat16 strict parity, real released weights, or full-size deployment; those precision modes recorded larger errors. |
-| FlowGRPO | A 64-pixel GPU training step and a two-process CPU proof | A merged API, learned reward quality, actor-fleet operation, or multi-host accelerator qualification. |
-| Rematerialization | Reviewed implementation with measured 72–78% lower compiler-reported temporary memory in the measured cases | A 72–78% reduction in total GPU memory, or the same saving/time trade-off for another architecture. |
-| Training transactions | Explicit attempted/accepted/committed counters, loss statistics, scaler state, and partial-window checkpoint work | A claim that the older integrated checkpoint contract already has those fields or guarantees. |
+| Gemma 3n vision | Development-branch tower/wrapper implementation and precision-specific comparisons | Not yet an integrated claim of default-precision/bfloat16 parity, real released weights, or full-size deployment. |
+| FlowGRPO | Development-branch objective/rollout implementation with bounded GPU and local-process exercises | Not yet a merged user API, learned reward-quality result, actor fleet, or multi-host accelerator qualification. |
+| Rematerialization | Reviewed development-branch policy and compiler-memory measurements | Compiler temporary-memory changes are not total GPU-memory savings or a universal time/memory trade-off. |
+| Training transactions | Explicit attempted/accepted/committed counters, loss statistics, scaler state, and partial-window checkpoint work | Older checkpoint layouts do not gain these fields or guarantees until the repair is integrated. |
 
-These results justify further integration and qualification. Use the support page for the commit you run, rather than treating a branch measurement as a release promise.
+Exact branch measurements belong in a committed report identifying the measured revision, configuration, and method. They are omitted here until that report can be linked. Use the [support page](docs/reference/support.md) for the integrated revision you run, rather than treating branch work as a release promise.
 
 ### Model and checkpoint families
 
@@ -568,6 +568,59 @@ Before using multiple hosts, initialize the JAX process pool before creating dev
 
 Dew has XLA attention, a cuDNN path for supported GPU inputs, and a TPU Pallas attention path. Kernel shape/dtype restrictions still apply. [Distributed training](docs/concepts/distributed.md) explains supported combinations and placement details. [The TPU guide](docs/tpu.md) covers CLI previews, permissions, cost, setup, and verification boundaries; `dew-tpu --dry-run` is not a hardware test.
 
+### Adapt the token example to four devices
+
+This complete adaptation trains a small decoder on four FSDP shards and inspects a real embedding parameter after the updates. Save it as `train_four_devices.py`. The command below creates **four simulated CPU devices in one process**; set the environment before importing JAX or opening a backend:
+
+```bash
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 python train_four_devices.py
+```
+
+```python
+import itertools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from dew import Layout, MeshSpec, Trainer, models
+from dew.data import Dataset
+from dew.objectives.lm import LMObjective
+
+row = np.array([1, 2, 3, 4, 1, 2, 3, 4, 1], dtype=np.int32)
+batch = {"text": np.tile(row, (8, 1))}
+data = Dataset(train=lambda: itertools.repeat(batch), val=None,
+               records=8, batch=8)
+model = models.build(
+    "causal_transformer", vocab_size=32, emb_features=16,
+    num_layers=1, num_heads=4, mlp_features=32, max_seq_len=8,
+    dtype=jnp.float32, attention_impl="xla",
+)
+trainer = Trainer(
+    LMObjective(model, seq_len=8), optax.adam(0.001),
+    key=jax.random.key(0),
+    mesh=MeshSpec(fsdp=4),
+    layout=Layout(min_shard=1),
+)
+state = trainer.fit(data, steps=2, log_every=1)
+embedding = state.params["params"]["embed_tokens"]["embedding"]
+embedding.block_until_ready()
+print("Embedding global shape:", embedding.shape)
+print("Embedding placement:", embedding.sharding)
+for shard in embedding.addressable_shards:
+    print("Local shard:", shard.device, "slice:", shard.index,
+          "shape:", shard.data.shape)
+```
+
+The changes from single-device training are the `mesh=MeshSpec(fsdp=4)` and `layout=Layout(min_shard=1)` arguments passed to `Trainer`. The global batch is eight, so the four-device batch placement can assign two rows per device. The vocabulary has 32 entries and the embedding width is 16; under the default logical-axis rules, the vocabulary dimension divides into four groups of eight. The other selected model widths also divide by four.
+
+`min_shard` counts **elements**, not bytes. The normal default is 65,536 elements; this tiny embedding contains only 512, so that default would leave it replicated deliberately. Setting the threshold to one lets this teaching example show real parameter sharding. It is not a performance recommendation for large runs, where communicating many tiny shards can cost more than the memory saved.
+
+The executed CPU program completed two updates, with losses 3.8234 and 3.6756. Its `(32, 16)` embedding had `PartitionSpec('fsdp',)` and four addressable `(8, 16)` slices: vocabulary rows `0:8`, `8:16`, `16:24`, and `24:32`. `addressable_shards` describes actual local array buffers; on multiple hosts it lists only the current process's buffers. This is stronger evidence than merely printing the mesh size, but it remains a local CPU execution, not a four-GPU throughput or inter-host networking result.
+
+On an appropriately configured four-GPU machine, start a fresh process exposing those four devices, select the CUDA backend, and use the same model/mesh/layout arguments. Do not carry the CPU simulation flag into that launch. Check the parameter's placement and local slices again; different model dimensions or logical-axis rules can change which dimension is split. For a two-device adaptation, change `fsdp` to two and expose two devices; the batch/vocabulary dimensions above divide by two as well. That two-device variation was not executed here.
+
 ## Evaluate, checkpoint, resume, and export
 
 ### Evaluation needs data, a schedule, and a consumer
@@ -627,45 +680,7 @@ The [recipe walkthrough](docs/recipes.md) sets up a corpus file, token files, an
 
 You do not need to register a custom objective just to pass it to `Trainer`. Its minimum job is to initialize a Flax variables mapping and describe a differentiable loss. For a simple scalar task, return the scalar and `Aux(metrics=...)`. Optional evaluation and state updates remain explicit.
 
-Here is a complete small objective and dataset, using the same scalar API as ordinary Flax training. It learns `y = 2x + 1`; it is independent of the capability-demo variables:
-
-```python
-import itertools
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-from flax import linen as nn
-
-from dew import Trainer
-from dew.data import Dataset
-from dew.objectives.base import Aux, Objective
-
-
-class Regression(Objective):
-    def __init__(self):
-        self.model = nn.Dense(features=1)
-
-    def init(self, key):
-        return self.model.init(key, jnp.zeros((1, 1), dtype=jnp.float32))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        mse = jnp.mean((prediction - batch["y"]) ** 2)
-        return mse, Aux(metrics={"mse": mse})
-
-
-x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-batch = {"x": x, "y": 2 * x + 1}
-data = Dataset(train=lambda: itertools.repeat(batch), val=None,
-               records=32, batch=32)
-objective = Regression()
-state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
-    data, steps=100, log_every=50)
-prediction = objective.model.apply(state.params, x)
-print("Training MSE:", float(jnp.mean((prediction - batch["y"]) ** 2)))
-```
+The [worked regression comparison](#the-same-training-problem-organized-differently) below includes a complete Dew objective, generated dataset, and training call alongside equivalent PyTorch and Lightning programs. It starts the same affine model from zero weights and bias so framework-specific initializers do not change the problem. The rest of this section explains the extension points that example uses.
 
 The optimizer updates the inner `params` collection. If a Linen call returns mutable collections such as batch statistics, put their replacements in `Aux.variables`; do not use that field to replace optimizer-owned parameters. A frozen encoder can live outside the learned collection, and an `EMASpec` can select the subtree to average.
 
@@ -691,11 +706,182 @@ These tools work at different layers. The comparisons below concern their docume
 
 ### The same training problem, organized differently
 
-For a supervised regression task, **plain PyTorch** usually puts the model call and loss inside a user loop, then calls backward, an optimizer step, and gradient reset. **Lightning** moves task computation into `training_step`, validation into `validation_step`, and optimizer construction into `configure_optimizers`; its trainer handles the surrounding loop. **Dew** puts Flax initialization and loss in an objective, passes the optimizer separately, and returns an explicit updated state. All three can express the same mathematical problem. Fewer visible loop lines do not establish faster computation or less complexity overall.
+The following programs solve the same problem rather than comparing unrelated toy examples:
 
-For language-model fine-tuning, **Transformers Trainer** couples training arguments, a model with the expected forward/loss interface, a data collator, and tokenizer/processor conventions. **Dew** uses compatible translated/built variables, a token/chat dataset, an LM objective, and an Optax optimizer. You must still preserve chat-template, label-shift, padding, and special-token semantics. Dew's smaller API does not replace Transformers' model catalog or mean a checkpoint needs no adaptation.
+| Choice | Identical setting in all three programs |
+|---|---|
+| Data | `np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)`; target `2 * x + 1` |
+| Model | One affine output, `prediction = weight * x + bias`, float32 |
+| Initialization | Weight zero and bias zero; not each framework's different random default |
+| Loss | Mean squared error over all 32 examples |
+| Optimizer | SGD, learning rate 0.1, no momentum or weight decay |
+| Updates | 100 full-batch updates, no gradient accumulation |
+| Other work | CPU, no validation, checkpoints, data shuffling, or pretrained assets |
 
-For diffusion, **Diffusers** documents self-contained, task-specific training scripts whose preprocessing and training loops users can adapt. **Dew** puts process/target construction into `DiffusionObjective` and shares trainer behavior with other modalities. Dew still needs task-specific preprocessing and compatible model/condition/autoencoder choices. Neither a similar solver name nor a matching-looking module is proof of the same complete pipeline.
+**Execution boundary:** the PyTorch and Lightning programs are source-reviewed against the linked [PyTorch optimizer](https://docs.pytorch.org/docs/stable/generated/torch.optim.SGD.html) and [Lightning Trainer](https://lightning.ai/docs/pytorch/stable/core-api/trainer) documentation, but were **not executed** for this guide. The Dew program was executed on CPU and printed a training MSE of about `5.73e-7`. No cross-framework numerical or performance parity is claimed. Matching the mathematical setup does not guarantee bitwise-identical arithmetic.
+
+#### Plain PyTorch: the program owns the update loop
+
+```python
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+x_array = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
+x = torch.from_numpy(x_array)
+y = torch.from_numpy(2 * x_array + 1)
+model = nn.Linear(1, 1, dtype=torch.float32)
+with torch.no_grad():
+    model.weight.zero_()
+    model.bias.zero_()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+for _ in range(100):
+    optimizer.zero_grad(set_to_none=True)
+    loss = F.mse_loss(model(x), y, reduction="mean")
+    loss.backward()
+    optimizer.step()
+
+with torch.no_grad():
+    print("Training MSE:", float(F.mse_loss(model(x), y, reduction="mean")))
+```
+
+Parameters live in the module. The program clears gradients, computes the loss, runs backward, and asks the optimizer to mutate those parameters. `torch.no_grad()` keeps initialization and the final diagnostic outside autograd.
+
+#### Lightning: task hooks, with trainer-owned updates
+
+```python
+import lightning as L
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class Regression(L.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.layer = nn.Linear(1, 1, dtype=torch.float32)
+        with torch.no_grad():
+            self.layer.weight.zero_()
+            self.layer.bias.zero_()
+
+    def forward(self, x):
+        return self.layer(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        return F.mse_loss(self(x), y, reduction="mean")
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=0.1)
+
+
+def main():
+    x_array = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
+    x = torch.from_numpy(x_array)
+    y = torch.from_numpy(2 * x_array + 1)
+    loader = DataLoader(TensorDataset(x, y), batch_size=32,
+                        shuffle=False, num_workers=0)
+    model = Regression()
+    trainer = L.Trainer(
+        accelerator="cpu", devices=1, precision="32-true",
+        max_steps=100, max_epochs=100, accumulate_grad_batches=1,
+        logger=False, enable_checkpointing=False, enable_progress_bar=False,
+        enable_model_summary=False, num_sanity_val_steps=0,
+    )
+    trainer.fit(model, train_dataloaders=loader)
+    model.eval()
+    with torch.no_grad():
+        print("Training MSE:", float(F.mse_loss(model(x), y, reduction="mean")))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+The loader has one full batch per epoch, so 100 epochs allow the requested 100 updates. The model and loss are still PyTorch computation. Lightning handles gradient reset, backward, optimizer stepping, and loop/device state through its trainer; the class supplies the task and optimizer hooks.
+
+#### Dew: objective computation and explicit returned state
+
+Run this complete program in a fresh CPU process, for example with `JAX_PLATFORMS=cpu python regression_dew.py`:
+
+```python
+import itertools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import linen as nn
+
+from dew import Trainer
+from dew.data import Dataset
+from dew.objectives.base import Aux, Objective
+
+
+class Regression(Objective):
+    def __init__(self):
+        self.model = nn.Dense(
+            features=1, dtype=jnp.float32,
+            kernel_init=jax.nn.initializers.zeros,
+            bias_init=jax.nn.initializers.zeros,
+        )
+
+    def init(self, key):
+        return self.model.init(key, jnp.zeros((1, 1), dtype=jnp.float32))
+
+    def loss(self, variables, batch, step):
+        prediction = self.model.apply(variables, batch["x"])
+        mse = jnp.mean((prediction - batch["y"]) ** 2)
+        return mse, Aux(metrics={"mse": mse})
+
+
+x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
+batch = {"x": x, "y": 2 * x + 1}
+data = Dataset(train=lambda: itertools.repeat(batch), val=None,
+               records=32, batch=32)
+objective = Regression()
+state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
+    data, steps=100, log_every=50)
+prediction = objective.model.apply(state.params, x)
+print("Training MSE:", float(jnp.mean((prediction - batch["y"]) ** 2)))
+```
+
+The model describes computation; `init` returns its variables instead of storing mutable learned tensors in the model object. The objective supplies a scalar loss and reports, while `Trainer` differentiates and applies Optax updates. The returned `state.params` is the variables tree used by the final forward pass. All three implementations express the same affine regression update, but organize state and the loop differently. Fewer visible loop lines are not a speed measurement.
+
+### Map a causal-LM row between Transformers and Dew
+
+For language-model fine-tuning, Transformers Trainer combines a model with the expected forward/loss interface, training arguments, and a data collator. Dew combines a compatible decoder, a token/chat dataset, `LMObjective`, and an optimizer. The important translation includes **which target tokens count**, not just the names of the batch fields.
+
+Consider one right-padded document whose IDs are `[11, 12, 13, 14, 0]`: the first two IDs are prompt tokens, the next two are assistant completion tokens, and 0 is padding. The following is a data-layout mapping, not a standalone model script:
+
+| Meaning | Conventional Transformers causal-LM batch | Dew role-masked LM batch |
+|---|---|---|
+| Token IDs | `input_ids = [[11, 12, 13, 14, 0]]` | `text = [[11, 12, 13, 14, 0]]` |
+| Attention padding | `attention_mask = [[1, 1, 1, 1, 0]]` | For this single right-padded causal row, valid earlier targets cannot attend to later padding; packed documents require Dew's segment IDs/positions. A loss mask is not an attention mask. |
+| Counted targets | `labels = [[-100, -100, 13, 14, -100]]` | `text_roles = [[USER, USER, ASSISTANT, ASSISTANT, PAD]]`, using the corresponding `Role` values |
+| Loss configuration | The compatible causal-LM model shifts labels internally and ignores `-100` targets | `LMObjective` with `seq_len=4`, `loss_role=Role.ASSISTANT`, and `pad_id=0` shifts IDs/roles internally |
+| Predictions that count | Position 1 predicts ID 13; position 2 predicts ID 14 | The same two target positions count |
+
+Do not shift Transformers labels a second time when the selected causal model already does so. Do not put `-100` into Dew's `text` IDs: it is a label-ignore sentinel, not a vocabulary entry. A Transformers collator configured for ordinary causal pretraining may create labels for prompt tokens too; completion-only training needs the intended label mask. Left padding, packed documents, and model-specific chat templates require additional attention/position handling beyond this simple row. This mapping was source-reviewed, not executed as an inter-framework parity test.
+
+### Map a Diffusers denoising step to Dew
+
+Diffusers exposes preprocessing and the training loop in its task-specific scripts. In its [unconditional training example](https://github.com/huggingface/diffusers/blob/main/examples/unconditional_image_generation/train_unconditional.py), the epsilon-prediction path samples Gaussian noise and integer timesteps, calls `noise_scheduler.add_noise`, predicts with the model, then computes MSE against the sampled noise. Dew places the corresponding process/target construction in `DiffusionObjective`:
+
+| Step | Diffusers epsilon-prediction example | Dew diffusion objective |
+|---|---|---|
+| Clean input | Preprocessed float image batch, usually `[B, C, H, W]` in `[-1, 1]` | Built-in loaders supply uint8 `[B, H, W, C]`; the objective normalizes it. Latents require the configured autoencoder. |
+| Random draw | A noise tensor plus integer timesteps from the scheduler's training range | Split `Step.key`; draw noise and times through the selected process schedule |
+| Corruption | `noise_scheduler.add_noise(clean_images, noise, timesteps)` | The prediction transform's `forward_diffusion` produces noisy input, input preconditioning, and target from schedule rates |
+| Model call | `model(noisy_images, timesteps).sample` | Flax `model.apply` receives preconditioned noisy input, `schedule.model_time(t)`, and configured conditions |
+| Target/loss | In the epsilon branch, unweighted `F.mse_loss(prediction, noise)` | The chosen prediction transform and weighting determine the target and weighted loss |
+| Parameter update | The script/Accelerate performs backward, clipping, optimizer stepping, and optional EMA | `Trainer` performs differentiation, the selected optimizer, and the objective's EMA update |
+
+This maps responsibilities, **not interchangeable defaults**. Match alpha/sigma schedules, discrete timestep indexing or continuous time, prediction type, input/output preconditioning, weighting, and loss normalization before expecting equivalent updates. Dew's squared-error primitive uses the Optax `0.5 * error**2` convention, while the shown Diffusers MSE branch uses `error**2`; even that factor must be accounted for in a numerical comparison. The practical Dew example above uses EDM, not the Diffusers script's default linear-beta epsilon configuration. The Diffusers code was source-reviewed and not executed here.
 
 **MaxText** is the closer JAX training comparison, and it now documents Flax NNX, broad model work, scalable pretraining, and post-training including SFT/GRPO/GSPO. Dew uses Linen and exposes a common objective boundary across several modalities. It does not inherit MaxText's engineering or deployment evidence by implementing similar mesh axes, optimizers, or model components. MaxText itself distinguishes supported releases from its evolving main branch; compare specific revisions and workloads.
 
@@ -703,7 +889,7 @@ For diffusion, **Diffusers** documents self-contained, task-specific training sc
 
 ## Installation options and learning paths
 
-The distribution name is `dew-ml`; imports use `dew`. The project declares Python 3.11 or newer. The demo above was exercised with the project's Python 3.12 environment. Use a virtual environment and record resolved dependency versions for work you need to reproduce.
+The distribution name is `dew-ml`; imports use `dew`. The project currently declares Python 3.11 or newer, and the demonstrated programs used the project's Python 3.12 environment. That declared compatibility floor is not a claim that 3.11 is the newest or optimal baseline; the supported baseline is under review. Use a virtual environment and record resolved dependency versions for work you need to reproduce.
 
 For package-only use rather than editing a checkout:
 
