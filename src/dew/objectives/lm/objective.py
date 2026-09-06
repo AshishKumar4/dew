@@ -123,6 +123,26 @@ def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
     return found
 
 
+def _global_qk_max(qk) -> jax.Array | None:
+    """The largest per-head maximum anywhere in the sowed `qk` dict, None
+    when no layer sowed one."""
+    found: list[jax.Array] = []
+
+    def visit(node) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if "max_logits" in node:
+            logged = node["max_logits"]
+            found.append(jnp.max(
+                logged[0] if isinstance(logged, (tuple, list)) else logged))
+            return
+        for value in node.values():
+            visit(value)
+
+    visit(qk)
+    return jnp.max(jnp.stack(found)) if found else None
+
+
 @objectives("lm")
 class LMObjective(Objective):
     """Shifted cross entropy; evaluation scores tokens and writes text."""
@@ -144,6 +164,7 @@ class LMObjective(Objective):
         seq_aux: bool = True,
         loss_role: Role | None = None,
         mtp_weight: Optional[float] = None,
+        qk_stats: bool = False,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
         in; the `[tokens, vocab]` logits are built one slice at a time. Four costs
@@ -176,7 +197,12 @@ class LMObjective(Objective):
         (arXiv 2412.19437, eq. 24). The training loss adds that times the
         mean over the model's prediction depths of each depth's cross
         entropy, so the model needs `num_nextn_predict_layers` above zero.
-        Unset leaves the term out and the depths untrained."""
+        Unset leaves the term out and the depths untrained.
+
+        `qk_stats` opens the `qk` collection the attention layers sow their
+        per-head logit maxima under, and reports them for the optimizer's
+        QK-Clip; the recipe sets it when the optimizer is `muonclip`. Unset
+        leaves the collection closed, which costs no extra matmul."""
         self.model = model
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -202,6 +228,7 @@ class LMObjective(Objective):
                     f"mtp_weight is a positive weight on the term, got {mtp_weight}; "
                     "None leaves the term out")
         self.mtp_weight = mtp_weight
+        self.qk_stats = qk_stats
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
         if samples is not None:
@@ -218,13 +245,14 @@ class LMObjective(Objective):
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
-                     depths: bool = False, roles=None):
+                     depths: bool = False, roles=None, qk_stats: bool = False):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns the `[B, seq_len]` losses, the weight of each target (1 where
         it counts), whether each prediction was right, what the routers
-        sowed when `routing` asked for it, and the prediction depths' losses
-        and weights when `depths` asked for them.
+        sowed when `routing` asked for it, the prediction depths' losses
+        and weights when `depths` asked for them, and the attention layers'
+        per-head logit maxima when `qk_stats` asked for them.
 
         A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
@@ -245,13 +273,18 @@ class LMObjective(Objective):
             packing["positions"] = positions[:, :-1]
         if segment_ids is not None:
             packing["segment_ids"] = segment_ids[:, :-1]
+        collections = (["router"] if routing else []) + (["qk"] if qk_stats else [])
         hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
                                   method=type(self.model).hidden_states,
-                                  mutable=["router"] if routing else False, **packing)
+                                  mutable=collections or False, **packing)
         sown = None
-        if routing:
-            hidden, sown = hidden
-            sown = sown.get("router", {})
+        qk = None
+        if collections:
+            hidden, gathered = hidden
+            if routing:
+                sown = gathered.get("router", {})
+            if qk_stats:
+                qk = gathered.get("qk")
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
         losses, predicted = chunked_cross_entropy(
@@ -276,11 +309,14 @@ class LMObjective(Objective):
             states = self.model.apply(
                 params, hidden, inputs, train=train, rngs=rngs,
                 method=type(self.model).mtp_hidden_states,
-                mutable=["router"] if routing else False, **packing)
-            if routing:
+                mutable=collections or False, **packing)
+            if collections:
                 # A routed depth balances and counts like a trunk layer.
                 states, depth_sown = states
-                sown = {**(sown or {}), **depth_sown.get("router", {})}
+                if routing:
+                    sown = {**(sown or {}), **depth_sown.get("router", {})}
+                if qk_stats:
+                    qk = {**(qk or {}), **depth_sown.get("qk", {})}
             for depth, state in enumerate(states, start=1):
                 depth_losses, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
@@ -288,7 +324,7 @@ class LMObjective(Objective):
                     precision=self.model.precision)
                 depth_scores.append((depth_losses, self._target_weights(
                     targets[:, depth:], segment_ids, losses.dtype, depth)))
-        return losses, weights, correct, sown, depth_scores
+        return losses, weights, correct, sown, depth_scores, qk
 
     def per_token_log_probs(self, params, tokens):
         """Next-token log-probabilities, negated cross entropies, over a
@@ -331,11 +367,12 @@ class LMObjective(Objective):
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
-        losses, weights, correct, routing, depths = self.token_scores(
+        losses, weights, correct, routing, depths, qk = self.token_scores(
             params, tokens, train=True, rngs={"dropout": step.key},
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
-            depths=self.mtp_weight is not None, roles=self._batch_roles(batch))
+            depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
+            qk_stats=self.qk_stats)
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -375,7 +412,13 @@ class LMObjective(Objective):
             balanced, load = balance(ran, routing, rate)
             reported.update(load)
             variables = {"moe": {**moe, **balanced}}
-        return loss, Aux(reported, variables)
+        stats = None
+        if self.qk_stats:
+            peak = _global_qk_max(qk)
+            if peak is not None:
+                reported["qk/max_logit"] = peak
+            stats = qk
+        return loss, Aux(reported, variables, stats)
 
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced token scores, plus the sampled text when asked for.
@@ -407,7 +450,7 @@ class LMObjective(Objective):
     def _scored(self):
         """The teacher-forced scores, compiled once per objective."""
         def scored(params, tokens, segment_ids, positions, roles):
-            losses, weights, _, _, _ = self.token_scores(
+            losses, weights, _, _, _, _ = self.token_scores(
                 params, tokens, segment_ids=segment_ids, positions=positions,
                 roles=roles)
             return losses, weights

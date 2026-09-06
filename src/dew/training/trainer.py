@@ -299,7 +299,16 @@ class Trainer:
                     state.params["params"])
                 finite = None
 
-            updates, opt_state = optimizer.update(grads, state.opt_state, state.params["params"])
+            # The QK-Clip's per-head maxima ride in as an extra arg where the
+            # optimizer declares it takes them. Plain optax transforms take
+            # the update as always.
+            if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+                updates, opt_state = optimizer.update(
+                    grads, state.opt_state, state.params["params"],
+                    qk_stats=aux.qk_stats)
+            else:
+                updates, opt_state = optimizer.update(
+                    grads, state.opt_state, state.params["params"])
             params = write_back(
                 {**state.params, "params": optax.apply_updates(state.params["params"], updates)},
                 aux.variables)
