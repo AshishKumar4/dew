@@ -820,6 +820,9 @@ def gemma4_vision_tiny_system(seed: int = 1234):
         last = tower(pixel_values=torch.from_numpy(pixels),
                      pixel_position_ids=torch.from_numpy(positions),
                      return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    # The trunk strips padding with a boolean mask, which flattens the batch;
+    # the fixture has no padding, so the reshape back is the same tokens.
+    last = last.reshape(BATCH, -1, vconf.hidden_size)
     projector = Gemma4MultimodalEmbedder(
         vconf, SimpleNamespace(hidden_size=G4V_TEXT_WIDTH))
     scatter_weights(projector, seed + 1)
