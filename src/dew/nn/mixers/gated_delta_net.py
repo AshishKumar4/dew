@@ -37,6 +37,8 @@ class GatedDeltaNetMixer(MixerBase):
     output_gate_type: str = 'silu'
 
     def build(self, ctx: MixerContext):
+        if not ctx.causal:
+            raise ValueError("gated_delta_net requires causal=True; its recurrence has no bidirectional mode")
         from dew.nn.linear import GatedDeltaNet, CHUNK_SIZE
 
         return functools.partial(

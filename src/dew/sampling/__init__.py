@@ -5,7 +5,7 @@ from .solvers import (
 )
 from .guidance import CFG
 from .sample import sample
-from .text import generate
+from .text import Generation, Sampling, generate
 from .pipelines import TextToImage
 
 __all__ = [
@@ -20,5 +20,6 @@ __all__ = [
     "CFG",
     "sample",
     "generate",
+    "Generation", "Sampling",
     "TextToImage",
 ]

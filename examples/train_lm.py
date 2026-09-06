@@ -17,7 +17,7 @@ from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 import dew.nn.backbones  # registers the models
 from dew.registry import models
-from dew.sampling import generate
+from dew.sampling import Sampling, generate
 from dew.training import Checkpoints, Trainer
 
 
@@ -48,7 +48,7 @@ def main(config: Config):
                          max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
                          dtype="bfloat16")
     objective = LMObjective(model, config.sequence_length,
-                            samples=Samples(prompt, config.sample_tokens, temperature=0.8, top_k=40,
+                            samples=Samples(prompt, config.sample_tokens, sampling=Sampling(temperature=0.8, top_k=40),
                                             decode=tokenizer.decode))
 
     trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
@@ -56,7 +56,7 @@ def main(config: Config):
     state = trainer.fit(data, steps=steps, log_every=50)
 
     tokens = generate(model, state.averaged, jnp.asarray([prompt], jnp.int32),
-                      config.sample_tokens, key=jax.random.key(1), temperature=0.8, top_k=40)
+                      config.sample_tokens, key=jax.random.key(1), sampling=Sampling(temperature=0.8, top_k=40)).tokens
     text = tokenizer.decode(tokens[0])
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)

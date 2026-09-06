@@ -24,6 +24,7 @@ import tyro
 from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
+from dew.sampling import Sampling
 from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
 from dew.training.quantization import Quantization, apply_quantization
@@ -184,11 +185,8 @@ def build_samples(config: LmRunConfig) -> Optional[Samples]:
     tokenizer = build_tokenizer(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
-        max_new_tokens=config.sample_tokens,
-        temperature=0.8,
-        top_k=40,
-        decode=tokenizer.decode,
-    )
+        max_new_tokens=config.sample_tokens, sampling=Sampling(temperature=0.8, top_k=40),
+        decode=tokenizer.decode)
 
 
 def run_summary(config: LmRunConfig, fields: dict) -> dict:

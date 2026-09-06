@@ -1,14 +1,4 @@
-"""Sampling rollouts for online RL.
-
-A `SampledRollout` is a `dew.training.Rollout`: it takes the trainer's
-prompt batch, samples `groups` completions per prompt with
-`dew.sampling.generate`, scores each completion with `reward`, and packs the
-fixed-shape batch the RL objectives read. Everything runs on the host outside
-`jit` with the state's live parameters, including the old log-probabilities,
-which come from the objective's own head over the concatenation. The
-advantage family is a value: group for GRPO's leave-in mean, RLOO for the
-leave-one-out mean, from `dew.rl`.
-"""
+"""Host-side grouped rollouts with sampling-policy likelihoods."""
 
 from __future__ import annotations
 
@@ -22,134 +12,99 @@ import numpy as np
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.rl import group_advantage, rloo_advantage
+from dew.sampling.text import Sampling, generate
 
 from ..lm import LMObjective
 
 Reward: TypeAlias = Callable[[str, str, str, str], float]
-"""A reward call: `reward(data_source, completion, ground_truth, extra_info)`
-is the score of one completion, a plain float the rollout writes into the
-`rewards` column."""
+"""Score ``(data_source, completion, ground_truth, extra_info)``."""
 
 IDS_KEY = "input_ids"
-"""Batch key holding the `[N, prompt + response]` concatenation, prompts
-left-padded and groups contiguous inside each prompt row."""
-
 RESPONSE_MASK_KEY = "response_mask"
-"""Batch key holding the `[N, response]` completion marks."""
-
+RESPONSE_LENGTH_KEY = "response_length"
+TERMINATED_KEY = "terminated"
 OLD_LOG_PROBS_KEY = "old_log_probs"
-"""Batch key holding the `[N, response]` log-probabilities under the sampling
-policy."""
+"""Raw model-policy log-probabilities recorded before the training update.
 
+GRPO's PPO ratio compares current raw policy to this old raw policy. These
+values do not describe the behavior distribution after temperature/top-k.
+"""
+BEHAVIOR_LOG_PROBS_KEY = "behavior_log_probs"
+"""Actual sampling log-probabilities, including temperature/top-k and greedy selection."""
 ADVANTAGES_KEY = "advantages"
-"""Batch key holding the `[N, response]` advantages broadcast over the width."""
-
 REWARDS_KEY = "rewards"
-"""Batch key holding the `[N]` scalar reward of each completion."""
 
 
 def _texts(rows: np.ndarray) -> list[str]:
-    """Fixed-width UTF-8 byte rows back to strings. The rows are int32, so
-    each value becomes one byte; reading the raw buffer would pad every
-    byte with three zeros."""
+    """Decode fixed-width UTF-8 byte rows stored as int32."""
     return [bytes(row[row != 0].astype(np.uint8)).decode("utf-8")
             for row in np.asarray(rows, np.int32)]
 
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
-    """G completions per prompt, scored and advantaged.
+    """G completions per prompt, in prompt-major group order.
 
-    `objective` is the RL objective training the run; its head rescores the
-    concatenation for `old_log_probs`, so the trainer holds one objective for
-    rollout and loss, with `seq_len` one below the prompt width plus
-    `max_new_tokens`. `decode` renders ids for the reward call; the default
-    joins the raw ids, which suits rewards that read ids. `eos_id` stops the
-    response mask after the first stop token; None runs every row to
-    `max_new_tokens`. Rows keep the prompt order, groups contiguous inside a
-    row, and every leaf holds full-bleed rectangles: prompts at their
-    left-padded width, responses at `max_new_tokens`, advantages broadcast
-    over the response width.
+    EOS is a valid action in the response mask but excluded from reward text.
+    Output rectangles preserve the input prompt width and configured response
+    budget. Likelihoods come from the cached model at each sampled action.
     """
 
     objective: LMObjective
     reward: Reward
-    decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(
-        str(token) for token in ids)
+    decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids)
     groups: int = 4
     max_new_tokens: int = 32
     sample: str = "group"
-    eos_id: int | None = None
-    temperature: float = 1.0
+    sampling: Sampling = Sampling()
 
     def __post_init__(self) -> None:
         if self.groups < 2:
-            raise ValueError(
-                f"groups is {self.groups}: an advantage needs at least two completions")
+            raise ValueError(f"groups is {self.groups}: an advantage needs at least two completions")
         if self.max_new_tokens < 1:
-            raise ValueError(
-                f"max_new_tokens is {self.max_new_tokens}: a rollout generates "
-                "at least one token")
+            raise ValueError("a rollout generates at least one token")
         if self.sample not in ("group", "rloo"):
-            raise ValueError(
-                f"sample is {self.sample!r}: the advantage families are 'group' and 'rloo'")
+            raise ValueError("the advantage families are 'group' and 'rloo'")
 
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
-        from dew.sampling import generate
-
-        prompts = np.asarray(batch[PROMPT_KEY], np.int32)
-        prompt_length = np.asarray(batch[LENGTH_KEY], np.int32).reshape(-1)
-        sources = _texts(batch[SOURCE_KEY])
-        truths = _texts(batch[TRUTH_KEY])
-        infos = _texts(batch[INFO_KEY])
+        prompts = np.asarray(batch[PROMPT_KEY])
+        prompt_lengths = np.asarray(batch[LENGTH_KEY])
+        sources, truths, infos = (_texts(batch[name]) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
         rows, width = prompts.shape
         if width + self.max_new_tokens != self.objective.seq_len + 1:
-            raise ValueError(
-                f"the concatenation is {width + self.max_new_tokens} ids wide for a "
-                f"seq_len {self.objective.seq_len} objective; size the objective "
-                "one below the prompt width plus max_new_tokens")
-
-        completions = [
-            np.asarray(generate(
-                self.objective.model, state.params, prompts, self.max_new_tokens,
-                key=jax.random.fold_in(key, group), temperature=self.temperature))
-            [:, width:width + self.max_new_tokens]
-            for group in range(self.groups)]
-        sampled = np.stack(completions, axis=1)
-        rewards = np.asarray(
-            [[self.reward(sources[row],
-                          self.decode([int(token) for token in sampled[row, group]]),
-                          truths[row], infos[row])
-              for group in range(self.groups)] for row in range(rows)], np.float32)
+            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
+        generated = [generate(
+            self.objective.model, state.params, prompts, self.max_new_tokens,
+            key=jax.random.fold_in(key, group), sampling=self.sampling,
+            prompt_lengths=prompt_lengths) for group in range(self.groups)]
+        sampled = np.stack([np.asarray(result.tokens)[:, width:] for result in generated], axis=1)
+        lengths = np.stack([np.asarray(result.lengths) for result in generated], axis=1)
+        terminated = np.stack([np.asarray(result.terminated) for result in generated], axis=1)
+        raw = np.stack([np.asarray(result.raw_log_probs) for result in generated], axis=1)
+        behavior = np.stack([np.asarray(result.behavior_log_probs) for result in generated], axis=1)
+        rewards = np.asarray([
+            [self.reward(sources[row], self.decode(sampled[row, group,
+                         :int(lengths[row, group]) - int(terminated[row, group])].tolist()),
+                         truths[row], infos[row]) for group in range(self.groups)]
+            for row in range(rows)], np.float32)
         flat = jnp.asarray(rewards.reshape(-1))
-        raw = (group_advantage(flat, self.groups) if self.sample == "group"
-               else rloo_advantage(flat, self.groups))
-        advantages = np.asarray(raw, np.float32)
+        advantages = np.asarray(
+            group_advantage(flat, self.groups) if self.sample == "group"
+            else rloo_advantage(flat, self.groups), np.float32)
+        mask = np.arange(self.max_new_tokens)[None, None, :] < lengths[..., None]
+        full = np.concatenate([
+            np.broadcast_to(prompts[:, None, :], (rows, self.groups, width)), sampled], axis=-1)
+        repeated_lengths = np.repeat(prompt_lengths, self.groups)
 
-        if self.eos_id is None:
-            mask = np.ones((rows, self.groups, self.max_new_tokens), np.float32)
-        else:
-            # A response counts through its first stop token. The shifted
-            # cumulative sum is zero exactly there, one or more after.
-            stopped = (sampled == self.eos_id)
-            mask = ((np.cumsum(stopped, axis=-1) - stopped) == 0).astype(np.float32)
-
-        full = np.concatenate(
-            [np.broadcast_to(prompts[:, None, :], (rows, self.groups, width)),
-             sampled], axis=-1)
-        # Position p of the concatenation predicts the token at p + 1, so the
-        # response starts at the prompt width minus one.
-        old = np.asarray(self.objective.per_token_log_probs(
-            state.params, full.reshape(-1, full.shape[-1])),
-            np.float32).reshape(rows, self.groups, -1)[:, :, width - 1:width - 1 + self.max_new_tokens]
         return {
             IDS_KEY: full.reshape(-1, full.shape[-1]),
-            RESPONSE_MASK_KEY: mask.reshape(-1, self.max_new_tokens),
-            OLD_LOG_PROBS_KEY: old.reshape(-1, self.max_new_tokens),
-            ADVANTAGES_KEY: np.broadcast_to(
-                advantages.reshape(rows, self.groups)[..., None],
-                (rows, self.groups, self.max_new_tokens)).reshape(-1, self.max_new_tokens),
+            RESPONSE_MASK_KEY: mask.reshape(-1, self.max_new_tokens).astype(np.float32),
+            RESPONSE_LENGTH_KEY: lengths.reshape(-1),
+            TERMINATED_KEY: terminated.reshape(-1),
+            OLD_LOG_PROBS_KEY: raw.reshape(-1, self.max_new_tokens),
+            BEHAVIOR_LOG_PROBS_KEY: behavior.reshape(-1, self.max_new_tokens),
+            ADVANTAGES_KEY: np.broadcast_to(advantages[:, None],
+                                           (rows * self.groups, self.max_new_tokens)),
             REWARDS_KEY: rewards.reshape(-1),
-            LENGTH_KEY: np.broadcast_to(
-                prompt_length[:, None], (rows, self.groups)).reshape(-1),
+            LENGTH_KEY: repeated_lengths,
         }
