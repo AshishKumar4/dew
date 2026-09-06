@@ -846,3 +846,54 @@ def test_a_corrupt_zone_cache_is_named_rather_than_emptied(fake):
     (config_dir() / "zones.json").write_text("{not json")
     with pytest.raises(ValueError, match="zones.json.*delete it"):
         tpu_config.cached_zone("slice")
+
+
+def _write_process_zone_cache(directory, worker):
+    import os
+    from dew.cli import config
+
+    os.environ["DEW_CONFIG_DIR"] = directory
+    for index in range(12):
+        config.cache_zone(f"slice-{worker}-{index}", "us-central2-b")
+    config.forget_zone(f"old-{worker}")
+
+
+def test_zone_cache_preserves_parallel_process_updates(tmp_path, monkeypatch):
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    directory = tmp_path / "zones"
+    monkeypatch.setenv("DEW_CONFIG_DIR", str(directory))
+    for worker in range(3):
+        tpu_config.cache_zone(f"old-{worker}", "us-east1-d")
+    with ProcessPoolExecutor(max_workers=3, mp_context=multiprocessing.get_context("spawn")) as pool:
+        futures = [pool.submit(_write_process_zone_cache, str(directory), worker)
+                   for worker in range(3)]
+        for future in futures:
+            future.result(timeout=30)
+    expected = {f"slice-{worker}-{index}": "us-central2-b"
+                for worker in range(3) for index in range(12)}
+    assert json.loads((directory / "zones.json").read_text()) == expected
+
+
+def test_zone_cache_readers_never_observe_partial_writes(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    directory = tmp_path / "zones"
+    monkeypatch.setenv("DEW_CONFIG_DIR", str(directory))
+    tpu_config.cache_zone("stable", "us-east1-d")
+    start = Barrier(4)
+
+    def write_and_read(worker):
+        start.wait(timeout=10)
+        for index in range(24):
+            tpu_config.cache_zone(f"slice-{worker}-{index}", "us-central2-b")
+            assert tpu_config.cached_zone("stable") == "us-east1-d"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(write_and_read, range(4)))
+    expected = {f"slice-{worker}-{index}": "us-central2-b"
+                for worker in range(4) for index in range(24)}
+    expected["stable"] = "us-east1-d"
+    assert json.loads((directory / "zones.json").read_text()) == expected
