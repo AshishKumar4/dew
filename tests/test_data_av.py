@@ -114,3 +114,15 @@ def test_a_video_without_audio_is_refused(tmp_path):
     silent = _clip(tmp_path, name="silent.mkv", audio=False)
     with pytest.raises(ValueError, match="does not contain any stream"):
         read_av_random_clip(silent, num_frames=8, audio_padding=2, seed=0)
+
+
+def test_a_missing_decoded_frame_reports_its_time(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import moviepy
+
+    video = SimpleNamespace(duration=2.0, get_frame=lambda timestamp: None)
+    monkeypatch.setattr(moviepy, "VideoFileClip",
+                        lambda path, audio: nullcontext(video))
+    with pytest.raises(ValueError, match="missing.mp4 returned no video frame at"):
+        read_av_random_clip("missing.mp4", num_frames=1, audio_padding=0, seed=0)

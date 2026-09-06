@@ -21,8 +21,10 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -e '.[test]'
+uv pip install -e '.[test,av,tfds,metrics]'
 ```
+
+This development install includes optional data and metric packages so full-source type checking can resolve their imports. CI uses the same extras. Ordinary users can start with the smaller base installation above.
 
 ## Check the environment
 
