@@ -41,7 +41,9 @@ def test_a_bf16_dit_predicts_in_fp32(rng):
                       mlp_ratio=2, dtype=jnp.bfloat16)
     x, temb, textcontext = small_inputs(rng)
     params = model.init(rng, x, temb, textcontext)
-    assert model.apply(params, x, temb, textcontext).dtype == jnp.float32
+    out = model.apply(params, x, temb, textcontext)
+    assert out.dtype == jnp.float32
+    assert jnp.all(jnp.isfinite(out))
 
 
 @pytest.mark.parametrize("architecture, extra", [

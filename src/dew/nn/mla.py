@@ -32,11 +32,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
-# The backbone holds the norm and rotary primitives, and it imports the
-# mixers package, whose hub imports this module; a module reference read at
-# build time completes in either import order.
-from dew.nn.backbones import causal_transformer as backbone
+from dew.nn.attention import (
+    RMSNorm, apply_rotary, causal_attention_mask, rotary_freqs,
+    scaled_dot_product_attention,
+)
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import logical_axes
 
@@ -141,7 +140,7 @@ def mla_rope_freqs(positions, head_dim: int, theta: float,
     does.
     """
     if yarn is None:
-        return backbone.rotary_freqs(positions, head_dim, theta)
+        return rotary_freqs(positions, head_dim, theta)
     inv_freq = yarn_inv_freq(head_dim, theta, yarn)
     positions = jnp.asarray(positions, jnp.float32)
     if positions.ndim == 1:
@@ -344,7 +343,7 @@ class SparseIndexer(nn.Module):
         what the reference's `update_indexer` ordering does.
         """
         k_rot, k_pass = jnp.split(keys, [self.rope_head_dim], axis=-1)
-        k_rot = backbone.apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
+        k_rot = apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
         return jnp.concatenate([k_rot[:, :, 0, :], k_pass], axis=-1)
 
     def select(self, hidden, q_resid, keys, freqs_cos, freqs_sin, mask):
@@ -363,7 +362,7 @@ class SparseIndexer(nn.Module):
             batch, length, self.n_heads, self.head_dim)
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
-            [backbone.apply_rotary(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+            [apply_rotary(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
         scores = jnp.matmul(
             query.astype(jnp.float32),
             jnp.expand_dims(keys.astype(jnp.float32).transpose(0, 2, 1), -3))
@@ -451,7 +450,7 @@ class MultiHeadLatentAttention(nn.Module):
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
             precision=self.precision)
         norm = functools.partial(
-            backbone.RMSNorm, epsilon=self.norm_eps,
+            RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
         if self.q_lora_rank is None:
@@ -523,7 +522,7 @@ class MultiHeadLatentAttention(nn.Module):
     def _rotate(self, part, freqs_cos, freqs_sin):
         if self.rope_interleave:
             return apply_rotary_interleave(part, freqs_cos, freqs_sin)
-        return backbone.apply_rotary(part, freqs_cos, freqs_sin)
+        return apply_rotary(part, freqs_cos, freqs_sin)
 
     def _expand(self, latent, rot):
         """Latent and rope head into per-head keys and values."""

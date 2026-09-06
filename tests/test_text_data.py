@@ -22,6 +22,7 @@ import pytest
 from dew.data import ByteTokenizer, Loading, PackedTokens, TokenWindows
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.nn.backbones import causal_transformer as backbone
+from dew.nn.mixers import attention as attention_kind
 from dew.objectives.lm import LMObjective
 from dew.training import Step
 
@@ -85,14 +86,14 @@ def test_byte_tokenizer_is_utf8_bytes_with_a_256_vocab():
     assert tok.vocab_size == 256
     assert tok.encode("A") == [0x41]
     assert tok.encode("é") == [0xC3, 0xA9]  # two utf-8 bytes, not one id
-    assert isinstance(tok.eos_id, int)
+    assert tok.eos_id == 255
 
 
 def test_byte_tokenizer_decode_tolerates_junk_bytes():
     # Generated ids will land on invalid utf-8 sequences; the model still
     # needs text out of them, not an exception.
     tok = ByteTokenizer()
-    assert isinstance(tok.decode([0xFF, 0xFE, 0x41]), str)
+    assert tok.decode([0xFF, 0xFE, 0x41]) == chr(0xFFFD) * 2 + "A"
 
 
 # ---------------------------------------------------------------------------------
@@ -763,7 +764,7 @@ def _attention_mask(batch, monkeypatch):
     right; rebuilding it from the segment ids here would test the test.
     """
     seen = []
-    kernel = backbone.scaled_dot_product_attention
+    kernel = attention_kind.scaled_dot_product_attention
 
     def recording_kernel(query, key, value, **kwargs):
         seen.append(kwargs.get("mask"))
@@ -773,7 +774,7 @@ def _attention_mask(batch, monkeypatch):
     model = _tiny_backbone(tokens.shape[1])
     params = model.init(jax.random.PRNGKey(0), tokens)
 
-    monkeypatch.setattr(backbone, "scaled_dot_product_attention", recording_kernel)
+    monkeypatch.setattr(attention_kind, "scaled_dot_product_attention", recording_kernel)
     model.apply(params, tokens,
                 positions=jnp.asarray(batch["text_positions"][:, :-1]),
                 segment_ids=jnp.asarray(batch["text_segment_ids"][:, :-1]))
