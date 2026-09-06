@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -147,7 +148,7 @@ def test_the_loss_composes_the_term_over_head_log_probs():
     batch = pair_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, aux = objective.loss(params, batch, step)
+    loss, aux = scalar_loss(objective, params, batch, step)
 
     chosen_ids, rejected_ids, chosen_mask, rejected_mask = flat(batch)
     stack = np.concatenate([chosen_ids, rejected_ids])
@@ -172,12 +173,9 @@ def test_the_reference_comes_from_the_frozen_tree():
     moved = jax.tree.map(lambda leaf: leaf + 1.0, frozen)
     batch = pair_batch()
 
-    base, _ = objective.loss(
-        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    live_moved, _ = objective.loss(
-        moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
-    ref_moved, _ = objective.loss(
-        params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved))
+    base, _ = scalar_loss(objective, params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
+    live_moved, _ = scalar_loss(objective, moved, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen))
+    ref_moved, _ = scalar_loss(objective, params, batch, Step(step=jnp.asarray(0), key=jax.random.key(1), ema=moved))
 
     assert abs(float(live_moved) - float(base)) > 1e-3
     assert abs(float(ref_moved) - float(base)) > 1e-3
@@ -194,10 +192,10 @@ def test_swapped_halves_change_the_loss():
     batch = pair_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, _ = objective.loss(moved, batch, step)
+    loss, _ = scalar_loss(objective, moved, batch, step)
     swapped = {IDS_KEY: batch[IDS_KEY][:, ::-1, :],
                MASK_KEY: batch[MASK_KEY][:, ::-1, :]}
-    flipped, _ = objective.loss(moved, swapped, step)
+    flipped, _ = scalar_loss(objective, moved, swapped, step)
 
     assert abs(float(flipped) - float(loss)) > 1e-4
 
@@ -236,23 +234,23 @@ def test_a_misshapen_batch_is_refused():
     flat_batch = {IDS_KEY: batch[IDS_KEY].reshape(-1, WIDTH),
                   MASK_KEY: batch[MASK_KEY].reshape(-1, WIDTH)}
     with pytest.raises(ValueError, match="holds pairs"):
-        objective.loss(params, flat_batch, step)
+        scalar_loss(objective, params, flat_batch, step)
 
     short = {IDS_KEY: batch[IDS_KEY][:, :, :4], MASK_KEY: batch[MASK_KEY][:, :, :4]}
     with pytest.raises(ValueError, match="6 ids per row"):
-        objective.loss(params, short, step)
+        scalar_loss(objective, params, short, step)
 
     wide = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY][:, :, :4]}
     with pytest.raises(ValueError, match="one mark per token"):
-        objective.loss(params, wide, step)
+        scalar_loss(objective, params, wide, step)
 
     bare = {IDS_KEY: batch[IDS_KEY]}
     with pytest.raises(ValueError, match="completion_mask"):
-        objective.loss(params, bare, step)
+        scalar_loss(objective, params, bare, step)
 
     no_ref = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     with pytest.raises(ValueError, match="step.ema"):
-        objective.loss(params, batch, no_ref)
+        scalar_loss(objective, params, batch, no_ref)
 
 
 # --- the source ------------------------------------------------------------------

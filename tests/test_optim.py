@@ -6,6 +6,7 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import json
 import numpy as np
@@ -574,8 +575,7 @@ def test_muonclip_moves_a_real_step():
         losses = []
         for _ in range(3):
             (loss, _), grads = jax.value_and_grad(
-                lambda p: objective.loss(
-                    {**variables, "params": p}, batch, info),
+                lambda p: scalar_loss(objective, {**variables, "params": p}, batch, info),
                 has_aux=True)(params)
             updates, opt_state = solver.update(
                 grads, opt_state, params, **stats)

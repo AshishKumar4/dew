@@ -364,7 +364,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(steps):
-        state, _, loss, _, _ = compiled(state, None, batch)
+        state, loss, _, _, _ = compiled(state, batch)
         losses.append(float(loss))
 
     assert len(pool[0]["losses"]) == steps

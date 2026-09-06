@@ -11,13 +11,15 @@ never separates a pair; the loss reads them in TRL's stacked order.
 
 from __future__ import annotations
 
+import dataclasses
 import jax.numpy as jnp
+from dew.objectives.base import Variables
 
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
-from dew.objectives.base import Aux
+from dew.objectives.base import Aux, Mean
 from dew.registry import objectives
-from dew.rl import preference_logsigmoid
+from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm import LMObjective
 
@@ -89,13 +91,13 @@ class DPOObjective(LMObjective):
         policy_rejected = self.per_token_log_probs(params, rejected_ids)
         ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
         ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
-        loss = preference_logsigmoid(
+        terms = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
         pair_chosen = self.beta * (policy_chosen * chosen_mask).sum(-1)
         pair_rejected = self.beta * (policy_rejected * rejected_mask).sum(-1)
         accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
-        return loss, Aux({
+        return Mean(jnp.sum(terms), jnp.asarray(terms.size)), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
@@ -103,7 +105,7 @@ class DPOObjective(LMObjective):
 
     def preview(self, params, batch, step, *, scored=None):
         """Draw policy text; this objective's EMA holds the frozen reference."""
-        return super().preview(params, batch, step.replace(ema=None), scored=scored)
+        return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
 
     def evaluate(self, params, batch, step):
         """The chosen responses' perplexity under the policy: the per-token

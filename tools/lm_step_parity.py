@@ -54,7 +54,7 @@ def run(config: dict[str, int], batch: int, seq: int, steps: int,
                       checkpoints=None, tracker=None)
     abstract = jax.eval_shape(trainer.initial_state)
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-    scale = None
+    
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
     generator = np.random.default_rng(0)
@@ -64,7 +64,7 @@ def run(config: dict[str, int], batch: int, seq: int, steps: int,
     step = trainer.compile(state, data)
     record = Record([], [])
     for index in range(steps):
-        state, scale, loss, metrics, finite = step(state, scale, data)
+        state, loss, metrics, finite, _ = step(state, data)
         if not bool(finite):
             raise RuntimeError(f"the loss went non-finite at step {index}")
         record.losses.append(float(loss))

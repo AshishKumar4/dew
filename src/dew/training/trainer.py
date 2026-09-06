@@ -15,7 +15,7 @@ import functools
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -30,13 +30,13 @@ from dew.artifacts import agree_process_phase, broadcast_from_process_zero, coll
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, merge, select
+from dew.objectives.base import Aux, Batch, Effects, Loss, Mean, Metric, Objective, Step, Variables, merge, select, mean_loss
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
     shard_batch,
 )
-from dew.training.state import TrainState
+from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 
 if TYPE_CHECKING:
@@ -50,11 +50,9 @@ StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 the loss and the objective's report out."""
 
 CompiledStep = Callable[
-    [TrainState, dynamic_scale_lib.DynamicScale | None, Batch],
-    tuple[TrainState, dynamic_scale_lib.DynamicScale | None, jax.Array,
-          Mapping[str, jax.Array], jax.Array]]
-"""What `Trainer.compile` returns: `(state, scale, batch)` in, `(state, scale,
-loss, metrics, finite)` out."""
+    [TrainState, Batch],
+    tuple[TrainState, jax.Array, Mapping[str, jax.Array], jax.Array, jax.Array]]
+"""A call returns state, scalar loss, metrics, loss_finite, and accepted."""
 
 
 class Rollout(Protocol):
@@ -172,13 +170,38 @@ def _pick(artifacts: tuple, reads: type):
             f"{[type(a).__name__ for a in artifacts]}")
     return matching[0]
 
+def _all_finite(tree) -> jax.Array:
+    finite = jnp.asarray(True)
+    for leaf in jax.tree.leaves(tree):
+        finite = finite & jnp.all(jnp.isfinite(leaf))
+    return finite
 
-class Trainer:
+
+def _compact_qk(tree):
+    def compact(path, leaf):
+        is_maximum = any(getattr(entry, "key", None) == "max_logits" for entry in path)
+        return jnp.max(leaf, axis=-2, keepdims=True) if is_maximum and leaf.ndim > 1 else leaf
+    return jax.tree_util.tree_map_with_path(compact, tree)
+
+
+def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
+    # Flax's growth comparison uses the incoming streak, including at restart.
+    grow = scale.fin_steps == scale.growth_interval
+    increased = jnp.minimum(scale.scale * scale.growth_factor, jnp.finfo(jnp.float32).max)
+    decreased = scale.scale * scale.backoff_factor
+    if scale.minimum_scale is not None:
+        decreased = jnp.maximum(decreased, scale.minimum_scale)
+    return dataclasses.replace(scale, scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
+                         fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1))
+
+
+
+class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
 
     def __init__(
         self,
-        objective: Objective,
+        objective: Objective[Loss, Effects],
         optimizer: optax.GradientTransformation,
         *,
         key: jax.Array,
@@ -188,23 +211,20 @@ class Trainer:
         dynamic_scale: bool = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
-        step: Callable[[Objective, optax.GradientTransformation], StepFn] | None = None,
+        step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
         rollout: Rollout | None = None,
         profile: Profile | None = None,
     ):
-        """`accumulation` wraps the optimizer in `optax.MultiSteps` here, and
-        the EMA runs on the update clock that wrapper defines. `step` replaces
-        the compiled step's body with `step(objective, optimizer)`, for an
-        update that is not one loss (a GAN's alternating optimizers); it then
-        owns the step counter, the EMA and the `Aux.variables` write-back,
-        with `ema_update` and `write_back` at hand. `rollout` produces the
-        batch the step consumes; None trains the prefetched batch untouched."""
+        """Accumulate accepted microbatches before an optimizer commit.
+
+        A custom step owns accepted/update clocks, scaler, EMA and mutable
+        writes. The compiled wrapper owns attempted-work advancement. Host
+        rollout collection runs once per consumed batch, outside replay.
+        """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
         self.objective = objective
-        self.optimizer: optax.GradientTransformation = (
-            optax.MultiSteps(optimizer, every_k_schedule=accumulation).gradient_transformation()
-            if accumulation > 1 else optimizer)
+        self.optimizer = optimizer
         self.key = key
         self.mesh = mesh
         self.layout = layout
@@ -234,6 +254,11 @@ class Trainer:
         ema = self.objective.ema
         return TrainState(
             step=jnp.zeros((), jnp.int32),
+            microstep=jnp.zeros((), jnp.int32),
+            updates=jnp.zeros((), jnp.int32),
+            scale=(jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale())
+                   if self.dynamic_scale else None),
+            window_size=jnp.asarray(self.accumulation, jnp.int32),
             params=params,
             opt_state=self.optimizer.init(params["params"]),
             ema=None if ema is None else select(params, ema.select),
@@ -247,8 +272,25 @@ class Trainer:
         return build_mesh(self.mesh)
 
     def shardings(self, state: TrainState) -> Placement:
-        """The layout's placement of `state`, leaf for leaf."""
-        return self.layout.shardings(self.device_mesh, state)
+        """Parameter gradients follow parameters; replay records follow batches."""
+        mesh = self.device_mesh
+        placed = self.layout.shardings(mesh, dataclasses.replace(state, accumulation=None))
+        accumulation = state.accumulation
+        if accumulation is None:
+            return placed
+        replicated = NamedSharding(mesh, P())
+        pending = jax.tree.map(lambda _: replicated, accumulation)
+        def buffered_shardings(tree, batches):
+            if tree is None:
+                return None
+            sample = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape[1:], x.dtype), tree)
+            layout = batch_shardings(mesh, sample) if batches else self.layout.shardings(mesh, sample)
+            return jax.tree.map(lambda s: NamedSharding(mesh, P(None, *s.spec)), layout)
+        pending = dataclasses.replace(pending,
+            gradient=None if accumulation.gradient is None else placed.params["params"],
+            batches=buffered_shardings(accumulation.batches, True),
+            variables=buffered_shardings(accumulation.variables, False))
+        return dataclasses.replace(placed, accumulation=pending)
 
     def place(self) -> tuple[TrainState, Placement, bytes | None]:
         """The state itself, fresh or restored, on the mesh, with its shardings
@@ -261,10 +303,14 @@ class Trainer:
         if checkpoints is None or resume is None:
             state = jax.jit(self.initial_state, out_shardings=shardings)()
             return state, shardings, None
+        abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
+        shardings = self.shardings(abstract)
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
         state, position = checkpoints.restore(template, resume)
+        if int(state.window_size) != self.accumulation:
+            raise ValueError("checkpoint accumulation window_size differs from this trainer")
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
@@ -272,148 +318,209 @@ class Trainer:
     # The step
     # ------------------------------------------------------------------
 
-    def _default_step(self):
-        """The compiled step's body over the global batch; GSPMD partitions it.
+    def _loss_shape(self, state: TrainState, batch: Batch):
+        info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
+                    with_ema(state.params, state.ema))
+        return jax.eval_shape(self.objective.loss, state.params, batch, info)
 
-        The loss is a mean over the batch-sharded axis, so its gradient
-        carries the cross-device all-reduce on its own. One key per step:
-        threefry is partitionable, so every device draws its own slice of the
-        same stream without folding in a device index.
-        """
-        objective = self.objective
-        optimizer = self.optimizer
-        ema_spec = objective.ema
-        accumulation = self.accumulation
+    def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes):
+        if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
+            return state
+        stats, aux = shapes
+        shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
+        slots = self.accumulation - 1
 
-        def step(state: TrainState, scale, batch):
-            info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
-                        ema=with_ema(state.params, state.ema))
+        def zeros(leaf):
+            dtype = jnp.float32 if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
+            return jnp.zeros(leaf.shape, dtype)
+
+        def buffer(tree):
+            return jax.tree.map(lambda x: jnp.zeros((slots, *x.shape), x.dtype), tree)
+
+        mutable = (None if shared or aux.variables is None else
+                   {name: state.params[name] for name in aux.variables})
+        accumulation = Accumulation(
+            gradient=jax.tree.map(zeros, state.params["params"]) if shared else None,
+            mass=jnp.zeros((), jnp.float32),
+            statistics=((jnp.zeros((), jnp.float32),) if shared else
+                        tuple(zeros(x) for x in jax.tree.leaves(stats))),
+            effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
+            qk_stats=jax.tree.map(
+                lambda x: jnp.full(x.shape, -jnp.inf, jnp.float32)
+                if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
+                _compact_qk(jax.tree.map(zeros, aux.qk_stats))),
+            batches=None if shared else buffer(batch),
+            variables=None if mutable is None else buffer(mutable),
+            attempts=None if shared else jnp.zeros((slots,), jnp.int32),
+            schedules=None if shared else jnp.zeros((slots,), jnp.int32))
+        return dataclasses.replace(state, accumulation=accumulation)
+
+    def _default_step(self, shapes):
+        objective, optimizer, size = self.objective, self.optimizer, self.accumulation
+        stats_shape, aux_shape = shapes
+        shared = isinstance(stats_shape, (Mean, jax.ShapeDtypeStruct))
+        stats_tree = jax.tree.structure(stats_shape)
+        effects_tree = jax.tree.structure(aux_shape.effects)
+
+        def step(state: TrainState, batch: Batch):
+            info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
+                        with_ema(state.params, state.ema))
+            scale = state.scale
+            factor = jnp.asarray(1., jnp.float32) if scale is None else scale.scale
+            previous = state.accumulation
+            fill = state.microstep % size
+            due = (fill + 1) == size
 
             def loss_fn(trainable):
                 return objective.loss({**state.params, "params": trainable}, batch, info)
 
+            stats, pullback, aux = jax.vjp(loss_fn, state.params["params"], has_aux=True)
+            loss, local_cotangent = jax.vjp(lambda s: objective.reduce_loss(s)[0], stats)
+            gradients = jax.tree.map(lambda x: x.astype(jnp.float32) / factor,
+                                     pullback(local_cotangent(factor)[0])[0])
+            local_finite = _all_finite((loss, stats, gradients, aux.variables, aux.effects))
+            local_ok = jnp.asarray(True) if scale is None else local_finite
+            qk = _compact_qk(aux.qk_stats)
+            effects = tuple(jax.tree.leaves(aux.effects))
+            candidate = previous
+            if previous is not None:
+                effects = tuple(a + b for a, b in zip(previous.effects, effects, strict=True))
+                qk = jax.tree.map(jnp.maximum, previous.qk_stats, qk)
+                if shared:
+                    if isinstance(stats, Mean):
+                        mass, total = stats.mass, stats.total
+                    elif isinstance(stats, (jax.Array, float, int)):
+                        mass, total = jnp.asarray(1.), jnp.asarray(stats)
+                    else:
+                        raise TypeError("shared accumulation requires Mean or a scalar")
+                    mass = jax.lax.stop_gradient(mass)
+                    total_mass = previous.mass + mass
+                    denominator = jnp.where(total_mass > 0, total_mass, 1)
+                    gradients = jax.tree.map(
+                        lambda old, new: old * (previous.mass / denominator)
+                        + new * (mass / denominator), previous.gradient, gradients)
+                    numerator = previous.statistics[0] + total
+                    pooled = Mean(numerator, total_mass)
+                    value, active = mean_loss(pooled)
+                    candidate = dataclasses.replace(previous, gradient=gradients, mass=total_mass,
+                                                 statistics=(numerator,), effects=effects, qk_stats=qk)
+                else:
+                    pooled_leaves = tuple(a + b for a, b in zip(
+                        previous.statistics, jax.tree.leaves(stats), strict=True))
+                    pooled = stats_tree.unflatten(pooled_leaves)
+                    value, active = objective.reduce_loss(pooled)
+                    candidate = dataclasses.replace(previous, statistics=pooled_leaves, effects=effects, qk_stats=qk)
+
+                    def final_gradient(_):
+                        schedules, attempts = previous.schedules, previous.attempts
+                        assert schedules is not None and attempts is not None
+                        _, reduce_pullback = jax.vjp(lambda s: objective.reduce_loss(s)[0], pooled)
+                        cotangent = reduce_pullback(factor)[0]
+                        combined = jax.tree.map(lambda x: x.astype(jnp.float32) / factor,
+                                                pullback(cotangent)[0])
+                        # Each replay reads its original sequential-mutable snapshot.
+                        # Returned Aux is discarded; effects and writes happen once.
+                        def replay(index, accumulated):
+                            retained = jax.tree.map(lambda x: x[index], previous.batches)
+                            variables = state.params if previous.variables is None else {
+                                **state.params, **jax.tree.map(lambda x: x[index], previous.variables)}
+                            original = Step(schedules[index],
+                                            jax.random.fold_in(state.key, attempts[index]), info.ema)
+                            def forward(trainable):
+                                replayed, _ = objective.loss({**variables, "params": trainable}, retained, original)
+                                return replayed
+                            _, back = jax.vjp(forward, state.params["params"])
+                            contribution = back(cotangent)[0]
+                            return jax.tree.map(lambda a, b: a + b.astype(jnp.float32) / factor,
+                                                accumulated, contribution)
+                        return jax.lax.fori_loop(0, size - 1, replay, combined)
+                    gradients = jax.lax.cond(due & local_ok, final_gradient, lambda _: gradients, None)
+                loss = jnp.where(due, value, loss)
+            else:
+                _, active = objective.reduce_loss(stats)
+            gradient_finite = local_finite & _all_finite((loss, gradients, effects, qk, aux.variables))
+            accepted = jnp.asarray(True) if scale is None else gradient_finite
+            numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
+                                      microstep=state.microstep + 1)
+
+            def commit(current):
+                if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+                    update, opt_state = optimizer.update(gradients, current.opt_state,
+                                                        current.params["params"], qk_stats=qk)
+                else:
+                    update, opt_state = optimizer.update(gradients, current.opt_state,
+                                                        current.params["params"])
+                params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
+                if aux_shape.effects is not None:
+                    params = write_back(params, objective.apply_effects(params, effects_tree.unflatten(effects)))
+                averaged = current.ema
+                if objective.ema is not None:
+                    if averaged is None:
+                        raise ValueError("the objective declares EMA but the state carries none")
+                    averaged = ema_update(averaged, params, objective.ema.decay(current.updates))
+                return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
+                                       updates=current.updates + 1)
+
+            numerical = jax.lax.cond(due & active & accepted, commit, lambda x: x, numerical)
             if scale is not None:
-                grad_fn = scale.value_and_grad(loss_fn, has_aux=True)
-                scale, finite, (loss, aux), grads = grad_fn(state.params["params"])
-            else:
-                (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-                    state.params["params"])
-                finite = None
-
-            # The QK-Clip's per-head maxima ride in as an extra arg where the
-            # optimizer declares it takes them. Plain optax transforms take
-            # the update as always.
-            if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-                updates, opt_state = optimizer.update(
-                    grads, state.opt_state, state.params["params"],
-                    qk_stats=aux.qk_stats)
-            else:
-                updates, opt_state = optimizer.update(
-                    grads, state.opt_state, state.params["params"])
-            params = write_back(
-                {**state.params, "params": optax.apply_updates(state.params["params"], updates)},
-                aux.variables)
-            new_state = dataclasses.replace(
-                state, step=state.step + 1, params=params, opt_state=opt_state)
-
-            if finite is not None:
-                # Overflowed gradients mean the update did not happen, so the
-                # step counter, which every schedule reads, stays with the
-                # params and the optimizer state.
-                keep = functools.partial(jnp.where, finite)
-                new_state = dataclasses.replace(
-                    new_state,
-                    step=keep(new_state.step, state.step),
-                    params=jax.tree.map(keep, new_state.params, state.params),
-                    opt_state=jax.tree.map(keep, new_state.opt_state, state.opt_state))
-
-            if ema_spec is not None:
-                # `state.step` counts micro-batches, and under MultiSteps the
-                # params only move on every accumulation-th one. The EMA runs
-                # on that same clock: the schedule is indexed by completed
-                # updates and the average happens on the micro-step whose
-                # update lands. A rejected mixed-precision step is not an
-                # update either.
-                decay = ema_spec.decay(state.step // accumulation)
-                due = True if finite is None else finite
-                if accumulation > 1:
-                    due = due & ((state.step + 1) % accumulation == 0)
-                if state.ema is None:
-                    raise ValueError(
-                        "the objective declares an EMA and the state carries none; "
-                        "a state built by this trainer always holds one")
-                averaged = ema_update(state.ema, new_state.params, decay)
-                if due is not True:
-                    averaged = jax.tree.map(functools.partial(jnp.where, due),
-                                            averaged, state.ema)
-                new_state = dataclasses.replace(new_state, ema=averaged)
-            return new_state, scale, loss, aux
-
+                accepted = accepted & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
+            if previous is not None:
+                assert candidate is not None
+                def retain(acc):
+                    if not shared:
+                        acc = dataclasses.replace(acc, batches=jax.tree.map(lambda held, x: held.at[fill].set(x), acc.batches, batch),
+                        attempts=acc.attempts.at[fill].set(state.step),
+                        schedules=acc.schedules.at[fill].set(state.microstep))
+                        if acc.variables is not None:
+                            reads = {name: state.params[name] for name in acc.variables}
+                            acc = dataclasses.replace(acc, variables=jax.tree.map(
+                                lambda held, x: held.at[fill].set(x), acc.variables, reads))
+                    return acc
+                def clear(acc):
+                    return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
+                        lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
+                        else jnp.zeros_like(x), acc.qk_stats))
+                numerical = dataclasses.replace(numerical, accumulation=jax.lax.cond(due, clear, retain, candidate))
+            result = jax.lax.cond(accepted, lambda _: numerical, lambda _: state, None)
+            if scale is not None:
+                result = dataclasses.replace(result, scale=_advance_scale(scale, gradient_finite))
+            return result, loss, aux
         return step
 
-    def _step_body(self):
-        if self.step is None:
-            return self._default_step()
-        custom = self.step(self.objective, self.optimizer)
+    def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
+        """Compile a transaction over state and one already-produced global batch.
 
-        def step(state, scale, batch):
-            state, loss, aux = custom(state, batch)
-            return state, scale, loss, aux
-
-        return step
-
-    def compile(self, state: TrainState, batch: Batch,
-                scale: dynamic_scale_lib.DynamicScale | None = None) -> CompiledStep:
-        """The training step `fit` runs, compiled ahead of time over `state`
-        and one global `batch`.
-
-        The step takes `(state, scale, batch)` and returns `(state, scale,
-        loss, metrics, finite)`; `scale` is the `DynamicScale` of a
-        mixed-precision run and None otherwise. Its shardings are the layout's
-        and it donates the state, so a benchmark that runs it measures the
-        step a real run runs.
-
-        What comes back calls the jitted function, not the executable.
-        Calling an executable from Python re-checks every leaf's shape and
-        sharding on every call, about 4.5 us a leaf (0.4 ms a step for a
-        99-leaf state, 4.9 ms for 1067 leaves, one CPU core of an i9-12900K),
-        while jit dispatches through its C++ cache. The FLOP count still comes
-        off the ahead-of-time executable: jit lowers through the same cache,
-        so the first call finds that compilation and compiles nothing.
-
-        Every call runs under `jax.set_mesh` and the pipeline's microbatch
-        count, which put the mesh and the schedule in context while the step
-        traces: the attention seam reads the sequence axis off the mesh
-        (`dew.nn.sharding.sequence_shards`), a decoder reads the stage axis
-        and the count (`pipeline_stages` and `microbatches`), and the mesh
-        context is part of jit's cache key, so a call outside it would trace
-        and compile the step a second time. Entering it costs nothing
-        measurable beside the dispatch (32 us either way on the CPU above).
+        Retained records and asynchronous checkpoints can own old array leaves.
+        The call therefore does not donate input state or batch buffers.
         """
-        body = self._step_body()
+        if int(state.window_size) != self.accumulation:
+            raise ValueError("checkpoint accumulation window_size differs from this trainer")
+        if (state.scale is not None) != self.dynamic_scale:
+            raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         mesh = self.device_mesh
-        shardings = self.shardings(state)
-        replicated = NamedSharding(mesh, P())
-
-        def step(state, scale, batch):
-            state, scale, loss, aux = body(state, scale, batch)
-            return state, scale, loss, aux.metrics, jnp.isfinite(loss)
-
-        jitted = jax.jit(
-            step,
-            in_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
-                          batch_shardings(mesh, batch)),
-            out_shardings=(shardings, jax.tree.map(lambda _: replicated, scale),
-                           replicated, replicated, replicated),
-            donate_argnums=(0,),
-        )
         with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
-            self.flops_per_step = step_flops(jitted, state, scale, batch)
+            shapes = None if self.step is not None else self._loss_shape(state, batch)
+            prepared = self._initialize_accumulation(state, batch, shapes)
+            body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
+            shardings = self.shardings(prepared)
+            replicated = NamedSharding(mesh, P())
 
-        def run(state, scale, batch):
+            def step(current, batch):
+                result, loss, aux = body(current, batch)
+                return (dataclasses.replace(result, step=current.step + 1), loss, aux.metrics,
+                        jnp.isfinite(loss), result.microstep > current.microstep)
+
+            jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
+                             out_shardings=(shardings, replicated, replicated, replicated, replicated))
+            prepared = jax.device_put(prepared, shardings)
+            self.flops_per_step = step_flops(jitted, prepared, batch)
+
+        def run(current, batch):
             with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
-                return jitted(state, scale, batch)
-
+                if current.accumulation is None and self.accumulation > 1 and self.step is None:
+                    current = self._initialize_accumulation(current, batch, shapes)
+                    current = jax.device_put(current, shardings)
+                return jitted(current, batch)
         return run
 
     # ------------------------------------------------------------------
@@ -452,13 +559,14 @@ class Trainer:
                 raise ValueError(
                     "checkpoint_every asks for checkpoints and this trainer has no "
                     "checkpointer; pass Checkpoints(directory) to write any")
+            if current == steps and checkpoints is not None and checkpoints.latest is not None:
+                return state
             local_every = None if checkpoints is None else checkpoints.local_every
-            scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
             train_step = None
             # Rebound once the step is compiled, so the first tick measures steps,
             # not the compile.
             last_log_time = time.time()
-            last_saved = current if checkpoints is not None and current else None
+            last_saved = current if checkpoints is not None and checkpoints.latest is not None else None
             interval_steps = 0
             steps_since_log = 0
             # Seconds spent sampling this interval, logged under
@@ -503,14 +611,14 @@ class Trainer:
                     batch = shard_batch(mesh, self.rollout(state, batch, key))
                     rollout_seconds += time.perf_counter() - began
                 if train_step is None:
-                    train_step = self.compile(state, batch, scale)
+                    train_step = self.compile(state, batch)
                     last_log_time = time.time()
                 if (profile is not None and not tracing and traced == 0
                         and seen >= profile.warmup):
                     jax.profiler.start_trace(profile.directory)
                     tracing = True
 
-                state, scale, loss, aux, finite = train_step(state, scale, batch)
+                state, loss, aux, finite, accepted = train_step(state, batch)
                 position = train.source_state
                 current += 1
                 seen += 1
@@ -540,6 +648,9 @@ class Trainer:
                                    **{f"train/{k}": float(v) for k, v in aux.items()},
                                    **self._throughput(now - last_log_time, steps_since_log,
                                                       data.batch)}
+                        scalars["train/accepted"] = float(accepted)
+                        if state.scale is not None:
+                            scalars["train/loss_scale"] = float(state.scale.scale)
                         if self.rollout is not None:
                             scalars["train/rollout_seconds"] = rollout_seconds
                         print(f"step {current}: loss {scalars['train/loss']:.4f}")
@@ -715,7 +826,7 @@ class Trainer:
                 if metrics:
                     error = None
                     try:
-                        info = Step(step=state.step, key=jax.random.fold_in(score_key, scored), ema=ema)
+                        info = Step(step=state.microstep, key=jax.random.fold_in(score_key, scored), ema=ema)
                         produced = self.objective.evaluate(state.params, batch, info)
                     except BaseException as failure:
                         error = failure
@@ -741,7 +852,7 @@ class Trainer:
                     error = None
                     preview = None
                     try:
-                        info = Step(step=state.step, key=preview_key, ema=ema)
+                        info = Step(step=state.microstep, key=preview_key, ema=ema)
                         preview = self.objective.preview(state.params, batch, info, scored=produced)
                     except BaseException as failure:
                         error = failure

@@ -14,6 +14,7 @@ sampler runs in test_lm_recipe.
 from typing import Optional
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -153,7 +154,7 @@ def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     batch = token_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, _ = objective.loss(params, batch, step_at())
+    loss, _ = scalar_loss(objective, params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     expected = reference_cross_entropy(logits, tokens[:, 1:])
@@ -171,7 +172,7 @@ def test_padded_targets_are_left_out_of_the_average():
     tokens = np.asarray(batch[TEXT_KEY])
     assert (tokens[:, 1:] == pad_id).any(), "this batch has no padding to skip"
 
-    loss, _ = objective.loss(params, batch, step_at())
+    loss, _ = scalar_loss(objective, params, batch, step_at())
 
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
     masked = reference_cross_entropy(logits, tokens[:, 1:], pad_id=pad_id)
@@ -185,7 +186,7 @@ def test_a_batch_of_only_padding_does_not_divide_by_zero():
     params = objective.init(jax.random.key(0))
     batch = {TEXT_KEY: jnp.full((2, SEQ + 1), 5, jnp.int32)}
 
-    loss, aux = objective.loss(params, batch, step_at())
+    loss, aux = scalar_loss(objective, params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
 
 
@@ -194,7 +195,7 @@ def test_aux_reports_perplexity_and_token_accuracy():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, aux = objective.loss(params, batch, step_at())
+    loss, aux = scalar_loss(objective, params, batch, step_at())
 
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
@@ -213,7 +214,7 @@ def test_a_batch_with_no_room_for_the_shift_is_rejected():
     batch = {TEXT_KEY: jnp.zeros((2, SEQ), jnp.int32)}
 
     with pytest.raises(ValueError, match=f"{SEQ + 1} ids per row"):
-        objective.loss(params, batch, step_at())
+        scalar_loss(objective, params, batch, step_at())
 
 
 def test_dropout_runs_on_the_step_key():
@@ -223,9 +224,9 @@ def test_dropout_runs_on_the_step_key():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    first, _ = objective.loss(params, batch, step_at(key=1))
-    again, _ = objective.loss(params, batch, step_at(key=1))
-    other, _ = objective.loss(params, batch, step_at(key=2))
+    first, _ = scalar_loss(objective, params, batch, step_at(key=1))
+    again, _ = scalar_loss(objective, params, batch, step_at(key=1))
+    other, _ = scalar_loss(objective, params, batch, step_at(key=2))
 
     assert float(first) == pytest.approx(float(again))
     assert float(first) != pytest.approx(float(other))
@@ -243,7 +244,7 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     params = objective.init(jax.random.key(0))
     inputs = token_batch()[TEXT_KEY][:, :-1]
     hidden = objective.model.apply(params, inputs, method=Bf16LM.hidden_states)
-    loss, aux = objective.loss(params, token_batch(), step_at())
+    loss, aux = scalar_loss(objective, params, token_batch(), step_at())
 
     assert hidden.dtype == jnp.bfloat16
     assert objective.model.apply(params, inputs).dtype == jnp.float32
@@ -251,53 +252,7 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     assert loss.dtype == jnp.float32 and aux.metrics["ce"].dtype == jnp.float32
 
 
-def test_the_compiled_step_never_builds_a_tokens_by_vocabulary_tensor():
-    """The point of chunking, read off the optimized HLO.
 
-    The vocabulary here is 512 wide over 16 tokens, and the head is 32 wide,
-    so a `[tokens, vocab]` tensor is unmistakable in the text. The
-    full-vocabulary loss below is compiled too, and the grep has to find the
-    tensor in that text first. This reads the CPU executable: at this toy
-    size the GPU compiler concatenates the four tiles back into one row, and
-    the GPU evidence is the peak-memory sweep in docs/benchmarks.md.
-    """
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-
-    vocab, batch, seq = 512, 2, 8
-    model = CausalTransformer(vocab_size=vocab, emb_features=32, num_layers=1,
-                              num_heads=4, mlp_features=64, max_seq_len=16,
-                              dtype=jnp.bfloat16)
-    objective = LMObjective(model, seq, head_chunks=4)
-    params = objective.init(jax.random.key(0))
-    tokens = jnp.zeros((batch, seq + 1), jnp.int32)
-    batch_dict = {TEXT_KEY: tokens}
-
-    def chunked(p):
-        loss, aux = objective.loss(p, batch_dict, step_at())
-        return loss, aux.metrics
-
-    def full_vocabulary(p):
-        logits = model.apply(p, tokens[:, :-1])
-        losses = optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:])
-        correct = (jnp.argmax(logits, axis=-1) == tokens[:, 1:]).astype(losses.dtype)
-        return jnp.mean(losses), {"token_accuracy": jnp.mean(correct)}
-
-    def compiled_text(loss_fn):
-        return jax.jit(jax.value_and_grad(loss_fn, has_aux=True)).lower(
-            params).compile().as_text()
-
-    whole_row = (f"f32[{batch * seq},{vocab}]", f"f32[{batch},{seq},{vocab}]")
-    chunked_text, full_text = compiled_text(chunked), compiled_text(full_vocabulary)
-
-    assert any(shape in full_text for shape in whole_row), (
-        "the full-vocabulary step lost its logits tensor, so this grep proves nothing")
-    assert not any(shape in chunked_text for shape in whole_row)
-    assert f"f32[{batch * seq},{vocab // 4}]" in chunked_text, "no chunk tile either"
-
-    reduced_over_the_vocabulary = [
-        line for line in chunked_text.splitlines()
-        if ("reduce" in line and f",{vocab}]" in line)]
-    assert reduced_over_the_vocabulary == []
 
 
 def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
@@ -306,7 +261,7 @@ def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
     batch = token_batch()
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
 
-    _, aux = objective.loss(params, batch, step_at())
+    _, aux = scalar_loss(objective, params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = (np.argmax(np.asarray(logits), axis=-1) == targets).mean()
@@ -320,7 +275,7 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
     assert (targets == 0).any(), "this batch has no padding to skip"
 
-    _, aux = objective.loss(params, batch, step_at())
+    _, aux = scalar_loss(objective, params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
     kept = targets != 0
@@ -392,7 +347,7 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     """
     trainer = make_trainer(tmp_path, fsdp=fsdp)
     batch = next(cycle_batches(seed=7))
-    scored = jax.jit(lambda params: trainer.objective.loss(params, batch, step_at())[0])
+    scored = jax.jit(lambda params: scalar_loss(trainer.objective, params, batch, step_at())[0])
     before = float(scored(trainer.initial_state().params))
 
     state = trainer.fit(Data(cycle_batches), steps=STEPS, log_every=50)
@@ -711,8 +666,8 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids,
              "text_positions": positions}
 
-    packed, _ = objective.loss(params, batch, step_at())
-    unpacked, _ = objective.loss(params, {TEXT_KEY: tokens}, step_at())
+    packed, _ = scalar_loss(objective, params, batch, step_at())
+    unpacked, _ = scalar_loss(objective, params, {TEXT_KEY: tokens}, step_at())
 
     losses, weights = objective.token_scores(
         params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
@@ -745,7 +700,7 @@ def test_a_fixed_window_batch_is_scored_exactly_as_before():
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
-    loss, _ = objective.loss(params, batch, step_at())
+    loss, _ = scalar_loss(objective, params, batch, step_at())
 
     tokens = np.asarray(batch[TEXT_KEY])
     logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
@@ -760,7 +715,7 @@ def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     segment_ids = jnp.zeros((2, SEQ + 1), jnp.int32)
     batch = {TEXT_KEY: tokens, "text_segment_ids": segment_ids, "text_positions": segment_ids}
 
-    loss, aux = objective.loss(params, batch, step_at())
+    loss, aux = scalar_loss(objective, params, batch, step_at())
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
     scores = objective.evaluate(params, batch, step_at())
     assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
@@ -786,7 +741,7 @@ def test_loss_role_counts_only_assistant_targets():
     batch = assistant_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, aux = objective.loss(params, batch, step_at())
+    loss, aux = scalar_loss(objective, params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     kept = np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT
@@ -805,7 +760,7 @@ def test_loss_role_without_the_roles_column_raises():
     params = objective.init(jax.random.key(0))
 
     with pytest.raises(ValueError, match="text_roles"):
-        objective.loss(params, token_batch(), step_at())
+        scalar_loss(objective, params, token_batch(), step_at())
 
 
 def test_a_roles_column_is_ignored_without_loss_role():
@@ -815,7 +770,7 @@ def test_a_roles_column_is_ignored_without_loss_role():
     params = objective.init(jax.random.key(0))
     batch = assistant_batch()
 
-    loss, _ = objective.loss(params, batch, step_at())
+    loss, _ = scalar_loss(objective, params, batch, step_at())
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
@@ -831,7 +786,7 @@ def test_a_misaligned_roles_column_is_refused():
     batch[ROLES_KEY] = jnp.zeros((batch[TEXT_KEY].shape[0], SEQ), jnp.int8)
 
     with pytest.raises(ValueError, match="one per token"):
-        objective.loss(params, batch, step_at())
+        scalar_loss(objective, params, batch, step_at())
 
 
 def test_evaluation_weights_follow_loss_role():

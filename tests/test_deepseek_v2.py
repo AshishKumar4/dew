@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -105,8 +106,8 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
     balanced = LMObjective(model, 8, aux_loss_alpha=0.05, seq_aux=False)
     params = plain.init(jax.random.PRNGKey(0))
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    base, _ = plain.loss(params, {TEXT_KEY: tokens}, step)
-    loss, aux = balanced.loss(params, {TEXT_KEY: tokens}, step)
+    base, _ = scalar_loss(plain, params, {TEXT_KEY: tokens}, step)
+    loss, aux = scalar_loss(balanced, params, {TEXT_KEY: tokens}, step)
 
     _, sown = model.apply(params, tokens[:, :-1], mutable=["router"],
                           method=type(model).hidden_states)
@@ -116,6 +117,5 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
         for layer in ("layers_0", "layers_1"))
     assert float(loss - base) == pytest.approx(float(expected), rel=1e-5)
     assert float(aux.metrics["aux_loss"]) == pytest.approx(float(expected), rel=1e-5)
-    grads = jax.grad(lambda p: balanced.loss(p, {TEXT_KEY: tokens}, step)[0] - plain.loss(
-        p, {TEXT_KEY: tokens}, step)[0])(params)
+    grads = jax.grad(lambda p: scalar_loss(balanced, p, {TEXT_KEY: tokens}, step)[0] - scalar_loss(plain, p, {TEXT_KEY: tokens}, step)[0])(params)
     assert float(jnp.abs(grads["params"]["layers_0"]["mlp"]["gate"]["kernel"]).max()) > 0
