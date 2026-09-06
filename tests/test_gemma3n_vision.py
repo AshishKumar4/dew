@@ -10,6 +10,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import checkify
 import numpy as np
 import optax
 import pytest
@@ -121,8 +122,11 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
     positions = jnp.asarray(np.stack([np.flatnonzero(row == record["image_token_id"])
                                      for row in np.asarray(ids)]), jnp.int32)
-    run = jax.jit(lambda state: _wrapper_forward(bundle, state, pixels, ids, positions))
-    logits = np.asarray(run(variables))
+    run = jax.jit(checkify.checkify(
+        lambda state, tokens: _wrapper_forward(bundle, state, pixels, tokens, positions)))
+    error, output = run(variables, ids)
+    error.throw()
+    logits = np.asarray(output)
     reference = np.load(FIXTURE / "wrapper_ref.npy")
     np.testing.assert_allclose(logits, reference, rtol=0, atol=1e-4)
     np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
@@ -133,7 +137,13 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
         lambda path, leaf: jnp.zeros_like(leaf) if any(
             getattr(part, "key", None) == "hard_embedding_norm" for part in path) else leaf,
         variables)
-    assert np.max(np.abs(np.asarray(run(muted)) - reference)) > 1e-2
+    error, muted_output = run(muted, ids)
+    error.throw()
+    assert np.max(np.abs(np.asarray(muted_output) - reference)) > 1e-2
+    audio_ids = jnp.where(ids == 54, 57, ids)
+    error, _ = run(variables, audio_ids)
+    with pytest.raises(ValueError, match="image-only input_ids"):
+        error.throw()
 
 
 def test_soft_initialization_also_creates_the_hard_vision_path():
@@ -189,6 +199,8 @@ def test_projector_refuses_incomplete_or_misaligned_image_inputs(bundle):
     {"do_pooling": True},
     {"model_args": {"features_only": True}},
     {"model_args": {"norm_layer": "batchnorm2d"}},
+    {"model_type": "siglip_vision_model"},
+    {"unknown_computational_field": True},
 ))
 def test_unsupported_timm_graph_changes_fail_before_loading(change):
     config = json.loads((FIXTURE / "config.json").read_text())
@@ -221,3 +233,61 @@ def test_image_only_released_config_builds_the_actual_encoder():
     output, _ = jax.eval_shape(tower.init_with_output, jax.random.key(0),
                                jax.ShapeDtypeStruct((1, 3, 768, 768), jnp.float32))
     assert output.shape == (1, 256, 2048)
+
+
+@pytest.mark.parametrize("bad_id", (47, 56))
+def test_hard_vision_ids_reject_both_sides_of_the_vocabulary_eager_and_compiled(bundle, bad_id):
+    _, variables, _, projector, _ = bundle
+    ids = jnp.array([[bad_id, 48]], jnp.int32)
+    with pytest.raises(ValueError, match="vision token IDs"):
+        projector.apply(variables["projector"], ids, method=projector.hard_embeddings)
+    checked = jax.jit(checkify.checkify(lambda tokens: projector.apply(
+        variables["projector"], tokens, method=projector.hard_embeddings)))
+    error, _ = checked(ids)
+    with pytest.raises(ValueError, match="vision token IDs"):
+        error.throw()
+    error, valid = checked(jnp.array([[48, 55]], jnp.int32))
+    error.throw()
+    np.testing.assert_allclose(valid, np.load(FIXTURE / "hard_ref.npy")[:, [0, 2]], rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("bad_id", (-1, 56, 57))
+def test_image_only_inputs_reject_negative_upper_boundary_and_audio_ids(bundle, bad_id):
+    _, variables, _, projector, _ = bundle
+    embeddings = jnp.ones((1, 2, 32))
+    ids = jnp.array([[2, bad_id]], jnp.int32)
+
+    def prepare(tokens):
+        return projector.apply(variables["projector"], embeddings, tokens,
+                               per_layer_input_vocab=48, method=projector.model_inputs)
+
+    with pytest.raises(ValueError, match="image-only input_ids"):
+        prepare(ids)
+    checked = jax.jit(checkify.checkify(prepare))
+    error, _ = checked(ids)
+    with pytest.raises(ValueError, match="image-only input_ids"):
+        error.throw()
+    error, valid = checked(jnp.array([[2, 55]], jnp.int32))
+    error.throw()
+    np.testing.assert_array_equal(valid["input_embeddings"][:, 0], embeddings[:, 0])
+    np.testing.assert_allclose(valid["input_embeddings"][:, 1],
+                               np.load(FIXTURE / "hard_ref.npy")[:, -1], rtol=0, atol=1e-4)
+
+
+def test_checked_hard_embedding_gradients_remain_jittable(bundle):
+    _, variables, _, projector, _ = bundle
+    ids = jnp.array([[48, 50, 55]], jnp.int32)
+    coefficients = jnp.linspace(-1, 1, 96).reshape(1, 3, 32)
+
+    def loss(params):
+        embeddings = projector.apply({"params": params}, ids, method=projector.hard_embeddings)
+        return jnp.mean(embeddings * coefficients)
+
+    params = variables["projector"]["params"]
+    expected_value, expected_grad = jax.value_and_grad(loss)(params)
+    error, (value, gradients) = jax.jit(checkify.checkify(jax.value_and_grad(loss)))(params)
+    error.throw()
+    np.testing.assert_allclose(value, expected_value, rtol=0, atol=1e-6)
+    for actual, expected in zip(jax.tree.leaves(gradients), jax.tree.leaves(expected_grad), strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
+

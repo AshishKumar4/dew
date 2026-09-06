@@ -107,6 +107,45 @@ Diffusion Gemma denoises blocks with a causal prompt encoder, a bidirectional ca
 
 Multimodal wrapper translation separates decoder, vision tower, and projector variables. The projector produces soft image tokens, which enter the decoder at image positions. Supported paths and remaining restrictions are listed in the [capability reference](../reference/support.md). Ordinary `generate` is not a general multimodal preprocessing pipeline.
 
-Gemma 3n uses the MobileNet-v5 encoder. It accepts floating processor output shaped `[B, C, H, W]` and emits `[B, R * R, 2048]` features; `R` is `msfa_output_resolution`, 16 by default. Its projector handles both soft image features and hard IDs from the vision vocabulary. Call `projector.apply` with `method=projector.model_inputs`, the decoder's scaled token embeddings, original IDs, projected soft tokens, and precomputed integer image positions. Set `per_layer_input_vocab=decoder.per_layer_input_vocab`. The returned dictionary supplies `tokens`, `input_embeddings`, and `embedding_positions` to `decoder.apply`. It replaces hard vision embeddings and masks IDs outside the per-layer embedding vocabulary.
+Gemma 3n uses the MobileNet-v5 encoder. It accepts floating processor output shaped `[B, C, H, W]` and emits `[B, R * R, 2048]` features; `R` is `msfa_output_resolution`, 16 by default. Its projector handles soft image features and hard IDs from the vision vocabulary. `model_inputs` receives the decoder's scaled token embeddings, original IDs, projected soft tokens, and precomputed integer image positions. Set `per_layer_input_vocab=decoder.per_layer_input_vocab`. The prepared dictionary supplies `tokens`, `input_embeddings`, and `embedding_positions` to `decoder.apply`.
 
-Gemma 3n wrapper translation accepts image-only bundles whose audio config is absent or `None` and whose tensor files contain no audio component. Full released audio-bearing bundles remain unsupported. The MobileNet architecture and its supported `model_args` are checked before tensor translation. Arbitrary timm backbones, classifier pooling, alternative norm layers, and feature-only timm wrappers are rejected.
+`hard_embeddings` checks the interval `[vocab_offset, vocab_offset + vocab_size)`. `model_inputs` accepts only `[0, vocab_offset + vocab_size)`; it rejects negative and audio-vocabulary IDs before fusion. Both methods raise on invalid eager input. Compiled callers must use `jax.jit(checkify.checkify(...))` and call the returned `error.throw()` on the host before consuming the result or applying an update. Plain `jit` does not functionalize these checks. The private numerical path stays pure and does not clip or poison IDs.
+
+This small projector demonstrates the checked boundary without a checkpoint:
+
+```python
+import jax
+import jax.numpy as jnp
+from jax.experimental import checkify
+from dew.nn.vision import Gemma3nProjectorModule
+
+projector = Gemma3nProjectorModule(vision_width=8, text_width=4,
+                                  vocab_offset=16, vocab_size=3)
+features = jnp.arange(8, dtype=jnp.float32).reshape(1, 1, 8)
+variables = projector.init(jax.random.key(0), features)
+soft_tokens = projector.apply(variables, features)
+text_embeddings = jnp.ones((1, 4, 4), dtype=jnp.float32)
+ids = jnp.array([[2, 16, 17, 18]], dtype=jnp.int32)
+image_positions = jnp.array([[2]], dtype=jnp.int32)
+
+def prepare(params, embeddings, tokens, soft, positions):
+    return projector.apply(params, embeddings, tokens, soft, positions,
+                           per_layer_input_vocab=16, method=projector.model_inputs)
+
+checked_prepare = jax.jit(checkify.checkify(prepare))
+error, inputs = checked_prepare(variables, text_embeddings, ids,
+                                soft_tokens, image_positions)
+error.throw()                         # On the host, before using inputs.
+print(inputs["tokens"].tolist())      # [[2, 0, 0, 0]]
+
+error, _ = checked_prepare(variables, text_embeddings, ids.at[0, 3].set(19),
+                           soft_tokens, image_positions)
+try:
+    error.throw()
+except ValueError:
+    print("Rejected unsupported token ID")
+```
+
+After `error.throw()` succeeds, the prepared dictionary can enter the decoder. Valid vision IDs map to zero only for its smaller per-layer embedding table; the fused image and hard-vision embeddings retain their values.
+
+Gemma 3n wrapper translation accepts image-only bundles whose audio config is absent or `None` and whose tensor files contain no audio component. Full released audio-bearing bundles remain unsupported. Translation checks the full vision record, its model type, and its `model_args` before tensor loading. Unknown computational fields, arbitrary timm backbones, classifier pooling, alternative norm layers, and feature-only timm wrappers are rejected.
