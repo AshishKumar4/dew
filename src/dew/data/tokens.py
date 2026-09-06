@@ -127,7 +127,9 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
         if document is None:
             raise ValueError(f"document {index} of the packed corpus is missing")
         start = int(self._offset[index])
-        return {"text": document["text"][start:start + self._chunk_len]}
+        # Every per-token field is cut the same way, so ids and roles stay
+        # aligned inside the chunk.
+        return {key: value[start:start + self._chunk_len] for key, value in document.items()}
 
 
 @datasets("packed_tokens")
