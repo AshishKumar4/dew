@@ -399,7 +399,7 @@ This is a dataset-backed starting configuration for unconditional Oxford Flowers
 
 Prepare Oxford Flowers in a **separate environment from Dew/JAX training**. Reading already prepared ArrayRecords does not require TensorFlow, but preparation can depend on TensorFlow and a builder's other dependencies. Do not infer that every TFDS builder can prepare without it. The commands below deliberately install TensorFlow only in a dedicated preparation environment; they can download packages and the dataset, so inspect the dataset's access conditions first.
 
-Both environments use the same `TFDS_DATA_DIR` on disk. Use a new directory if your existing preparation contains TFRecords rather than ArrayRecords. The explicit label file matters because `OxfordFlowers` reads label names when processing records, even in an unconditional run. Python 3.13 below is the separately checked TensorFlow preparation interpreter, not a claim about Dew's newest supported training baseline.
+Preparation writes under `TFDS_DATA_DIR`; training receives the **exact prepared version directory**, not just that parent directory. Use a new preparation directory if the existing files are TFRecords rather than ArrayRecords. Python 3.13 below is the separately checked TensorFlow preparation interpreter, not a claim about Dew's newest supported training baseline.
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
@@ -413,19 +413,18 @@ import tensorflow_datasets as tfds
 data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
 builder = tfds.builder("oxford_flowers102", data_dir=str(data_dir))
 builder.download_and_prepare(file_format="array_record")
-labels = data_dir / "flowers102-labels.txt"
-labels.write_text("\n".join(builder.info.features["label"].names) + "\n")
-print("Prepared", builder.info.full_name, "and", labels)
+print("Prepared version directory:", builder.data_dir)
 PY
 ```
 
-The preparation interpreter is invoked by path, so it does not replace your active Dew/JAX environment. Keep `TFDS_DATA_DIR` exported, and install the prepared-data reader extra into your separate training environment:
+The preparation interpreter is invoked by path, so it does not replace your active Dew/JAX environment. Set `DEW_FLOWERS_PATH` to the printed `builder.data_dir`. For Oxford Flowers version 2.1.1 prepared above, use the path below; if the builder printed a different version directory, use that exact directory instead. Then install the reader extra into the separate training environment:
 
 ```bash
+export DEW_FLOWERS_PATH="$TFDS_DATA_DIR/oxford_flowers102/2.1.1"
 uv pip install --python .venv/bin/python -e ".[tfds]"
 ```
 
-This runtime command requires a Dew revision with the TensorFlow-free `tfds` extra; older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the TensorFlow preparation environment to train the model merely because it contains TFDS. The shared ArrayRecords and label file cross the environment boundary; the builder's TensorFlow preparation stack does not.
+This runtime command requires a Dew revision with the TensorFlow-free `tfds` extra and explicit prepared-directory reader; older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the preparation environment for training merely because it contains TFDS. The prepared directory contains ArrayRecords, `dataset_info.json`, and the label vocabulary; those files cross the environment boundary, while the builder's TensorFlow preparation stack does not. `OxfordFlowers(path=..., labels=None)` derives `label.labels.txt` from that directory; `labels` remains an optional file override. In a recipe CLI, the equivalent source setting is `--data.path "$DEW_FLOWERS_PATH"`.
 
 Save this complete script as `train_flowers64.py`. It trains in pixels, without a CLIP/T5 tower or VAE, so the training script requires no pretrained model weights. `DiffusionRunConfig` records the actual model, process, data, optimizer, and trainer choices in `run.json`.
 
@@ -445,7 +444,7 @@ from dew.training.runtime import prepare_process
 
 
 def main():
-    data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
+    prepared_dir = Path(os.environ["DEW_FLOWERS_PATH"]).expanduser()
     config = DiffusionRunConfig(
         model=ModelConfig(
             "simple_dit",
@@ -454,8 +453,8 @@ def main():
             dtype="bfloat16", attention_impl="auto",
         ),
         data=OxfordFlowers(
+            path=str(prepared_dir), labels=None,
             image_size=64, augmentation="none", val_batches=4,
-            labels=str(data_dir / "flowers102-labels.txt"),
             loading=Loading(workers=4, threads=4, read_buffer=16, worker_buffer=2),
         ),
         preset=EDM(), sampler=Heun(), sampling_steps=32,
