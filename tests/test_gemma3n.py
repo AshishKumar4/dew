@@ -8,6 +8,7 @@ its tolerance and the largest difference observed.
 """
 
 from pathlib import Path
+from statistics import NormalDist
 
 import jax
 import jax.numpy as jnp
@@ -139,6 +140,44 @@ def test_gaussian_topk_keeps_about_the_stated_fraction():
         kept = gaussian_topk(rows, sparsity) > 0
         assert abs(float(kept.mean()) - (1 - sparsity)) < 0.01
     assert float(gaussian_topk(rows, 0.95).min()) == 0.0
+
+
+@pytest.mark.parametrize("sparsity", [0.5, 0.95])
+def test_gaussian_topk_has_the_population_cutoff_jacobian(sparsity):
+    # Both active and inactive coordinates, separated from the cutoff.
+    x = np.array([-2, -1, 0, 1, 5], dtype=np.float64)
+    multiplier = NormalDist().inv_cdf(sparsity)
+    mean, std = x.mean(), x.std()
+    margin = x - mean - multiplier * std
+    assert np.min(np.abs(margin)) > 0.05
+    cutoff_gradient = (1 + multiplier * (x - mean) / std) / x.size
+    expected = (np.eye(x.size) - cutoff_gradient) * (margin > 0)[:, None]
+    def apply(row):
+        return gaussian_topk(row, sparsity)
+    actual = jax.jit(jax.jacrev(apply))(jnp.asarray(x, jnp.float32))
+    # Five-term population moments and the normal quantile at fp32.
+    # A stopped cutoff gradient or sample deviation misses by >1e-2.
+    np.testing.assert_allclose(actual, expected, atol=5e-7, rtol=0)
+    # Forward cancellation at the cutoff is bounded in the input scale,
+    # not by relative error in the small positive remainder.
+    unit = np.finfo(np.float32).eps / 2
+    bound = 8 * unit * (np.abs(x) + abs(mean) + abs(multiplier) * std)
+    output = np.asarray(apply(jnp.asarray(x, jnp.float32)), dtype=np.float64)
+    assert np.all(np.abs(output - np.maximum(margin, 0)) <= bound)
+
+
+def test_gaussian_topk_uses_zero_relu_derivative_at_the_cutoff():
+    # At sparsity 1/2 the quantile is exactly zero, so the middle entry
+    # equals the cutoff exactly; perturbations select opposite branches.
+    def apply(row):
+        return gaussian_topk(row, 0.5)
+    x = jnp.array([-1., 0., 1.])
+    derivative = jax.jit(jax.jacrev(apply))(x)
+    np.testing.assert_allclose(derivative, [[0, 0, 0], [0, 0, 0],
+                                          [-1/3, -1/3, 2/3]], atol=5e-8, rtol=0)
+    delta = 2 ** -12
+    assert float(apply(x.at[1].set(-delta))[1]) == 0
+    assert float(apply(x.at[1].set(delta))[1]) == pytest.approx(2 * delta / 3)
 
 
 @pytest.mark.parametrize("field,value", [("num_inputs", 1), ("active_idx", 4), ("coef_clip", 0.0)])
