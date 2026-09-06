@@ -1515,16 +1515,72 @@ def _llama4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         "tokens_per_image": int(tokens),
     }
 
+def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
+    """A Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
+    text = _wrapper_text(hf_config, used)
+    tower = vision_nn.translate_gemma4_vision_config(hf_config)
+    used.add("vision_config")
+    projector = vision_nn.translate_gemma4_projector_config(
+        tower, text["emb_features"])
+    image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
+    _wrapper_tokens(hf_config, used)
+    audio = hf_config.get("audio_config")
+    if audio is None:
+        used.add("audio_config")
+    else:
+        _refuse("audio_config",
+                "the audio tower has no counterpart here; only wrappers without "
+                "one translate")
+    # The soft-token count follows the image resolution, so the record leaves
+    # it open and each call reads it off the tower output. The wrapper's
+    # vision_soft_tokens_per_image is the processor's budget, not the count.
+    used.update(("vision_soft_tokens_per_image", "video_token_id", "audio_token_id",
+                 "boa_token_id", "eoa_token_id", "eoa_token_index"))
+    return {
+        "model_type": "gemma4",
+        "text_model_type": "gemma4_text",
+        "text": text,
+        "tower": tower,
+        "projector": projector,
+        "image_token_id": image,
+        "tokens_per_image": None,
+    }
+
+
+def _qwen35_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
+    """A Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
+    text = _wrapper_text(hf_config, used)
+    tower = vision_nn.translate_qwen35_vision_config(hf_config)
+    used.add("vision_config")
+    projector = vision_nn.translate_qwen35_projector_config(
+        tower, text["emb_features"])
+    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    _wrapper_tokens(hf_config, used)
+    # One resolution per call, so the soft-token count varies with the image
+    # and the record leaves it open the way the Gemma 4 wrapper does.
+    used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
+    return {
+        "model_type": "qwen3_5",
+        "text_model_type": "qwen3_5_text",
+        "text": text,
+        "tower": tower,
+        "projector": projector,
+        "image_token_id": image,
+        "tokens_per_image": None,
+    }
+
 
 def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3 and llama4 wrappers translate: text_config through the decoder map,
-    vision_config into the tower value's fields, and the projector fields
-    beside them, with the image token id and the soft-token count. Anything
-    else refuses naming its model_type: gemma4's gemma4_vision tower (2D
-    position tables, vision rotary, clippable linears, position pooling) has
-    no counterpart here, and neither do gemma3n's or qwen3_5's towers.
+    gemma3, llama4, gemma4 and qwen3_5 wrappers translate: text_config through
+    the decoder map, vision_config into the tower value's fields, and the
+    projector fields beside them, with the image token id and the soft-token
+    count. The count is fixed for gemma3 and llama4 and open for gemma4 and
+    qwen3_5, whose towers pool to a count the image resolution decides. A
+    gemma3n wrapper refuses: its tower is MobileNet-v5, an image classifier
+    outside this tree, and its soft tokens ride a vocab offset the text
+    embeddings here do not model.
     """
     model_type = hf_config.get("model_type")
     used = {"model_type"}
@@ -1532,17 +1588,22 @@ def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         record = _gemma3_wrapper(hf_config, used)
     elif model_type == "llama4":
         record = _llama4_wrapper(hf_config, used)
+    elif model_type == "gemma4":
+        record = _gemma4_wrapper(hf_config, used)
+    elif model_type == "qwen3_5":
+        record = _qwen35_wrapper(hf_config, used)
     else:
         vision = hf_config.get("vision_config")
         tower_type = vision.get("model_type") if isinstance(vision, Mapping) else None
-        if tower_type == "gemma4_vision":
-            _refuse("vision_config (model_type 'gemma4_vision')",
-                    "its 2D position tables, vision rotary, clippable linears and "
-                    "position pooling have no counterpart here; only the wrapper's "
-                    "text_config translates today")
+        if tower_type == "gemma3n_vision":
+            _refuse("vision_config (model_type 'gemma3n_vision')",
+                    "its MobileNet-v5 tower is an image classifier with no "
+                    "counterpart here; only the wrapper's text_config translates "
+                    "today")
         _refuse(f"model_type {model_type!r}",
-                "translate_wrapper_config loads the gemma3 and llama4 wrappers; "
-                "any other multimodal wrapper names a tower with no counterpart")
+                "translate_wrapper_config loads the gemma3, llama4, gemma4 and "
+                "qwen3_5 wrappers; any other multimodal wrapper names a tower "
+                "with no counterpart")
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
@@ -1557,6 +1618,10 @@ def _wrapper_tower_weights(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> D
         return vision_nn.translate_siglip_vision_weights(hf_tensors)
     if kind == "llama4":
         return vision_nn.translate_llama4_vision_weights(hf_tensors)
+    if kind == "gemma4":
+        return vision_nn.translate_gemma4_vision_weights(hf_tensors)
+    if kind == "qwen3_5":
+        return vision_nn.translate_qwen35_vision_weights(hf_tensors)
     raise ValueError(f"tower kind {kind!r} has no weight map here")
 
 
@@ -1567,6 +1632,10 @@ def _wrapper_projector_weights(kind: str,
         return vision_nn.translate_gemma_projector_weights(hf_tensors)
     if kind == "llama4":
         return vision_nn.translate_llama4_projector_weights(hf_tensors)
+    if kind == "gemma4":
+        return vision_nn.translate_gemma4_projector_weights(hf_tensors)
+    if kind == "qwen3_5":
+        return vision_nn.translate_qwen35_projector_weights(hf_tensors)
     raise ValueError(f"projector kind {kind!r} has no weight map here")
 
 
@@ -1577,12 +1646,17 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     One leading `model.` comes off every name first, which is the released
     nesting; what stays routes by prefix. The language half rides the text
     family's own map, including the top-level tied head copy, and the tower
-    and projector halves ride theirs. A prefix outside the three raises
-    ValueError with the tensor name.
+    and projector halves ride theirs. Gemma 4 keeps its embedder under
+    `embed_vision`, and Qwen 3.5 keeps its merger inside the vision model, so
+    the projector prefix runs before the tower's. A prefix outside the three
+    raises ValueError with the tensor name.
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
-    tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model."}[tower_kind]
+    tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model.",
+                    "gemma4": "vision_tower.", "qwen3_5": "visual."}[tower_kind]
+    projector_prefix = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
+                        "gemma4": "embed_vision.", "qwen3_5": "visual.merger."}[projector_kind]
     text_tensors: Dict[str, np.ndarray] = {}
     tower_tensors: Dict[str, np.ndarray] = {}
     projector_tensors: Dict[str, np.ndarray] = {}
@@ -1595,10 +1669,10 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             # lm_head.weight, so a bare tail regains its prefix.
             text_tensors[tail if tail.startswith(("model.", "lm_head.weight", "mtp."))
                          else f"model.{tail}"] = tensor
+        elif bare.startswith(projector_prefix):
+            projector_tensors[bare[len(projector_prefix):]] = tensor
         elif bare.startswith(tower_prefix):
             tower_tensors[bare[len(tower_prefix):]] = tensor
-        elif bare.startswith("multi_modal_projector."):
-            projector_tensors[bare[22:]] = tensor
         elif bare == "lm_head.weight":
             text_tensors["lm_head.weight"] = tensor
         else:
