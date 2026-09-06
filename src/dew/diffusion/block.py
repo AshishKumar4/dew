@@ -124,8 +124,7 @@ def denoise_logits(decoder, sc, variables, sc_variables, cache, canvas,
     tempered logits become soft embeddings through the embedding table, or
     zeros on the first step, and the self-conditioning module folds them into
     the scaled canvas embeddings the input-embeddings hook carries. The canvas
-    positions continue past the prefix, which is what the reference passes as
-    decoder_position_ids.
+    positions continue past the prefix as decoder_position_ids.
     """
     canvas = jnp.asarray(canvas, jnp.int32)
     table = variables["params"]["embed_tokens"]["embedding"]
@@ -153,8 +152,7 @@ def sample_canvas(key: jax.Array, denoise, shape: Sequence[int], *,
 
     The first step conditions on nothing; every later step conditions on the
     previous step's tempered logits. `steps` counts down like the reference
-    loop. What returns is the argmax of the last step's tempered logits; the
-    reference appends that canvas to the sequence.
+    loop. The argmax of the last step's tempered logits is the denoised canvas.
     """
     process = denoise.process
     key, canvas_key = jax.random.split(key)
