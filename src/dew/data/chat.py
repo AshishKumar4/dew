@@ -137,14 +137,14 @@ _tokenizer_lock = threading.Lock()
 
 
 @functools.lru_cache(maxsize=None)
-def _load_tokenizer(path: str) -> PreTrainedTokenizerBase:
+def load_tokenizer(path: str) -> PreTrainedTokenizerBase:
     """The chat template's tokenizer, loaded once per process.
 
     The render map runs inside grain workers, which unpickle only the path,
     so each worker loads its own copy on its first record. The lock
     serializes that first import: transformers swaps in its lazy module
     object while it initializes, and two threads importing it together can
-    catch it half built.
+    catch it half built. The prompt source shares this cache.
     """
     with _tokenizer_lock:
         from transformers import AutoTokenizer
@@ -200,7 +200,7 @@ class RenderConversation:
 
     def __call__(self, index: int, record: Batch) -> Batch:
         ids, roles = render_conversation(
-            _load_tokenizer(self.tokenizer), record["messages"],
+            load_tokenizer(self.tokenizer), record["messages"],
             f"{self.tokenizer} row {index}")
         return {"text": ids, ROLES_KEY: roles}
 
@@ -212,7 +212,7 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
     this pass renders each row once and keeps only its count. A bad row
     fails the run here with its index.
     """
-    load = _load_tokenizer(tokenizer)
+    load = load_tokenizer(tokenizer)
     return [len(render_conversation(load, record["messages"], f"{source.path} row {index}")[0])
             for index, record in enumerate(source)]
 
