@@ -100,20 +100,36 @@ class CLIPAttention(nn.Module):
 
 
 @logical_axes({("fc1",): ("embed", "mlp"), ("fc2",): ("mlp", "embed")})
-class CLIPMLP(nn.Module):
-    """The feed-forward of a CLIP layer: one hidden layer, quick-GELU."""
+class MLP(nn.Module):
+    """Two biased maps with an activation between: the feed-forward of a CLIP,
+    SigLIP or Llama 4 vision layer, which differ only in the activation.
+    `activation` is the reference's name: 'quick_gelu' (CLIP),
+    'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's exact erf form; jax's
+    default is the tanh approximation, so exactness is spelled out)."""
     hidden_size: int
     intermediate_size: int
+    activation: str = "quick_gelu"
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
     def setup(self):
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(nn.Dense, use_bias=True,
+                                  dtype=self.dtype, precision=self.precision)
         self.fc1 = dense(self.intermediate_size, name="fc1")
         self.fc2 = dense(self.hidden_size, name="fc2")
 
     def __call__(self, hidden_states):
-        return self.fc2(quick_gelu(self.fc1(hidden_states)))
+        if self.activation == "quick_gelu":
+            act = quick_gelu
+        elif self.activation == "gelu_pytorch_tanh":
+            act = functools.partial(jax.nn.gelu, approximate=True)
+        elif self.activation == "gelu":
+            act = functools.partial(jax.nn.gelu, approximate=False)
+        else:
+            raise ValueError(
+                f"activation {self.activation!r} is not expressible: this MLP "
+                "runs quick_gelu, gelu_pytorch_tanh or gelu")
+        return self.fc2(act(self.fc1(hidden_states)))
 
 
 class CLIPEncoderLayer(nn.Module):
@@ -134,8 +150,8 @@ class CLIPEncoderLayer(nn.Module):
             self.hidden_size, self.num_heads, self.causal, dtype=self.dtype,
             precision=self.precision, name="self_attn")
         self.layer_norm2 = norm(name="layer_norm2")
-        self.mlp = CLIPMLP(self.hidden_size, self.intermediate_size,
-                           dtype=self.dtype, precision=self.precision, name="mlp")
+        self.mlp = MLP(self.hidden_size, self.intermediate_size,
+                       dtype=self.dtype, precision=self.precision, name="mlp")
 
     def __call__(self, hidden_states, mask=None):
         hidden_states = hidden_states + self.self_attn(
