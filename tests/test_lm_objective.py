@@ -24,6 +24,7 @@ pytestmark = pytest.mark.mesh
 from flax import linen as nn
 
 from dew.artifacts import TextSamples, TokenScores
+from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity, Samples, TEXT_KEY
 from dew.registry import metrics
@@ -133,13 +134,14 @@ class Data:
     steps_per_epoch = None
 
 
-def reference_cross_entropy(logits, targets, pad_id=None):
+def reference_cross_entropy(logits, targets, pad_id=None, weights=None):
     """Shifted cross entropy in numpy, from the model's own logits."""
     logits = np.asarray(logits, np.float64)
     largest = logits.max(axis=-1, keepdims=True)
     log_probs = logits - largest - np.log(np.exp(logits - largest).sum(axis=-1, keepdims=True))
     picked = -np.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
-    weights = np.ones_like(picked) if pad_id is None else (targets != pad_id).astype(np.float64)
+    if weights is None:
+        weights = np.ones_like(picked) if pad_id is None else (targets != pad_id).astype(np.float64)
     return float((picked * weights).sum() / weights.sum())
 
 
@@ -779,3 +781,84 @@ def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     assert float(loss) == 0.0 and bool(jnp.isfinite(aux.metrics["perplexity"]))
     scores = objective.evaluate(params, batch, step_at())
     assert float(jnp.sum(scores.weights)) == 0.0, "an all-padding row must weigh nothing"
+
+
+# --- loss_role: SFT on the chat data path --------------------------------------
+
+
+def assistant_batch(every=2, batch=4, seq=SEQ, seed=0):
+    """token_batch with a roles column marking every `every`-th target."""
+    batch_dict = token_batch(batch=batch, seq=seq, seed=seed)
+    roles = np.zeros((batch, seq + 1), np.int8)
+    roles[:, 1::every] = Role.ASSISTANT
+    batch_dict[ROLES_KEY] = jnp.asarray(roles)
+    return batch_dict
+
+
+def test_loss_role_counts_only_assistant_targets():
+    """With loss_role set, the loss is the cross entropy over the targets
+    whose role matches, and the reported accuracy counts the same targets."""
+    objective = make_objective(loss_role=Role.ASSISTANT)
+    params = objective.init(jax.random.key(0))
+    batch = assistant_batch()
+    tokens = np.asarray(batch[TEXT_KEY])
+
+    loss, aux = objective.loss(params, batch, step_at())
+
+    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
+    kept = np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT
+    assert kept.sum() > 0 and (~kept).sum() > 0, "the batch counts nothing out"
+    expected = reference_cross_entropy(logits, tokens[:, 1:], weights=kept)
+    assert float(loss) == pytest.approx(expected, rel=1e-5)
+    full = reference_cross_entropy(logits, tokens[:, 1:])
+    assert abs(expected - full) > 1e-4, "the role mask made no difference to check"
+    accuracy = ((np.argmax(np.asarray(logits), axis=-1) == tokens[:, 1:]) & kept).sum() / kept.sum()
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
+
+
+def test_loss_role_without_the_roles_column_raises():
+    """A loss_role run on a plain token batch names the missing column."""
+    objective = make_objective(loss_role=Role.ASSISTANT)
+    params = objective.init(jax.random.key(0))
+
+    with pytest.raises(ValueError, match="text_roles"):
+        objective.loss(params, token_batch(), step_at())
+
+
+def test_a_roles_column_is_ignored_without_loss_role():
+    """The same packed SFT batch trains every target under a plain
+    LMObjective: the column only matters when a role is asked for."""
+    objective = make_objective()
+    params = objective.init(jax.random.key(0))
+    batch = assistant_batch()
+
+    loss, _ = objective.loss(params, batch, step_at())
+
+    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
+    expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
+    assert float(loss) == pytest.approx(expected, rel=1e-5)
+
+
+def test_a_misaligned_roles_column_is_refused():
+    """Roles align with the input tokens, one per token. A short column
+    fails with both shapes."""
+    objective = make_objective(loss_role=Role.ASSISTANT)
+    params = objective.init(jax.random.key(0))
+    batch = token_batch()
+    batch[ROLES_KEY] = jnp.zeros((batch[TEXT_KEY].shape[0], SEQ), jnp.int8)
+
+    with pytest.raises(ValueError, match="one per token"):
+        objective.loss(params, batch, step_at())
+
+
+def test_evaluation_weights_follow_loss_role():
+    objective = make_objective(loss_role=Role.ASSISTANT)
+    params = objective.init(jax.random.key(0))
+    batch = assistant_batch()
+
+    scores = objective.evaluate(params, batch, step_at())
+
+    assert isinstance(scores, TokenScores)
+    assert scores.losses.shape == scores.weights.shape == (4, SEQ)
+    expected = (np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(scores.weights), expected)
