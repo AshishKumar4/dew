@@ -17,6 +17,7 @@ dependencies = [
     "optax>=0.2.2",
     "orbax",
     "numpy",
+    "pillow",
     "clu",
     "einops",
     "tqdm",
