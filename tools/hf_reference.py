@@ -30,6 +30,13 @@ What lands in tests/fixtures/hf:
   The llada and dream tinies carry no transformers class (both ship remote
   code), so their logits come from the small torch port beside them, which
   follows the released block line for line and runs at fp32.
+  siglip-tiny/ and llama4-vision-tiny/ hold a tiny trunk with its projector:
+  model.safetensors and projector.safetensors under the reference tensor
+  names, config.json with the tower config, projector.json with the knobs the
+  tower config leaves out, fixed pixels, and the fp32 trunk and projector
+  outputs. The SigLIP tower is two layers of width 32 over a 2x2 grid pooled
+  to one soft token of width 16; the Llama 4 trunk is two layers of width 32
+  shuffled to one token of width 64 and mapped to width 32.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
@@ -46,23 +53,29 @@ import argparse
 import json
 import os
 from pathlib import Path
+from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
 import torch
-from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma2Config, Gemma2ForCausalLM, Gemma3ForCausalLM, Gemma3TextConfig,
+    Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
     GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
+    SiglipVisionConfig, SiglipVisionModel,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
 )
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32ForCausalLM,
+)
+from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector, Llama4VisionModel,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -515,6 +528,114 @@ def write_diffusion_tiny(name: str, model: torch.nn.Module, config: dict,
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
+
+def siglip_tiny_system(seed: int = 1234, text_width: int = 16, mm_tokens: int = 1):
+    """A tiny SigLIP tower and Gemma projector with scattered weights.
+
+    Returns the torch modules with fp32 reference outputs on fixed pixels, and
+    the configs that describe them. The tower is two layers of width 32 over a
+    2x2 patch grid pooled to one soft token; both writers below share this
+    system so the plain and wrapper fixtures agree.
+    """
+
+    vconf = SiglipVisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
+        hidden_act="gelu_pytorch_tanh", layer_norm_eps=1e-6)
+    torch.manual_seed(seed)
+    tower = SiglipVisionModel(vconf)
+    scatter_weights(tower, seed)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
+    with torch.no_grad():
+        last = tower(pixel_values=torch.from_numpy(pixels),
+                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    gconf = Gemma3Config(
+        text_config=Gemma3TextConfig(hidden_size=text_width),
+        vision_config=vconf, mm_tokens_per_image=mm_tokens)
+    projector = Gemma3MultiModalProjector(gconf)
+    scatter_weights(projector, seed + 1)
+    projector = projector.float().eval()
+    with torch.no_grad():
+        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+    return {"tower": tower, "projector": projector, "vconf": vconf,
+            "pixels": pixels, "last": last, "soft": soft,
+            "text_width": text_width, "mm_tokens": mm_tokens}
+
+
+def llama4_vision_tiny_system(seed: int = 1234, text_width: int = 32):
+    """A tiny Llama 4 vision trunk and outer projector, same sharing deal."""
+    from types import SimpleNamespace
+
+    vconf = Llama4VisionConfig(
+        hidden_size=32, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
+        norm_eps=1e-5, hidden_act="gelu",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        pixel_shuffle_ratio=0.5, projector_input_dim=64, projector_output_dim=64,
+        vision_output_dim=64, vision_feature_select_strategy="default",
+        attention_dropout=0.0, projector_dropout=0.0)
+    torch.manual_seed(seed)
+    tower = Llama4VisionModel(vconf)
+    scatter_weights(tower, seed)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
+    with torch.no_grad():
+        last = tower(pixel_values=torch.from_numpy(pixels),
+                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    projector = Llama4MultiModalProjector(SimpleNamespace(
+        vision_config=vconf, text_config=SimpleNamespace(hidden_size=text_width)))
+    scatter_weights(projector, seed + 1)
+    projector = projector.float().eval()
+    with torch.no_grad():
+        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+    return {"tower": tower, "projector": projector, "vconf": vconf,
+            "pixels": pixels, "last": last, "soft": soft, "text_width": text_width}
+
+
+def write_siglip_tiny() -> None:
+    """The SigLIP trunk and Gemma projector as Dew reads them: bare tensor
+    names, the tower config, the projector's two knobs, fixed pixels and both
+    fp32 reference outputs."""
+    from safetensors.torch import save_file
+
+    system = siglip_tiny_system()
+    directory = FIXTURES / "siglip-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": system["text_width"],
+         "mm_tokens_per_image": system["mm_tokens"]}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_llama4_vision_tiny() -> None:
+    """The Llama 4 trunk and outer projector, same layout."""
+    from safetensors.torch import save_file
+
+    system = llama4_vision_tiny_system()
+    directory = FIXTURES / "llama4-vision-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": system["text_width"]}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
@@ -651,6 +772,8 @@ def main() -> None:
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
     write_diffusion_tiny("llada-tiny", LladaTiny(), LLADA_TINY_CONFIG)
     write_diffusion_tiny("dream-tiny", DreamTiny(), DREAM_TINY_CONFIG)
+    write_siglip_tiny()
+    write_llama4_vision_tiny()
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 

@@ -300,7 +300,8 @@ class GemmaProjectorModule(nn.Module):
                 f"patches_per_side ({self.patches_per_side}) must split over "
                 f"tokens_per_side ({self.tokens_per_side})")
         self.mm_soft_emb_norm = RMSNorm(
-            epsilon=self.norm_eps, dtype=self.dtype, name="mm_soft_emb_norm")
+            epsilon=self.norm_eps, scale_offset=True, dtype=self.dtype,
+            name="mm_soft_emb_norm")
         self.mm_input_projection = nn.Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
             precision=self.precision, name="mm_input_projection")
@@ -349,13 +350,13 @@ def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> Tuple[jax.A
     """
     positions = jnp.arange(grid * grid + 1, dtype=jnp.int32)
     kinds = jnp.where(positions == grid * grid, -2, positions)
-    xs = jnp.where(kinds < 0, 0, kinds % grid) + 1
-    ys = jnp.where(kinds < 0, 0, kinds // grid) + 1
+    safe = jnp.where(kinds < 0, 0, kinds)
     freq_dim = head_dim // 2
     inv_freq = 1.0 / (theta ** (jnp.arange(0, freq_dim, 2, dtype=jnp.float32)
                                 / freq_dim))
-    angles = jnp.concatenate([xs[:, None] * inv_freq[None, :],
-                              ys[:, None] * inv_freq[None, :]], axis=1)
+    angles = jnp.concatenate([(safe % grid + 1)[:, None] * inv_freq[None, :],
+                              (safe // grid + 1)[:, None] * inv_freq[None, :]], axis=1)
+    angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
     return jnp.cos(angles), jnp.sin(angles)
 
 
@@ -408,7 +409,9 @@ class Llama4VisionMLP(nn.Module):
         self.fc2 = dense(self.hidden_size, name="fc2")
 
     def __call__(self, hidden_states):
-        return self.fc2(jax.nn.gelu(self.fc1(hidden_states)))
+        # nn.GELU() is the exact erf form, and jax's default is the tanh
+        # approximation, so exactness is spelled out.
+        return self.fc2(jax.nn.gelu(self.fc1(hidden_states), approximate=False))
 
 
 class Llama4VisionEncoderLayer(nn.Module):
@@ -481,7 +484,10 @@ class Llama4VisionAdapterMLP(nn.Module):
         self.fc2 = dense(self.output_dim, name="fc2")
 
     def __call__(self, hidden_states):
-        return self.fc2(jax.nn.gelu(self.fc1(hidden_states)))
+        # The reference gels after both maps, including the last one
+        # (modeling_llama4.py, Llama4VisionMLP2.forward).
+        gelu = functools.partial(jax.nn.gelu, approximate=False)
+        return gelu(self.fc2(gelu(self.fc1(hidden_states))))
 
 
 class Llama4VisionTransformer(nn.Module):
@@ -642,10 +648,8 @@ class Llama4Projector(ProjectorBase):
 
     def build(self) -> nn.Module:
         return Llama4ProjectorModule(text_width=self.text_width)
-
-
-def merge_soft_tokens(token_embeds: jax.Array, soft_tokens: jax.Array,
-                      image_mask: jax.Array) -> jax.Array:
+def merge_soft_tokens(token_embeds: jax.typing.ArrayLike, soft_tokens: jax.typing.ArrayLike,
+                      image_mask: jax.typing.ArrayLike) -> jax.Array:
     """Token embeddings with one image's soft tokens at its image positions.
 
     `token_embeds` is [B, S, H], `soft_tokens` [B, T, H], and `image_mask`
@@ -729,8 +733,8 @@ def siglip_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     """One SigLIP vision tensor name into its path in a trunk tree.
 
     position_ids is an arange buffer, not a parameter. The attention pooling
-    head some checkpoints carry has no counterpart on the Gemma path, so its
-    tensors refuse with their names. Anything else unknown raises ValueError.
+    head some checkpoints carry maps to nothing: the Gemma path reads the
+    trunk sequence alone. Anything else unknown raises ValueError.
     """
     if hf_name == "embeddings.position_ids":
         return None
@@ -738,9 +742,9 @@ def siglip_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     if path is not None:
         return path
     if hf_name.split(".")[0] == "head":
-        raise ValueError(
-            f"unknown tensor name {hf_name!r}: the attention pooling head is not "
-            "built, the Gemma path reads the trunk sequence alone")
+        # The attention pooling head some checkpoints carry. The Gemma path
+        # reads the trunk sequence alone, so its tensors map to nothing.
+        return None
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
