@@ -323,7 +323,12 @@ class MobileMultiScaleFusion(nn.Module):
 
 
 class MobileNetV5Encoder(nn.Module):
-    """The mobilenetv5_300m_enc graph, with timm's construction controls."""
+    """The mobilenetv5_300m_enc graph, with timm's construction controls.
+
+    Strict GPU fp32 reference comparisons use precision=HIGHEST. The bf16
+    path executes with its own rounding; it is not qualified at the fp32
+    reference tolerance.
+    """
 
     channel_multiplier: float = 1.0
     stem_size: int = 64
