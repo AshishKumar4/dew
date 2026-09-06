@@ -194,7 +194,9 @@ def test_gemma4_tower_matches_the_reference_implementation():
     record = V.translate_gemma4_vision_config(fixture["config"])
     tower = V.tower_from_record(record).build()
     variables = {"params": V.translate_gemma4_vision_weights(fixture["tensors"])}
-    image = gemma4_image(fixture["pixels"], int(record["patch_size"]))
+    patch = record["patch_size"]
+    assert isinstance(patch, int)
+    image = gemma4_image(fixture["pixels"], patch)
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, image)) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(

@@ -67,6 +67,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any, Dict
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
@@ -824,7 +825,7 @@ def gemma4_vision_tiny_system(seed: int = 1234):
     # the fixture has no padding, so the reshape back is the same tokens.
     last = last.reshape(BATCH, -1, vconf.hidden_size)
     projector = Gemma4MultimodalEmbedder(
-        vconf, SimpleNamespace(hidden_size=G4V_TEXT_WIDTH))
+        vconf, Gemma4TextConfig(hidden_size=G4V_TEXT_WIDTH))
     scatter_weights(projector, seed + 1)
     projector = projector.float().eval()
     with torch.no_grad():
@@ -902,8 +903,11 @@ def qwen35_vision_tiny_system(seed: int = 1234):
     scatter_weights(tower, seed)
     tower = tower.float().eval()
     pixels = np.random.RandomState(11).rand(BATCH, 3, 32, 32).astype(np.float32)
-    features = qwen35_patchify(pixels, vconf.patch_size,
-                               vconf.spatial_merge_size, vconf.temporal_patch_size)
+    patch_size = vconf.patch_size
+    temporal_patch_size = vconf.temporal_patch_size
+    assert isinstance(patch_size, int) and isinstance(temporal_patch_size, int)
+    features = qwen35_patchify(pixels, patch_size, vconf.spatial_merge_size,
+                               temporal_patch_size)
     grid = torch.tensor([[1, 4, 4]] * BATCH)
     with torch.no_grad():
         output = tower(hidden_states=torch.from_numpy(features), grid_thw=grid,
@@ -944,7 +948,7 @@ def write_qwen35_vision_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
-GEMMA4_MM_TEXT = dict(
+GEMMA4_MM_TEXT: Dict[str, Any] = dict(
     vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3,
     layer_types=["sliding_attention", "sliding_attention", "full_attention"],
     num_attention_heads=4, num_key_value_heads=2, head_dim=8,
@@ -960,7 +964,7 @@ GEMMA4_MM_TEXT = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
-QWEN35_MM_TEXT = dict(
+QWEN35_MM_TEXT: Dict[str, Any] = dict(
     vocab_size=256, hidden_size=64, intermediate_size=128,
     num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
     head_dim=32, hidden_act="silu", max_position_embeddings=64,
