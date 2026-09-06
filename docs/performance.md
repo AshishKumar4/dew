@@ -340,3 +340,26 @@ tolerance the labs report (`docs/research/frontier-training.md:183`).
 These numbers say nothing about 0.4B parameters, which is the run section
 4.9 of `docs/design/plan.md` asks for and which needs a v5e-16. Wall-clock
 is not comparable either, because the runs shared a machine.
+
+## Quantized training on the RTX 4080
+
+The fp8 trunk compiles and runs on the card, but the step does not get
+faster. Conditions: RTX 4080 16 GiB, driver 595.84, jax/jaxlib 0.11.1,
+Qwix 0.1.8, `JAX_PLATFORMS=cuda`, one process, one device, bf16 compute
+with the `xla` attention kernel, `Quantization(dtype="fp8")` over the whole
+trunk, adamw, 3 warmup and 10 measured steps. Two sizes, each its own
+process: 8 layers of width 256 (mlp 512) and of width 1024 (mlp 2048),
+both 8 heads, vocabulary 512, sequence 64, batch 8.
+
+| width | bf16 compile | bf16 ms/step | fp8 compile | fp8 ms/step |
+|---|---:|---:|---:|---:|
+| 256 | 7.95 s | 2.01 | 5.58 s | 2.18 |
+| 1024 | 8.36 s | 9.59 | 6.29 s | 9.75 |
+
+The compiled fp8 step holds `f8e4m3fn` converts (146 mentions in the HLO at
+width 256, against 12 GPU gemm calls), so the quantization reaches the
+device; the converts cost more than any gemm saving at these sizes, and no
+error is raised anywhere. The losses train (2.44 bf16 against 2.68 fp8 at
+width 256, 0.009 against 0.011 at width 1024, each after 14 steps from the
+same init).
+There is no fp8 speedup to adopt on this card at these sizes.
