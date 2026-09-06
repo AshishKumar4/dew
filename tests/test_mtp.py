@@ -235,9 +235,9 @@ def test_a_packed_batch_keeps_the_depths_inside_their_documents():
     batch = {TEXT_KEY: jnp.asarray(ids), "segment_ids": jnp.asarray(segments),
              "positions": jnp.asarray(positions)}
 
-    _, _, _, _, depths, _ = objective.token_scores(
+    depths = objective.token_scores(
         params, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
-        positions=jnp.asarray(positions), depths=True)
+        positions=jnp.asarray(positions), depths=True).depths
     (_, weights), = depths
 
     # State at p predicts the target at p + 2: only p = 0, 1 (document 1)

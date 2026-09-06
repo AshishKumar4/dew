@@ -24,7 +24,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -144,6 +144,24 @@ def _global_qk_max(qk) -> jax.Array | None:
 
 
 @objectives("lm")
+class Scores(NamedTuple):
+    """What `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
+
+    `losses` and `weights` are `[B, seq_len]`: the next-token cross entropy
+    and 1 where the target counts. `correct` is 1 where the argmax was the
+    target. `routing` is what the routers sowed, `depths` the prediction
+    depths' (losses, weights) pairs, `qk` the attention layers' per-head
+    logit maxima; each is None or empty unless its flag asked for it.
+    """
+
+    losses: jax.Array
+    weights: jax.Array
+    correct: jax.Array
+    routing: Optional[dict]
+    depths: list
+    qk: Optional[dict]
+
+
 class LMObjective(Objective):
     """Shifted cross entropy; evaluation scores tokens and writes text."""
 
@@ -248,11 +266,9 @@ class LMObjective(Objective):
                      depths: bool = False, roles=None, qk_stats: bool = False):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
-        Returns the `[B, seq_len]` losses, the weight of each target (1 where
-        it counts), whether each prediction was right, what the routers
-        sowed when `routing` asked for it, the prediction depths' losses
-        and weights when `depths` asked for them, and the attention layers'
-        per-head logit maxima when `qk_stats` asked for them.
+        Returns `Scores`: the losses, the weight of each target, whether each
+        prediction was right, and what `routing`, `depths` and `qk_stats`
+        asked for.
 
         A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
@@ -324,13 +340,13 @@ class LMObjective(Objective):
                     precision=self.model.precision)
                 depth_scores.append((depth_losses, self._target_weights(
                     targets[:, depth:], segment_ids, losses.dtype, depth)))
-        return losses, weights, correct, sown, depth_scores, qk
+        return Scores(losses, weights, correct, sown, depth_scores, qk)
 
     def per_token_log_probs(self, params, tokens):
         """Next-token log-probabilities, negated cross entropies, over a
         `[B, seq_len + 1]` batch: the `[B, seq_len]` row per token the
         rollout reads back for `old_log_probs`."""
-        return -self.token_scores(params, tokens)[0]
+        return -self.token_scores(params, tokens).losses
 
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """1 where a target counts: not padding, and in a packed batch inside
@@ -367,12 +383,13 @@ class LMObjective(Objective):
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
-        losses, weights, correct, routing, depths, qk = self.token_scores(
+        scores = self.token_scores(
             params, tokens, train=True, rngs={"dropout": step.key},
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats)
+        losses, weights, correct, routing, depths, qk = scores
         # A batch that is entirely padding would divide by zero and take the
         # whole run down with a nan.
         counted = jnp.maximum(jnp.sum(weights), 1.0)
@@ -450,10 +467,9 @@ class LMObjective(Objective):
     def _scored(self):
         """The teacher-forced scores, compiled once per objective."""
         def scored(params, tokens, segment_ids, positions, roles):
-            losses, weights, _, _, _, _ = self.token_scores(
-                params, tokens, segment_ids=segment_ids, positions=positions,
-                roles=roles)
-            return losses, weights
+            scores = self.token_scores(params, tokens, segment_ids=segment_ids,
+                                       positions=positions, roles=roles)
+            return scores.losses, scores.weights
 
         return jax.jit(scored)
 
