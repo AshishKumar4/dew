@@ -26,6 +26,7 @@ from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
+from dew.training.quantization import Quantization, apply_quantization
 
 DEFAULT_MODEL_CONFIG = {"emb_features": 512, "num_layers": 8, "num_heads": 8}
 
@@ -71,6 +72,9 @@ class LmRunConfig(RunConfig):
     """Which loss trains: 'lm' for next-token prediction, 'masked_diffusion'
     for MDLM masked denoising on a bidirectional model (a --pretrained
     diffusion checkpoint carries its mask token id)."""
+    quantization: Optional[Quantization] = None
+    """Quantized-training spec, wrapped around the built model before the
+    objective sees it; unset trains in the compute dtype."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
@@ -254,6 +258,8 @@ def main(config: LmRunConfig) -> TrainState:
     else:
         model, pretrained, fields = load_pretrained(
             config.pretrained, config.model, vocab_size, context, meta)
+    if config.quantization is not None:
+        model = apply_quantization(model, config.quantization)
     if config.objective == "masked_diffusion":
         objective = build_masked_objective(config, model, fields)
         objective_metrics = ()
