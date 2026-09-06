@@ -121,9 +121,17 @@ def _project(tree: Variables, like: Variables) -> Variables:
 
 def ema_update(ema: Variables, params: Variables,
                decay: jax.typing.ArrayLike) -> Variables:
-    """One EMA step over the selected leaves; `decay` is the schedule's value."""
-    return jax.tree.map(lambda average, live: decay * average + (1 - decay) * live,
-                        ema, _project(params, ema))
+    """One EMA step over the selected leaves; `decay` is the schedule's value.
+
+    At unit decay the average passes through unchanged. The arithmetic form
+    multiplies the live tree by zero, and zero times a non-finite parameter
+    is NaN, so one bad parameter would poison a frozen reference on the step
+    it appears. The select runs per leaf."""
+    def step(average, live):
+        updated = decay * average + (1 - decay) * live
+        return jnp.where(jnp.asarray(decay) >= 1.0, average, updated)
+
+    return jax.tree.map(step, ema, _project(params, ema))
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
