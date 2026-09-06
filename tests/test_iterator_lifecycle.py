@@ -216,17 +216,6 @@ def test_eof_reports_finalization_failure_instead_of_clean_exhaustion():
             next(stream)
 
 
-def test_fit_zero_steps_opens_no_training_source_but_still_evaluates():
-    validation = Source(end=1)
-
-    def unwanted():
-        raise AssertionError("zero-step fit opened training")
-
-    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0))
-    state = trainer.fit(Dataset(unwanted, lambda: validation, None, 8),
-                        steps=0, eval_every=1)
-    assert int(state.step) == 0 and validation.closed.is_set()
-
 
 def test_repeated_bounded_fit_releases_each_source_and_reuses_checkpointer(tmp_path):
     opened = []
@@ -261,7 +250,8 @@ def test_unexpected_training_eof_still_closes_and_does_not_save_success(tmp_path
     assert checkpoints.latest is None
 
 
-def test_metric_failure_closes_both_iterators_before_it_escapes():
+@pytest.mark.parametrize("steps", [0, 2])
+def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
     train, validation = Source(), Source(end=2)
 
     class Evaluated(Regression):
@@ -280,11 +270,17 @@ def test_metric_failure_closes_both_iterators_before_it_escapes():
         def finalize(self, accumulated):
             return float(accumulated)
 
+    def training():
+        if steps == 0:
+            raise AssertionError("zero-step fit opened training")
+        return train
+
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):
-        trainer.fit(Dataset(lambda: train, lambda: validation, None, 8),
-                    steps=2, eval_every=1, metrics=(InvalidMetric(),))
-    assert train.closed.is_set() and validation.closed.is_set()
+        trainer.fit(Dataset(training, lambda: validation, None, 8),
+                    steps=steps, eval_every=1, metrics=(InvalidMetric(),))
+    assert train.closed.is_set() == (steps > 0)
+    assert validation.closed.is_set()
     assert validation.owners[-1] == threading.get_ident()
 
 
