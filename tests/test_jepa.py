@@ -465,10 +465,10 @@ def test_probe_metrics_score_representations_and_average_over_the_pass():
     x, y = separable_embeddings()
     representations = Representations(features=x, labels=y)
     linear, knn = metrics.linear_probe(4, steps=200), metrics.knn_probe(4, k=3)
-    assert linear.reads is Representations and linear.name == "linear_probe_accuracy"
-    assert linear.reduce([linear(representations, None), 0.0]) == pytest.approx(
+    assert linear.reads is Representations and linear.name == "batch_linear_probe_accuracy"
+    assert linear.finalize(linear.merge(linear(representations, None), (0.0, 1))) == pytest.approx(
         float(linear_probe_accuracy(x, y, 4, steps=200)) / 2)
-    assert knn.reduce([knn(representations, None)]) > 0.9
+    assert knn.finalize(knn(representations, None)) > 0.9
 
 
 def test_probes_are_at_chance_on_noise():

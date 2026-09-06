@@ -101,6 +101,10 @@ class DPOObjective(LMObjective):
             "accuracy": accuracy,
         })
 
+    def preview(self, params, batch, step, *, scored=None):
+        """Draw policy text; this objective's EMA holds the frozen reference."""
+        return super().preview(params, batch, step.replace(ema=None), scored=scored)
+
     def evaluate(self, params, batch, step):
         """The chosen responses' perplexity under the policy: the per-token
         cross entropies with the shifted completion mask as weights."""

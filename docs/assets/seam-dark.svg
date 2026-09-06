@@ -19,7 +19,7 @@
   <line x1="500" y1="186" x2="700" y2="186" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
   <text x="716" y="191" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">typed artifacts: images, text, token scores</text>
   <text x="24" y="225" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">every eval_every</text>
-  <text x="120" y="225" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#e6edf3">metric.reduce(scored)</text>
+  <text x="120" y="225" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#e6edf3">metric.finalize(summary)</text>
   <line x1="500" y1="220" x2="700" y2="220" stroke="#6e7681" stroke-width="1.4" marker-end="url(#a)"/>
   <text x="716" y="225" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">one val/&lt;name&gt; per metric</text>
   <text x="24" y="284" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#9198a1" text-anchor="start">Implementations: DiffusionObjective, JepaObjective, LMObjective. The trainer treats all three the same way.</text>

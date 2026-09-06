@@ -659,10 +659,9 @@ def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
 def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
     """Ten windows at batch four are two batches, in file order, then the end.
 
-    Validation batches keep drop_remainder: a part-full batch cannot be
-    sharded across the data axis, and it would weigh as much as a full one in
-    the metric reducers. The two windows past the last full batch are simply
-    not scored, which is a reason to hold out a whole number of batches.
+    Validation batches keep drop_remainder so their shapes fit the configured
+    device mesh. The two windows past the last full batch are not scored,
+    which is a reason to hold out a whole number of batches.
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 11 * seq_len, dtype=np.int64)
