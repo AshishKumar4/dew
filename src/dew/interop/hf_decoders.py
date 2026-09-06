@@ -1899,7 +1899,8 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
         if (len(parts) >= 4 and parts[:2] == ['model', 'layers']
                 and parts[3:] in (['embed_tokens', 'weight'], ['shared_head', 'head', 'weight'])):
             shared = 'model.embed_tokens.weight' if parts[3] == 'embed_tokens' else 'lm_head.weight'
-            if not np.array_equal(tensor, hf_tensors.get(shared, tied_head)):
+            reference = hf_tensors.get(shared, tied_head)
+            if reference is None or not np.array_equal(tensor, reference):
                 raise ValueError(
                     f"{name} differs from {shared}, which the depth shares")
 
