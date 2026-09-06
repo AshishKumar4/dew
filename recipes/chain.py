@@ -32,24 +32,23 @@ from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
 from dew.objectives.rl.rollout import Reward
 from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 
-KINDS = ("sft", "dpo", "grpo")
 """The stage losses a chain links: supervised fine-tuning, preference
 optimization, online RL."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Stage:
-    """One link: `data` trained with `objective` for `steps` gradient steps.
+    """One link: `data` trained for `steps` gradient steps.
 
-    `beta` is the DPO or GRPO KL strength, defaulting per loss (0.1 for DPO,
-    0.0 for GRPO) when None; an SFT stage refuses one. A GRPO stage names its
-    `reward` and sampling sizes, and refuses to run without a reward: a
-    rollout no rule scores is steps in the dark.
+    The data decides the loss: `ChatMessages` trains SFT, `PreferencePairs`
+    DPO and `Prompts` GRPO. `beta` is the DPO or GRPO KL strength, 0.1 for
+    DPO and 0.0 for GRPO when None; an SFT stage refuses one. A GRPO stage
+    names its `reward` and sampling sizes, and refuses to run without a
+    reward: a rollout no rule scores is steps in the dark.
     """
 
     name: str
     data: ChatMessages | PreferencePairs | Prompts
-    objective: str = "sft"
     steps: int = 100
     beta: float | None = None
     reward: Reward | None = None
@@ -58,24 +57,18 @@ class Stage:
     sample: str = "group"
 
     def __post_init__(self) -> None:
-        if self.objective not in KINDS:
-            raise ValueError(
-                f"stage {self.name!r} trains {self.objective!r}; "
-                f"the chain links {list(KINDS)}")
         if self.steps < 1:
             raise ValueError(f"stage {self.name!r} runs {self.steps} steps: at least one")
-        pairs = {"sft": ChatMessages, "dpo": PreferencePairs, "grpo": Prompts}
-        if not isinstance(self.data, pairs[self.objective]):
-            raise ValueError(
-                f"stage {self.name!r} trains {self.objective} on "
-                f"{type(self.data).__name__}; a {self.objective} stage reads "
-                f"{pairs[self.objective].__name__}")
-        if self.objective == "sft" and self.beta is not None:
+        if isinstance(self.data, ChatMessages) and self.beta is not None:
             raise ValueError(
                 f"stage {self.name!r} sets beta on an SFT stage, which has no KL term")
-        if self.objective == "grpo" and self.reward is None:
+        if isinstance(self.data, Prompts) and self.reward is None:
             raise ValueError(
                 f"stage {self.name!r} samples without a reward; name one")
+
+    @property
+    def kind(self) -> str:
+        return {ChatMessages: "sft", PreferencePairs: "dpo", Prompts: "grpo"}[type(self.data)]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,7 +107,7 @@ class Recipe:
                 **({"rollout": rollout} if rollout is not None else {}),
             )
             print(f"Stage {index + 1}/{len(self.stages)}: {stage.name} "
-                  f"({stage.objective}, {stage.steps} steps)")
+                  f"({stage.kind}, {stage.steps} steps)")
             states.append(trainer.fit(
                 stage.data.load(batch=self.batch), steps=stage.steps))
             variables = states[-1].params
@@ -124,16 +117,13 @@ class Recipe:
                variables: Variables | None) -> tuple[LMObjective, Rollout | None]:
         """The stage's objective over the shared model, continuing `variables`
         past the first stage, with its rollout beside it for GRPO."""
-        if stage.objective == "sft":
-            assert isinstance(stage.data, ChatMessages)
+        if isinstance(stage.data, ChatMessages):
             return LMObjective(self.model, stage.data.seq_len, loss_role=Role.ASSISTANT,
                                pretrained=variables), None
-        if stage.objective == "dpo":
-            assert isinstance(stage.data, PreferencePairs)
+        if isinstance(stage.data, PreferencePairs):
             beta = 0.1 if stage.beta is None else stage.beta
             return DPOObjective(self.model, stage.data.seq_len - 1, beta=beta,
                                 pretrained=variables), None
-        assert isinstance(stage.data, Prompts)
         assert stage.reward is not None
         beta = 0.0 if stage.beta is None else stage.beta
         objective = GRPOObjective(

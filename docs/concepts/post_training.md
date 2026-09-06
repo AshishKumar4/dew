@@ -25,9 +25,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dew.data import ChatMessages, Loading
 
-pq.write_table(pa.table({"prompt": [messages] * 8}), "/tmp/sft.parquet")
+pq.write_table(pa.table({"prompt": [messages] * 8}), "sft.parquet")
 data = ChatMessages(tokenizer="tests/fixtures/tokenizers/tiny-chat",
-                    path="/tmp/sft.parquet", seq_len=31,
+                    path="sft.parquet", seq_len=31,
                     loading=Loading(workers=0)).load(batch=8)
 batch = next(data.train())
 assert {"text", "text_roles", "text_segment_ids", "text_positions"} <= set(batch)
@@ -39,8 +39,12 @@ reads the four named here.
 The objective is the same class as pretraining with one field:
 
 ```python
+from dew import models
 from dew.objectives.lm import LMObjective
-objective = LMObjective(model, seq_len, loss_role=Role.ASSISTANT)
+
+decoder = models.build("causal_transformer", vocab_size=len(tokenizer), emb_features=32,
+                       num_layers=1, num_heads=2, mlp_features=64, max_seq_len=32)
+objective = LMObjective(decoder, 31, loss_role=Role.ASSISTANT)
 ```
 Without `loss_role` every counted target counts, as in pretraining. A batch without `text_roles` raises, naming the column.
 
@@ -69,7 +73,8 @@ assert abs(float(loss) - float(fixture["trl_loss"])) < 1e-6
 
 ```python
 from dew.objectives.rl import DPOObjective
-objective = DPOObjective(model, seq_len, beta=0.1)
+
+objective = DPOObjective(decoder, 31, beta=0.1)
 ```
 
 ## GRPO: sample, score, clip
@@ -93,25 +98,32 @@ assert abs(float(pg + beta * kl) - float(fixture["verl_loss"])) < 1e-6
 Online, a `SampledRollout` packs the batch the loss reads: it samples `groups` completions per prompt with `dew.sampling.generate`, scores each with `reward(data_source, completion, ground_truth, extra_info)`, and advantaged with the group or RLOO family. The trainer calls it between the data stream and the compiled step:
 
 ```python
+from dew import Trainer
 from dew.objectives.rl import GRPOObjective, SampledRollout
 
-objective = GRPOObjective(model, seq_len, beta=0.01)
+
+def reward(data_source, completion, ground_truth, extra_info):
+    return float(completion.strip() == ground_truth)
+
+
+objective = GRPOObjective(decoder, 31, beta=0.01)
 rollout = SampledRollout(objective, reward, groups=4, max_new_tokens=32)
-trainer = Trainer(objective, optimizer, rollout=rollout, ...)
+trainer = Trainer(objective, optimizer, key=key, rollout=rollout)
 ```
 
 ## Chaining stages
 
-`recipes/chain.py` links stages sharing one decoder: each stage trains its own data in its own directory, and every stage after the first initializes from the previous stage's final parameters, which also freezes the next stage's reference:
+`recipes/chain.py` links stages sharing one decoder. The data names the loss: conversations train SFT, pairs DPO, prompts GRPO. Each stage trains in its own directory, and every stage after the first initializes from the previous stage's final parameters, which also freezes the next stage's reference:
 
 ```python
+# runs elsewhere: a thousand-step chain over real conversations, pairs and prompts
 from recipes.chain import Recipe, Stage
 
-recipe = Recipe(model, optimizer, key, stages=(
+recipe = Recipe(decoder, optimizer, key, stages=(
     Stage(name="sft", data=sft_data, steps=1000),
-    Stage(name="dpo", data=dpo_data, objective="dpo", steps=500),
-    Stage(name="grpo", data=prompt_data, objective="grpo", steps=200,
-          reward=my_reward, groups=4, max_new_tokens=32),
+    Stage(name="dpo", data=dpo_data, steps=500),
+    Stage(name="grpo", data=prompt_data, steps=200,
+          reward=reward, groups=4, max_new_tokens=32),
 ), directory="runs/chain", batch=8)
 states = recipe.run()
 ```
