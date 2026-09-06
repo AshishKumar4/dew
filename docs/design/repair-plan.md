@@ -30,6 +30,8 @@ Preserve normal float32 behavior and reference layouts during transparent optimi
 
 C01 should preserve a distinction between work consumed and updates accepted. Simply assigning the Python loop counter from `state.step` changes termination and can cause an unbounded run under repeated rejection. C02 must not multiply the entire composite loss by one token count without establishing every auxiliary term's denominator and state-update timing.
 
+C01 must include overflow before and on an accumulation boundary, checkpoints with a partially filled accumulator, and restoration of the scaler's finite-step and growth history. C02 must also cover an entire accumulation window with zero valid targets and define whether weight decay, optimizer updates, and schedules advance in that case.
+
 Review the complete state and reduction proposal together before implementing it. Migrate all callers and checkpoint fields as one pre-1.0 cutover; do not add compatibility shims to conceal the old contract.
 
 ## Then: make rollouts mathematically and operationally correct
