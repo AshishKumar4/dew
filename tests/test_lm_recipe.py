@@ -105,6 +105,49 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()
 
 
+def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
+    """`--optim.optimizer muonclip` through `recipe.main`: the per-head maxima
+    travel from the loss to the optimizer inside the compiled step, so the
+    query kernel lands away from a Muon run at the same seed. Observed on
+    CPU: 4 steps, kernels differ by 0.48."""
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+
+    def run(name, *args):
+        config = run_config(recipe, tokens, "--trainer.name", name,
+                            "--trainer.epochs", "1", *args)
+        return recipe.main(config)
+
+    muon = run("muon", "--optim.optimizer", "muon")
+    clipped = run("clip", "--optim.optimizer", "muonclip",
+                  "--optim.optimizer-opts", '{"qk_clip_threshold": 1.0}')
+
+    def q_kernel(state):
+        return np.asarray(
+            state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"])
+
+    assert int(clipped.step) == int(muon.step) > 0
+    assert bool(jnp.all(jnp.isfinite(q_kernel(clipped))))
+    assert float(np.max(np.abs(q_kernel(clipped) - q_kernel(muon)))) > 1e-6
+
+
+def test_the_recipe_trains_a_quantized_trunk(tmp_path):
+    """`quantization:quantization --quantization.dtype int8` through
+    `recipe.main`: the run completes to finite weights and the record
+    round-trips the value. Observed on CPU: 4 steps, all leaves finite."""
+    pytest.importorskip("qwix")
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(recipe, tokens, "--trainer.name", "quant",
+                        "--trainer.epochs", "1", "quantization:quantization",
+                        "--quantization.dtype", "int8")
+    state = recipe.main(config)
+    assert int(state.step) > 0
+    assert all(bool(jnp.all(jnp.isfinite(leaf)))
+               for leaf in jax.tree.leaves(state.params["params"]))
+    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant")) == config
+
+
 def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
     """A local HF-layout decoder, the way a --pretrained run is pointed at one.
 

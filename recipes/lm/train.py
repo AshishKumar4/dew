@@ -272,6 +272,7 @@ def main(config: LmRunConfig) -> TrainState:
             pretrained=pretrained,
             balance_rate=config.balance_rate,
             mtp_weight=config.mtp_weight,
+            qk_stats=config.optim.optimizer == "muonclip",
         )
         objective_metrics = (metrics.perplexity(),)
 
