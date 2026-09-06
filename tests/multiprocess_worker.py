@@ -742,7 +742,9 @@ def mode_evaluation_contract(args) -> dict:
         try:
             count = 0 if failure == "empty" else (
                 1 if failure == "next" or (rank == 0 and failure == "uneven") else 2)
-            for _ in range(count):
+            for index in range(count):
+                if failure == "preview_only" and index:
+                    raise OSError("unrequested validation tail was read")
                 yield {"a_metadata": np.asarray(7), "a_python": 9,
                        "x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
             if failure == "next" and rank == 1:
@@ -751,6 +753,8 @@ def mode_evaluation_contract(args) -> dict:
             closed.append(failure)
 
     def validation():
+        if failure == "no_consumer":
+            raise OSError("validation opened without a consumer")
         if failure == "construct" and rank == 1:
             raise OSError("iterator construction failed")
         return batches()

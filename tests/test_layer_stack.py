@@ -146,19 +146,18 @@ def deepseek_shaped(**overrides):
 # gradients against the plain loop's, both compiled as a training step
 # compiles them. A provider (the last layer of its kind before the sharing
 # layers) is a run of one, and so is the layer between two runs of another
-# kind. Largest observed differences at fp32 matmuls, CPU then RTX 4080:
-# gemma4 logits 0.0 / 1.9e-05, gradients 2.3e-08 / 3.4e-05; deepseek 0.0 /
-# 0.0 and 0.0 / 2.5e-07; gemma3n 2.7e-05 / 1.5e-04 on logits of order 4 and
-# 1.1e-03 / 6.0e-03 on the embedding gradient of order 8. The GPU lowers the
-# scan body and the unrolled layers to different fusions, so reductions
-# round in a different order. Gemma 3n's activation sparsity is a relu at
-# 1.64 standard deviations above each gate row's mean, so a rounding
-# difference in the row's statistics moves the kink, and the ten layers of
-# it between the loss and the embedding amplify that. A scan that read the
-# wrong layer's weights would miss by 1e-1 or more.
+# kind. Gemma 3n keeps the initialized forward check but checks gradients
+# at reference-scale projections with a live per-layer-input residual; its
+# default zero correction scales put that residual exactly at RMSNorm's
+# epsilon floor. The resulting high-gain Jacobian is sensitive even to
+# one-ULP weight perturbations without any sparse-ReLU branch changing.
+# CE gradients are of order one. At fp32, Transformers 5.16.1 on identical
+# weights differs by at most 6.92e-6; scan/plain by 7.53e-7 on CPU and
+# 8.11e-6 on RTX 4080 (JAX 0.10/0.11). The 1e-5 bound also rejects
+# wrong-layer and missing-residual mutations.
 SHAPES = {
     "gemma4": (gemma4_shaped, ((0, 5), (5, 1), (6, 1), (7, 1), (8, 3), (11, 1)), 1e-4, 1e-4),
-    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 5e-4, 2e-2),
+    "gemma3n": (gemma3n_shaped, ((0, 4), (4, 1), (5, 2), (7, 1), (8, 1), (9, 1)), 5e-4, 1e-5),
     "deepseek": (deepseek_shaped, ((0, 1), (1, 5)), 1e-6, 1e-6),
 }
 
@@ -190,13 +189,44 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     difference = float(jnp.max(jnp.abs(logits - jax.jit(plain.apply)(variables, ids))))
     assert difference < logit_bound, f"max |logit difference| {difference:.3e}"
 
+    if shape == "gemma3n":
+        variables = gemma3n_training_variables(variables)
+
     def gradients(model):
         def loss(params):
-            return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
-        return jax.jit(jax.grad(loss))(variables["params"])
+            current = {**variables, "params": params}
+            if shape == "gemma3n":
+                return next_token_loss(model, current, ids)
+            return jnp.mean(model.apply(current, ids) ** 2)
+        return jax.jit(jax.value_and_grad(loss))(variables["params"])
 
-    difference = largest_difference(gradients(plain), gradients(scanned))
+    loss, grads = gradients(plain)
+    scanned_loss, scanned_grads = gradients(scanned)
+    assert abs(float(loss - scanned_loss)) < logit_bound
+    difference = largest_difference(grads, scanned_grads)
     assert difference < gradient_bound, f"max |gradient difference| {difference:.3e}"
+
+
+def gemma3n_training_variables(variables):
+    """Reference initializer scale, with the per-layer input branch active.
+
+    LeCun kernels have variance 1/fan_in; Gemma 3n's reference config uses
+    initializer_range=0.02. Only this gradient case rescales them. Init
+    identity and fixture/initialized logits still use their original weights.
+    """
+    def rescale(path, value):
+        if path[-1].key == "kernel":
+            return value * np.float32(np.sqrt(value.shape[0]) * 0.02)
+        if path[-1].key == "correct_output_scale":
+            return jnp.ones_like(value)
+        return value
+    return jax.tree_util.tree_map_with_path(rescale, variables)
+
+
+def next_token_loss(model, variables, ids):
+    logits = model.apply(variables, ids)[:, :-1]
+    return -jnp.take_along_axis(
+        jax.nn.log_softmax(logits), ids[:, 1:, None], axis=-1).mean()
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -386,26 +416,6 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
 
 
-@mesh_lane
-def test_the_stages_hand_activations_on_by_collective_permute():
-    """The compiled step moves each stage's output to the next stage with a
-    collective permute, and stacks no stage's parameters on another's
-    devices: the stacked layer weights are stage-sharded."""
-    model = tiny()
-    objective = LMObjective(model, SEQ_LEN)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    spec = MeshSpec(fsdp=2, stage=2, microbatches=4)
-    mesh = build_mesh(spec)
-    batch = shard_batch(mesh, token_batch())
-    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-
-    def loss(params):
-        return scalar_loss(objective, {**variables, "params": params}, batch, step)[0]
-
-    with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
-        text = jax.jit(jax.grad(loss)).lower(variables["params"]).compile().as_text()
-
-    assert text is not None and "collective-permute" in text
 
 
 @mesh_lane

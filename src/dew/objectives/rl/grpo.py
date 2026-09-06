@@ -13,8 +13,9 @@ samples.
 
 from __future__ import annotations
 
-import jax
 import dataclasses
+
+import jax
 import jax.numpy as jnp
 from dew.objectives.base import Variables
 

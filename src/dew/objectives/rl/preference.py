@@ -12,6 +12,7 @@ never separates a pair; the loss reads them in TRL's stacked order.
 from __future__ import annotations
 
 import dataclasses
+
 import jax.numpy as jnp
 from dew.objectives.base import Variables
 
