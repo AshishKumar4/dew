@@ -2377,18 +2377,16 @@ def test_diffusion_gemma_text_reuses_the_gemma4_map_in_decoder_mode():
 
 
 def _diffusion_fp32(name):
-    """A tiny diffusion fixture as a model plus variables, without the mask id.
-
-    The backbone holds no mask_token_id field until Compose lands it, so the
-    id is asserted and set aside; the forward never reads it.
-    """
+    """A tiny diffusion fixture as a model plus variables, mask id stored on
+    the model the way the backbone holds it."""
     from safetensors.numpy import load_file
 
     directory = FIXTURES / name
     config = translate_config(fixture_config(name))
-    assert config.pop("mask_token_id") == 120
+    assert config["mask_token_id"] == 120
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    assert model.mask_token_id == 120
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return (model, variables, np.load(directory / "input_ids.npy"),
             np.load(directory / "logits.npy"))
