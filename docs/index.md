@@ -45,6 +45,7 @@ For the same run described by flags instead of code, see [Recipes](recipes.md).
 - [The data pipeline](concepts/data.md): dataset specs, the `Dataset` value, determinism, resume.
 - [Language models](concepts/language_models.md): the decoder, the data path, generation, the masked diffusion variant.
 - [Mixture of experts](concepts/moe.md): the router, the expert axis, parity.
+- [Post-training](concepts/post_training.md): SFT on roles, DPO, GRPO with a rollout, and the chain that links them.
 - [API](api.md): every public module and what it exports, written from the code.
 - [The design](design/api.md): the twelve decisions the API follows and why.
 
