@@ -100,7 +100,7 @@ The default training step updates EMA on optimizer-update boundaries when gradie
 
 ## Evaluation
 
-Override `evaluate(variables, batch, step)` when you need validation artifacts. It can return one artifact, a tuple of artifacts, or `None`. Existing artifact types include token scores, image grids, text samples, and learned representations. A metric declares which artifact type it reads, computes its per-batch contribution, and reduces the contributions over a pass.
+Override `evaluate(variables, batch, step)` to produce scoring artifacts for the complete coordinated batch. It can return one artifact, a tuple, or `None`. Existing types include token scores, image grids, text samples and representations. A `Metric[S]` declares which artifact type it reads, computes per-batch sufficient statistics, merges them into pass-owned state, and finalizes once. Override `preview(variables, batch, step, *, scored=None)` for once-per-event display work. The base implementation reuses the first scoring artifacts when available. All ranks run numerical work and gathers; decode only on process zero after all gathers finish.
 
 Evaluation is opt-in at the training call: provide validation data and set `eval_every`. Passing `metrics` alone does not trigger it. Evaluation runs outside the compiled optimization step; compile expensive device computation within your evaluation implementation when needed. [Evaluation and tracking](../guides/evaluation.md) describes scheduling, metrics, and current limitations.
 
