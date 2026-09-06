@@ -3,9 +3,9 @@
 Each is loaded from its file, the way tests/test_benchmark_data.py loads
 benchmark_data.py, and run on a case small enough for CPU in seconds. A
 reference generator writes its tiny fixture into a temporary directory and
-the result is compared with what is committed, so a generator that drifts
-from its fixture, or a library upgrade that changes the reference, shows up
-here, before a parity test measures Dew against stale evidence. A
+the result is compared with what is committed: data/config/weight identity,
+and named arithmetic outputs under the existing family parity contracts.
+This catches generator drift without requiring bit-identical CPU math. A
 benchmark runs its pure pieces, and its real entry point where the step
 compiles on CPU in seconds.
 """
@@ -22,6 +22,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
+# The existing family parity contracts, not bounds fitted to a CI CPU:
+# test_moe.py (routers and expert sums), test_text_encoders.py (tiny towers),
+# test_t5_encoders.py (tiny hidden states), test_vae_16ch.py (raw encode/decode).
+MOE_OUTPUTS = {
+    "mixtral.npz": {"router_weights": 1e-6, "block_output": 2e-5},
+    "deepseek.npz": {"router_weights": 1e-6, "block_output": 2e-5},
+    "deepseek_v2.npz": {"router_weights": 1e-6},
+    "deepseek_v4.npz": {"router_weights": 1e-6, "experts_output": 2e-5},
+}
+CLIP_OUTPUTS = dict.fromkeys(
+    ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds"), 1e-4)
+T5_OUTPUTS = {"last_hidden_state": 1e-4}
+VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
+
 
 def load(name: str):
     """tools/ holds scripts, not a package, so a tool is loaded from its file."""
@@ -32,11 +46,35 @@ def load(name: str):
     return module
 
 
-def assert_same_arrays(written: Path, committed: Path) -> None:
-    ours, theirs = np.load(written), np.load(committed)
-    assert sorted(ours.files) == sorted(theirs.files)
-    for name in theirs.files:
-        assert np.array_equal(ours[name], theirs[name]), name
+def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
+    """Only named arithmetic outputs use the family's fp32 parity bound.
+
+    Seeds do not promise cross-platform bit identity for arithmetic:
+    https://docs.pytorch.org/docs/2.14/notes/randomness.html
+    https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html
+    Inputs (including floats), weights and discrete choices remain exact.
+    These bounds do not guarantee every CPU/release; a failure requires
+    investigation, never automatic fixture regeneration.
+    """
+    with np.load(written) as ours, np.load(committed) as theirs:
+        assert set(ours.files) == set(theirs.files)
+        assert numerical.keys() <= set(theirs.files)
+        for name in theirs.files:
+            actual, expected = ours[name], theirs[name]
+            assert actual.shape == expected.shape, name
+            assert actual.dtype == expected.dtype, name
+            if name in numerical:
+                assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
+                difference = float(np.max(np.abs(actual - expected)))
+                assert difference < numerical[name], f"{name}: max error {difference:.3e}"
+            else:
+                np.testing.assert_array_equal(actual, expected, err_msg=name)
+
+
+def assert_fixture_json(written: Path, committed: Path) -> None:
+    assert {p.name for p in written.iterdir()} == {p.name for p in committed.iterdir()}
+    for path in committed.glob("*.json"):
+        assert json.loads((written / path.name).read_text()) == json.loads(path.read_text()), path.name
 
 
 def assert_same_tensors(written: Path, committed: Path) -> None:
@@ -45,6 +83,7 @@ def assert_same_tensors(written: Path, committed: Path) -> None:
     ours, theirs = load_file(str(written)), load_file(str(committed))
     assert sorted(ours) == sorted(theirs)
     for name in theirs:
+        assert ours[name].dtype == theirs[name].dtype, name
         assert np.array_equal(ours[name], theirs[name]), name
 
 
@@ -53,16 +92,13 @@ def assert_same_tensors(written: Path, committed: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
-    """The committed router fixtures regenerate byte for byte, so the config
-    the test reads and the arrays it compares against come from one run of
-    this generator and not from an edit that forgot to rerun it."""
+    """Exact recipe, parameters and router choices; fp32 router/block parity."""
     load("moe_reference").main(["--out", str(tmp_path)])
 
     committed = FIXTURES / "moe"
-    assert json.loads((tmp_path / "config.json").read_text()) == json.loads(
-        (committed / "config.json").read_text())
-    for name in ("mixtral.npz", "deepseek.npz", "deepseek_v4.npz"):
-        assert_same_arrays(tmp_path / name, committed / name)
+    assert_fixture_json(tmp_path, committed)
+    for name, outputs in MOE_OUTPUTS.items():
+        assert_fixture_arrays(tmp_path / name, committed / name, outputs)
 
 
 def test_moe_expert_tensors_undo_the_gate_up_merge():
@@ -93,16 +129,13 @@ def test_moe_expert_tensors_undo_the_gate_up_merge():
 # ---------------------------------------------------------------------------
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """tiny/ regenerates byte for byte: the prompts and image recipe, the
-    random-weight checkpoint, and the reference outputs the parity test reads.
-    The real tower is left to the network-marked test; nothing downloads."""
+    """Exact checkpoint, tokenizer and pixels; both towers meet fp32 parity."""
     load("clip_reference").write_tiny(tmp_path)
 
     committed = FIXTURES / "clip" / "tiny"
-    assert json.loads((tmp_path / "prompts.json").read_text()) == json.loads(
-        (committed / "prompts.json").read_text())
+    assert_fixture_json(tmp_path, committed)
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
-    assert_same_arrays(tmp_path / "reference.npz", committed / "reference.npz")
+    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", CLIP_OUTPUTS)
 
 
 # ---------------------------------------------------------------------------
@@ -110,18 +143,13 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """tiny/ regenerates byte for byte: the prompts, the config the loader
-    builds the encoder from (decoder_start_token_id included, as every
-    published T5 config carries it), the full state dict and the reference
-    hidden states."""
+    """Exact checkpoint, config, tokenizer and tokens; fp32 encoder parity."""
     load("t5_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "tiny", FIXTURES / "t5" / "tiny"
-    for name in ("prompts.json", "config.json"):
-        assert json.loads((written / name).read_text()) == json.loads(
-            (committed / name).read_text()), name
+    assert_fixture_json(written, committed)
     assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
-    assert_same_arrays(written / "reference.npz", committed / "reference.npz")
+    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", T5_OUTPUTS)
 
 
 # ---------------------------------------------------------------------------
@@ -129,18 +157,114 @@ def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """sd3-tiny/ regenerates byte for byte: the image recipe, the config the
-    loader builds the autoencoder from, its weights, and the encode and
-    decode of the one committed image."""
+    """Exact checkpoint, config and sample; fp32 encode/decode parity."""
     load("vae_reference").main(["--out", str(tmp_path)])
 
     written, committed = tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny"
-    for name in ("inputs.json", "config.json"):
-        assert json.loads((written / name).read_text()) == json.loads(
-            (committed / name).read_text()), name
+    assert_fixture_json(written, committed)
     assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
                         committed / "diffusion_pytorch_model.safetensors")
-    assert_same_arrays(written / "reference.npz", committed / "reference.npz")
+    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", VAE_OUTPUTS)
+
+
+def test_fixture_roundoff_is_allowed_only_in_named_outputs(tmp_path):
+    """One-ULP arithmetic variation is not a different fixture computation."""
+    cases = [(f"moe/{name}", fields) for name, fields in MOE_OUTPUTS.items()]
+    cases += [("clip/tiny/reference.npz", CLIP_OUTPUTS),
+              ("t5/tiny/reference.npz", T5_OUTPUTS),
+              ("vae/sd3-tiny/reference.npz", VAE_OUTPUTS)]
+    for fixture, numerical in cases:
+        committed = FIXTURES / fixture
+        with np.load(committed) as data:
+            arrays = dict(data)
+        for name in numerical:
+            arrays[name] = np.nextafter(arrays[name], np.float32(np.inf))
+        written = tmp_path / "rounded.npz"
+        np.savez(written, **arrays)
+        assert_fixture_arrays(written, committed, numerical)
+
+
+@pytest.mark.parametrize("fixture,field,numerical", [
+    ("moe/mixtral.npz", "hidden", MOE_OUTPUTS["mixtral.npz"]),
+    ("moe/mixtral.npz", "mlp.gate.weight", MOE_OUTPUTS["mixtral.npz"]),
+    ("moe/mixtral.npz", "router_indices", MOE_OUTPUTS["mixtral.npz"]),
+    ("clip/tiny/reference.npz", "pixel_values", CLIP_OUTPUTS),
+    ("t5/tiny/reference.npz", "input_ids", T5_OUTPUTS),
+    ("vae/sd3-tiny/reference.npz", "sample", VAE_OUTPUTS),
+])
+def test_fixture_identity_rejects_changed_inputs_weights_and_choices(
+    tmp_path, fixture, field, numerical,
+):
+    """Even a one-ULP input/weight change is not arithmetic-output roundoff."""
+    committed = FIXTURES / fixture
+    with np.load(committed) as data:
+        arrays = dict(data)
+    value = arrays[field].flat[0]
+    arrays[field].flat[0] = (np.nextafter(value, np.float32(np.inf))
+                            if arrays[field].dtype == np.float32 else value + 1)
+    written = tmp_path / "mutated.npz"
+    np.savez(written, **arrays)
+    with pytest.raises(AssertionError, match=field):
+        assert_fixture_arrays(written, committed, numerical)
+
+
+@pytest.mark.parametrize("mutation", ["shape", "dtype", "nan", "missing", "extra"])
+def test_fixture_outputs_preserve_schema_and_finiteness(tmp_path, mutation):
+    committed = FIXTURES / "t5/tiny/reference.npz"
+    with np.load(committed) as data:
+        arrays = dict(data)
+    hidden = arrays["last_hidden_state"]
+    if mutation == "shape":
+        arrays["last_hidden_state"] = hidden.reshape(-1)
+    elif mutation == "dtype":
+        arrays["last_hidden_state"] = hidden.astype(np.float64)
+    elif mutation == "nan":
+        hidden.flat[0] = np.nan
+    elif mutation == "missing":
+        del arrays["last_hidden_state"]
+    else:
+        arrays["unexpected"] = hidden
+    written = tmp_path / "mutated.npz"
+    np.savez(written, **arrays)
+    with pytest.raises(AssertionError):
+        assert_fixture_arrays(written, committed, T5_OUTPUTS)
+
+
+@pytest.mark.parametrize("family,factory,branch,writer,fixture,field,numerical", [
+    ("moe", "DeepseekV3MoE", "shared_experts", "write_deepseek",
+     "moe/deepseek.npz", "block_output", MOE_OUTPUTS["deepseek.npz"]),
+    ("clip", "tiny_model", "text_model.encoder.layers.0.mlp", "write_tiny",
+     "clip/tiny/reference.npz", "last_hidden_state", CLIP_OUTPUTS),
+    ("t5", "tiny_model", "encoder.block.0.layer.1.DenseReluDense", "write_tiny",
+     "t5/tiny/reference.npz", "last_hidden_state", T5_OUTPUTS),
+    ("vae", "tiny_model", "encoder.mid_block.resnets.0.conv2", "write_tiny",
+     "vae/sd3-tiny/reference.npz", "latent", VAE_OUTPUTS),
+])
+def test_fixture_output_contract_rejects_a_dropped_branch(
+    tmp_path, monkeypatch, family, factory, branch, writer, fixture, field, numerical,
+):
+    """Run the real reference with one term dropped but identical saved weights."""
+    import torch
+
+    generator = load(f"{family}_reference")
+    build = getattr(generator, factory)
+
+    def without_branch(*args, **kwargs):
+        model = build(*args, **kwargs)
+        model.get_submodule(branch).register_forward_hook(
+            lambda module, inputs, output: torch.zeros_like(output))
+        return model
+
+    monkeypatch.setattr(generator, factory, without_branch)
+    getattr(generator, writer)(tmp_path)
+    committed = FIXTURES / fixture
+    with np.load(tmp_path / committed.name) as actual, np.load(committed) as expected:
+        for name in set(expected.files) - numerical.keys():
+            np.testing.assert_array_equal(actual[name], expected[name], err_msg=name)
+    for weights in committed.parent.glob("*.safetensors"):
+        assert_same_tensors(tmp_path / weights.name, weights)
+    with pytest.raises(AssertionError, match=field):
+        assert_fixture_arrays(tmp_path / committed.name, committed, numerical)
 
 
 # ---------------------------------------------------------------------------

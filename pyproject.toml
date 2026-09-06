@@ -30,6 +30,7 @@ dependencies = [
     "python-dotenv",
     "transformers",
     "jinja2",
+    "filelock",
     "huggingface_hub",
     "wandb",
 ]

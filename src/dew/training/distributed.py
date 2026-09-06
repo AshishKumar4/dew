@@ -345,9 +345,12 @@ class DevicePrefetchIterator:
 
     Use as a context manager or call close, including after a bounded loop.
     At most depth batches are queued plus one being read/placed. Source next,
-    checkpoint operations and final close run on the worker. Only an optional
+    checkpoint operations and final close run on the worker. An optional
     thread-safe, nonblocking request_stop hook runs on the closing thread.
-    Arbitrary blocking source code cannot be killed: close reports a timeout.
+    If thread creation itself fails, caller-thread finalization runs before
+    re-raising; no worker has touched the source. That synchronous error path
+    requires a cooperative finalizer. Active-worker close reports a timeout
+    when arbitrary source code cannot be stopped.
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
@@ -360,42 +363,47 @@ class DevicePrefetchIterator:
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._stop = threading.Event()
         self._done = threading.Event()
-        self._ready = threading.Event()
-        self._initial_error: BaseException | None = None
+        self._start_lock = threading.Lock()
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
-        self._thread.start()
-        # Restoration is synchronous to the caller but uses the same thread
-        # as next/get_state/close (Grain's DatasetIterator is not thread-safe).
-        self._ready.wait()
-        if self._initial_error is not None:
-            error, self._initial_error = self._initial_error, None
-            self._thread.join()
-            raise error
+        # No source work may start until the caller owns this object. In
+        # particular, an interrupt during restoration must unwind through
+        # this iterator's close, never the caller's untransferred-source path.
+
+    def _start(self) -> None:
+        with self._start_lock:
+            if self._done.is_set():
+                return
+            if self._thread.ident is None:
+                try:
+                    self._thread.start()
+                except RuntimeError as error:
+                    if self._thread.ident is None:
+                        # Thread creation failed before any source operation.
+                        self._stop.set()
+                        try:
+                            request_stop = getattr(self._iterator, "request_stop", None)
+                            if request_stop is not None:
+                                request_stop()
+                        except BaseException as failure:
+                            error.add_note(f"Source cancellation failed: {failure!r}")
+                        self._prefetch()
+                    raise
 
     def _prefetch(self):
         iterator, mesh = self._iterator, self._mesh
         assert iterator is not None and mesh is not None
         source = iterator if isinstance(iterator, Checkpointable) else None
+        batch = state = placed = None
         try:
-            if self.source_state is not None:
+            if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
                 saved = self.source_state
                 source.set_state(saved if isinstance(source.get_state(), bytes)
                                  else json.loads(saved))
-        except BaseException as error:
-            # Failed construction does not transfer source ownership.
-            self._initial_error = error
-            self._iterator = self._mesh = None
-            self._ready.set()
-            self._done.set()
-            return
-        self._ready.set()
-        batch = state = placed = None
-        try:
             while not self._stop.is_set():
                 batch = next(iterator)
                 if self._stop.is_set():
@@ -460,7 +468,9 @@ class DevicePrefetchIterator:
         except BaseException as failure:
             error = failure
         self._discard()
-        self._thread.join(timeout)
+        self._start()  # Even an unused iterator finalizes on its worker.
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
         self._discard()
         self._error = None  # Unconsumed speculative errors are discarded too.
         failure = None
@@ -492,6 +502,9 @@ class DevicePrefetchIterator:
         return self
 
     def __next__(self):
+        if self._stop.is_set():
+            raise StopIteration
+        self._start()
         while not self._stop.is_set():
             try:
                 batch, position = self._queue.get(timeout=0.05)

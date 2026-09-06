@@ -42,7 +42,7 @@ jobs:
         uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
     - name: Test with pytest
       run: |
-        JAX_PLATFORMS=cpu pytest -m "not network" -q -ra --junitxml=pytest-report.xml
+        /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv --capture=tee-sys -ra --junitxml=pytest-report.xml
     - name: Annotate failures
       if: always()
       run: |
