@@ -814,10 +814,13 @@ class PeakToPeak:
 
     def __call__(self, artifact, batch):
         self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["image"]).shape))
-        return float(jnp.max(artifact.features) - jnp.min(artifact.features))
+        return float(jnp.max(artifact.features) - jnp.min(artifact.features)), 1
 
-    def reduce(self, values):
-        return float(np.mean(values))
+    def merge(self, accumulated, contribution):
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated):
+        return accumulated[0] / accumulated[1]
 
 
 def val_stream():

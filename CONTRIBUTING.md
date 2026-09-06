@@ -68,9 +68,10 @@ These constructions are banned, in prose, docstrings, comments and commit messag
 
 - Write for a Python/ML reader new to Dew; state any JAX or Flax prerequisite. Teach a complete workflow before advanced options, and separate tutorials, task guides, explanations, and reference.
 - Use public APIs and explain inputs, shapes, dtypes, randomness, state, outputs, and relevant limits. Keep research history and implementation rationale outside the primary learning path.
-- Run examples from an empty Python namespace in a temporary working directory. Include imports, data setup, dependencies, and every file they read. State expected results and verify any files or metrics the text promises.
-- Label download- or accelerator-dependent examples and report what was not executed. Do not supply hidden test variables or treat syntax-only compilation as execution.
-- Check links and build the documentation. Record implementation defects separately; do not redesign APIs to make an example easier to write.
+- Keep examples self-contained, with imports, inputs, dependencies, and required files. Keep API examples current when behavior changes.
+- Identify download and hardware requirements. Do not claim that an unexercised runtime path works.
+- Test observable runtime behavior. Do not add assertions about prose, source spelling, documentation structure, or generated API-index snapshots.
+
 
 ## Before a merge
 

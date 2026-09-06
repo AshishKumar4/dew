@@ -28,27 +28,20 @@ def _get_clip(modelname: str):
 
 
 def _clip_image_text_cosine(model, processor, artifact, batch, field):
-    """Per-sample cos(image, text) of shape [N], normalized the way
-    `CLIPModel.forward` normalizes before its logits.
-
-    An objective samples a fixed few rows of a batch, so the prompts are the
-    leading rows of the batch's, row for row with the samples, as `paired`
-    takes them for the pixel metrics.
-    """
+    """Per-image cosine on complete, equally sized image and prompt batches."""
     # The sampler's [-1, 1] floats as uint8 pixels, nearest value, clipped
     # because a sample can leave the range.
     images = np.clip(np.round((np.asarray(artifact.images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
     count = images.shape[0]
     text = batch[field]
-    if np.shape(text["input_ids"])[0] < count:
+    if (np.shape(text["input_ids"])[0] != count
+            or np.shape(text["attention_mask"])[0] != count):
         raise ValueError(
-            f"the artifact holds {count} rows and batch[{field!r}] only "
-            f"{np.shape(text['input_ids'])[0]}; a metric that pairs an image with its "
-            "prompt needs at least as many prompts as samples")
+            f"the artifact holds {count} rows and batch[{field!r}] "
+            f"{np.shape(text['input_ids'])[0]}; CLIP requires equal prompt counts")
     pixel_values = processor(images=images, return_tensors="np")["pixel_values"]
     image_embeds = model.get_image_features(pixel_values)
-    text_embeds = model.get_text_features(text["input_ids"][:count],
-                                          text["attention_mask"][:count])
+    text_embeds = model.get_text_features(text["input_ids"], text["attention_mask"])
     image_embeds = image_embeds / jnp.linalg.norm(image_embeds, axis=-1, keepdims=True)
     text_embeds = text_embeds / jnp.linalg.norm(text_embeds, axis=-1, keepdims=True)
     return jnp.einsum('nd,nd->n', image_embeds, text_embeds)
@@ -62,7 +55,7 @@ def clip(modelname: str = "openai/clip-vit-large-patch14", field: str = "text") 
 
     def measure(artifact, batch):
         model, processor = _get_clip(modelname)
-        return jnp.mean(1.0 - _clip_image_text_cosine(model, processor, artifact, batch, field))
+        return 1.0 - _clip_image_text_cosine(model, processor, artifact, batch, field)
 
     return ImageMetric(name="clip_similarity", measure=measure)
 
@@ -77,6 +70,6 @@ def clip_score(modelname: str = "openai/clip-vit-large-patch14",
     def measure(artifact, batch):
         model, processor = _get_clip(modelname)
         cos = _clip_image_text_cosine(model, processor, artifact, batch, field)
-        return jnp.mean(100.0 * jnp.maximum(cos, 0.0))
+        return 100.0 * jnp.maximum(cos, 0.0)
 
     return ImageMetric(name="clip_score", measure=measure)

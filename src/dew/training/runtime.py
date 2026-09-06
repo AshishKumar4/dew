@@ -18,7 +18,7 @@ from jax.experimental import multihost_utils
 
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import enable_compilation_cache
-from dew.training.distributed import broadcast_from_process_zero
+from dew.artifacts import broadcast_from_process_zero
 
 if TYPE_CHECKING:
     from dew.config import Wandb

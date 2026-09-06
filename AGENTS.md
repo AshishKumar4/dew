@@ -11,7 +11,7 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 
 ## Parallel work and integration
 
-- Give each parallel writer an isolated worktree and clear file ownership. Coordinate shared-file edits and GPU use before starting them. Keep at most four expert/slow sessions active; use no Sonnet models.
+- Give each parallel writer an isolated worktree and clear file ownership. Coordinate shared-file edits and GPU use before starting them.
 - Inspect GPU processes and current lane ownership before launching GPU work. A process name alone does not establish whether the device is available.
 - Commit completed work as `Ashish Kumar Singh <ashishkmr472@gmail.com>` with a concise conventional commit message. Subagents report commits without pushing. The coordinating agent may push when the user authorizes it; never force-push.
 - Preserve tracked and untracked work before integration. Remove a worktree only after its work is committed, verified, merged, and no process still needs it.

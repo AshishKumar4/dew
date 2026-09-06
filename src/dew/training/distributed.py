@@ -536,20 +536,6 @@ class DevicePrefetchIterator:
 # What every process has to agree on
 # --------------------------------------------------------------------------
 
-def broadcast_from_process_zero(value):
-    """`value` as process 0 holds it, on every process.
-
-    JSON-encodable values only. The bytes go out behind their length, because
-    a collective needs one shape on every process and the others do not know
-    how long process 0's value is.
-    """
-    payload = np.frombuffer(json.dumps(value).encode(), np.uint8)
-    length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), np.int64)))
-    if jax.process_index() != 0:
-        payload = np.zeros(length, np.uint8)
-    return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
-
-
 def minimum_across_processes(count: int) -> int:
     """The smallest `count` any process holds."""
     return int(multihost_utils.process_allgather(np.asarray(count, np.int64)).min())

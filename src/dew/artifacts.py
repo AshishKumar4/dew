@@ -1,17 +1,18 @@
 """What an objective's evaluation produces, as typed values.
 
-An objective's `evaluate` returns one of these; a `Tracker` renders it by
-dispatching on the type; a metric is a function of it and the batch. The
-types carry only arrays, so they cross `jit` and say nothing about where
-they will be drawn.
+Objectives return these values from scoring and preview hooks. A metric
+consumes scoring artifacts; a tracker renders previews by type. Array leaves
+cross jit, while optional captions and decoded text remain host metadata.
 """
 
 from __future__ import annotations
 
+import json
 from typing import TypeVar
 
 from flax import struct
 import jax
+from jax.experimental import multihost_utils
 import numpy as np
 
 T = TypeVar("T")
@@ -33,7 +34,7 @@ class VideoGrid:
 
 @struct.dataclass
 class TextSamples:
-    """Decoded continuations of a prompt, and the token ids they came from."""
+    """Generated token rows, with optional decoded preview text and prompt."""
     tokens: jax.Array
     prompt: str = struct.field(pytree_node=False, default="")
     texts: tuple[str, ...] = struct.field(pytree_node=False, default=())
@@ -57,9 +58,8 @@ class TokenScores:
     weights: jax.Array
 
 
-# `evaluate` returns one artifact or a tuple of them; a tracker renders each
-# by type and a metric picks the type it reads. An LM returns TokenScores
-# every pass and TextSamples when samples are configured.
+# Scoring and preview hooks each return one artifact or a tuple. Metrics
+# pick exactly one scoring artifact by type; previews never satisfy metrics.
 Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
 Artifacts = Artifact | tuple[Artifact, ...]
 
@@ -68,8 +68,6 @@ def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
     """`leaf` as numpy, gathering it across the pool when it is a global
     array this process holds only a shard of."""
     if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
-        from jax.experimental import multihost_utils
-
         return np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
     return np.asarray(leaf)
 
@@ -86,3 +84,97 @@ def host(value: T) -> T:
     process, sees it.
     """
     return jax.tree.map(_addressable, value)
+
+
+def collective_host(value: T, *, phase: str) -> T:
+    """Materialize an evaluation tree on every rank with transfer consensus.
+
+    All ranks must call this, even for entirely local trees. Local leaves and
+    global arrays' addressable shards are checked before any data gather.
+    Ranks then agree the ordered global gather plan and each transfer outcome.
+    Local-only trees may differ, as with root-only decoded previews. A device
+    failure inside an in-flight collective still needs runtime termination.
+    """
+    leaves = []
+    tree = None
+    global_indices = []
+    plan = []
+    error = None
+    try:
+        paths, tree = jax.tree_util.tree_flatten_with_path(value)
+        for path, leaf in paths:
+            if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
+                for shard in leaf.addressable_shards:
+                    np.asarray(shard.data)
+                global_indices.append(len(leaves))
+                plan.append([jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype),
+                             str(leaf.sharding)])
+                leaves.append(leaf)
+            else:
+                leaves.append(np.asarray(leaf))
+    except BaseException as failure:
+        error = failure
+    agree_process_phase(error, phase=f"{phase} transfer preflight")
+    root_plan = broadcast_from_process_zero(plan)
+    error = None if plan == root_plan else ValueError("global array gather plans differ across ranks")
+    agree_process_phase(error, phase=f"{phase} gather plan")
+    for index in global_indices:
+        error = None
+        try:
+            leaves[index] = _addressable(leaves[index])
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase=f"{phase} transfer leaf {index}")
+    error = None
+    result = value
+    try:
+        assert tree is not None
+        result = jax.tree.unflatten(tree, leaves)
+    except BaseException as failure:
+        error = failure
+    agree_process_phase(error, phase=f"{phase} tree reconstruction")
+    return result
+
+
+def broadcast_from_process_zero(value):
+    """A JSON-encodable value broadcast from rank zero to every rank."""
+    payload = np.frombuffer(json.dumps(value).encode(), np.uint8)
+    length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), np.int64)))
+    if jax.process_index() != 0:
+        payload = np.zeros(length, np.uint8)
+    return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
+
+
+def agree_process_phase(error: BaseException | None, *, phase: str,
+                        available: bool = True) -> int:
+    """Propagate host errors, then count ranks declaring availability.
+
+    All live ranks must reach this boundary. It cannot rescue a failed or
+    blocked device collective. Errors take priority over unavailable input.
+    """
+    if jax.process_count() == 1:
+        if error is not None:
+            raise error
+        return int(available)
+    status = 2 if error is not None else int(available)
+    statuses = np.asarray(multihost_utils.process_allgather(np.asarray(status, np.int32))).reshape(-1)
+    failed = np.flatnonzero(statuses == 2)
+    if not failed.size:
+        return int(np.count_nonzero(statuses))
+    source = int(failed[0])
+    is_source = jax.process_index() == source
+    message = b""
+    if is_source:
+        assert error is not None
+        message = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
+        if len(message) > 4096:
+            message = message[:4064] + b" ... [diagnostic truncated]"
+    length = int(multihost_utils.broadcast_one_to_all(
+        np.asarray(len(message), np.int32), is_source=is_source))
+    payload = np.frombuffer(message, np.uint8) if is_source else np.zeros(length, np.uint8)
+    diagnostic = multihost_utils.broadcast_one_to_all(payload, is_source=is_source).tobytes()
+    context = f"Process phase {phase} failed on rank {source}: {diagnostic.decode('utf-8', errors='replace')}"
+    if error is not None:
+        error.add_note(context)
+        raise error
+    raise RuntimeError(context)
