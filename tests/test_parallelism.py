@@ -432,11 +432,11 @@ def test_shard_batch_splits_across_all_devices():
 def test_prefetch_iterator_preserves_order_and_terminates():
     mesh = build_mesh()
     source = ({"x": np.full((jax.device_count(), 2), i, np.float32)} for i in range(5))
-    it = DevicePrefetchIterator(source, mesh, depth=2)
-    seen = [float(np.asarray(b["x"])[0, 0]) for b in it]
-    assert seen == [0.0, 1.0, 2.0, 3.0, 4.0]
-    with pytest.raises(StopIteration):
-        next(it)
+    with DevicePrefetchIterator(source, mesh, depth=2) as it:
+        seen = [float(np.asarray(b["x"])[0, 0]) for b in it]
+        assert seen == [0.0, 1.0, 2.0, 3.0, 4.0]
+        with pytest.raises(StopIteration):
+            next(it)
 
 
 def test_prefetch_iterator_surfaces_source_errors():
@@ -446,10 +446,10 @@ def test_prefetch_iterator_surfaces_source_errors():
         yield {"x": np.zeros((jax.device_count(), 2), np.float32)}
         raise ValueError("source exploded")
 
-    it = DevicePrefetchIterator(broken(), mesh, depth=2)
-    next(it)
-    with pytest.raises(ValueError, match="source exploded"):
+    with DevicePrefetchIterator(broken(), mesh, depth=2) as it:
         next(it)
+        with pytest.raises(ValueError, match="source exploded"):
+            next(it)
 
 
 def test_prefetch_iterator_tracks_checkpointable_source_state():
@@ -464,15 +464,15 @@ def test_prefetch_iterator_tracks_checkpointable_source_state():
         worker_count=0,
     )
     mesh = build_mesh()
-    it = DevicePrefetchIterator(iter(loader), mesh, depth=2)
-    next(it)
-    next(it)
-    state = it.source_state
-    expected = np.asarray(next(it))
+    with DevicePrefetchIterator(iter(loader), mesh, depth=2) as it:
+        next(it)
+        next(it)
+        state = it.source_state
+        expected = np.asarray(next(it))
 
-    resumed = DevicePrefetchIterator(iter(loader), mesh, depth=2,
-                                     source_state=state)
-    assert np.array_equal(np.asarray(next(resumed)), expected)
+        with DevicePrefetchIterator(iter(loader), mesh, depth=2,
+                                    source_state=state) as resumed:
+            assert np.array_equal(np.asarray(next(resumed)), expected)
 
 
 def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
@@ -491,15 +491,15 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()
-    it = DevicePrefetchIterator(data.train(), mesh, depth=2)
-    next(it)
-    state = it.source_state
-    expected = np.asarray(next(it)["text"])
-    assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
+    with DevicePrefetchIterator(data.train(), mesh, depth=2) as it:
+        next(it)
+        state = it.source_state
+        expected = np.asarray(next(it)["text"])
+        assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
 
-    resumed = DevicePrefetchIterator(data.train(), mesh, depth=2,
-                                     source_state=state)
-    assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
+        with DevicePrefetchIterator(data.train(), mesh, depth=2,
+                                    source_state=state) as resumed:
+            assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
 
 
 # --------------------------------------------------------------------------
@@ -778,13 +778,13 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     assert position is not None, "iterator position was never captured"
 
     mesh = build_mesh()
-    resumed = DevicePrefetchIterator(grain_image_loader(), mesh,
-                                     source_state=position)
-    fresh = DevicePrefetchIterator(grain_image_loader(), mesh)
-    for _ in range(3):
-        next(fresh)
-    np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
-                                  np.asarray(next(fresh)["image"]))
+    with DevicePrefetchIterator(grain_image_loader(), mesh,
+                                source_state=position) as resumed:
+        with DevicePrefetchIterator(grain_image_loader(), mesh) as fresh:
+            for _ in range(3):
+                next(fresh)
+            np.testing.assert_array_equal(np.asarray(next(resumed)["image"]),
+                                          np.asarray(next(fresh)["image"]))
 
 
 def test_fit_resumes_the_unfinished_part_of_a_run(tmp_path):

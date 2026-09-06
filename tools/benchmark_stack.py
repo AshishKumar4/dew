@@ -89,43 +89,43 @@ def measure(depth: int, scan: bool, config: StackConfig, counter: CompileCounter
                 config={**WIDTH, "num_layers": depth, "scan_layers": scan},
                 dtype=config.dtype, batch_size=BATCH, seq_len=SEQ_LEN)
     trainer = build_trainer(case, config)
-    source = DevicePrefetchIterator(batches(case), trainer.device_mesh)
-    abstract = jax.eval_shape(trainer.initial_state)
-    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-    counter.steps = 0
+    with DevicePrefetchIterator(batches(case), trainer.device_mesh) as source:
+        abstract = jax.eval_shape(trainer.initial_state)
+        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+        counter.steps = 0
 
-    started = time.perf_counter()
-    compiled = trainer.compile(state, next(source))
-    compile_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        compiled = trainer.compile(state, next(source))
+        compile_seconds = time.perf_counter() - started
 
-    def step(state):
-        state, _, loss, _, _ = compiled(state, None, next(source))
-        return state, loss
+        def step(state):
+            state, _, loss, _, _ = compiled(state, None, next(source))
+            return state, loss
 
-    # One warm step before the timed window; the first dispatch of the
-    # executable stays outside it.
-    state, loss = step(state)
-    for _ in range(config.warmup - 1):
+        # One warm step before the timed window; the first dispatch of the
+        # executable stays outside it.
         state, loss = step(state)
-    loss.block_until_ready()
-    started = time.perf_counter()
-    for _ in range(config.steps):
-        state, loss = step(state)
-    loss.block_until_ready()
-    elapsed = time.perf_counter() - started
-    return {
-        "depth": depth,
-        "scan_layers": scan,
-        "stage": config.stage,
-        "microbatches": config.microbatches,
-        "fsdp": config.fsdp,
-        "params": parameter_count(state.params),
-        "compile_seconds": round(compile_seconds, 2),
-        "compilations": counter.steps,
-        "ms_per_step": round(elapsed / config.steps * 1e3, 2),
-        "loss": float(loss),
-        "device_kind": jax.devices()[0].device_kind,
-    }
+        for _ in range(config.warmup - 1):
+            state, loss = step(state)
+        loss.block_until_ready()
+        started = time.perf_counter()
+        for _ in range(config.steps):
+            state, loss = step(state)
+        loss.block_until_ready()
+        elapsed = time.perf_counter() - started
+        return {
+            "depth": depth,
+            "scan_layers": scan,
+            "stage": config.stage,
+            "microbatches": config.microbatches,
+            "fsdp": config.fsdp,
+            "params": parameter_count(state.params),
+            "compile_seconds": round(compile_seconds, 2),
+            "compilations": counter.steps,
+            "ms_per_step": round(elapsed / config.steps * 1e3, 2),
+            "loss": float(loss),
+            "device_kind": jax.devices()[0].device_kind,
+        }
 
 
 def main(config: StackConfig) -> list[dict]:

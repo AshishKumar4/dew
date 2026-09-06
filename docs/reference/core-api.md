@@ -83,6 +83,8 @@ fit(data, *, steps, log_every=100, eval_every=None,
 
 For accurate continuation, checkpointable data must provide its iterator position. The overflow path currently has separate attempted-work and accepted-step counters; see [checkpoint limits](../guides/checkpoints.md#current-limits).
 
+`fit` owns the iterators returned by the dataset, not the dataset itself. It closes training read-ahead before final evaluation and closes every validation pass, including failures and early exhaustion. A fit already at its target opens no training iterator or profiler; requested final evaluation still runs. On every exit it stops its own active trace and waits for pending checkpoint writes without closing the borrowed checkpointer or tracker. The original training/evaluation failure remains primary; cleanup failures are attached as exception notes.
+
 ### Initialize, restore, and compile
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
@@ -114,7 +116,16 @@ Loading(workers=32, threads=64, read_buffer=128, worker_buffer=20)
 
 `train` opens a training iterator, and `val` opens one finite validation pass or is `None`. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count.
 
+Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
+
+`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership on successful construction. Use it in a `with` block, or call `close(timeout=5.0)`, even when a loop consumes only a fixed number of batches. Depth must be positive; the bound is `depth` queued device batches plus at most one in-flight batch, excluding the consumer and upstream buffers. Its `source_state` describes the last delivered batch, never speculative read-ahead. EOF and source failures follow preceding queued batches; early close discards unread data and speculative failures, but reports finalization failures.
+
+The prefetch worker performs iteration, checkpoint operations, and final source close. Closing requests cancellation, discards queued batches, and joins the worker. A `TimeoutError` means the source read, placement, or finalization did not cooperate: the thread was **not** killed and its in-flight references may remain. Cancellation stays requested and close can be retried. After close, further iteration stops.
+
+Grain lifecycle limits: the installed `DataLoaderIterator` exposes no public close, so Dew releases its owned references without reaching into private iterators or changing the sampling pipeline. Local-record probes release the source and child processes, but that is not a deterministic upstream shutdown contract. Grain also keeps a process-wide shared-memory deletion thread pool. Its `DatasetIterator.close()` is called on the iteration thread, but read-executor shutdown does not wait for already-running record reads. Arbitrary blocked upstream reads remain outside Dew's shutdown guarantee.
+
 `Loading` controls Grain concurrency and buffers for built-in specifications. Use zero worker processes for small local examples; the defaults may be excessive for a tiny dataset. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
+
 
 ## Checkpoints
 

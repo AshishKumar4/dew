@@ -341,65 +341,182 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
 
 
 class DevicePrefetchIterator:
-    """Runs the host-to-device batch transfer a few batches ahead of the loop.
+    """Bounded host-to-device read-ahead, exclusively owning its source.
 
-    Without this the transfer sits on the critical path between steps, because
-    the loop only starts moving batch N+1 after step N has been dispatched.
+    Use as a context manager or call close, including after a bounded loop.
+    At most depth batches are queued plus one being read/placed. Source next,
+    checkpoint operations and final close run on the worker. Only an optional
+    thread-safe, nonblocking request_stop hook runs on the closing thread.
+    Arbitrary blocking source code cannot be killed: close reports a timeout.
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
                  source_state: Optional[bytes] = None):
-        self._iterator = iter(iterator)
-        self._mesh = mesh
+        if depth <= 0:
+            raise ValueError("prefetch depth must be positive")
+        self._iterator: Iterator | None = iter(iterator)
+        self._source_name = type(self._iterator).__name__
+        self._mesh: Mesh | None = mesh
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
-        self._terminal: Optional[BaseException] = None
-        self._source = self._iterator if isinstance(self._iterator, Checkpointable) else None
-        if source_state is not None:
-            if self._source is None:
-                raise TypeError(
-                    f"{type(self._iterator).__name__} cannot resume from a saved position")
-            self._source.set_state(self._position_for(self._source, source_state))
-        # Position of the source iterator as of the batch most recently handed
-        # out, so a checkpoint resumes at the next unseen batch, not at
-        # whatever the prefetch thread has already raced ahead to.
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._ready = threading.Event()
+        self._initial_error: BaseException | None = None
+        self._error: BaseException | None = None
+        self._cleanup_error: BaseException | None = None
         self.source_state = source_state
-        self._thread = threading.Thread(target=self._prefetch, daemon=True)
+        self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._thread.start()
-
-    def _position_as_bytes(self, state) -> bytes:
-        """A position a checkpoint can carry: grain's DataLoader iterator
-        reports JSON bytes, its Dataset iterator (the packed loader) a dict,
-        and the checkpoint holds one uint8 array either way."""
-        return state if isinstance(state, bytes) else json.dumps(state).encode()
-
-    def _position_for(self, source: Checkpointable, saved: bytes):
-        """`saved` back in the shape this iterator's set_state reads."""
-        return saved if isinstance(source.get_state(), bytes) else json.loads(saved)
+        # Restoration is synchronous to the caller but uses the same thread
+        # as next/get_state/close (Grain's DatasetIterator is not thread-safe).
+        self._ready.wait()
+        if self._initial_error is not None:
+            error, self._initial_error = self._initial_error, None
+            self._thread.join()
+            raise error
 
     def _prefetch(self):
+        iterator, mesh = self._iterator, self._mesh
+        assert iterator is not None and mesh is not None
+        source = iterator if isinstance(iterator, Checkpointable) else None
         try:
-            while True:
-                batch = next(self._iterator)
-                state = (self._position_as_bytes(self._source.get_state())
-                         if self._source is not None else None)
-                self._queue.put((shard_batch(self._mesh, batch), state))
+            if self.source_state is not None:
+                if source is None:
+                    raise TypeError(f"{self._source_name} cannot resume from a saved position")
+                saved = self.source_state
+                source.set_state(saved if isinstance(source.get_state(), bytes)
+                                 else json.loads(saved))
+        except BaseException as error:
+            # Failed construction does not transfer source ownership.
+            self._initial_error = error
+            self._iterator = self._mesh = None
+            self._ready.set()
+            self._done.set()
+            return
+        self._ready.set()
+        batch = state = placed = None
+        try:
+            while not self._stop.is_set():
+                batch = next(iterator)
+                if self._stop.is_set():
+                    break
+                state = source.get_state() if source is not None else None
+                if source is not None and not isinstance(state, bytes):
+                    state = json.dumps(state).encode()
+                placed = shard_batch(mesh, batch)
+                batch = None
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put((placed, state), timeout=0.05)
+                        break
+                    except queue.Full:
+                        pass
+                placed = state = None
         except StopIteration:
-            self._queue.put(StopIteration())
-        except BaseException as error:  # surfaced on the consumer's thread
-            self._queue.put(error)
+            pass
+        except BaseException as error:
+            self._error = error
+        finally:
+            batch = placed = state = None
+            try:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+            except BaseException as error:
+                self._cleanup_error = error
+            finally:
+                self._iterator = self._mesh = None
+                # No bound close method or checkpointable alias may retain a
+                # Grain pipeline after the worker exits.
+                iterator = source = mesh = close = None
+                if self._stop.is_set():
+                    self._discard()
+                self._done.set()
+
+    def _discard(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def close(self, *, timeout: float = 5.0) -> None:
+        """Cancel and join, discarding unread batches, not consumed position.
+
+        A timeout leaves cancellation requested; a later close may join again.
+        It does not mean the source's in-flight work or buffers were released.
+        """
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("a prefetch worker cannot close itself")
+        if timeout < 0:
+            raise ValueError("close timeout must be nonnegative")
+        first_stop = not self._stop.is_set()
+        self._stop.set()
+        error = None
+        try:
+            request_stop = getattr(self._iterator, "request_stop", None)
+            if first_stop and request_stop is not None:
+                request_stop()
+        except BaseException as failure:
+            error = failure
+        self._discard()
+        self._thread.join(timeout)
+        self._discard()
+        self._error = None  # Unconsumed speculative errors are discarded too.
+        failure = None
+        if self._thread.is_alive():
+            failure = TimeoutError(
+                f"{self._source_name} did not stop within {timeout}s: its next, "
+                "placement or finalization is uncooperative; the worker is still alive")
+        elif self._cleanup_error is not None:
+            failure, self._cleanup_error = self._cleanup_error, None
+        if error is not None:
+            if failure is not None:
+                error.add_note(f"Prefetch cleanup also failed: {failure!r}")
+            raise error
+        if failure is not None:
+            raise failure
+
+    def __enter__(self) -> DevicePrefetchIterator:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            self.close()
+        except BaseException as error:
+            if exc is None:
+                raise
+            exc.add_note(f"Prefetch cleanup failed: {error!r}")
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._terminal is not None:
-            raise self._terminal
-        item = self._queue.get()
-        if isinstance(item, BaseException):
-            self._terminal = item
-            raise item
-        batch, self.source_state = item
-        return batch
+        while not self._stop.is_set():
+            try:
+                batch, position = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                if not self._done.is_set():
+                    continue
+                # The final publication may race the timed-out get.
+                try:
+                    batch, position = self._queue.get_nowait()
+                except queue.Empty:
+                    error, self._error = self._error, None
+                    cleanup, self._cleanup_error = self._cleanup_error, None
+                    if error is not None:
+                        if cleanup is not None:
+                            error.add_note(f"Source cleanup failed: {cleanup!r}")
+                        raise error
+                    if cleanup is not None:
+                        raise cleanup
+                    raise StopIteration
+            if self._stop.is_set():
+                break
+            self.source_state = position
+            return batch
+        raise StopIteration
+
 
 
 # --------------------------------------------------------------------------
