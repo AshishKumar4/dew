@@ -636,6 +636,78 @@ def write_llama4_vision_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+def write_gemma3_mm_tiny() -> None:
+    """A Gemma 3 wrapper fixture: the SigLIP and projector halves under the
+    released model.* prefixes beside a tiny decoder half, with the wrapper
+    config and both vision reference outputs.
+
+    The decoder half reuses gemma3-tiny's weights under model.language_model.*,
+    and the tied head rides top-level as the released layout carries it. The
+    tower and projector come from the shared SigLIP system at a fresh seed.
+    """
+    from safetensors.torch import load_file, save_file
+
+    system = siglip_tiny_system(seed=4321, text_width=64)
+    text = load_file(str(FIXTURES / "gemma3-tiny" / "model.safetensors"))
+    text_config = json.loads((FIXTURES / "gemma3-tiny" / "config.json").read_text())
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"model.vision_tower.{name}"] = tensor
+    for name, tensor in system["projector"].state_dict().items():
+        merged[f"model.multi_modal_projector.{name}"] = tensor
+    for name, tensor in text.items():
+        merged[f"model.language_model.{name}"] = tensor
+    merged["lm_head.weight"] = text["model.embed_tokens.weight"].clone()
+    directory = FIXTURES / "gemma3-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "gemma3",
+        "text_config": text_config,
+        "vision_config": system["vconf"].to_dict(),
+        "mm_tokens_per_image": system["mm_tokens"],
+        "boi_token_index": 200, "eoi_token_index": 201,
+        "image_token_index": 202}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_llama4_mm_tiny() -> None:
+    """A Llama 4 wrapper fixture, same deal with an untied head: the tiny
+    decoder half keeps its own lm_head, which lands top-level."""
+    from safetensors.torch import load_file, save_file
+
+    system = llama4_vision_tiny_system(seed=4321)
+    text = load_file(str(FIXTURES / "llama4-tiny" / "model.safetensors"))
+    text_config = json.loads((FIXTURES / "llama4-tiny" / "config.json").read_text())
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"model.vision_model.{name}"] = tensor
+    for name, tensor in system["projector"].state_dict().items():
+        merged[f"model.multi_modal_projector.{name}"] = tensor
+    for name, tensor in text.items():
+        merged["lm_head.weight" if name == "lm_head.weight"
+               else f"model.language_model.{name}"] = tensor
+    directory = FIXTURES / "llama4-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "llama4",
+        "text_config": text_config,
+        "vision_config": system["vconf"].to_dict(),
+        "boi_token_index": 90, "eoi_token_index": 91,
+        "image_token_index": 92}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
@@ -774,6 +846,8 @@ def main() -> None:
     write_diffusion_tiny("dream-tiny", DreamTiny(), DREAM_TINY_CONFIG)
     write_siglip_tiny()
     write_llama4_vision_tiny()
+    write_gemma3_mm_tiny()
+    write_llama4_mm_tiny()
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 
