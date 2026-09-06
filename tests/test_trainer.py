@@ -568,7 +568,7 @@ def test_a_failing_validation_loader_fails_the_pass():
 
     with pytest.raises(OSError, match="val.bin"):
         make_trainer(objective=Features()).fit(Data(val=UnreadableSplit), steps=1,
-                                               log_every=1, eval_every=1)
+                                               log_every=1, eval_every=1, metrics=(Spread([]),))
 
 
 def test_a_metric_that_reads_a_type_the_objective_does_not_produce_is_an_error():
@@ -707,7 +707,6 @@ def test_goodput_arithmetic():
         "goodput/time_to_first_step_s": 2.0, "goodput/step_fraction": 0.5}
     assert trainer_module.goodput(10.0, None, 4.0) == {"goodput/step_fraction": 0.0}
     assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
-
 
 
 
