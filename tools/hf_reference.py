@@ -37,6 +37,20 @@ What lands in tests/fixtures/hf:
   outputs. The SigLIP tower is two layers of width 32 over a 2x2 grid pooled
   to one soft token of width 16; the Llama 4 trunk is two layers of width 32
   shuffled to one token of width 64 and mapped to width 32.
+  gemma4-vision-tiny/ holds the Gemma 4 trunk with its embedder: the same
+  file layout, patches and (x, y) position ids as the processor emits them
+  for a 4x4 grid, pooled to four soft tokens of width 32. qwen35-vision-tiny/
+  holds the Qwen 3.5 trunk with its merger split off under the released
+  merger.* names: the same layout, a 32-pixel square image patchifying into
+  a 4x4 grid over the 8x8 learned position table, merged to four soft tokens
+  of width 64.
+  gemma3-tiny-mm/, llama4-tiny-mm/, gemma4-tiny-mm/ and qwen35-tiny-mm/ hold
+  a wrapper fixture each: the vision and projector halves under the released
+  model.* nesting beside a tiny decoder half, the wrapper config, fixed
+  pixels with one image mark per soft token in the input ids, and the fp32
+  wrapper logits. The Gemma 4 pixels are patches with positions; the Qwen
+  wrapper reference runs on pre-merged embeddings, since its image-grid
+  positions are outside what Dew models.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
@@ -53,6 +67,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any, Dict
 from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
@@ -73,9 +88,21 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32ForCausalLM,
 )
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+from transformers.models.gemma4.configuration_gemma4 import (
+    Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig,
+)
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ForConditionalGeneration, Gemma4MultimodalEmbedder, Gemma4VisionModel,
+)
 from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import (
     Llama4MultiModalProjector, Llama4VisionModel,
+)
+from transformers.models.qwen3_5.configuration_qwen3_5 import (
+    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig,
+)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5VisionModel,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -743,6 +770,332 @@ def write_llama4_mm_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+G4V_TEXT_WIDTH = 32
+G4V_IMAGE = 60
+
+
+def gemma4_vision_tiny_config() -> Gemma4VisionConfig:
+    """Two layers of width 32 over a 4x4 patch grid pooled by 2 into four
+    soft tokens, with one grouped-query repeat and the released
+    standardization on."""
+    return Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+        hidden_activation="gelu_pytorch_tanh", rms_norm_eps=1e-6,
+        patch_size=8, pooling_kernel_size=2, position_embedding_size=64,
+        rope_parameters={"rope_type": "default", "rope_theta": 100.0},
+        standardize=True, use_clipped_linears=False, attention_bias=False,
+        attention_dropout=0.0)
+
+
+def gemma4_positions(grid: int, batch: int) -> np.ndarray:
+    """The processor's (x, y) patch ids for a square grid, row-major."""
+    rows = np.arange(grid).reshape(-1, 1).repeat(grid, axis=1).reshape(-1)
+    cols = np.arange(grid).reshape(1, -1).repeat(grid, axis=0).reshape(-1)
+    one = np.stack([cols, rows], axis=-1).astype(np.int64)
+    return np.stack([one] * batch, axis=0)
+
+
+def gemma4_vision_tiny_system(seed: int = 1234):
+    """A tiny Gemma 4 vision trunk and multimodal embedder with scattered
+    weights, on patchified pixels as the processor emits them.
+
+    Returns the torch modules with fp32 reference outputs on fixed patches,
+    and the configs that describe them. The 32-pixel image patchifies into
+    a 4x4 grid pooled to four soft tokens. The standardization buffers ride
+    the state dict, so they are scattered with the weights.
+    """
+    from types import SimpleNamespace
+
+    vconf = gemma4_vision_tiny_config()
+    torch.manual_seed(seed)
+    tower = Gemma4VisionModel(vconf)
+    scatter_weights(tower, seed)
+    with torch.no_grad():
+        tower.std_bias.copy_(torch.randn(32) * 0.5)
+        tower.std_scale.copy_(1.0 + torch.randn(32) * 0.05)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 16, 192).astype(np.float32)
+    positions = gemma4_positions(4, BATCH)
+    with torch.no_grad():
+        last = tower(pixel_values=torch.from_numpy(pixels),
+                     pixel_position_ids=torch.from_numpy(positions),
+                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    # The trunk strips padding with a boolean mask, which flattens the batch;
+    # the fixture has no padding, so the reshape back is the same tokens.
+    last = last.reshape(BATCH, -1, vconf.hidden_size)
+    projector = Gemma4MultimodalEmbedder(
+        vconf, Gemma4TextConfig(hidden_size=G4V_TEXT_WIDTH))
+    scatter_weights(projector, seed + 1)
+    projector = projector.float().eval()
+    with torch.no_grad():
+        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+    return {"tower": tower, "projector": projector, "vconf": vconf,
+            "pixels": pixels, "positions": positions, "last": last,
+            "soft": soft}
+
+
+def write_gemma4_vision_tiny() -> None:
+    """The Gemma 4 trunk and embedder as Dew reads them: bare tensor names,
+    the tower config, the text width, fixed patches and positions, and both
+    fp32 reference outputs."""
+    from safetensors.torch import save_file
+
+    system = gemma4_vision_tiny_system()
+    directory = FIXTURES / "gemma4-vision-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": G4V_TEXT_WIDTH}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "positions.npy", system["positions"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+QWEN_VISION_TEXT_WIDTH = 64
+QWEN_VISION_IMAGE = 200
+
+
+def qwen35_vision_tiny_config() -> Qwen3_5VisionConfig:
+    """Two layers of width 32 over a 4x4 patch grid merged by 2 into four
+    soft tokens, with the two-frame temporal patch the still-image processor
+    fills by repeating the frame."""
+    return Qwen3_5VisionConfig(
+        depth=2, hidden_size=32, hidden_act="gelu_pytorch_tanh",
+        intermediate_size=64, num_heads=4, in_channels=3, patch_size=8,
+        spatial_merge_size=2, temporal_patch_size=2, out_hidden_size=64,
+        num_position_embeddings=64)
+
+
+def qwen35_patchify(images: np.ndarray, patch_size: int, merge_size: int,
+                    temporal_patch_size: int) -> np.ndarray:
+    """Still images into flat tokens the way the Qwen processor lays them:
+    spatial patches in merge-block order, each frame repeated along time
+    (image_processing_qwen2_vl.py, patchify)."""
+    batch, channels, height, width = images.shape
+    grid = height // patch_size
+    blocks = grid // merge_size
+    patches = images.reshape(batch, channels, blocks, merge_size, patch_size,
+                             blocks, merge_size, patch_size)
+    patches = patches.transpose(0, 2, 5, 3, 6, 1, 4, 7)
+    flat = patches.reshape(batch, grid * grid, channels * patch_size * patch_size)
+    return np.tile(flat[:, :, None, :], (1, 1, temporal_patch_size, 1)).reshape(
+        batch * grid * grid, channels * temporal_patch_size * patch_size * patch_size)
+
+
+def qwen35_vision_tiny_system(seed: int = 1234):
+    """A tiny Qwen 3.5 vision trunk and merger with scattered weights.
+
+    Returns the torch modules with fp32 reference outputs on a fixed 32-pixel
+    image, and the configs that describe them. The image patchifies into a
+    4x4 grid over an 8x8 learned position table, so the interpolation path
+    runs, and merges by 2 into four soft tokens.
+    """
+    vconf = qwen35_vision_tiny_config()
+    torch.manual_seed(seed)
+    tower = Qwen3_5VisionModel(vconf)
+    scatter_weights(tower, seed)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 3, 32, 32).astype(np.float32)
+    patch_size = vconf.patch_size
+    temporal_patch_size = vconf.temporal_patch_size
+    assert isinstance(patch_size, int) and isinstance(temporal_patch_size, int)
+    features = qwen35_patchify(pixels, patch_size, vconf.spatial_merge_size,
+                               temporal_patch_size)
+    grid = torch.tensor([[1, 4, 4]] * BATCH)
+    with torch.no_grad():
+        output = tower(hidden_states=torch.from_numpy(features), grid_thw=grid,
+                       return_dict=True)
+        last = output.last_hidden_state.to(torch.float32).numpy().reshape(
+            BATCH, -1, vconf.hidden_size)
+        soft = output.pooler_output.to(torch.float32).numpy().reshape(
+            BATCH, -1, vconf.out_hidden_size)
+    return {"tower": tower, "vconf": vconf, "pixels": pixels,
+            "last": last, "soft": soft}
+
+
+def write_qwen35_vision_tiny() -> None:
+    """The Qwen 3.5 trunk and merger as Dew reads them: bare tensor names
+    with the merger under its released prefix, the tower config, the fixed
+    square image, and both fp32 reference outputs."""
+    from safetensors.torch import save_file
+
+    system = qwen35_vision_tiny_system()
+    directory = FIXTURES / "qwen35-vision-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    tower_tensors = {name: tensor for name, tensor in
+                     system["tower"].state_dict().items()
+                     if not name.startswith("merger.")}
+    merger_tensors = {name: tensor for name, tensor in
+                      system["tower"].state_dict().items()
+                      if name.startswith("merger.")}
+    save_file(tower_tensors, directory / "model.safetensors")
+    save_file(merger_tensors, directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": QWEN_VISION_TEXT_WIDTH}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+GEMMA4_MM_TEXT: Dict[str, Any] = dict(
+    vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3,
+    layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+    num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+    hidden_activation="gelu_pytorch_tanh", attention_k_eq_v=True,
+    sliding_window=4, hidden_size_per_layer_input=0, num_kv_shared_layers=0,
+    per_layer_config={"2": {"head_dim": 16, "num_key_value_heads": 1}},
+    max_position_embeddings=64, rms_norm_eps=1e-6,
+    final_logit_softcapping=30.0, tie_word_embeddings=True,
+    bos_token_id=2, eos_token_id=1, pad_token_id=0,
+    use_bidirectional_attention="vision", use_double_wide_mlp=False,
+    rope_parameters={
+        "full_attention": {"rope_type": "proportional", "rope_theta": 1e6,
+                           "partial_rotary_factor": 0.25},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
+
+QWEN35_MM_TEXT: Dict[str, Any] = dict(
+    vocab_size=256, hidden_size=64, intermediate_size=128,
+    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+    head_dim=32, hidden_act="silu", max_position_embeddings=64,
+    rms_norm_eps=1e-6, tie_word_embeddings=True,
+    linear_conv_kernel_dim=4, linear_key_head_dim=12, linear_value_head_dim=16,
+    linear_num_key_heads=2, linear_num_value_heads=4,
+    layer_types=["linear_attention"] * 3 + ["full_attention"],
+    rope_parameters={"rope_type": "default", "rope_theta": 1000000.0,
+                     "partial_rotary_factor": 0.25,
+                     "mrope_interleaved": True, "mrope_section": [2, 1, 1]})
+
+
+def write_gemma4_mm_tiny() -> None:
+    """A Gemma 4 wrapper fixture: the vision and embedder halves under the
+    released model.* prefixes beside a tiny dense decoder half, with the
+    wrapper config, patches and positions, and the wrapper logits.
+
+    Each row marks four image positions, the pooled count of the 4x4 patch
+    grid, and the reference runs without multimodal masks, so the text side
+    stays causal the way Dew's decoder runs it.
+    """
+    from safetensors.torch import save_file
+
+    system = gemma4_vision_tiny_system(seed=4321)
+    torch.manual_seed(4321)
+    text = Gemma4ForConditionalGeneration(Gemma4Config(
+        text_config=Gemma4TextConfig(**GEMMA4_MM_TEXT),
+        vision_config=system["vconf"], audio_config=None)).model.language_model
+    scatter_weights(text, seed=4321)
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"model.vision_tower.{name}"] = tensor
+    for name, tensor in system["projector"].state_dict().items():
+        merged[f"model.embed_vision.{name}"] = tensor
+    for name, tensor in text.state_dict().items():
+        if name == "lm_head.weight":
+            continue
+        merged[f"model.language_model.{name}"] = tensor
+    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
+    directory = FIXTURES / "gemma4-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "gemma4",
+        "text_config": dict(GEMMA4_MM_TEXT, model_type="gemma4_text"),
+        "vision_config": system["vconf"].to_dict(),
+        "audio_config": None,
+        "vision_soft_tokens_per_image": 4,
+        "boi_token_id": 61, "eoi_token_id": 62,
+        "image_token_id": G4V_IMAGE}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "positions.npy", system["positions"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    ids = np.array([[60, 60, 60, 60, 9], [2, 60, 60, 60, 60]], np.int32)
+    with torch.no_grad():
+        wrapper = Gemma4ForConditionalGeneration(Gemma4Config(
+            text_config=dict(GEMMA4_MM_TEXT, model_type="gemma4_text"),
+            vision_config=system["vconf"], audio_config=None,
+            image_token_id=G4V_IMAGE, boi_token_id=61, eoi_token_id=62))
+        wrapper.load_state_dict(merged, strict=True)
+        wrapper = wrapper.float().eval()
+        logits = wrapper(
+            input_ids=torch.from_numpy(ids),
+            pixel_values=torch.from_numpy(system["pixels"]),
+            image_position_ids=torch.from_numpy(system["positions"]),
+            use_cache=False).logits.to(torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_qwen35_mm_tiny() -> None:
+    """A Qwen 3.5 wrapper fixture: the vision trunk and merger beside a tiny
+    hybrid decoder half under the released model.* nesting, with the wrapper
+    config, the square image, and the wrapper logits.
+
+    Each row marks four image positions, the merged count of the 4x4 patch
+    grid. The reference's image-grid positions are outside what Dew models,
+    so the wrapper reference runs on pre-merged embeddings with no vision
+    inputs, which scores with plain sequential positions on both sides.
+    """
+    from safetensors.torch import load_file, save_file
+
+    system = qwen35_vision_tiny_system(seed=4321)
+    torch.manual_seed(4321)
+    text = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN35_MM_TEXT)).model
+    scatter_weights(text, seed=4321)
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"model.visual.{name}"] = tensor
+    for name, tensor in text.state_dict().items():
+        if name == "lm_head.weight":
+            continue
+        merged[f"model.language_model.{name}"] = tensor
+    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
+    directory = FIXTURES / "qwen35-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5",
+        "text_config": dict(QWEN35_MM_TEXT, model_type="qwen3_5_text"),
+        "vision_config": system["vconf"].to_dict(),
+        "image_token_id": QWEN_VISION_IMAGE, "video_token_id": 201,
+        "vision_start_token_id": 202, "vision_end_token_id": 203},
+        indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    ids = np.array([[2, 200, 200, 200, 200], [200, 200, 200, 200, 9]], np.int32)
+    with torch.no_grad():
+        wrapper = Qwen3_5ForConditionalGeneration(Qwen3_5Config(
+            text_config=dict(QWEN35_MM_TEXT, model_type="qwen3_5_text"),
+            vision_config=system["vconf"].to_dict(),
+            image_token_id=QWEN_VISION_IMAGE, video_token_id=201,
+            vision_start_token_id=202, vision_end_token_id=203))
+        wrapper.load_state_dict(merged, strict=True)
+        wrapper = wrapper.float().eval()
+        embeds = wrapper.model.get_input_embeddings()(torch.from_numpy(ids))
+        image = torch.from_numpy(system["soft"]).to(embeds.dtype)
+        mask = (torch.from_numpy(ids) == QWEN_VISION_IMAGE).unsqueeze(-1).expand_as(embeds)
+        fused = embeds.masked_scatter(mask, image)
+        logits = wrapper(inputs_embeds=fused, use_cache=False).logits.to(
+            torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
 def write_diffusion_sc_tiny() -> None:
     """The self-conditioning MLP alone: its weights, narrow config, fixed
     inputs and the fp32 reference output."""
@@ -1003,8 +1356,12 @@ def main() -> None:
     write_diffusion_tiny("dream-tiny", DreamTiny(), DREAM_TINY_CONFIG)
     write_siglip_tiny()
     write_llama4_vision_tiny()
+    write_gemma4_vision_tiny()
+    write_qwen35_vision_tiny()
     write_gemma3_mm_tiny()
     write_llama4_mm_tiny()
+    write_gemma4_mm_tiny()
+    write_qwen35_mm_tiny()
     write_diffusion_sc_tiny()
     write_diffusion_denoiser_tiny()
     write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
