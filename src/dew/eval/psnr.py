@@ -53,6 +53,6 @@ def psnr(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid)
     """
     def measure(artifact, batch):
         samples, targets = paired(artifact, batch, field)
-        return peak_signal_noise_ratio(samples, targets, data_range)
+        return peak_signal_noise_ratio(samples, targets, data_range, per_example=True)
 
     return ImageMetric(name="psnr", measure=measure, reads=reads)

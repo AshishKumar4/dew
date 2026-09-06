@@ -14,9 +14,8 @@ and the reason. Padding is excluded only when the run names the pad id.
 Packed token files have no padding, and masking out a real id would drop
 those tokens from the average.
 
-Evaluation returns the teacher-forced per-token scores, which `perplexity`
-reduces over a whole pass with the token counts, and, when asked for, the text
-the model writes from a fixed prompt.
+Evaluation returns teacher-forced per-token scores for streaming perplexity.
+The separate preview hook writes text from a fixed prompt once per event.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, TokenScores
+from dew.artifacts import TextSamples, TokenScores, host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
@@ -58,9 +57,11 @@ def prompt_batch(prompt) -> jax.Array:
 
 @dataclass(frozen=True)
 class Samples:
-    """The text an evaluation writes: `prompt` ids (one, or several of equal
-    length), how many tokens to add, the sampling knobs, and the `decode`
-    that turns ids back into a string."""
+    """Once-per-event text preview configuration.
+
+    Prompts contain token IDs, with equal lengths for multiple prompts.
+    This display count does not limit the teacher-forced scoring population.
+    """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
     temperature: float = 1.0
@@ -163,7 +164,7 @@ class Scores(NamedTuple):
 
 @objectives("lm")
 class LMObjective(Objective):
-    """Shifted cross entropy; evaluation scores tokens and writes text."""
+    """Shifted cross entropy, teacher-forced scoring and optional text previews."""
 
     artifact = TokenScores
 
@@ -438,29 +439,31 @@ class LMObjective(Objective):
         return loss, Aux(reported, variables, stats)
 
     def evaluate(self, params, batch, step: Step):
-        """Teacher-forced token scores, plus the sampled text when asked for.
-
-        Both read the EMA copy, so the perplexity and the samples describe the
-        same weights.
-        """
+        """Teacher-forced scores over the complete batch, using EMA when present."""
         params = params if step.ema is None else step.ema
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         segment_ids, positions = _packing(batch)
         losses, weights = self._scored(params, tokens, segment_ids, positions,
                                        self._batch_roles(batch))
-        scores = TokenScores(losses=losses, weights=weights)
+        return TokenScores(losses=losses, weights=weights)
+
+    def preview(self, params, batch, step: Step, *, scored=None):
+        """Sample the configured prompt once, then decode only on process zero."""
         if self.samples is None:
-            return scores
-        # Deferred, so a run that writes no text pulls in no sampler.
+            return None
         from dew.sampling.text import generate
 
+        params = params if step.ema is None else step.ema
         generated = generate(
             self.model, params, self._prompt, self.samples.max_new_tokens,
             key=step.key, temperature=self.samples.temperature, top_k=self.samples.top_k)
+        generated, prompt = host((generated, self._prompt))
+        if jax.process_index() != 0:
+            return None
         decode = self.samples.decode
-        return scores, TextSamples(
+        return TextSamples(
             tokens=generated,
-            prompt=decode(np.asarray(self._prompt)[0].tolist()),
+            prompt=decode(np.asarray(prompt)[0].tolist()),
             texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
 
     @functools.cached_property
@@ -486,13 +489,16 @@ class Perplexity:
     reads = TokenScores
 
     def __call__(self, scores: TokenScores, batch) -> tuple[float, float]:
-        weights = jnp.asarray(scores.weights, jnp.float32)
-        return (float(jnp.sum(jnp.asarray(scores.losses, jnp.float32) * weights)),
-                float(jnp.sum(weights)))
+        weights = np.asarray(scores.weights, dtype=np.float64)
+        losses = np.asarray(scores.losses, dtype=np.float64)
+        return float(np.sum(losses * weights)), float(np.sum(weights))
 
-    def reduce(self, values: Sequence[tuple[float, float]]) -> float:
-        total = sum(loss for loss, _ in values)
-        count = sum(count for _, count in values)
+    def merge(self, accumulated: tuple[float, float],
+              contribution: tuple[float, float]) -> tuple[float, float]:
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated: tuple[float, float]) -> float:
+        total, count = accumulated
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))

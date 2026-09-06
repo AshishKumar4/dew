@@ -170,24 +170,29 @@ class DiffusionObjective(Objective):
         return jnp.clip(samples, -1.0, 1.0)
 
     def evaluate(self, params, batch, step: Step):
-        """`VALIDATION_SAMPLES` samples from the batch's conditions, with the
-        averaged weights when the run keeps them, seeded by the step's key.
+        """One generated sample for every real row, without display decoding."""
+        params = params if step.ema is None else step.ema
+        count = batch[self.inputs.sample.key].shape[0]
+        tokens = {keyword: batch[condition.field]
+                  for keyword, condition in self.inputs.conditions.items()}
+        samples = self._sample(params, tokens, step.key, count=count)
+        assert self.artifact is not None
+        return self.artifact(samples)
 
-        The captions are decoded on the host, so the tokens come home first.
-        On a pool the batch is a global array this process holds one shard
-        of, and the gather is a collective every process makes here.
-        """
+    def preview(self, params, batch, step: Step, *, scored=None):
+        """A separate small draw for display, with root-only caption decoding."""
         params = params if step.ema is None else step.ema
         count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
         tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
                   for keyword, condition in self.inputs.conditions.items()}
+        samples = self._sample(params, tokens, step.key, count=count)
+        samples, tokens = host((samples, tokens))
+        if jax.process_index() != 0:
+            return None
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
-            captions = condition.encoder.captions(host(tokens[keyword]))
+            captions = condition.encoder.captions(tokens[keyword])
             if captions:
                 break
-        samples = self._sample(params, tokens, step.key, count=count)
-        # An Objective may produce no artifact; this one always produces a
-        # grid, chosen from the sample field's rank in __init__.
         assert self.artifact is not None
         return self.artifact(samples, captions)

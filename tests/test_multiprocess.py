@@ -845,3 +845,35 @@ def test_a_pool_draws_a_jepa_artifact(tmp_path):
     assert drawn[0]["rendered"] is True
     assert drawn[0]["features"][0] == worker.BATCH
     assert drawn[0]["std"] > 0.0
+
+
+@pytest.mark.distributed
+def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
+    reports = run_pool("evaluation_contract", tmp_path, 2)
+    first, second = (report["results"] for report in reports)
+    for event in ("normal", "repeat", "untracked", "preview_only", "uneven"):
+        assert first[event]["scores"] == second[event]["scores"]
+    assert first["normal"]["scores"]["val/mean"] == first["repeat"]["scores"]["val/mean"]
+    assert first["normal"]["scores"]["val/mean"] == first["untracked"]["scores"]["val/mean"]
+    for report in reports:
+        events = report["results"]["normal"]["events"]
+        scoring = [key for kind, key in events if kind == "score"]
+        preview = [key for kind, key in events if kind == "preview"]
+        assert len(scoring) == 2 and scoring[0] != scoring[1]
+        assert len(preview) == 1 and preview[0] not in scoring
+        assert report["results"]["preview_only"]["events"][0][0] == "preview"
+        assert len(report["results"]["preview_only"]["events"]) == 1
+        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 1
+        assert report["results"]["uneven"]["scores"]["evaluation/uneven_shards"] == 1
+        for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
+            assert "error" in report["results"][phase], (phase, report)
+            if phase != "construct":
+                assert phase in report["closed"]
+        assert "iterator next failed" in report["results"]["next"]["error"]
+        assert report["results"]["empty"] == {"scores": {}, "events": []}
+        assert report["results"]["no_consumer"]["events"] == []
+        assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
+        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 8
+        for invalid in ("mismatch", "duplicates"):
+            assert "error" in report["results"][invalid]
+            assert report["results"][invalid]["events"] == []

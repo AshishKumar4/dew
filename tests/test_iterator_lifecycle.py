@@ -261,8 +261,11 @@ def test_metric_failure_closes_both_iterators_before_it_escapes():
         def __call__(self, artifact, batch):
             return np.linalg.inv(artifact.features)  # Not square: a real metric failure.
 
-        def reduce(self, values):
-            return np.mean(values)
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return float(accumulated)
 
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):

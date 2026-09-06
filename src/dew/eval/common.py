@@ -1,53 +1,66 @@
-"""The metric shape the trainer consumes. One artifact type, a per-batch
-measurement, the mean over the pass."""
+"""Host-local image metric sufficient statistics."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Callable
 
+import jax
 import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, VideoGrid
+from dew.objectives.base import Batch
 
 
-def frames(artifact) -> Any:
-    """The pixels an image metric scores, `[N, H, W, C]` or `[N, T, H, W, C]`
-    in [-1, 1], from either grid."""
+@contextmanager
+def metric_device():
+    """Keep host metric kernels and lazily loaded weights on one local device."""
+    device = jax.local_devices()[0]
+    mesh = jax.sharding.Mesh(np.asarray([device]), ("metric",))
+    with jax.set_mesh(mesh), jax.default_device(device):
+        yield
+
+
+def frames(artifact: ImageGrid | VideoGrid) -> jax.Array:
+    """Pixels in [-1, 1], with videos retaining their frame axis."""
     return artifact.videos if isinstance(artifact, VideoGrid) else artifact.images
 
 
-def paired(artifact, batch, field: str):
-    """The sampled pixels and the records they were sampled for, row for row.
-
-    An objective samples a fixed few rows of a batch, so a metric that measures
-    a sample against its record takes the leading rows of the batch. A batch
-    shorter than the samples is refused with both counts.
-    """
+def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
+    """Generated and reference pixels aligned over the complete batch."""
     from dew.inputs import unit_range
 
     samples = frames(artifact)
     targets = unit_range(batch[field])
-    if targets.shape[0] < samples.shape[0]:
+    if targets.shape[0] != samples.shape[0]:
         raise ValueError(
-            f"the artifact holds {samples.shape[0]} rows and batch[{field!r}] only "
-            f"{targets.shape[0]}; a metric that pairs them needs at least as many "
-            "records as samples")
-    return samples, targets[:samples.shape[0]]
+            f"the artifact holds {samples.shape[0]} rows and batch[{field!r}] "
+            f"{targets.shape[0]}; paired metrics require equal counts")
+    return samples, targets
 
 
 @dataclass(frozen=True, eq=False)
 class ImageMetric:
-    """A measurement of an `ImageGrid` against the batch it was sampled for,
-    averaged over the validation pass."""
+    """Per-image (per-frame for video) means over the consumed pass."""
 
     name: str
-    measure: Callable[[Any, Any], ArrayLike]
-    """A scalar per batch, which a metric computes on device and `__call__`
-    brings to a float."""
+    measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike]
+    """One measurement per image or frame, never an already averaged scalar."""
     reads: type = ImageGrid
 
-    def __call__(self, artifact, batch) -> float:
-        return float(np.asarray(self.measure(artifact, batch)))
+    def __call__(self, artifact, batch) -> tuple[float, int]:
+        with metric_device():
+            values = np.asarray(self.measure(artifact, batch), dtype=np.float64)
+        if values.ndim != 1:
+            raise ValueError(f"{self.name} must measure one value per image or frame")
+        return float(values.sum()), values.size
 
-    def reduce(self, values: Sequence[float]) -> float:
-        return float(np.mean(values))
+    def merge(self, accumulated: tuple[float, int],
+              contribution: tuple[float, int]) -> tuple[float, int]:
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated: tuple[float, int]) -> float:
+        total, count = accumulated
+        if count == 0:
+            raise ValueError(f"{self.name}: no images or frames in the validation pass")
+        return total / count

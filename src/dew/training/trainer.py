@@ -23,6 +23,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
@@ -34,7 +35,7 @@ from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, 
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
-    minimum_across_processes, shard_batch,
+    agree_evaluation_phase, broadcast_from_process_zero, shard_batch,
 )
 from dew.training.state import TrainState
 from dew.training.tracker import Tracker
@@ -638,75 +639,174 @@ class Trainer:
 
     def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
                   mesh, step: int) -> dict[str, float]:
-        """Score the validation split: the objective's artifacts through the
-        metrics and, on the first batch, to the tracker.
+        """Score the coordinated shard prefix and produce one optional preview.
 
-        Every process scores the batch count all of them have. The held-out
-        split runs out at different points on different processes (the token
-        and packed splits are whole files strided per process), and a process
-        that left the pass while the others waited in its collectives would
-        wedge the pool, so each batch is agreed before it is scored. A metric
-        or a loader that raises takes the pass down with it.
-
-        An artifact and the batch beside it come home before they are scored or
-        drawn: a metric reads them with numpy and the tracker draws on process
-        zero, neither of which can touch a shard of a global array. The gathers
-        are collectives, so they happen here, on every process, and not inside
-        the one metric or the one process that consumes them. Scoring the whole
-        batch is also the only way the number means what it says: a process
-        scoring its own shard would log its slice of the split as the metric.
+        Every rank participates in numerical work and global-array gathers.
+        Only process zero owns host metric statistics and tracker effects.
+        Host outcomes are agreed before the next collective; blocked device
+        collectives still require the distributed runtime's failure handling.
         """
+        process_zero = jax.process_index() == 0
+        error = None
+        configuration = None
+        try:
+            names = [metric.name for metric in metrics]
+            if len(names) != len(set(names)):
+                raise ValueError("evaluation metric names must be unique")
+            configuration = {
+                "validation": data.val is not None,
+                "metrics": [[metric.name, metric.reads.__module__, metric.reads.__qualname__]
+                            for metric in metrics],
+            }
+        except BaseException as failure:
+            error = failure
+        agree_evaluation_phase(error, phase="configuration")
+        root_configuration = broadcast_from_process_zero(configuration)
+        error = None if configuration == root_configuration else ValueError(
+            "validation availability and ordered metric names/types must agree across ranks")
+        agree_evaluation_phase(error, phase="configuration agreement")
+        preview_enabled = bool(broadcast_from_process_zero(
+            process_zero and self.tracker is not None))
         if data.val is None:
             return {}
-        process_zero = jax.process_index() == 0
-        info = Step(step=state.step, key=jax.random.fold_in(state.key, state.step),
-                    ema=with_ema(state.params, state.ema))
-        values: dict[str, list] = {metric.name: [] for metric in metrics}
-        iterator = iter(data.val())
+
+        # Stable integer domains keep display choices out of scoring randomness.
+        event_key = jax.random.fold_in(jax.random.fold_in(state.key, 0x4556414C), state.step)
+        score_key = jax.random.fold_in(event_key, 0x53434F52)
+        preview_key = jax.random.fold_in(event_key, 0x50524556)
+        ema = with_ema(state.params, state.ema)
+        summaries: dict[str, object] = {}
+        source = iterator = None
+        scored = local_records = 0
+        uneven = False
         try:
-            scored = 0
+            error = None
+            try:
+                source = data.val()
+                iterator = iter(source)
+            except BaseException as failure:
+                error = failure
+            agree_evaluation_phase(error, phase="iterator construction")
+            assert iterator is not None
             while True:
-                batch = next(iterator, None)
-                if not minimum_across_processes(int(batch is not None)):
+                error = None
+                batch = None
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    pass
+                except BaseException as failure:
+                    error = failure
+                available = agree_evaluation_phase(
+                    error, phase=f"iterator next batch {scored}", available=batch is not None)
+                if available != jax.process_count():
+                    uneven = available > 0
+                    batch = None
                     break
-                if batch is None:
-                    # Every process agreed one was available, so this cannot
-                    # happen; leaving the loop here instead would strand the
-                    # others in the next collective.
-                    raise RuntimeError(
-                        "the validation pass agreed a batch was available and this "
-                        "process has none")
-                batch = shard_batch(mesh, batch)
-                produced = self.objective.evaluate(state.params, batch, info)
-                produced = (() if produced is None
-                            else produced if isinstance(produced, tuple) else (produced,))
-                produced = tuple(host(artifact) for artifact in produced)
+                assert batch is not None
+                error = None
+                try:
+                    local_records += int(jax.tree.leaves(batch)[0].shape[0])
+                    if metrics or (scored == 0 and preview_enabled):
+                        batch = shard_batch(mesh, batch)
+                except BaseException as failure:
+                    error = failure
+                agree_evaluation_phase(error, phase=f"batch placement {scored}")
+                produced = None
                 if metrics:
-                    # One gather for every metric, whatever fields they read.
+                    error = None
+                    try:
+                        info = Step(step=state.step, key=jax.random.fold_in(score_key, scored), ema=ema)
+                        produced = self.objective.evaluate(state.params, batch, info)
+                    except BaseException as failure:
+                        error = failure
+                    agree_evaluation_phase(error, phase=f"scoring batch {scored}")
+                    produced = host(produced)
                     home = host(batch)
+                    artifacts = (() if produced is None else produced
+                                 if isinstance(produced, tuple) else (produced,))
                     for metric in metrics:
-                        values[metric.name].append(metric(_pick(produced, metric.reads), home))
-                if scored == 0 and process_zero and self.tracker is not None:
-                    for artifact in produced:
-                        self.tracker.artifact(artifact, step)
+                        error = None
+                        if process_zero:
+                            try:
+                                contribution = metric(_pick(artifacts, metric.reads), home)
+                                summaries[metric.name] = (
+                                    metric.merge(summaries[metric.name], contribution)
+                                    if metric.name in summaries else contribution)
+                                del contribution
+                            except BaseException as failure:
+                                error = failure
+                        agree_evaluation_phase(error, phase=f"metric {metric.name} batch {scored}")
+                    del home, artifacts
+                if scored == 0 and preview_enabled:
+                    error = None
+                    preview = None
+                    try:
+                        info = Step(step=state.step, key=preview_key, ema=ema)
+                        preview = self.objective.preview(state.params, batch, info, scored=produced)
+                    except BaseException as failure:
+                        error = failure
+                    agree_evaluation_phase(error, phase="preview generation/decoding")
+                    preview = host(preview)
+                    error = None
+                    if process_zero and self.tracker is not None:
+                        try:
+                            for artifact in (() if preview is None else preview
+                                             if isinstance(preview, tuple) else (preview,)):
+                                self.tracker.artifact(artifact, step)
+                        except BaseException as failure:
+                            error = failure
+                    agree_evaluation_phase(error, phase="preview rendering")
+                    preview = artifact = None
+                produced = batch = None
                 scored += 1
-            scores = {f"val/{name}": float(metric.reduce(values[name]))
-                      for metric in metrics for name in [metric.name] if values[name]}
+            records = int(np.asarray(multihost_utils.process_allgather(
+                np.asarray(local_records, np.int64))).sum())
+            event_words = np.asarray(host(jax.random.key_data(event_key))).tolist()
+            scores: dict[str, float] = {}
+            if scored:
+                for metric in metrics:
+                    error = None
+                    if process_zero:
+                        try:
+                            scores[f"val/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
+                        except BaseException as failure:
+                            error = failure
+                    agree_evaluation_phase(error, phase=f"finalizing metric {metric.name}")
+            error = None
             if process_zero:
-                print(f"Validation at step {step} over {scored} batches: {scores}")
-                if self.tracker is not None and scores:
+                try:
+                    if scored:
+                        scores.update({"evaluation/coordinated_batches": float(scored),
+                                       "evaluation/records": float(records),
+                                       "evaluation/uneven_shards": float(uneven)})
+                    print(f"Validation at step {step}: {scored} coordinated batches, {records} records, "
+                          f"uneven_shards={uneven}, event_key={event_words}: {scores}")
+                except BaseException as failure:
+                    error = failure
+            agree_evaluation_phase(error, phase="evaluation summary")
+            error = None
+            if process_zero and self.tracker is not None and scores:
+                try:
                     self.tracker.log(scores, step)
-            return scores
+                except BaseException as failure:
+                    error = failure
+            agree_evaluation_phase(error, phase="final tracking")
+            return broadcast_from_process_zero(scores)
         finally:
             primary = sys.exception()
+            error = None
             try:
-                close = getattr(iterator, "close", None)
+                close = getattr(iterator if iterator is not None else source, "close", None)
                 if close is not None:
                     close()
-            except BaseException as error:
-                if primary is None:
-                    raise
-                primary.add_note(f"Validation iterator cleanup failed: {error!r}")
+            except BaseException as failure:
+                if primary is not None:
+                    primary.add_note(f"Validation iterator cleanup failed: {failure!r}")
+                else:
+                    error = failure
+            if primary is None:
+                agree_evaluation_phase(error, phase="iterator cleanup")
 
 
     # ------------------------------------------------------------------

@@ -95,6 +95,6 @@ def ssim(data_range: float = 2.0, field: str = "image", reads: type = ImageGrid)
     type the trainer hands this metric; a video run passes `VideoGrid`."""
     def measure(artifact, batch):
         samples, targets = paired(artifact, batch, field)
-        return structural_similarity(samples, targets, data_range)
+        return structural_similarity(samples, targets, data_range, per_example=True)
 
     return ImageMetric(name="ssim", measure=measure, reads=reads)
