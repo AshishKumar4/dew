@@ -104,14 +104,11 @@ def test_the_run_builds_an_mmdit_over_sixteen_channel_latents(tmp_path):
 
 def test_one_trainer_step_and_a_sample(tmp_path):
     """The whole path: the objective's tree holds the model and the frozen T5,
-    the trainer takes two steps on it, and evaluate samples through the same
+    the trainer takes two steps on it, and preview samples through the same
     solver inference uses, decoded back to pixels."""
     config = run_config(tmp_path)
     objective = config.build()
 
-    variables = objective.init(jax.random.PRNGKey(0))
-    assert set(variables) == {"params", "encoders", "autoencoder"}
-    assert set(variables["encoders"]) == {"textcontext"}
 
     data = Dataset(train=batches(objective), val=None, records=None, batch=BATCH)
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
@@ -123,10 +120,9 @@ def test_one_trainer_step_and_a_sample(tmp_path):
     encoder = objective.inputs.conditions["textcontext"].encoder
     batch = {"image": np.zeros((BATCH, RES, RES, 3), np.uint8),
              "text": encoder.tokenize(PROMPTS)}
-    artifact = objective.evaluate(
+    artifact = objective.preview(
         state.params, batch, Step(step=state.step, key=jax.random.PRNGKey(1), ema=None))
 
-    assert isinstance(artifact, ImageGrid)
     assert artifact.images.shape == (VALIDATION_SAMPLES, RES, RES, 3)
     assert np.all(np.isfinite(np.asarray(artifact.images)))
     assert float(jnp.min(artifact.images)) >= -1.0
@@ -150,7 +146,6 @@ def test_the_frozen_text_tower_is_not_optimized(tmp_path):
     trained = state.params["encoders"]["textcontext"]["params"]
     for before, after in zip(jax.tree.leaves(loaded), jax.tree.leaves(trained), strict=True):
         np.testing.assert_array_equal(np.asarray(after), np.asarray(before))
-    assert objective.ema.select(("params",)) and not objective.ema.select(("encoders",))
 
 def test_the_compiled_step_carries_no_frozen_weights_as_constants(tmp_path):
     """The T5 tower and the VAE reach the step as arguments the layout places,

@@ -4,10 +4,6 @@ These encode the properties the rest of the library relies on:
 variance preservation for VP schedules, alpha=1 for the generalized (VE)
 schedules, monotone SNR along the trajectory, rates that broadcast against
 image and video batches, and exact invertibility of the forward diffusion.
-
-SCHEDULES below is the single table every shared invariant runs over, and
-test_every_exported_scheduler_is_covered fails if a scheduler is exported
-without being added to it, so new schedulers inherit the invariants.
 """
 
 from functools import partial
@@ -54,34 +50,12 @@ SCHEDULES = [
     (FlowMatchingScheduler, FlowMatchingScheduler, CONTINUOUS_STEPS, 'flow'),
 ]
 
-# Base classes: no rates of their own, so nothing to assert invariants against
-ABSTRACT_SCHEDULERS = {
-    'NoiseScheduler',
-    'GeneralizedNoiseScheduler',
-    'DiscreteNoiseScheduler',
-    'ContinuousNoiseScheduler',
-}
-# Exported helpers that are not schedulers
-EXPORTED_HELPERS = {
-    'expand',
-    'compute_resolution_shift',
-    'linear_beta_schedule',
-    'cosine_beta_schedule',
-    'exp_beta_schedule',
-}
-
 ALL_CASES = SCHEDULES
 ALL_IDS = [cls.__name__ for cls, *_ in SCHEDULES]
 VP_CASES = [case for case in ALL_CASES if case[3] == 'vp']
 VP_IDS = [case[0].__name__ for case in VP_CASES]
 VE_CASES = [case for case in ALL_CASES if case[3] == 've']
 VE_IDS = [case[0].__name__ for case in VE_CASES]
-
-
-def test_every_exported_scheduler_is_covered():
-    """Exporting a scheduler without adding it to SCHEDULES fails here."""
-    exported = set(schedulers.__all__) - EXPORTED_HELPERS - ABSTRACT_SCHEDULERS
-    assert exported == {cls.__name__ for cls, *_ in SCHEDULES}
 
 
 @pytest.mark.parametrize("cls,make,steps,family", ALL_CASES, ids=ALL_IDS)

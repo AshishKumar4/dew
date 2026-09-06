@@ -863,6 +863,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert len(preview) == 1 and preview[0] not in scoring
         assert report["results"]["preview_only"]["events"][0][0] == "preview"
         assert len(report["results"]["preview_only"]["events"]) == 1
+        assert report["results"]["preview_only"]["scores"]["evaluation/coordinated_batches"] == 1
+        assert report["results"]["preview_only"]["scores"]["evaluation/records"] == 8
         assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 1
         assert report["results"]["uneven"]["scores"]["evaluation/uneven_shards"] == 1
         for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
@@ -871,7 +873,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
                 assert phase in report["closed"]
         assert "iterator next failed" in report["results"]["next"]["error"]
         assert report["results"]["empty"] == {"scores": {}, "events": []}
-        assert report["results"]["no_consumer"]["events"] == []
+        assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
+        assert "no_consumer" not in report["closed"]
         assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
         assert report["results"]["uneven"]["scores"]["evaluation/records"] == 8
         for invalid in ("mismatch", "duplicates"):
@@ -891,7 +894,7 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
     for report in reports:
         assert report["measured"]["val/count"] == 3
         assert report["measured"]["evaluation/records"] == 3
-        assert report["no_consumer"]["evaluation/records"] == 3
+        assert report["no_consumer"] == {}
     assert reports[0]["local"] == [0, 1, 2]
     assert reports[1]["local"] is None
 
