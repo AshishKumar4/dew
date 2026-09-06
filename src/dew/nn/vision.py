@@ -1751,13 +1751,16 @@ def translate_qwen35_projector_weights(
     """A Qwen 3.5 merger's tensors into its params tree, in fp32."""
 
     def path_of(hf_name: str) -> Optional[Tuple[str, ...]]:
-        parts = hf_name.split(".")
-        if len(parts) == 3 and parts[0] == "merger" and parts[2] in ("weight", "bias"):
-            leaf = "kernel" if parts[2] == "weight" else "bias"
-            if parts[1] == "norm":
-                return ("norm", "scale" if parts[2] == "weight" else "bias")
-            if parts[1] in ("linear_fc1", "linear_fc2"):
-                return ({"linear_fc1": "fc1", "linear_fc2": "fc2"}[parts[1]], leaf)
+        # The plain fixture keeps the reference's merger prefix while the
+        # wrapper routing strips it; both name the same leaves.
+        bare = hf_name[7:] if hf_name.startswith("merger.") else hf_name
+        parts = bare.split(".")
+        if len(parts) == 2 and parts[1] in ("weight", "bias"):
+            leaf = "kernel" if parts[1] == "weight" else "bias"
+            if parts[0] == "norm":
+                return ("norm", "scale" if parts[1] == "weight" else "bias")
+            if parts[0] in ("linear_fc1", "linear_fc2"):
+                return ({"linear_fc1": "fc1", "linear_fc2": "fc2"}[parts[0]], leaf)
         raise ValueError(f"unknown tensor name {hf_name!r}")
 
     return _translate(hf_tensors, path_of)
