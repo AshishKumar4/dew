@@ -21,6 +21,8 @@ Gemma 3, Llama 4, Gemma 4, Qwen 3.5, and image-only Gemma 3n have vision towers 
 
 The Gemma 3n reference comparisons use float32. On GPU, the strict comparison sets `precision=jax.lax.Precision.HIGHEST` on the tower, projector, and decoder. Default GPU precision and bf16 show larger differences on the scaled fixture. The bf16/cuDNN execution path was exercised separately; it is not qualified at the float32 reference tolerance.
 
+Gemma 3n hard-token embedding and input preparation check token ranges, including the image-only audio-ID restriction. Compiled callers must use `jit(checkify.checkify(...))` and call `Error.throw()` on the host before using the result. Ordinary `jit` alone does not support these checked boundaries.
+
 Distinguish these checks when reporting support:
 
 1. Configuration translation preserves the fields needed to construct a model.
