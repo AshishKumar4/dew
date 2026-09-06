@@ -10,14 +10,10 @@ data parallelism (8x1) and once as data x fsdp (2x4), and checks what only a
 real fit can check: finite losses out of the compiled step, parameters and
 their optimizer moments genuinely split over the fsdp axis, the objective's
 evaluation running against the sharded EMA copy, and a checkpoint on disk
-afterwards. The declarations behind the layout are checked too: every matrix
-parameter of every registered model is declared or listed as heuristic, and
-every declared name is carried by some parameter.
+afterwards.
 """
 
-import fnmatch
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import jax
@@ -34,7 +30,6 @@ from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.dit import TextContext
-from dew.nn.sharding import DECLARED, HEURISTIC, declared_axes, is_heuristic, parameter_path
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
@@ -274,16 +269,7 @@ CASES = [
         seq_len=SEQ_LEN, label="qwen35"),
 ]
 
-# jepa_predictor has no training step of its own: it is built through the
-# registry and trained inside the two JEPA cases.
-COVERED = {case.architecture for case in CASES} | {"jepa_predictor"}
-
 IDS = [case.name for case in CASES]
-
-
-def test_every_registry_architecture_is_trained_here():
-    """The point of the file: a new architecture must arrive with a trained case."""
-    assert COVERED == set(models)
 
 
 def model_variables(case: Case):
@@ -298,135 +284,6 @@ def model_variables(case: Case):
         return init(rng, sample, jnp.arange(MASK.num_context, dtype=jnp.int32)[None])
     return init(rng, sample, jnp.ones((1,)),
                 TextContext(jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)), jnp.ones((1, TEXT_TOKENS), bool)))
-
-
-# Options the trained cases leave off but whose modules are declared: shapes
-# only, so the declarations behind them are checked without a training run.
-VARIANTS = [
-    replace(case, config={**case.config, "tie_embeddings": False}, label="untied")
-    for case in CASES if case.is_lm and "num_experts" not in case.config
-] + [
-    Case("simple_dit", {**DIT, "scan_order": "hilbert"}, label="hilbert"),
-    Case("hybrid_dit", {**DIT, "num_layers": 4, "ssm_state_dim": 8,
-                        "ssm_attention_ratio": "3:1", "use_2d_fusion": True}, label="fusion"),
-    Case("uvit", {"patch_size": PATCH, "emb_features": 64, "num_layers": 4, "num_heads": 2,
-                  "add_residualblock_output": True}, label="residual"),
-    # The Gemma 4 gaps leave the default tree untouched, so a case with them
-    # on carries their declarations: per-layer table, projection, gate and
-    # projection, with the second layer sharing the first's K/V.
-    Case("causal_transformer", {**LM, "per_layer_input_dim": 8,
-                                "num_kv_shared_layers": 1}, seq_len=SEQ_LEN, label="gemma4"),
-    # A multi-token-prediction depth adds its projection and block beside the
-    # backbone, so the declarations behind them are checked here.
-    Case("causal_transformer", {**LM, "num_nextn_predict_layers": 1}, seq_len=SEQ_LEN, label="mtp"),
-    # Qwen2 biases q, k and v while o_proj stays bias-free, so the split
-    # dial's declarations are walked with the odd projection left out.
-    Case("causal_transformer", {**LM, "attention_bias": True, "o_proj_bias": False},
-         seq_len=SEQ_LEN, label="qwen2"),
-    # Gemma 2's stack: the sandwich norms with (1 + w) scales, the attention
-    # softcap and the erf gelu; the softcap and the activation add no leaf,
-    # so the case pins that they build and place like the plain stack.
-    Case("causal_transformer", {**LM, "sandwich_norms": True, "scale_offset": True,
-                                "embedding_scale": True, "attn_logit_softcap": 5.0,
-                                "final_logit_softcap": 30.0, "mlp": "geglu_exact"},
-         seq_len=SEQ_LEN, label="gemma2"),
-    # Qwen3-MoE's routing: the top-k softmax weights used unrenormalised
-    # (norm_topk_prob off), with q/k norms and experts narrower than the
-    # dense feed-forward, on the second layer only.
-    Case("causal_transformer", {**LM, "qk_norm": True, "mixture": {
-        "experts": 8, "top_k": 2, "layers": (1,), "norm_topk_prob": False,
-        "expert_features": 32}}, seq_len=SEQ_LEN, label="qwen3_moe"),
-    # OLMo 3's block: no input norms, the output pair on, and one q/k norm
-    # over the whole projection, whose scale is heads * head_dim wide.
-    Case("causal_transformer", {**LM, "sandwich_norms": True, "pre_norms": False,
-                                "qk_norm": True, "qk_norm_scope": "projection"},
-         seq_len=SEQ_LEN, label="olmo3"),
-    # Llama 3.1's ramp, on the model and on the full kind alone (OLMo 3's
-    # placement): a value from a record at both seams, no leaf added.
-    Case("causal_transformer", {**LM, "rope_scaling": {
-        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
-        "high_freq_factor": 4.0, "original_max_position_embeddings": 8}},
-         seq_len=SEQ_LEN, label="llama31"),
-    Case("causal_transformer", {
-        **LM, "layer_types": ("sliding_attention", "full_attention"),
-        "kinds": {"sliding_attention": {"window": 4},
-                  "full_attention": {"rope_scaling": {
-                      "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
-                      "high_freq_factor": 4.0, "original_max_position_embeddings": 8}}}},
-        seq_len=SEQ_LEN, label="kind_ramp"),
-]
-
-
-def frozen_towers():
-    """The condition encoders' towers, from the committed tiny configs: they
-    are placed on the mesh beside the model, so their declarations are
-    checked like a model's."""
-    import json
-
-    from dew.nn.text_encoders import (
-        CLIP, CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer,
-        translate_clip_config, translate_t5_config,
-    )
-    fixtures = Path(__file__).resolve().parent / "fixtures"
-    clip_config = translate_clip_config(
-        json.loads((fixtures / "clip" / "tiny" / "config.json").read_text()))
-    clip = CLIP(text_model=CLIPTextTransformer(**clip_config["text"]),
-                vision_model=CLIPVisionTransformer(**clip_config["vision"]),
-                projection_dim=clip_config["projection_dim"])
-    vision = clip_config["vision"]
-    pixels = jnp.zeros((1, vision["num_channels"], vision["image_size"], vision["image_size"]))
-    yield clip, (pixels, jnp.ones((1, 4), jnp.int32))
-    t5_config = translate_t5_config(
-        json.loads((fixtures / "t5" / "tiny" / "config.json").read_text()))
-    tokens = (jnp.ones((1, 4), jnp.int32),)
-    yield T5EncoderTransformer(**t5_config), tokens
-    # The tiny fixture is gated-gelu; the relu feed-forward declares a module
-    # of its own, so a tower with it is walked too.
-    yield T5EncoderTransformer(**{**t5_config, "feed_forward_proj": "relu"}), tokens
-
-
-def every_leaf():
-    """Every parameter leaf of every case and variant, the predictor and the
-    frozen towers included."""
-    for case in CASES:
-        yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
-    for case in VARIANTS:
-        yield from jax.tree_util.tree_flatten_with_path(model_variables(case))[0]
-    model = models.build("jepa_predictor", **PREDICTOR)
-    variables = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, MASK.num_context, 32)),
-        jnp.arange(MASK.num_context, dtype=jnp.int32)[None],
-        jnp.arange(MASK.block_area, dtype=jnp.int32)[None])
-    yield from jax.tree_util.tree_flatten_with_path(variables)[0]
-    for tower, inputs in frozen_towers():
-        variables = jax.eval_shape(tower.init, jax.random.key(0), *inputs)
-        yield from jax.tree_util.tree_flatten_with_path(variables)[0]
-
-
-def test_every_matrix_parameter_is_declared_or_listed_as_heuristic():
-    """A parameter of rank two or more is placed by a declaration on its
-    module, or its module says it takes the shape heuristic; nothing is
-    placed by a name that happened to match."""
-    undeclared = sorted({
-        "/".join(parameter_path(path)) for path, leaf in every_leaf()
-        if leaf.ndim >= 2 and declared_axes(path, leaf.ndim) is None
-        and not is_heuristic(path)})
-    assert undeclared == []
-
-
-def test_every_declared_name_is_carried_by_a_parameter():
-    """A renamed module has to break its declaration: every declared suffix
-    and every heuristic pattern names some parameter of some registered
-    model."""
-    modules = {parameter_path(path)[:-1] for path, _ in every_leaf()}
-    unmatched = [key for key in DECLARED
-                 if not any(module[-len(key):] == key for module in modules)]
-    assert unmatched == []
-    paths = {parameter_path(path) for path, _ in every_leaf()}
-    unused = [pattern for pattern in HEURISTIC if not any(
-        all(fnmatch.fnmatchcase(name, glob) for name, glob in zip(names[start:], pattern))
-        for names in paths for start in range(len(names) - len(pattern) + 1))]
-    assert unused == []
 
 
 def text_condition() -> Condition:

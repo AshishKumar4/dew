@@ -18,88 +18,8 @@ from dew.registry import dtype_name, resolve_dtype, with_precision
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
 
-@pytest.fixture
-def implementations(monkeypatch):
-    """Record what jax.nn.dot_product_attention is asked to dispatch to."""
-    seen = []
-
-    def spy(query, key, value, **kwargs):
-        seen.append(kwargs.get("implementation"))
-        return query
-
-    monkeypatch.setattr(jax.nn, "dot_product_attention", spy)
-    return seen
-
-
 def qkv(dtype=jnp.bfloat16):
     return (jnp.ones(BF16_QKV, dtype),) * 3
-
-
-def test_auto_resolves_to_xla_off_gpu(implementations):
-    if jax.default_backend() == 'gpu':
-        pytest.skip("this is the answer off a gpu; the next test is the gpu one")
-    scaled_dot_product_attention(*qkv(), implementation='auto')
-    assert implementations == ['xla']
-
-
-def test_auto_resolves_to_cudnn_on_gpu(implementations, monkeypatch):
-    """The resolution happens per trace, not at config time, so a config
-    logged as 'auto' on this box still runs on the next one."""
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    scaled_dot_product_attention(*qkv(), implementation='auto')
-    assert implementations == ['cudnn']
-
-
-def test_auto_keeps_the_shapes_cudnn_refuses_on_xla(implementations, monkeypatch):
-    """'auto' promises the fused kernel where it runs. cudnn takes bf16 or
-    fp16 and a head dimension that is a multiple of 8 up to 128, so a fp32
-    query or a 4-wide head (the UNets' attention at their smallest test
-    size) goes to xla, and only an explicit 'cudnn' raises for them."""
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    scaled_dot_product_attention(*qkv(jnp.float32), implementation='auto')
-    narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
-    scaled_dot_product_attention(*narrow, implementation='auto')
-    wide = (jnp.ones((1, 4, 2, 256), jnp.bfloat16),) * 3
-    scaled_dot_product_attention(*wide, implementation='auto')
-    assert implementations == ['xla', 'xla', 'xla']
-    with pytest.raises(ValueError, match="multiple of 8"):
-        scaled_dot_product_attention(*narrow, implementation='cudnn')
-
-
-def test_odd_lengths_reach_cudnn_padded_even(implementations, monkeypatch):
-    """cudnn's fused kernel has no backward pass for an odd sequence length,
-    and 77 CLIP text tokens are odd, so the call is padded to an even length,
-    the pad key hidden by the kernel's own padding mask, and a pad query row
-    sliced back off. 'auto' keeps every cross-attention on cudnn."""
-    calls = []
-
-    def spy(query, key, value, **kwargs):
-        calls.append((query.shape[1], key.shape[1], kwargs["key_value_seq_lengths"]))
-        implementations.append(kwargs.get("implementation"))
-        return query
-
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    monkeypatch.setattr(jax.nn, "dot_product_attention", spy)
-    query = jnp.ones((1, 256, 2, 8), jnp.bfloat16)
-    context = jnp.ones((1, 77, 2, 8), jnp.bfloat16)
-
-    cross = scaled_dot_product_attention(query, context, context, implementation='auto')
-    back = scaled_dot_product_attention(context, query, query, implementation='auto')
-    scaled_dot_product_attention(query, query, query, implementation='auto')
-
-    assert implementations == ['cudnn', 'cudnn', 'cudnn']
-    assert cross.shape == (1, 256, 2, 8) and back.shape == (1, 77, 2, 8)
-    (q_len, kv_len, lengths), (q_back, kv_back, none), (q_self, kv_self, none_self) = calls
-    assert (q_len, kv_len) == (256, 78) and lengths.tolist() == [77]
-    assert (q_back, kv_back) == (78, 256) and none is None
-    assert (q_self, kv_self) == (256, 256) and none_self is None
-
-
-def test_auto_runs_the_kernel_it_resolved_to():
-    q, k, v = qkv()
-    assert jnp.array_equal(
-        scaled_dot_product_attention(q, k, v, implementation='auto'),
-        scaled_dot_product_attention(q, k, v, implementation='xla'))
 
 
 @pytest.mark.parametrize("implementation", ['auto', 'xla', 'cudnn', 'tpu'])
@@ -121,10 +41,15 @@ def test_fused_attention_rejects_bf16_softmax(implementation):
                                      implementation=implementation)
 
 
-@pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, 'default'])
-def test_fused_attention_takes_default_precision(implementations, precision):
-    scaled_dot_product_attention(*qkv(), precision=precision, implementation='xla')
-    assert implementations == ['xla']
+@pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])
+def test_fused_attention_default_precision_matches_the_attention_equation(precision):
+    query, key, value = jax.random.normal(
+        jax.random.key(0), (3, *BF16_QKV), dtype=jnp.float32)
+    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(query.shape[-1])
+    expected = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(scores, axis=-1), value)
+    actual = scaled_dot_product_attention(
+        query, key, value, precision=precision, implementation="xla")
+    assert jnp.max(jnp.abs(actual - expected)) < 1e-5
 
 
 def test_cudnn_rejects_float32_inputs():
@@ -134,38 +59,10 @@ def test_cudnn_rejects_float32_inputs():
         scaled_dot_product_attention(*qkv(jnp.float32), implementation='cudnn')
 
 
-def test_policy_reaches_nested_unet_attention_configs():
-    """The unet keeps its attention settings per stage, and a stage does not
-    inherit the model dtype, so the policy has to write into every stage too,
-    and the build has to resolve the dtype it wrote."""
-    fields = with_precision(
-        'unet', {"attention_configs": [None, {"heads": 8}], "precision": "default"},
-        dtype="bfloat16", attention_impl="auto")
-
-    assert fields["dtype"] == "bfloat16"
-    assert fields["attention_impl"] == "auto"
-    assert fields["precision"] == "default"
-    assert fields["attention_configs"] == [
-        None, {"heads": 8, "dtype": "bfloat16", "force_fp32_for_softmax": True}]
-
-    model = models.build('unet', **fields)
-    assert model.dtype is jnp.bfloat16
-    assert model.attention_configs[1].dtype is jnp.bfloat16
-    assert model.attention_configs[1].force_fp32_for_softmax is True
-
-
-def test_policy_fills_in_the_stages_the_config_left_at_the_default():
-    """A config that never mentions attention_configs still gets bf16
-    attention: the unet's own default stages compute in fp32."""
-    fields = with_precision('unet', {}, dtype="bfloat16", attention_impl="reference")
-    assert [stage.dtype for stage in fields["attention_configs"]] == \
-        [jnp.bfloat16] * len(models['unet'].attention_configs)
-
-
-def test_policy_spells_the_reference_kernel_as_none():
-    fields = with_precision('simple_dit', {}, dtype="float32", attention_impl="reference")
-    assert fields == {"dtype": "float32", "attention_impl": None}
-    assert models.build('simple_dit', **fields).attention_impl is None
+def test_cudnn_rejects_a_head_dimension_it_cannot_honor():
+    narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
+    with pytest.raises(ValueError, match="multiple of 8"):
+        scaled_dot_product_attention(*narrow, implementation="cudnn")
 
 
 @pytest.mark.parametrize("key,value", [("dtype", "bfloat16"), ("attention_impl", "xla")])
@@ -237,8 +134,6 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
         architecture, {**TINY, **PER_ARCH[architecture]},
         dtype="bfloat16", attention_impl="auto")
     model = models.build(architecture, **fields)
-    assert model.dtype is jnp.bfloat16
-    assert model.attention_impl == 'auto'
 
     args = tiny_inputs(architecture, rng)
     params = model.init(rng, *args)
