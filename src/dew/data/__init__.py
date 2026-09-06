@@ -18,6 +18,7 @@ from .images import (AestheticCoyo, CC3M, CC12M, Combined30M, CombinedAesthetic,
                      CombinedMsml612, DiffusionDB, HFImages, ImageDataset, Laion2bAesthetic,
                      Laion12mCoco, LaionaCoco, LaionaCocoCoyo, OxfordFlowers)
 from .processors import AutoAudioProcessor, AutoTextTokenizer
+from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
 from .prompts import Prompts
 from .sources.hf import HFDatasetSource
 from .sources.text import TokenDocumentSource, TokenFileSource
@@ -28,9 +29,9 @@ from .video import LocalVideos, VideoDataset, VoxCeleb2
 
 __all__ = [
     "AestheticCoyo", "AutoAudioProcessor", "AutoTextTokenizer", "Batch", "ByteTokenizer",
-    "CC12M", "CC3M", "ChatMessages", "Combined30M", "CombinedAesthetic", "CombinedMsml612", "CombinedOnline",
     "Checkpointable", "Dataset", "DatasetSpec", "DiffusionDB", "HFDatasetSource", "HFImages", "HFTokenizer",
-    "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
-    "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "Prompts", "Role",
+    "IDS_KEY", "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
+    "Loading", "LocalVideos", "MASK_KEY", "OnlineImages", "OxfordFlowers",
+    "PackedTokens", "PreferencePairs", "Prompts", "Role",
     "TokenDocumentSource", "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "local_batch",
 ]
