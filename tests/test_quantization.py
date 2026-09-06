@@ -149,11 +149,13 @@ def test_an_int8_trunk_trains_with_finite_loss():
 def test_a_scanned_quantized_stack_scores_as_the_plain_one():
     """Quantization composes with the scan. Both stacks compiled as a
     training step compiles them, the wrapped scan agrees with the wrapped
-    plain loop bitwise, while staying away from its fp32 twin; the distance
-    is the assertion that the rules reached under the scan. Observed on
-    CPU: 0.0 and 1.2e-01 on logits of order 3. (Eager the two differ by
-    3.6e-02, fusion order in the uncompiled matmuls, so both sides compile
-    here.)"""
+    plain loop while staying away from its fp32 twin; the distance is the
+    assertion that the rules reached under the scan. Observed on logits of
+    order 3: scan against plain 0.0 on CPU and 1.5e-02 on the RTX 4080,
+    where the scan body and the unrolled layers lower to different fusions
+    and int8 rounding flips under the reordered reductions; scan against
+    fp32 1.2e-01 on both. (Eager the two differ by 3.6e-02, fusion order in
+    the uncompiled matmuls, so both sides compile here.)"""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(), scan_layers=True)
@@ -162,7 +164,7 @@ def test_a_scanned_quantized_stack_scores_as_the_plain_one():
     plain = jax.jit(plain_wrapped.apply)(variables, ids)
     reference = jax.jit(model.apply)(variables, ids)
     assert float(jnp.max(jnp.abs(scanned - reference))) > 1e-2
-    assert float(jnp.max(jnp.abs(scanned - plain))) == 0.0
+    assert float(jnp.max(jnp.abs(scanned - plain))) < 5e-2
 
 
 @pytest.mark.mesh
