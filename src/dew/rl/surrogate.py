@@ -168,3 +168,20 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     diff = jnp.asarray(ref_log_probs, jnp.float32) - jnp.asarray(log_probs, jnp.float32)
     diff = jnp.clip(diff, -KL_DIFF_CLAMP, KL_DIFF_CLAMP)
     return jnp.clip(jnp.exp(diff) - diff - 1, -KL_CLAMP, KL_CLAMP)
+
+
+def preference_logsigmoid(policy_chosen: jax.Array, policy_rejected: jax.Array,
+                          ref_chosen: jax.Array, ref_rejected: jax.Array,
+                          mask_chosen: jax.Array, mask_rejected: jax.Array,
+                          beta: float) -> jax.Array:
+    """DPO's loss over one pair batch (arXiv:2305.18290, eq. 7): the mean of
+    `-logsigmoid(beta * delta)`, where `delta` is the chosen log-ratio minus
+    the rejected one and each sequence score sums the per-token
+    log-probabilities under its mask. TRL's `dpo_loss` with the `sigmoid`
+    type reads the same terms (`trl/trainer/dpo_trainer.py`); the masks here
+    arrive already shifted, one per scored token."""
+    chosen = (jnp.sum(policy_chosen * mask_chosen, axis=-1)
+              - jnp.sum(ref_chosen * mask_chosen, axis=-1))
+    rejected = (jnp.sum(policy_rejected * mask_rejected, axis=-1)
+                - jnp.sum(ref_rejected * mask_rejected, axis=-1))
+    return -jnp.mean(jax.nn.log_sigmoid(beta * (chosen - rejected)))
