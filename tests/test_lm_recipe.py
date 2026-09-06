@@ -23,6 +23,7 @@ SEQ = 32
 def load_recipe():
     path = REPO_ROOT / "recipes" / "lm" / "train.py"
     spec = importlib.util.spec_from_file_location("recipe_lm", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -99,7 +100,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     state = recipe.main(config)
 
     data = config.data.load(batch=8)
-    assert int(state.step) == data.steps_per_epoch > 0
+    assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "run")) == config
     assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()
 

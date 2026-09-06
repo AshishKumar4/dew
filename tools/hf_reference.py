@@ -711,12 +711,14 @@ def write_diffusion_sc_tiny() -> None:
     """The self-conditioning MLP alone: its weights, narrow config, fixed
     inputs and the fp32 reference output."""
     from safetensors.torch import save_file
-    from types import SimpleNamespace
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaTextConfig,
+    )
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
         DiffusionGemmaSelfConditioning,
     )
 
-    config = SimpleNamespace(
+    config = DiffusionGemmaTextConfig(
         hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
         rms_norm_eps=1e-6)
     module = DiffusionGemmaSelfConditioning(config)
