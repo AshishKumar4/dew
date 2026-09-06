@@ -205,6 +205,7 @@ class DiffusionObjective(Objective):
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None
+        assert samples is not None and tokens is not None
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
             captions = condition.encoder.captions(tokens[keyword])

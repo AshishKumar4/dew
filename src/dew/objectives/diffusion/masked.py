@@ -134,6 +134,7 @@ class MaskedDiffusionObjective(Objective):
         tokens = collective_host(tokens, phase="masked diffusion preview")
         if jax.process_index() != 0:
             return None
+        assert tokens is not None
         texts = () if self.decode is None else tuple(
             self.decode(row.tolist()) for row in np.asarray(tokens))
         return TextSamples(tokens=tokens, texts=texts)

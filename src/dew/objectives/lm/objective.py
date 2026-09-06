@@ -475,6 +475,7 @@ class LMObjective(Objective):
         generated, prompt = collective_host((generated, prompt), phase="LM preview")
         if settings is None or jax.process_index() != 0:
             return None
+        assert generated is not None and prompt is not None
         decode = settings.decode
         return TextSamples(
             tokens=generated,
