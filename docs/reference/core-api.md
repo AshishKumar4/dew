@@ -151,14 +151,19 @@ The model must implement Linen `hidden_states(tokens, train=..., positions=..., 
 
 `pretrained` supplies the complete variables tree; `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling; `samples` configures text previews. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders.
 
-Import `generate` from `dew.sampling`:
+Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
 generate(model, params, prompt, max_new_tokens, *, key,
-         temperature=1.0, top_k=None)
+         sampling=Sampling(), prompt_lengths=None) -> Generation
+Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0)
 ```
 
-`params` is the complete variables tree. `prompt` is int32 `(B, P)`. The result includes the prompt and has shape `(B, P + max_new_tokens)`. Zero temperature is greedy decoding. Prompt and continuation must fit the cache. This fixed-length API does not provide a request server, streaming output, or arbitrary stopping rules.
+`params` is the complete variables tree. `prompt` is an integer `(B, P)` array. Optional `(B,)` `prompt_lengths` counts real tokens at each row's right edge. Each real prompt plus the token budget must fit the cache. The host groups equal lengths and removes padding before the compiled cached decoder; different lengths can produce different JIT shapes. This API does not provide streaming or continuous request batching.
+
+`Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)`. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)` and zero invalid tails. Only slots below `lengths` are likelihoods. Behavior probabilities include temperature/top-k; raw probabilities describe the unmodified model. Greedy behavior has probability one for its selected action.
+
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. GRPO compares current and old raw-policy likelihoods; it does not silently substitute the behavior distribution. Reward text excludes EOS and the invalid tail. Models explicitly declaring `causal=False` are refused by the next-token objective.
 
 ## Diffusion and JEPA objectives
 

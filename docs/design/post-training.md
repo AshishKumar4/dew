@@ -64,12 +64,15 @@ In: `prompt` `[B, P]` int32, left-padded, `prompt_length` `[B]` int32, and the t
 | --- | --- | --- | --- |
 | `input_ids` | `[N, P+T]` | int32 | prompt and continuation, groups contiguous per prompt |
 | `response_mask` | `[N, T]` | float32 | 1 through the first stop token |
-| `old_log_probs` | `[N, T]` | float32 | from the params that sampled, rescored by the objective's head |
+| `old_log_probs` | `[N, T]` | float32 | raw policy likelihoods recorded during generation |
+| `behavior_log_probs` | `[N, T]` | float32 | actual temperature/top-k sampling likelihoods |
+| `response_length` | `[N]` | int32 | generated actions, including EOS |
+| `terminated` | `[N]` | bool | EOS termination instead of the token budget |
 | `advantages` | `[N, T]` | float32 | group or RLOO advantages broadcast over the width |
 | `rewards` | `[N]` | float32 | raw scores, for telemetry |
 | `prompt_length` | `[N]` | int32 | real tokens before padding |
 
-Shapes are constants of the run, because `generate` runs for exactly `max_new_tokens` whatever it sees. One shape per run is what keeps `Trainer.compile` tracing once.
+The rollout returns fixed-width arrays even when EOS ends a completion early. The response mask and lengths describe valid actions. Generation groups equal prompt lengths before its cached decoder; those groups can create different JIT shapes. The returned training rectangle keeps `Trainer.compile` independent of completion lengths.
 
 ### 1.4 verl's parquet schema, mapped
 
