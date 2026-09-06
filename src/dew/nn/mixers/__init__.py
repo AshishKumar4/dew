@@ -114,57 +114,6 @@ class MixerBase:
             f"{type(self).__name__} names a mixer kind but builds no mixer")
 
 
-@mixers("attention")
-@dataclasses.dataclass(frozen=True)
-class AttentionMixer(MixerBase):
-    """Grouped-query causal attention: no fields of its own.
-
-    Every dial is the model's (heads, norms, bias, scale, kernel), read from
-    the context, so this value only selects the kind. A record names it with
-    `{"kind": "attention"}`.
-    """
-
-    def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        # The backbone imports this package for the registry, so importing it
-        # back at module scope would be a cycle; by the time a layer builds,
-        # both are loaded.
-        from dew.nn.backbones.causal_transformer import CausalSelfAttention
-
-        return functools.partial(
-            CausalSelfAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            num_kv_heads=ctx.num_kv_heads,
-            head_dim=ctx.head_dim,
-            max_seq_len=ctx.max_seq_len,
-            causal=ctx.causal,
-            rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rope_scaling,
-            qk_norm=ctx.qk_norm,
-            qk_norm_scope=ctx.qk_norm_scope,
-            v_norm=ctx.v_norm,
-            k_eq_v=ctx.k_eq_v,
-            norm_eps=ctx.norm_eps,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            kv_shared=ctx.kv_shared,
-            kv_store_key=ctx.kv_store_key,
-            sliding_window=ctx.sliding_window,
-            attention_bias=ctx.attention_bias,
-            o_proj_bias=ctx.o_proj_bias,
-            attention_scale=ctx.attention_scale,
-            attention_sinks=ctx.attention_sinks,
-            yarn=ctx.yarn,
-            attn_logit_softcap=ctx.attn_logit_softcap,
-            output_gate=ctx.output_gate,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
-            partial_rotary_factor=ctx.partial_rotary_factor,
-            partial_rotary_type=ctx.partial_rotary_type)
-
-
 def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
     """A `{"kind": ..., ...fields}` record as the kind value it names.
 
@@ -194,6 +143,7 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
 
 # The kind modules register where they are defined; this hub imports them,
 # one line per kind module, alphabetical.
+from .attention import AttentionMixer  # noqa: E402,F401  (registers the kind)
 from . import gated_delta_net  # noqa: E402,F401  (registers the kind)
 from .. import llama4  # noqa: E402,F401  (registers the kind)
 from .. import mla  # noqa: E402,F401  (registers the kind)
