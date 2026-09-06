@@ -287,6 +287,27 @@ class GatedMLP(nn.Module):
         return self.down_proj(gate * self.up_proj(x))
 
 
+@dataclasses.dataclass(frozen=True)
+class BlockWiring:
+    """How a block norms its two residuals, and whether it scales its output.
+
+    `pre_norms` norms each sublayer's input and `output_norms` its output.
+    The input pair alone is the plain pre-norm block, both pairs Gemma's
+    sandwich block, and the output pair alone OLMo 3's post-norm block
+    (modeling_olmo3.py:249-266), where each sublayer reads the residual
+    stream as it is and its output is normed before it is added. The output
+    pair norms the sublayer outputs and not their inputs, so the input norms
+    keep their names and their places, and a checkpoint without the output
+    pair loads into the same tree minus two leaves per layer. `output_scale`
+    multiplies the block's output by a learned scalar. One wiring serves
+    every layer, so it stays off the per-layer specs the scan groups by.
+    """
+
+    pre_norms: bool = True
+    output_norms: bool = False
+    output_scale: bool = False
+
+
 @logical_axes({
     ("per_layer_input_gate",): ("embed", "mlp"),
     ("per_layer_projection",): ("mlp", "embed"),
@@ -300,13 +321,14 @@ class DecoderBlock(nn.Module):
     What `feedforward` builds lands there as mlp and takes the normalized
     states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share.
 
-    sandwich_norms adds Gemma's second pair of norms, on the output of each
-    sublayer and not on its input; the pre-norms keep their names and their
-    places, so a checkpoint without them loads into the same tree minus two
-    leaves per layer. pre_norms=False drops the input pair, which with the
-    output pair on is OLMo 3's post-norm block (modeling_olmo3.py:249-266):
-    each sublayer reads the residual stream as it is and its output is
-    normed before it is added.
+    `wiring` places the block's norms: the input pair alone is the plain
+    pre-norm block, both pairs Gemma's sandwich block, and the output pair
+    alone OLMo 3's post-norm block (modeling_olmo3.py:249-266), where each
+    sublayer reads the residual stream as it is and its output is normed
+    before it is added. The output pair norms the sublayer outputs and not
+    their inputs, so the input norms keep their names and their places, and
+    a checkpoint without the output pair loads into the same tree minus two
+    leaves per layer.
 
     kv_store threads one dict down the layer stack so a KV-sharing mixer
     reads its provider's keys and values; a mixer without a kv_store keyword
@@ -324,16 +346,14 @@ class DecoderBlock(nn.Module):
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
     emb_features: int
+    wiring: BlockWiring
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
-    sandwich_norms: bool = False
-    pre_norms: bool = True
     per_layer_input_dim: int = 0
     parallel: Optional[Callable[..., nn.Module]] = None
     """A branch summed with the feed-forward's output before its output norm,
     called with the residual and that output (Gemma 4's routed experts)."""
-    layer_scalar: bool = False  # Gemma 4 multiplies each layer's output by a learned scalar
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     dropout_rate: float = 0.0
@@ -344,18 +364,18 @@ class DecoderBlock(nn.Module):
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
-        if self.pre_norms:
+        if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.pre_norms:
+        if self.wiring.pre_norms:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             self.mlp_output_norm = norm(name='mlp_output_norm')
         self.mlp = self.feedforward(name='mlp')
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
-        if self.layer_scalar:
+        if self.wiring.output_scale:
             # The reference's layer_scalar buffer, a checkpoint leaf of one
             # value, which the released Gemma 4 checkpoints carry.
             self.output_scalar = self.param('layer_scalar', nn.initializers.ones, (1,), jnp.float32)
@@ -368,7 +388,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_projection')
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         if self.altup is not None:
-            if not self.pre_norms or self.parallel is not None or self.layer_scalar:
+            if not self.wiring.pre_norms or self.parallel is not None or self.wiring.output_scale:
                 raise ValueError(
                     "altup runs Gemma 3n's block, which has its pre-norms and "
                     "neither a parallel branch nor a layer scalar")
@@ -376,11 +396,11 @@ class DecoderBlock(nn.Module):
                 spec=self.altup, emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision, name='altup')
         if self.laurel_rank is not None:
-            if self.laurel_rank < 1 or not self.pre_norms:
+            if self.laurel_rank < 1 or not self.wiring.pre_norms:
                 raise ValueError(
                     f"laurel_rank is the width of the learned augmented residual "
                     f"over the attention's normed input, got {self.laurel_rank} "
-                    f"with pre_norms={self.pre_norms}")
+                f"with {self.wiring}")
             self.laurel = LaurelBlock(
                 rank=self.laurel_rank, emb_features=self.emb_features,
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
@@ -394,19 +414,19 @@ class DecoderBlock(nn.Module):
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
             x = predictions[altup.active_idx]
-        normed = self.input_layernorm(x) if self.pre_norms else x
+        normed = self.input_layernorm(x) if self.wiring.pre_norms else x
         mixed = self.self_attn(normed,
                                decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}))
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
-        hidden = self.mlp(self.post_attention_layernorm(x) if self.pre_norms else x)
+        hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x)
         if self.parallel is not None:
             hidden = self.moe(x, hidden)
-        if self.sandwich_norms:
+        if self.wiring.output_norms:
             hidden = self.mlp_output_norm(hidden)
         x = x + self.dropout(hidden, deterministic=not train)
         if altup is not None and predictions is not None:
@@ -421,7 +441,7 @@ class DecoderBlock(nn.Module):
             return corrected
         if self.per_layer_input_dim and per_layer_input is not None:
             x = x + self._per_layer_residual(x, per_layer_input)
-        if self.layer_scalar:
+        if self.wiring.output_scale:
             x = x * self.output_scalar.astype(x.dtype)
         return x
 
@@ -460,11 +480,10 @@ class MTPBlock(nn.Module):
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
     emb_features: int
+    wiring: BlockWiring
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
-    sandwich_norms: bool = False
-    pre_norms: bool = True
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -484,8 +503,7 @@ class MTPBlock(nn.Module):
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
-            sandwich_norms=self.sandwich_norms,
-            pre_norms=self.pre_norms,
+                wiring=self.wiring,
             dropout_rate=self.dropout_rate,
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
@@ -1196,6 +1214,8 @@ class CausalTransformer(nn.Module):
                 kv_shared=index in sharing,
                 provider=index if index in providers else None)
             for index, layer_type in enumerate(types))
+        wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
+                             output_scale=self.layer_scalar)
 
         def block(index: int, name: str) -> DecoderBlock:
             spec = specs[index]
@@ -1216,11 +1236,9 @@ class CausalTransformer(nn.Module):
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
-                sandwich_norms=self.sandwich_norms,
-                pre_norms=self.pre_norms,
+                wiring=wiring,
                 per_layer_input_dim=ple or 0,
                 parallel=parallel if spec.routed else None,
-                layer_scalar=self.layer_scalar,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
                 dropout_rate=self.dropout_rate,
@@ -1258,8 +1276,7 @@ class CausalTransformer(nn.Module):
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
-                sandwich_norms=self.sandwich_norms,
-                pre_norms=self.pre_norms,
+                wiring=wiring,
                 dropout_rate=self.dropout_rate,
                 dtype=self.dtype, precision=self.precision, name=f'mtp_{depth}')
             for depth in range(self.num_nextn_predict_layers)]
