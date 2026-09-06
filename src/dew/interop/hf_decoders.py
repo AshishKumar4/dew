@@ -1568,7 +1568,12 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     for name, tensor in hf_tensors.items():
         bare = name[6:] if name.startswith("model.") else name
         if bare.startswith("language_model."):
-            text_tensors[bare[15:]] = tensor
+            tail = bare[15:]
+            # A text model holds its tensors directly while a causal LM nests
+            # them under a second model. The family map reads model.* and
+            # lm_head.weight, so a bare tail regains its prefix.
+            text_tensors[tail if tail.startswith(("model.", "lm_head.weight", "mtp."))
+                         else f"model.{tail}"] = tensor
         elif bare.startswith(tower_prefix):
             tower_tensors[bare[len(tower_prefix):]] = tensor
         elif bare.startswith("multi_modal_projector."):

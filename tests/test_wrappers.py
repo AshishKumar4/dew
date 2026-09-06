@@ -137,3 +137,52 @@ def test_a_gemma4_wrapper_is_refused_naming_its_vision_tower():
     only its text_config translates."""
     config = json.loads((FIXTURES / "gemma4-26b-a4b" / "config.json").read_text())
     assert translate_config(config["text_config"])["emb_features"] == 2816
+
+
+def _multimodal_logits(name, image_id, shift=0):
+    """Pixels through the translated tower and projector, merged at the image
+    marks, into the translated decoder through the input-embeddings hook."""
+    directory = FIXTURES / name
+    record = translate_wrapper_config(
+        json.loads((directory / "config.json").read_text()))
+    variables = translate_wrapper_weights(
+        load_file(str(directory / "model.safetensors")), record)
+    pixels = np.load(directory / "pixels.npy")
+    ids = np.load(directory / "input_ids.npy")
+    tower = V.tower_from_record(record["tower"]).build()
+    features = tower.apply(variables["tower"], pixels)
+    projector = V.projector_from_record(record["projector"]).build()
+    soft = projector.apply(variables["projector"], features)
+    length = ids.shape[1]
+    positions = (np.stack([np.where(row == image_id)[0] for row in ids]) + shift) % length
+    positions = positions.astype(np.int32)
+    fields = dict(record["text"])
+    if name.startswith("gemma3"):
+        # The reference conditional applies no logit cap (only its causal-LM
+        # head path does), so the decoder builds without the text record's.
+        fields["final_logit_softcap"] = None
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", fields, dtype="float32", attention_impl="reference"))
+    return (np.asarray(model.apply(variables["language_model"], ids,
+                                   input_embeddings=np.asarray(soft),
+                                   embedding_positions=positions)),
+            np.load(directory / "wrapper_ref.npy"), positions)
+
+
+def test_gemma3_multimodal_forward_matches_the_wrapper():
+    """fp32 end-to-end parity on the tiny Gemma 3 wrapper: tolerance 1e-4,
+    observed max |logit difference| 2.4e-06 with identical argmax. Soft tokens
+    at shifted positions miss by more than 1.0, so the placement is live."""
+    logits, reference, _ = _multimodal_logits("gemma3-tiny-mm", 202)
+    assert np.max(np.abs(logits - reference)) < 1e-4
+    assert (logits.argmax(-1) == reference.argmax(-1)).all()
+    misplaced, _, _ = _multimodal_logits("gemma3-tiny-mm", 202, shift=1)
+    assert np.max(np.abs(misplaced - reference)) > 1.0
+
+
+def test_llama4_multimodal_forward_matches_the_wrapper():
+    """fp32 end-to-end parity on the tiny Llama 4 wrapper: tolerance 1e-4,
+    observed max |logit difference| 4.1e-06 with identical argmax."""
+    logits, reference, _ = _multimodal_logits("llama4-tiny-mm", 92)
+    assert np.max(np.abs(logits - reference)) < 1e-4
+    assert (logits.argmax(-1) == reference.argmax(-1)).all()
