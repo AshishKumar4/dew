@@ -176,13 +176,24 @@ sharpens over `max_steps` steps under a temperature annealed from `t_max` to
 and the rest are redrawn, and the previous step's tempered logits condition the
 next one through the self-conditioning MLP in `dew.nn.diffusion_gemma`.
 `BlockProcess` in `dew.diffusion.block` holds the schedule and `sample_canvas`
-runs the loop over a denoiser callable.
+runs the loop over a denoiser callable. The wired denoiser is two functions
+beside it: `prefill_cache` runs the causal encoder over the prompt into a KV
+cache, and `denoise_logits` runs the canvas against that cache bidirectionally
+with self-conditioning folded in through the decoder's input-embeddings hook.
 
 ```python
 from dew.diffusion.block import BlockProcess
 
 process = BlockProcess(canvas_length=256, vocab_size=262144)
 process.temperature(48)
+```
+
+```python
+# runs elsewhere: needs a translated DiffusionGemma checkpoint for the encoder
+from dew.diffusion.block import denoise_logits, prefill_cache
+
+cache = prefill_cache(encoder, variables, prompt)
+logits = denoise_logits(decoder, sc, variables, sc_variables, cache, canvas, None)
 ```
 
 ## Multimodal wrappers
