@@ -24,7 +24,7 @@ For an introduction, start with DDPM for the denoising objective, then EDM for t
 | Guidance over part of the sampling path | [Applying Guidance in a Limited Interval Improves Sample and Distribution Quality](https://arxiv.org/abs/2404.07724) |
 | Diffusion language modeling and a square-root schedule | [Diffusion-LM Improves Controllable Text Generation](https://arxiv.org/abs/2205.14217) |
 
-Dew's `simple_dit` is not an exact copy of the DiT architecture. In particular, its time embedding uses EDM-style random Fourier features rather than DiT's sinusoidal embedding. Time scaling belongs to the chosen model/training convention; a flow preset's factor of 1000 is not a universal requirement of Fourier features. See the [diffusion guide](guides/diffusion.md) for how a preset and model fit together.
+Dew's `simple_dit` uses EDM-style random Fourier time features; the original DiT uses sinusoidal time embeddings. This makes `simple_dit` an architectural variant. Time scaling belongs to the selected model/training convention; a flow preset's factor of 1000 is not a universal requirement of Fourier features. See the [diffusion guide](guides/diffusion.md) for how a preset and model fit together.
 
 ## Representation learning and sequence models
 

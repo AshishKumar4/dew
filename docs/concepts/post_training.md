@@ -38,13 +38,13 @@ DPO compares the policy's relative preference for two answers with a fixed refer
 
 `PreferencePairs` accepts a Parquet `path` or a tuple of JSON strings in `records`, but not both. Each row has `chosen`, `rejected`, `chosen_mask`, and `rejected_mask`. The masks have the same lengths as their ID lists. If you omit a mask, Dew treats every token as completion; it does not infer a boundary from the text. Always provide masks for prompt-and-answer data.
 
-A loaded batch contains `input_ids` and `completion_mask`, both shaped `[B, 2, S]`. Index 0 of the middle axis is chosen, index 1 is rejected. Dew right-pads shorter rows to `S` and gives the padding zero mask weight. It rejects overlong rows rather than cutting a preference pair. Unlike `ChatMessages`, **`PreferencePairs.seq_len` is the full row width `S`**; use `DPOObjective(model, seq_len=S - 1)`.
+A loaded batch contains `input_ids` and `completion_mask`, both shaped `[B, 2, S]`. Index 0 of the middle axis is chosen, index 1 is rejected. Dew right-pads shorter rows to `S` and gives padding zero mask weight. Overlong rows raise an error. `PreferencePairs.seq_len` is the full row width `S`; use `DPOObjective(model, seq_len=S - 1)`.
 
 The objective sums next-token log-probabilities over each completion and applies the preference log-sigmoid loss. `beta` must be positive and controls the scale of the policy/reference comparison. Validation measures the chosen answers' perplexity under the policy. That metric alone does not measure preference win rate or response quality.
 
 ### Run a complete offline DPO example
 
-Run this block in a fresh Python process after [installing Dew](../installation.md). All inputs are in memory. The vocabulary is an invented eight-token vocabulary, so this teaches pair construction and optimization rather than producing readable language. IDs 1 and 2 (or 1 and 6) form the prompt, 3 is the preferred answer, 4 is the rejected answer, and 5 ends the answer. The end token counts toward the completion loss. Repeating the two pairs supplies a batch of eight, which also divides across eight local devices.
+Run this block in a fresh Python process after [installing Dew](../installation.md). All inputs are in memory. The invented eight-token vocabulary demonstrates pair construction and optimization. IDs 1 and 2 (or 1 and 6) form the prompt, 3 is the preferred answer, 4 is the rejected answer, and 5 ends the answer. The end token counts toward completion loss. Repeating the two pairs supplies a batch of eight, which also divides across eight local devices.
 
 ```python
 import json
@@ -108,7 +108,7 @@ You should see two training updates and the final confirmation. This run writes 
 
 Dew stores the DPO reference in `TrainState.ema`. EMA means *exponential moving average*, but DPO fixes its decay to 1, so this tree never moves. The objective refuses an `ema_decay` override. You do not create a second model object or optimize the reference, but you still retain a separate parameter tree and run reference forward passes. Budget memory for policy parameters, reference parameters, optimizer state, gradients, activations, and batches. Reusing the EMA field does not make the reference free.
 
-SFT uses the language-model objective's moving EMA by default. GRPO also allocates a frozen EMA reference, even when `beta=0` skips reference rescoring. The `pretrained` argument takes a full Flax variables dictionary, including its `params` collection, rather than an arbitrary flat tensor dictionary. At a new DPO or GRPO stage, that initialization becomes the frozen reference.
+SFT uses the language-model objective's moving EMA by default. GRPO also allocates a frozen EMA reference, even when `beta=0` skips reference rescoring. The `pretrained` argument takes a full Flax variables mapping, including its outer `params` collection. At a new DPO or GRPO stage, that initialization becomes the frozen reference.
 
 ## GRPO: generate answers and score them
 
@@ -130,7 +130,7 @@ With `N = B * G`, the objective consumes:
 | Field | Shape | Meaning |
 | --- | --- | --- |
 | `input_ids` | `[N, P + R]` | Prompt followed by sampled response, with each prompt's group contiguous. |
-| `old_log_probs` | `[N, R]` | Response log-probabilities rescored under the sampling policy. |
+| `old_log_probs` | `[N, R]` | Response log-probabilities rescored under the untempered model distribution. |
 | `advantages` | `[N, R]` | Each completion's advantage repeated across response positions. |
 | `response_mask` | `[N, R]` | Response positions that count toward the loss. |
 | `rewards` | `[N]` | Scalar reward for each completion. |
@@ -139,11 +139,13 @@ Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough conte
 
 With `eos_id` set, the response mask includes the first end token and excludes later tokens. The current rollout still generates a fixed response width and sends the full sampled row to `decode`; a reward must handle trailing tokens deliberately. Generation and rescoring receive the left-padded IDs without a prompt-length attention mask. Do not assume variable-length padded prompts are equivalent to separate unpadded generation. Validate that behavior for your decoder before using this path on real tasks. GRPO validation scores prompt perplexity; it does not generate and score an independent reward evaluation.
 
+Sampling temperature changes the distribution that draws tokens. The recorded `old_log_probs` come from untempered model rescoring, so they do not represent that sampling distribution at non-unit temperature. Exact likelihood provenance and correction semantics remain under review; fixed-tensor loss parity does not resolve this collection mismatch.
+
 ## Move between stages
 
 The Python-only `recipes.chain.Recipe` accepts a shared decoder, optimizer, key, output directory, batch size, and a tuple of `Stage` values. A stage's dataset **type** selects its objective: `ChatMessages` selects SFT, `PreferencePairs` selects DPO, and `Prompts` selects GRPO. The stage name labels its directory; a name such as `"sft"` does not infer masks or convert data.
 
-Each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. The returned list retains every stage's final state, so long chains can retain substantial memory. Keep stage names distinct so their checkpoint directories do not collide.
+In new stage directories, each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. An existing stage directory can instead trigger checkpoint restoration. Use distinct stage names and a new run directory when you intend a fresh chain. The returned list retains every stage's final state, so long chains can retain substantial memory.
 
 The chain exposes `beta`, `reward`, `groups`, `max_new_tokens`, and `sample`, but does not expose the rollout's `decode`, `eos_id`, or `temperature`. Its default reward input is therefore token-ID text. For tokenizer-decoded rewards or stop-token handling, construct `SampledRollout` and `Trainer` yourself. The [LM command-line recipe](../recipes.md) accepts `lm` and `masked_diffusion` objectives over token files; it is not a command-line SFT/DPO/GRPO chain.
 
@@ -153,7 +155,7 @@ Agentic RL (multi-turn interaction with tools or environments) and FlowGRPO for 
 
 Known trainer defects also affect planning real runs: overflow/resume can diverge, accumulation with unequal valid-token masks does not reproduce a globally token-weighted update, repeated evaluation can reuse random draws, and prefetch lifetime has an open issue. Keep `accumulation=1` for masked-loss comparisons, and do not treat this tiny run as proof of recovery or long-run stability. See [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before relying on those paths.
 
-The previously recorded fixed-tensor comparisons were:
+The recorded fixed-tensor comparisons are:
 
 | Check | Reference | Largest recorded difference |
 | --- | --- | --- |
