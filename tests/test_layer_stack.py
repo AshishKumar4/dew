@@ -243,9 +243,9 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     for model in (plain, scanned):
         objective = LMObjective(model, 11, balance_rate=0.01, aux_loss_alpha=0.1)
         loss, aux = scalar_loss(objective, variables, batch, step)
-        assert aux.variables is not None
+        assert aux.effects is not None
         outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
-                         aux.variables["moe"]))
+                         objective.apply_effects(variables, aux.effects)["moe"]))
     (loss, metrics, moe), (scanned_loss, scanned_metrics, scanned_moe) = outcomes
 
     assert abs(loss - scanned_loss) < 1e-5, (loss, scanned_loss)

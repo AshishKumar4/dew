@@ -148,10 +148,6 @@ def reference_losses(trainer, steps):
 
     @jax.jit
     def step(params, opt_state, batch, key):
-        info = type(state)(step=jnp.zeros((), jnp.int32), params=params, opt_state=opt_state,
-                           ema=None, key=key)
-        del info
-
         def loss_fn(trainable):
             from dew.objectives.base import Step
             return scalar_loss(objective, {**params, "params": trainable}, batch,
