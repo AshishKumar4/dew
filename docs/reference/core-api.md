@@ -24,7 +24,7 @@ Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `
 
 A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [stateful example](../concepts/objectives.md#update-non-parameter-state).
 
-`EMASpec(decay, select=everything)` comes from `dew.objectives.base`. `decay` is an Optax-compatible callable from completed optimizer-update count to a scalar decay. `select` accepts a tuple of string keys describing a leaf path and returns a boolean. `under("params", "context_encoder")` selects that subtree; `everything` selects all leaves. Selection must retain at least one leaf. Unit decay preserves the selected initial reference; other decays update the weighted average.
+`EMASpec(decay, select=everything)` comes from `dew.objectives.base`. `decay` maps completed optimizer-update count to a scalar. `select` accepts a tuple of keys naming a leaf; `under("params", "context_encoder")` selects that subtree, and `everything` selects all leaves. EMA arithmetic uses at least fp32 and preserves explicit fp64, then rounds each result to the initialized EMA leaf dtype. Unit decay selects the frozen leaf exactly. Router bias updates also retain the initialized bias dtype; integer load comparisons avoid converting large counts to floats.
 
 ### Input descriptions
 
@@ -65,7 +65,7 @@ Trainer(objective, optimizer, *, key,
 
 `objective` is an initialized objective object and `optimizer` an Optax gradient transformation. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. Optional capability objects enable checkpoints, tracking, host-side rollouts, and profiling.
 
-`accumulation` counts accepted microbatches per effective window. Shared means use an fp32 weighted gradient accumulator. Composite statistics keep independent normalizers and retain inputs for scalar-VJP replay. Parameters and EMA stay fixed within the window; sequential mutable replacements retain their original read snapshots during replay. `dynamic_scale=True` persists scale and finite-history state and rejects nonfinite transactions without discarding the accepted prefix.
+`accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, preserving float64 when enabled in JAX. Each finalized gradient enters Optax in its parameter's dtype; partially accumulated gradients keep the wider working dtype. Composite statistics retain independent normalizers and inputs for scalar-VJP replay. Parameters and EMA stay fixed within the window; sequential mutable replacements retain their original read snapshots. `dynamic_scale=True` persists scale/history and rejects nonfinite working or optimizer-input gradients without discarding the accepted prefix.
 
 The custom `step(objective, optimizer)` factory owns accepted/update clocks, scaler, EMA and mutable writes. Its body returns `(state, loss, aux)`. The common compiled wrapper advances attempted `state.step`. A host `rollout` produces realized training arrays once per consumed attempt, before differentiation or replay.
 

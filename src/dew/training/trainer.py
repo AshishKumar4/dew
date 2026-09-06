@@ -97,7 +97,8 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
     """
     interval_loss, bad_run, worst_bad_run = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
-    return interval_loss + loss.astype(jnp.float32), bad_run, jnp.maximum(worst_bad_run, bad_run)
+    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    return interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run)
 
 
 def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
@@ -132,15 +133,20 @@ def _project(tree: Variables, like: Variables) -> Variables:
 
 def ema_update(ema: Variables, params: Variables,
                decay: jax.typing.ArrayLike) -> Variables:
-    """One EMA step over the selected leaves; `decay` is the schedule's value.
+    """Update selected EMA leaves in their initialized storage dtypes.
 
-    At unit decay the average passes through unchanged. The arithmetic form
-    multiplies the live tree by zero, and zero times a non-finite parameter
-    is NaN, so one bad parameter would poison a frozen reference on the step
-    it appears. The select runs per leaf."""
+    Arithmetic uses at least fp32 and preserves explicit fp64. Unit decay
+    selects the original leaf, including nonfinite frozen-reference values.
+    """
     def step(average, live):
-        updated = decay * average + (1 - decay) * live
-        return jnp.where(jnp.asarray(decay) >= 1.0, average, updated)
+        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
+        if average.dtype != dtype or live.dtype != dtype:
+            # Widen stored values without bypassing their producer's rounding.
+            average, live = jax.lax.optimization_barrier((average, live))
+        weight = jnp.asarray(decay, dtype)
+        updated = weight * average.astype(dtype) + (1 - weight) * live.astype(dtype)
+        stored = updated.astype(average.dtype)
+        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
 
     return jax.tree.map(step, ema, _project(params, ema))
 
@@ -169,6 +175,11 @@ def _pick(artifacts: tuple, reads: type):
             f"a metric reads {reads.__name__}, and the objective's evaluation produced "
             f"{[type(a).__name__ for a in artifacts]}")
     return matching[0]
+def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
+    """Working gradients use at least fp32, preserving higher caller precision."""
+    dtype = jnp.promote_types(gradient.dtype, jnp.float32)
+    return gradient.astype(dtype) / jnp.asarray(factor, dtype)
+
 
 def _all_finite(tree) -> jax.Array:
     finite = jnp.asarray(True)
@@ -328,6 +339,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         stats, aux = shapes
         shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
+        mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = self.accumulation - 1
         shape = lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
         trainable = jax.tree.map(shape, state.params["params"])
@@ -336,7 +348,7 @@ class Trainer(Generic[Loss, Effects]):
                    jax.tree.map(shape, {name: state.params[name] for name in aux.variables}))
 
         def zeros(leaf):
-            dtype = jnp.float32 if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
+            dtype = jnp.promote_types(leaf.dtype, jnp.float32) if jnp.issubdtype(leaf.dtype, jnp.inexact) else leaf.dtype
             return jnp.zeros(leaf.shape, dtype)
 
         def buffer(tree):
@@ -345,12 +357,12 @@ class Trainer(Generic[Loss, Effects]):
         def allocate():
             return Accumulation(
                 gradient=jax.tree.map(zeros, trainable) if shared else None,
-                mass=jnp.zeros((), jnp.float32) if shared else None,
-                statistics=((jnp.zeros((), jnp.float32),) if shared else
+                mass=jnp.zeros((), mean_dtype) if shared else None,
+                statistics=((jnp.zeros((), mean_dtype),) if shared else
                             tuple(zeros(x) for x in jax.tree.leaves(stats))),
                 effects=tuple(zeros(x) for x in jax.tree.leaves(aux.effects)),
                 qk_stats=jax.tree.map(
-                    lambda x: jnp.full(x.shape, -jnp.inf, jnp.float32)
+                    lambda x: jnp.full(x.shape, -jnp.inf, jnp.promote_types(x.dtype, jnp.float32))
                     if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
                     _compact_qk(jax.tree.map(zeros, aux.qk_stats))),
                 batches=None if shared else buffer(records),
@@ -386,8 +398,8 @@ class Trainer(Generic[Loss, Effects]):
 
             stats, pullback, aux = jax.vjp(loss_fn, state.params["params"], has_aux=True)
             loss, local_cotangent = jax.vjp(lambda s: objective.reduce_loss(s)[0], stats)
-            gradients = jax.tree.map(lambda x: x.astype(jnp.float32) / factor,
-                                     pullback(local_cotangent(factor)[0])[0])
+            gradients = jax.tree.map(lambda x: _unscale(x, factor),
+                                     pullback(local_cotangent(jnp.asarray(factor, loss.dtype))[0])[0])
             local_finite = _all_finite((loss, stats, gradients, aux.variables, aux.effects))
             local_ok = jnp.asarray(True) if scale is None else local_finite
             qk = _compact_qk(aux.qk_stats)
@@ -410,8 +422,8 @@ class Trainer(Generic[Loss, Effects]):
                     total_mass = prior_mass + mass
                     denominator = jnp.where(total_mass > 0, total_mass, 1)
                     gradients = jax.tree.map(
-                        lambda old, new: old * (prior_mass / denominator)
-                        + new * (mass / denominator), prior_gradient, gradients)
+                        lambda old, new: old * jnp.asarray(prior_mass / denominator, old.dtype)
+                        + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradients)
                     numerator = previous.statistics[0] + total
                     pooled = Mean(numerator, total_mass)
                     value, active = mean_loss(pooled)
@@ -431,8 +443,8 @@ class Trainer(Generic[Loss, Effects]):
                         cotangent = jax.tree.map(
                             lambda cot, leaf: cot.astype(leaf.dtype)
                             if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
-                            reduce_pullback(factor)[0], stats)
-                        combined = jax.tree.map(lambda x: x.astype(jnp.float32) / factor,
+                            reduce_pullback(jnp.asarray(factor, value.dtype))[0], stats)
+                        combined = jax.tree.map(lambda x: _unscale(x, factor),
                                                 pullback(cotangent)[0])
                         # Each replay reads its original sequential-mutable snapshot.
                         # Returned Aux is discarded; effects and writes happen once.
@@ -448,7 +460,7 @@ class Trainer(Generic[Loss, Effects]):
                                 return replayed
                             _, back = jax.vjp(forward, state.params["params"])
                             contribution = back(cotangent)[0]
-                            return jax.tree.map(lambda a, b: a + b.astype(jnp.float32) / factor,
+                            return jax.tree.map(lambda a, b: a + _unscale(b, factor),
                                                 accumulated, contribution)
                         return jax.lax.fori_loop(0, size - 1, replay, combined)
                     gradients = jax.lax.cond(due & local_ok, final_gradient, lambda _: gradients, None)
@@ -461,26 +473,40 @@ class Trainer(Generic[Loss, Effects]):
                                       microstep=state.microstep + 1)
 
             def commit(current):
-                if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-                    update, opt_state = optimizer.update(gradients, current.opt_state,
-                                                        current.params["params"], qk_stats=qk)
-                else:
-                    update, opt_state = optimizer.update(gradients, current.opt_state,
-                                                        current.params["params"])
-                params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
-                if aux_shape.effects is not None:
-                    params = write_back(params, objective.apply_effects(params, effects_tree.unflatten(effects)))
-                averaged = current.ema
-                if objective.ema is not None:
-                    if averaged is None:
-                        raise ValueError("the objective declares EMA but the state carries none")
-                    averaged = ema_update(averaged, params, objective.ema.decay(current.updates))
-                return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1)
+                # Optax initializes its state from parameter dtypes. Accumulation
+                # stays wider; only the completed gradient enters that contract.
+                optimizer_gradients = jax.tree.map(
+                    lambda gradient, parameter: gradient.astype(parameter.dtype),
+                    gradients, current.params["params"])
+                native_finite = _all_finite(optimizer_gradients)
 
-            numerical = jax.lax.cond(due & active & accepted, commit, lambda x: x, numerical)
+                def apply(current):
+                    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+                        update, opt_state = optimizer.update(optimizer_gradients, current.opt_state,
+                                                            current.params["params"], qk_stats=qk)
+                    else:
+                        update, opt_state = optimizer.update(optimizer_gradients, current.opt_state,
+                                                            current.params["params"])
+                    params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
+                    if aux_shape.effects is not None:
+                        params = write_back(params, objective.apply_effects(params, effects_tree.unflatten(effects)))
+                    averaged = current.ema
+                    if objective.ema is not None:
+                        if averaged is None:
+                            raise ValueError("the objective declares EMA but the state carries none")
+                        averaged = ema_update(averaged, params, objective.ema.decay(current.updates))
+                    return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
+                                               updates=current.updates + 1)
+
+                current = jax.lax.cond(native_finite if scale is not None else jnp.asarray(True),
+                                       apply, lambda x: x, current)
+                return current, native_finite
+
+            numerical, native_finite = jax.lax.cond(
+                due & active & accepted, commit, lambda x: (x, jnp.asarray(True)), numerical)
+            gradient_finite = gradient_finite & native_finite
             if scale is not None:
-                accepted = accepted & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
+                accepted = gradient_finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
             if previous is not None:
                 assert candidate is not None
                 def retain(acc):
@@ -689,7 +715,7 @@ class Trainer(Generic[Loss, Effects]):
                                      {"loss": float(book[0] / interval_steps)})
                     other += time.perf_counter() - paused
                     last_saved = current
-                    book = (jnp.zeros((), jnp.float32), book[1], book[2])
+                    book = (jnp.zeros_like(book[0]), book[1], book[2])
                     interval_steps = 0
                 if (local_every and checkpoints is not None
                         and current % local_every == 0 and current < steps):

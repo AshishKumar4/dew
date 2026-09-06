@@ -53,7 +53,8 @@ def mean_loss(stats: Mean) -> tuple[jax.Array, jax.Array]:
     """Reduce a shared-denominator estimator, including empty support."""
     mass = jax.lax.stop_gradient(stats.mass)
     active = mass > 0
-    value = stats.total.astype(jnp.float32) / jnp.where(active, mass, 1)
+    dtype = jnp.result_type(stats.total.dtype, mass.dtype, jnp.float32)
+    value = stats.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
     return jnp.where(active, value, 0), active
 
 
@@ -169,7 +170,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if isinstance(stats, Mean):
             return mean_loss(stats)
         if isinstance(stats, (jax.Array, float, int)):
-            value = jnp.asarray(stats, jnp.float32)
+            value = jnp.asarray(stats)
+            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(True)
