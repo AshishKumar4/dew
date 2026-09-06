@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.rl import group_advantage, rloo_advantage
 
 from ..lm import LMObjective
@@ -29,6 +30,23 @@ Reward: TypeAlias = Callable[[str, str, str, str], float]
 is the score of one completion, a plain float the rollout writes into the
 `rewards` column."""
 
+IDS_KEY = "input_ids"
+"""Batch key holding the `[N, prompt + response]` concatenation, prompts
+left-padded and groups contiguous inside each prompt row."""
+
+RESPONSE_MASK_KEY = "response_mask"
+"""Batch key holding the `[N, response]` completion marks."""
+
+OLD_LOG_PROBS_KEY = "old_log_probs"
+"""Batch key holding the `[N, response]` log-probabilities under the sampling
+policy."""
+
+ADVANTAGES_KEY = "advantages"
+"""Batch key holding the `[N, response]` advantages broadcast over the width."""
+
+REWARDS_KEY = "rewards"
+"""Batch key holding the `[N]` scalar reward of each completion."""
+
 
 def _texts(rows: np.ndarray) -> list[str]:
     """Fixed-width UTF-8 byte rows back to strings. The rows are int32, so
@@ -36,6 +54,7 @@ def _texts(rows: np.ndarray) -> list[str]:
     byte with three zeros."""
     return [bytes(row[row != 0].astype(np.uint8)).decode("utf-8")
             for row in np.asarray(rows, np.int32)]
+
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
@@ -78,11 +97,11 @@ class SampledRollout:
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
         from dew.sampling import generate
 
-        prompts = np.asarray(batch["prompt"], np.int32)
-        prompt_length = np.asarray(batch["prompt_length"], np.int32).reshape(-1)
-        sources = _texts(batch["data_source"])
-        truths = _texts(batch["ground_truth"])
-        infos = _texts(batch["extra_info"])
+        prompts = np.asarray(batch[PROMPT_KEY], np.int32)
+        prompt_length = np.asarray(batch[LENGTH_KEY], np.int32).reshape(-1)
+        sources = _texts(batch[SOURCE_KEY])
+        truths = _texts(batch[TRUTH_KEY])
+        infos = _texts(batch[INFO_KEY])
         rows, width = prompts.shape
         if width + self.max_new_tokens != self.objective.seq_len + 1:
             raise ValueError(
@@ -124,13 +143,13 @@ class SampledRollout:
             state.params, full.reshape(-1, full.shape[-1])),
             np.float32).reshape(rows, self.groups, -1)[:, :, width - 1:width - 1 + self.max_new_tokens]
         return {
-            "input_ids": full.reshape(-1, full.shape[-1]),
-            "response_mask": mask.reshape(-1, self.max_new_tokens),
-            "old_log_probs": old.reshape(-1, self.max_new_tokens),
-            "advantages": np.broadcast_to(
+            IDS_KEY: full.reshape(-1, full.shape[-1]),
+            RESPONSE_MASK_KEY: mask.reshape(-1, self.max_new_tokens),
+            OLD_LOG_PROBS_KEY: old.reshape(-1, self.max_new_tokens),
+            ADVANTAGES_KEY: np.broadcast_to(
                 advantages.reshape(rows, self.groups)[..., None],
                 (rows, self.groups, self.max_new_tokens)).reshape(-1, self.max_new_tokens),
-            "rewards": rewards.reshape(-1),
-            "prompt_length": np.broadcast_to(
+            REWARDS_KEY: rewards.reshape(-1),
+            LENGTH_KEY: np.broadcast_to(
                 prompt_length[:, None], (rows, self.groups)).reshape(-1),
         }
