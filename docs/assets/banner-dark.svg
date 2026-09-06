@@ -1,20 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="720" height="200" viewBox="0 0 720 200" role="img" aria-label="dew">
-<defs>
-    <linearGradient id="gb" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7fe6d8"/><stop offset="1" stop-color="#12a394"/>
-    </linearGradient>
-    <mask id="mb">
-      <rect x="-40" y="-50" width="80" height="120" fill="#fff"/>
-      <ellipse cx="-11" cy="16" rx="5.5" ry="11" transform="rotate(-22 -11 16)" fill="#000"/>
-    </mask>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-labelledby="title description">
+  <title id="title">Dew — model training with JAX and Flax</title>
+  <desc id="description">Language models, diffusion, and representation learning. Explicit models, objectives, and training state.</desc>
+  <defs>
+    <linearGradient id="gb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7fe6d8"/><stop offset="1" stop-color="#12a394"/></linearGradient>
+    <mask id="mb"><rect x="-40" y="-50" width="80" height="120" fill="#fff"/><ellipse cx="-11" cy="16" rx="5.5" ry="11" transform="rotate(-22 -11 16)" fill="#000"/></mask>
   </defs>
-  <g transform="translate(217.03 100.00) scale(1.0000) translate(0 -7.5)">
-    <path mask="url(#mb)" fill="url(#gb)"
-          d="M -2.6 -37.5 A 3 3 0 0 1 2.6 -37.5 L 27.713 6 A 32 32 0 1 1 -27.713 6 Z"/>
+  <rect x="1" y="1" width="958" height="358" rx="24" fill="#101b20" stroke="#25463f"/>
+  <g fill="none" stroke="#25463f" stroke-width="1.5" aria-hidden="true">
+    <path d="M-40 215C60 125 100 235 188 145S247 2 315-18"/>
+    <path d="M-40 235C74 135 114 248 204 155S265 2 333-18"/>
+    <path d="M680 380C750 302 798 360 874 254S925 123 984 84"/>
+    <path d="M699 380C767 315 813 373 890 265S943 133 984 108"/>
   </g>
-<g fill="#e6edf3" transform="translate(279.03 140.00) scale(0.062500 -0.062500)">
-<path transform="translate(0 0)" d="M550 -20Q418 -20 313.5 47.5Q209 115 149.0 244.0Q89 373 89 557Q89 743 150.0 871.5Q211 1000 315.5 1066.0Q420 1132 549 1132Q649 1132 712.5 1098.5Q776 1065 813.0 1018.5Q850 972 870 933H881V1490H1141V0H886V177H870Q849 137 811.0 91.0Q773 45 709.5 12.5Q646 -20 550 -20ZM621 194Q748 194 817.0 294.5Q886 395 886 558Q886 721 817.5 819.5Q749 918 621 918Q489 918 422.0 816.0Q355 714 355 558Q355 401 422.5 297.5Q490 194 621 194Z"/>
+  <g transform="translate(120 24)">
+    <g transform="translate(217.03 100) translate(0 -7.5)"><path mask="url(#mb)" fill="url(#gb)" d="M -2.6 -37.5 A 3 3 0 0 1 2.6 -37.5 L 27.713 6 A 32 32 0 1 1 -27.713 6 Z"/></g>
+    <g fill="#edf7f5" transform="translate(279.03 140) scale(0.0625 -0.0625)"><path transform="translate(0 0)" d="M550 -20Q418 -20 313.5 47.5Q209 115 149.0 244.0Q89 373 89 557Q89 743 150.0 871.5Q211 1000 315.5 1066.0Q420 1132 549 1132Q649 1132 712.5 1098.5Q776 1065 813.0 1018.5Q850 972 870 933H881V1490H1141V0H886V177H870Q849 137 811.0 91.0Q773 45 709.5 12.5Q646 -20 550 -20ZM621 194Q748 194 817.0 294.5Q886 395 886 558Q886 721 817.5 819.5Q749 918 621 918Q489 918 422.0 816.0Q355 714 355 558Q355 401 422.5 297.5Q490 194 621 194Z"/>
 <path transform="translate(1237.04 0)" d="M632 -23Q463 -23 341.5 48.0Q220 119 154.5 248.0Q89 377 89 552Q89 724 153.5 854.5Q218 985 336.5 1058.5Q455 1132 615 1132Q751 1132 867.5 1072.5Q984 1013 1055.0 888.5Q1126 764 1126 568V486H348Q353 337 431.5 259.0Q510 181 635 181Q721 181 782.5 218.0Q844 255 870 326L1109 277Q1069 142 943.5 59.5Q818 -23 632 -23ZM349 663H873Q861 783 796.5 855.5Q732 928 616 928Q497 928 427.5 851.5Q358 775 349 663Z"/>
-<path transform="translate(2376.08 0)" d="M377 0 44 1118H318L428 680Q449 588 474.5 480.5Q500 373 524 246Q548 370 574.0 477.5Q600 585 624 680L737 1118H985L1095 680Q1117 587 1143.0 479.5Q1169 372 1194 246Q1217 371 1241.5 478.5Q1266 586 1289 680L1399 1118H1675L1341 0H1078L947 456Q924 536 902.0 630.5Q880 725 859 819Q838 725 815.5 630.0Q793 535 771 456L640 0Z"/>
-</g>
+<path transform="translate(2376.08 0)" d="M377 0 44 1118H318L428 680Q449 588 474.5 480.5Q500 373 524 246Q548 370 574.0 477.5Q600 585 624 680L737 1118H985L1095 680Q1117 587 1143.0 479.5Q1169 372 1194 246Q1217 371 1241.5 478.5Q1266 586 1289 680L1399 1118H1675L1341 0H1078L947 456Q924 536 902.0 630.5Q880 725 859 819Q838 725 815.5 630.0Q793 535 771 456L640 0Z"/></g>
+  </g>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" text-anchor="middle">
+    <text x="480" y="222" font-size="29" font-weight="600" fill="#edf7f5">Model training with JAX and Flax</text>
+    <text x="480" y="266" font-size="23" fill="#acd0c9">Language · Diffusion · Representation learning</text>
+    <path d="M300 300H660" stroke="#25463f"/>
+    <text x="480" y="327" font-size="17" letter-spacing="1.2" fill="#acd0c9">MODELS / OBJECTIVES / EXPLICIT STATE</text>
+  </g>
 </svg>
