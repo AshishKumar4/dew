@@ -828,11 +828,115 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed, "local": local}
 
 
+def mode_builtin_preview_failures(args) -> dict:
+    """Exercise nested builtin preview failures while both ranks remain alive."""
+    import jax
+    import optax
+    import dew.sampling.text as text_sampling
+    from dew.data import Dataset
+    from dew.diffusion import presets
+    from dew.diffusion.discrete import MDLM
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Euler
+    from dew.training import Trainer
+
+    rank = jax.process_index()
+    reports = {}
+    for kind in ("lm", "diffusion", "masked"):
+        model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
+                                  num_heads=2, mlp_features=16, max_seq_len=8,
+                                  causal=kind != "masked", dtype="float32", attention_impl="xla")
+        if kind == "lm":
+            objective = LMObjective(model, seq_len=4,
+                                    samples=Samples(prompt=[1, 2], max_new_tokens=1))
+            batch = {"text": np.ones((3, 5), np.int32)}
+        elif kind == "masked":
+            objective = MaskedDiffusionObjective(model, MDLM(mask_id=7)(), seq_len=4,
+                                                samples=1, steps=2)
+            batch = {"text": np.ones((3, 4), np.int32)}
+        else:
+            objective = DiffusionObjective(
+                SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
+                presets.EDM()(), InputSpec(Field("image", (RES, RES, 3))),
+                steps=2, sampler=Euler(), guidance=None)
+            batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
+        tracker = ScoreRecorder()
+        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
+                          tracker=tracker if rank == 0 else None)
+        state, _, _ = trainer.place()
+        field = "_prompt" if kind == "lm" else "_sample"
+        original = getattr(objective, field)
+        original_generate = text_sampling.generate
+        closed = []
+
+        def validation():
+            try:
+                yield batch
+            finally:
+                closed.append(case)
+
+        data = Dataset(train=validation, val=validation, records=6, batch=6)
+        for phase in ("setup", "generation", "preflight"):
+            for source in (0, 1):
+                case = f"{kind}-{phase}-{source}"
+                fault = ValueError(f"{case}: local sampler failure before device work")
+
+                def sample_failure(*sample_args, **kwargs):
+                    if phase == "generation" and rank == source:
+                        raise fault
+                    if kind == "diffusion":
+                        result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
+                    else:
+                        result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
+                    if phase == "preflight" and rank == source:
+                        result = jax.device_put(result, jax.local_devices()[0])
+                        result.delete()
+                    return result
+
+                if phase == "setup":
+                    if rank == source:
+                        delattr(objective, field)
+                elif kind == "lm":
+                    text_sampling.generate = sample_failure
+                else:
+                    objective._sample = sample_failure
+                try:
+                    trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+                except (AttributeError, ValueError, RuntimeError) as error:
+                    reports[case] = {"type": type(error).__name__, "error": str(error),
+                                     "original": error is fault, "closed": case in closed}
+                else:
+                    reports[case] = {"error": None}
+                finally:
+                    setattr(objective, field, original)
+                    text_sampling.generate = original_generate
+                # Files keep the successful escapee alive without accidentally
+                # matching the stranded rank's next JAX phase agreement.
+                ready = args.out.parent / f"{case}.{rank}.ready"
+                ready.write_text("returned")
+                peer = args.out.parent / f"{case}.{1 - rank}.ready"
+                deadline = time.monotonic() + 30
+                while not peer.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{case}: peer never returned from evaluation")
+                    time.sleep(.01)
+        case = f"{kind}-healthy"
+        scores = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+        reports[case] = {"scores": scores, "drawn": len(tracker.drawn)}
+    return reports
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "evaluation_contract": mode_evaluation_contract,
-         "evaluation_replicas": mode_evaluation_replicas}
+         "evaluation_replicas": mode_evaluation_replicas,
+         "builtin_preview_failures": mode_builtin_preview_failures}
 
 
 def parse_args(argv=None):
