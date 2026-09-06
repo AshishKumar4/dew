@@ -664,7 +664,7 @@ class Trainer:
         agree_process_phase(error, phase="configuration agreement")
         preview_enabled = bool(broadcast_from_process_zero(
             process_zero and self.tracker is not None))
-        if data.val is None:
+        if data.val is None or not (metrics or preview_enabled):
             return {}
 
         # Stable integer domains keep display choices out of scoring randomness.
@@ -759,6 +759,8 @@ class Trainer:
                     preview = artifact = None
                 produced = batch = None
                 scored += 1
+                if not metrics:
+                    break
             event_words = np.asarray(collective_host(
                 jax.random.key_data(event_key), phase="event identity")).tolist()
             scores: dict[str, float] = {}
