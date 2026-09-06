@@ -467,10 +467,13 @@ class Spread:
     def __call__(self, artifact, batch):
         values = np.asarray(jax.tree.leaves(artifact)[0])
         self.seen.append(values.shape)
-        return float(values.std())
+        return float(values.std()), 1
 
-    def reduce(self, values):
-        return float(np.mean(values))
+    def merge(self, accumulated, contribution):
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated):
+        return accumulated[0] / accumulated[1]
 
 
 class RecordingTracker:
@@ -515,8 +518,8 @@ def expected_artifact(case: Case):
     if case.is_jepa:
         return Representations, (BATCH, case.config["emb_features"])
     if case.frames:
-        return VideoGrid, (4, *case.sample_shape)
-    return ImageGrid, (4, *case.sample_shape)
+        return VideoGrid, (BATCH, *case.sample_shape)
+    return ImageGrid, (BATCH, *case.sample_shape)
 
 
 def fsdp_leaves(tree):
@@ -544,13 +547,11 @@ def run_case(case: Case, tmp_path, fsdp):
     assert int(state.step) == 2
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == 2 and all(np.isfinite(loss) for loss in losses), losses
-    # A pass after step 1 and one at the end, both from the EMA parameters as
-    # they sit on the mesh. A diffusion objective samples four images
-    # whatever the batch holds, since each is a full sampler pass.
+    # Both passes score every row with the same EMA weight selection.
     assert seen == [shape] * 2, seen
     scores = [s["val/artifact_spread"] for _, s in tracker.scalars if "val/artifact_spread" in s]
     assert len(scores) == 2 and all(np.isfinite(score) for score in scores)
-    assert [type(value) for _, value in tracker.artifacts] == [artifact] * 2
+    assert [type(value) for _, value in tracker.artifacts] == ([] if case.is_lm else [artifact] * 2)
     assert Checkpoints(trainer.checkpoints.directory).latest == 2
     return trainer, state
 

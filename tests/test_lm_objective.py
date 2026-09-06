@@ -23,7 +23,7 @@ import pytest
 pytestmark = pytest.mark.mesh
 from flax import linen as nn
 
-from dew.artifacts import TextSamples, TokenScores
+from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity, Samples, TEXT_KEY
@@ -143,24 +143,6 @@ def reference_cross_entropy(logits, targets, pad_id=None, weights=None):
     if weights is None:
         weights = np.ones_like(picked) if pad_id is None else (targets != pad_id).astype(np.float64)
     return float((picked * weights).sum() / weights.sum())
-
-
-@pytest.fixture
-def recorded_generate(monkeypatch):
-    """Stand in for `dew.sampling.text.generate` and record how it was called."""
-    calls = []
-
-    def generate(model, params, prompt, max_new_tokens, *, key, temperature=1.0,
-                 top_k=None):
-        calls.append({"model": model, "params": params, "prompt": prompt,
-                      "max_new_tokens": max_new_tokens, "key": key,
-                      "temperature": temperature, "top_k": top_k})
-        return jnp.concatenate(
-            [prompt, jnp.zeros((prompt.shape[0], max_new_tokens), jnp.int32)], axis=1)
-
-    import dew.sampling.text as text_sampler
-    monkeypatch.setattr(text_sampler, "generate", generate)
-    return calls
 
 
 # --- the loss --------------------------------------------------------------
@@ -456,37 +438,36 @@ def test_evaluation_reads_the_ema_copy():
     assert float(jnp.mean(live.losses)) != pytest.approx(expected)
 
 
-def test_evaluation_writes_text_from_the_ema_copy(recorded_generate):
-    objective = make_objective(samples=Samples(
-        prompt=[1, 2, 3], max_new_tokens=4, temperature=0.0,
-        decode=lambda ids: "".join(str(i) for i in ids)))
+def test_scoring_with_samples_configured_does_not_decode():
+    def fail_decode(ids):
+        raise AssertionError("scoring decoded a preview")
+
+    objective = make_objective(samples=Samples(prompt=[1, 2, 3], max_new_tokens=2,
+                                              decode=fail_decode))
     params = objective.init(jax.random.key(0))
-    ema = jax.tree.map(lambda leaf: leaf + 1, params)
-
-    scores, samples = objective.evaluate(params, token_batch(), step_at(key=5, ema=ema))
-
-    assert isinstance(scores, TokenScores) and isinstance(samples, TextSamples)
-    assert samples.tokens.shape == (1, 3 + 4)
-    assert samples.prompt == "123" and samples.texts == ("1230000",)
-    call, = recorded_generate
-    assert call["params"] is ema, "samples were drawn from the live params"
-    assert call["model"] is objective.model
-    assert np.array_equal(np.asarray(call["prompt"]), [[1, 2, 3]])
-    assert call["max_new_tokens"] == 4 and call["temperature"] == 0.0
-    assert call["top_k"] is None
-    assert jnp.array_equal(jax.random.key_data(call["key"]),
-                           jax.random.key_data(jax.random.key(5)))
+    scores = objective.evaluate(params, token_batch(), step_at())
+    assert isinstance(scores, TokenScores)
+    expected = objective.token_scores(params, token_batch()[TEXT_KEY])
+    # Jitted scoring and eager scoring differ by <= 4.8e-7 in float32 on CPU.
+    np.testing.assert_allclose(scores.losses, expected.losses, rtol=1e-6, atol=1e-6)
 
 
-def test_evaluation_without_an_ema_writes_from_the_live_params(recorded_generate):
-    objective = make_objective(samples=Samples(prompt=[[1, 2], [3, 4]], max_new_tokens=2))
+def test_preview_generates_reproducible_text_from_ema():
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
+                              num_heads=2, mlp_features=32, max_seq_len=32,
+                              dtype="float32", attention_impl="xla")
+    objective = LMObjective(model, seq_len=SEQ, samples=Samples(
+        prompt=[1, 2, 3], max_new_tokens=4, temperature=0.0))
     params = objective.init(jax.random.key(0))
-
-    _, samples = objective.evaluate(params, token_batch(), step_at())
-
-    assert samples.tokens.shape == (2, 4)
-    assert recorded_generate[0]["params"] is params
-    assert recorded_generate[0]["temperature"] == 1.0
+    ema = jax.tree.map(lambda leaf: leaf + 0.1, params)
+    averaged = objective.preview(params, token_batch(), step_at(key=5, ema=ema))
+    direct = objective.preview(ema, token_batch(), step_at(key=5))
+    np.testing.assert_array_equal(averaged.tokens, direct.tokens)
+    assert averaged.texts == direct.texts
+    np.testing.assert_array_equal(averaged.tokens[:, :3], [[1, 2, 3]])
+    assert averaged.tokens.shape == (1, 7)
 
 
 def test_prompts_that_cannot_be_batched_are_rejected():
@@ -507,7 +488,7 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)))
     light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]))
 
-    score = metric.reduce([metric(heavy, None), metric(light, None)])
+    score = metric.finalize(metric.merge(metric(heavy, None), metric(light, None)))
 
     assert score == pytest.approx(np.exp((4 * 1.0 + 1 * 3.0) / 5))
     assert score != pytest.approx(np.exp(np.mean([1.0, 3.0])))
@@ -518,9 +499,9 @@ def test_a_batch_with_no_counted_target_weighs_nothing():
     scored = TokenScores(losses=jnp.full((1, 4), 2.0), weights=jnp.ones((1, 4)))
     empty = TokenScores(losses=jnp.zeros((1, 4)), weights=jnp.zeros((1, 4)))
 
-    assert metric.reduce([metric(scored, None), metric(empty, None)]) == pytest.approx(np.exp(2.0))
+    assert metric.finalize(metric.merge(metric(scored, None), metric(empty, None))) == pytest.approx(np.exp(2.0))
     with pytest.raises(ValueError, match="no counted target"):
-        metric.reduce([metric(empty, None)])
+        metric.finalize(metric(empty, None))
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
@@ -530,7 +511,7 @@ def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)
-    assert metric.reduce(values) == pytest.approx(expected)
+    assert metric.finalize(metric.merge(*values)) == pytest.approx(expected)
 
 
 class RecordingTracker:

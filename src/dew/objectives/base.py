@@ -13,9 +13,9 @@ it reports back rides in an `Aux`. Both are pytrees, so they cross `jit`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar
 
 from flax import struct
 import jax
@@ -139,32 +139,54 @@ class Objective(ABC):
         """
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
-        """What a validation batch produces: one artifact, or a tuple of them.
+        """Scoring artifacts for every row of the coordinated global batch.
 
-        Called once per validation batch with the arrays already on the mesh
-        and outside any jit, so an objective jits its device work here and
-        decodes to host strings after it. `step.ema` holds the averaged weights.
+        Every rank participates in numerical work outside the optimizer jit.
+        No display sampling or decoding belongs here. Each scoring batch has
+        a distinct key; `step.ema` holds the averaged weights.
         """
         return None
 
+    def preview(self, params: Variables, batch: Batch, step: Step, *,
+                scored: Artifacts | None = None) -> Artifacts | None:
+        """One display per event, reusing first-batch scoring when available.
 
-class Metric(Protocol):
-    """A per-batch measurement of one artifact type, and its reduction over a pass."""
+        Called on every rank with a separate preview key. Before an internal
+        collective, coordinate local setup and generation failures with
+        agree_process_phase so every rank reaches the same boundary. Complete
+        all gathers before root-only decoding. The trainer coordinates the
+        hook's final outcome before any subsequent collective.
+        """
+        return scored if scored is not None else self.evaluate(params, batch, step)
+
+
+S = TypeVar("S")
+
+
+class Metric(Protocol[S]):
+    """Host-local statistics, merged immediately and finalized once.
+
+    The first contribution initializes a pass. State belongs to that pass
+    alone; merge may update its owned buffers in place. Metrics must never
+    perform process collectives or retain state between passes.
+    """
 
     @property
     def name(self) -> str: ...
 
     @property
     def reads(self) -> type:
-        """The artifact type this metric scores; the trainer hands it that one."""
+        """The scoring artifact type this metric reads."""
         ...
 
-    def __call__(self, artifact: Any, batch: Batch, /) -> Any:
-        """One batch's measurement, whatever `reduce` needs of it. The trainer
-        passes both by position, so a metric names the artifact for what it
-        reads (`representations`, `scores`)."""
+    def __call__(self, artifact: Any, batch: Batch, /) -> S:
+        """One complete batch's sufficient statistics."""
         ...
 
-    def reduce(self, values: Sequence[Any]) -> float:
-        """The pass's value from every batch's measurement."""
+    def merge(self, accumulated: S, contribution: S, /) -> S:
+        """Combine a contribution with the pass-owned accumulator."""
+        ...
+
+    def finalize(self, accumulated: S, /) -> float:
+        """The completed pass's scalar."""
         ...
