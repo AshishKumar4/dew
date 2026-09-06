@@ -25,7 +25,7 @@ def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
 
     directory = FIXTURES / "llada-tiny"
     config = translate_config(json.loads((directory / "config.json").read_text()))
-    assert config.pop("mask_token_id") == 120
+    assert config["mask_token_id"] == 120
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", config, dtype="float32", attention_impl="reference"))
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
