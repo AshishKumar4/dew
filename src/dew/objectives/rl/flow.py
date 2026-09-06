@@ -7,14 +7,15 @@ across coordinates. Its variance includes elapsed time. The released
 scripts/train_sd3.py at 879042cf5707f8b90daa98d147d7deac2317c5da instead divides
 squared mean displacement by the diffusion coefficient squared, a term equal
 to elapsed time times this conditional KL. These regularizers have different
-step weighting.
+step weighting. Callback scores are retained in float64 through host grouping,
+unlike the released trainer's earlier float32 score conversion.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeAlias
 
 import jax
@@ -29,7 +30,7 @@ from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Mean, Step, Variables
-from dew.objectives.diffusion.objective import DiffusionObjective
+from dew.objectives.diffusion.objective import DiffusionObjective, VALIDATION_SAMPLES
 from dew.registry import objectives
 
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
@@ -42,6 +43,18 @@ if TYPE_CHECKING:
     from dew.training.state import TrainState
 
 Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
+
+
+
+def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
+    """The real row-bearing field used by rollout, scoring, and preview."""
+    conditions = inputs.conditions
+    name = next(iter(conditions.values())).field if conditions else inputs.sample.key
+    source = jnp.asarray(jax.tree.leaves(batch[name])[0])
+    if source.ndim == 0 or source.shape[0] == 0:
+        raise ValueError("flow sampling needs a non-empty leading batch dimension")
+    return source
+
 
 
 @objectives("flow_grpo")
@@ -188,11 +201,53 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
         return Mean(pg + self.beta * kl, mass), Aux(metrics)
 
+    def _draw(self, params: Variables, batch: Batch, key: jax.Array,
+              limit: int | None = None) -> tuple[jax.Array, Batch]:
+        error = None
+        prepared = None
+        try:
+            count = _source(self.inputs, batch).shape[0]
+            tokens = {keyword: batch[condition.field]
+                      for keyword, condition in self.inputs.conditions.items()}
+            if limit is not None:
+                count = min(limit, count)
+                tokens = jax.tree.map(lambda value: value[:count], tokens)
+            prepared = (count, tokens)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="flow sample setup")
+        assert prepared is not None
+        count, tokens = prepared
+        error = None
+        samples = None
+        try:
+            samples = self._sample(params, tokens, key, count=count)
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="flow sample generation")
+        assert samples is not None
+        return samples, tokens
+
     def evaluate(self, params: Variables, batch: Batch, step: Step):
-        return super().evaluate(params, batch, replace(step, ema=None))
+        """Generate one live-policy sample per source row, including prompt-only batches."""
+        samples, _ = self._draw(params, batch, step.key)
+        assert self.artifact is not None
+        return self.artifact(samples)
 
     def preview(self, params: Variables, batch: Batch, step: Step, *, scored=None):
-        return super().preview(params, batch, replace(step, ema=None), scored=scored)
+        """Draw on all ranks; materialize before root-only caption decoding."""
+        samples, tokens = self._draw(params, batch, step.key, VALIDATION_SAMPLES)
+        samples, tokens = collective_host((samples, tokens), phase="flow preview")
+        if jax.process_index() != 0:
+            return None
+        captions = ()
+        for keyword, condition in self.inputs.conditions.items():
+            captions = condition.encoder.captions(tokens[keyword])
+            if captions:
+                break
+        assert self.artifact is not None
+        return self.artifact(samples, captions)
+
 
 
 
@@ -209,6 +264,10 @@ class FlowRollout:
     epsilon 1e-4, as Flow-GRPO's PerPromptStatTracker does. Each prompt row
     defines a group; equal prompt text in other rows does not merge groups.
     Zero-advantage rows are masked, as the reference training loop filters them.
+    Callback collection, JSON/byte transport, and population statistics retain
+    float64 values. Host rewards remain float64; training advantages are
+    float32 after normalization. The reward metric is a float32 diagnostic,
+    and JAX device transfer also narrows the reward column when x64 is off.
 
     The trainer supplies global arrays on every process. Generation remains
     collective, rewards run once on rank zero, and the result contains only
@@ -240,13 +299,7 @@ class FlowRollout:
             raise ValueError("conditioning fields must not overwrite FlowGRPO transition fields")
         object.__setattr__(self, "_generate", jax.jit(self._generate_impl))
 
-    def _source(self, batch: Batch) -> jax.Array:
-        conditions = self.objective.inputs.conditions
-        name = next(iter(conditions.values())).field if conditions else self.objective.inputs.sample.key
-        source = jnp.asarray(jax.tree.leaves(batch[name])[0])
-        if source.ndim == 0 or source.shape[0] == 0:
-            raise ValueError("a flow rollout needs a non-empty leading batch dimension")
-        return source
+
 
     def _generate_impl(self, params: Variables, batch: Batch,
                        key: jax.Array) -> tuple[FlowTrajectory, jax.Array]:
@@ -258,7 +311,7 @@ class FlowRollout:
             objective.model, objective.trainable(params), given,
             None if objective.guidance is None else objective.unconditional)
         noise_key, sample_key = jax.random.split(key)
-        count = self._source(batch).shape[0]
+        count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
         trajectory = sample_trajectory(denoise, initial, self.steps, solver=objective.sde,
                                        guidance=objective.guidance, key=sample_key)
@@ -284,7 +337,7 @@ class FlowRollout:
         owned = slice(None)
         count = 0
         try:
-            source = self._source(batch)
+            source = _source(self.objective.inputs, batch)
             count = source.shape[0]
             owned = self._owned_rows(source)
 
@@ -315,18 +368,18 @@ class FlowRollout:
         rewards = None
         if jax.process_index() == 0:
             try:
-                rewards = np.asarray(self.reward(np.asarray(images), context), np.float32)
+                rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
                 if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
                     raise ValueError("a flow reward must return one finite scalar per generated sample")
             except BaseException as failure:
                 error = failure
         agree_process_phase(error, phase="flow rollout reward")
         rewards = np.asarray(broadcast_from_process_zero(
-            None if rewards is None else rewards.tolist()), np.float32)
+            None if rewards is None else rewards.tolist()), np.float64)
         error = None
         result = None
         try:
-            grouped = rewards.reshape(-1, self.groups).astype(np.float64)
+            grouped = rewards.reshape(-1, self.groups)
             centered = grouped - grouped.mean(axis=1, keepdims=True)
             # The author code uses float64 population statistics. The shared
             # JAX group estimator fixes float32 and ddof=1, which changes this loss.

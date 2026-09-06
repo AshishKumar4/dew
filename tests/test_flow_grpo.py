@@ -322,7 +322,7 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     outputs = [tmp_path / f"rank{rank}.json" for rank in range(2)]
     running = [subprocess.Popen(
         [sys.executable, str(worker), str(rank), "2", coordinator, str(output)],
-        env=worker_env(1), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env={**worker_env(1), "JAX_ENABLE_X64": "0"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, start_new_session=True) for rank, output in enumerate(outputs)]
     try:
         reports = [report_of(process, output, timeout=120)
@@ -334,14 +334,24 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     baseline_path = tmp_path / "single.json"
     baseline_process = subprocess.Popen(
         [sys.executable, str(worker), "0", "1", "unused", str(baseline_path)],
-        env=worker_env(1), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env={**worker_env(1), "JAX_ENABLE_X64": "0"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, start_new_session=True)
     baseline = report_of(baseline_process, baseline_path, timeout=120)
     local_rewards = np.concatenate([report["local_rewards"] for report in reports])
     assert local_rewards.shape == (12,)
-    np.testing.assert_allclose(local_rewards, baseline["global_rewards"], atol=3e-6)
+    raw_callback = np.asarray(reports[0]["callback_rewards"], np.float64)
+    np.testing.assert_array_equal(local_rewards, raw_callback)
+    raw_groups = raw_callback.reshape(4, 3)
+    expected_advantages = ((raw_groups - raw_groups.mean(axis=1, keepdims=True))
+                           / (raw_groups.std(axis=1, keepdims=True) + 1e-4)).reshape(-1)
+    np.testing.assert_allclose(raw_callback, baseline["callback_rewards"], rtol=0, atol=5e-8)
+    assert reports[0]["metric_rows"] == 4 and reports[0]["preview_rows"] == 4
+    assert reports[1]["metric_rows"] == 0 and reports[1]["preview_rows"] == 0
+    assert reports[0]["validation_mean"] == pytest.approx(baseline["validation_mean"], abs=1e-6)
     for report, output in zip(reports, outputs):
-        np.testing.assert_allclose(report["global_rewards"], baseline["global_rewards"], atol=3e-6)
+        np.testing.assert_allclose(report["global_advantages"], expected_advantages, atol=2e-5)
+        np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
+        assert not report["x64_enabled"]
         assert report["density_error"] < 1e-5
         assert report["updates"] == 1 and report["parameter_change"] > 0
         assert report["reference_unchanged"]
@@ -398,12 +408,126 @@ def test_group_normalization_preserves_small_differences_on_large_reward_offset(
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), guidance=None)
     state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(81)).initial_state()
-    rollout = FlowRollout(objective, lambda images, context: 1_000_000 + images.mean(axis=1),
+    callback_values = []
+
+    def reward(images, context):
+        values = 1_000_000 + images.mean(axis=1)
+        callback_values.append(values.copy())
+        return values
+
+    rollout = FlowRollout(objective, reward,
                           groups=3, steps=4)
     batch = rollout(state, {"image": np.zeros((2, 2), np.float32)}, jax.random.key(82))
-    rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
+    rewards = np.asarray(callback_values[0], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_allclose(batch["advantages"], expected.reshape(-1), atol=2e-6)
+
+
+
+def test_float64_callback_distinctions_reach_a_real_policy_update():
+    import itertools
+    from dew.data import Dataset
+    from dew.nn.backbones.dit import SimpleDiT
+
+    count = jax.device_count()
+    raw = np.tile(np.asarray([1e6 + 0.01, 1e6 + 0.02, 1e6 + 0.03], np.float64), count)
+    groups = raw.reshape(count, 3)
+    oracle = ((groups - groups.mean(axis=1, keepdims=True))
+              / (groups.std(axis=1, keepdims=True) + 1e-4)).reshape(-1)
+    model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
+                      num_layers=1, num_heads=2, mlp_ratio=2)
+    objective = FlowGRPOObjective(model, Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
+                                  InputSpec(Field("image", (4, 4, 1))), guidance=None)
+    rollout = FlowRollout(objective, lambda images, context: raw, groups=3, steps=3)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(91), rollout=rollout)
+    initial = trainer.place()[0]
+    source = {"image": np.zeros((count, 4, 4, 1), np.uint8)}
+    collected = rollout(initial, source, jax.random.key(92))
+    data = Dataset(train=lambda: itertools.repeat(source), val=None, records=count, batch=count)
+    final = trainer.fit(data, steps=1, log_every=1)
+    assert int(final.updates) == 1
+    change = float(optax.tree.norm(jax.tree.map(
+        lambda a, b: a - b, final.params["params"], initial.params["params"])))
+    assert np.isfinite(change) and change > 1e-6
+    np.testing.assert_allclose(collected["advantages"], oracle, atol=2e-6)
+    np.testing.assert_array_equal(collected["rewards"], raw)
+    assert collected["rewards"].dtype == np.float64
+    np.testing.assert_array_equal(collected["transition_mask"],
+                                   np.broadcast_to((oracle != 0)[:, None], (count * 3, 2)))
+
+
+
+def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
+    import itertools
+    from dew.artifacts import ImageGrid
+    from dew.data import Dataset
+    from dew.inputs import CharTable, Condition
+    from dew.nn.backbones.dit import SimpleDiT
+
+    class PixelMean:
+        name = "pixel_mean"
+        reads = ImageGrid
+
+        def __init__(self):
+            self.images = []
+
+        def __call__(self, artifact, batch):
+            images = np.asarray(artifact.images)
+            self.images.append(images.copy())
+            return float(images.sum(dtype=np.float64)), images.size
+
+        def merge(self, left, right):
+            return left[0] + right[0], left[1] + right[1]
+
+        def finalize(self, values):
+            return values[0] / values[1]
+
+    class PreviewLog:
+        def __init__(self):
+            self.scalars = {}
+            self.images = []
+
+        def log(self, scalars, step):
+            self.scalars.update(scalars)
+
+        def artifact(self, artifact, step):
+            self.images.append(np.asarray(artifact.images).copy())
+
+    count = jax.device_count()
+    inputs = InputSpec(Field("image", (4, 4, 1)), {
+        "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
+    prompts = inputs.tokenize([f"p{row}" for row in range(count)])
+    model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
+                      num_layers=1, num_heads=2, mlp_ratio=2)
+    process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
+    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3)
+    rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
+    tracker, metric = PreviewLog(), PixelMean()
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
+    initial = trainer.place()[0]
+    step = Step(initial.microstep, jax.random.key(102), initial.averaged)
+    evaluated = objective.evaluate(initial.params, prompts, step)
+    previewed = objective.preview(initial.params, prompts, step)
+    tokens = {keyword: prompts[condition.field] for keyword, condition in inputs.conditions.items()}
+    conditions = objective.encode(initial.params["encoders"], tokens)
+    denoiser = process.denoiser(model, objective.trainable(initial.params), conditions, objective.unconditional)
+    noise_key, sample_key = jax.random.split(step.key)
+    expected = sample(denoiser, process.noise(noise_key, (count, *objective.latent_shape)),
+                      objective.steps, solver=objective.sampler, guidance=objective.guidance, key=sample_key)
+    np.testing.assert_allclose(evaluated.images, np.clip(expected, -1, 1), atol=2e-6)
+    assert previewed.images.shape == (min(4, count), 4, 4, 1)
+    assert len(previewed.captions) == min(4, count)
+    data = Dataset(train=lambda: itertools.repeat(prompts), val=lambda: iter((prompts, prompts)),
+                   records=count, batch=count)
+    final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,))
+    assert int(final.updates) == 1
+    observed = np.concatenate(metric.images)
+    assert observed.shape == (count * 2, 4, 4, 1)
+    assert tracker.scalars["val/pixel_mean"] == pytest.approx(observed.mean(dtype=np.float64), abs=1e-8)
+    assert tracker.scalars["evaluation/records"] == count * 2
+    assert tracker.images[0].shape == (min(4, count), 4, 4, 1)
+
+
 
 
 
