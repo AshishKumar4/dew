@@ -2367,13 +2367,21 @@ def test_llada_renames_its_tensors_onto_the_shared_map():
 
 def test_diffusion_gemma_text_reuses_the_gemma4_map_in_decoder_mode():
     """The same weights with the diffusion model_type translate as the Gemma 4
-    text decoder does, except the record reads decoder mode. The encoder
-    cache, the canvas and the self-conditioning loop are not landed here."""
+    text decoder does, except the record reads decoder mode, values off keys
+    on full layers whatever the config says, and the head's divide-by-30. The
+    encoder cache, the canvas and the self-conditioning loop live in
+    dew.diffusion.block."""
     gemma4 = translate_config(fixture_config("gemma4-ple"))
     diffusion = translate_config({**fixture_config("gemma4-ple"),
                                   'model_type': 'diffusion_gemma_text'})
     assert diffusion['causal'] is False
-    assert {key: value for key, value in diffusion.items() if key != 'causal'} == gemma4
+    assert diffusion['attention_k_eq_v'] is True
+    assert diffusion['final_logit_softcap'] == 30.0
+    assert {key: value for key, value in diffusion.items()
+            if key not in ('causal', 'attention_k_eq_v',
+                           'final_logit_softcap')} == {
+        key: value for key, value in gemma4.items()
+        if key not in ('attention_k_eq_v', 'final_logit_softcap')}
 
 
 def _diffusion_fp32(name):
