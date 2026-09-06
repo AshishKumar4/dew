@@ -514,12 +514,12 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
 
 
 def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
-    """OLMo 3's block (pre_norms off, sandwich on): x + norm(attn(x)), then
+    """OLMo 3's block (input norms off, output norms on): x + norm(attn(x)), then
     x + norm(mlp(x)), with no input norms (modeling_olmo3.py:249-266). The
     block's output is checked against that equation computed from its own
     sublayers, and against the pre-norm block on the same weights, which
     normalises the input instead and lands elsewhere."""
-    from dew.nn.backbones.causal_transformer import DecoderBlock, GatedMLP, RMSNorm
+    from dew.nn.backbones.causal_transformer import BlockWiring, DecoderBlock, GatedMLP, RMSNorm
     from dew.nn.mixers import AttentionMixer, MixerContext
 
     features, ids = 32, tokens(rng)
@@ -528,7 +528,7 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
         emb_features=features, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=SEQ))
     feedforward = functools.partial(GatedMLP, hidden_features=64, out_features=features)
     block = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
-                         sandwich_norms=True, pre_norms=False)
+                         wiring=BlockWiring(pre_norms=False, output_norms=True))
     params = block.init(rng, x)
     assert set(params['params']) == {'self_attn', 'mlp', 'attention_output_norm', 'mlp_output_norm'}
 
@@ -542,7 +542,7 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     assert jnp.allclose(block.apply(params, x), expected, atol=1e-5)
 
     pre = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
-                       sandwich_norms=True)
+                       wiring=BlockWiring(output_norms=True))
     with_input_norms = pre.init(rng, x)
     with_input_norms['params'].update(params['params'])
     assert not jnp.allclose(pre.apply(with_input_norms, x), expected, atol=1e-2)
