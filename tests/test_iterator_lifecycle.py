@@ -16,6 +16,7 @@ import pytest
 from dew.artifacts import Representations
 from dew.data import Dataset
 from dew.data.dataset import tokenized
+from dew.data.tokens import bounded
 from dew.training import Checkpoints, Profile, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator
 from test_instrumentation import Regression, batches
@@ -277,7 +278,7 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):
-        trainer.fit(Dataset(training, lambda: validation, None, 8),
+        trainer.fit(Dataset(training, bounded(lambda: validation, 1), None, 8),
                     steps=steps, eval_every=1, metrics=(InvalidMetric(),))
     assert train.closed.is_set() == (steps > 0)
     assert validation.closed.is_set()
@@ -388,7 +389,8 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
         sender.join(10)
 
 
-def test_tokenized_cancellation_reaches_source_during_finalization():
+@pytest.mark.parametrize("limited", [False, True])
+def test_wrapped_cancellation_reaches_source_during_finalization(limited):
     entered, stopped, closed = threading.Event(), threading.Event(), threading.Event()
 
     class Finalizing:
@@ -406,7 +408,7 @@ def test_tokenized_cancellation_reaches_source_during_finalization():
             stopped.wait()
             closed.set()
 
-    wrapped = tokenized(Finalizing, None)()
+    wrapped = (bounded(Finalizing, 1) if limited else tokenized(Finalizing, None))()
     stream = DevicePrefetchIterator(wrapped, build_mesh())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()
@@ -451,3 +453,22 @@ def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
     assert caught.value is failure
     assert owners == [threading.get_ident()]
     stream.close()
+
+
+def test_bounded_validation_preserves_records_and_owned_close():
+    from contextlib import closing
+
+    source = Source()
+    reader = bounded(lambda: source, 2)()
+    with closing(reader):
+        values = [float(batch["x"][0, 0]) for batch in reader]
+    assert values == [1.0, 2.0]
+    assert source.closed.is_set()
+    reader.close()
+
+
+def test_zero_validation_bound_opens_no_source():
+    def unexpected():
+        raise AssertionError("zero bound opened its source")
+
+    assert list(bounded(unexpected, 0)()) == []

@@ -45,11 +45,41 @@ def token_files(path: str | None, name: str) -> tuple[str, str]:
     return str(train_bin), str(val_bin)
 
 
+class _BoundedIterator:
+    def __init__(self, source: Iterator[Batch], batches: int):
+        self._source: Iterator[Batch] | None = source
+        self._iterator: Iterator[Batch] = itertools.islice(source, batches)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._iterator)
+
+    def request_stop(self):
+        stop = getattr(self._source, "request_stop", None)
+        if stop is not None:
+            stop()
+
+    def close(self):
+        try:
+            close = getattr(self._source, "close", None)
+            if close is not None:
+                close()
+        finally:
+            self._iterator = iter(())
+            self._source = None
+
+
 def bounded(stream: Callable[[], Iterator[Batch]], batches: int | None) -> Callable[[], Iterator[Batch]]:
-    """`stream`, ending after `batches` batches when that is set."""
+    """Limit validation batches while preserving owned source shutdown."""
     if batches is None:
         return stream
-    return lambda: itertools.islice(stream(), batches)
+    if batches < 0:
+        raise ValueError("validation batch limit must be nonnegative")
+    if batches == 0:
+        return lambda: iter(())
+    return lambda: _BoundedIterator(stream(), batches)
 
 
 @datasets("token_windows")
