@@ -5,18 +5,21 @@ AdamW keeps the embeddings, the head and the norms, Muon takes the matrices.
 Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
-
 import jax
 import jax.numpy as jnp
+import json
 import numpy as np
 import optax
 import pytest
+from pathlib import Path
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 import dew.nn.moe  # declares the expert and gate axes the two MoE cases read
-from dew.training.optim import build_optimizer, muon_weight_dimension_numbers
+from dew.training.optim import (
+    build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip)
+from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
 
@@ -305,3 +308,290 @@ def test_the_router_gate_takes_the_adamw_update():
     expected, _ = reference.update(grad, reference.init(param), param)
     np.testing.assert_allclose(np.asarray(at(updates, path)),
                                np.asarray(expected), atol=1e-8)
+
+
+# --------------------------------------------------------------------------
+# MuonClip: Muon plus the QK-Clip (Kimi K2, arXiv 2507.20534)
+# --------------------------------------------------------------------------
+
+from tools.muonclip_reference import clip_qk_kernel, clip_scale
+
+QK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muonclip" / "maxtext_mla.json"
+
+
+def muonclip_solver(**kwargs):
+    return build_optimizer(
+        OptimConfig(optimizer='muonclip', learning_rate=LR, **kwargs), steps=10)
+
+
+def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
+    """A trainable tree of query/key kernels and its fixed gradients."""
+    rng = np.random.default_rng(seed)
+    params, grads = {}, {}
+    for layer in range(layers):
+        params[f'layers_{layer}'] = {
+            'self_attn': {
+                'q_proj': {'kernel': jnp.asarray(
+                    rng.normal(0, 0.5, (16, heads * dim)), jnp.float32)},
+                'k_proj': {'kernel': jnp.asarray(
+                    rng.normal(0, 0.5, (16, kv_heads * dim)), jnp.float32)}}}
+        grads[f'layers_{layer}'] = {
+            'self_attn': {
+                'q_proj': {'kernel': jnp.asarray(
+                    rng.normal(0, 0.01, (16, heads * dim)), jnp.float32)},
+                'k_proj': {'kernel': jnp.asarray(
+                    rng.normal(0, 0.01, (16, kv_heads * dim)), jnp.float32)}}}
+    return params, grads
+
+
+def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None):
+    """The `qk` collection with per-layer maxima, as the model sows it."""
+    stats = {}
+    for layer in range(layers):
+        sown = {'max_logits': (jnp.asarray(
+            np.full((rows, heads), 10.0, np.float32) if values is None
+            else np.asarray(values, np.float32).reshape(rows, heads), jnp.float32),)}
+        if nope is not None:
+            sown['qk_nope'] = jnp.asarray(nope)
+        stats[f'layers_{layer}'] = {'self_attn': sown}
+    return stats
+
+
+def largest_update_difference(left, right) -> float:
+    return max(float(jnp.max(jnp.abs(a - b)))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right)))
+
+
+def test_muonclip_without_stats_steps_like_muon():
+    """No maxima, no clip: the transform steps aside bitwise, leaving every
+    run whose loss never opened the collection on Muon's update."""
+    params, grads = qk_tree()
+    muon = muon_solver()
+    clipped = muonclip_solver()
+    expected, _ = muon.update(grads, muon.init(params), params)
+    updates, _ = clipped.update(grads, clipped.init(params), params)
+    assert largest_update_difference(updates, expected) == 0.0
+
+
+def test_a_quiet_clip_steps_like_muon():
+    """Maxima below the threshold rescale nothing: bitwise the Muon update."""
+    params, grads = qk_tree()
+    muon = muon_solver()
+    clipped = muonclip_solver()
+    expected, _ = muon.update(grads, muon.init(params), params)
+    updates, _ = clipped.update(
+        grads, clipped.init(params), params,
+        qk_stats=qk_stats(values=[[10.0] * 4] * 3))
+    assert largest_update_difference(updates, expected) == 0.0
+
+
+def test_the_clip_matches_the_paper_equations():
+    """Per-head query and key rescale against the paper's equations in
+    tools/muonclip_reference.py: one head fires at half, the rest hold.
+    Observed on CPU: 6.0e-08."""
+    params, grads = qk_tree()
+    stats = qk_stats(values=[[200.0, 50.0, 10.0, 5.0],
+                             [10.0, 10.0, 10.0, 10.0],
+                             [10.0, 10.0, 10.0, 10.0]])
+    tx = scale_by_qk_clip(100.0)
+    updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
+    s_max = np.max(np.asarray(stats['layers_0']['self_attn']['max_logits'][0]),
+                   axis=0)
+    gamma = clip_scale(s_max, 100.0)
+    for proj in ('q_proj', 'k_proj'):
+        stepped = (np.asarray(params['layers_0']['self_attn'][proj]['kernel'])
+                   + np.asarray(grads['layers_0']['self_attn'][proj]['kernel']))
+        expected = clip_qk_kernel(stepped, np.asarray(gamma), 4)
+        applied = (np.asarray(params['layers_0']['self_attn'][proj]['kernel'])
+                   + np.asarray(updates['layers_0']['self_attn'][proj]['kernel']))
+        assert float(np.max(np.abs(applied - expected))) < 1e-6
+
+
+def test_grouped_keys_clip_by_the_strongest_head():
+    """Two key heads behind four query heads: one firing query head rescales
+    the whole key projection by its gamma, the conservative side, while the
+    quiet query heads keep Muon's update bitwise. Observed on CPU: key at
+    half, quiet query slices bitwise."""
+    params, grads = qk_tree(kv_heads=2)
+    stats = qk_stats(values=[[200.0, 10.0, 10.0, 10.0],
+                             [10.0, 10.0, 10.0, 10.0],
+                             [10.0, 10.0, 10.0, 10.0]])
+    tx = scale_by_qk_clip(100.0)
+    updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
+    key, key_update = (params['layers_0']['self_attn']['k_proj']['kernel'],
+                       updates['layers_0']['self_attn']['k_proj']['kernel'])
+    grad_update = grads['layers_0']['self_attn']['k_proj']['kernel']
+    assert float(jnp.max(jnp.abs(
+        (np.asarray(key) + np.asarray(key_update))
+        - 0.5 * (np.asarray(key) + np.asarray(grad_update))))) < 1e-6
+    query_update = updates['layers_0']['self_attn']['q_proj']['kernel']
+    plain = grads['layers_0']['self_attn']['q_proj']['kernel']
+    assert largest_update_difference(
+        query_update.reshape(16, 4, 8)[:, 1:, :],
+        plain.reshape(16, 4, 8)[:, 1:, :]) == 0.0
+
+
+def test_the_latent_branches_match_maxtext():
+    """The MLA branches against MaxText 0.2.4's own outputs, committed as
+    tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`
+    and `kv_b_proj` for `wkv_b`, the same per-head tensors under Dew's
+    names. Observed on CPU: at most 4.7e-09."""
+    fixture = json.loads(QK_FIXTURE.read_text())
+    assert fixture['maxtext'] == '0.2.4'
+    worst = 0.0
+    tx = scale_by_qk_clip(100.0)
+    for case in fixture['cases']:
+        proj = 'q_proj' if case['layer'] == 'wq_b' else 'kv_b_proj'
+        flat = np.asarray(case['param']).reshape(
+            len(case['param']), -1)
+        params = {'l': {'m': {proj: {'kernel': jnp.asarray(flat)}}}}
+        grads = jax.tree.map(jnp.zeros_like, params)
+        stats = {'l': {'m': {
+            'max_logits': (jnp.asarray(case['max_logits'], jnp.float32),),
+            'qk_nope': jnp.asarray(case['qk_nope'])}}}
+        updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
+        applied = (flat + np.asarray(updates['l']['m'][proj]['kernel'])
+                   ).reshape(np.asarray(case['expected']).shape)
+        worst = max(worst, float(np.max(np.abs(applied - case['expected']))))
+    assert worst < 1e-6, worst
+
+
+def test_nonpositive_maxima_hold_their_weights():
+    """A head whose logits never rose above zero clips nothing: the raw
+    transform is the identity there, bitwise. MaxText's formula would hand
+    such a head a negative rescale, so Dew holds it at 1.0 instead."""
+    params, grads = qk_tree()
+    tx = scale_by_qk_clip(100.0)
+    updates, _ = tx.update(
+        grads, tx.init(params), params,
+        qk_stats=qk_stats(values=[[-3.0, 0.0, -0.5, -100.0]] * 3))
+    assert largest_update_difference(updates, grads) == 0.0
+
+
+def test_an_unsown_projection_is_refused():
+    """A named projection whose layer sowed nothing raises naming the layer,
+    and a non-positive threshold raises too: both would train a different
+    model than the maxima describe."""
+    params, grads = qk_tree()
+    tx = scale_by_qk_clip(100.0)
+    with pytest.raises(ValueError, match="sowed no max logits"):
+        tx.update(grads, tx.init(params), params, qk_stats={})
+    with pytest.raises(ValueError, match="bounds positive logits"):
+        scale_by_qk_clip(0.0)
+
+
+def test_the_threshold_rides_optimizer_opts():
+    """`--optim.optimizer-opts '{"qk_clip_threshold": 5.0}'` reaches the
+    transform: maxima of 50 clip nothing at the default 100, and rescale
+    each side by sqrt(5/50) at 5, so their product carries the tenth."""
+    params, grads = qk_tree()
+    stats = qk_stats(values=[[50.0] * 4] * 3)
+    default = muonclip_solver()
+    muon = muon_solver()
+    plain, _ = muon.update(grads, muon.init(params), params)
+    updates, _ = default.update(grads, default.init(params), params,
+                                qk_stats=stats)
+    assert largest_update_difference(updates, plain) == 0.0
+    low = build_optimizer(OptimConfig(
+        optimizer='muonclip', learning_rate=LR,
+        optimizer_opts={'qk_clip_threshold': 5.0}), steps=10)
+    clipped, _ = low.update(grads, low.init(params), params, qk_stats=stats)
+    factor = float(np.sqrt(5.0 / 50.0))
+    stepped = (np.asarray(params['layers_0']['self_attn']['q_proj']['kernel'])
+               + np.asarray(plain['layers_0']['self_attn']['q_proj']['kernel']))
+    assert float(np.max(np.abs(
+        np.asarray(params['layers_0']['self_attn']['q_proj']['kernel'])
+        + np.asarray(clipped['layers_0']['self_attn']['q_proj']['kernel'])
+        - factor * stepped))) < 1e-6
+
+
+def tiny_decoder(**overrides):
+    fields = dict(vocab_size=32, emb_features=16, num_layers=2, num_heads=4,
+                  num_kv_heads=2, mlp_features=32, max_seq_len=8,
+                  qk_norm=False)
+    fields.update(overrides)
+    return CausalTransformer(**fields)
+
+
+def test_the_sow_reports_the_kernels_logits():
+    """The `qk` collection holds one fp32 `[rows, heads]` maximum per layer,
+    finite and tracking the query kernel: doubling layer 0's queries doubles
+    its maxima, which a stale or miswired sow would not. A closed collection
+    sows nothing, and the plain forward skips the extra matmul."""
+    model = tiny_decoder()
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], jnp.int32)
+    _, sown = model.apply(variables, ids, mutable=["qk"])
+    assert set(sown.get("qk", {})) == {"layers_0", "layers_1"}
+    for layer in ("layers_0", "layers_1"):
+        (max_logits,) = sown["qk"][layer]["self_attn"]["max_logits"]
+        assert max_logits.shape == (1, 4) and max_logits.dtype == jnp.float32
+        assert bool(jnp.all(jnp.isfinite(max_logits)))
+        assert bool(jnp.all(max_logits != 0.0))
+
+    def double_layer_zero(path, leaf):
+        names = tuple(entry.key for entry in path
+                      if isinstance(entry, jax.tree_util.DictKey))
+        if (len(names) >= 3 and names[-3:] == (
+                'self_attn', 'q_proj', 'kernel')
+                and 'layers_0' in names):
+            return leaf * 2
+        return leaf
+
+    doubled = jax.tree_util.tree_map_with_path(double_layer_zero, variables)
+    _, sown_doubled = model.apply(doubled, ids, mutable=["qk"])
+    before = sown["qk"]["layers_0"]["self_attn"]["max_logits"][0]
+    after = sown_doubled["qk"]["layers_0"]["self_attn"]["max_logits"][0]
+    assert float(jnp.max(jnp.abs(after / before - 2.0))) < 1e-5
+    # Layer 1 reads layer 0's output, so its maxima legitimately move; what
+    # has to hold there is presence and finiteness, not equality.
+    (downstream,) = sown_doubled["qk"]["layers_1"]["self_attn"]["max_logits"]
+    assert downstream.shape == (1, 4)
+    assert bool(jnp.all(jnp.isfinite(downstream)))
+
+    _, shut = model.apply(variables, ids, mutable=[])
+    assert shut == {}
+
+
+def test_muonclip_moves_a_real_step():
+    """Three muonclip steps on the tiny decoder, stats from its own forward:
+    finite losses, and different weights than Muon at the same seed, which is
+    what proves the clip fired on the real tree. Observed on CPU: maxima peak
+    at 4.49 against the threshold of 1.0, losses finite around 3.9, weights
+    0.56 from Muon's."""
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+    model = tiny_decoder()
+    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    rows = np.random.default_rng(0).integers(0, 32, size=(4, 9)).astype(np.int32)
+    batch = {"text": rows}
+    inputs = jnp.asarray(rows[:, :-1])
+    objective = LMObjective(model, 8)
+    info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+
+    def run(solver, stats):
+        params, opt_state = variables["params"], solver.init(variables["params"])
+        losses = []
+        for _ in range(3):
+            (loss, _), grads = jax.value_and_grad(
+                lambda p: objective.loss(
+                    {**variables, "params": p}, batch, info),
+                has_aux=True)(params)
+            updates, opt_state = solver.update(
+                grads, opt_state, params, **stats)
+            params = optax.apply_updates(params, updates)
+            losses.append(float(loss))
+        return params, losses
+
+    muon = muon_solver()
+    clipped = build_optimizer(OptimConfig(
+        optimizer='muonclip', learning_rate=LR,
+        optimizer_opts={'qk_clip_threshold': 1.0}), steps=10)
+    _, plain_losses = run(muon, {})
+    _, sown = model.apply(variables, inputs, mutable=["qk"])
+    stats = {"qk_stats": sown.get("qk")}
+    params, losses = run(clipped, stats)
+    assert all(np.isfinite(losses)), losses
+    assert all(np.isfinite(plain_losses)), plain_losses
+    muon_params, _ = run(muon, {})
+    assert largest_update_difference(params, muon_params) > 1e-6

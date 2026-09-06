@@ -49,6 +49,48 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
     return mask[None, None]
 
 
+def combined_attention_mask(query_length: int, key_length: int, causal: bool,
+                            sliding_window: Optional[int],
+                            mask: Optional[jax.Array]) -> Optional[jax.Array]:
+    """`mask` with the structural positions folded in: a causal flag keeps
+    keys at or before each query's row, a window narrows that to the most
+    recent keys, both read off the row index the way the fused kernels take
+    them as flags. Unset stays unset, so a caller that distinguishes no mask
+    from an all-true one keeps doing so."""
+    if causal or sliding_window is not None:
+        structural = causal_attention_mask(
+            jnp.arange(query_length), key_length, sliding_window)
+        mask = structural if mask is None else jnp.logical_and(mask, structural)
+    return mask
+
+
+def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,
+                         sliding_window: Optional[int] = None,
+                         mask: Optional[jax.Array] = None,
+                         bias: Optional[jax.Array] = None) -> jax.Array:
+    """Per query head, the largest pre-softmax logit: `[batch, heads]`, fp32.
+
+    The logits are the scaled dot products the kernels softmax, masked
+    positions reading -inf so causality and packing never trip the maximum.
+    Grouped key heads repeat out to the query heads first, the same grouping
+    the kernels run. A logit softcap and attention sinks stay out: the clip
+    that reads this bounds the raw query-key growth, and a softcapped model
+    bounds it already."""
+    heads = query.shape[-2]
+    key = repeat_kv_heads(key, heads)
+    scale = 1.0 / math.sqrt(query.shape[-1])
+    logits = jnp.einsum('...qhd,...khd->...hqk',
+                        query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
+                        key.astype(jnp.float32))
+    if bias is not None:
+        logits = logits + bias.astype(jnp.float32)
+    combined = combined_attention_mask(
+        query.shape[-3], key.shape[-3], causal, sliding_window, mask)
+    if combined is not None:
+        logits = jnp.where(combined, logits, -jnp.inf)
+    return jnp.max(logits, axis=(-2, -1))
+
+
 class RMSNorm(nn.Module):
     """RMSNorm normalized in fp32, with Gemma's (1 + w) scale behind a flag.
 
@@ -521,10 +563,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             raise ValueError(
                 "attention sinks and a logit softcap have no reference that "
                 "combines them, so the sink path takes no softcap")
-        if causal or sliding_window is not None:
-            structural = causal_attention_mask(
-                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
-            mask = structural if mask is None else jnp.logical_and(mask, structural)
+        mask = combined_attention_mask(
+            query.shape[-3], key.shape[-3], causal, sliding_window, mask)
         return attention_with_sinks(
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
@@ -542,10 +582,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
-        if causal or sliding_window is not None:
-            structural = causal_attention_mask(
-                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
-            mask = structural if mask is None else jnp.logical_and(mask, structural)
+        mask = combined_attention_mask(
+            query.shape[-3], key.shape[-3], causal, sliding_window, mask)
         if softcap is not None:
             return softcapped_attention(
                 query, key, value, softcap, dtype=dtype, precision=precision,

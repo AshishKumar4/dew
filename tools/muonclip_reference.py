@@ -50,10 +50,10 @@ def clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
 
 
 def clip_qk_kernel(kernel: jax.Array, scale: jax.Array, heads: int) -> jax.Array:
-    """A general query/key kernel `[..., heads * dim]` rescaled per head."""
+    """A stepped query/key kernel rescaled per head, the paper's update."""
     tail = kernel.shape[-1] // heads
     scaled = (kernel.reshape(kernel.shape[:-1] + (heads, tail))
-              * jnp.sqrt(scale).astype(kernel.dtype))
+              * jnp.sqrt(scale)[:, None].astype(kernel.dtype))
     return scaled.reshape(kernel.shape)
 
 

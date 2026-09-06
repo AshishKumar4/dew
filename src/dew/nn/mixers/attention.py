@@ -18,8 +18,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
-    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask, open_kv_cache,
-    rotary_freqs, scaled_dot_product_attention,
+    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask,
+    max_attention_logits, open_kv_cache, rotary_freqs,
+    scaled_dot_product_attention,
 )
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
@@ -303,7 +304,12 @@ class CausalSelfAttention(nn.Module):
                 # 75.8 ms and 4.99 GiB, measured in
                 # docs/concepts/language_models.md.
                 implementation = 'xla'
-
+        # The per-head maxima the QK-Clip reads. Computed only when a caller
+        # opened the collection; the plain forward leaves it closed and its
+        # leaves bitwise identical.
+        if not self.is_initializing() and self.is_mutable_collection("qk"):
+            self.sow("qk", "max_logits", max_attention_logits(
+                query, key, causal=causal, sliding_window=window, mask=mask))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,

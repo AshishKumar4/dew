@@ -94,7 +94,7 @@ class ModelConfig:
 class OptimConfig:
     """Optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Literal["adam", "adamw", "lamb", "muon"] = "adamw"
+    optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
     learning_rate_schedule: Optional[Literal["cosine"]] = None
