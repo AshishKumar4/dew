@@ -23,11 +23,10 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
-from dew.artifacts import host
+from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import pipeline_microbatches
@@ -35,7 +34,7 @@ from dew.objectives.base import Aux, Batch, Metric, Objective, Step, Variables, 
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
-    agree_evaluation_phase, broadcast_from_process_zero, shard_batch,
+    shard_batch,
 )
 from dew.training.state import TrainState
 from dew.training.tracker import Tracker
@@ -658,11 +657,11 @@ class Trainer:
             }
         except BaseException as failure:
             error = failure
-        agree_evaluation_phase(error, phase="configuration")
+        agree_process_phase(error, phase="configuration")
         root_configuration = broadcast_from_process_zero(configuration)
         error = None if configuration == root_configuration else ValueError(
             "validation availability and ordered metric names/types must agree across ranks")
-        agree_evaluation_phase(error, phase="configuration agreement")
+        agree_process_phase(error, phase="configuration agreement")
         preview_enabled = bool(broadcast_from_process_zero(
             process_zero and self.tracker is not None))
         if data.val is None:
@@ -675,7 +674,7 @@ class Trainer:
         ema = with_ema(state.params, state.ema)
         summaries: dict[str, object] = {}
         source = iterator = None
-        scored = local_records = 0
+        scored = records = 0
         uneven = False
         try:
             error = None
@@ -684,7 +683,7 @@ class Trainer:
                 iterator = iter(source)
             except BaseException as failure:
                 error = failure
-            agree_evaluation_phase(error, phase="iterator construction")
+            agree_process_phase(error, phase="iterator construction")
             assert iterator is not None
             while True:
                 error = None
@@ -695,7 +694,7 @@ class Trainer:
                     pass
                 except BaseException as failure:
                     error = failure
-                available = agree_evaluation_phase(
+                available = agree_process_phase(
                     error, phase=f"iterator next batch {scored}", available=batch is not None)
                 if available != jax.process_count():
                     uneven = available > 0
@@ -704,12 +703,14 @@ class Trainer:
                 assert batch is not None
                 error = None
                 try:
-                    local_records += int(jax.tree.leaves(batch)[0].shape[0])
-                    if metrics or (scored == 0 and preview_enabled):
-                        batch = shard_batch(mesh, batch)
+                    batch = shard_batch(mesh, batch)
+                    rows = next((leaf.shape[0] for leaf in jax.tree.leaves(batch) if leaf.ndim), None)
+                    if rows is None:
+                        raise ValueError("validation batch has no row-bearing array")
+                    records += int(rows)
                 except BaseException as failure:
                     error = failure
-                agree_evaluation_phase(error, phase=f"batch placement {scored}")
+                agree_process_phase(error, phase=f"batch placement {scored}")
                 produced = None
                 if metrics:
                     error = None
@@ -718,9 +719,9 @@ class Trainer:
                         produced = self.objective.evaluate(state.params, batch, info)
                     except BaseException as failure:
                         error = failure
-                    agree_evaluation_phase(error, phase=f"scoring batch {scored}")
-                    produced = host(produced)
-                    home = host(batch)
+                    agree_process_phase(error, phase=f"scoring batch {scored}")
+                    produced, home = collective_host(
+                        (produced, batch), phase=f"scoring batch {scored}")
                     artifacts = (() if produced is None else produced
                                  if isinstance(produced, tuple) else (produced,))
                     for metric in metrics:
@@ -734,7 +735,7 @@ class Trainer:
                                 del contribution
                             except BaseException as failure:
                                 error = failure
-                        agree_evaluation_phase(error, phase=f"metric {metric.name} batch {scored}")
+                        agree_process_phase(error, phase=f"metric {metric.name} batch {scored}")
                     del home, artifacts
                 if scored == 0 and preview_enabled:
                     error = None
@@ -744,8 +745,8 @@ class Trainer:
                         preview = self.objective.preview(state.params, batch, info, scored=produced)
                     except BaseException as failure:
                         error = failure
-                    agree_evaluation_phase(error, phase="preview generation/decoding")
-                    preview = host(preview)
+                    agree_process_phase(error, phase="preview generation/decoding")
+                    preview = collective_host(preview, phase="preview artifacts")
                     error = None
                     if process_zero and self.tracker is not None:
                         try:
@@ -754,13 +755,12 @@ class Trainer:
                                 self.tracker.artifact(artifact, step)
                         except BaseException as failure:
                             error = failure
-                    agree_evaluation_phase(error, phase="preview rendering")
+                    agree_process_phase(error, phase="preview rendering")
                     preview = artifact = None
                 produced = batch = None
                 scored += 1
-            records = int(np.asarray(multihost_utils.process_allgather(
-                np.asarray(local_records, np.int64))).sum())
-            event_words = np.asarray(host(jax.random.key_data(event_key))).tolist()
+            event_words = np.asarray(collective_host(
+                jax.random.key_data(event_key), phase="event identity")).tolist()
             scores: dict[str, float] = {}
             if scored:
                 for metric in metrics:
@@ -770,7 +770,7 @@ class Trainer:
                             scores[f"val/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
                         except BaseException as failure:
                             error = failure
-                    agree_evaluation_phase(error, phase=f"finalizing metric {metric.name}")
+                    agree_process_phase(error, phase=f"finalizing metric {metric.name}")
             error = None
             if process_zero:
                 try:
@@ -782,14 +782,14 @@ class Trainer:
                           f"uneven_shards={uneven}, event_key={event_words}: {scores}")
                 except BaseException as failure:
                     error = failure
-            agree_evaluation_phase(error, phase="evaluation summary")
+            agree_process_phase(error, phase="evaluation summary")
             error = None
             if process_zero and self.tracker is not None and scores:
                 try:
                     self.tracker.log(scores, step)
                 except BaseException as failure:
                     error = failure
-            agree_evaluation_phase(error, phase="final tracking")
+            agree_process_phase(error, phase="final tracking")
             return broadcast_from_process_zero(scores)
         finally:
             primary = sys.exception()
@@ -804,7 +804,7 @@ class Trainer:
                 else:
                     error = failure
             if primary is None:
-                agree_evaluation_phase(error, phase="iterator cleanup")
+                agree_process_phase(error, phase="iterator cleanup")
 
 
     # ------------------------------------------------------------------

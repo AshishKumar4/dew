@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, TokenScores, host
+from dew.artifacts import TextSamples, TokenScores, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import calculate_load_balance_updates, deepseek_v2_aux_loss
@@ -457,7 +457,7 @@ class LMObjective(Objective):
         generated = generate(
             self.model, params, self._prompt, self.samples.max_new_tokens,
             key=step.key, temperature=self.samples.temperature, top_k=self.samples.top_k)
-        generated, prompt = host((generated, self._prompt))
+        generated, prompt = collective_host((generated, self._prompt), phase="LM preview")
         if jax.process_index() != 0:
             return None
         decode = self.samples.decode

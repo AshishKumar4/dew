@@ -678,10 +678,27 @@ def mode_evaluation_contract(args) -> dict:
             events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
-            return Representations(features=features, labels=batch["x"][:, 0])
+            global_artifact = Representations(features=features, labels=batch["x"][:, 0])
+            if failure in ("deleted_first", "deleted_later", "mismatched_plan"):
+                local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
+                if rank == 0 and failure != "mismatched_plan":
+                    local.delete()
+                local_artifact = Representations(features=local, labels=np.arange(3))
+                if failure == "mismatched_plan":
+                    return local_artifact if rank == 0 else global_artifact
+                return ((local_artifact, global_artifact) if failure == "deleted_first"
+                        else (global_artifact, local_artifact))
+            if failure == "deleted_batch" and rank == 0:
+                batch["a_metadata"].delete()
+            return global_artifact
 
         def preview(self, params, batch, step, *, scored=None):
             events.append(["preview", np.asarray(jax.random.key_data(step.key)).tolist()])
+            if failure == "deleted_preview":
+                local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
+                if rank == 0:
+                    local.delete()
+                return Representations(features=local, labels=np.arange(3))
             features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
                 batch["x"], step.key)
             preview = host(Representations(features=features, labels=batch["x"][:, 0]))
@@ -699,6 +716,7 @@ def mode_evaluation_contract(args) -> dict:
                 raise ValueError("host metric failed")
             values = np.asarray(artifact.features)
             assert np.array_equal(artifact.labels, np.arange(8))
+            assert batch["a_metadata"] == 7 and batch["a_python"] == 9
             return float(values.sum()), values.size
 
         def merge(self, accumulated, contribution):
@@ -725,7 +743,8 @@ def mode_evaluation_contract(args) -> dict:
             count = 0 if failure == "empty" else (
                 1 if failure == "next" or (rank == 0 and failure == "uneven") else 2)
             for _ in range(count):
-                yield {"x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
+                yield {"a_metadata": np.asarray(7), "a_python": 9,
+                       "x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
             if failure == "next" and rank == 1:
                 raise OSError("iterator next failed")
         finally:
@@ -743,7 +762,8 @@ def mode_evaluation_contract(args) -> dict:
     results = {}
     for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
                     "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
-                    "log", "render", "construct", "next"):
+                    "log", "render", "construct", "next", "deleted_first", "deleted_later",
+                    "deleted_batch", "deleted_preview", "mismatched_plan"):
         events.clear()
         trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
         metric = Mean()
@@ -760,10 +780,59 @@ def mode_evaluation_contract(args) -> dict:
     return {"results": results, "closed": closed}
 
 
+def mode_evaluation_replicas(args) -> dict:
+    """Record counts follow logical rows rather than sequence/stage replicas."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from dew.artifacts import Representations, host
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    from dew.training import MeshSpec, Trainer
+
+    class Rows(Objective):
+        def init(self, key):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, params, batch, step):
+            return params["params"]["offset"] ** 2, Aux({})
+
+        def evaluate(self, params, batch, step):
+            return Representations(features=batch["x"], labels=batch["x"][:, 0])
+
+    class Count:
+        name, reads = "count", Representations
+
+        def __call__(self, artifact, batch):
+            assert batch["a_metadata"] == 7 and batch["a_python"] == 9
+            return len(artifact.features)
+
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return float(accumulated)
+
+    mesh = MeshSpec(stage=2) if args.name == "stage" else MeshSpec(sequence=2)
+    trainer = Trainer(Rows(), optax.sgd(.01), mesh=mesh, key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"a_metadata": np.asarray(7), "a_python": 9,
+             "x": np.arange(3, dtype=np.float32)[:, None]}
+    data = Dataset(train=lambda: iter([batch]), val=lambda: iter([batch]), records=3, batch=3)
+    measured = trainer._evaluate(state, data, (Count(),), trainer.device_mesh, 0)
+    unconsumed = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+    # Plain host stays usable on root alone for local arrays outside evaluation.
+    local = None
+    if jax.process_index() == 0:
+        local = host(jax.device_put(np.arange(3), jax.local_devices()[0])).tolist()
+    return {"measured": measured, "no_consumer": unconsumed, "local": local}
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
-         "evaluation_contract": mode_evaluation_contract}
+         "evaluation_contract": mode_evaluation_contract,
+         "evaluation_replicas": mode_evaluation_replicas}
 
 
 def parse_args(argv=None):

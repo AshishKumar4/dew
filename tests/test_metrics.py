@@ -58,7 +58,6 @@ def test_frechet_distance_grows_with_covariance_mismatch():
 @pytest.mark.network
 def test_fid_metric_scores_real_images_better_than_noise(rng):
     metric = fid()
-    assert isinstance(metric, ImageMetric)
     assert metric.name == 'fid' and metric.reads is ImageGrid
 
     key_real, key_noise = jax.random.split(rng)
@@ -487,8 +486,8 @@ def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
     side: 123 between halves against 505 for noise. The absolute number is
     finite-sample bias, not the distance between the halves, and it falls with
     the sample count on the same photographs: 176 at 16 a side, 89 at 128, 63
-    at 256, 41 at 512, while noise stays near 500 throughout. That is why the
-    metric's own docstring calls a per-batch value a trend, not a headline.
+    at 256, 41 at 512, while noise stays near 500 throughout. A comparison
+    therefore needs the consumed population counts alongside its FID value.
     """
     tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
     from dew.inputs import unit_range

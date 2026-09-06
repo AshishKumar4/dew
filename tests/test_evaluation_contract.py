@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from dew.artifacts import ImageGrid, TokenScores
-from dew.eval import psnr
+from dew.artifacts import ImageGrid, TokenScores, VideoGrid
+from dew.eval import psnr, ssim
 from dew.eval.fid import FIDStats, GaussianStats, fid, frechet_distance
 from dew.objectives.lm.objective import perplexity
 from dew.objectives.rl.preference import DPOObjective
@@ -86,3 +86,12 @@ def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objectiv
     frozen = generate(model, reference, jnp.asarray([[1, 2]]), 3, key=key, temperature=0)
     assert not np.array_equal(expected, frozen)
     np.testing.assert_array_equal(preview.tokens, expected)
+
+
+@pytest.mark.parametrize("factory", [psnr, ssim])
+@pytest.mark.parametrize("reference_shape", [(1, 1, 16, 16, 3), (1, 2, 1, 16, 3), (1, 2, 16, 16, 1)])
+def test_paired_video_metrics_refuse_broadcastable_missing_pixels(factory, reference_shape):
+    metric = factory(field="video", reads=VideoGrid)
+    generated = VideoGrid(np.zeros((1, 2, 16, 16, 3), np.float32))
+    with pytest.raises(ValueError, match="pixel shapes"):
+        metric(generated, {"video": np.zeros(reference_shape, np.uint8)})
