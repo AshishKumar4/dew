@@ -19,6 +19,8 @@ The [family reference](model-families.md) lists detailed translation coverage. T
 
 Gemma 3, Llama 4, Gemma 4, Qwen 3.5, and image-only Gemma 3n have vision towers and wrapper translation with small reference fixtures. Some image paths support fixed-resolution still images only. Gemma 3n includes the MobileNet-v5 encoder and hard/soft vision embeddings; complete audio-bearing bundles still raise an error. Audio towers are not implemented. Diffusion Gemma has a block sampler and denoiser comparison against a small reference model; this does not mean its full released checkpoint was loaded on the local GPU.
 
+The Gemma 3n reference comparisons use float32. On GPU, the strict comparison sets `precision=jax.lax.Precision.HIGHEST` on the tower, projector, and decoder. Default GPU precision and bf16 show larger differences on the scaled fixture. The bf16/cuDNN execution path was exercised separately; it is not qualified at the float32 reference tolerance.
+
 Distinguish these checks when reporting support:
 
 1. Configuration translation preserves the fields needed to construct a model.

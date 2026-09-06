@@ -29,10 +29,13 @@ def bundle():
     config = json.loads((FIXTURE / "config.json").read_text())
     record = translate_wrapper_config(config)
     variables = translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
-    tower = V.tower_from_record(record["tower"]).build()
-    projector = V.projector_from_record(record["projector"]).build()
+    # Match the fp32 reference arithmetic on GPU as well as CPU.
+    precision = jax.lax.Precision.HIGHEST
+    tower = V.tower_from_record(record["tower"]).build().clone(precision=precision)
+    projector = V.projector_from_record(record["projector"]).build().clone(precision=precision)
     decoder = models.build("causal_transformer", **with_precision(
         "causal_transformer", record["text"], dtype="float32", attention_impl="reference"))
+    decoder = decoder.clone(precision=precision)
     return record, variables, tower, projector, decoder
 
 
