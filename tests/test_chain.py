@@ -80,7 +80,7 @@ def stages(tmp_path):
             loading=Loading(workers=0)), steps=1),
         Stage(name="dpo", data=PreferencePairs(
             records=pair_records(), seq_len=4, loading=Loading(workers=0)),
-            objective="dpo", steps=1),
+            steps=1),
     )
 
 
@@ -111,13 +111,9 @@ def test_a_mislinked_chain_is_refused(tmp_path):
 
     with pytest.raises(ValueError, match="at least one stage"):
         Recipe(model, optim, key, (), str(tmp_path))
-    with pytest.raises(ValueError, match="the chain links"):
-        Stage(name="x", data=chat, objective="ppo")
     with pytest.raises(ValueError, match="at least one"):
         Stage(name="x", data=chat, steps=0)
-    with pytest.raises(ValueError, match="reads ChatMessages"):
-        Stage(name="x", data=prompts, objective="sft")
     with pytest.raises(ValueError, match="no KL term"):
         Stage(name="x", data=chat, beta=0.1)
     with pytest.raises(ValueError, match="without a reward"):
-        Stage(name="x", data=prompts, objective="grpo")
+        Stage(name="x", data=prompts)
