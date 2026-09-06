@@ -24,6 +24,8 @@ What lands in tests/fixtures/moe:
   `e_score_correction_bias` so the selection bias is exercised, its shared
   expert's weights under `mlp.shared_experts.*`, and the block output, which
   is the routed sum plus that shared branch.
+- deepseek_v2.npz: hidden inputs, gate weights, and group-limited softmax
+  router weights and indices, without renormalising the selected mass.
 - deepseek_v4.npz: the router and experts of a DeepSeek V4 sparse layer,
   `DeepseekV4TopKRouter` scoring sqrt(softplus) with a nonzero selection
   bias and `DeepseekV4Experts` clamping the gate and up projections at
@@ -36,6 +38,12 @@ siblings, the names the checkpoints hold: transformers 5.16.1 merges those
 into one `mlp.experts.gate_up_proj` tensor while loading
 (`transformers/core_model_loading.py:1545`), gate rows first, and this undoes
 that merge so the fixture is in the layout a translation into Dew reads.
+
+Regeneration checks in tests/test_tools.py keep configs, inputs, parameters
+and router indices exact. Only router_weights, block_output and
+experts_output use the existing fp32 bounds in tests/test_moe.py. PyTorch
+does not promise bit-identical arithmetic across platforms, even with fixed
+seeds (https://docs.pytorch.org/docs/2.14/notes/randomness.html).
 """
 
 import argparse

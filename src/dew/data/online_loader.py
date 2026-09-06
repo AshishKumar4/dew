@@ -23,7 +23,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -224,7 +224,8 @@ def _fetch_shard(shard: Mapping[str, Sequence[str]], fetch: Fetch, threads: int)
 
 
 def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: int,
-               threads: int, fetch: Fetch, stop: multiprocessing.synchronize.Event) -> None:
+               threads: int, fetch: Fetch, stop: multiprocessing.synchronize.Event,
+               shutdown: threading.Event, finish: Callable[[BaseException | None], None]) -> None:
     """Walk `rows` forever, `workers` processes fetching a shard each with
     `threads` threads, and reshuffle between passes.
 
@@ -233,20 +234,31 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
     """
     bounds = [index * len(rows) // workers for index in range(workers + 1)]
     with _WORKER_CONTEXT.Pool(workers, initializer=_init_worker, initargs=(sink, stop)) as pool:
-        for iteration in itertools.count(1):
-            if stop.is_set():
-                return
-            result = pool.map_async(partial(_fetch_shard, fetch=fetch, threads=threads),
-                                    [rows[start:end] for start, end in zip(bounds, bounds[1:])])
-            while not stop.is_set():
-                try:
-                    result.get(timeout=0.05)
-                    break
-                except multiprocessing.TimeoutError:
-                    pass
-            if stop.is_set():
-                return
-            rows = rows.shuffle(seed=iteration)
+        error = None
+        try:
+            for iteration in itertools.count(1):
+                if stop.is_set():
+                    return
+                result = pool.map_async(partial(_fetch_shard, fetch=fetch, threads=threads),
+                                        [rows[start:end] for start, end in zip(bounds, bounds[1:])])
+                while not stop.is_set():
+                    try:
+                        result.get(timeout=0.05)
+                        break
+                    except multiprocessing.TimeoutError:
+                        pass
+                if stop.is_set():
+                    return
+                rows = rows.shuffle(seed=iteration)
+        except BaseException as failure:
+            error = failure
+            raise
+        finally:
+            finish(error)
+            # Queue.get's timeout covers readiness, not a partial packet.
+            # Keep writers alive until the iteration owner has left next.
+            # Only close, never request_stop, permits destructive teardown.
+            shutdown.wait()
 
 
 class ImageStream:
@@ -254,9 +266,11 @@ class ImageStream:
     "caption": [batch] str}`.
 
     A batch is `batch` samples the fetchers really produced, and a quiet queue
-    is no batch. While the fetcher lives the stream keeps waiting. Once it is
-    gone iteration ends, or raises the fetcher's own exception if it died of
-    one. `dropped` counts the urls the workers threw away. The
+    is no batch. While production runs the stream keeps waiting. When it
+    finishes, iteration ends or raises its exception after queued samples.
+    The fetcher retains its pool until iteration-owning close, so cancellation
+    cannot destroy a writer halfway through an active queue receive.
+    `dropped` counts the urls the workers threw away. The
     fetchers run at most `prefetch` batches ahead. The stream reports no
     position, so a run over it does not checkpoint.
     """
@@ -267,8 +281,10 @@ class ImageStream:
         self.batch = batch
         self.queue_timeout = queue_timeout
         self.dropped = 0
-        self.samples: multiprocessing.queues.Queue = _WORKER_CONTEXT.Queue(prefetch * batch)
+        self.samples: multiprocessing.queues.Queue | None = _WORKER_CONTEXT.Queue(prefetch * batch)
         self._stop = _WORKER_CONTEXT.Event()
+        self._shutdown = threading.Event()
+        self._done = threading.Event()
         self._closed = False
         self._error: BaseException | None = None
         self._waiting_logged = False
@@ -276,11 +292,16 @@ class ImageStream:
 
         # The fetcher's exception is kept for `__next__` to re-raise.
         def produce() -> None:
+            samples = self.samples
+            assert samples is not None
             try:
-                fetch_rows(rows, self.samples, workers=workers, threads=threads,
-                           fetch=fetch, stop=self._stop)
+                fetch_rows(rows, samples, workers=workers, threads=threads,
+                           fetch=fetch, stop=self._stop, shutdown=self._shutdown,
+                           finish=self._finish)
             except BaseException as error:
-                self._error = error
+                self._finish(error)
+            finally:
+                self._done.set()
 
         self.fetcher = threading.Thread(target=produce, daemon=True)
         self.fetcher.start()
@@ -289,6 +310,9 @@ class ImageStream:
         return self
 
     def __next__(self) -> Batch:
+        samples = self.samples
+        if samples is None:
+            raise StopIteration
         images: list[np.ndarray] = []
         captions: list[str] = []
         waiting_since = time.monotonic()
@@ -296,9 +320,9 @@ class ImageStream:
             if self._stop.is_set():
                 raise StopIteration
             try:
-                item = self.samples.get(timeout=min(0.05, self.queue_timeout))
+                item = samples.get(timeout=min(0.05, self.queue_timeout))
             except queue.Empty:
-                if (not self.fetcher.is_alive()
+                if (self._done.is_set()
                         or time.monotonic() - waiting_since >= self.queue_timeout):
                     self._check_fetcher()
                 continue
@@ -312,6 +336,10 @@ class ImageStream:
             raise StopIteration
         return {"image": np.stack(images), CAPTION: np.asarray(captions)}
 
+    def _finish(self, error: BaseException | None) -> None:
+        self._error = error
+        self._done.set()
+
     def request_stop(self) -> None:
         """Signal cancellation; safe alongside next and final close."""
         self._stop.set()
@@ -321,18 +349,24 @@ class ImageStream:
         self.request_stop()
         if self._closed:
             return
+        self._shutdown.set()
         self.fetcher.join()
         # Pool termination can interrupt queue writers. Do not drain/reuse
         # their pipe, or wait for abandoned payloads to flush.
-        self.samples.cancel_join_thread()
-        self.samples.close()
+        samples = self.samples
+        if samples is not None:
+            samples.cancel_join_thread()
+            samples.close()
+            # A consumer-only multiprocessing.Queue has no feeder finalizer;
+            # close alone leaves its pipe descriptors held by the object.
+            self.samples = None
         self._error = None
         self._closed = True
 
     def _check_fetcher(self) -> None:
         """Raise when there is nothing left to wait for. A live fetcher is
         only slow."""
-        if self.fetcher.is_alive():
+        if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True
                 print(f"No sample in {self.queue_timeout}s, still fetching "

@@ -486,8 +486,10 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
         scale = None
 
+        initial_batch = next(source)
+        jax.block_until_ready((state, initial_batch))
         compile_start = time.perf_counter()
-        compiled = trainer.compile(state, next(source))
+        compiled = trainer.compile(state, initial_batch)
         compile_seconds = time.perf_counter() - compile_start
 
         def step(state, scale):

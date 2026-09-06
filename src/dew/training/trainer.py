@@ -471,10 +471,8 @@ class Trainer:
             # seen since the last host check; the host check reads it to decide
             # whether to stop.
             book = fresh_book()
-            tracing, traced, seen = False, 0, 0
-            loss = None
+            seen = 0
             first_step = None
-            other = 0.0
 
             if current < steps:
                 source = data.train()
