@@ -144,8 +144,10 @@ class LMObjective(Objective):
         mtp_weight: Optional[float] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
-        in; four is the measured best on one RTX 4080 at vocabulary 50,304,
-        see docs/research/lm-head.md.
+        in; the `[tokens, vocab]` logits are built one slice at a time. Four costs
+        2.2% of the step for 1.2 GiB less peak memory at vocabulary 50,304
+        on one RTX 4080 (docs/benchmarks.md); the saving grows with the
+        vocabulary, and one is the full pass.
 
         `pretrained` is a variables dict to start from instead of a fresh
         init, as dew.interop.hf_decoders.load_pretrained_decoder returns for a
