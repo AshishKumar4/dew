@@ -424,7 +424,7 @@ export DEW_FLOWERS_PATH="$TFDS_DATA_DIR/oxford_flowers102/2.1.1"
 uv pip install --python .venv/bin/python -e ".[tfds]"
 ```
 
-This runtime command requires a Dew revision with the TensorFlow-free `tfds` extra and explicit prepared-directory reader; older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the preparation environment for training merely because it contains TFDS. The prepared directory contains ArrayRecords, `dataset_info.json`, and the label vocabulary; those files cross the environment boundary, while the builder's TensorFlow preparation stack does not. `OxfordFlowers(path=..., labels=None)` derives `label.labels.txt` from that directory; `labels` remains an optional file override. In a recipe CLI, the equivalent source setting is `--data.path "$DEW_FLOWERS_PATH"`.
+This runtime command requires a Dew revision with the TensorFlow-free `tfds` extra and explicit prepared-directory reader; older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the preparation environment for training merely because it contains TFDS. The prepared directory contains ArrayRecords, `dataset_info.json`, and the label vocabulary; those files cross the environment boundary, while the builder's TensorFlow preparation stack does not. With `labels=None`, `OxfordFlowers` derives `label.labels.txt` from `path`; `labels` remains an optional file override. In a recipe CLI, the equivalent source setting is `--data.path "$DEW_FLOWERS_PATH"`.
 
 Save this complete script as `train_flowers64.py`. It trains in pixels, without a CLIP/T5 tower or VAE, so the training script requires no pretrained model weights. `DiffusionRunConfig` records the actual model, process, data, optimizer, and trainer choices in `run.json`.
 
@@ -487,7 +487,7 @@ if __name__ == "__main__":
     main()
 ```
 
-With your CUDA JAX environment activated and `TFDS_DATA_DIR` still set, launch it with:
+With your CUDA JAX environment activated and `DEW_FLOWERS_PATH` set to the prepared version directory, launch it with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python train_flowers64.py
