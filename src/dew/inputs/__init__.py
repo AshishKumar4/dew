@@ -23,11 +23,19 @@ import numpy as np
 
 from dew import registry
 from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
+from dew.nn.vision import PIXEL_VALUES_KEY
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
+
+
+def pixel_field(height: int, width: int, channels: int = 3) -> Field:
+    """The batch field carrying one image per row for a vision tower: float32
+    [channels, height, width] as the checkpoint's processor emitted it, beside
+    the decoder's token field."""
+    return Field(PIXEL_VALUES_KEY, (channels, height, width))
 
 
 @dataclass(frozen=True)
@@ -111,4 +119,4 @@ class InputSpec:
 
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "CharTable", "rebuild", "unit_range"]
+           "CharTable", "rebuild", "unit_range", "pixel_field"]

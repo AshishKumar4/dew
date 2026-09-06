@@ -16,7 +16,7 @@ Set up the venv and run it:
 
 What lands in tests/fixtures/hf:
 - <family>-tiny/ for qwen3, gemma, gemma2, gemma3, llama, llama31, mistral,
-  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3 and deepseek-v32: a
+  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3, deepseek-v32, llada and dream: a
   random-weight checkpoint in the HF layout (config.json +
   model.safetensors), the 2 x 12 token ids it was run on, and the fp32
   logits of the reference model in eval mode with eager attention. Small
@@ -27,6 +27,16 @@ What lands in tests/fixtures/hf:
   V3.2, the sparse indexer; their routers' balancing bias is scattered too,
   since a checkpoint carries it and a fixture at its zeros would not tell a
   load that reads it from one that drops it.
+  The llada and dream tinies carry no transformers class (both ship remote
+  code), so their logits come from the small torch port beside them, which
+  follows the released block line for line and runs at fp32.
+  siglip-tiny/ and llama4-vision-tiny/ hold a tiny trunk with its projector:
+  model.safetensors and projector.safetensors under the reference tensor
+  names, config.json with the tower config, projector.json with the knobs the
+  tower config leaves out, fixed pixels, and the fp32 trunk and projector
+  outputs. The SigLIP tower is two layers of width 32 over a 2x2 grid pooled
+  to one soft token of width 16; the Llama 4 trunk is two layers of width 32
+  shuffled to one token of width 64 and mapped to width 32.
 - qwen3-0.6b/: no weights. tensors.json is the tensor table of the real
   checkpoint straight from the hub metadata API, so a test can check the
   parameter tree without downloading 1.5 GB. prompt.json holds a 48 token
@@ -34,32 +44,38 @@ What lands in tests/fixtures/hf:
   weights in fp32, which the network test compares against.
 - One directory per released config the translation is tested on
   (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
-  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b): config.json and the
-  repo it came from in source.json, no weights. Google's and Meta's gated
-  repos come from unsloth's mirrors, minus the mirror's marker keys.
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b):
+  config.json and the repo it came from in source.json, no weights. Google's
+  and Meta's gated repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
 
 import argparse
 import json
 import os
 from pathlib import Path
+from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
 import torch
-from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma2Config, Gemma2ForCausalLM, Gemma3ForCausalLM, Gemma3TextConfig,
+    Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
     GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
+    SiglipVisionConfig, SiglipVisionModel,
 )
 from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
     DeepseekV32Config,
 )
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32ForCausalLM,
+)
+from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector, Llama4VisionModel,
 )
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -273,6 +289,582 @@ def tiny_deepseek_v32() -> DeepseekV32ForCausalLM:
     return DeepseekV32ForCausalLM(config)
 
 
+def _diffusion_rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm without bias, the norm both diffusion decoders use."""
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+def _diffusion_rope(seq_len: int, head_dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate-half rope tables, the convention LLaDA and Dream share with Llama."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.einsum("i,j->ij", torch.arange(seq_len).float(), inv_freq)
+    both = torch.cat((freqs, freqs), dim=-1)
+    return both.cos(), both.sin()
+
+
+def _diffusion_rotate(x: torch.Tensor) -> torch.Tensor:
+    first, second = x.chunk(2, dim=-1)
+    return torch.cat((-second, first), dim=-1)
+
+
+def _diffusion_attend(x: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      o: torch.Tensor, qb, kb, vb, ob,
+                      cos: torch.Tensor, sin: torch.Tensor, heads: int) -> torch.Tensor:
+    """Full attention over the sequence, one head width shared by both models."""
+    batch, seq, _ = x.shape
+    head_dim = q.shape[-1] // heads
+    queries = (x @ q.t() + (0 if qb is None else qb)).view(batch, seq, heads, head_dim)
+    keys = (x @ k.t() + (0 if kb is None else kb)).view(batch, seq, -1, head_dim)
+    values = (x @ v.t() + (0 if vb is None else vb)).view(batch, seq, -1, head_dim)
+    table = cos.view(1, seq, 1, head_dim)
+    turn = sin.view(1, seq, 1, head_dim)
+    queries = queries * table + _diffusion_rotate(queries) * turn
+    keys = keys * table + _diffusion_rotate(keys) * turn
+    queries = queries.transpose(1, 2)
+    keys = keys.transpose(1, 2)
+    values = values.transpose(1, 2)
+    if keys.shape[1] != heads:
+        repeat = heads // keys.shape[1]
+        keys = keys.repeat_interleave(repeat, dim=1)
+        values = values.repeat_interleave(repeat, dim=1)
+    attended = torch.nn.functional.scaled_dot_product_attention(
+        queries, keys, values, is_causal=False)
+    return (attended.transpose(1, 2).reshape(batch, seq, heads * head_dim) @ o.t()
+            + (0 if ob is None else ob))
+
+
+class _RmsWeight(torch.nn.Module):
+    """A bare RMS scale, named by its holder to match the checkpoint."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(width))
+
+
+class LladaTinyBlock(torch.nn.Module):
+    """One LLaDA llama block under the released tensor names."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int, eps: float):
+        super().__init__()
+        self.attn_norm = _RmsWeight(hidden)
+        self.q_proj = torch.nn.Linear(hidden, heads * hidden // heads, bias=False)
+        self.k_proj = torch.nn.Linear(hidden, kv_heads * hidden // heads, bias=False)
+        self.v_proj = torch.nn.Linear(hidden, kv_heads * hidden // heads, bias=False)
+        self.attn_out = torch.nn.Linear(heads * hidden // heads, hidden, bias=False)
+        self.ff_norm = _RmsWeight(hidden)
+        self.ff_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.ff_out = torch.nn.Linear(intermediate, hidden, bias=False)
+        self.heads = heads
+
+    def forward(self, x, cos, sin):
+        normed = _diffusion_rms(x, self.attn_norm.weight, 1e-5)
+        x = x + _diffusion_attend(
+            normed, self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
+            self.attn_out.weight, None, None, None, None, cos, sin, self.heads)
+        normed = _diffusion_rms(x, self.ff_norm.weight, 1e-5)
+        return x + self.ff_out(torch.nn.functional.silu(self.ff_proj(normed))
+                               * self.up_proj(normed))
+
+
+class _LladaTransformer(torch.nn.Module):
+    """The transformer holder, so the checkpoint keys read model.transformer.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
+                 vocab: int, eps: float):
+        super().__init__()
+        self.wte = torch.nn.Embedding(vocab, hidden)
+        self.blocks = torch.nn.ModuleList(
+            [LladaTinyBlock(hidden, heads, heads, intermediate, eps) for _ in range(layers)])
+        self.ln_f = _RmsWeight(hidden)
+        self.ff_out = torch.nn.Linear(hidden, vocab, bias=False)
+
+
+class _LladaModel(torch.nn.Module):
+    """The model holder, so the checkpoint keys read model.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
+                 vocab: int, eps: float):
+        super().__init__()
+        self.transformer = _LladaTransformer(hidden, layers, heads, intermediate, vocab, eps)
+
+
+class LladaTiny(torch.nn.Module):
+    """LLaDA-8B's computation at toy width, under its OLMo-style names."""
+
+    def __init__(self, hidden=32, layers=2, heads=4, intermediate=64, vocab=128,
+                 theta=500000.0, eps=1e-5):
+        super().__init__()
+        self.model = _LladaModel(hidden, layers, heads, intermediate, vocab, eps)
+        self.theta = theta
+        self.head_dim = hidden // heads
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        cos, sin = _diffusion_rope(ids.shape[1], self.head_dim, self.theta)
+        x = self.model.transformer.wte(ids)
+        for block in self.model.transformer.blocks:
+            x = block(x, cos, sin)
+        return self.model.transformer.ff_out(
+            _diffusion_rms(x, self.model.transformer.ln_f.weight, 1e-5))
+
+
+class _DreamAttention(torch.nn.Module):
+    """The attention holder, so the checkpoint keys read self_attn.*."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int):
+        super().__init__()
+        head_dim = hidden // heads
+        self.q_proj = torch.nn.Linear(hidden, heads * head_dim, bias=True)
+        self.k_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=True)
+        self.v_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=True)
+        self.o_proj = torch.nn.Linear(heads * head_dim, hidden, bias=False)
+
+
+class _DreamMlp(torch.nn.Module):
+    """The MLP holder, so the checkpoint keys read mlp.*."""
+
+    def __init__(self, hidden: int, intermediate: int):
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = torch.nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = torch.nn.Linear(intermediate, hidden, bias=False)
+
+
+class _DreamModel(torch.nn.Module):
+    """The model holder, so the checkpoint keys read model.*."""
+
+    def __init__(self, hidden: int, layers: int, heads: int, kv_heads: int,
+                 intermediate: int, vocab: int):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(vocab, hidden)
+        self.layers = torch.nn.ModuleList(
+            [DreamTinyLayer(hidden, heads, kv_heads, intermediate) for _ in range(layers)])
+        self.norm = _RmsWeight(hidden)
+
+
+class DreamTinyLayer(torch.nn.Module):
+    """One Dream decoder layer under the qwen2 tensor names."""
+
+    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int):
+        super().__init__()
+        self.input_layernorm = _RmsWeight(hidden)
+        self.self_attn = _DreamAttention(hidden, heads, kv_heads)
+        self.post_attention_layernorm = _RmsWeight(hidden)
+        self.mlp = _DreamMlp(hidden, intermediate)
+        self.heads = heads
+
+    def forward(self, x, cos, sin):
+        normed = _diffusion_rms(x, self.input_layernorm.weight, 1e-6)
+        x = x + _diffusion_attend(
+            normed, self.self_attn.q_proj.weight, self.self_attn.k_proj.weight,
+            self.self_attn.v_proj.weight, self.self_attn.o_proj.weight,
+            self.self_attn.q_proj.bias, self.self_attn.k_proj.bias,
+            self.self_attn.v_proj.bias, None, cos, sin, self.heads)
+        normed = _diffusion_rms(x, self.post_attention_layernorm.weight, 1e-6)
+        return x + self.mlp.down_proj(torch.nn.functional.silu(self.mlp.gate_proj(normed))
+                                      * self.mlp.up_proj(normed))
+
+
+class DreamTiny(torch.nn.Module):
+    """Dream-v0's computation at toy width, under its qwen2 names."""
+
+    def __init__(self, hidden=32, layers=2, heads=4, kv_heads=2, intermediate=64,
+                 vocab=128, theta=1000000.0):
+        super().__init__()
+        self.model = _DreamModel(hidden, layers, heads, kv_heads, intermediate, vocab)
+        self.lm_head = torch.nn.Linear(hidden, vocab, bias=False)
+        self.theta = theta
+        self.head_dim = hidden // heads
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        cos, sin = _diffusion_rope(ids.shape[1], self.head_dim, self.theta)
+        x = self.model.embed_tokens(ids)
+        for layer in self.model.layers:
+            x = layer(x, cos, sin)
+        return self.lm_head(_diffusion_rms(x, self.model.norm.weight, 1e-6))
+
+
+LLADA_TINY_CONFIG = {
+    "model_type": "llada", "architectures": ["LLaDAModelLM"],
+    "d_model": 32, "n_layers": 2, "n_heads": 4, "n_kv_heads": 4,
+    "mlp_hidden_size": 64, "embedding_size": 128, "vocab_size": 128,
+    "max_sequence_length": 64, "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
+    "mask_token_id": 120, "weight_tying": False, "include_bias": False,
+    "include_qkv_bias": False, "activation_type": "silu", "block_type": "llama",
+    "layer_norm_type": "rms", "layer_norm_with_affine": True,
+    "attention_layer_norm": False, "bias_for_layer_norm": False,
+    "rope": True, "rope_full_precision": True,
+}
+
+DREAM_TINY_CONFIG = {
+    "model_type": "Dream", "architectures": ["DreamModel"],
+    "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "intermediate_size": 64, "vocab_size": 128,
+    "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+    "mask_token_id": 120, "tie_word_embeddings": False, "hidden_act": "silu",
+    "use_mrope": False, "use_sliding_window": False, "sliding_window": None,
+    "rope_scaling": None,
+}
+
+
+def write_diffusion_tiny(name: str, model: torch.nn.Module, config: dict,
+                         seed: int = 1234) -> None:
+    """A diffusion tiny fixture: the torch reference's weights under the
+    released tensor names, its config and its fp32 logits on fixed ids."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    scatter_weights(model, seed)
+    model = model.float().eval()
+    save_file(model.state_dict(), directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
+    ids = np.random.RandomState(7).randint(
+        0, config["vocab_size"], (BATCH, LENGTH)).astype(np.int64)
+    np.save(directory / "input_ids.npy", ids.astype(np.int32))
+    with torch.no_grad():
+        logits = model(torch.from_numpy(ids)).to(torch.float32).numpy()
+    np.save(directory / "logits.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def siglip_tiny_system(seed: int = 1234, text_width: int = 16, mm_tokens: int = 1):
+    """A tiny SigLIP tower and Gemma projector with scattered weights.
+
+    Returns the torch modules with fp32 reference outputs on fixed pixels, and
+    the configs that describe them. The tower is two layers of width 32 over a
+    2x2 patch grid pooled to one soft token; both writers below share this
+    system so the plain and wrapper fixtures agree.
+    """
+
+    vconf = SiglipVisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+        num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
+        hidden_act="gelu_pytorch_tanh", layer_norm_eps=1e-6)
+    torch.manual_seed(seed)
+    tower = SiglipVisionModel(vconf)
+    scatter_weights(tower, seed)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
+    with torch.no_grad():
+        last = tower(pixel_values=torch.from_numpy(pixels),
+                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    gconf = Gemma3Config(
+        text_config=Gemma3TextConfig(hidden_size=text_width),
+        vision_config=vconf, mm_tokens_per_image=mm_tokens)
+    projector = Gemma3MultiModalProjector(gconf)
+    scatter_weights(projector, seed + 1)
+    projector = projector.float().eval()
+    with torch.no_grad():
+        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+    return {"tower": tower, "projector": projector, "vconf": vconf,
+            "pixels": pixels, "last": last, "soft": soft,
+            "text_width": text_width, "mm_tokens": mm_tokens}
+
+
+def llama4_vision_tiny_system(seed: int = 1234, text_width: int = 32):
+    """A tiny Llama 4 vision trunk and outer projector, same sharing deal."""
+    from types import SimpleNamespace
+
+    vconf = Llama4VisionConfig(
+        hidden_size=32, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
+        norm_eps=1e-5, hidden_act="gelu",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        pixel_shuffle_ratio=0.5, projector_input_dim=64, projector_output_dim=64,
+        vision_output_dim=64, vision_feature_select_strategy="default",
+        attention_dropout=0.0, projector_dropout=0.0)
+    torch.manual_seed(seed)
+    tower = Llama4VisionModel(vconf)
+    scatter_weights(tower, seed)
+    tower = tower.float().eval()
+    pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
+    with torch.no_grad():
+        last = tower(pixel_values=torch.from_numpy(pixels),
+                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
+    projector = Llama4MultiModalProjector(SimpleNamespace(
+        vision_config=vconf, text_config=SimpleNamespace(hidden_size=text_width)))
+    scatter_weights(projector, seed + 1)
+    projector = projector.float().eval()
+    with torch.no_grad():
+        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
+    return {"tower": tower, "projector": projector, "vconf": vconf,
+            "pixels": pixels, "last": last, "soft": soft, "text_width": text_width}
+
+
+def write_siglip_tiny() -> None:
+    """The SigLIP trunk and Gemma projector as Dew reads them: bare tensor
+    names, the tower config, the projector's two knobs, fixed pixels and both
+    fp32 reference outputs."""
+    from safetensors.torch import save_file
+
+    system = siglip_tiny_system()
+    directory = FIXTURES / "siglip-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": system["text_width"],
+         "mm_tokens_per_image": system["mm_tokens"]}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_llama4_vision_tiny() -> None:
+    """The Llama 4 trunk and outer projector, same layout."""
+    from safetensors.torch import save_file
+
+    system = llama4_vision_tiny_system()
+    directory = FIXTURES / "llama4-vision-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(
+        {"text_width": system["text_width"]}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_gemma3_mm_tiny() -> None:
+    """A Gemma 3 wrapper fixture: the SigLIP and projector halves under the
+    released model.* prefixes beside a tiny decoder half, with the wrapper
+    config and both vision reference outputs.
+
+    The decoder half reuses gemma3-tiny's weights under model.language_model.*,
+    and the tied head rides top-level as the released layout carries it. The
+    tower and projector come from the shared SigLIP system at a fresh seed.
+    """
+    from safetensors.torch import load_file, save_file
+
+    system = siglip_tiny_system(seed=4321, text_width=64)
+    text = load_file(str(FIXTURES / "gemma3-tiny" / "model.safetensors"))
+    text_config = json.loads((FIXTURES / "gemma3-tiny" / "config.json").read_text())
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"model.vision_tower.{name}"] = tensor
+    for name, tensor in system["projector"].state_dict().items():
+        merged[f"model.multi_modal_projector.{name}"] = tensor
+    for name, tensor in text.items():
+        tail = name[6:] if name.startswith("model.") else name
+        merged[f"model.language_model.{tail}"] = tensor
+    merged["lm_head.weight"] = text["model.embed_tokens.weight"].clone()
+    directory = FIXTURES / "gemma3-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "gemma3",
+        "text_config": text_config,
+        "vision_config": system["vconf"].to_dict(),
+        "mm_tokens_per_image": system["mm_tokens"],
+        "boi_token_index": 200, "eoi_token_index": 201,
+        "image_token_index": 202}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
+    with torch.no_grad():
+        from transformers.models.gemma3.modeling_gemma3 import (
+            Gemma3ForConditionalGeneration,
+        )
+        wrapper = Gemma3ForConditionalGeneration(Gemma3Config(
+            text_config={k: v for k, v in text_config.items()
+                         if k not in ("architectures", "model_type")},
+            vision_config=system["vconf"], mm_tokens_per_image=system["mm_tokens"],
+            boi_token_index=200, eoi_token_index=201, image_token_index=202))
+        wrapper.load_state_dict(
+            {k: v for k, v in merged.items()}, strict=True)
+        wrapper = wrapper.float().eval()
+        logits = wrapper(
+            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
+                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_llama4_mm_tiny() -> None:
+    """A Llama 4 wrapper fixture: vision halves and decoder half under the
+    released nesting with no model prefix, with the wrapper config, both
+    vision references and the wrapper logits."""
+    from safetensors.torch import load_file, save_file
+
+    system = llama4_vision_tiny_system(seed=4321)
+    text = load_file(str(FIXTURES / "llama4-tiny" / "model.safetensors"))
+    text_config = json.loads((FIXTURES / "llama4-tiny" / "config.json").read_text())
+    merged = {}
+    for name, tensor in system["tower"].state_dict().items():
+        merged[f"vision_model.{name}"] = tensor
+    for name, tensor in system["projector"].state_dict().items():
+        merged[f"multi_modal_projector.{name}"] = tensor
+    for name, tensor in text.items():
+        merged[f"language_model.{name}"] = tensor
+    directory = FIXTURES / "llama4-tiny-mm"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(merged, directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps({
+        "model_type": "llama4",
+        "text_config": text_config,
+        "vision_config": system["vconf"].to_dict(),
+        "boi_token_index": 90, "eoi_token_index": 91,
+        "image_token_index": 92}, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    ids = np.array([[2, 5, 92, 7, 9], [92, 3, 4, 5, 6]], np.int32)
+    with torch.no_grad():
+        from transformers.models.llama4.configuration_llama4 import Llama4Config
+        from transformers.models.llama4.modeling_llama4 import (
+            Llama4ForConditionalGeneration,
+        )
+        wrapper = Llama4ForConditionalGeneration(Llama4Config(
+            text_config={k: v for k, v in text_config.items()
+                         if k not in ("architectures", "model_type")},
+            vision_config=system["vconf"],
+            boi_token_index=90, eoi_token_index=91, image_token_index=92))
+        wrapper.load_state_dict(merged, strict=True)
+        wrapper = wrapper.float().eval()
+        logits = wrapper(
+            input_ids=torch.from_numpy(ids), pixel_values=torch.from_numpy(
+                system["pixels"]), use_cache=False).logits.to(torch.float32).numpy()
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "wrapper_ref.npy", logits)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_diffusion_sc_tiny() -> None:
+    """The self-conditioning MLP alone: its weights, narrow config, fixed
+    inputs and the fp32 reference output."""
+    from safetensors.torch import save_file
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaTextConfig,
+    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaSelfConditioning,
+    )
+
+    config = DiffusionGemmaTextConfig(
+        hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
+        rms_norm_eps=1e-6)
+    module = DiffusionGemmaSelfConditioning(config)
+    scatter_weights(module, seed=4321)
+    module = module.float().eval()
+    rng = np.random.RandomState(11)
+    embeds = rng.rand(BATCH, 4, 32).astype(np.float32)
+    signal = rng.rand(BATCH, 4, 32).astype(np.float32)
+    with torch.no_grad():
+        ref = module(torch.from_numpy(embeds),
+                     torch.from_numpy(signal)).to(torch.float32).numpy()
+    directory = FIXTURES / "diffusion-gemma-sc-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(module.state_dict(), directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(
+        {"hidden_size": 32, "intermediate_size": 64,
+         "hidden_activation": "gelu_pytorch_tanh", "rms_norm_eps": 1e-6},
+        indent=1) + "\n")
+    np.save(directory / "inputs.npy", embeds)
+    np.save(directory / "signal.npy", signal)
+    np.save(directory / "ref.npy", ref)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+DIFFUSION_DENOISER_TEXT = {
+    "model_type": "diffusion_gemma_text",
+    "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 4,
+    "num_key_value_heads": 2, "head_dim": 8, "intermediate_size": 64,
+    "vocab_size": 64, "max_position_embeddings": 64, "rms_norm_eps": 1e-6,
+    "hidden_activation": "gelu_pytorch_tanh", "tie_word_embeddings": False,
+    "attention_bias": False, "sliding_window": 8,
+    "layer_types": ["full_attention", "full_attention"],
+    "rope_parameters": {
+        "full_attention": {"rope_type": "proportional",
+                           "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+    "num_experts": 4, "top_k_experts": 2, "moe_intermediate_size": 16,
+    "global_head_dim": 8, "num_global_key_value_heads": 2,
+}
+
+
+def write_diffusion_denoiser_tiny() -> None:
+    """One DiffusionGemma denoise step: the text weights under the released
+    encoder/decoder prefixes, the text config, a fixed prompt, canvas and
+    previous logits, and the fp32 reference logits with and without
+    self-conditioning.
+
+    The reference ties its encoder and decoder text weights, so the fixture
+    copies the encoder's text weights over the decoder's after scattering;
+    the dew tree holds them once. The tied check in the loader refuses a
+    checkpoint that disagrees there.
+    """
+    from safetensors.torch import save_file
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+    )
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+
+    text = DiffusionGemmaTextConfig(**{
+        key: value for key, value in DIFFUSION_DENOISER_TEXT.items()
+        if key != "model_type"})
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=text, vision_config=vision, canvas_length=4,
+        tie_word_embeddings=False))
+    state = model.state_dict()
+    for name in list(state):
+        if name.startswith("model.decoder.layers.") or name in (
+                "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
+            counterpart = name.replace("model.decoder.", "model.encoder.language_model.", 1)
+            state[name].copy_(state[counterpart])
+    model.load_state_dict(state)
+    model = model.float().eval()
+    saved = {name: tensor for name, tensor in model.state_dict().items()
+             if name.startswith("model.encoder.language_model.")
+             or name.startswith("model.decoder.") or name == "lm_head.weight"}
+    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(saved, directory / "model.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(DIFFUSION_DENOISER_TEXT, indent=1) + "\n")
+    prompt = np.array([[2, 5, 7, 9]], np.int32)
+    canvas = np.array([[3, 4, 5, 6]], np.int32)
+    prev = np.random.RandomState(3).randn(1, 4, 64).astype(np.float32)
+    with torch.no_grad():
+        bare = model(input_ids=torch.from_numpy(prompt),
+                     decoder_input_ids=torch.from_numpy(canvas)
+                     ).logits.to(torch.float32).numpy()
+        conditioned = model(
+            input_ids=torch.from_numpy(prompt),
+            decoder_input_ids=torch.from_numpy(canvas),
+            self_conditioning_logits=torch.from_numpy(prev)
+            ).logits.to(torch.float32).numpy()
+    np.save(directory / "prompt.npy", prompt)
+    np.save(directory / "canvas.npy", canvas)
+    np.save(directory / "prev_logits.npy", prev)
+    np.save(directory / "ref_bare.npy", bare)
+    np.save(directory / "ref_conditioned.npy", conditioned)
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+
 def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
     """Random weights with something in every tensor.
 
@@ -376,8 +968,9 @@ def write_released_config(name: str, repo: str) -> None:
         del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+    layers = config.get('num_hidden_layers', config.get('n_layers', config.get('num_layers')))
     print(f"{directory / 'config.json'}: {repo}, "
-          f"{config['num_hidden_layers']} layers, {len(config)} fields")
+          f"{layers} layers, {len(config)} fields")
 
 
 def main() -> None:
@@ -406,6 +999,17 @@ def main() -> None:
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")
     write_tiny("deepseek-v3-tiny", tiny_deepseek_v3())
     write_tiny("deepseek-v32-tiny", tiny_deepseek_v32(), seed=DEEPSEEK_V32_SEED)
+    write_diffusion_tiny("llada-tiny", LladaTiny(), LLADA_TINY_CONFIG)
+    write_diffusion_tiny("dream-tiny", DreamTiny(), DREAM_TINY_CONFIG)
+    write_siglip_tiny()
+    write_llama4_vision_tiny()
+    write_gemma3_mm_tiny()
+    write_llama4_mm_tiny()
+    write_diffusion_sc_tiny()
+    write_diffusion_denoiser_tiny()
+    write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
+    write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
+    write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)
