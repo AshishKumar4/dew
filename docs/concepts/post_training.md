@@ -1,143 +1,166 @@
-# Post-training: SFT, DPO and GRPO on one trainer
+# Post-training
 
-Pretraining, SFT, DPO and GRPO are the same loop with different losses. The trainer, the mesh, the EMA, the checkpoints and the logging do not change; what changes is the data path and the objective. Every example below runs from the repository root with the dew venv: the SFT one reads the tiny chat tokenizer under `tests/fixtures/tokenizers`, the DPO and GRPO ones read the parity fixtures under `tests/fixtures/rl`.
+Post-training changes a language model's behavior after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the model generates answers and your reward function scores them.
 
-## SFT: count the assistant's tokens
+Dew provides objectives and data specifications for these three methods. They use the same `Trainer`, but they do not consume interchangeable batches. Start with [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for the model/objective/trainer relationship. The example below trains a tiny DPO model without a tokenizer download, a dataset download, or a pretrained checkpoint.
 
-SFT data is conversations, and the loss counts only assistant targets. `render_conversation` turns messages into ids plus a role per token, using the tokenizer's own chat template:
+## SFT: learn from assistant answers
 
-```python
-from transformers import AutoTokenizer
-from dew.data.chat import Role, render_conversation
+An SFT conversation contains messages with explicit roles. `ChatMessages` reads a Parquet file whose `prompt` column contains a list of messages per row. This is the input layout, not a script:
 
-tokenizer = AutoTokenizer.from_pretrained("tests/fixtures/tokenizers/tiny-chat")
-messages = [{"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "hello"}]
-ids, roles = render_conversation(tokenizer, messages, "tiny-chat")
-targets = (roles[1:] == Role.ASSISTANT).tolist()
-assert targets == [False] * 13 + [True] * 16
+```text
+prompt = [
+    {"role": "user", "content": "What is two plus two?"},
+    {"role": "assistant", "content": "Four."}
+]
 ```
 
-`ChatMessages` packs those roles beside the ids, so a batch carries four aligned per-token fields:
+Supply `ChatMessages` with your tokenizer directory in `tokenizer`, your Parquet file in `path`, and the prediction length in `seq_len`. The tokenizer must have a chat template: a rule for rendering message boundaries, role headers, and content as tokens. A model's training format matters here; joining the message strings yourself can change both the input and which tokens count toward the loss.
+
+Dew renders successive conversation prefixes to assign a role to each token. For an assistant turn, it excludes the generation header from the assistant span. It checks that each tokenized prefix agrees with the longer render and raises when a template changes earlier tokens. This is a checked prefix-rendering method, not a claim that arbitrary chat templates or string delimiters yield correct assistant masks. Inspect the rendered tokens and roles for representative conversations before a real run. Start with a system or user message; an assistant first message is rejected.
+
+`ChatMessages.load(batch=B)` packs conversations into these arrays:
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `text` | `[B, L + 1]` | Token IDs, including the extra next-token target. |
+| `text_roles` | `[B, L + 1]` | `Role` value at each token. |
+| `text_segment_ids` | `[B, L + 1]` | Document identity; separates packed conversations. |
+| `text_positions` | `[B, L + 1]` | Position within each packed document. |
+
+Here `L` is `ChatMessages.seq_len`. Use `LMObjective(model, L, loss_role=Role.ASSISTANT)`, importing `Role` from `dew.data.chat`. The objective shifts IDs and roles together: input position `i` predicts token `i + 1`, and the target's role determines whether that prediction counts. It also excludes padding and transitions between packed documents. With `loss_role` set, a batch without `text_roles` raises. Without `loss_role`, the objective does not restrict the loss to assistant targets.
+
+`val_path` can name a separate conversation file. Keep evaluation conversations out of the training file; see [evaluation](../guides/evaluation.md) for what token metrics measure.
+
+## DPO: learn from preference pairs
+
+DPO compares the policy's relative preference for two answers with a fixed reference policy. The **policy** is the model you update. The **reference** is its starting parameter snapshot. For each prompt, the chosen and rejected sequences include the prompt followed by their respective completions. Completion masks mark the answer tokens with 1 and prompt tokens with 0.
+
+`PreferencePairs` accepts a Parquet `path` or a tuple of JSON strings in `records`, but not both. Each row has `chosen`, `rejected`, `chosen_mask`, and `rejected_mask`. The masks have the same lengths as their ID lists. If you omit a mask, Dew treats every token as completion; it does not infer a boundary from the text. Always provide masks for prompt-and-answer data.
+
+A loaded batch contains `input_ids` and `completion_mask`, both shaped `[B, 2, S]`. Index 0 of the middle axis is chosen, index 1 is rejected. Dew right-pads shorter rows to `S` and gives the padding zero mask weight. It rejects overlong rows rather than cutting a preference pair. Unlike `ChatMessages`, **`PreferencePairs.seq_len` is the full row width `S`**; use `DPOObjective(model, seq_len=S - 1)`.
+
+The objective sums next-token log-probabilities over each completion and applies the preference log-sigmoid loss. `beta` must be positive and controls the scale of the policy/reference comparison. Validation measures the chosen answers' perplexity under the policy. That metric alone does not measure preference win rate or response quality.
+
+### Run a complete offline DPO example
+
+Run this block in a fresh Python process after [installing Dew](../installation.md). All inputs are in memory. The vocabulary is an invented eight-token vocabulary, so this teaches pair construction and optimization rather than producing readable language. IDs 1 and 2 (or 1 and 6) form the prompt, 3 is the preferred answer, 4 is the rejected answer, and 5 ends the answer. The end token counts toward the completion loss. Repeating the two pairs supplies a batch of eight, which also divides across eight local devices.
 
 ```python
-import pyarrow as pa
-import pyarrow.parquet as pq
-from dew.data import ChatMessages, Loading
+import json
 
-pq.write_table(pa.table({"prompt": [messages] * 8}), "sft.parquet")
-data = ChatMessages(tokenizer="tests/fixtures/tokenizers/tiny-chat",
-                    path="sft.parquet", seq_len=31,
-                    loading=Loading(workers=0)).load(batch=8)
-batch = next(data.train())
-assert {"text", "text_roles", "text_segment_ids", "text_positions"} <= set(batch)
-```
-
-The packer adds its own per-field positions beside those four; the loss
-reads the four named here.
-
-The objective is the same class as pretraining with one field:
-
-```python
-from dew import models
-from dew.objectives.lm import LMObjective
-
-decoder = models.build("causal_transformer", vocab_size=len(tokenizer), emb_features=32,
-                       num_layers=1, num_heads=2, mlp_features=64, max_seq_len=32)
-objective = LMObjective(decoder, 31, loss_role=Role.ASSISTANT)
-```
-Without `loss_role` every counted target counts, as in pretraining. A batch without `text_roles` raises, naming the column.
-
-## DPO: prefer chosen over rejected
-
-The DPO term is `preference_logsigmoid` in `dew.rl`, pinned against TRL 1.12 on fixed tensors. The fixture carries both sides' per-token log-probabilities, the full-length completion mask, and TRL's own loss:
-
-```python
-import jax.numpy as jnp
+import jax
 import numpy as np
-from dew.rl import preference_logsigmoid
+import optax
 
-fixture = dict(np.load("tests/fixtures/rl/dpo.npz", allow_pickle=True))
-policy = np.asarray(fixture["policy_logps"], np.float32)
-ref = np.asarray(fixture["ref_logps"], np.float32)
-mask = np.asarray(fixture["completion_mask"], np.float32)[:, 1:]
-half = policy.shape[0] // 2
-beta = float(fixture["beta"])
-loss = preference_logsigmoid(jnp.asarray(policy[:half]), jnp.asarray(policy[half:]),
-                             jnp.asarray(ref[:half]), jnp.asarray(ref[half:]),
-                             jnp.asarray(mask[:half]), jnp.asarray(mask[half:]), beta)
-assert abs(float(loss) - float(fixture["trl_loss"])) < 1e-6
-```
-
-`DPOObjective` composes that term with the chunked head: policy and reference log-probabilities are negated per-token cross entropies, summed under the shifted mask, with the reference read from the frozen `step.ema` at unit decay, so the run carries no second model. Batches are `[B, 2, S]` pairs from `PreferencePairs`, chosen at index 0:
-
-```python
+from dew import Trainer, models
+from dew.data import Loading, PreferencePairs
 from dew.objectives.rl import DPOObjective
 
-objective = DPOObjective(decoder, 31, beta=0.1)
+rows = [
+    {
+        "chosen": [1, 2, 3, 5],
+        "rejected": [1, 2, 4, 5],
+        "chosen_mask": [0, 0, 1, 1],
+        "rejected_mask": [0, 0, 1, 1],
+    },
+    {
+        "chosen": [1, 6, 3, 5],
+        "rejected": [1, 6, 4, 5],
+        "chosen_mask": [0, 0, 1, 1],
+        "rejected_mask": [0, 0, 1, 1],
+    },
+]
+row_width = 4
+spec = PreferencePairs(
+    records=tuple(json.dumps(row) for row in rows * 4),
+    seq_len=row_width,
+    pad_id=0,
+    loading=Loading(workers=0, threads=1, read_buffer=2),
+)
+data = spec.load(batch=8)
+model = models.build(
+    "causal_transformer",
+    vocab_size=8,
+    emb_features=16,
+    num_layers=1,
+    num_heads=2,
+    mlp_features=32,
+    max_seq_len=row_width,
+)
+objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
+trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+initial = trainer.initial_state()
+# Copy the snapshot to host memory before training donates device buffers.
+reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
+state = trainer.fit(data, steps=2, log_every=1)
+assert int(state.step) == 2
+for before, after in zip(
+    jax.tree.leaves(reference), jax.tree.leaves(state.ema), strict=True
+):
+    np.testing.assert_array_equal(before, np.asarray(after))
+print("Completed", int(state.step), "DPO updates; reference stayed fixed.")
 ```
 
-## GRPO: sample, score, clip
+You should see two training updates and the final confirmation. This run writes no checkpoints or tracker records. For a real dataset, construct both sequences with the same tokenizer and chat format, verify their common prompt, and derive masks from known token boundaries. Do not search arbitrary strings for an assistant marker and assume the resulting character offset is a token boundary.
 
-The GRPO loss is the `dew.rl` composition pinned against verl 0.9 on one fixed rollout: the dual-clipped surrogate of the token log-ratio, token-meaned over the response mask, plus `beta` times the token-mean k3 KL:
+### Account for reference memory
 
-```python
-from dew.rl import clipped_surrogate, k3_kl, token_log_ratio, token_mean
+Dew stores the DPO reference in `TrainState.ema`. EMA means *exponential moving average*, but DPO fixes its decay to 1, so this tree never moves. The objective refuses an `ema_decay` override. You do not create a second model object or optimize the reference, but you still retain a separate parameter tree and run reference forward passes. Budget memory for policy parameters, reference parameters, optimizer state, gradients, activations, and batches. Reusing the EMA field does not make the reference free.
 
-fixture = dict(np.load("tests/fixtures/rl/grpo.npz", allow_pickle=True))
-get = lambda key: jnp.asarray(np.asarray(fixture[key], np.float32))
-old, current, ref, advantages, mask = (get("old_log_probs"), get("current_log_probs"),
-    get("ref_log_probs"), get("advantages"), get("response_mask"))
-beta = float(fixture["beta"])
-ratio = token_log_ratio(current, old)
-pg, aux = clipped_surrogate(ratio, advantages, mask)
-kl = token_mean(k3_kl(current, ref), mask)
-assert abs(float(pg + beta * kl) - float(fixture["verl_loss"])) < 1e-6
+SFT uses the language-model objective's moving EMA by default. GRPO also allocates a frozen EMA reference, even when `beta=0` skips reference rescoring. The `pretrained` argument takes a full Flax variables dictionary, including its `params` collection, rather than an arbitrary flat tensor dictionary. At a new DPO or GRPO stage, that initialization becomes the frozen reference.
+
+## GRPO: generate answers and score them
+
+GRPO needs a prompt stream and a reward function before it can produce a training batch. `Prompts` accepts Parquet or JSON records with `prompt`, `data_source`, `ground_truth`, and `extra_info`. The prompt may be token IDs, a string, or role/content messages. Strings and messages require a tokenizer; token-ID lists do not load one. Missing reward fields become empty strings, and non-string reward metadata travels as JSON text.
+
+The prompt loader produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len`. It retains the tail of an overlong prompt. The metadata columns become fixed-width UTF-8 byte arrays for transport, then `SampledRollout` turns them back into strings for this callable interface:
+
+```text
+reward(data_source: str, completion: str,
+       ground_truth: str, extra_info: str) -> float
 ```
 
-Online, a `SampledRollout` packs the batch the loss reads: it samples `groups` completions per prompt with `dew.sampling.generate`, scores each with `reward(data_source, completion, ground_truth, extra_info)`, and advantaged with the group or RLOO family. The trainer calls it between the data stream and the compiled step:
+Choose a reward whose score you can check independently of training. For example, an exact-answer task can compare a decoded completion with the ground-truth answer under an explicit normalization rule. `SampledRollout.decode` defaults to space-separated token IDs, not natural-language decoding. Supply the model tokenizer's decoding function when your reward reads text.
 
-```python
-from dew import Trainer
-from dew.objectives.rl import GRPOObjective, SampledRollout
+Construct `SampledRollout` with the objective, reward callable, `groups=G`, and `max_new_tokens=R`, then pass that object as the trainer's `rollout` argument. `G` must be at least 2. The trainer calls the rollout on the host before the compiled update. Each prompt gets `G` sampled completions; group-relative or leave-one-out (`sample="rloo"`) rewards determine their advantages. An advantage expresses how a completion's reward compares with its group's rewards.
 
+With `N = B * G`, the objective consumes:
 
-def reward(data_source, completion, ground_truth, extra_info):
-    return float(completion.strip() == ground_truth)
-
-
-objective = GRPOObjective(decoder, 31, beta=0.01)
-rollout = SampledRollout(objective, reward, groups=4, max_new_tokens=32)
-trainer = Trainer(objective, optimizer, key=key, rollout=rollout)
-```
-
-## Chaining stages
-
-`recipes/chain.py` links stages sharing one decoder. The data names the loss: conversations train SFT, pairs DPO, prompts GRPO. Each stage trains in its own directory, and every stage after the first initializes from the previous stage's final parameters, which also freezes the next stage's reference:
-
-```python
-# runs elsewhere: a thousand-step chain over real conversations, pairs and prompts
-from recipes.chain import Recipe, Stage
-
-recipe = Recipe(decoder, optimizer, key, stages=(
-    Stage(name="sft", data=sft_data, steps=1000),
-    Stage(name="dpo", data=dpo_data, steps=500),
-    Stage(name="grpo", data=prompt_data, steps=200,
-          reward=reward, groups=4, max_new_tokens=32),
-), directory="runs/chain", batch=8)
-states = recipe.run()
-```
-
-`tests/test_chain.py` runs an SFT-to-DPO chain two steps tiny and asserts the link: the second stage's frozen reference is the first stage's final tree, byte for byte. The recipe flag `--objective` in `recipes/lm/train.py` stays `lm | masked_diffusion`: that recipe reads a token directory and a Hugging Face decoder, neither of which a pair or prompt stage survives, so post-training lives in the chain instead of behind its flag.
-
-## Reference parity
-
-| check | reference | largest observed difference |
+| Field | Shape | Meaning |
 | --- | --- | --- |
-| chat ids and assistant mask | TRL 1.12 | 0, both exact |
-| DPO loss | TRL 1.12 | 5.96e-08 |
-| DPO gradients | TRL 1.12 autograd | exact |
-| GRPO loss | verl 0.9 | 7.45e-08 |
-| GRPO gradients | torch autograd | exact |
+| `input_ids` | `[N, P + R]` | Prompt followed by sampled response, with each prompt's group contiguous. |
+| `old_log_probs` | `[N, R]` | Response log-probabilities rescored under the sampling policy. |
+| `advantages` | `[N, R]` | Each completion's advantage repeated across response positions. |
+| `response_mask` | `[N, R]` | Response positions that count toward the loss. |
+| `rewards` | `[N]` | Scalar reward for each completion. |
 
-The parity scripts live in `tools/parity_*.py` and run in an environment with torch and TRL installed; Dew never imports either. The fixtures they write under `tests/fixtures/rl/` are committed, and the tests above read them back.
+Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. GRPO combines a clipped policy-ratio loss with a k3 KL penalty against the frozen reference when `beta > 0`. The clipping parameters are `epsilon_low`, `epsilon_high`, and `dual_clip`.
+
+With `eos_id` set, the response mask includes the first end token and excludes later tokens. The current rollout still generates a fixed response width and sends the full sampled row to `decode`; a reward must handle trailing tokens deliberately. Generation and rescoring receive the left-padded IDs without a prompt-length attention mask. Do not assume variable-length padded prompts are equivalent to separate unpadded generation. Validate that behavior for your decoder before using this path on real tasks. GRPO validation scores prompt perplexity; it does not generate and score an independent reward evaluation.
+
+## Move between stages
+
+The Python-only `recipes.chain.Recipe` accepts a shared decoder, optimizer, key, output directory, batch size, and a tuple of `Stage` values. A stage's dataset **type** selects its objective: `ChatMessages` selects SFT, `PreferencePairs` selects DPO, and `Prompts` selects GRPO. The stage name labels its directory; a name such as `"sft"` does not infer masks or convert data.
+
+Each stage starts a fresh optimizer and step counter from the previous stage's final policy variables. DPO and GRPO freeze that starting policy as their reference. The returned list retains every stage's final state, so long chains can retain substantial memory. Keep stage names distinct so their checkpoint directories do not collide.
+
+The chain exposes `beta`, `reward`, `groups`, `max_new_tokens`, and `sample`, but does not expose the rollout's `decode`, `eos_id`, or `temperature`. Its default reward input is therefore token-ID text. For tokenizer-decoded rewards or stop-token handling, construct `SampledRollout` and `Trainer` yourself. The [LM command-line recipe](../recipes.md) accepts `lm` and `masked_diffusion` objectives over token files; it is not a command-line SFT/DPO/GRPO chain.
+
+## Limits and evidence
+
+Agentic RL (multi-turn interaction with tools or environments) and FlowGRPO for flow/diffusion models are planned work, not completed workflows in this API. A Python reward callback does not supply a sandbox, tool execution, trajectory management, or a serving system.
+
+Known trainer defects also affect planning real runs: overflow/resume can diverge, accumulation with unequal valid-token masks does not reproduce a globally token-weighted update, repeated evaluation can reuse random draws, and prefetch lifetime has an open issue. Keep `accumulation=1` for masked-loss comparisons, and do not treat this tiny run as proof of recovery or long-run stability. See [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before relying on those paths.
+
+The previously recorded fixed-tensor comparisons were:
+
+| Check | Reference | Largest recorded difference |
+| --- | --- | --- |
+| Chat IDs and assistant mask | TRL 1.12 | 0, both exact |
+| DPO loss | TRL 1.12 | 5.96e-08 |
+| DPO gradients | TRL 1.12 autograd | Exact |
+| GRPO loss | verl 0.9 | 7.45e-08 |
+| GRPO gradients | PyTorch autograd | Exact |
+
+These are narrow numerical comparisons, not benchmarks of learned behavior or evidence of multi-host post-training. They do not establish tokenizer coverage, model-family coverage, or parity with a full TRL/verl training run. See [references](../references.md) for the methods and upstream projects.

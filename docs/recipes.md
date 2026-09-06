@@ -1,79 +1,116 @@
-# Recipes
+# Run a training recipe
 
-A recipe is a training entry point: it reads a config, builds the model, the data and the objective, writes the config beside the checkpoints, and runs `Trainer.fit`. There are three, `recipes/diffusion/train.py`, `recipes/jepa/train.py` and `recipes/lm/train.py`, and each exposes `main(config)`, which returns the final train state.
+A recipe is a Python entry point that builds a model, loads data, chooses an objective, and calls `Trainer.fit`. Use a recipe when you want a command-line run with a saved configuration. Use the [getting-started tutorial](getting-started.md) when you want to build those pieces yourself in Python.
 
-## The config tree
+The repository contains LM, diffusion, and JEPA recipes. Their command lines come from typed configuration objects, so the flags follow the same structure. This page starts with a complete local language-model run. It creates its own corpus and trains from random initialization; it does not fetch data or model weights.
 
-`dew.config` holds plain frozen dataclasses:
+## Prepare a small corpus
 
-- `ModelConfig(architecture, config, dtype, attention_impl)`: the registry name and the fields the registry builds the model from, plus the run's compute dtype and attention kernel, which `dew.registry.with_precision` writes into the fields (and into a UNet's nested per-stage attention configs).
-- `data`: a dataset spec from the `datasets` registry, chosen as a subcommand. Its fields are the spec's own, so `data:oxford-flowers --data.image-size 128` and `data:token-windows --data.path data/shakespeare --data.seq-len 256` are the whole data configuration; there is no separate `DataConfig`.
-- `OptimConfig(optimizer, optimizer_opts, learning_rate, learning_rate_schedule, learning_rate_peak, learning_rate_end, learning_rate_warmup_steps, learning_rate_decay_steps, weight_decay, clip_grads)`. `optimizer` is `adam`, `adamw`, `lamb`, `muon` or `muonclip`; `muon` splits the parameters into the matrices Muon orthogonalises and the embeddings, heads and norms AdamW steps, read off the same axis declarations the sharding uses. `muonclip` adds Kimi K2's QK-Clip after that split: attention heads whose maximum pre-softmax logit passes `--optim.optimizer-opts '{"qk_clip_threshold": 100.0}'` rescale their query and key projections, read from the per-head maxima the model sows. Without those maxima the clip steps aside, so other objectives train on plain Muon.
-- `TrainerConfig(name, checkpoint_dir, keep, batch_size, seed, steps, epochs, log_every, eval_every, checkpoint_every, accumulation, dynamic_scale, mesh, layout, profile, compilation_cache_dir, wandb, multi_host, xla_flags)`. `mesh` is `MeshSpec(fsdp, expert, tensor, sequence)`, `layout` is `Layout(min_shard, tolerance)`, `profile` is `Profile(directory, steps, warmup)` and `wandb` is `Wandb(project, entity, offline)`, so the flags are `--trainer.mesh.fsdp 4`, `--trainer.layout.min-shard 65536` and `--trainer.wandb.project dew`. `eval_every` and `checkpoint_every` take a step count, `epoch`, or `None` for never; `epoch` is the default. `wandb` unset means no tracker and the run logs to the terminal; `profile` unset traces nothing.
-- `RunConfig(model, data, optim, trainer)`, with `save(directory)`, `load(directory)` and `train(objective, data, name=, metrics=, summary=)`. `train` is the step every recipe ends on once it has built its objective and data: it writes `run.json` into `name` under the checkpoint directory before anything trains, opens the tracker when `trainer.wandb` is set (with the record, the recipe's `summary` and the step count as its config), builds the trainer from `optim` and `trainer`, runs `fit`, and publishes the checkpoint the run ended on. `load` rebuilds the same class, raising on a field it does not know or one that is missing. Registry-typed fields (the data spec, a preset, a sampler) are stored as `{"name", "fields"}` and rebuilt through their registry, and a list in the record comes back as the tuple its field declares.
-
-Each recipe subclasses `RunConfig` with the knobs its objective needs. `DiffusionRunConfig` adds `preset` and `sampler`, each a subcommand over its registry (`preset:edm --preset.sigma-data 0.5`, `sampler:heun`), `guidance` (`CFG(scale, interval)`), `sampling_steps`, `unconditional_prob`, `ema_decay`, `text` (the encoder, its checkpoint, the batch field it reads and the unconditional prompt; `None` trains unconditionally), `autoencoder` (the Stable Diffusion VAE for latent diffusion; `None` trains in pixels) and `val_metrics`. `JepaRunConfig` adds `predictor`, `num_target_blocks`, `target_scale`, `target_aspect`, `momentum`, `momentum_steps`, `probe_classes`, `probe_label_key` and `knn_k`. `LmRunConfig` adds `tokenizer`, `ema_decay`, `sample_prompt`, `sample_tokens`, `pretrained` and `balance_rate`.
-
-The run directory is the whole record. `DiffusionRunConfig.build()` turns the config into the model, the process and the inputs; the recipe calls it to train and `TextToImage.from_run(directory)` calls it to sample, so what samples is what trained.
-
-## From the command line
-
-The CLI is generated from the dataclasses, so every field is a dotted flag, a registry-typed field is a subcommand, and `--help` prints the whole tree.
+Follow [installation](installation.md), activate your environment, and open a shell in the Dew checkout. The `recipes/` and `tools/` scripts belong to the checkout, not to the installed `dew` Python package. Save the checkout path before switching to an empty working directory:
 
 ```bash
-python recipes/diffusion/train.py data:oxford-flowers --data.image-size 128 \
-    --trainer.batch-size 32 --trainer.epochs 2000 --model.architecture simple_dit \
-    --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}' \
-    preset:edm sampler:heun --guidance 3.0
+export DEW_REPO="$PWD"
+mkdir -p /tmp/dew-first-recipe
+cd /tmp/dew-first-recipe
 ```
 
-```bash
-python recipes/jepa/train.py data:oxford-flowers --probe-classes 102 \
-    --model.config '{"patch_size": 16, "emb_features": 384}' \
-    --predictor '{"predictor_features": 192, "num_layers": 6}'
-```
-
-Dashes and underscores both parse, and booleans take the `--trainer.no-dynamic-scale` form. Architecture arguments stay in one JSON object, so anything the registry accepts works without the recipe knowing about it, and a field the model does not have is an error.
-
-## From python
+Use a new directory if that path already contains a run you want to preserve. Run this Python block there to create the only input file:
 
 ```python
-# runs elsewhere: downloads Oxford Flowers and the CLIP text tower
-import sys; sys.path.insert(0, "recipes/diffusion")
-from dew.config import ModelConfig, OptimConfig, TrainerConfig, Wandb
-from dew.data import OxfordFlowers
-from dew.diffusion import presets
-from train import DiffusionRunConfig, main
+from pathlib import Path
 
-config = DiffusionRunConfig(
-    model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 512}),
-    data=OxfordFlowers(image_size=128),
-    preset=presets.EDM(),
-    optim=OptimConfig(learning_rate=2e-4),
-    trainer=TrainerConfig(batch_size=32, epochs=100, accumulation=2, checkpoint_dir="./runs",
-                          wandb=Wandb(project="dew", offline=True)),
-)
-state = main(config)
+lines = [
+    f"The number after {number} is {number + 1}.\n"
+    for number in range(100)
+]
+corpus = Path("corpus.txt")
+corpus.write_text("".join(lines) * 20, encoding="utf-8")
+print("Wrote", corpus, "with", corpus.stat().st_size, "bytes")
 ```
 
-Use this when the run is part of a larger script, a sweep, or a notebook.
-
-## Language models
+Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 IDs:
 
 ```bash
-python tools/tokenize_text.py --input data/shakespeare.txt --out data/shakespeare --tokenizer byte --val-fraction 0.02
-python recipes/lm/train.py data:token-windows --data.path data/shakespeare --data.seq-len 256 \
-    --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}' --sample-prompt "ROMEO:" --sample-tokens 200
+python "$DEW_REPO/tools/tokenize_text.py" \
+    --input corpus.txt --out tokens --tokenizer byte --val-fraction 0.1
 ```
 
-`data.path` is the directory the tokenize tool wrote. The vocabulary comes from its `meta.json`, so it is not a flag. Validation logs the perplexity over the whole held-out pass, weighted by target so padding counts for nothing, and, when `--sample-prompt` is set, the text the EMA model writes after it. `data:packed-tokens` trains on documents packed into rows, with the attention mask and the positions reset at each document boundary.
+The command writes `tokens/train.bin`, `tokens/val.bin`, and `tokens/meta.json`. The metadata records the tokenizer, vocabulary size, storage dtype, and token counts. Keep those files together. The validation split is the beginning of the token stream, not a random sample. This repeated toy corpus is suitable for checking the workflow, but not for measuring generalization.
 
-`--pretrained` continues from a Hugging Face decoder instead of a fresh init:
+## Inspect the CLI, then train
+
+Help performs no training:
 
 ```bash
-python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-qwen3 --tokenizer Qwen/Qwen3-0.6B
-python recipes/lm/train.py data:token-windows --data.path data/corpus-qwen3 --data.seq-len 512 \
-    --pretrained Qwen/Qwen3-0.6B --tokenizer Qwen/Qwen3-0.6B --trainer.batch-size 4 --optim.learning-rate 1e-5
+python "$DEW_REPO/recipes/lm/train.py" --help
+python "$DEW_REPO/recipes/lm/train.py" data:token-windows --help
 ```
 
-It takes a hub repo id or a local directory in the HF layout, of the families `dew.interop.hf_decoders` covers (`llama`, `qwen3`, `gemma3_text`, `gemma4_text`). The checkpoint decides the architecture, so `--model.config` may only carry `max_seq_len`, and the token files must have been written with the tokenizer the checkpoint expects.
+Now run two updates on a small decoder:
+
+```bash
+python "$DEW_REPO/recipes/lm/train.py" data:token-windows \
+    --data.path tokens --data.seq-len 16 \
+    --data.loading.workers 0 --data.loading.threads 1 \
+    --data.loading.read-buffer 2 --data.val-batches 2 \
+    --model.dtype float32 --model.attention-impl reference \
+    --model.config '{"emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_features": 32}' \
+    --trainer.batch-size 8 --trainer.steps 2 --trainer.log-every 1 \
+    --trainer.eval-every 2 --trainer.checkpoint-every 2 \
+    --trainer.checkpoint-dir runs --trainer.name byte-demo \
+    --trainer.multi-host False --sample-tokens 0
+```
+
+The first update includes JAX compilation, so it takes longer than later updates. You should see losses for steps 1 and 2, a validation report, and checkpoint output. `runs/byte-demo/run.json` records the resolved configuration next to the checkpoint directories. The final checkpoint holds the training state and data position. See [checkpoints](guides/checkpoints.md) before depending on resume behavior.
+
+This is a training smoke run, not a useful language model. `--sample-tokens 0` disables text sampling, so validation only scores tokens. After increasing the training duration, you can request sample continuations with `--sample-prompt "The number after" --sample-tokens 32`. Sampling uses the EMA model; the recipe expands the decoder's context to accommodate the prompt plus those new tokens. Random byte sequences may decode to replacement characters early in training.
+
+## Read a recipe configuration
+
+The four shared parts are:
+
+| Configuration | What you choose | CLI example |
+| --- | --- | --- |
+| `model` | Architecture, constructor fields, compute dtype, attention implementation. | `--model.architecture causal_transformer` |
+| `data` | A dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
+| `optim` | Optimizer, learning rate, schedule, weight decay, clipping. | `--optim.learning-rate 0.0001` |
+| `trainer` | Run length, batch size, checkpoint/logging intervals, device layout. | `--trainer.steps 1000` |
+
+A dotted flag selects a field inside a configuration object. A subcommand such as `data:token-windows` selects a registered dataset type and makes that type's flags available. Architecture fields travel in one JSON object through `--model.config`; JSON keys keep their Python spellings, such as `num_layers`. Use the architecture's documented fields rather than guessing from a different model family.
+
+`--trainer.steps` and `--trainer.epochs` are alternatives; set one, not both. The batch size is global across JAX processes. Loader workers and threads control host-side reading, not the device batch size. Zero workers avoids launching a worker process pool for this small run. See [data](concepts/data.md) before increasing those settings.
+
+`eval_every` and `checkpoint_every` accept a step interval, `epoch`, or `None`. Epoch intervals require a known dataset size. A stream without a restorable read position cannot produce a resumable checkpoint; its checkpoint interval must be `None`. A configured checkpointer can still write the final state, so `None` should not be read as a promise that no files will exist. The [checkpoint guide](guides/checkpoints.md) describes the distinction.
+
+`ModelConfig` defaults to bfloat16 computation while parameters remain float32. The offline example uses float32 and reference attention to keep device-specific kernel choices out of the first run. Device meshes and layout settings belong to [distributed training](concepts/distributed.md), not to the model's JSON fields.
+
+The shared optimizer choices are `adam`, `adamw`, `lamb`, `muon`, and `muonclip`. Start with the recipe's optimizer unless you have a reason to change it. Muon partitions matrix updates from embedding, head, and normalization updates; MuonClip additionally needs attention QK statistics for its clipping operation. Choosing its name alone does not establish that a new objective emits those statistics.
+
+With `trainer.wandb` unset, Dew logs to the terminal. Setting `--trainer.wandb.project` enables Weights & Biases; its offline setting prevents an online tracker session, but does not prevent dataset or model downloads elsewhere in a recipe. Profiling is opt-in through `trainer.profile`. The saved `run.json` records configuration, not your dataset contents, package environment, or source checkout. Archive those separately when you need to reproduce a run.
+
+## Use your own token data or pretrained model
+
+Replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files, and rerun the tokenizer into a new output directory. Keep the tokenizer identity consistent between tokenization and training. The recipe reads the vocabulary from `meta.json`; there is no separate vocabulary-size flag. `data:token-windows` draws fixed-width windows. For document-aware packing, tokenize with `--pack`, then select `data:packed-tokens`; the packer resets attention boundaries and positions between documents.
+
+`--pretrained` accepts a supported Hugging Face model directory or Hub ID. A Hub ID can trigger a download, authentication, and license requirements. For an offline run, prepare a local checkpoint and its tokenizer files before starting, then tokenize the corpus with that same tokenizer and pass matching `--tokenizer` and `--pretrained` values. The checkpoint selects the architecture; in that mode `--model.config` may only override `max_seq_len`. Consult [language models](concepts/language_models.md) for family-specific import and export boundaries rather than assuming any Hugging Face directory will work.
+
+The LM recipe's `--objective` accepts `lm` or `masked_diffusion`. The latter trains a bidirectional masked-denoising model with its own mask-token requirements. It is not a flag for SFT, DPO, or GRPO; those data layouts and their Python workflows are in [post-training](concepts/post_training.md).
+
+## Diffusion and JEPA recipes
+
+Inspect these entry points without creating data or loading weights:
+
+```bash
+python "$DEW_REPO/recipes/diffusion/train.py" --help
+python "$DEW_REPO/recipes/jepa/train.py" --help
+```
+
+A diffusion configuration adds a training `preset`, validation `sampler`, guidance, sampling steps, a text condition, and an optional autoencoder. Registry choices use subcommands such as `preset:edm` and `sampler:heun`. Guidance is a structured configuration, so its scale is `--guidance.scale`, not a bare numeric `--guidance` argument. The default configuration uses Oxford Flowers, a CLIP text encoder, and a CLIP validation metric. Running it can download both data and weights. Prepare the dataset, text encoder, and any evaluation models before a resource-constrained or offline run; selecting an offline tracker does not prepare them.
+
+A JEPA configuration adds predictor fields, target-mask settings, an EMA momentum schedule for the target encoder, and optional representation probes. The encoder predicts representations of hidden image or video regions, rather than generating those pixels. Image and video dataset/model choices must agree. Set an explicit run length and prepare the chosen dataset before launching it.
+
+Both recipes expose `main(config)` for use in a Python application. Their frozen dataclass configurations extend `RunConfig` with the fields above. Import `DiffusionRunConfig` from `dew.objectives.diffusion.config`; `JepaRunConfig` and `LmRunConfig` live in their respective checkout recipe modules. Call the recipe's `main`, which performs process setup and builds the objective and data, rather than calling `config.train` with unrelated objects. See the guides for [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) before choosing their task-specific settings.
+
+## Before increasing the run size
+
+Check that the first small run reaches the intended number of updates, reports finite losses, reads the intended split, and writes to the intended directory. Increasing batch size, sequence length, or model width changes memory requirements. A two-step local result does not verify multi-host collectives, sustained input throughput, recovery after preemption, or final model quality. Known overflow/resume, unequal-mask accumulation, repeated-evaluation RNG, and prefetch-lifetime defects remain relevant to longer runs; use the checkpoint, evaluation, and data guides when planning around them.
