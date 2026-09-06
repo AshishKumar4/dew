@@ -17,9 +17,12 @@ the matrix.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import optax
 
 from dew.nn.sharding import LogicalAxes, declared_axes
@@ -120,11 +123,176 @@ def _muon_groups(learning_rate, **opts):
         **opts)
 
 
+QK_PROJECTIONS = frozenset({'q_proj', 'q_b_proj', 'k_proj', 'kv_b_proj'})
+"""The projection names the clip rescales: the query and key projections of
+grouped-query attention and, for latent attention, the per-head output
+projections. Anything else keeps its update untouched."""
+
+
+def _dict_names(path: jax.tree_util.KeyPath) -> tuple[str, ...]:
+    """The dict keys along `path`, dropping the sequence indices a stacked
+    view never produces on a parameter tree."""
+    return tuple(entry.key for entry in path
+                 if isinstance(entry, jax.tree_util.DictKey))
+
+
+def _sown(node, name: str):
+    """The array a sowed collection holds under `name`, past its one-tuple."""
+    value = node.get(name) if isinstance(node, Mapping) else None
+    if value is None:
+        return None
+    return value[0] if isinstance(value, (tuple, list)) else value
+
+
+def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
+    """Per-head rescale: `min(1, tau / s)` past the threshold, 1.0 elsewhere.
+
+    A head whose every logit is non-positive clips nothing: MaxText's
+    formula reads `minimum(1, tau / (s + 1e-6))`, which goes negative there
+    and would flip the weights' sign, so Dew holds those heads at 1.0."""
+    return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
+
+
+def _query_widths(params) -> dict[tuple[str, ...], int]:
+    """Each module's query projection width, read off static shapes: what a
+    key projection's head count is measured against."""
+    widths = {}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
+        names = _dict_names(path)
+        if (len(names) >= 2 and names[-1] == 'kernel'
+                and names[-2] in ('q_proj', 'q_b_proj')):
+            widths[tuple(names[:-2])] = leaf.shape[-1]
+    return widths
+
+
+def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
+                     split: int) -> jax.Array:
+    """The update whose application rescales the stepped weights by `gamma`:
+    `(gamma - 1) * param + gamma * update`, over `split` heads."""
+    width = param.shape[-1] // split
+    shape = param.shape[:-1] + (split, width)
+    gamma = jnp.asarray(gamma, update.dtype)
+    out = (gamma - 1) * param.reshape(shape) + gamma * update.reshape(shape)
+    return out.reshape(param.shape)
+
+
+def _mla_query_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
+    """`[heads, width]`: `sqrt` on the nope slice, full on the rope slice.
+    The comparison keeps the sowed width dynamic; only the shape is static."""
+    is_nope = jnp.arange(width)[None, :] < nope
+    return jnp.where(is_nope, jnp.sqrt(scale)[:, None], scale[:, None])
+
+
+def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
+    """`[heads, width]`: `sqrt` on the nope slice, 1.0 on the values."""
+    is_nope = jnp.arange(width)[None, :] < nope
+    return jnp.where(is_nope, jnp.sqrt(scale)[:, None],
+                     jnp.ones((), scale.dtype))
+
+
+def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
+               path: jax.tree_util.KeyPath, update: jax.Array,
+               param: jax.Array) -> jax.Array:
+    """`update` rescaled the way the post-update weights rescale.
+
+    The clip fires on the weights after the step: `gamma * (W + update)`.
+    Written as an update, `(gamma - 1) * W + gamma * update`, so the chain
+    runs it after Muon and the applied tree lands on the same weights
+    MaxText's post-step rescale writes. Leaves outside `QK_PROJECTIONS`
+    keep their update; a named leaf whose layer sowed no maxima raises
+    naming the layer, since stepping it unclipped would train a different
+    model than the maxima describe.
+
+    Queries rescale per head over the whole projection, the gate half of an
+    output-gated projection with its query head, and the latent query's rope
+    slice by the full gamma. Keys rescale per head where the head count is
+    known from static shapes: equal query and key widths are multi-head
+    attention. Anything else is grouped-query attention, whose per-group
+    minima need the group count where only dynamic values cross. There the
+    whole projection takes the layer's strongest head, the conservative
+    side: it never under-clips."""
+    names = _dict_names(path)
+    if len(names) < 2 or names[-1] != 'kernel' or names[-2] not in QK_PROJECTIONS:
+        return update
+    node = qk_stats
+    for name in names[:-2]:
+        node = node.get(name) if isinstance(node, Mapping) else None
+        if node is None:
+            break
+    logged = _sown(node, 'max_logits')
+    if logged is None:
+        raise ValueError(
+            f"QK-Clip reaches {'.'.join(names)} but its layer sowed no max "
+            "logits; the model has to sow them under the 'qk' collection "
+            "for the clip to know what fires")
+    s_max = jnp.max(jnp.asarray(logged, jnp.float32), axis=0)
+    heads = s_max.shape[0]
+    scale = _clip_scale(s_max, tau)
+    last = param.shape[-1]
+    if last % heads:
+        raise ValueError(
+            f"QK-Clip cannot split {'.'.join(names)} of width {last} into "
+            f"{heads} heads")
+    proj = names[-2]
+    nope = _sown(node, 'qk_nope')
+    if proj in ('q_proj', 'q_b_proj'):
+        if nope is None:
+            return _rescaled_update(update, param, jnp.sqrt(scale)[:, None],
+                                    heads)
+        return _rescaled_update(
+            update, param, _mla_query_gamma(scale, nope, last // heads), heads)
+    if proj == 'kv_b_proj':
+        if nope is None:
+            raise ValueError(
+                f"QK-Clip reaches {'.'.join(names)} with no nope width sowed; "
+                "a latent key projection needs its layer's 'qk_nope'")
+        return _rescaled_update(
+            update, param, _mla_key_gamma(scale, nope, last // heads), heads)
+    width = qdims.get(tuple(names[:-2]))
+    if width is not None and width == last:
+        return _rescaled_update(update, param, jnp.sqrt(scale)[:, None], heads)
+    scoped = jnp.min(scale).astype(update.dtype)
+    return (scoped - 1) * param + scoped * update
+
+def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
+    """QK-Clip after the update: heads past `tau` rescale their query and
+    key projections, Kimi K2's MuonClip (arXiv 2507.20534).
+
+    The per-head maxima arrive as `qk_stats`, the `qk` collection the model
+    sowed, which the trainer forwards from the loss's `Aux`. Without them
+    the transform steps aside, leaving every other optimizer and every run
+    whose loss never opened the collection on its old update."""
+    if tau <= 0:
+        raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
+
+    def init_fn(params) -> optax.EmptyState:
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None, qk_stats=None):
+        if qk_stats is None or params is None:
+            return updates, state
+        clipped = jax.tree_util.tree_map_with_path(
+            functools.partial(_clip_leaf, qk_stats, tau, _query_widths(params)),
+            updates, params)
+        return clipped, state
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
+def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
+    """Muon over the matrices, AdamW over the rest, and the QK-Clip after."""
+    return optax.chain(
+        _muon_groups(learning_rate, **opts),
+        scale_by_qk_clip(qk_clip_threshold))
+
+
 OPTIMIZER_MAP = {
     'adam': optax.adam,
     'adamw': optax.adamw,
     'lamb': optax.lamb,
     'muon': _muon_groups,
+    'muonclip': _muonclip_groups,
 }
 
 
@@ -144,7 +312,7 @@ def build_optimizer(config: "OptimConfig", steps: int) -> optax.GradientTransfor
     opts = dict(config.optimizer_opts)
     if config.weight_decay is not None:
         opts['weight_decay'] = config.weight_decay
-        if config.optimizer == 'muon':
+        if config.optimizer in ('muon', 'muonclip'):
             # Weight decay reaches the AdamW group as well. That is where the
             # norm scales live, and Moonlight calls it crucial for stability
             # there (docs/research/frontier-training.md:184).

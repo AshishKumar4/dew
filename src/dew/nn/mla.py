@@ -33,8 +33,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
-    RMSNorm, apply_rotary, causal_attention_mask, rotary_freqs,
-    scaled_dot_product_attention,
+    RMSNorm, apply_rotary, causal_attention_mask, max_attention_logits,
+    rotary_freqs, scaled_dot_product_attention,
 )
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import logical_axes
@@ -624,6 +624,14 @@ class MultiHeadLatentAttention(nn.Module):
         query = jnp.concatenate([q_pass, q_rot], axis=-1)
         if scale != 1.0:
             query = query * scale
+        # The per-head maxima the QK-Clip reads, with the nope width the
+        # clip needs to split the latent projections: computed only when a
+        # caller opened the collection. Under the sparse indexer the mask
+        # holds the selected keys, so the maximum is over those.
+        if not self.is_initializing() and self.is_mutable_collection("qk"):
+            self.sow("qk", "max_logits", max_attention_logits(
+                query, key, causal=causal, mask=mask))
+            self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=implementation, causal=causal, mask=mask)

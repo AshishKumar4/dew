@@ -56,6 +56,14 @@ class Aux:
     """Non-parameter collections to write back into the state as a whole: the
     MoE balancing bias, batch statistics, sown values. The `params` collection
     is the optimizer's and cannot be written this way."""
+    qk_stats: Variables | None = None
+    """The `qk` collection the attention layers sowed, for the optimizer's
+    QK-Clip: nested by module path, each attention layer holding
+    `max_logits` as a one-tuple of an fp32 `[rows, heads]` array of per-head
+    logit maxima, an MLA layer additionally holding `qk_nope` as an int
+    scalar naming its nope width. Rows are the batch's rows, microbatches
+    concatenated under a pipeline. None when the loss never opened the
+    collection, in which case the clip steps aside."""
 
 
 def everything(path: Path) -> bool:

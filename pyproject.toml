@@ -123,7 +123,10 @@ filterwarnings = [
     # moviepy's video reader sets .shape on an array the way NumPy 2.5
     # deprecated. Scoped to it so the same warning from dew's own code still
     # fails the run.
-    'ignore:Setting the shape on a NumPy array:DeprecationWarning:moviepy\.video\.io\.ffmpeg_reader',
+    'ignore:Setting the shape on a NumPy array:DeprecationWarning:moviepy\\.video\\.io\\.ffmpeg_reader',
+    # Qwix 0.1.8 aliases a flax name flax removed; scoped to qwix so the same
+    # warning from dew's own code still fails the run.
+    'ignore:.VariableState. was removed:DeprecationWarning:qwix',
 ]
 
 [tool.setuptools.dynamic]
