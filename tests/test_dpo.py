@@ -266,7 +266,7 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
 
 
 def test_pairs_stack_chosen_over_rejected():
-    source = PreferenceSource.from_records(records(PAIR), 0)
+    source = PreferenceSource.from_records(records(PAIR), 0, 4)
 
     batch = source[0]
 
@@ -276,34 +276,33 @@ def test_pairs_stack_chosen_over_rejected():
 
 def test_missing_masks_default_to_all_completion():
     row = {"chosen": [1, 2], "rejected": [3]}
-    source = PreferenceSource.from_records(records(row), 0)
+    source = PreferenceSource.from_records(records(row), 0, 4)
 
     batch = source[0]
 
-    np.testing.assert_array_equal(batch[MASK_KEY], [[1, 1], [1, 0]])
-
+    np.testing.assert_array_equal(batch[MASK_KEY], [[1, 1, 0, 0], [1, 0, 0, 0]])
 
 def test_a_ragged_pair_is_refused():
     row = dict(PAIR, chosen_mask=[0, 1, 1])
     with pytest.raises(ValueError, match="as long as its ids"):
-        PreferenceSource.from_records(records(row), 0)[0]
+        PreferenceSource.from_records(records(row), 0, 4)[0]
     row = dict(PAIR, chosen=[1, "x"])
     with pytest.raises(ValueError, match="token ids"):
-        PreferenceSource.from_records(records(row), 0)[0]
+        PreferenceSource.from_records(records(row), 0, 4)[0]
     row = dict(PAIR, rejected_mask=[0, 0, 2])
     with pytest.raises(ValueError, match="0/1"):
-        PreferenceSource.from_records(records(row), 0)[0]
+        PreferenceSource.from_records(records(row), 0, 4)[0]
 
 
 def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError, match="both chosen and rejected"):
-        PreferenceSource.from_records(records({"chosen": [1]}), 0)
+        PreferenceSource.from_records(records({"chosen": [1]}), 0, 4)
     with pytest.raises(ValueError, match="unknown fields"):
-        PreferenceSource.from_records(records(dict(PAIR, reward=1.0)), 0)
+        PreferenceSource.from_records(records(dict(PAIR, reward=1.0)), 0, 4)
     with pytest.raises(ValueError, match="an object"):
-        PreferenceSource.from_records(records([1, 2]), 0)[0]
+        PreferenceSource.from_records(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError, match="no pairs"):
-        PreferenceSource.from_records((), 0)
+        PreferenceSource.from_records((), 0, 4)
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):
@@ -316,7 +315,8 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = PreferencePairs(path=str(path), loading=Loading(workers=0)).load(batch=1)
+    data = PreferencePairs(path=str(path), seq_len=4,
+                           loading=Loading(workers=0)).load(batch=1)
 
     assert data.records == 1
     batch = next(data.train())
@@ -324,6 +324,32 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         np.asarray(batch[IDS_KEY]), [[[1, 2, 3, 4], [1, 2, 5, 0]]])
     np.testing.assert_array_equal(
         np.asarray(batch[MASK_KEY]), [[[0, 0, 1, 1], [0, 0, 1, 0]]])
+
+def test_varied_rows_pad_to_one_window():
+    """Two pairs of different lengths batch without ragged edges: the
+    grain batcher stacks static shapes, so every row is already `[2,
+    seq_len]`."""
+    rows = records(
+        {"chosen": [1, 2, 3, 4], "rejected": [5]},
+        {"chosen": [6], "rejected": [7, 8]})
+    data = PreferencePairs(records=rows, seq_len=4,
+                           loading=Loading(workers=0)).load(batch=2)
+
+    batch = next(data.train())
+
+    ids = np.asarray(batch[IDS_KEY])
+    assert ids.shape == (2, 2, 4)
+    order = np.argsort(-ids[:, 0, :].sum(-1))
+    np.testing.assert_array_equal(ids[order][:, 0, :], [[1, 2, 3, 4], [6, 0, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY])[order][:, 1, :],
+                                  [[1, 0, 0, 0], [1, 1, 0, 0]])
+
+def test_an_overlong_row_is_refused():
+    row = {"chosen": [1, 2, 3, 4, 5], "rejected": [1]}
+    with pytest.raises(ValueError, match="shorten the row"):
+        PreferenceSource.from_records(records(row), 0, 4)
+    with pytest.raises(ValueError, match="seq_len"):
+        PreferenceSource.from_records(records(PAIR), 0, 0)
 
 
 def test_parquet_without_sides_is_refused(tmp_path):
