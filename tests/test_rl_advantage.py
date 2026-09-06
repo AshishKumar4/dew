@@ -118,9 +118,10 @@ def test_masked_whiten_matches_the_references(reference, compiled):
     variance = variance / (count + 1e-8) * count / (count - 1)
     deviation = math.sqrt(variance + 1e-8)
     expected = (x - mean) / deviation
-    # gamma_(n+8): n-term reductions plus centring, squares, Bessel
-    # correction and rsqrt/multiply. Include the mean's absolute input
-    # scale so cancellation near zero cannot make the bound vanish.
+    # Conservative gamma_(n+8) envelope for this fixed, nondegenerate
+    # binary-mask fixture, not a universal whitening error theorem. It
+    # covers reductions, centring, Bessel correction and rsqrt/multiply;
+    # the mean's absolute input scale protects near-zero centered outputs.
     unit = np.finfo(np.float32).eps / 2
     gamma = (count + 8) * unit / (1 - (count + 8) * unit)
     bound = gamma * (np.abs(x - mean) + math.fsum(abs(x[keep])) / count) / deviation
