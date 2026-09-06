@@ -137,6 +137,8 @@ state = trainer.fit(data, steps=1200, metrics=(metrics.perplexity(),))
 
 `generate` prefills the KV cache and decodes in one scan, and `tools/tokenize_text.py` writes the token files a corpus trains from. A masked-diffusion objective on the same decoder trains diffusion language models on the sqrt schedule.
 
+Post-training is the same trainer with different losses: `LMObjective` with `loss_role` for SFT on `ChatMessages`, `DPOObjective` on `PreferencePairs` with the reference frozen as the EMA at unit decay, and `GRPOObjective` on `Prompts` sampled through a `SampledRollout` with a plain-callable reward. `recipes/chain.py` links the stages sharing one decoder, each stage initializing from the last stage's checkpoint. `docs/concepts/post_training.md` runs each stage tiny.
+
 ## JEPA
 
 `JepaObjective` trains an I-JEPA or V-JEPA encoder. The predictor reads the encoder's embeddings of the visible patches and predicts the embeddings of masked target blocks; the targets come from a target encoder that is an EMA of the context encoder.
@@ -180,6 +182,9 @@ The data pipeline is built on Grain. A dataset is a random-access source and a t
 | Local video directories, VoxCeleb2 | video clips with audio | `LocalVideos`, `VoxCeleb2` |
 | Tokenized text (`train.bin`, `val.bin`) | token windows or packed documents | `TokenWindows`, `PackedTokens` |
 | URL streams (LAION-style tables) | images fetched while training | `OnlineImages` |
+| Chat parquet (`prompt` conversations) | rendered ids with a role per token | `ChatMessages` |
+| Preference rows (chosen and rejected ids) | fixed-width pairs with completion masks | `PreferencePairs` |
+| Prompt rows (verl layout) | left-padded prompts with reward context | `Prompts` |
 
 `load` returns a `Dataset`: a `train` and a `val` iterator, the record count and the global batch. Augmentation is a field of the spec, not an environment variable.
 
