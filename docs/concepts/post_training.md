@@ -1,8 +1,8 @@
 # Post-training
 
-Post-training changes a language model's behavior after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the model generates answers and your reward function scores them.
+Post-training changes a model's behavior after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Flow-GRPO scores samples from a rectified-flow model.
 
-Dew provides objectives and data specifications for these three methods. They use the same `Trainer`, but they do not consume interchangeable batches. Start with [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for the model/objective/trainer relationship. The example below trains a tiny DPO model without a tokenizer download, a dataset download, or a pretrained checkpoint.
+Dew provides objectives and data specifications for the three language-model methods, plus a Flow-GRPO objective and rollout. They use the same `Trainer`, but they do not consume interchangeable batches. Start with [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for the model/objective/trainer relationship. The first example below trains a tiny DPO model without a tokenizer download, a dataset download, or a pretrained checkpoint.
 
 ## SFT: learn from assistant answers
 
@@ -141,6 +141,47 @@ With `eos_id` set, the response mask includes the first end token and excludes l
 
 Sampling temperature changes the distribution that draws tokens. The recorded `old_log_probs` come from untempered model rescoring, so they do not represent that sampling distribution at non-unit temperature. Exact likelihood provenance and correction semantics remain under review; fixed-tensor loss parity does not resolve this collection mismatch.
 
+## Flow-GRPO
+
+Flow-GRPO optimizes generated samples with a reward function. It requires a rectified-flow Process with velocity prediction. The objective reuses DiffusionObjective's InputSpec, conditioning encoders, and optional autoencoder. The reward receives decoded samples in [-1, 1] and the repeated source batch, and returns one finite scalar per sample.
+
+This offline example trains a small DiT. Brightness is a demonstration reward. The image field supplies the batch size; the rollout does not train on those zero-valued pixels.
+
+```python
+import itertools
+import jax
+import numpy as np
+import optax
+from dew import Field, InputSpec, Trainer, models, presets
+from dew.data import Dataset
+from dew.objectives.rl import FlowGRPOObjective, FlowRollout
+
+inputs = InputSpec(Field("image", (4, 4, 1)))
+model = models.SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
+                         num_layers=1, num_heads=2, mlp_ratio=2)
+objective = FlowGRPOObjective(model, presets.Flow()(), inputs,
+                              guidance=None, beta=0.01, steps=5)
+
+def brightness(images, batch):
+    return images.mean(axis=(1, 2, 3))
+
+rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
+batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
+data = Dataset(train=lambda: itertools.repeat(batch), val=None, records=2, batch=2)
+trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout)
+state = trainer.fit(data, steps=2, log_every=1)
+print(int(state.updates))
+```
+
+This prints two committed updates. A conditioned run can supply the fields from `inputs.tokenize(prompts)` without an image field. Each source row forms one contiguous group. The rollout uses population group standard deviation with epsilon 1e-4. Zero-advantage rows remain in the fixed-shape batch with their transition mask cleared.
+
+`steps` counts time points including both endpoints. Here, five points produce four stochastic transitions, and `train_steps=2` selects the first two for the update. `train_steps=None` uses all transitions. The objective's separate `steps` and `sampler` configure evaluation. The public `sample_trajectory` function returns a FlowTrajectory with states, times, joint log densities, and stochastic-support marks. Deterministic intervals have undefined Gaussian density and never contribute to the policy loss.
+
+`FlowGRPOObjective` uses per-coordinate log-density ratios and averages the loss over selected stochastic transitions. Positive `beta` freezes the initial policy in the EMA slot; zero `beta` allocates no reference. Evaluation and previews use the live policy. The KL metric is `transition_kl`, the per-coordinate conditional Gaussian KL from [the paper's section 4](https://arxiv.org/html/2505.05470v5#S4), with elapsed time included in the transition variance. The [released SD3 training script](https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/scripts/train_sd3.py#L897-L899) uses a time-reweighted regularizer, so its `beta` values are not directly interchangeable with this conditional-KL contract.
+
+On multiple hosts, every rank joins generation. Rewards run on rank zero. The rollout returns process-owned rows for the trainer to reassemble. Its current host conversion gathers the full trajectory on each rank before selecting owned rows, so host memory grows with the global rollout size. The two-process CPU check proves row ownership and one-update parity; it does not establish cluster throughput.
+
+
 ## Move between stages
 
 The Python-only `recipes.chain.Recipe` accepts a shared decoder, optimizer, key, output directory, batch size, and a tuple of `Stage` values. A stage's dataset **type** selects its objective: `ChatMessages` selects SFT, `PreferencePairs` selects DPO, and `Prompts` selects GRPO. The stage name labels its directory; a name such as `"sft"` does not infer masks or convert data.
@@ -151,7 +192,7 @@ The chain exposes `beta`, `reward`, `groups`, `max_new_tokens`, and `sample`, bu
 
 ## Limits and evidence
 
-Agentic RL (multi-turn interaction with tools or environments) and FlowGRPO for flow/diffusion models are planned work, not completed workflows in this API. A Python reward callback does not supply a sandbox, tool execution, trajectory management, or a serving system.
+Agentic language-model RL (multi-turn interaction with tools or environments) remains planned work. A Python reward callback does not supply a sandbox, tool execution, agent trajectory management, or a serving system.
 
 Known trainer defects also affect planning real runs: overflow/resume can diverge, accumulation with unequal valid-token masks does not reproduce a globally token-weighted update, repeated evaluation can reuse random draws, and prefetch lifetime has an open issue. Keep `accumulation=1` for masked-loss comparisons, and do not treat this tiny run as proof of recovery or long-run stability. See [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before relying on those paths.
 
