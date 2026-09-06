@@ -399,11 +399,11 @@ This is a dataset-backed starting configuration for unconditional Oxford Flowers
 
 Prepare Oxford Flowers in a **separate environment from Dew/JAX training**. Reading already prepared ArrayRecords does not require TensorFlow, but preparation can depend on TensorFlow and a builder's other dependencies. Do not infer that every TFDS builder can prepare without it. The commands below deliberately install TensorFlow only in a dedicated preparation environment; they can download packages and the dataset, so inspect the dataset's access conditions first.
 
-Both environments use the same `TFDS_DATA_DIR` on disk. Use a new directory if your existing preparation contains TFRecords rather than ArrayRecords. The explicit label file matters because `OxfordFlowers` reads label names when processing records, even in an unconditional run. Python 3.12 here is a TensorFlow-compatible preparation interpreter, not a claim about Dew's newest supported training baseline.
+Both environments use the same `TFDS_DATA_DIR` on disk. Use a new directory if your existing preparation contains TFRecords rather than ArrayRecords. The explicit label file matters because `OxfordFlowers` reads label names when processing records, even in an unconditional run. Python 3.13 below is the separately checked TensorFlow preparation interpreter, not a claim about Dew's newest supported training baseline.
 
 ```bash
-uv venv --python 3.12 .venv-tfds-prepare
-uv pip install --python .venv-tfds-prepare/bin/python tensorflow-datasets tensorflow
+uv venv --python 3.13 .venv-tfds-prepare
+uv pip install --python .venv-tfds-prepare/bin/python tensorflow-datasets==4.9.10 tensorflow==2.21.0
 export TFDS_DATA_DIR="$HOME/dew-data/tfds-arrayrecord"
 .venv-tfds-prepare/bin/python - <<'PY'
 import os
@@ -419,7 +419,13 @@ print("Prepared", builder.info.full_name, "and", labels)
 PY
 ```
 
-The preparation interpreter is invoked by path, so it does not replace your active Dew/JAX environment. Keep `TFDS_DATA_DIR` exported, and use the separately installed training environment for the script below. Do not activate the TensorFlow preparation environment to train the model merely because it contains TFDS. The training environment needs the prepared-data reader dependencies described in [installation](docs/installation.md), not the builder's TensorFlow preparation stack.
+The preparation interpreter is invoked by path, so it does not replace your active Dew/JAX environment. Keep `TFDS_DATA_DIR` exported, and install the prepared-data reader extra into your separate training environment:
+
+```bash
+uv pip install --python .venv/bin/python -e ".[tfds]"
+```
+
+This runtime command requires a Dew revision with the TensorFlow-free `tfds` extra; older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the TensorFlow preparation environment to train the model merely because it contains TFDS. The shared ArrayRecords and label file cross the environment boundary; the builder's TensorFlow preparation stack does not.
 
 Save this complete script as `train_flowers64.py`. It trains in pixels, without a CLIP/T5 tower or VAE, so the training script requires no pretrained model weights. `DiffusionRunConfig` records the actual model, process, data, optimizer, and trainer choices in `run.json`.
 
