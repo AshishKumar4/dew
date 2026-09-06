@@ -1,29 +1,28 @@
 # Post-training in Dew: SFT, DPO and online RL on one trainer
 
-Design, rewritten 2026-09-03 against `api.md`. Nothing here is built. Every citation is a symbol in the tree this document sits in; a line number appears only where I read that line for this pass. The earlier version of this design was written against the trainer the API design replaced, so its mechanisms are restated here rather than renamed.
+Built through wave 5; wave 6 is open. Every citation is a symbol in the tree this document sits in; a line number appears only where I read that line for this pass.
 
 A modality is an objective, so post-training is more objectives, and the user learns one thing:
 
 ```
-LMObjective(model, seq_len)                          # pretraining, as today
-LMObjective(model, seq_len, loss_role=ASSISTANT)     # SFT: the same class, a loss mask, a chat data path
+LMObjective(model, seq_len)                                  # pretraining, as today
+LMObjective(model, seq_len, loss_role=Role.ASSISTANT)        # SFT: the same class, a loss mask, a chat data path
 DPOObjective(model, seq_len, beta=0.1)
 GRPOObjective(model, seq_len, beta=0.0)
-FlowGRPOObjective(model, process, inputs, beta=0.0)
-Trainer(objective, optimizer, ..., rollout=VLLMRollout(...))
+Trainer(objective, optimizer, ..., rollout=SampledRollout(...))
 ```
 
-They run on the `Trainer` as it is (`dew.training.trainer`), with the same state, sharding, EMA clock, checkpoints and tracker keys. Three mechanisms carry the design: the reference is the EMA tree at unit decay (§3), sampling is one more trainer capability (§4), and rewards are plain callables (§5). The surrogate math is already built and parity-tested in `dew.rl`, so the online objectives are assembly rather than derivation (§6).
+They run on the `Trainer` as it is (`dew.training.trainer`), with the same state, sharding, EMA clock, checkpoints and tracker keys. Three mechanisms carry the design: the reference is the EMA tree at unit decay (§3), sampling is one more trainer capability (§4), and rewards are plain callables (§5). The surrogate math is built and parity-tested in `dew.rl`, so the online objectives are assembly rather than derivation (§6). Staged runs chain these links in `recipes/chain.py` (§12).
 
 ## 1. Data
 
-The three new paths are `DatasetSpec`s in the `datasets` registry, beside `TokenWindows` and `PackedTokens` (`dew/data/tokens.py:56, :132`). Each returns a `Dataset` from `load(batch=)`, so a recipe reaches them through the same `data:` subcommand every other run uses, and none of them changes the trainer.
+The three paths are `DatasetSpec`s in the `datasets` registry, beside `TokenWindows` and `PackedTokens`: `ChatMessages` (`dew/data/chat.py`), `PreferencePairs` (`dew/data/preferences.py`) and `Prompts` (`dew/data/prompts.py`). Each returns a `Dataset` from `load(batch=)`, so a recipe reaches them through the same `data:` subcommand every other run uses, and none of them changes the trainer.
 
 ### 1.1 Chat and SFT: a role per token
 
 SFT needs one field beyond the pretraining contract: which role wrote each token, because the loss must count assistant tokens only.
 
-`ChatMessages`, registered as `chat_messages`: a Grain source over a parquet file of verl-shaped rows (§1.4). One record is one conversation, a list of `{role, content}` messages, plus the columns a reward wants carried through. A transform renders the conversation and emits, per token, `text`, `text_roles` (int8: 0 pad, 1 system, 2 user, 3 assistant, 4 tool), `text_segment_ids` and `text_positions`.
+`ChatMessages`, registered as `chat_messages`: a Grain source over a parquet file whose `prompt` column holds verl-shaped conversations, plus a tokenizer whose chat template renders them. `ConversationSource` reads the conversations; `RenderConversation` renders each and emits, per token, `text`, `text_roles` (int8: 0 pad, 1 system, 2 user, 3 assistant, 4 tool), which the packer carries beside `text_segment_ids` and `text_positions`. A `_lengths` pass renders every row up front, so a bad row fails the run with its index before packing starts.
 
 The assistant span comes from prefix rendering, not from template markers:
 
@@ -33,7 +32,7 @@ The assistant span comes from prefix rendering, not from template markers:
 
 TRL's `assistant_only_loss` needs a template carrying `{% generation %}` markers and swaps in a bundled template when the user's lacks them, which changes the rendered ids and not just the mask. verl tokenizes each message alone and concatenates, which is only equal to whole-conversation tokenization for templates that happen to be concatenation-safe. The prefix method is exact for any template and asserts it. TRL's mask is still the parity reference for the transform (§8).
 
-Packing is unchanged machinery: `text_roles` joins as one more per-token feature in `FirstFitPackIterDataset` with its own `length_struct` and `padding_struct` entries (`dew/data/tokens.py:164, :194`), and `DocumentChunks` already cuts a document longer than the window (`:93`), which is what the packer requires. Segment ids still stop attention at a document boundary.
+Packing is unchanged machinery: `text_roles` joins as one more per-token feature in `FirstFitPackIterDataset` with its own `length_struct` and `padding_struct` entries, `DocumentChunks` cuts every per-token field of a document longer than the window so ids and roles stay aligned, and a conversation that starts with the assistant is refused, since its opening header cannot be separated from its completion through the template. Segment ids still stop attention at a document boundary.
 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |
@@ -42,50 +41,42 @@ Packing is unchanged machinery: `text_roles` joins as one more per-token feature
 | `text_positions` | `[B, S+1]` | int32 | position inside that document |
 | `text_roles` | `[B, S+1]` | int8 | role per token, 0 on pad |
 
-`loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, composed with the pad and segment-boundary weights it already computes (`dew/objectives/lm/objective.py:198-205`). With no `loss_role`, every counted target counts, exactly as pretraining does.
+`loss_role` multiplies the objective's existing target weights by `(text_roles[:, 1:] == loss_role)`, composed with the pad and segment-boundary weights it already computes. With no `loss_role`, every counted target counts, exactly as pretraining does.
 
 ### 1.2 Preference pairs
 
-`PreferencePairs`, registered as `preference_pairs`: a parquet of `prompt` with `chosen` and `rejected`, each either text or a conversation. The transform renders the prompt with `add_generation_prompt=True`, appends each completion, left-pads both to a common length, and marks the completion.
+`PreferencePairs`, registered as `preference_pairs`: a parquet file or JSON rows of `chosen` and `rejected` token-id lists with `chosen_mask` and `rejected_mask` marking the completion tokens; absent masks default to all-completion. Every element is one `[2, seq_len]` pair, chosen at index 0, padded with `pad_id` and 0, so a grain batch is `[B, 2, seq_len]` and shuffling never separates a pair. A row longer than `seq_len` fails with its lengths: a pair cannot be chunked without cutting a completion, and silent cuts train the wrong preference.
 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |
-| `text` | `[2B, S]` | int32 | chosen at `[0::2]`, rejected at `[1::2]`, adjacent per pair |
-| `text_segment_ids` | `[2B, S]` | int32 | 1 real, 0 pad |
-| `text_positions` | `[2B, S]` | int32 | 0-based within the real tokens |
-| `completion_mask` | `[2B, S]` | int8 | 1 on completion tokens, including the stop token |
+| `input_ids` | `[B, 2, S]` | int32 | pairs, chosen at index 0 |
+| `completion_mask` | `[B, 2, S]` | int32 | 1 on completion tokens, including the stop token |
 
-Adjacent interleaving is verl-omni's layout and is chosen over TRL's concatenate-then-chunk so a pair shares a prompt without a reordering step.
-
-For images, `DiffusionDPOObjective` reads a pair-of-images record, encodes both through the autoencoder, and applies one shared timestep and one shared noise per pair. The online variant needs no pair dataset: the rollout samples G images per prompt and the reward's best and worst become the pair.
+The objective reads the pair index out explicitly: a reshape would interleave two pairs into the halves and compare across them.
 
 ### 1.3 Prompts for online RL
 
-`Prompts`, registered as `prompts`: parquet of `prompt` plus whatever columns the reward reads. No masks, because the rollout produces them.
+`Prompts`, registered as `prompts`: a parquet file or JSON rows of `prompt` (messages, a string, or token ids) plus the reward columns `data_source`, `ground_truth` and `extra_info`, defaulting to empty when absent. Each row encodes to a left-padded `prompt` of `max_prompt_len` ids plus `prompt_length`, with the reward columns as fixed-width UTF-8 byte arrays so every leaf survives the device transfer. Prompts longer than the window keep their tail; blank prompts fail. No masks, because the rollout produces them.
 
-In: `prompt` `[b, P]` int32, left-padded, and `prompt_length` `[b]` int32. Out of the rollout, and what `loss` consumes:
+In: `prompt` `[B, P]` int32, left-padded, `prompt_length` `[B]` int32, and the three reward columns as UTF-8 bytes. Out of the rollout, and what `loss` consumes:
 
 | key | shape | dtype | content |
 | --- | --- | --- | --- |
-| `text` | `[b*G, P+N]` | int32 | prompt and continuation |
-| `text_segment_ids` | `[b*G, P+N]` | int32 | 1 real, 0 pad |
-| `text_positions` | `[b*G, P+N]` | int32 | 0-based within real tokens |
-| `response_mask` | `[b*G, N]` | int8 | 1 on generated tokens through the first stop token |
-| `old_log_probs` | `[b*G, N]` | float32 | from the params that sampled |
-| `advantages` | `[b*G]` | float32 | group-relative |
-| `reward` | `[b*G]` | float32 | raw scores, for telemetry |
-| `truncated` | `[b*G]` | bool | hit N without a stop token |
+| `input_ids` | `[N, P+T]` | int32 | prompt and continuation, groups contiguous per prompt |
+| `response_mask` | `[N, T]` | float32 | 1 through the first stop token |
+| `old_log_probs` | `[N, T]` | float32 | from the params that sampled, rescored by the objective's head |
+| `advantages` | `[N, T]` | float32 | group or RLOO advantages broadcast over the width |
+| `rewards` | `[N]` | float32 | raw scores, for telemetry |
+| `prompt_length` | `[N]` | int32 | real tokens before padding |
 
-Shapes are constants of the run, because `generate` runs for exactly `max_new_tokens` whatever it sees (`dew/sampling/text.py:57-65`). One shape per run is what keeps `Trainer.compile` tracing once (`dew/training/trainer.py:277`).
-
-For diffusion the tables change only in what prompt and response mean: the prompt is the conditioning the `InputSpec` already describes, and the response is a latent trajectory (§7).
+Shapes are constants of the run, because `generate` runs for exactly `max_new_tokens` whatever it sees. One shape per run is what keeps `Trainer.compile` tracing once.
 
 ### 1.4 verl's parquet schema, mapped
 
 | verl field | verl content | Dew |
 | --- | --- | --- |
 | `data_source` | dataset name, indexes the reward | `data_source`, passed to the reward (§5) |
-| `prompt` | chat messages | rendered by the chat transform into `text` and `text_roles` |
+| `prompt` | chat messages | rendered by the chat transform into `text` and `text_roles`, or encoded by the prompt source |
 | `reward_model` | `{"style": "rule", "ground_truth": str}` | `ground_truth`, passed to the reward |
 | `extra_info` | bookkeeping | `extra_info`, passed to the reward |
 | `ability` | task category | carried in `extra_info`; Dew dispatches on nothing |
@@ -105,16 +96,16 @@ Decision: `loss_role`. It is the same class, one field, one multiply. The object
 
 ## 3. The frozen reference
 
-**Decision: the reference is the EMA tree at unit decay.** A preference or RL objective sets `ema = EMASpec(decay=optax.constant_schedule(1.0))` and reads `step.ema` in `loss`. `Step.ema` is the variables tree with the averaged leaves in place of the live ones (`dew/objectives/base.py:41-48`), so the reference forward runs through the same code as the policy forward with a different tree.
+**Decision: the reference is the EMA tree at unit decay.** A preference or RL objective sets `ema = EMASpec(decay=optax.constant_schedule(1.0))` and reads `step.ema` in `loss`. `Step.ema` is the variables tree with the averaged leaves in place of the live ones (`dew/objectives/base.py`), so the reference forward runs through the same code as the policy forward with a different tree.
 
 What falls out without new machinery:
 
 - **Out of the optimizer.** Only the `params` collection is differentiated and only it reaches `tx.init`, so no masked optimizer and no zero-gradient tree.
-- **Checkpointed and sharded.** `ema` is a field of `TrainState` (`dew/training/state.py:24-28`), so `Trainer.shardings` shards it like params and a resumed run restores its reference with everything else.
-- **The clock is already right.** The EMA runs on completed optimizer updates, not micro-steps, and a rejected mixed-precision step is not an update (`dew/training/trainer.py:246-261`). A reference cannot drift under accumulation.
-- **`select` scopes it.** `EMASpec.select` is a `PathFilter` (`dew/objectives/base.py:100-108`), so a reference over part of the tree, a frozen encoder beside a trained head, costs one filter.
+- **Checkpointed and sharded.** `ema` is a field of `TrainState`, so `Trainer.shardings` shards it like params and a resumed run restores its reference with everything else.
+- **The clock is already right.** The EMA runs on completed optimizer updates, not micro-steps, and a rejected mixed-precision step is not an update. A reference cannot drift under accumulation.
+- **`select` scopes it.** `EMASpec.select` is a `PathFilter`, so a reference over part of the tree, a frozen encoder beside a trained head, costs one filter.
 
-One change is required, and it is small. `ema_update` is `decay * average + (1 - decay) * live` (`dew/training/trainer.py:70-73`). At decay 1.0 that is arithmetically the average, but `0.0 * NaN` is NaN, so a single non-finite parameter poisons a frozen reference on the step it appears, and the `finite` gate only exists when `dynamic_scale` is on. The fix is one select per leaf: return the average unchanged where `decay >= 1.0`. The test that ships with it forces a non-finite parameter and asserts the reference is bit-identical afterwards, with and without `dynamic_scale`.
+One change was required, and it is small. `ema_update` is `decay * average + (1 - decay) * live`. At decay 1.0 that is arithmetically the average, but `0.0 * NaN` is NaN, so a single non-finite parameter poisons a frozen reference on the step it appears, and the `finite` gate only exists when `dynamic_scale` is on. The fix is one select per leaf: return the average unchanged where `decay >= 1.0` (`dew/training/trainer.py:134`). The test that ships with it forces a non-finite parameter and asserts the reference is bit-identical afterwards, with and without `dynamic_scale`.
 
 The cost of the decision is that a run cannot hold a moving policy EMA and a frozen reference at the same time. No objective in scope wants both. The alternative, a masked subtree inside `params`, was rejected: one extra full copy in HBM, an optimizer wrapper, gradient and update trees for something that never moves, and a second checkpoint layout. The EMA slot is already allocated, already sharded and already checkpointed.
 
@@ -122,16 +113,16 @@ The cost of the decision is that a run cannot hold a moving policy EMA and a fro
 
 ## 4. The rollout capability
 
-Sampling is effectful, host-side and sometimes remote, so it is a capability the trainer is given, beside the checkpointer, the tracker and the profiler, all of which are `X | None = None` (`dew/training/trainer.py:105-126`):
+Sampling is effectful, host-side and sometimes remote, so it is a capability the trainer is given, beside the checkpointer, the tracker and the profiler, all of which are `X | None = None`:
 
 ```python
 class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 ```
 
-`Trainer(..., rollout=None)` is exactly today's loop. When one is given, the trainer calls it between `batch = next(train)` and the compiled step (`dew/training/trainer.py:362, :373`) and reshards the result with `shard_batch(mesh, ...)`.
+`Trainer(..., rollout=None)` is exactly today's loop. When one is given, the trainer calls it between `batch = next(train)` and the compiled step (`dew/training/trainer.py:477`) and reshards the result with `shard_batch(mesh, ...)`.
 
-**Why not the `step=` seam.** `Trainer.step` replaces the compiled step's body and is documented as the one place for an update that is not one loss (`dew/training/trainer.py:117-126`). It runs inside `jit` and owns the counter, the EMA and the write-back. A rollout is the opposite kind of thing: it produces the batch the step then consumes, it may post to a vLLM server, and it cannot be traced. Putting it in the step body would either force generation inside `jit` or smuggle a host callback into a compiled function. Two seams, two kinds of work, and the design says which is which.
+**Why not the `step=` seam.** `Trainer.step` replaces the compiled step's body and is documented as the one place for an update that is not one loss. It runs inside `jit` and owns the counter, the EMA and the write-back. A rollout is the opposite kind of thing: it produces the batch the step then consumes, it may post to a vLLM server, and it cannot be traced. Putting it in the step body would either force generation inside `jit` or smuggle a host callback into a compiled function. Two seams, two kinds of work, and the design says which is which.
 
 **Why not a method on `Objective`.** The objective's surface is pure and crosses `jit`: `loss` and `evaluate` are functions of variables, a batch and a `Step`. An objective that opens a socket is not that, and every objective would carry an identity method it never uses.
 
@@ -141,7 +132,7 @@ The rest falls out:
 - **Keys.** The rollout key is folded from `state.key` and `state.step`, the same stream the step key comes from, with one extra fold so a rollout and its step never share draws. Both are checkpointed, so a resumed run samples forward rather than replaying.
 - **Accumulation.** One rollout per micro-batch. A group never straddles a micro-batch, so the group baseline is computed inside the batch it belongs to, which is the whole batch at the default `accumulation=1`.
 - **Distributed.** The rollout runs per process on that process's slice, which is what `DevicePrefetchIterator` hands it, and `shard_batch` reassembles the global array. Groups are process-local by construction.
-- **Telemetry through the existing channels.** Reward mean and generation length ride `Aux.metrics` out of `loss`, which the trainer logs under `train/`. Wall time cannot come from inside `jit`, so the trainer times the host-side call and folds `train/rollout_seconds` into the same log tick that carries throughput (`dew/training/trainer.py:395-404`). There is no second return channel.
+- **Telemetry through the existing channels.** Reward means ride `Aux.metrics` out of `loss`, which the trainer logs under `train/`. Wall time cannot come from inside `jit`, so the trainer times the host-side call and folds `train/rollout_seconds` into the same log tick that carries throughput (`dew/training/trainer.py:526-531`). There is no second return channel.
 
 ## 5. Rewards
 
@@ -152,33 +143,27 @@ A reward is a callable from one finished record to a float: `reward(data_source,
 They are assembly over `dew.rl`, whose estimators and surrogates are built, ported from Tunix and verl, and pinned against their fixtures (`dew/rl/advantage.py`, `dew/rl/surrogate.py`, `tests/fixtures/rl/*.npz`).
 
 - **SFT** is `LMObjective` with `loss_role` (§2).
-- **DPO** takes per-sequence log-probabilities as the negated per-token cross entropies the chunked head already returns (`dew/objectives/lm/chunked.py:83-89`), summed under `completion_mask`, for the policy and for `step.ema`. The loss is `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))` over the pair rows.
-- **GRPO** reads `old_log_probs`, `advantages` and `response_mask` from the rolled-out batch and is one composition: `clipped_surrogate(token_log_ratio(...), advantages, response_mask)` plus `beta * token_mean(k3_kl(...), response_mask)` (`dew/rl/surrogate.py:110, :74, :156, :60`). The advantages come from `group_advantage` or `rloo_advantage` inside the rollout (`dew/rl/advantage.py:99, :120`), where the rewards are.
+- **DPO** (`dew/objectives/rl/preference.py`) takes per-sequence log-probabilities as the negated per-token cross entropies the chunked head already returns, summed under the shifted `completion_mask`, for the policy and for `step.ema`. The loss is `preference_logsigmoid` over the pair halves: `-logsigmoid(beta * ((pi_c - ref_c) - (pi_r - ref_r)))`, meaned (`dew/rl/surrogate.py:173`). Validation scores the chosen responses' perplexity.
+- **GRPO** (`dew/objectives/rl/grpo.py`) reads `old_log_probs`, `advantages` and `response_mask` from the rolled-out batch and is one composition: `clipped_surrogate(token_log_ratio(...), advantages, response_mask)` plus `beta * token_mean(k3_kl(...), response_mask)` (`dew/rl/surrogate.py:109, :73, :155, :60`). The current log-probabilities are sliced out of the concatenation one before the prompt width; `beta=0.0` leaves the reference unread. The advantages come from `group_advantage` or `rloo_advantage` inside the rollout (`dew/rl/advantage.py:100, :121`), where the rewards are. Validation scores the prompts' own perplexity off `prompt_length`, since a validation pass never samples.
 
-Nothing in that list derives new math, which is the point of having landed `dew.rl` first.
+Both read and write per-token log-probabilities through `LMObjective.per_token_log_probs`, the negated chunked cross entropies, so the policy and the reference share one head path. Nothing in that list derives new math, which is the point of having landed `dew.rl` first.
 
 ## 7. Diffusion RL
 
-Two additions, both small because the sampling seam was rebuilt for this shape:
-
-**A trajectory beside the sample.** `sample(denoise, x_T, steps, *, solver, guidance, key)` returns the final sample from one scan (`dew/sampling/sample.py:8-14`). RL needs the path: the recorded `(x_t, x_next, t, t_next)` per step. `dew.sampling.trajectory` shares that scan body and returns the stacked path, so a normal sample never pays to materialise it and a rollout never re-derives the walk. Delete `trajectory` and only RL loses its data source.
-
-**An SDE solver, as an ordinary solver.** The `Solver` protocol hands `step` the key, the process, the model callable and both of the model's predictions (`dew/sampling/solvers.py:26-32`). The earlier design needed a change to the sampler seam for this; the current protocol already passes everything an SDE transition needs, so an `SDE` solver is a new file and no existing file changes. Its `State` carries the log-probability of each transition, which is what the loss recomputes under the policy.
-
-`FlowGRPOObjective` then recomputes the model at each recorded `(x_t, t)`, rebuilds the transition mean, takes its log-probability, and applies the same `clipped_surrogate` with a per-step mask of ones. The reward is an image scorer, host-side, in the rollout.
+Not built; wave 6 is open. The design stands as written: a recorded trajectory beside the sample, an SDE solver as an ordinary solver with no existing sampler file changed, and a FlowGRPO objective applying the same `clipped_surrogate` per diffusion step.
 
 ## 8. Parity plan
 
 | check | reference | recorded |
 | --- | --- | --- |
-| chat rendering and the assistant mask | TRL's mask for the same template and conversation | ids equal, mask equal |
-| DPO loss and gradient | TRL on fixed tensors | largest difference |
-| GRPO surrogate and KL | the committed `dew.rl` fixtures | already pinned |
+| chat rendering and the assistant mask | TRL 1.12's mask for the same template and conversation | ids exact, mask exact, difference 0 |
+| DPO loss and gradient | TRL 1.12 on fixed tensors | loss 5.96e-08, gradients exact |
+| GRPO loss and gradient | verl 0.9's PPO path on one fixed rollout | loss 7.45e-08, gradients exact |
 | group and RLOO advantages | verl on the same rewards | already pinned |
-| SDE transition and its log-probability | verl-omni's flow-GRPO step | largest difference |
+| SDE transition and its log-probability | verl-omni's flow-GRPO step | open with wave 6 |
 | a rolled-out run's shapes | the tables in §1.3 | one trace of `compile` per run |
 
-Each new test records the largest observed difference and tightens its tolerance to it. Each objective gets one mutation per branch that must fail parity.
+Each new test records the largest observed difference and tightens its tolerance to it. DPO carries a swapped-halves test guarding the pair order; GRPO carries one failing mutation per term: an unclipped ratio, a k1 penalty, and a flat mean.
 
 ## 9. What fits
 
@@ -190,11 +175,17 @@ Research scale uses Dew's own `generate` and its samplers. Beyond that, the cros
 
 ## 11. Waves
 
-| # | wave | acceptance |
-| --- | --- | --- |
-| 1 | chat data path and `loss_role` | mask parity against TRL; a packed SFT batch carries four aligned per-token fields; loss counts assistant targets only |
-| 2 | unit-decay reference | a non-finite parameter leaves the reference bit-identical, with and without `dynamic_scale`; a resumed run restores it |
-| 3 | the rollout capability | identity default leaves the loop unchanged; one `compile` per run with a rollout; `train/rollout_seconds` in the log tick; a resumed run does not replay |
-| 4 | DPO | loss and gradient parity against TRL; the pair layout asserted |
-| 5 | GRPO on `dew.rl` | the composition matches verl end to end on one fixed rollout; a mutation of each term fails |
-| 6 | trajectory, SDE solver, FlowGRPO | transition parity against verl-omni; no existing sampler file changed |
+| # | wave | acceptance | status |
+| --- | --- | --- | --- |
+| 1 | chat data path and `loss_role` | mask parity against TRL; a packed SFT batch carries four aligned per-token fields; loss counts assistant targets only | built |
+| 2 | unit-decay reference | a non-finite parameter leaves the reference bit-identical, with and without `dynamic_scale`; a resumed run restores it | built |
+| 3 | the rollout capability | identity default leaves the loop unchanged; one `compile` per run with a rollout; `train/rollout_seconds` in the log tick; a resumed run does not replay | built |
+| 4 | DPO | loss and gradient parity against TRL; the pair layout asserted | built |
+| 5 | GRPO on `dew.rl` | the composition matches verl end to end on one fixed rollout; a mutation of each term fails | built |
+| 6 | trajectory, SDE solver, FlowGRPO | transition parity against verl-omni; no existing sampler file changed | open |
+
+## 12. Staged runs
+
+`recipes/chain.py` links the waves into one run: a `Recipe` is an ordered tuple of `Stage`s over one built decoder, each stage naming its data, its loss (`sft`, `dpo` or `grpo`), its step count and, for GRPO, its reward and sampling sizes. Every stage trains in its own checkpoint directory; every stage after the first initializes from the previous stage's final parameters through the objective's `pretrained` mechanism, which is also what freezes the next stage's reference. The optimizer restarts each stage. A stage refuses mismatched data, and a GRPO stage refuses to run without a reward.
+
+`recipes/lm/train.py` stays the pretraining recipe: its `--objective` flag stays `lm | masked_diffusion`, because its data path (a token directory), its `--pretrained` (a Hugging Face decoder, not a dew run) and its sampling setup assume pretraining from the start. Post-training stages need pair and prompt data, dew-checkpoint init and reward callables, none of which survive that command line, so they live in the chain instead of behind its flag.

@@ -11,11 +11,11 @@ from .optim import build_optimizer
 from .runtime import prepare_process, run_timestamp
 from .state import TrainState
 from .tracker import Tracker, WandbTracker
-from .trainer import Profile, Trainer, ema_update, write_back
+from .trainer import Profile, Rollout, Trainer, ema_update, write_back
 
 __all__ = [
     "Aux", "Checkpoints", "DEFAULT_RULES", "EMASpec", "Layout", "MeshSpec", "Metric",
-    "Objective", "Profile", "Step", "Tracker", "TrainState", "Trainer", "WandbTracker",
+    "Objective", "Profile", "Rollout", "Step", "Tracker", "TrainState", "Trainer", "WandbTracker",
     "build_mesh", "build_optimizer", "ema_update", "everything", "prepare_process",
     "run_timestamp", "under", "write_back",
 ]
