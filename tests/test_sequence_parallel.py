@@ -8,8 +8,8 @@ the output put back in sequence order. The proof is equality with whole
 sequences: the same loss, the same gradients, the same attention output.
 """
 
-import collections
-import re
+
+
 
 import jax
 import jax.numpy as jnp

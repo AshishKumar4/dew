@@ -51,7 +51,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import Aux, Mean, Objective, mean_loss
 
 
 class Regression(Objective):
@@ -63,8 +63,10 @@ class Regression(Objective):
 
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
-        mse = jnp.mean((prediction - batch["y"]) ** 2)
-        return mse, Aux(metrics={"mse": mse})
+        errors = (prediction - batch["y"]) ** 2
+        loss = Mean(jnp.sum(errors), jnp.asarray(errors.size))
+        mse, _ = mean_loss(loss)
+        return loss, Aux(metrics={"mse": mse})
 
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
@@ -81,7 +83,7 @@ print(f"Final mean squared error: {mse:.6f}")
 assert mse < 1e-4
 ```
 
-`x` and `y` are float32 arrays with shape `(32, 1)`: 32 examples with one feature or target each. `Dataset.train` opens a fresh iterator that repeats this batch. `Regression.init` creates the Flax variables, and `Regression.loss` returns a scalar mean squared error plus values available for training logs. `Trainer.fit` runs 100 steps and returns a `TrainState`; `state.params` contains the complete Flax variables used by `model.apply`.
+`x` and `y` are float32 arrays with shape `(32, 1)`: 32 examples with one feature or target each. `Regression.loss` returns the squared-error sum and its element count as `Mean`, plus training metrics. `Trainer.fit` consumes 100 batches and returns a `TrainState`; `state.params` contains the Flax variables used by `model.apply`.
 
 The loss should decrease. The CPU validation run printed `Final mean squared error: 0.000000`; the assertion allows small floating-point differences. This example fits a synthetic relation, not a held-out dataset. It writes no checkpoints or run configuration and performs no evaluation pass.
 

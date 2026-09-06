@@ -6,8 +6,8 @@ the parameter tree it initialises, the loss it computes from a batch, and what
 its evaluation produces. Swapping the objective swaps the research question
 without touching any of the mechanics.
 
-Everything an objective sees in one call arrives as a `Step`, and everything
-it reports back rides in an `Aux`. Both are pytrees, so they cross `jit`.
+An objective receives schedule and randomness through Step, and returns
+additive loss statistics with Aux reports. These values are JAX PyTrees.
 """
 
 from __future__ import annotations
@@ -41,7 +41,10 @@ frozen subtrees."""
 
 @struct.dataclass
 class Mean:
-    """An additive numerator and its parameter-independent support mass."""
+    """A scalar sum with nonnegative, parameter-independent support mass.
+
+    Zero mass declares a zero numerator and no contribution.
+    """
     total: jax.Array
     mass: jax.Array
 
@@ -73,9 +76,9 @@ class Aux(Generic[Effects]):
     """Reports, sequential mutable replacements, and deferred effects."""
     metrics: dict[str, jax.Array]
     variables: Variables | None = None
-    """Non-parameter collections to write back into the state as a whole: the
-    MoE balancing bias, batch statistics, sown values. The `params` collection
-    is the optimizer's and cannot be written this way."""
+    """Complete nonparameter replacements from one accepted microbatch,
+    such as BatchNorm statistics. The optimizer owns the params collection;
+    deferred router-bias updates belong in effects instead."""
     qk_stats: Variables | None = None
     """The `qk` collection the attention layers sowed, for the optimizer's
     QK-Clip: nested by module path, each attention layer holding

@@ -31,7 +31,7 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.objectives` |  |
+| `dew.objectives` | `Aux`, `EMASpec`, `Mean`, `Objective`, `Step`, `mean_loss`, `scalar_loss` |
 | `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |

@@ -23,14 +23,14 @@ class Accumulation:
     Aux.variables need per-record read snapshots.
     """
     gradient: Variables | None
-    mass: jax.Array
+    mass: jax.Array | None
     statistics: tuple[jax.Array, ...]
     effects: tuple[jax.Array, ...]
     qk_stats: Variables | None
     batches: Batch | None
     variables: Variables | None
     attempts: jax.Array | None
-    schedules: jax.Array | None
+
 
 
 @struct.dataclass

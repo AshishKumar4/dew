@@ -4,19 +4,21 @@ This page describes the interfaces used in the tutorials. Read [your first train
 
 ## Objective
 
-Import `Objective`, `Aux`, and `Step` from `dew.objectives.base`.
+Import `Objective`, `Aux`, `Step`, `Mean`, `mean_loss`, and `scalar_loss` from `dew.objectives`.
 
 | Member | Contract |
 |---|---|
 | `init(key)` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it for shapes and initialization. |
-| `loss(variables, batch, step)` | Return a scalar JAX loss and `Aux`. Differentiation targets `variables["params"]`. |
+| `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Mean(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
+| `reduce_loss(statistics)` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
+| `apply_effects(variables, effects)` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
 | `evaluate(variables, batch, step)` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |
 | `ema` | Optional `EMASpec`; the base objective uses `None`. |
 | `artifact` | Optional description of the objective's evaluation artifact type. |
 
-`Step` contains `step`, `key`, and `ema`. The EMA field holds a full variables mapping with selected averaged leaves overlaid, or `None` when no EMA is configured.
+`Step.step` counts accepted microbatches. Its `key` derives from consumed attempts, including rejected ones. `ema` holds selected averaged leaves overlaid onto the complete variables mapping, or `None`.
 
-`Aux(metrics, variables=None, qk_stats=None)` carries training metrics, optional replacement non-parameter collections, and optional attention statistics for QK-Clip. Metrics should be scalar arrays suitable for logging. The optimizer exclusively owns parameter updates.
+`Aux(metrics, variables=None, qk_stats=None, effects=None)` carries training measurements, sequential mutable replacements, QK maxima, and additive deferred effects. The trainer applies effects once on a supported optimizer commit. `scalar_loss(objective, variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
 ### Collections and EMA selection
 
@@ -63,9 +65,9 @@ Trainer(objective, optimizer, *, key,
 
 `objective` is an initialized objective object and `optimizer` an Optax gradient transformation. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. Optional capability objects enable checkpoints, tracking, host-side rollouts, and profiling.
 
-`accumulation` wraps the optimizer with Optax MultiSteps. It currently averages microbatch gradients. This is not equivalent to a combined token mean when valid-target counts differ. `dynamic_scale=True` uses dynamic loss scaling; its overflow/resume behavior is under repair. These limitations are not solved by changing logging cadence.
+`accumulation` counts accepted microbatches per effective window. Shared means use an fp32 weighted gradient accumulator. Composite statistics keep independent normalizers and retain inputs for scalar-VJP replay. Parameters and EMA stay fixed within the window; sequential mutable replacements retain their original read snapshots during replay. `dynamic_scale=True` persists scale and finite-history state and rejects nonfinite transactions without discarding the accepted prefix.
 
-The `step` factory replaces the default optimization step and owns its state-update contract. A custom `rollout` transforms a batch before the compiled step; it is distinct from replacing the step itself.
+The custom `step(objective, optimizer)` factory owns accepted/update clocks, scaler, EMA and mutable writes. Its body returns `(state, loss, aux)`. The common compiled wrapper advances attempted `state.step`. A host `rollout` produces realized training arrays once per consumed attempt, before differentiation or replay.
 
 ### Train
 
@@ -81,15 +83,15 @@ fit(data, *, steps, log_every=100, eval_every=None,
 - `checkpoint_every` controls periodic saves when a checkpointer exists. The normal completion path can still save a final checkpoint when a checkpointer is present.
 - `metrics` reduce evaluation artifacts and require evaluation to be enabled.
 
-For accurate continuation, checkpointable data must provide its iterator position. The overflow path currently has separate attempted-work and accepted-step counters; see [checkpoint limits](../guides/checkpoints.md#current-limits).
+Checkpointable data must supply the consumed iterator position. A failed scaled transaction advances attempted work and scaler history while preserving the earlier accepted prefix. Completely inactive windows close accepted slots without an optimizer call, weight decay, EMA, or deferred effects. Auxiliary-only windows can still be active.
 
-`fit` owns the iterators returned by the dataset, not the dataset itself. It closes training read-ahead before final evaluation and closes every validation pass, including failures and early exhaustion. A fit already at its target opens no training iterator or profiler; requested final evaluation still runs. On every exit it stops its own active trace and waits for pending checkpoint writes without closing the borrowed checkpointer or tracker. The original training/evaluation failure remains primary; cleanup failures are attached as exception notes.
+`fit` owns the iterators returned by the dataset. It closes training read-ahead before final evaluation and closes validation passes on success or failure. A restored fit already at its target performs no data, evaluation, compilation, or save work. On exit it stops its trace and waits for pending checkpoint writes without closing the borrowed checkpointer or tracker. Cleanup failures attach to the primary error.
 
 ### Initialize, restore, and compile
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
 
-`compile(state, batch, scale=None)` returns a callable invoked as `compiled(state, scale, batch)`, with `scale=None` for ordinary unscaled training. It returns `(state, scale, loss, metrics, finite)`. State buffers are donated, so callers must use the returned state and not reuse donated buffers. `finite` reports finite loss, not gradient acceptance.
+`compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler travels in `TrainState`. `loss_finite` and `accepted` are separate: a finite scalar can have a rejected nonfinite gradient. The callable does not donate state or batch arrays because retained replay records and asynchronous checkpoints may own those buffers.
 
 ## TrainState
 
@@ -97,13 +99,18 @@ Import `TrainState` from `dew.training`.
 
 | Field | Meaning |
 |---|---|
-| `step` | Scalar counter stored with the state |
+| `step` | Completed attempted batches, including rejected work |
+| `microstep` | Accepted microbatches, including finite zero-support slots |
+| `updates` | Committed supported optimizer updates |
 | `params` | Complete Flax variables, including the inner `params` collection |
-| `opt_state` | Optimizer state, including accumulation state when enabled |
+| `opt_state` | Underlying optimizer state, advanced only on commits |
 | `ema` | Selected moving-average variables or `None` |
-| `key` | Run random key |
+| `key` | Immutable root training key |
+| `scale` | Dynamic loss scaler with finite-history state, or `None` |
+| `window_size` | Persisted accumulation length, checked on restore |
+| `accumulation` | Actual partial gradient/statistic/effect/replay state, or `None` |
 
-`state.averaged` overlays EMA leaves onto `state.params`. It raises when no EMA is configured. It does not silently return live variables. Dynamic loss-scaler state is not currently part of this checkpointed structure.
+`state.averaged` overlays EMA leaves onto `state.params` and raises when no EMA is configured. For fixed window length K, the accepted fill is `microstep % K`. A partial window is checkpointed without flushing.
 
 ## Dataset and Loading
 

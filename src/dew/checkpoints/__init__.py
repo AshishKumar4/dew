@@ -331,11 +331,17 @@ class Checkpoints:
                 # iterator's position, so it comes from the checkpoint's own
                 # metadata, not from the template. A local checkpoint
                 # holds it as a device array, replicated like the step.
-                item['position'] = jax.tree.map(
+                target = next(iter(jax.tree.leaves(item)), None)
+                target_sharding = getattr(target, "sharding", None)
+                position_sharding = (
+                    jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
+                    if isinstance(target_sharding, jax.sharding.NamedSharding) else
+                    jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+                item["position"] = jax.tree.map(
                     lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
                     dict(metadata['position']))
                 restore_args['position'] = jax.tree.map(
-                    lambda leaf: (ocp.ArrayRestoreArgs(sharding=item['step'].sharding,
+                    lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
                                                        global_shape=leaf.shape)
                                   if from_local else ocp.RestoreArgs()),
                     item['position'])

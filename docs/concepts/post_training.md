@@ -99,7 +99,7 @@ for before, after in zip(
     jax.tree.leaves(reference), jax.tree.leaves(state.ema), strict=True
 ):
     np.testing.assert_array_equal(before, np.asarray(after))
-print("Completed", int(state.step), "DPO updates; reference stayed fixed.")
+print("Completed", int(state.updates), "DPO updates; reference stayed fixed.")
 ```
 
 You should see two training updates and the final confirmation. This run writes no checkpoints or tracker records. For a real dataset, construct both sequences with the same tokenizer and chat format, verify their common prompt, and derive masks from known token boundaries. Do not search arbitrary strings for an assistant marker and assume the resulting character offset is a token boundary.

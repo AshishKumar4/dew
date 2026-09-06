@@ -935,9 +935,64 @@ def mode_builtin_preview_failures(args) -> dict:
     return reports
 
 
+def mode_training_contract(args) -> dict:
+    """A rejected shard and a partial composite checkpoint in a real pool."""
+    import jax
+    import jax.numpy as jnp
+    from dew.checkpoints import Checkpoints
+    from dew.training.distributed import shard_batch
+    from test_training_transactions import Tiny, ShortScaleTrainer
+    import optax
+
+    class Rows(Tiny):
+        def loss(self, variables, batch, step):
+            return super().loss(variables, {**batch, "bad": jnp.any(batch["bad"])}, step)
+
+    checkpoints = Checkpoints(args.run_dir)
+    def build():
+        return ShortScaleTrainer(Rows(True), optax.adamw(.03, weight_decay=.1),
+                                 key=jax.random.PRNGKey(9), accumulation=2,
+                                 dynamic_scale=True, checkpoints=checkpoints)
+    trainer = build()
+    state, _, _ = trainer.place()
+    rank, processes = jax.process_index(), jax.process_count()
+    per_process = 8 // processes
+    begin, end = rank * per_process, (rank + 1) * per_process
+    data = []
+    for attempt in range(4):
+        weights = np.array([1., .5, 1., .5, 0., 0., 0., 0.], np.float32)
+        bad = np.zeros(8, bool)
+        bad[-1] = attempt == 1
+        local = {"y": np.linspace(1., 2., 8, dtype=np.float32)[begin:end],
+                 "mask": weights[begin:end], "bad": bad[begin:end], "active": np.array(1, np.int32)}
+        data.append(shard_batch(trainer.device_mesh, local))
+    step = trainer.compile(state, data[0])
+    flags = []
+    for attempt, batch in enumerate(data):
+        state, loss, _, finite, accepted = step(state, batch)
+        flags.append([bool(as_numpy(finite)), bool(as_numpy(accepted))])
+        if attempt == 0:
+            checkpoints.save(1, state, None, {"loss": float(as_numpy(loss))})
+    checkpoints.wait()
+    uninterrupted = as_numpy(state)
+    resumed_trainer = build()
+    restored, _, _ = resumed_trainer.place()
+    step = resumed_trainer.compile(restored, data[1])
+    for batch in data[1:]:
+        restored, *_ = step(restored, batch)
+    resumed = as_numpy(restored)
+    same = all(np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True))
+    return {"flags": flags, "resumed_equal": same,
+            "state": [np.asarray(x).tolist() for x in jax.tree.leaves(resumed)],
+            "clocks": [int(resumed.step), int(resumed.microstep), int(resumed.updates)],
+            "scale": float(resumed.scale.scale)}
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
+         "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
          "builtin_preview_failures": mode_builtin_preview_failures}
