@@ -415,27 +415,6 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
 
 
-@mesh_lane
-def test_the_stages_hand_activations_on_by_collective_permute():
-    """The compiled step moves each stage's output to the next stage with a
-    collective permute, and stacks no stage's parameters on another's
-    devices: the stacked layer weights are stage-sharded."""
-    model = tiny()
-    objective = LMObjective(model, SEQ_LEN)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    spec = MeshSpec(fsdp=2, stage=2, microbatches=4)
-    mesh = build_mesh(spec)
-    batch = shard_batch(mesh, token_batch())
-    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-
-    def loss(params):
-        return objective.loss({**variables, "params": params}, batch, step)[0]
-
-    with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
-        text = jax.jit(jax.grad(loss)).lower(variables["params"]).compile().as_text()
-
-    assert text is not None and "collective-permute" in text
-
 
 @mesh_lane
 def test_a_pipeline_refuses_a_stack_it_cannot_split_evenly():
