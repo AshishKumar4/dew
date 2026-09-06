@@ -138,6 +138,37 @@ def flat(batch):
     return (ids[:, 0], ids[:, 1], mask[:, 0], mask[:, 1])
 
 
+def test_identical_reference_has_zero_rewards_and_tied_accuracy():
+    objective = DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=.5)
+    params = objective.init(jax.random.key(0))
+    loss, aux = scalar_loss(objective, params, pair_batch(), Step(jnp.array(0), jax.random.key(1), params))
+    assert float(loss) == pytest.approx(np.log(2), rel=1e-6)
+    assert float(aux.metrics["rewards/chosen"]) == 0.
+    assert float(aux.metrics["rewards/rejected"]) == 0.
+    assert float(aux.metrics["accuracy"]) == 0.
+
+
+def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
+    model = TinyHead(vocab_size=VOCAB)
+    objective = DPOObjective(model, WIDTH - 1, beta=.5)
+    reference = objective.init(jax.random.key(0))
+    params = jax.tree.map(lambda x: x + .1, reference)
+    batch = pair_batch()
+    loss, aux = scalar_loss(objective, params, batch, Step(jnp.array(0), jax.random.key(1), reference))
+    chosen, rejected, chosen_mask, rejected_mask = flat(batch)
+    def score(variables, ids, mask):
+        logits = model.apply(variables, jnp.asarray(ids[:, :-1]))
+        log_probs = jax.nn.log_softmax(logits)
+        selected = np.take_along_axis(np.asarray(log_probs), ids[:, 1:, None], axis=-1)[..., 0]
+        return (selected * mask).sum(axis=-1)
+    rewards_chosen = .5 * (score(params, chosen, chosen_mask) - score(reference, chosen, chosen_mask))
+    rewards_rejected = .5 * (score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask))
+    np.testing.assert_allclose(aux.metrics["rewards/chosen"], rewards_chosen.mean(), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
+    assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
+    np.testing.assert_allclose(loss, np.logaddexp(0, rewards_rejected - rewards_chosen).mean(), rtol=1e-6)
+
+
 def test_the_loss_composes_the_term_over_head_log_probs():
     """The objective's loss is the preference term over the chunked head's
     per-token log-probabilities, policy from the live params and reference

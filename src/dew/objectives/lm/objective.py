@@ -181,7 +181,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         model,
         seq_len: int,
         *,
-        ema_decay: float = 0.999,
+        ema_decay: float | None = 0.999,
         pad_id: Optional[int] = None,
         head_chunks: int = 4,
         samples: Optional[Samples] = None,
@@ -257,7 +257,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.mtp_weight = mtp_weight
         self.qk_stats = qk_stats
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         if samples is not None:
             self._prompt = prompt_batch(samples.prompt)
 

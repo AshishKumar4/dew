@@ -39,7 +39,7 @@ class GRPOObjective(LMObjective):
     (`verl/trainer/ppo/core_algos.py`, `compute_policy_loss_vanilla` with
     `token-mean` and `kl_penalty_forward` with `k3`).
 
-    `beta` is the KL strength, 0.0 leaving the reference unread;
+    `beta` is the KL strength; 0.0 allocates no frozen reference.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points;
     `model` and `seq_len` are the LMObjective's, with `seq_len` one below the
     prompt width plus the response width. An `ema_decay` argument is refused,
@@ -59,7 +59,7 @@ class GRPOObjective(LMObjective):
             raise ValueError(
                 "the response mask already says which targets count, "
                 "so loss_role is refused on a GRPO objective")
-        kwargs["ema_decay"] = 1.0
+        kwargs["ema_decay"] = 1.0 if beta > 0 else None
         super().__init__(model, seq_len, **kwargs)
         self.beta = beta
         self.epsilon_low = epsilon_low

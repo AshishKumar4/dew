@@ -306,6 +306,8 @@ class Checkpoints:
                 raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
             if (metadata["scale"] is None) != (template.scale is None):
                 raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
+            if (metadata["ema"] is None) != (template.ema is None):
+                raise ValueError("checkpoint EMA configuration differs from this run")
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
             # about none. A local checkpoint knows device arrays only, so its

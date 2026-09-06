@@ -92,11 +92,9 @@ class DPOObjective(LMObjective):
         policy_rejected = self.per_token_log_probs(params, rejected_ids)
         ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
         ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
-        terms = preference_logsigmoid_terms(
+        terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
-        pair_chosen = self.beta * (policy_chosen * chosen_mask).sum(-1)
-        pair_rejected = self.beta * (policy_rejected * rejected_mask).sum(-1)
         accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
         return Mean(jnp.sum(terms), jnp.asarray(terms.size)), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),

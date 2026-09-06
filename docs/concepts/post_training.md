@@ -106,9 +106,9 @@ You should see two training updates and the final confirmation. This run writes 
 
 ### Account for reference memory
 
-Dew stores the DPO reference in `TrainState.ema`. EMA means *exponential moving average*, but DPO fixes its decay to 1, so this tree never moves. The objective refuses an `ema_decay` override. You do not create a second model object or optimize the reference, but you still retain a separate parameter tree and run reference forward passes. Budget memory for policy parameters, reference parameters, optimizer state, gradients, activations, and batches. Reusing the EMA field does not make the reference free.
+Dew stores the DPO reference in `TrainState.ema`. EMA means *exponential moving average*, but DPO fixes its decay to 1, so this tree never moves. The objective refuses an `ema_decay` override. `rewards/chosen` and `rewards/rejected` are beta times each side's policy-minus-reference sequence log-ratio, so an unmoved policy reports zero rewards and no wins. You do not create a second model object or optimize the reference, but you still retain a separate parameter tree and run reference forward passes. Budget memory for policy parameters, reference parameters, optimizer state, gradients, activations, and batches. Reusing the EMA field does not make the reference free.
 
-SFT uses the language-model objective's moving EMA by default. GRPO also allocates a frozen EMA reference, even when `beta=0` skips reference rescoring. The `pretrained` argument takes a full Flax variables mapping, including its outer `params` collection. At a new DPO or GRPO stage, that initialization becomes the frozen reference.
+SFT uses the language-model objective's moving EMA by default; pass `ema_decay=None` to train without any averaged copy. GRPO allocates the frozen reference only when `beta > 0`. The `pretrained` argument takes a full Flax variables mapping, including its outer `params` collection. At a new DPO or GRPO stage, that initialization becomes the frozen reference.
 
 ## GRPO: generate answers and score them
 

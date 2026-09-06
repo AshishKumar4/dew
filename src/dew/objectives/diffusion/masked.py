@@ -48,7 +48,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         seq_len: int,
         *,
         head_chunks: int = 4,
-        ema_decay: float = 0.999,
+        ema_decay: float | None = 0.999,
         sampler: Unmask = Unmask(),
         steps: int = 64,
         samples: int = 4,
@@ -70,7 +70,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def init(self, key):
