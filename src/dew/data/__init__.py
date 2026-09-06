@@ -18,6 +18,7 @@ from .images import (AestheticCoyo, CC3M, CC12M, Combined30M, CombinedAesthetic,
                      CombinedMsml612, DiffusionDB, HFImages, ImageDataset, Laion2bAesthetic,
                      Laion12mCoco, LaionaCoco, LaionaCocoCoyo, OxfordFlowers)
 from .processors import AutoAudioProcessor, AutoTextTokenizer
+from .prompts import Prompts
 from .sources.hf import HFDatasetSource
 from .sources.text import TokenDocumentSource, TokenFileSource
 from .streaming import CombinedOnline, OnlineImages
@@ -30,6 +31,6 @@ __all__ = [
     "CC12M", "CC3M", "ChatMessages", "Combined30M", "CombinedAesthetic", "CombinedMsml612", "CombinedOnline",
     "Checkpointable", "Dataset", "DatasetSpec", "DiffusionDB", "HFDatasetSource", "HFImages", "HFTokenizer",
     "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
-    "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "Role",
+    "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers", "PackedTokens", "Prompts", "Role",
     "TokenDocumentSource", "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "local_batch",
 ]

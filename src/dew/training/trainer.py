@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +54,18 @@ CompiledStep = Callable[
           Mapping[str, jax.Array], jax.Array]]
 """What `Trainer.compile` returns: `(state, scale, batch)` in, `(state, scale,
 loss, metrics, finite)` out."""
+
+
+class Rollout(Protocol):
+    """A host-side batch producer the trainer runs before the compiled step.
+
+    Sampling is effectful and untraceable, so it lives outside `jit`: the
+    trainer calls the rollout with the state, the prefetched batch and a key
+    folded from the run key and the step, then reshards what comes back with
+    `shard_batch`. The returned batch must hold arrays in fixed shapes, so
+    the step still compiles once per run."""
+
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,6 +188,7 @@ class Trainer:
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
         step: Callable[[Objective, optax.GradientTransformation], StepFn] | None = None,
+        rollout: Rollout | None = None,
         profile: Profile | None = None,
     ):
         """`accumulation` wraps the optimizer in `optax.MultiSteps` here, and
@@ -183,7 +196,8 @@ class Trainer:
         the compiled step's body with `step(objective, optimizer)`, for an
         update that is not one loss (a GAN's alternating optimizers); it then
         owns the step counter, the EMA and the `Aux.variables` write-back,
-        with `ema_update` and `write_back` at hand."""
+        with `ema_update` and `write_back` at hand. `rollout` produces the
+        batch the step consumes; None trains the prefetched batch untouched."""
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
         self.objective = objective
@@ -198,6 +212,7 @@ class Trainer:
         self.checkpoints = checkpoints
         self.tracker = tracker
         self.step = step
+        self.rollout = rollout
         self.profile = profile
         # Measured off the compiled step, once per fit.
         self.flops_per_step = None
@@ -440,6 +455,9 @@ class Trainer:
         last_saved = current if checkpoints is not None and current else None
         interval_steps = 0
         steps_since_log = 0
+        # Seconds spent sampling this interval, logged under
+        # train/rollout_seconds when a rollout is set.
+        rollout_seconds = 0.0
         # The interval's loss and both bad-loss counters live on device, so the
         # loop never blocks on a result, and move together in one dispatch.
         # `worst_bad_run` remembers the longest streak of non-finite losses
@@ -456,6 +474,17 @@ class Trainer:
                   f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
         while current < steps:
             batch = next(train)
+            if self.rollout is not None:
+                # Host-side and untraceable: sampling, scoring, advantages.
+                # The key folds the step key once more, keeping the
+                # rollout's draws off the step's stream; both are
+                # checkpointed, so a resumed run samples forward. Fixed
+                # shapes mean the compile below traces once.
+                began = time.perf_counter()
+                key = jax.random.fold_in(
+                    jax.random.fold_in(state.key, state.step), 1)
+                batch = shard_batch(mesh, self.rollout(state, batch, key))
+                rollout_seconds += time.perf_counter() - began
             if train_step is None:
                 train_step = self.compile(state, batch, scale)
                 last_log_time = time.time()
@@ -494,10 +523,12 @@ class Trainer:
                                **{f"train/{k}": float(v) for k, v in aux.items()},
                                **self._throughput(now - last_log_time, steps_since_log,
                                                   data.batch)}
+                    if self.rollout is not None:
+                        scalars["train/rollout_seconds"] = rollout_seconds
                     print(f"step {current}: loss {scalars['train/loss']:.4f}")
                     if self.tracker is not None:
                         self.tracker.log(scalars, current)
-                    last_log_time, steps_since_log = now, 0
+                    last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
 
             if eval_every and current % eval_every == 0 and current < steps:
                 paused = time.perf_counter()

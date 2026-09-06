@@ -290,6 +290,12 @@ class LMObjective(Objective):
                     targets[:, depth:], segment_ids, losses.dtype, depth)))
         return losses, weights, correct, sown, depth_scores
 
+    def per_token_log_probs(self, params, tokens):
+        """Next-token log-probabilities, negated cross entropies, over a
+        `[B, seq_len + 1]` batch: the `[B, seq_len]` row per token the
+        rollout reads back for `old_log_probs`."""
+        return -self.token_scores(params, tokens)[0]
+
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """1 where a target counts: not padding, and in a packed batch inside
         the document of the state that predicts it, which sits `depth + 1`
