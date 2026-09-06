@@ -20,7 +20,7 @@ Two distinctions affect the ranking. Dew's pipeline computes stages on separate 
 
 | Knob | What it is | Who ships it and source | Dew today | Gap | Fit |
 |---|---|---|---|---|---|
-| `run_name` | Run identifier and automatic resume namespace. | MaxText [base.yml:21][maxtext-base] | Async persistent Orbax manager (`src/dew/checkpoints/__init__.py:121-150`). | Run directory is explicit; no separate output-root/run-name pair. | Trainer Checkpoints and run config; keep one path. |
+| `run_name` | Run identifier and automatic resume namespace. | MaxText [base.yml:21][maxtext-base] | `TrainerConfig.name` and `checkpoint_dir`; recipes save below the selected name (`src/dew/config/__init__.py:124-125,296-321`). | The root/name pair already exists; naming and resume policy need contract-level comparison. | Reuse run configuration and Checkpoints. |
 | `model_name` | Select a model override configuration. | MaxText [base.yml:23][maxtext-base] | DecoderFamily registry (`src/dew/interop/hf_decoders.py:2280-2305`). | Family coverage must be checked at the model boundary. | DecoderFamily registry. |
 | `override_model_config` | Allow CLI overrides of family geometry for experiments. | MaxText [base.yml:24][maxtext-base] | Decoder geometry and per-layer kinds (`src/dew/nn/backbones/causal_transformer.py:821-873`). | Direct constructor fields already allow overrides. | DecoderFamily registry; no extra override flag. |
 | `override_logical_axis_rules` | Replace logical rules instead of merging defaults. | MaxText [base.yml:25][maxtext-base] | Parameter Layout rules and tolerance (`src/dew/training/distributed.py:205-305`). | Dew accepts a complete rule tuple; no merging switch. | MeshSpec/Layout; keep explicit rules. |
@@ -307,7 +307,7 @@ Two distinctions affect the ranking. Dew's pipeline computes stages on separate 
 | Knob | What it is | Who ships it and source | Dew today | Gap | Fit |
 |---|---|---|---|---|---|
 | `record_internal_nn_metrics` | Record internal neural-network metrics. | MaxText [base.yml:469][maxtext-base] | Step, evaluation, logging and checkpoint cadence (`src/dew/training/trainer.py:422-590`). Tracker protocol (`src/dew/training/tracker.py:1-45`). | Tracker and run config exist; storage sinks and internal metric selection differ. | Trainer Tracker capability; model diagnostics travel in Objective Aux. |
-| `base_output_directory` | Parent directory for checkpoints and run outputs. | MaxText [base.yml:473][maxtext-base] | Async persistent Orbax manager (`src/dew/checkpoints/__init__.py:121-150`). | Run directory is explicit; no separate output-root/run-name pair. | Trainer Checkpoints and run config; keep one path. |
+| `base_output_directory` | Parent directory for checkpoints and run outputs. | MaxText [base.yml:473][maxtext-base] | `TrainerConfig.checkpoint_dir` plus the recipe name form the output path (`src/dew/config/__init__.py:124-125,302-321`). | Existing run-root control; remote storage and output layouts require separate verification. | Reuse run configuration and Checkpoints. |
 
 ### Multi-tier and emergency checkpoints
 
