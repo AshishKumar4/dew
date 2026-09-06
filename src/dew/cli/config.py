@@ -11,7 +11,10 @@ import dataclasses
 import json
 import os
 import tomllib
+import tempfile
 from pathlib import Path
+
+from filelock import FileLock
 
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
 
@@ -120,20 +123,40 @@ def cached_zone(name: str) -> str | None:
     return _zone_cache().get(name)
 
 
-def cache_zone(name: str, zone: str) -> None:
-    cache = _zone_cache()
-    if cache.get(name) == zone:
-        return
-    cache[name] = zone
+def _update_zone_cache(name: str, zone: str | None) -> None:
     path = zone_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    with FileLock(str(path) + ".lock"):
+        cache = _zone_cache()
+        if zone is None:
+            if cache.pop(name, None) is None:
+                return
+        else:
+            if cache.get(name) == zone:
+                return
+            cache[name] = zone
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=".zones-", suffix=".json", delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def cache_zone(name: str, zone: str) -> None:
+    _update_zone_cache(name, zone)
 
 
 def forget_zone(name: str) -> None:
-    cache = _zone_cache()
-    if cache.pop(name, None) is not None:
-        zone_cache_path().write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    _update_zone_cache(name, None)
 
 
 def split_type(accelerator_type: str) -> tuple[str, int]:
