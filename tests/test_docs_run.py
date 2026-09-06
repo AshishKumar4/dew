@@ -1,41 +1,21 @@
-"""The code in the documentation runs.
+"""Execute user-documentation Python blocks from an empty namespace.
 
-Every ```python block in README.md and docs/**/*.md is executed in file order,
-in one namespace per file, on CPU. The namespace starts with the small real
-objects a snippet refers to without building them (`data`, `steps`,
-`prompt`, `key`, a tiny `model`, `objective`, `trainer`, `state`, `process`,
-`inputs`, `text`, `fields`), so a block that trains does so for a few steps on
-random records, and a block that names a symbol the library lacks, or calls
-it with arguments it does not take, fails here before a reader's terminal.
-
-A block whose first line is `# runs elsewhere: <reason>` is compiled but not
-run; the reason is for the reader (a download, a run directory on disk, a
-process pool). A syntax error or a misspelled import in it still fails.
-
-The tutorials are notebooks, so they are checked, not executed: every
-`dew` name a code cell imports has to exist, and every call of one of those
-names has to match its signature. That is what a markdown block gets for free
-by being run, and without it a notebook keeps naming a symbol the library
-deleted until a reader finds out.
-
-The seven tutorials on the pre-registry API are named in `PENDING` and their
-check is a strict xfail, so the marker erases itself: the first notebook
-ported to the built API fails as an unexpected pass until its name comes off
-the list, and a new notebook is checked from the day it is added.
+Each page gets a separate process and temporary working directory. Blocks
+run in page order; setup must appear on the page. Download-dependent blocks
+labelled runs elsewhere are syntax-checked only. Notebook checks validate
+imports and signatures without claiming notebook execution.
 """
 
 import ast
-import contextlib
 import importlib
 import inspect
-import itertools
 import json
 import os
 import re
 import sys
+import subprocess
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,105 +39,43 @@ PENDING = (
 )
 ELSEWHERE = re.compile(r"^\s*# runs elsewhere: \S")
 
-RES, TOKENS, BATCH = 16, 8, 8
-
-
 def blocks(path: Path) -> list[tuple[int, str]]:
     text = path.read_text()
     return [(text.count("\n", 0, match.start()) + 2, match.group(1))
             for match in BLOCK.finditer(text)]
 
 
-def tiny_world(tmp_path):
-    """The objects a snippet assumes exist, at a size that trains in seconds.
-
-    The repository's `tests` directory sits in the world at its own path, so
-    a snippet reads a committed fixture the way a reader at the root does,
-    while everything it writes lands in the temporary directory.
-    """
-    (tmp_path / "tests").symlink_to(ROOT / "tests")
-    import jax
-    import optax
-
-    import dew
-    from dew import Checkpoints, Condition, Field, InputSpec, MeshSpec, Trainer, models, presets
-    from dew.data import ByteTokenizer, Dataset
-    from dew.inputs import CharTable
-    from dew.objectives.diffusion import DiffusionObjective
-
-    def batches():
-        rng = np.random.RandomState(0)
-        encoder = CharTable.from_pretrained(tokens=TOKENS)
-        while True:
-            yield {"image": rng.randint(0, 256, (BATCH, RES, RES, 3), np.uint8),
-                   "text": encoder.tokenize(["a flower"] * BATCH),
-                   "label": rng.randint(0, 5, (BATCH,), np.int32)}
-
-    data = Dataset(train=batches, val=lambda: itertools.islice(batches(), 1),
-                   records=4 * BATCH, batch=BATCH)
-    text = CharTable.from_pretrained(tokens=TOKENS)
-    inputs = InputSpec(Field("image", (RES, RES, 3)), {"textcontext": Condition(text)})
-    fields = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
-    model = models.SimpleDiT(**fields)
-    process = presets.EDM()()
-    objective = DiffusionObjective(model, process, inputs, steps=2)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
-                      checkpoints=Checkpoints(str(tmp_path / "runs" / "flowers")))
-    state = trainer.fit(data, steps=2, log_every=1)
-    return dict(
-        __name__="__docs__", dew=dew, jax=jax, optax=optax, np=np,
-        data=data, steps=2, key=jax.random.key(0), text=text, inputs=inputs, fields=fields,
-        model=model, process=process, objective=objective, trainer=trainer, state=state,
-        prompt=np.asarray([list(b"ROMEO:")], np.int32), tokenizer=ByteTokenizer(),
-        optimizer=optax.adam(1e-3), meta={"vocab_size": 256},
-    )
-
-
-@contextlib.contextmanager
-def registries_restored():
-    """A snippet that registers a model (README's `@models("my_dit")`) must
-    not leave it behind for the tests that share this worker: the sweep over
-    every registered model would then meet a class no case covers. Entered
-    after `tiny_world` has built its objects, so every table is filled before
-    the snapshot; dew's exports register lazily."""
-    from dew import registry
-
-    tables = [registry.models, registry.presets, registry.samplers, registry.datasets,
-              registry.encoders, registry.metrics, registry.objectives]
-    before = [dict(table._members) for table in tables]
-    try:
-        yield
-    finally:
-        for table, members in zip(tables, before):
-            table._members.clear()
-            table._members.update(members)
-
-
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
-def test_the_documented_code_runs(path, tmp_path, monkeypatch):
-    found = blocks(path)
-    if not found:
-        pytest.skip("no python blocks")
-    monkeypatch.chdir(tmp_path)
-    namespace = tiny_world(tmp_path)
-    # Concept pages name jax bare where a snippet builds an array.
-    if path != ROOT / "README.md":
-        namespace.update(dict(jnp=__import__("jax.numpy", fromlist=["x"]), jax=__import__("jax")))
-    with registries_restored():
-        for line, source in found:
-            where = f"{path.relative_to(ROOT)}:{line}"
-            code = compile(source, where, "exec")
-            if ELSEWHERE.match(source):
-                continue
-            try:
-                exec(code, namespace)
-            except Exception as error:  # noqa: BLE001 - the report names the block
-                raise AssertionError(f"{where} failed: {type(error).__name__}: {error}") from error
+def test_the_documented_code_runs(path, tmp_path):
+    executable = []
+    for line, source in blocks(path):
+        location = f"{path.relative_to(ROOT)}:{line}"
+        compile(source, location, "exec")
+        if not ELSEWHERE.match(source):
+            executable.append((location, source))
+    if not executable:
+        pytest.skip("no offline executable Python blocks")
+    runner = (
+        "import json, sys\n"
+        "namespace = {'__name__': '__main__'}\n"
+        "for location, source in json.loads(sys.argv[1]):\n"
+        "    exec(compile(source, location, 'exec'), namespace)\n"
+    )
+    environment = dict(os.environ)
+    for name in ("XLA_FLAGS", "JAX_DEFAULT_MATMUL_PRECISION", "JAX_NUM_CPU_DEVICES"):
+        environment.pop(name, None)
+    environment.update(PYTHONPATH=str(ROOT / "src"), JAX_PLATFORMS="cpu",
+                       JAX_NUM_CPU_DEVICES="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", runner, json.dumps(executable)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_the_api_page_is_the_code():
     """docs/api.md is generated; a module whose exports changed regenerates it."""
-    import subprocess
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "api_page.py"), "--check"],
         cwd=ROOT, capture_output=True, text=True,

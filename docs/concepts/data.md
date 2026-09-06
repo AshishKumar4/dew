@@ -1,59 +1,67 @@
-# The data pipeline
+# Supplying training data
 
-A dataset is a frozen dataclass in the `datasets` registry, and `load(batch=)` turns it into a `Dataset`, the value a run trains on:
+This guide assumes the [first training run](../getting-started.md). You should know the shape and dtype your loss expects. Dew passes named arrays from a dataset to the objective; the objective decides what those fields mean.
+
+## Start with batches you already have
+
+A `Dataset` contains a callable opening a training iterator, an optional callable opening a validation iterator, the number of training records when known, and a global batch size.
 
 ```python
-import dew
-from dew.data import Dataset, OxfordFlowers, TokenWindows
+import itertools
+import numpy as np
+from dew.data import Dataset
 
-spec = OxfordFlowers(image_size=128, val_batches=4)     # a DatasetSpec: what the data is and how it is read
-assert dew.datasets["oxford_flowers102"] is OxfordFlowers
-# data = spec.load(batch=32)                            # a Dataset: train, val, records, batch
+x = np.arange(16, dtype=np.float32).reshape(8, 2)
+y = x.sum(axis=1, keepdims=True)
+batch = {"features": x, "target": y}
+data = Dataset(train=lambda: itertools.repeat(batch),
+               val=lambda: iter([batch]), records=8, batch=8)
+first = next(data.train())
+assert first["features"].shape == (8, 2)
+np.testing.assert_array_equal(first["target"], y)
 ```
 
-`Dataset.train()` opens an endless shuffled stream of global batches. `Dataset.val()` opens one pass over the held-out records in a fixed order that ends by itself, and is `None` when nothing is held out. `records` is the count behind the training stream, so `steps_per_epoch` is one pass over them, and `batch` is the global batch. Image and video fields are uint8 in `[0, 255]`; tokenized text is the `{"input_ids", "attention_mask"}` dict an encoder's `tokenize` produces, under `"text"`; a token window is int32 ids under `"text"`. An objective converts pixels to `[-1, 1]` itself through `dew.inputs.unit_range`, so the dataset stays what the reader decoded.
+This example uses the same records for both splits only to demonstrate iterator construction. Use disjoint records for a real validation result. A training iterator should provide enough batches for the requested number of steps. A validation iterator must end after one pass.
 
-The spec's fields are its knobs, and because a recipe's config holds the spec as a tyro subcommand, they are the recipe's flags too: `data:oxford-flowers --data.image-size 128 --data.loading.workers 16`. A new dataset is a dataclass behind `@datasets(name)` and appears on the command line as a subcommand.
+The callable matters: `train()` must open a fresh iterator for a new or resumed run. Returning the same partially consumed iterator can change which records the run sees. Iterator lifetime and cancellation are under review; use separate processes for repeated isolated smoke runs until that issue is resolved.
 
-## What every spec shares
+## Match the objective's fields
 
-`dew.data.dataset` holds the plumbing the image, video and token specs have in common:
+| Use | Typical fields | Shape and dtype |
+|---|---|---|
+| Image diffusion | `image` | `(B, H, W, C)`, uint8 in `[0, 255]`; the objective converts to its model range |
+| Video diffusion | Configured video field | Batch, frame, height, width, channel dimensions; check the selected source and objective |
+| Next-token language modeling | `text` | `(B, S + 1)`, int32 token IDs; inputs and targets overlap by one position |
+| Packed language modeling | `text`, `text_segment_ids`, `text_positions` | Aligned token, document, and position arrays |
+| SFT | Packed token fields plus `text_roles` | Role IDs aligned with tokens; the objective selects target roles |
+| Custom objective | Your field names | Whatever your initialization and loss explicitly support |
 
-- `local_batch(batch)` computes the per-process batch and raises on a global batch the processes cannot split evenly.
-- `hold_out(source, records, held_out)` slices the head of a source off as the validation split and gives training the rest, so the two are disjoint.
-- `train_stream` builds grain's shuffled, sharded, repeated stream over the training slice, with the transformations applied after `to_iter_dataset` so they run in the workers.
-- `validation_pass` reads the held-out slice once in canonical order, sharded by process, and applies the random map before the per-process slice, so a record's augmentation is keyed by its global index and is the same on one host or eight.
+For text-conditioned diffusion, the condition encoder tokenizes the caption field and supplies a conditioning value to the model. These are not the same batches as autoregressive token windows. Keep token IDs, attention masks, padding IDs, and the tokenizer's vocabulary consistent with the selected checkpoint.
 
-Before a validation pass the processes agree on the batch count and every process scores that many.
+## Use a dataset specification
 
-## Determinism
+Built-in sources such as `OxfordFlowers`, `TokenWindows`, and `ChatMessages` are dataset specifications. Calling `load(batch=...)` prepares their data pipeline and returns a `Dataset`. Source-specific fields describe paths, tokenization, transforms, and splitting.
 
-Decoding, resizing and augmentation draw their randomness from the record's own generator, seeded from the spec's `seed` and the record's index. Each grain read thread runs its own copy of the augmentation pipeline, so a record gets the same pixels and the same caption at any `loading.workers`, any `loading.threads`, and any number of hosts. A failed record is dropped and counted.
+`Loading` configures Grain worker processes, read threads, and buffers. The defaults can start many workers; for a small local example use `Loading(workers=0)` on specifications that accept it. Increase concurrency only after measuring the input pipeline on your data and hardware.
 
-## The specs
+Image sources can require network access on first use. Token-window sources read files created by the tokenizer preparation tool. Streaming sources may depend on remote servers and may not expose a restorable iterator position. See [recipes](../recipes.md) for entry points and [installation extras](../installation.md#add-optional-dependencies) for dependencies.
 
-| Spec | Records | Notes |
-| --- | --- | --- |
-| `OxfordFlowers` | TFDS images, captioned from the class name through a prompt template | needs the `tfds` extra |
-| `HFImages` | a Hugging Face hub dataset with a `caption` or `text` column | `name`, `split`; needs the `streaming` extra |
-| `Laion12mCoco`, `CC12M`, `LaionaCoco`, `Combined30M` and the other named sets | captioned images from ArrayRecord shards on a GCS mount, one `dew.data.images.ArrayRecordImages` each | `path` is the mount |
-| `LocalVideos`, `VoxCeleb2` | video clips with audio, `frames` per record | need the `av` extra |
-| `TokenWindows` | `seq_len + 1` ids per record from `train.bin` and `val.bin` | written by `tools/tokenize_text.py` |
-| `PackedTokens` | documents packed into rows with segment ids and positions | the language model's packed path |
-| `OnlineImages`, `CombinedOnline` | images fetched from URL tables while training | no validation split; needs the `streaming` extra |
+## Epochs, batching, and packing
 
-`import dew.data` registers all of them and imports none of opencv, albumentations, TFDS, `datasets` or transformers; a spec imports what it needs when it is loaded.
+`Dataset.steps_per_epoch` uses integer division of `records` by the global batch size when a record count is available. It returns `None` when the count is unknown. Use an explicit step target for a stream without a finite record count.
 
-## Resuming mid-epoch
+Packing combines tokens from several documents into fixed-width rows. Document IDs prevent attention and target scoring from crossing document boundaries; position IDs restart according to the packing convention. All per-token metadata must follow the same slicing and packing as the token IDs.
 
-Grain iterators report their position through `get_state()`, and the prefetch iterator carries the position of the batch it last handed out. The trainer writes every process's position into the checkpoint's `position` entry and hands each process its own back on resume, so a resumed job continues where it stopped on every host. A checkpoint written by two processes raises when one process resumes it, since a position belongs to one process's shard. A stream without `get_state` cannot record a position, and `fit` raises if asked to checkpoint one.
+Padding and packing affect the number of valid targets, even when array shapes match. The current gradient accumulation path averages microbatch gradients, so unequal valid-token counts can differ from one combined token-mean loss. Do not claim those runs have equivalent effective batches without checking the normalization contract.
 
-## Measuring it
+## Resume from a data position
 
-`tools/benchmark_data.py` iterates a spec's training stream with no model attached and prints samples per second and p50/p95 step latency, with the first steps dropped so worker startup is not counted:
+A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires compatible data ordering, tokenizer, transforms, and process topology as well as the model checkpoint.
 
-```bash
-python tools/benchmark_data.py --steps 100 data:oxford-flowers --data.image-size 128
-```
+[Resuming training](../guides/checkpoints.md) shows the complete save/restore path. A model-only checkpoint cannot recover records consumed by an arbitrary generator.
 
-If that number is above what training reaches, the loader is not the bottleneck.
+## Use multiple processes
+
+`Dataset.batch` is global. With multiple JAX processes, each process supplies its share of the global batch; Dew assembles the sharded arrays. Built-in sources handle their process partitioning. A custom source must define it deliberately to avoid training on duplicated records.
+
+Start with a single-device run and inspect the batch. Then validate record identity, disjoint process slices, sharding, and resume behavior on the intended topology. The [distributed guide](distributed.md) explains placement; a local simulated mesh does not validate remote storage or cross-host failure recovery.

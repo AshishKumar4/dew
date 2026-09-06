@@ -1,59 +1,117 @@
-# The objectives seam
+# Writing a custom objective
 
-The trainer owns the mechanics: sharding, gradients, EMA bookkeeping, checkpoints, logging, the loops. An `Objective` owns what is being learned: the parameters it holds, the loss it computes from a batch, and what evaluation produces. Swapping the objective swaps the research question without touching any of the mechanics.
+This page assumes you have run [the first training example](../getting-started.md) and understand Flax Linen's `init` and `apply` methods. An `Objective` defines how to initialize a variables tree, compute a loss, and optionally evaluate a batch. `Trainer` differentiates the loss, applies the optimizer, and manages training state.
 
-## The interface
+## Initialization
 
-`dew.objectives.Objective` is three methods and three attributes.
+Subclass `dew.objectives.base.Objective`. Implement `init(key)` to return the complete Flax variables mapping, including a `params` collection. It can contain one model or several models, as long as your loss interprets the same structure.
 
-```python
-import jax
-from dew import Aux, EMASpec, InputSpec
-from dew.artifacts import Artifacts
-from dew.objectives.base import Variables
+The trainer traces initialization to determine shapes and then initializes variables with their device placement. Keep `init` pure: it should compute arrays from its key and configuration, without downloading weights or opening files. Load external weights explicitly before constructing an objective that accepts pretrained variables.
 
-class Objective:
-    inputs: InputSpec              # per-example shapes the tree is initialised from
-    ema: EMASpec | None = None     # which leaves get an exponential moving average, and how fast
-    artifact: type | None = None   # what evaluate returns
+The [regression tutorial](../getting-started.md#define-initialization-and-loss) includes a complete custom objective. Register an objective when a configuration needs to look it up through a registry. Passing an instance directly to `Trainer` requires no decorator.
 
-    def init(self, key) -> Variables: ...
-    def loss(self, params, batch, step) -> tuple[jax.Array, Aux]: ...
-    def evaluate(self, params, batch, step) -> Artifacts | None: ...
+## Loss and auxiliary values
+
+`loss(variables, batch, step)` returns `(scalar_loss, aux)`. The scalar must be differentiable with respect to `variables["params"]`. Batch fields are a contract between your data and objective: Dew does not infer whether a column is an image, a token sequence, or a label.
+
+`Aux(metrics=...)` contains scalar arrays to report with the loss. If a tracker is configured, the trainer records these values under `train/<name>` at the logging cadence. A metric in `Aux` is a training-batch measurement; it is not automatically a whole-validation-set score.
+
+Use `Aux.variables` for updated non-parameter collections, such as batch statistics. The update replaces the specified collections; it is not an optimizer update to the `params` collection. `Aux.qk_stats` supplies attention statistics to the optional QK-Clip optimizer path.
+
+## Update non-parameter state
+
+A variables tree is a nested mapping. Its outer keys are collections, such as `params` for trainable arrays and `batch_stats` for BatchNorm's running statistics. A leaf is one array, such as a kernel, bias, mean, or variance. A typical shape is:
+
+```text
+variables
+  params
+    projection: kernel, bias
+    norm: scale, bias
+  batch_stats
+    norm: mean, var
 ```
 
-`init` builds the whole variables tree from one key, every collection, and the tree can hold several modules: JEPA's holds a context encoder and a predictor, a diffusion objective's holds the model and its frozen condition encoders. It is pure, and the trainer traces it once for shapes and once for values.
+Linen returns changed collections from `apply(..., mutable=["batch_stats"])`. Pass those collections through `Aux.variables` so the trainer keeps them with the updated parameters. This complete example trains a BatchNorm model and verifies that the running mean was saved:
 
-`loss` returns the scalar and an `Aux`: a dict of metrics the trainer logs under `train/`, and optionally `variables`, non-parameter collections to write back into the tree. The trainer differentiates with respect to `params["params"]` only; every other collection is read as state. `Aux.variables` carries anything a step updates without a gradient: a mixture-of-experts objective moves its routing bias through it, and batch statistics or sown values travel the same way.
+```python
+import itertools
 
-`step` is a `Step`: the step number, the key for this step (`jax.random.fold_in(run_key, step)`, so every draw in a step is reproducible and no random state is carried or checkpointed), and `ema`, the averaged weights.
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import linen as nn
 
-`evaluate` returns a typed artifact or a tuple of them: an `ImageGrid`, `VideoGrid`, `TextSamples`, `TokenScores` or `Representations` from `dew.artifacts`. It is called once per validation batch with the arrays already on the mesh and outside any jit, so an objective jits its own device work inside it and decodes to host strings after. Nothing in an objective logs, opens a file or knows about a tracker; the trainer hands the artifacts to the metrics and the tracker.
+from dew import Trainer
+from dew.data import Dataset
+from dew.objectives.base import Aux, Objective
 
-`EMASpec(decay, select)` says which leaves the EMA copy tracks and how fast. `decay` is an optax schedule read at the count of completed optimizer updates, so a momentum ramp works. `select` is a `PathFilter`, a predicate over a leaf's path; the default `everything` averages the whole tree, and `under("params", "context_encoder")` is what JEPA uses, because its target encoder is the EMA of that subtree and the predictor must stay out of the average. The same filter type labels optimizer groups and frozen subtrees, so there is one way to name a part of the tree.
 
-## What the trainer does with it
+class NormalizedRegressor(nn.Module):
+    @nn.compact
+    def __call__(self, x, train=False):
+        x = nn.BatchNorm(use_running_average=not train, name="norm")(x)
+        return nn.Dense(features=1, name="projection")(x)
 
-`dew.training.Trainer` builds one compiled step around the objective's loss:
 
-- `jax.value_and_grad(loss, has_aux=True)` on the global batch. The loss is a mean over the batch-sharded axis, so its gradient carries the cross-device all-reduce by itself; there is no hand-written `pmean`.
-- With `dynamic_scale=True`, the mixed-precision branch runs the same loss through `DynamicScale.value_and_grad`; a step whose gradients came back non-finite keeps the old params and optimizer state, does not advance the step and does not move the EMA.
-- The EMA runs on the update clock, not the micro-batch clock. Under `accumulation=k` the params only move on every k-th micro-step, so the average happens on that step and the decay schedule is indexed by completed updates.
-- The collections in `Aux.variables` are written back into the tree after the update.
-- The step is compiled once with explicit in and out shardings and donates the train state. `Trainer.compile(state, batch)` returns the function that runs that step under the mesh context, and the benchmarks time it.
+class StatefulRegression(Objective):
+    def __init__(self):
+        self.model = NormalizedRegressor()
 
-Every `eval_every` steps the trainer runs the validation pass, calls `evaluate` on each batch, hands each artifact to the metrics that read its type, and to the tracker, which renders it. A `Metric` names the artifact type it `reads`, measures one batch, and `reduce`s a pass; `metrics.perplexity()` reads `TokenScores` and reduces to exp of the target-weighted mean over the whole pass, so a batch of padding weighs nothing. Every process agrees how many validation batches it holds before the pass starts, and an exception in evaluation fails the run.
+    def init(self, key):
+        return self.model.init(key, jnp.zeros((1, 4), jnp.float32), train=True)
 
-A `Trainer` opens nothing when constructed: no tracker, no checkpoint directory, no mesh. `fit` does, and only through the `Checkpoints` and `Tracker` it was given; a run with neither trains and validates locally and logs to the terminal.
+    def loss(self, variables, batch, step):
+        prediction, updated = self.model.apply(
+            variables, batch["x"], train=True, mutable=["batch_stats"],
+        )
+        mse = jnp.mean((prediction - batch["y"]) ** 2)
+        return mse, Aux(metrics={"mse": mse}, variables=updated)
 
-## The three objectives
 
-`dew.objectives.diffusion.DiffusionObjective(model, process, inputs, ...)`: sample a noise level from the process's schedule, corrupt the sample, predict, transform the prediction, weight the per-sample losses by the process's weighting. The conditions are dropped on `unconditional_prob` of each batch so classifier-free guidance has an unconditional model to steer against. Its `evaluate` samples `VALIDATION_SAMPLES` images through `dew.sampling.sample` with the solver, guidance and step count it was constructed with, and returns an `ImageGrid` or a `VideoGrid`. With an autoencoder configured, the objective encodes the batch first and trains in latent space; the model's channel fields are then the autoencoder's `latent_channels`, 4 for the Stable Diffusion VAE, while `InputSpec` still takes the pixel shape. The frozen condition encoders' parameters live under `params["encoders"]`, placed by the layout like any other leaf, so the compiled step carries no encoder constants.
+x = np.arange(32, dtype=np.float32).reshape(8, 4)
+batch = {"x": x, "y": x.mean(axis=1, keepdims=True)}
+data = Dataset(train=lambda: itertools.repeat(batch), val=None, records=8, batch=8)
+objective = StatefulRegression()
+trainer = Trainer(objective, optax.sgd(0.001), key=jax.random.key(0))
+state = trainer.fit(data, steps=3, log_every=1)
+running_mean = np.asarray(state.params["batch_stats"]["norm"]["mean"])
+assert np.all(running_mean > 0)
+print("Stored running mean:", running_mean)
+```
 
-`dew.objectives.jepa.JepaObjective(encoder, predictor, mask, sample, ...)` predicts the representation of masked target blocks from the representation of the visible context, in latent space. The context encoder is trained, the target encoder is the EMA copy and is stop-gradiented, and the predictor maps context embeddings plus target positions to the target representations. Targets are layer-normalised without a learned affine before the L2 loss, which fixes the scale of the prediction problem. Every step reports `repr_std` and `repr_cov_offdiag`, because the characteristic failure of this objective is silent collapse: both encoders agree on a constant and the loss goes to zero. Its `evaluate` returns `Representations`, which `metrics.linear_probe` and `metrics.knn_probe` read.
+`updated` contains the complete replacement `batch_stats` collection from this call. Omitting a nested leaf is not a request to merge part of a collection. Keep parameter changes in the optimizer; do not return a replacement `params` collection through `Aux.variables`. At inference, call this model with `train=False` to use the stored running statistics. A few updates do not calibrate BatchNorm for a real dataset.
 
-`dew.objectives.lm.LMObjective(model, seq_len, ...)` is next-token cross entropy through the chunked fp32 head, with padding and packed-document boundaries weighted out. Its `evaluate` returns `TokenScores` for every pass and `TextSamples` when `samples` are configured. `dew.diffusion.discrete.MaskedDiffusionObjective` is the same model with full attention under a masking process, on the same data path; nothing in the trainer knows the difference.
+The [core reference](../reference/core-api.md#collections-and-ema-selection) describes collection and EMA selection contracts.
 
-## Writing one
+## Randomness
 
-Implement `init`, `loss` and `evaluate`, set `inputs` and, if wanted, `ema`, register the class with `@objectives(name)`, and hand an instance to the `Trainer`. `tests/test_objectives.py` drives a two-parameter `ConstantObjective` through the same loop, which is the shortest example of what the seam requires.
+`step` is a `Step` containing a scalar step number, a JAX key, and optional averaged variables. Use `jax.random.split(step.key, n)` when the loss needs several independent random draws. Do not create a new fixed key inside the loss, since that repeats noise or dropout masks.
+
+A `TrainState` stores the run key. A deterministic step key does not by itself guarantee bitwise equality across devices, compiler versions, different reduction orders, or untracked data-loader randomness. Exact continuation also depends on checkpointing the relevant state and iterator position.
+
+## Moving-average variables
+
+The base `Objective` has `ema=None`. Set an `EMASpec` only when the method uses an exponential moving average. It specifies a decay schedule and a path filter selecting the leaves to average. JEPA selects its context encoder; DPO uses unit decay for a frozen reference.
+
+The trainer stores the selected copy in `TrainState.ema`. `state.averaged` overlays that copy onto the live variables tree. It raises when the objective has no EMA. Some built-in objectives enable EMA by default, so account for the extra parameter storage when sizing a run.
+
+The default training step updates EMA on optimizer-update boundaries when gradient accumulation is enabled. The current implementation has unresolved overflow/checkpoint clock issues and does not preserve token-weighted equivalence across unequal-mask microbatches. See [capabilities and limitations](../reference/support.md).
+
+## Evaluation
+
+Override `evaluate(variables, batch, step)` when you need validation artifacts. It can return one artifact, a tuple of artifacts, or `None`. Existing artifact types include token scores, image grids, text samples, and learned representations. A metric declares which artifact type it reads, computes its per-batch contribution, and reduces the contributions over a pass.
+
+Evaluation is opt-in at the training call: provide validation data and set `eval_every`. Passing `metrics` alone does not trigger it. Evaluation runs outside the compiled optimization step; compile expensive device computation within your evaluation implementation when needed. [Evaluation and tracking](../guides/evaluation.md) describes scheduling, metrics, and current limitations.
+
+## Choose a built-in objective
+
+| Objective | Expected model and data |
+|---|---|
+| `LMObjective` | A decoder with hidden-state and vocabulary-head methods; integer token rows, optionally packing and role fields |
+| `DiffusionObjective` | A model accepting noisy samples, noise levels, and configured conditions; image or video batches |
+| `JepaObjective` | A context encoder and predictor; image or video batches and a masking specification |
+| `DPOObjective` | A language decoder; chosen/rejected token pairs and completion masks |
+| `GRPOObjective` | A language decoder; generated responses with old log probabilities, masks, rewards, and advantages |
+
+A built-in objective's model contract is more specific than `flax.linen.Module`. Use the corresponding guide before replacing its model. For a different loss or state layout, implement your own objective with explicit field and method requirements.
