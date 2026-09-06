@@ -65,8 +65,8 @@ av = ["opencv-python", "moviepy"]
 metrics = ["scipy", "requests"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
-# TFDS-backed dataset sources
-tfds = ["tensorflow-datasets", "tensorflow"]
+# Prepared TFDS ArrayRecords; dataset preparation has its own environment.
+tfds = ["tensorflow-datasets>=4.9.10"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
 
