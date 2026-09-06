@@ -9,17 +9,17 @@ Tolerances and the largest differences observed, fp32 on CPU:
 | quantity | tolerance | verl | Tunix |
 | --- | --- | --- | --- |
 | masked mean, per row | 2e-7 | 0.0 | 0.0 |
-| masked whiten | 5e-7 | 2.4e-07 | 0.0 |
+| masked whiten, kept positions | 5e-7 | 2.4e-07 | 0.0 |
 | group advantage, normalised | 2e-7 | 1.2e-07 | 1.2e-07 |
 | group advantage, unnormalised | 2e-7 | 0.0 | 0.0 |
 | RLOO advantage | 2e-7 | 1.2e-07 | 6.0e-08 |
 | GAE advantage | 5e-7 | 2.4e-07 | 3.0e-08 |
 | GAE return | 5e-7 | 1.2e-07 | 0.0 |
 
-The residues are summation order in fp32: verl reduces in torch, Tunix in
-numpy and JAX, Dew in JAX. Against Tunix, which reduces in JAX as Dew does,
-three of the seven agree bit for bit. The two references disagree with each
-other by 2.4e-07 on these inputs, which is the floor any port can reach.
+Whitening also checks every output against scalar float64 arithmetic. Its
+padding values whiten to about +/-20, where one fp32 ULP is 1.9e-6; the
+loss-consumed entries retain the absolute reference bound above. Padding
+instead uses the equation's forward-error bound, not a machine's snapshot.
 """
 
 import importlib.util
@@ -104,13 +104,43 @@ def test_masked_whiten_centres_and_scales_by_the_unbiased_deviation():
                        atol=1e-6)
 
 
-def test_masked_whiten_matches_the_references(reference):
-    whitened = masked_whiten(jnp.asarray(reference["values"]),
-                             jnp.asarray(reference["response_mask"]))
+@pytest.mark.parametrize("compiled", [False, True])
+def test_masked_whiten_matches_the_references(reference, compiled):
+    x = reference["values"].astype(np.float64)
+    keep = reference["response_mask"].astype(bool)
+    whiten = jax.jit(masked_whiten) if compiled else masked_whiten
+    whitened = np.asarray(whiten(jnp.asarray(reference["values"]),
+                                jnp.asarray(reference["response_mask"])))
 
+    count = int(keep.sum())
+    mean = math.fsum(x[keep]) / (count + 1e-8)
+    variance = math.fsum((value - mean) ** 2 for value in x[keep])
+    variance = variance / (count + 1e-8) * count / (count - 1)
+    deviation = math.sqrt(variance + 1e-8)
+    expected = (x - mean) / deviation
+    # Conservative gamma_(n+8) envelope for this fixed, nondegenerate
+    # binary-mask fixture, not a universal whitening error theorem. It
+    # covers reductions, centring, Bessel correction and rsqrt/multiply;
+    # the mean's absolute input scale protects near-zero centered outputs.
+    unit = np.finfo(np.float32).eps / 2
+    gamma = (count + 8) * unit / (1 - (count + 8) * unit)
+    bound = gamma * (np.abs(x - mean) + math.fsum(abs(x[keep])) / count) / deviation
+    for actual in (whitened, reference["verl_masked_whiten"],
+                   reference["tunix_masked_whiten"]):
+        assert np.all(np.abs(actual.astype(np.float64) - expected) <= bound)
     for name in ("verl_masked_whiten", "tunix_masked_whiten"):
-        difference = largest(whitened, reference[name])
+        difference = largest(whitened[keep], reference[name][keep])
         assert difference < GAE_TOLERANCE, f"{name}: {difference:.3e}"
+
+
+def test_masked_whiten_regularises_a_nearly_constant_sample():
+    delta = 2 ** -15
+    x = jnp.array([1 - delta, 1, 1 + delta, 100], jnp.float32)
+    keep = jnp.array([True, True, True, False])
+    # The unbiased variance is delta**2, below the reference's 1e-8
+    # regulariser; dropping epsilon or Bessel correction changes the signal.
+    expected = np.array([-delta, 0, delta]) / math.sqrt(delta ** 2 + 1e-8)
+    np.testing.assert_allclose(masked_whiten(x, keep)[:3], expected, atol=5e-7, rtol=0)
 
 
 def test_group_advantage_is_the_group_mean_over_its_deviation():

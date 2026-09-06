@@ -65,36 +65,18 @@ def test_none_and_the_attention_value_build_the_same_tree():
         assert jnp.array_equal(left, right)
 
 
-def test_a_record_and_a_value_agree():
-    """`mixer={"kind": ...}` from a config and the dataclass from code agree."""
-    assert tiny(mixer={"kind": "attention"}).mixer == AttentionMixer()
-    assert tiny(mixer={"kind": "test_scale", "scale": 3.0}).mixer == ScaleMixer(3.0)
-
-
-def test_models_build_takes_mixer_records():
-    """The CLI path builds the same values through `models.build`."""
+def test_mixer_records_and_values_compute_the_same_logits():
     config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
                   mlp_features=64, max_seq_len=16)
-
-    assert models.build("causal_transformer", **config).mixer is None
-    assert models.build(
-        "causal_transformer", **{**config, "mixer": {"kind": "test_scale", "scale": 3.0}}
-    ).mixer == ScaleMixer(3.0)
-
-
-def test_a_registered_kind_builds_and_runs():
-    """The test kind lands in the block as self_attn and runs the forward."""
-    model = tiny(mixer=ScaleMixer(scale=0.0))
-    ids = jnp.ones((2, 8), jnp.int32)
-    params = model.init(jax.random.key(0), ids)
-    bound = model.bind(params)
-
-    assert isinstance(bound.layers[0].self_attn, ScaleMixerModule)
-    assert bound.layers[0].self_attn.scale == 0.0
-    assert "q_proj" not in str(jax.tree.map(jnp.shape, params))
-    logits = model.apply(params, ids)
-    assert logits.shape == (2, 8, VOCAB)
-    assert jnp.all(jnp.isfinite(logits))
+    expected = tiny(mixer=ScaleMixer(3.0))
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    params = expected.init(jax.random.key(0), ids)
+    logits = expected.apply(params, ids)
+    record = {"kind": "test_scale", "scale": 3.0}
+    for model in (tiny(mixer=record),
+                  models.build("causal_transformer", **config, mixer=record)):
+        assert jnp.array_equal(model.apply(params, ids), logits)
+    assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
 
 
 def test_an_unknown_mixer_kind_is_refused():
@@ -119,10 +101,7 @@ def test_something_that_is_neither_a_value_nor_a_record_is_refused():
         tiny(mixer="test_scale")
 
 
-def test_the_registry_builds_kinds_by_name():
-    assert mixers["attention"] is AttentionMixer
-    assert mixers["test_scale"] is ScaleMixer
-    assert mixers.build("test_scale", scale=3.0) == ScaleMixer(3.0)
+def test_the_mixer_registry_refuses_unknown_kinds_and_fields():
     with pytest.raises(KeyError, match="no mixer named 'nope'"):
         mixers.build("nope")
     with pytest.raises(ValueError, match="has no field for"):
@@ -169,13 +148,7 @@ def test_a_kind_selects_the_mixer_its_layers_run():
     assert not jnp.allclose(kind_logits, swapped_logits)
 
 
-def test_a_kind_record_coerces_like_the_model_record():
-    """LayerKind takes its mixer as a record from a config or a value."""
-    from dew.nn.backbones.causal_transformer import LayerKind
-
-    assert LayerKind(mixer={"kind": "test_scale", "scale": 3.0}).mixer == ScaleMixer(3.0)
-    assert LayerKind(mixer=ScaleMixer(3.0)).mixer == ScaleMixer(3.0)
-    assert LayerKind().mixer is None
+def test_invalid_kind_mixer_records_are_refused():
     with pytest.raises(ValueError, match="kind's mixer"):
         LayerKind(mixer="test_scale")
     with pytest.raises(KeyError, match="no mixer named 'nope'"):
@@ -190,5 +163,7 @@ def test_models_build_takes_kind_mixer_records():
                   kinds={"linear": {"mixer": {"kind": "test_scale", "scale": 3.0}}})
 
     model = models.build("causal_transformer", **config)
-    assert model.kind_of("linear").mixer == ScaleMixer(3.0)
-    assert model.kind_of("full_attention").mixer is None
+    expected = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(3.0))})
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    params = expected.init(jax.random.key(0), ids)
+    assert jnp.array_equal(model.apply(params, ids), expected.apply(params, ids))

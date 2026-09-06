@@ -12,7 +12,6 @@ import pytest
 from flax import linen as nn
 
 import dew.nn.backbones  # registers the models
-from dew.artifacts import TextSamples
 from dew.data import Dataset
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
@@ -210,17 +209,14 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     process = MDLM(mask_id=BYTE_MASK)()
     model = models.CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,
                                      max_seq_len=ROW, causal=False)
-    objective = MaskedDiffusionObjective(model, process, ROW, steps=48, samples=16,
-                                         decode=lambda ids: "".join(chr(min(i, 255)) for i in ids))
-    assert objective.artifact is TextSamples and objective.inputs.sample.shape == (ROW,)
+    objective = MaskedDiffusionObjective(model, process, ROW, steps=48, samples=16)
 
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0))
     state = trainer.fit(Dataset(train=corpus_batches, val=None, records=None, batch=16),
                         steps=1000, log_every=500)
     params = state.params
 
-    loss, aux = scalar_loss(objective, params, {"text": ROWS}, Step(state.step, jax.random.PRNGKey(1), None))
-    assert set(aux.metrics) == {"masked_accuracy", "masked_fraction"}
+    loss, _ = scalar_loss(objective, params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
     assert jnp.isfinite(loss)
 
     t = jnp.full((len(ROWS),), 0.5)
@@ -229,8 +225,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     accuracy = float(jnp.sum((filled == ROWS) & is_masked) / jnp.sum(is_masked))
     assert accuracy > 0.8, accuracy
 
-    artifact = objective.evaluate(params, {"text": ROWS}, Step(state.step, jax.random.PRNGKey(3), None))
-    assert isinstance(artifact, TextSamples) and len(artifact.texts) == 16
+    artifact = objective.preview(params, {"text": ROWS}, Step(state.step, jax.random.PRNGKey(3), None))
     generated = np.asarray(artifact.tokens)
     assert generated.shape == (16, ROW) and not np.any(generated == BYTE_MASK)
     match = (generated[:, None, :] == ROWS[None, :, :]).mean(-1).max(-1)

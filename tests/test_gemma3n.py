@@ -7,7 +7,9 @@ random weights. Everything runs at fp32 on CPU, and each parity test states
 its tolerance and the largest difference observed.
 """
 
+import functools
 from pathlib import Path
+from statistics import NormalDist
 
 import jax
 import jax.numpy as jnp
@@ -15,8 +17,9 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.backbones.causal_transformer import GatedMLP
+from dew.nn.backbones.causal_transformer import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
+from dew.nn.mixers import AttentionMixer, MixerContext
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
@@ -101,6 +104,49 @@ def test_the_coefficient_clip_binds_in_the_training_pass_alone():
     assert float(np.max(np.abs(trained - tensors["predictions"]))) > 1e-3
 
 
+def test_zero_altup_scale_still_learns_the_per_layer_residual():
+    features, per_layer_features = 8, 3
+    mixer = AttentionMixer().build(MixerContext(
+        emb_features=features, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=1))
+    block = DecoderBlock(
+        mixer=mixer, feedforward=functools.partial(
+            GatedMLP, hidden_features=12, out_features=features,
+            activation="geglu", activation_sparsity=0.95),
+        emb_features=features, wiring=BlockWiring(output_norms=True),
+        norm_eps=1e-6, per_layer_input_dim=per_layer_features,
+        altup=AltUp(num_inputs=COPIES))
+    stream = jnp.linspace(-1, 1, COPIES * features).reshape(COPIES, 1, 1, features)
+    per_layer = jnp.linspace(0.2, 1, per_layer_features).reshape(1, 1, per_layer_features)
+    variables = block.init(jax.random.key(0), stream, per_layer_input=per_layer)
+    params = variables["params"]
+    params["post_per_layer_input_norm"]["scale"] = jnp.linspace(0.7, 1.3, features)
+
+    def forward(scale):
+        current = {**params, "altup": {**params["altup"], "correct_output_scale": scale}}
+        return block.apply({"params": current}, stream, per_layer_input=per_layer)
+
+    scale = params["altup"]["correct_output_scale"]
+    corrected = block.apply(variables, stream, per_layer_input=None)
+    np.testing.assert_array_equal(forward(scale), corrected)
+    derivative = np.asarray(jax.jit(jax.jacrev(forward))(scale), dtype=np.float64)
+
+    # At zero scale, GELU'(0)=1/2 and RMSNorm'(0)=diag(weight)/sqrt(eps).
+    # Differentiate only the PLE term; the unscaled corrected copies do not
+    # depend on this parameter. Float64 products give an independent chain
+    # rule oracle; normalize out the known 1000x gain before comparing fp32.
+    # CPU error is 1.31e-7; stopping the scale gradient misses by 0.457.
+    active = np.asarray(corrected[0, 0, 0], dtype=np.float64)
+    gate = np.asarray(params["per_layer_input_gate"]["kernel"], dtype=np.float64)
+    projection = np.asarray(params["per_layer_projection"]["kernel"], dtype=np.float64)
+    weight = np.asarray(params["post_per_layer_input_norm"]["scale"], dtype=np.float64)
+    ple = np.asarray(per_layer[0, 0], dtype=np.float64)
+    scaled_jacobian = (0.5 * active[:, None] * gate * ple) @ projection * weight
+    expected = np.stack([np.zeros_like(scaled_jacobian)]
+                        + [scaled_jacobian.T] * (COPIES - 1))
+    np.testing.assert_allclose(derivative[:, 0, 0] * np.sqrt(block.norm_eps),
+                               expected, atol=5e-7, rtol=0)
+
+
 def test_the_laurel_block_matches_the_reference():
     """`x + post_laurel_norm(linear_right(linear_left(x)))`. Tolerance
     1e-5; observed 4.8e-07."""
@@ -139,6 +185,44 @@ def test_gaussian_topk_keeps_about_the_stated_fraction():
         kept = gaussian_topk(rows, sparsity) > 0
         assert abs(float(kept.mean()) - (1 - sparsity)) < 0.01
     assert float(gaussian_topk(rows, 0.95).min()) == 0.0
+
+
+@pytest.mark.parametrize("sparsity", [0.5, 0.95])
+def test_gaussian_topk_has_the_population_cutoff_jacobian(sparsity):
+    # Both active and inactive coordinates, separated from the cutoff.
+    x = np.array([-2, -1, 0, 1, 5], dtype=np.float64)
+    multiplier = NormalDist().inv_cdf(sparsity)
+    mean, std = x.mean(), x.std()
+    margin = x - mean - multiplier * std
+    assert np.min(np.abs(margin)) > 0.05
+    cutoff_gradient = (1 + multiplier * (x - mean) / std) / x.size
+    expected = (np.eye(x.size) - cutoff_gradient) * (margin > 0)[:, None]
+    def apply(row):
+        return gaussian_topk(row, sparsity)
+    actual = jax.jit(jax.jacrev(apply))(jnp.asarray(x, jnp.float32))
+    # Five-term population moments and the normal quantile at fp32.
+    # A stopped cutoff gradient or sample deviation misses by >1e-2.
+    np.testing.assert_allclose(actual, expected, atol=5e-7, rtol=0)
+    # Forward cancellation at the cutoff is bounded in the input scale,
+    # not by relative error in the small positive remainder.
+    unit = np.finfo(np.float32).eps / 2
+    bound = 8 * unit * (np.abs(x) + abs(mean) + abs(multiplier) * std)
+    output = np.asarray(apply(jnp.asarray(x, jnp.float32)), dtype=np.float64)
+    assert np.all(np.abs(output - np.maximum(margin, 0)) <= bound)
+
+
+def test_gaussian_topk_uses_zero_relu_derivative_at_the_cutoff():
+    # At sparsity 1/2 the quantile is exactly zero, so the middle entry
+    # equals the cutoff exactly; perturbations select opposite branches.
+    def apply(row):
+        return gaussian_topk(row, 0.5)
+    x = jnp.array([-1., 0., 1.])
+    derivative = jax.jit(jax.jacrev(apply))(x)
+    np.testing.assert_allclose(derivative, [[0, 0, 0], [0, 0, 0],
+                                          [-1/3, -1/3, 2/3]], atol=5e-8, rtol=0)
+    delta = 2 ** -12
+    assert float(apply(x.at[1].set(-delta))[1]) == 0
+    assert float(apply(x.at[1].set(delta))[1]) == pytest.approx(2 * delta / 3)
 
 
 @pytest.mark.parametrize("field,value", [("num_inputs", 1), ("active_idx", 4), ("coef_clip", 0.0)])
