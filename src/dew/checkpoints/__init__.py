@@ -384,6 +384,15 @@ class Checkpoints:
         Saving is async so it stays off the training loop's critical path;
         anything that reads a checkpoint back has to call this first.
         """
+        error = None
         for manager in (self._manager, self._local_manager):
             if manager is not None:
-                manager.wait_until_finished()
+                try:
+                    manager.wait_until_finished()
+                except BaseException as failure:
+                    if error is None:
+                        error = failure
+                    else:
+                        error.add_note(f"Checkpoint wait also failed: {failure!r}")
+        if error is not None:
+            raise error

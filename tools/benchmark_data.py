@@ -18,6 +18,7 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import itertools  # noqa: E402
+import sys  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 from typing import TYPE_CHECKING, Iterable, List  # noqa: E402
@@ -84,7 +85,19 @@ def main(config: Benchmark) -> None:
     dataset = config.data.load(batch=config.batch)
     print(f"{datasets.name_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
-    report(measure(dataset.train(), config.steps, config.warmup), dataset.batch)
+    source = dataset.train()
+    try:
+        report(measure(source, config.steps, config.warmup), dataset.batch)
+    finally:
+        primary = sys.exception()
+        try:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note(f"Data iterator cleanup failed: {error!r}")
 
 
 if __name__ == "__main__":

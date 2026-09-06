@@ -118,33 +118,33 @@ def run(config: Comparison) -> Curve:
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     parameters = sum(x.size for x in jax.tree.leaves(state.params))
 
-    source = DevicePrefetchIterator(data.train(), trainer.device_mesh)
-    train_step = trainer.compile(state, next(source))
-    scale = None
-    losses: list[float] = []
-    start = time.perf_counter()
-    for step in range(config.steps):
-        state, scale, loss, _, is_finite = train_step(state, scale, next(source))
-        losses.append(float(loss))
-        if not bool(is_finite):
-            raise RuntimeError(f"loss went non-finite at step {step}")
-    seconds = time.perf_counter() - start
+    with DevicePrefetchIterator(data.train(), trainer.device_mesh) as source:
+        train_step = trainer.compile(state, next(source))
+        scale = None
+        losses: list[float] = []
+        start = time.perf_counter()
+        for step in range(config.steps):
+            state, scale, loss, _, is_finite = train_step(state, scale, next(source))
+            losses.append(float(loss))
+            if not bool(is_finite):
+                raise RuntimeError(f"loss went non-finite at step {step}")
+        seconds = time.perf_counter() - start
 
-    return Curve(
-        optimizer=config.optimizer,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        steps=config.steps,
-        tokens_per_step=config.batch_size * config.sequence_length,
-        tokens=config.steps * config.batch_size * config.sequence_length,
-        corpus_tokens=int(meta["train_tokens"]),
-        parameters=parameters,
-        model=fields,
-        seed=config.seed,
-        seconds=seconds,
-        device=jax.devices()[0].device_kind,
-        losses=losses,
-    )
+        return Curve(
+            optimizer=config.optimizer,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+            steps=config.steps,
+            tokens_per_step=config.batch_size * config.sequence_length,
+            tokens=config.steps * config.batch_size * config.sequence_length,
+            corpus_tokens=int(meta["train_tokens"]),
+            parameters=parameters,
+            model=fields,
+            seed=config.seed,
+            seconds=seconds,
+            device=jax.devices()[0].device_kind,
+            losses=losses,
+        )
 
 
 def main(config: Comparison) -> None:

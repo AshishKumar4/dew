@@ -35,6 +35,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Iterator, Literal, Mapping
@@ -480,89 +481,97 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     peak_before = device_peak_bytes()
     trainer = build_trainer(case, config.attention_impl)
 
-    source = DevicePrefetchIterator(batches(case), trainer.device_mesh)
-    abstract = jax.eval_shape(trainer.initial_state)
-    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-    scale = None
+    with DevicePrefetchIterator(batches(case), trainer.device_mesh) as source:
+        abstract = jax.eval_shape(trainer.initial_state)
+        state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+        scale = None
 
-    compile_start = time.perf_counter()
-    compiled = trainer.compile(state, next(source))
-    compile_seconds = time.perf_counter() - compile_start
+        compile_start = time.perf_counter()
+        compiled = trainer.compile(state, next(source))
+        compile_seconds = time.perf_counter() - compile_start
 
-    def step(state, scale):
-        state, scale, loss, _, finite = compiled(state, scale, next(source))
-        return state, scale, loss, finite
+        def step(state, scale):
+            state, scale, loss, _, finite = compiled(state, scale, next(source))
+            return state, scale, loss, finite
 
-    # At least one warm step, so the first dispatch of the executable is
-    # outside the timed window.
-    state, scale, loss, is_finite = step(state, scale)
-    for _ in range(config.warmup - 1):
+        # At least one warm step, so the first dispatch of the executable is
+        # outside the timed window.
         state, scale, loss, is_finite = step(state, scale)
-    loss.block_until_ready()
-
-    start = time.perf_counter()
-    for _ in range(config.steps):
-        state, scale, loss, is_finite = step(state, scale)
-    loss.block_until_ready()
-    elapsed = time.perf_counter() - start
-
-    # A second window of the same length, waiting on every step, for the
-    # spread. The loop above dispatches asynchronously on purpose, as a run
-    # does, so timing its individual iterations would time the dispatch and
-    # not the step. These per-step numbers are a different quantity from
-    # ms_per_step above, and each carries one synchronisation.
-    synced = []
-    for _ in range(config.steps):
-        step_start = time.perf_counter()
-        state, scale, loss, is_finite = step(state, scale)
-        loss.block_until_ready()
-        synced.append((time.perf_counter() - step_start) * 1e3)
-    p10, p50, p90 = np.percentile(synced, [10, 50, 90])
-
-    timeline = {}
-    if config.profile_dir:
-        # After the timed windows, so the trace's own overhead is not in them.
-        directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"))
-        jax.profiler.start_trace(directory)
-        for _ in range(config.profile_steps):
+        for _ in range(config.warmup - 1):
             state, scale, loss, is_finite = step(state, scale)
         loss.block_until_ready()
-        jax.profiler.stop_trace()
-        timeline = device_timeline(directory, config.profile_steps)
-    flops = trainer.flops_per_step
-    step_time = elapsed / config.steps
-    utilization = model_flops_utilization(flops, step_time)
-    peak = device_peak_bytes()
-    row: Row = {
-        "architecture": case.architecture,
-        "batch_size": case.batch_size,
-        "fsdp_size": case.fsdp_size,
-        "expert_size": case.expert_size,
-        "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
-        "packed_documents": case.packed_documents,
-        "dtype": case.dtype,
-        "attention_impl": config.attention_impl,
-        "xla_flags": config.xla_flags,
-        "devices": trainer.device_mesh.devices.size,
-        "device_kind": jax.devices()[0].device_kind,
-        "params": parameter_count(state.params),
-        "measured_steps": config.steps,
-        "compile_seconds": round(compile_seconds, 2),
-        "ms_per_step": round(step_time * 1e3, 3),
-        "p10_ms": round(float(p10), 3),
-        "p50_ms": round(float(p50), 3),
-        "p90_ms": round(float(p90), 3),
-        "samples_per_sec": round(case.batch_size / step_time, 2),
-        "flops_per_step": flops,
-        "utilization": utilization,
-        "peak_device_bytes": peak,
-        "case_peak_delta_bytes": (
-            None if peak is None or peak_before is None else max(0, peak - peak_before)),
-        "loss": float(loss),
-        "finite": bool(is_finite),
-        **timeline,
-    }
-    return row
+
+        start = time.perf_counter()
+        for _ in range(config.steps):
+            state, scale, loss, is_finite = step(state, scale)
+        loss.block_until_ready()
+        elapsed = time.perf_counter() - start
+
+        # A second window of the same length, waiting on every step, for the
+        # spread. The loop above dispatches asynchronously on purpose, as a run
+        # does, so timing its individual iterations would time the dispatch and
+        # not the step. These per-step numbers are a different quantity from
+        # ms_per_step above, and each carries one synchronisation.
+        synced = []
+        for _ in range(config.steps):
+            step_start = time.perf_counter()
+            state, scale, loss, is_finite = step(state, scale)
+            loss.block_until_ready()
+            synced.append((time.perf_counter() - step_start) * 1e3)
+        p10, p50, p90 = np.percentile(synced, [10, 50, 90])
+
+        timeline = {}
+        if config.profile_dir:
+            # After the timed windows, so the trace's own overhead is not in them.
+            directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"))
+            jax.profiler.start_trace(directory)
+            try:
+                for _ in range(config.profile_steps):
+                    state, scale, loss, is_finite = step(state, scale)
+                loss.block_until_ready()
+            finally:
+                primary = sys.exception()
+                try:
+                    jax.profiler.stop_trace()
+                except BaseException as error:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"Profiler stop failed: {error!r}")
+            timeline = device_timeline(directory, config.profile_steps)
+        flops = trainer.flops_per_step
+        step_time = elapsed / config.steps
+        utilization = model_flops_utilization(flops, step_time)
+        peak = device_peak_bytes()
+        row: Row = {
+            "architecture": case.architecture,
+            "batch_size": case.batch_size,
+            "fsdp_size": case.fsdp_size,
+            "expert_size": case.expert_size,
+            "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
+            "packed_documents": case.packed_documents,
+            "dtype": case.dtype,
+            "attention_impl": config.attention_impl,
+            "xla_flags": config.xla_flags,
+            "devices": trainer.device_mesh.devices.size,
+            "device_kind": jax.devices()[0].device_kind,
+            "params": parameter_count(state.params),
+            "measured_steps": config.steps,
+            "compile_seconds": round(compile_seconds, 2),
+            "ms_per_step": round(step_time * 1e3, 3),
+            "p10_ms": round(float(p10), 3),
+            "p50_ms": round(float(p50), 3),
+            "p90_ms": round(float(p90), 3),
+            "samples_per_sec": round(case.batch_size / step_time, 2),
+            "flops_per_step": flops,
+            "utilization": utilization,
+            "peak_device_bytes": peak,
+            "case_peak_delta_bytes": (
+                None if peak is None or peak_before is None else max(0, peak - peak_before)),
+            "loss": float(loss),
+            "finite": bool(is_finite),
+            **timeline,
+        }
+        return row
 
 
 TABLE_COLUMNS = (

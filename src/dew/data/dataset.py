@@ -52,6 +52,11 @@ class Dataset:
     when nothing is held out. `batch` is the global batch, `records` the
     training records behind it, so `steps_per_epoch` is one pass over them.
 
+    Each factory call returns a fresh iterator owned by its caller. Close it
+    after use when it exposes close; never close the shared dataset/backing
+    store. A source's optional request_stop is a separate thread-safe signal,
+    not permission to call final close concurrently with iteration.
+
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
@@ -141,16 +146,30 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         """The stream's iterator with each batch's captions tokenized."""
 
         def __init__(self, source: Iterator[Batch]):
-            self.source = source
+            self.source: Iterator[Batch] | None = source
 
         def __iter__(self):
             return self
 
         def __next__(self) -> Batch:
+            if self.source is None:
+                raise StopIteration
             batch = dict(next(self.source))
             captions = [str(caption) for caption in batch.pop(CAPTION)]
             batch.update(read(captions))
             return batch
+
+        def request_stop(self) -> None:
+            """Forward only the source's thread-safe cancellation signal."""
+            request_stop = getattr(self.source, "request_stop", None)
+            if request_stop is not None:
+                request_stop()
+
+        def close(self) -> None:
+            source, self.source = self.source, None
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
 
     class CheckpointableTokenizing(Tokenizing):
         """The same stage over a stream that can report and restore its
@@ -158,13 +177,17 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         protocol reads attributes statically, where a forwarding `__getattr__`
         would only satisfy `hasattr`."""
 
-        source: Checkpointable
-
         def get_state(self) -> Any:
-            return self.source.get_state()
+            source = self.source
+            if not isinstance(source, Checkpointable):
+                raise RuntimeError("the tokenized iterator is closed")
+            return source.get_state()
 
         def set_state(self, state: Any) -> None:
-            self.source.set_state(state)
+            source = self.source
+            if not isinstance(source, Checkpointable):
+                raise RuntimeError("the tokenized iterator is closed")
+            source.set_state(state)
 
     def start() -> Iterator[Batch]:
         source = iter(stream())

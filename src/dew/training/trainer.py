@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
@@ -434,156 +435,195 @@ class Trainer:
         written to the local directory as well.
         """
         started = time.perf_counter()
-        mesh = self.device_mesh
-        process_zero = jax.process_index() == 0
-        state, shardings, position = self.place()
-        current = int(state.step)
-        if current > steps:
-            raise ValueError(f"the run is at step {current}, past the {steps} asked for")
-
         profile, checkpoints = self.profile, self.checkpoints
-        if checkpoint_every and checkpoints is None:
-            raise ValueError(
-                "checkpoint_every asks for checkpoints and this trainer has no "
-                "checkpointer; pass Checkpoints(directory) to write any")
-        local_every = None if checkpoints is None else checkpoints.local_every
-        source = data.train()
-        if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
-            raise ValueError(
-                f"checkpoint_every needs a training stream with get_state and "
-                f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-                f"written without the data position would replay the data on "
-                f"resume. Train it with checkpoint_every=None "
-                f"(--trainer.checkpoint-every None)")
-        train = DevicePrefetchIterator(source, mesh, source_state=position)
-        scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
-        train_step = None
-        # Rebound once the step is compiled, so the first tick measures steps,
-        # not the compile.
-        last_log_time = time.time()
-        last_saved = current if checkpoints is not None and current else None
-        interval_steps = 0
-        steps_since_log = 0
-        # Seconds spent sampling this interval, logged under
-        # train/rollout_seconds when a rollout is set.
-        rollout_seconds = 0.0
-        # The interval's loss and both bad-loss counters live on device, so the
-        # loop never blocks on a result, and move together in one dispatch.
-        # `worst_bad_run` remembers the longest streak of non-finite losses
-        # seen since the last host check; the host check reads it to decide
-        # whether to stop.
-        book = fresh_book()
-        tracing, traced, seen = False, 0, 0
+        source = train = None
+        tracing, traced = False, 0
         loss = None
-        first_step = None
         other = 0.0
+        try:
+            mesh = self.device_mesh
+            process_zero = jax.process_index() == 0
+            state, shardings, position = self.place()
+            current = int(state.step)
+            if current > steps:
+                raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
-        if process_zero:
-            print(f"Training from step {current} to {steps} on "
-                  f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
-        while current < steps:
-            batch = next(train)
-            if self.rollout is not None:
-                # Host-side and untraceable: sampling, scoring, advantages.
-                # The key folds the step key once more, keeping the
-                # rollout's draws off the step's stream; both are
-                # checkpointed, so a resumed run samples forward. Fixed
-                # shapes mean the compile below traces once.
-                began = time.perf_counter()
-                key = jax.random.fold_in(
-                    jax.random.fold_in(state.key, state.step), 1)
-                batch = shard_batch(mesh, self.rollout(state, batch, key))
-                rollout_seconds += time.perf_counter() - began
-            if train_step is None:
-                train_step = self.compile(state, batch, scale)
-                last_log_time = time.time()
-            if (profile is not None and not tracing and traced == 0
-                    and seen >= profile.warmup):
-                jax.profiler.start_trace(profile.directory)
-                tracing = True
+            if checkpoint_every and checkpoints is None:
+                raise ValueError(
+                    "checkpoint_every asks for checkpoints and this trainer has no "
+                    "checkpointer; pass Checkpoints(directory) to write any")
+            local_every = None if checkpoints is None else checkpoints.local_every
+            scale = dynamic_scale_lib.DynamicScale() if self.dynamic_scale else None
+            train_step = None
+            # Rebound once the step is compiled, so the first tick measures steps,
+            # not the compile.
+            last_log_time = time.time()
+            last_saved = current if checkpoints is not None and current else None
+            interval_steps = 0
+            steps_since_log = 0
+            # Seconds spent sampling this interval, logged under
+            # train/rollout_seconds when a rollout is set.
+            rollout_seconds = 0.0
+            # The interval's loss and both bad-loss counters live on device, so the
+            # loop never blocks on a result, and move together in one dispatch.
+            # `worst_bad_run` remembers the longest streak of non-finite losses
+            # seen since the last host check; the host check reads it to decide
+            # whether to stop.
+            book = fresh_book()
+            tracing, traced, seen = False, 0, 0
+            loss = None
+            first_step = None
+            other = 0.0
 
-            state, scale, loss, aux, finite = train_step(state, scale, batch)
-            position = train.source_state
-            current += 1
-            seen += 1
-            steps_since_log += 1
-            interval_steps += 1
-            book = bookkeep(book, loss, finite)
-            if first_step is None:
-                loss.block_until_ready()
-                first_step = time.perf_counter() - started
+            if current < steps:
+                source = data.train()
+                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
+                    raise ValueError(
+                        f"checkpoint_every needs a training stream with get_state and "
+                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+                        f"written without the data position would replay the data on "
+                        f"resume. Train it with checkpoint_every=None "
+                        f"(--trainer.checkpoint-every None)")
+                train = DevicePrefetchIterator(source, mesh, source_state=position)
+                source = None  # Lifetime transferred to the prefetch worker.
 
-            if tracing and profile is not None:
-                traced += 1
-                if traced == profile.steps:
-                    tracing = False
-                    self._stop_trace(traced, loss, profile)
+            if process_zero:
+                print(f"Training from step {current} to {steps} on "
+                      f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
+            while current < steps:
+                assert train is not None
+                batch = next(train)
+                if self.rollout is not None:
+                    # Host-side and untraceable: sampling, scoring, advantages.
+                    # The key folds the step key once more, keeping the
+                    # rollout's draws off the step's stream; both are
+                    # checkpointed, so a resumed run samples forward. Fixed
+                    # shapes mean the compile below traces once.
+                    began = time.perf_counter()
+                    key = jax.random.fold_in(
+                        jax.random.fold_in(state.key, state.step), 1)
+                    batch = shard_batch(mesh, self.rollout(state, batch, key))
+                    rollout_seconds += time.perf_counter() - began
+                if train_step is None:
+                    train_step = self.compile(state, batch, scale)
+                    last_log_time = time.time()
+                if (profile is not None and not tracing and traced == 0
+                        and seen >= profile.warmup):
+                    jax.profiler.start_trace(profile.directory)
+                    tracing = True
 
-            if current % log_every == 0:
-                interval_loss, _, worst_bad_run = book
-                self._check_finite(worst_bad_run, current)
-                book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                if process_zero:
-                    # The interval's numbers need the loss on the host, so
-                    # this is where the loop waits on the device.
+                state, scale, loss, aux, finite = train_step(state, scale, batch)
+                position = train.source_state
+                current += 1
+                seen += 1
+                steps_since_log += 1
+                interval_steps += 1
+                book = bookkeep(book, loss, finite)
+                if first_step is None:
                     loss.block_until_ready()
-                    now = time.time()
-                    scalars = {"train/step": current, "train/loss": float(loss),
-                               **{f"train/{k}": float(v) for k, v in aux.items()},
-                               **self._throughput(now - last_log_time, steps_since_log,
-                                                  data.batch)}
-                    if self.rollout is not None:
-                        scalars["train/rollout_seconds"] = rollout_seconds
-                    print(f"step {current}: loss {scalars['train/loss']:.4f}")
-                    if self.tracker is not None:
-                        self.tracker.log(scalars, current)
-                    last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                    first_step = time.perf_counter() - started
 
-            if eval_every and current % eval_every == 0 and current < steps:
-                paused = time.perf_counter()
+                if tracing and profile is not None:
+                    traced += 1
+                    if traced == profile.steps:
+                        tracing = False
+                        self._stop_trace(traced, loss, profile)
+
+                if current % log_every == 0:
+                    interval_loss, _, worst_bad_run = book
+                    self._check_finite(worst_bad_run, current)
+                    book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
+                    if process_zero:
+                        # The interval's numbers need the loss on the host, so
+                        # this is where the loop waits on the device.
+                        loss.block_until_ready()
+                        now = time.time()
+                        scalars = {"train/step": current, "train/loss": float(loss),
+                                   **{f"train/{k}": float(v) for k, v in aux.items()},
+                                   **self._throughput(now - last_log_time, steps_since_log,
+                                                      data.batch)}
+                        if self.rollout is not None:
+                            scalars["train/rollout_seconds"] = rollout_seconds
+                        print(f"step {current}: loss {scalars['train/loss']:.4f}")
+                        if self.tracker is not None:
+                            self.tracker.log(scalars, current)
+                        last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+
+                if eval_every and current % eval_every == 0 and current < steps:
+                    paused = time.perf_counter()
+                    self._evaluate(state, data, metrics, mesh, current)
+                    other += time.perf_counter() - paused
+
+                # On its own clock, not the logging one: nested inside the log
+                # tick, a cadence that did not divide log_every never fired at all.
+                if (checkpoint_every and checkpoints is not None
+                        and current % checkpoint_every == 0 and current < steps):
+                    paused = time.perf_counter()
+                    checkpoints.save(current, state, position,
+                                     {"loss": float(book[0] / interval_steps)})
+                    other += time.perf_counter() - paused
+                    last_saved = current
+                    book = (jnp.zeros((), jnp.float32), book[1], book[2])
+                    interval_steps = 0
+                if (local_every and checkpoints is not None
+                        and current % local_every == 0 and current < steps):
+                    paused = time.perf_counter()
+                    checkpoints.save_local(current, state, position)
+                    other += time.perf_counter() - paused
+
+            paused = time.perf_counter()
+            if train is not None:
+                train.close()
+                train = None
+            other += time.perf_counter() - paused
+            if tracing and profile is not None:
+                tracing = False
+                # The window outlived the run, and a trace left running takes the
+                # next one down with it.
+                self._stop_trace(traced, loss, profile)
+            interval_loss, _, worst_bad_run = book
+            self._check_finite(worst_bad_run, current)
+            if loss is not None:
+                # The last step has to land before the wall time is read.
+                loss.block_until_ready()
+            paused = time.perf_counter()
+            if eval_every:
                 self._evaluate(state, data, metrics, mesh, current)
-                other += time.perf_counter() - paused
-
-            # On its own clock, not the logging one: nested inside the log
-            # tick, a cadence that did not divide log_every never fired at all.
-            if (checkpoint_every and checkpoints is not None
-                    and current % checkpoint_every == 0 and current < steps):
-                paused = time.perf_counter()
-                checkpoints.save(current, state, position,
-                                 {"loss": float(book[0] / interval_steps)})
-                other += time.perf_counter() - paused
-                last_saved = current
-                book = (jnp.zeros((), jnp.float32), book[1], book[2])
-                interval_steps = 0
-            if (local_every and checkpoints is not None
-                    and current % local_every == 0 and current < steps):
-                paused = time.perf_counter()
-                checkpoints.save_local(current, state, position)
-                other += time.perf_counter() - paused
-
-        if tracing and profile is not None:
-            # The window outlived the run, and a trace left running takes the
-            # next one down with it.
-            self._stop_trace(traced, loss, profile)
-        interval_loss, _, worst_bad_run = book
-        self._check_finite(worst_bad_run, current)
-        if loss is not None:
-            # The last step has to land before the wall time is read.
-            loss.block_until_ready()
-        paused = time.perf_counter()
-        if eval_every:
-            self._evaluate(state, data, metrics, mesh, current)
-        if checkpoints is not None and last_saved != current:
-            # The in-loop saves are conditional, so the state the run ends on
-            # may never have been written. It goes out under its real step,
-            # because a step-0 checkpoint holding the final weights would make
-            # a resume restart the schedule from the beginning.
-            checkpoints.save(
-                current, state, position,
-                {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
-        if checkpoints is not None:
-            checkpoints.wait()
-        other += time.perf_counter() - paused
+            if checkpoints is not None and last_saved != current:
+                # The in-loop saves are conditional, so the state the run ends on
+                # may never have been written. It goes out under its real step,
+                # because a step-0 checkpoint holding the final weights would make
+                # a resume restart the schedule from the beginning.
+                checkpoints.save(
+                    current, state, position,
+                    {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
+            other += time.perf_counter() - paused
+        finally:
+            paused = time.perf_counter()
+            primary = sys.exception()
+            error = primary
+            close = train.close if train is not None else getattr(source, "close", None)
+            stop_trace = None
+            if tracing and profile is not None:
+                tracing = False
+                stop_trace = lambda: self._stop_trace(traced, loss, profile)
+            for label, cleanup in (
+                ("Training iterator", close),
+                ("Profiler", stop_trace),
+                ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+            ):
+                if cleanup is not None:
+                    try:
+                        cleanup()
+                    except BaseException as failure:
+                        if error is None:
+                            error = failure
+                        else:
+                            error.add_note(f"{label} cleanup failed: {failure!r}")
+            source = train = close = cleanup = None
+            other += time.perf_counter() - paused
+            if primary is None and error is not None:
+                raise error
         if process_zero:
             scalars = goodput(time.perf_counter() - started, first_step, other)
             print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
@@ -623,39 +663,51 @@ class Trainer:
                     ema=with_ema(state.params, state.ema))
         values: dict[str, list] = {metric.name: [] for metric in metrics}
         iterator = iter(data.val())
-        scored = 0
-        while True:
-            batch = next(iterator, None)
-            if not minimum_across_processes(int(batch is not None)):
-                break
-            if batch is None:
-                # Every process agreed one was available, so this cannot
-                # happen; leaving the loop here instead would strand the
-                # others in the next collective.
-                raise RuntimeError(
-                    "the validation pass agreed a batch was available and this "
-                    "process has none")
-            batch = shard_batch(mesh, batch)
-            produced = self.objective.evaluate(state.params, batch, info)
-            produced = (() if produced is None
-                        else produced if isinstance(produced, tuple) else (produced,))
-            produced = tuple(host(artifact) for artifact in produced)
-            if metrics:
-                # One gather for every metric, whatever fields they read.
-                home = host(batch)
-                for metric in metrics:
-                    values[metric.name].append(metric(_pick(produced, metric.reads), home))
-            if scored == 0 and process_zero and self.tracker is not None:
-                for artifact in produced:
-                    self.tracker.artifact(artifact, step)
-            scored += 1
-        scores = {f"val/{name}": float(metric.reduce(values[name]))
-                  for metric in metrics for name in [metric.name] if values[name]}
-        if process_zero:
-            print(f"Validation at step {step} over {scored} batches: {scores}")
-            if self.tracker is not None and scores:
-                self.tracker.log(scores, step)
-        return scores
+        try:
+            scored = 0
+            while True:
+                batch = next(iterator, None)
+                if not minimum_across_processes(int(batch is not None)):
+                    break
+                if batch is None:
+                    # Every process agreed one was available, so this cannot
+                    # happen; leaving the loop here instead would strand the
+                    # others in the next collective.
+                    raise RuntimeError(
+                        "the validation pass agreed a batch was available and this "
+                        "process has none")
+                batch = shard_batch(mesh, batch)
+                produced = self.objective.evaluate(state.params, batch, info)
+                produced = (() if produced is None
+                            else produced if isinstance(produced, tuple) else (produced,))
+                produced = tuple(host(artifact) for artifact in produced)
+                if metrics:
+                    # One gather for every metric, whatever fields they read.
+                    home = host(batch)
+                    for metric in metrics:
+                        values[metric.name].append(metric(_pick(produced, metric.reads), home))
+                if scored == 0 and process_zero and self.tracker is not None:
+                    for artifact in produced:
+                        self.tracker.artifact(artifact, step)
+                scored += 1
+            scores = {f"val/{name}": float(metric.reduce(values[name]))
+                      for metric in metrics for name in [metric.name] if values[name]}
+            if process_zero:
+                print(f"Validation at step {step} over {scored} batches: {scores}")
+                if self.tracker is not None and scores:
+                    self.tracker.log(scores, step)
+            return scores
+        finally:
+            primary = sys.exception()
+            try:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                primary.add_note(f"Validation iterator cleanup failed: {error!r}")
+
 
     # ------------------------------------------------------------------
     # Telemetry
@@ -663,8 +715,17 @@ class Trainer:
 
     def _stop_trace(self, traced: int, loss, profile: Profile) -> None:
         """Close the profiler window once its last step has actually landed."""
-        loss.block_until_ready()
-        jax.profiler.stop_trace()
+        try:
+            if loss is not None:
+                loss.block_until_ready()
+        finally:
+            primary = sys.exception()
+            try:
+                jax.profiler.stop_trace()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                primary.add_note(f"Profiler stop failed: {error!r}")
         print(f"Wrote profile for {traced} steps to {profile.directory}")
 
     def _check_finite(self, worst_bad_run, step: int):
