@@ -392,7 +392,7 @@ def mode_steps(args) -> dict:
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(args.steps):
-        state, _, loss, _, _ = compiled(state, None, batch)
+        state, loss, _, _, _ = compiled(state, batch)
         losses.append(float(as_numpy(loss)))
     if args.save and args.steps:
         checkpoints.save(int(as_numpy(state.step)), state, None)
@@ -628,7 +628,7 @@ def pipeline_losses(trainer, rows, steps: int):
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(steps):
-        state, _, loss, _, _ = compiled(state, None, batch)
+        state, loss, _, _, _ = compiled(state, batch)
         losses.append(float(loss))
     return losses, state
 

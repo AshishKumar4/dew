@@ -4,6 +4,7 @@ data path, through the general trainer.
 """
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -47,8 +48,8 @@ def test_a_zero_time_row_contributes_nothing_to_the_loss(rng, monkeypatch):
     rows = jnp.array([[1, 2, 3, 4, 5, 1, 2, 3], [3, 2, 1, 0, 4, 5, 1, 2]])
     monkeypatch.setattr(DiscreteProcess, "sample_t",
                         lambda self, key, n: jnp.zeros((n,)))
-    full, _ = objective.loss(params, {"text": rows}, Step(jnp.asarray(0), rng, None))
-    rest, _ = objective.loss(params, {"text": rows[1:]}, Step(jnp.asarray(0), rng, None))
+    full, _ = scalar_loss(objective, params, {"text": rows}, Step(jnp.asarray(0), rng, None))
+    rest, _ = scalar_loss(objective, params, {"text": rows[1:]}, Step(jnp.asarray(0), rng, None))
     assert jnp.all(jnp.isfinite(full))
     assert float(full) == pytest.approx(0.0, abs=1e-12)
     assert float(full) == pytest.approx(float(rest), abs=1e-12)
@@ -218,7 +219,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
                         steps=1000, log_every=500)
     params = state.params
 
-    loss, aux = objective.loss(params, {"text": ROWS}, Step(state.step, jax.random.PRNGKey(1), None))
+    loss, aux = scalar_loss(objective, params, {"text": ROWS}, Step(state.step, jax.random.PRNGKey(1), None))
     assert set(aux.metrics) == {"masked_accuracy", "masked_fraction"}
     assert jnp.isfinite(loss)
 

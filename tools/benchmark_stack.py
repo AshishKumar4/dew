@@ -101,7 +101,7 @@ def measure(depth: int, scan: bool, config: StackConfig, counter: CompileCounter
         compile_seconds = time.perf_counter() - started
 
         def step(state):
-            state, _, loss, _, _ = compiled(state, None, next(source))
+            state, loss, _, _, _ = compiled(state, next(source))
             return state, loss
 
         # One warm step before the timed window; the first dispatch of the

@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -183,7 +184,7 @@ def test_the_loss_reads_the_rolled_out_batch():
     batch = rollout_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
-    loss, aux = objective.loss(params, batch, step)
+    loss, aux = scalar_loss(objective, params, batch, step)
 
     ids = np.asarray(batch[IDS_KEY])
     start = PROMPT_WIDTH - 1
@@ -208,7 +209,7 @@ def test_zero_beta_leaves_the_reference_unread():
     batch = rollout_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 
-    loss, aux = objective.loss(params, batch, step)
+    loss, aux = scalar_loss(objective, params, batch, step)
 
     assert np.isfinite(float(loss))
     assert "kl" not in aux.metrics
@@ -220,7 +221,7 @@ def test_a_positive_beta_needs_the_frozen_tree():
     params = objective.init(jax.random.key(0))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     with pytest.raises(ValueError, match="step.ema"):
-        objective.loss(params, rollout_batch(), step)
+        scalar_loss(objective, params, rollout_batch(), step)
 
 
 def test_a_misbuilt_objective_is_refused():
@@ -241,21 +242,21 @@ def test_a_misshapen_batch_is_refused():
 
     bare = {IDS_KEY: batch[IDS_KEY]}
     with pytest.raises(ValueError, match="old_log_probs"):
-        objective.loss(params, bare, step)
+        scalar_loss(objective, params, bare, step)
 
     narrow = dict(batch, **{IDS_KEY: batch[IDS_KEY][:, :5]})
     with pytest.raises(ValueError, match="8 ids per row"):
-        objective.loss(params, narrow, step)
+        scalar_loss(objective, params, narrow, step)
 
     wide = dict(batch, **{OLD_LOG_PROBS_KEY: jnp.zeros((ROWS, 9), jnp.float32),
                           ADVANTAGES_KEY: jnp.zeros((ROWS, 9), jnp.float32),
                           RESPONSE_MASK_KEY: jnp.zeros((ROWS, 9), jnp.float32)})
     with pytest.raises(ValueError, match="concatenation"):
-        objective.loss(params, wide, step)
+        scalar_loss(objective, params, wide, step)
 
     ragged = dict(batch, **{ADVANTAGES_KEY: jnp.zeros((ROWS, 2), jnp.float32)})
     with pytest.raises(ValueError, match="one term per response token"):
-        objective.loss(params, ragged, step)
+        scalar_loss(objective, params, ragged, step)
 
 
 def test_evaluation_scores_prompt_perplexity():
@@ -306,7 +307,7 @@ def test_the_rollout_batch_feeds_the_objective():
     rolled = rollout(state, batch, jax.random.key(1))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
 
-    loss, aux = objective.loss(params, rolled, step)
+    loss, aux = scalar_loss(objective, params, rolled, step)
 
     assert np.isfinite(float(loss))
     assert rolled[IDS_KEY].shape == (4, width + RESPONSE_WIDTH)

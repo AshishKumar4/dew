@@ -14,6 +14,7 @@ from collections import Counter
 from pathlib import Path
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -836,7 +837,7 @@ def _counted_cross_entropy(batch, seq_len):
     segment_ids = jnp.asarray(batch["text_segment_ids"], jnp.int32)
     positions = jnp.asarray(batch["text_positions"], jnp.int32)
 
-    ce, _ = objective.loss(params, batch, Step(step=jnp.zeros((), jnp.int32),
+    ce, _ = scalar_loss(objective, params, batch, Step(step=jnp.zeros((), jnp.int32),
                                                 key=jax.random.key(1), ema=None))
 
     logits = model.apply(params, tokens[:, :-1], positions=positions[:, :-1],

@@ -8,6 +8,7 @@ import dataclasses
 import json
 
 import jax
+from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -129,9 +130,8 @@ def test_an_int8_trunk_trains_with_finite_loss():
     @jax.jit
     def train(params, opt_state, key):
         (loss, _), grads = jax.value_and_grad(
-            lambda p: objective.loss(
-                {**variables, "params": p}, batch,
-                Step(step=jnp.zeros((), jnp.int32), key=key, ema=None)),
+            lambda p: scalar_loss(objective, {**variables, "params": p}, batch,
+            Step(step=jnp.zeros((), jnp.int32), key=key, ema=None)),
             has_aux=True)(params)
         updates, opt_state = solver.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, loss
@@ -190,7 +190,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
                     ema=None)
 
         def loss(params):
-            return objective.loss({**variables, "params": params},
+            return scalar_loss(objective, {**variables, "params": params},
                                   placed_batch, info)
 
         with jax.set_mesh(mesh), pipeline_microbatches(spec.microbatches):
