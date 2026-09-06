@@ -13,9 +13,9 @@
 <p><a href="docs/index.md">User guide</a> · <a href="docs/installation.md">Installation</a> · <a href="docs/reference/core-api.md">Core API</a> · <a href="docs/reference/support.md">Capabilities and limits</a></p>
 </div>
 
-Dew is a Python framework for building and training machine-learning models with **JAX and Flax Linen**. It combines model implementations, data loading, optimization, evaluation, and checkpointing for language models, image and video diffusion, and JEPA representation learning. You can use those pieces together or supply your own model and objective while keeping the training machinery.
+Dew is a Python framework for building and training machine-learning models with **JAX and Flax Linen**. It includes language-model, image/video diffusion, and JEPA implementations, together with data loaders, optimization, evaluation, and checkpoints. You can use the supplied models and objectives or define your own.
 
-The project grew out of [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). Its diffusion experiments needed the same surrounding work as other models: batches, gradients, averaged weights, checkpoints, and device placement. Dew separates that work from the task being learned. A language-model objective predicts tokens; a diffusion objective learns to remove noise; a JEPA objective predicts hidden representations. Each describes its computation to the same trainer.
+An objective defines model initialization, the loss, and optional evaluation outputs. `Trainer` computes gradients with JAX, applies an Optax optimizer, places variables and batches across devices, updates selected EMA weights, and coordinates evaluation and checkpoint writes. Language modeling, diffusion, and representation learning use those same training interfaces with different data and losses.
 
 Dew is useful when you want to inspect and change a training algorithm in ordinary Python while retaining JAX's array transformations and Flax's explicit variables. It is **pre-1.0 research software**. Implemented sharding and checkpoint translation do not amount to a qualification of every model, checkpoint, accelerator, or cluster. Current scope and restrictions appear beside the tables below. If your main goal is to serve an existing model behind an API, start with the [ecosystem comparison](#how-dew-compares-with-other-tools): Dew is not an inference server.
 
@@ -393,6 +393,104 @@ During conditional training, the objective can drop conditions on some examples 
 
 `TextToImage` packages conditioning and decoding, and `TextToImage.from_run` rebuilds compatible diffusion recipes from their recorded configuration and checkpoint. A directory produced by a bare `Checkpoints` call lacks that recipe record. Frozen text towers and autoencoders remain state with real memory costs. The [diffusion guide](docs/guides/diffusion.md), [recipes](docs/recipes.md), and [historical gallery](docs/gallery.md) cover current construction, dataset-backed runs, and older FlaxDiff results respectively.
 
+### Train a 64×64 diffusion model on a GPU
+
+This is a dataset-backed starting configuration for unconditional Oxford Flowers generation, beyond the 8×8 mechanics demo. It needs a CUDA-capable GPU, a compatible CUDA JAX installation, disk space for the prepared dataset/checkpoints, and the `tfds` extra. **The preparation and GPU training below were not executed for this guide.** No throughput, memory-fit, convergence, or image-quality result is claimed for this configuration.
+
+From the installed checkout, prepare Oxford Flowers once. These commands install optional packages and can download the dataset; inspect its access conditions first. Use a new TFDS directory if you already have a TFRecord preparation: Dew's random-access loader needs ArrayRecord rather than that format. The label file is created explicitly because `OxfordFlowers` reads label names when processing records, even in an unconditional run.
+
+```bash
+uv pip install -e ".[tfds]"
+export TFDS_DATA_DIR="$HOME/dew-data/tfds-arrayrecord"
+python - <<'PY'
+import os
+from pathlib import Path
+import tensorflow_datasets as tfds
+
+data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
+builder = tfds.builder("oxford_flowers102", data_dir=str(data_dir))
+builder.download_and_prepare(file_format="array_record")
+labels = data_dir / "flowers102-labels.txt"
+labels.write_text("\n".join(builder.info.features["label"].names) + "\n")
+print("Prepared", builder.info.full_name, "and", labels)
+PY
+```
+
+Save this complete script as `train_flowers64.py`. It trains in pixels, without a CLIP/T5 tower or VAE, so the training script requires no pretrained model weights. `DiffusionRunConfig` records the actual model, process, data, optimizer, and trainer choices in `run.json`.
+
+```python
+import os
+from pathlib import Path
+
+import jax
+import wandb
+
+from dew.config import ModelConfig, OptimConfig, TrainerConfig, Wandb
+from dew.data import Loading, OxfordFlowers
+from dew.diffusion.presets import EDM
+from dew.objectives.diffusion import DiffusionRunConfig
+from dew.sampling import Heun
+from dew.training.runtime import prepare_process
+
+
+def main():
+    data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
+    config = DiffusionRunConfig(
+        model=ModelConfig(
+            "simple_dit",
+            {"patch_size": 4, "emb_features": 256, "num_layers": 6,
+             "num_heads": 4, "mlp_ratio": 4},
+            dtype="bfloat16", attention_impl="auto",
+        ),
+        data=OxfordFlowers(
+            image_size=64, augmentation="none", val_batches=4,
+            labels=str(data_dir / "flowers102-labels.txt"),
+            loading=Loading(workers=4, threads=4, read_buffer=16, worker_buffer=2),
+        ),
+        preset=EDM(), sampler=Heun(), sampling_steps=32,
+        text=None, autoencoder=None, guidance=None, val_metrics=[],
+        optim=OptimConfig(learning_rate=2e-4, weight_decay=0.01, clip_grads=1.0),
+        trainer=TrainerConfig(
+            name="flowers64", checkpoint_dir="runs", batch_size=32, steps=10000,
+            log_every=50, eval_every=500, checkpoint_every=500, multi_host=False,
+            wandb=Wandb(project="dew-flowers", offline=True),
+        ),
+    )
+    prepare_process(
+        config.trainer.wandb, config.trainer.multi_host,
+        config.trainer.xla_flags, config.trainer.compilation_cache_dir,
+    )
+    if not any(device.platform == "gpu" for device in jax.devices()):
+        raise RuntimeError("This configuration expects a GPU-backed JAX installation")
+    objective = config.build()
+    data = config.data.load(batch=config.trainer.batch_size,
+                            tokenize=objective.inputs.tokenize)
+    try:
+        state = config.train(objective, data, name="flowers64",
+                             metrics=config.build_eval_metrics())
+        print("Completed training at step", int(state.step))
+    finally:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+With your CUDA JAX environment activated and `TFDS_DATA_DIR` still set, launch it with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python train_flowers64.py
+```
+
+The global batch is 32. Four validation batches reserve 128 records from the source before training; this adapter's holdout is not the official Oxford Flowers benchmark split. `augmentation="none"` keeps both training and validation preprocessing deterministic here, since this dataset specification shares its augmentation setting across the two streams. A production data recipe can make a different split/augmentation choice deliberately.
+
+`eval_every=500` schedules events, and the offline W&B tracker provides a preview consumer. The configured solver generates display samples at those events and at normal completion. `val_metrics=[]` is intentional: this example does not load a FID/CLIP feature extractor or present a preview as a population-level quality score. W&B runs offline and needs no online tracking account for this configuration, but its local files still consume disk.
+
+Periodic checkpoints and the final state go under `runs/flowers64`, alongside the separately written `run.json`; the Grain-backed loader contributes the data position. Repeating the same compatible script continues toward total step 10000 rather than requesting 10000 additional updates. Choose a new run name for a new experiment. Before committing to the full duration, change `steps` to a short run, inspect actual GPU memory and losses, and confirm checkpoint access. Increase the total target to continue only after that check.
+
+This is unconditional generation, so captions do not guide its samples. Adding text conditioning requires an explicit tokenizer/encoder and its weights, compatible model inputs, and an unconditional branch for CFG. A lower loss or attractive preview alone does not establish held-out image quality; add a separately specified evaluation population and metric when measuring it.
+
 ## Representation learning with JEPA
 
 A Joint-Embedding Predictive Architecture learns representations rather than generating pixels. The **context encoder** processes visible patches, the **predictor** estimates representations at hidden positions, and the **target encoder** supplies targets with gradients stopped. The target encoder follows an EMA of selected context-encoder variables.
@@ -635,3 +733,5 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for development and reporting expectatio
 Dew uses the [MIT license](LICENSE), with attribution and applicable notices for adapted upstream components. The RL math includes Apache-2.0-derived Tunix/verl code; the Flax VAE and attention ancestry includes Diffusers, and the FID implementation draws from jax-fid. Model weights and datasets retain their own licenses and access conditions. [References and attribution](docs/references.md) records the papers, projects, and earlier tutorials behind the implementation.
 
 For research use, cite the underlying model/method and identify the Dew revision and configuration that produced the result. Dew builds on JAX, Flax, Optax, Orbax, and Grain. The earlier FlaxDiff experiments received support from Google TPU Research Cloud; that historical support is not current multi-host qualification or a promise of available cloud resources.
+
+The project began as [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff), focused on diffusion experiments. Dew separated optimizer updates, data loading, sharding, and checkpoint handling from diffusion-specific computation so language-model and representation-learning objectives could use them too. The [FlaxDiff history guide](docs/from-flaxdiff.md) records the moved responsibilities and checkpoint boundaries.
