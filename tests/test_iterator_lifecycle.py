@@ -2,6 +2,8 @@
 
 import gc
 import json
+import os
+import signal
 import threading
 import weakref
 
@@ -82,11 +84,12 @@ def test_full_queue_close_preserves_consumed_position_and_releases_source():
 
 @pytest.mark.parametrize("failure", [None, ValueError("source failed")])
 def test_terminal_outcome_finalizes_with_a_full_data_queue(failure):
-    source = Source(end=2, failure=failure)
+    source = Source(end=3, failure=failure)
     with DevicePrefetchIterator(source, build_mesh(), depth=2) as stream:
+        assert int(np.asarray(next(stream)["x"])[0, 0]) == 1
         # Finalization must not depend on a consumer making room for EOF/error.
         assert source.closed.wait(5)
-        assert [int(np.asarray(next(stream)["x"])[0, 0]) for _ in range(2)] == [1, 2]
+        assert [int(np.asarray(next(stream)["x"])[0, 0]) for _ in range(2)] == [2, 3]
         if failure is not None:
             with pytest.raises(ValueError) as raised:
                 next(stream)
@@ -134,6 +137,8 @@ def test_timeout_does_not_close_a_running_generator_and_can_be_rejoined():
             closed.set()
 
     stream = DevicePrefetchIterator(blocked(), build_mesh())
+    consumer = threading.Thread(target=lambda: list(stream))
+    consumer.start()
     try:
         assert entered.wait(5)
         with pytest.raises(TimeoutError, match="still alive"):
@@ -144,6 +149,8 @@ def test_timeout_does_not_close_a_running_generator_and_can_be_rejoined():
     finally:
         release.set()
         stream.close()
+        consumer.join(5)
+    assert not consumer.is_alive()
     assert closed.is_set()
 
 
@@ -170,8 +177,14 @@ def test_tokenized_stop_interrupts_next_then_finalizes_on_its_owner():
 
     wrapped = tokenized(Blocking, None)()
     with DevicePrefetchIterator(wrapped, build_mesh()) as stream:
-        assert entered.wait(5)
-        stream.close()
+        consumer = threading.Thread(target=lambda: list(stream))
+        consumer.start()
+        try:
+            assert entered.wait(5)
+        finally:
+            stream.close()
+            consumer.join(5)
+        assert not consumer.is_alive()
     assert stopped.is_set() and closed.is_set()
     assert len(set(owners)) == 1 and owners[0] != threading.get_ident()
 
@@ -323,3 +336,88 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
     with pytest.raises(ValueError, match="get_state"):
         trainer.fit(Dataset(Uncheckpointable, None, None, 8), steps=1, checkpoint_every=1)
     assert closed.is_set()
+
+def test_constructor_starts_no_unowned_source_work():
+    source = Source()
+    with DevicePrefetchIterator(source, build_mesh(), source_state=b'{"position": 2}'):
+        assert source.owners == []
+    assert source.closed.is_set()
+    assert source.position == 0
+    assert source.owners[0] != threading.get_ident()
+
+
+def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp_path):
+    checkpoints = Checkpoints(str(tmp_path))
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                      checkpoints=checkpoints)
+    trainer.fit(Dataset(Source, None, None, 8), steps=1)
+    entered, stopped = threading.Event(), threading.Event()
+
+    class Restoring(Source):
+        restoring = False
+
+        def set_state(self, state):
+            self.restoring = True
+            entered.set()
+            stopped.wait()
+            super().set_state(state)
+            self.restoring = False
+
+        def request_stop(self):
+            stopped.set()
+
+        def close(self):
+            assert not self.restoring, "final close raced state restoration"
+            super().close()
+
+    source = Restoring()
+
+    def interrupt():
+        if entered.wait(10):
+            os.kill(os.getpid(), signal.SIGINT)
+
+    sender = threading.Thread(target=interrupt)
+    sender.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            trainer.fit(Dataset(lambda: source, None, None, 8), steps=2)
+        assert source.closed.is_set()
+        assert len(set(source.owners)) == 1
+        assert source.owners[0] != threading.get_ident()
+    finally:
+        stopped.set()
+        sender.join(10)
+
+
+def test_tokenized_cancellation_reaches_source_during_finalization():
+    entered, stopped, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class Finalizing:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
+
+        def request_stop(self):
+            stopped.set()
+
+        def close(self):
+            entered.set()
+            stopped.wait()
+            closed.set()
+
+    wrapped = tokenized(Finalizing, None)()
+    stream = DevicePrefetchIterator(wrapped, build_mesh())
+    consumer = threading.Thread(target=lambda: list(stream))
+    consumer.start()
+    try:
+        assert entered.wait(5)
+        stream.close(timeout=1)
+        assert closed.is_set()
+    finally:
+        stopped.set()
+        stream.close()
+        consumer.join(5)
+    assert not consumer.is_alive()
+

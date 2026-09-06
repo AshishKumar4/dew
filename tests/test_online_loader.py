@@ -281,10 +281,16 @@ def _drain(sink, expected, producer_failure, deadline):
 def _produce_in_a_thread(rows, sink):
     stop = online_loader._WORKER_CONTEXT.Event()
     producer_failure = []
+    shutdown = threading.Event()
+
+    def finish(error):
+        if error is not None:
+            producer_failure.append(error)
 
     def produce():
         try:
-            online_loader.fetch_rows(rows, sink, workers=2, threads=2, fetch=FETCH, stop=stop)
+            online_loader.fetch_rows(rows, sink, workers=2, threads=2, fetch=FETCH,
+                                     stop=stop, shutdown=shutdown, finish=finish)
         except BaseException as error:
             producer_failure.append(error)
 
@@ -294,6 +300,7 @@ def _produce_in_a_thread(rows, sink):
         yield producer_failure
     finally:
         stop.set()
+        shutdown.set()
         worker.join(10)
         assert not worker.is_alive(), "image fetch pool did not stop"
         sink.cancel_join_thread()
@@ -525,6 +532,110 @@ def test_abandoned_full_image_queue_releases_real_spawned_workers(tmp_path):
         stream.close()
     assert not stream.fetcher.is_alive()
     assert not ({child.pid for child in multiprocessing.active_children()} - before)
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def _cancel_image_packet_probe(directory):
+    """Run in a disposable process: pre-fix cancellation can wedge a C pipe read."""
+    import multiprocessing
+    from multiprocessing.connection import Connection
+
+    stream = ImageStream(_StubRows(12, passes=10000, root=directory),
+                         batch=1, size=256, min_size=32, workers=1, threads=1,
+                         timeout=1, retries=0, prefetch=1)
+    header, resume = threading.Event(), threading.Event()
+    failures = []
+    original_recv = Connection._recv
+
+    def recv(connection, size, *args):
+        value = original_recv(connection, size, *args)
+        if threading.current_thread() is consumer and size == 4 and not header.is_set():
+            header.set()
+            resume.wait()
+        return value
+
+    def consume():
+        try:
+            next(stream)
+        except StopIteration:
+            pass
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            stream.close()
+
+    consumer = threading.Thread(target=consume)
+    Connection._recv = recv
+    consumer.start()
+    try:
+        assert header.wait(10), "the image packet header never arrived"
+        stream.request_stop()
+        stream.fetcher.join(0.2)
+        assert stream.fetcher.is_alive(), "request_stop destroyed writers during receive"
+        assert multiprocessing.active_children(), "the packet writer exited before receive"
+    finally:
+        resume.set()
+    consumer.join(10)
+    assert not consumer.is_alive(), "cancelled receive remained blocked in a partial payload"
+    assert not failures, failures
+    assert not stream.fetcher.is_alive()
+    assert not multiprocessing.active_children()
+    print("partial-packet cancellation: consumer, fetcher and spawned writer released", flush=True)
+
+
+def test_cancellation_during_large_packet_does_not_terminate_its_writer(tmp_path):
+    import signal
+    import subprocess
+    from pathlib import Path
+
+    for index in range(12):
+        pixels = np.random.default_rng(index).integers(0, 256, (256, 256, 3), np.uint8)
+        (tmp_path / f"{index}.jpg").write_bytes(_png(pixels))
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join((str(Path(__file__).parent),
+                                                str(Path(__file__).parents[1] / "src")))
+    command = ("from test_online_loader import _cancel_image_packet_probe; "
+               f"_cancel_image_packet_probe({str(tmp_path)!r})")
+    process = subprocess.Popen([sys.executable, "-c", command], env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, start_new_session=True)
+    try:
+        output, _ = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(f"partial-packet cancellation did not terminate:\n{output}")
+    assert process.returncode == 0, output
+    print(output, end="")
+
+
+def test_closed_consumer_only_image_queue_releases_pipe_descriptors(monkeypatch):
+    import gc
+    from pathlib import Path
+
+    descriptors = Path("/proc/self/fd")
+    if not descriptors.exists():
+        pytest.skip("requires Linux descriptor accounting")
+    # Start multiprocessing's process-wide resource tracker before the baseline.
+    primed = online_loader._WORKER_CONTEXT.Queue(1)
+    primed.close()
+    del primed
+    gc.collect()
+    before = len(list(descriptors.iterdir()))
+
+    def exhausted(rows, sink, **kwargs):
+        return
+
+    monkeypatch.setattr(online_loader, "fetch_rows", exhausted)
+    stream = ImageStream(_StubRows(1), batch=1, size=8, min_size=4, workers=1,
+                         threads=1, timeout=1, retries=0, prefetch=1)
+    stream.close()
+    gc.collect()
+    after = len(list(descriptors.iterdir()))
+    assert after == before
+    print(f"retained closed ImageStream: pipe descriptor baseline={before}, after={after}")
+    # Keep the closed stream alive: deleting the owner must not be necessary.
     with pytest.raises(StopIteration):
         next(stream)
 
