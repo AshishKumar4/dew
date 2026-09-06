@@ -419,8 +419,11 @@ class Batches:
     def __call__(self, artifact, batch):
         return 1.0
 
-    def reduce(self, values):
-        return float(np.sum(values))
+    def merge(self, accumulated, contribution):
+        return accumulated + contribution
+
+    def finalize(self, accumulated):
+        return accumulated
 
 
 def mode_fit(args) -> dict:
@@ -478,11 +481,8 @@ PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the 
 class GlobalMean:
     """A metric that reads a whole batch field with numpy.
 
-    Every shipped image metric pairs its rows with the artifact's, so it only
-    ever reads the leading rows, which come back replicated. A metric is
-    allowed to read the whole field, and on a pool that field is a shard of a
-    global array numpy cannot touch, so this is what pins the contract that
-    the trainer brings the batch home and the number covers the global batch.
+    The trainer gathers every field before metrics run on process zero, so
+    the scalar covers the complete coordinated global batch.
     """
 
     name = "global_mean"
@@ -492,11 +492,15 @@ class GlobalMean:
 
         self.reads = ImageGrid
 
-    def __call__(self, artifact, batch) -> float:
-        return float(np.asarray(batch["image"], np.float64).mean())
+    def __call__(self, artifact, batch) -> tuple[float, int]:
+        values = np.asarray(batch["image"], np.float64)
+        return float(values.sum()), values.size
 
-    def reduce(self, values) -> float:
-        return float(np.mean(values))
+    def merge(self, accumulated, contribution):
+        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+    def finalize(self, accumulated):
+        return accumulated[0] / accumulated[1]
 
 
 def mode_validate(args) -> dict:
@@ -647,9 +651,292 @@ def mode_pipeline(args) -> dict:
     }
 
 
+def mode_evaluation_contract(args) -> dict:
+    """Tiny all-rank numerical scoring with root-only metrics and previews."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from dew.artifacts import Representations, host
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Trainer
+
+    rank = jax.process_index()
+    events = []
+    closed = []
+
+    class Numerical(Objective):
+        artifact = Representations
+
+        def init(self, key):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, params, batch, step):
+            return jnp.mean((batch["x"] + params["params"]["offset"]) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            events.append(["score", np.asarray(jax.random.key_data(step.key)).tolist()])
+            features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
+                batch["x"], step.key)
+            global_artifact = Representations(features=features, labels=batch["x"][:, 0])
+            if failure in ("deleted_first", "deleted_later", "mismatched_plan"):
+                local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
+                if rank == 0 and failure != "mismatched_plan":
+                    local.delete()
+                local_artifact = Representations(features=local, labels=np.arange(3))
+                if failure == "mismatched_plan":
+                    return local_artifact if rank == 0 else global_artifact
+                return ((local_artifact, global_artifact) if failure == "deleted_first"
+                        else (global_artifact, local_artifact))
+            if failure == "deleted_batch" and rank == 0:
+                batch["a_metadata"].delete()
+            return global_artifact
+
+        def preview(self, params, batch, step, *, scored=None):
+            events.append(["preview", np.asarray(jax.random.key_data(step.key)).tolist()])
+            if failure == "deleted_preview":
+                local = jax.device_put(np.ones((3, 1), np.float32), jax.local_devices()[0])
+                if rank == 0:
+                    local.delete()
+                return Representations(features=local, labels=np.arange(3))
+            features = jax.jit(lambda x, key: x + jax.random.normal(key, x.shape))(
+                batch["x"], step.key)
+            preview = host(Representations(features=features, labels=batch["x"][:, 0]))
+            if rank == 0 and failure == "preview":
+                raise ValueError("preview decoding failed")
+            return preview
+
+    class Mean:
+        name, reads = "mean", Representations
+
+        def __call__(self, artifact, batch):
+            if rank != 0:
+                raise AssertionError("host metric executed off root")
+            if failure == "metric":
+                raise ValueError("host metric failed")
+            values = np.asarray(artifact.features)
+            assert np.array_equal(artifact.labels, np.arange(8))
+            assert batch["a_metadata"] == 7 and batch["a_python"] == 9
+            return float(values.sum()), values.size
+
+        def merge(self, accumulated, contribution):
+            return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+        def finalize(self, accumulated):
+            if failure == "finalize":
+                raise ValueError("metric finalization failed")
+            return accumulated[0] / accumulated[1]
+
+    class Drawing:
+        def log(self, scalars, step):
+            if failure == "log":
+                raise ValueError("tracker logging failed")
+
+        def artifact(self, artifact, step):
+            assert rank == 0
+            if failure == "render":
+                raise ValueError("tracker rendering failed")
+            assert np.shape(artifact.features) == (8, 1)
+
+    def batches():
+        try:
+            count = 0 if failure == "empty" else (
+                1 if failure == "next" or (rank == 0 and failure == "uneven") else 2)
+            for _ in range(count):
+                yield {"a_metadata": np.asarray(7), "a_python": 9,
+                       "x": np.arange(rank * 4, (rank + 1) * 4, dtype=np.float32)[:, None]}
+            if failure == "next" and rank == 1:
+                raise OSError("iterator next failed")
+        finally:
+            closed.append(failure)
+
+    def validation():
+        if failure == "construct" and rank == 1:
+            raise OSError("iterator construction failed")
+        return batches()
+
+    objective = Numerical()
+    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
+    state, _, _ = trainer.place()
+    data = Dataset(train=batches, val=validation, records=8, batch=8)
+    results = {}
+    for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
+                    "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
+                    "log", "render", "construct", "next", "deleted_first", "deleted_later",
+                    "deleted_batch", "deleted_preview", "mismatched_plan"):
+        events.clear()
+        trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
+        metric = Mean()
+        if failure == "mismatch" and rank == 1:
+            metric.name = "another_metric"
+        scoring = () if failure in ("preview_only", "no_consumer") else (metric,)
+        if failure == "duplicates" and rank == 0:
+            scoring = (metric, metric)
+        try:
+            result = trainer._evaluate(state, data, scoring, trainer.device_mesh, 0)
+            results[failure] = {"scores": result, "events": list(events)}
+        except (ValueError, RuntimeError, OSError) as error:
+            results[failure] = {"error": str(error), "events": list(events)}
+    return {"results": results, "closed": closed}
+
+
+def mode_evaluation_replicas(args) -> dict:
+    """Record counts follow logical rows rather than sequence/stage replicas."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from dew.artifacts import Representations, host
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+    from dew.training import MeshSpec, Trainer
+
+    class Rows(Objective):
+        def init(self, key):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, params, batch, step):
+            return params["params"]["offset"] ** 2, Aux({})
+
+        def evaluate(self, params, batch, step):
+            return Representations(features=batch["x"], labels=batch["x"][:, 0])
+
+    class Count:
+        name, reads = "count", Representations
+
+        def __call__(self, artifact, batch):
+            assert batch["a_metadata"] == 7 and batch["a_python"] == 9
+            return len(artifact.features)
+
+        def merge(self, accumulated, contribution):
+            return accumulated + contribution
+
+        def finalize(self, accumulated):
+            return float(accumulated)
+
+    mesh = MeshSpec(stage=2) if args.name == "stage" else MeshSpec(sequence=2)
+    trainer = Trainer(Rows(), optax.sgd(.01), mesh=mesh, key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"a_metadata": np.asarray(7), "a_python": 9,
+             "x": np.arange(3, dtype=np.float32)[:, None]}
+    data = Dataset(train=lambda: iter([batch]), val=lambda: iter([batch]), records=3, batch=3)
+    measured = trainer._evaluate(state, data, (Count(),), trainer.device_mesh, 0)
+    unconsumed = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+    # Plain host stays usable on root alone for local arrays outside evaluation.
+    local = None
+    if jax.process_index() == 0:
+        local = host(jax.device_put(np.arange(3), jax.local_devices()[0])).tolist()
+    return {"measured": measured, "no_consumer": unconsumed, "local": local}
+
+
+def mode_builtin_preview_failures(args) -> dict:
+    """Exercise nested builtin preview failures while both ranks remain alive."""
+    import jax
+    import optax
+    import dew.sampling.text as text_sampling
+    from dew.data import Dataset
+    from dew.diffusion import presets
+    from dew.diffusion.discrete import MDLM
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Euler
+    from dew.training import Trainer
+
+    rank = jax.process_index()
+    reports = {}
+    for kind in ("lm", "diffusion", "masked"):
+        model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
+                                  num_heads=2, mlp_features=16, max_seq_len=8,
+                                  causal=kind != "masked", dtype="float32", attention_impl="xla")
+        if kind == "lm":
+            objective = LMObjective(model, seq_len=4,
+                                    samples=Samples(prompt=[1, 2], max_new_tokens=1))
+            batch = {"text": np.ones((3, 5), np.int32)}
+        elif kind == "masked":
+            objective = MaskedDiffusionObjective(model, MDLM(mask_id=7)(), seq_len=4,
+                                                samples=1, steps=2)
+            batch = {"text": np.ones((3, 4), np.int32)}
+        else:
+            objective = DiffusionObjective(
+                SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
+                presets.EDM()(), InputSpec(Field("image", (RES, RES, 3))),
+                steps=2, sampler=Euler(), guidance=None)
+            batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
+        tracker = ScoreRecorder()
+        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
+                          tracker=tracker if rank == 0 else None)
+        state, _, _ = trainer.place()
+        field = "_prompt" if kind == "lm" else "_sample"
+        original = getattr(objective, field)
+        original_generate = text_sampling.generate
+        closed = []
+
+        def validation():
+            try:
+                yield batch
+            finally:
+                closed.append(case)
+
+        data = Dataset(train=validation, val=validation, records=6, batch=6)
+        for phase in ("setup", "generation", "preflight"):
+            for source in (0, 1):
+                case = f"{kind}-{phase}-{source}"
+                fault = ValueError(f"{case}: local sampler failure before device work")
+
+                def sample_failure(*sample_args, **kwargs):
+                    if phase == "generation" and rank == source:
+                        raise fault
+                    if kind == "diffusion":
+                        result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
+                    else:
+                        result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
+                    if phase == "preflight" and rank == source:
+                        result = jax.device_put(result, jax.local_devices()[0])
+                        result.delete()
+                    return result
+
+                if phase == "setup":
+                    if rank == source:
+                        delattr(objective, field)
+                elif kind == "lm":
+                    text_sampling.generate = sample_failure
+                else:
+                    objective._sample = sample_failure
+                try:
+                    trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+                except (AttributeError, ValueError, RuntimeError) as error:
+                    reports[case] = {"type": type(error).__name__, "error": str(error),
+                                     "original": error is fault, "closed": case in closed}
+                else:
+                    reports[case] = {"error": None}
+                finally:
+                    setattr(objective, field, original)
+                    text_sampling.generate = original_generate
+                # Files keep the successful escapee alive without accidentally
+                # matching the stranded rank's next JAX phase agreement.
+                ready = args.out.parent / f"{case}.{rank}.ready"
+                ready.write_text("returned")
+                peer = args.out.parent / f"{case}.{1 - rank}.ready"
+                deadline = time.monotonic() + 30
+                while not peer.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{case}: peer never returned from evaluation")
+                    time.sleep(.01)
+        case = f"{kind}-healthy"
+        scores = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+        reports[case] = {"scores": scores, "drawn": len(tracker.drawn)}
+    return reports
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
-         "tracked": mode_tracked, "pipeline": mode_pipeline}
+         "tracked": mode_tracked, "pipeline": mode_pipeline,
+         "evaluation_contract": mode_evaluation_contract,
+         "evaluation_replicas": mode_evaluation_replicas,
+         "builtin_preview_failures": mode_builtin_preview_failures}
 
 
 def parse_args(argv=None):

@@ -63,7 +63,7 @@ def worker_env(devices: int) -> dict:
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
-def spawn(mode, out, processes=1, process_id=0, coordinator=None, **flags):
+def spawn(mode, out, processes=1, process_id=0, coordinator=None, devices=None, **flags):
     """One worker process, started and not waited for.
 
     Its own session, so killing it takes down anything it spawned with it.
@@ -79,7 +79,7 @@ def spawn(mode, out, processes=1, process_id=0, coordinator=None, **flags):
         elif value is not None:
             command += [flag, str(value)]
     return subprocess.Popen(
-        command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes),
+        command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes if devices is None else devices),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True)
 
@@ -845,3 +845,74 @@ def test_a_pool_draws_a_jepa_artifact(tmp_path):
     assert drawn[0]["rendered"] is True
     assert drawn[0]["features"][0] == worker.BATCH
     assert drawn[0]["std"] > 0.0
+
+
+@pytest.mark.distributed
+def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
+    reports = run_pool("evaluation_contract", tmp_path, 2)
+    first, second = (report["results"] for report in reports)
+    for event in ("normal", "repeat", "untracked", "preview_only", "uneven"):
+        assert first[event]["scores"] == second[event]["scores"]
+    assert first["normal"]["scores"]["val/mean"] == first["repeat"]["scores"]["val/mean"]
+    assert first["normal"]["scores"]["val/mean"] == first["untracked"]["scores"]["val/mean"]
+    for report in reports:
+        events = report["results"]["normal"]["events"]
+        scoring = [key for kind, key in events if kind == "score"]
+        preview = [key for kind, key in events if kind == "preview"]
+        assert len(scoring) == 2 and scoring[0] != scoring[1]
+        assert len(preview) == 1 and preview[0] not in scoring
+        assert report["results"]["preview_only"]["events"][0][0] == "preview"
+        assert len(report["results"]["preview_only"]["events"]) == 1
+        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 1
+        assert report["results"]["uneven"]["scores"]["evaluation/uneven_shards"] == 1
+        for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
+            assert "error" in report["results"][phase], (phase, report)
+            if phase != "construct":
+                assert phase in report["closed"]
+        assert "iterator next failed" in report["results"]["next"]["error"]
+        assert report["results"]["empty"] == {"scores": {}, "events": []}
+        assert report["results"]["no_consumer"]["events"] == []
+        assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
+        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 8
+        for invalid in ("mismatch", "duplicates"):
+            assert "error" in report["results"][invalid]
+            assert report["results"][invalid]["events"] == []
+        for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
+            assert "deleted" in report["results"][failure]["error"]
+            assert failure in report["closed"]
+        assert "gather plans differ" in report["results"]["mismatched_plan"]["error"]
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("axis", ["stage", "sequence"])
+def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, axis):
+    reports = run_pool("evaluation_replicas", tmp_path, 2, devices=1, name=axis)
+    assert reports[0]["measured"] == reports[1]["measured"]
+    for report in reports:
+        assert report["measured"]["val/count"] == 3
+        assert report["measured"]["evaluation/records"] == 3
+        assert report["no_consumer"]["evaluation/records"] == 3
+    assert reports[0]["local"] == [0, 1, 2]
+    assert reports[1]["local"] is None
+
+
+@pytest.mark.distributed
+def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failures(tmp_path):
+    reports = run_pool("builtin_preview_failures", tmp_path, 2, devices=1)
+    for kind in ("lm", "diffusion", "masked"):
+        for phase in ("setup", "generation", "preflight"):
+            for source in (0, 1):
+                case = f"{kind}-{phase}-{source}"
+                local, remote = reports[source][case], reports[1 - source][case]
+                assert local["closed"] and remote["closed"]
+                assert remote["type"] == "RuntimeError"
+                assert f"rank {source}" in remote["error"]
+                if phase == "setup":
+                    assert local["type"] == "AttributeError"
+                elif phase == "generation":
+                    assert local["type"] == "ValueError" and local["original"]
+                else:
+                    assert local["type"] == "RuntimeError" and "deleted" in local["error"]
+        assert reports[0][f"{kind}-healthy"]["drawn"] == 1
+        assert reports[1][f"{kind}-healthy"]["drawn"] == 0
+        assert reports[0][f"{kind}-healthy"]["scores"] == reports[1][f"{kind}-healthy"]["scores"]

@@ -38,6 +38,7 @@ nav:
       - SFT, DPO, and GRPO: concepts/post_training.md
       - Training recipes: recipes.md
       - TPU setup: tpu.md
+      - Moving from FlaxDiff: from-flaxdiff.md
   - Concepts:
       - Distributed training: concepts/distributed.md
       - Mixture of experts: concepts/moe.md

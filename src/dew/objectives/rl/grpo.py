@@ -121,6 +121,10 @@ class GRPOObjective(LMObjective):
             return pg_loss + self.beta * kl, Aux(metrics)
         return pg_loss, Aux(metrics)
 
+    def preview(self, params, batch, step, *, scored=None):
+        """Draw policy text; this objective's EMA holds the frozen reference."""
+        return super().preview(params, batch, step.replace(ema=None), scored=scored)
+
     def evaluate(self, params, batch, step):
         """The prompts' perplexity under the policy: each row's shifted
         cross entropy with the real suffix as weights, off the row's
