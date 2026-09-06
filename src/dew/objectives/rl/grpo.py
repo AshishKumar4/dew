@@ -13,6 +13,8 @@ samples.
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
@@ -123,7 +125,7 @@ class GRPOObjective(LMObjective):
 
     def preview(self, params, batch, step, *, scored=None):
         """Draw policy text; this objective's EMA holds the frozen reference."""
-        return super().preview(params, batch, step.replace(ema=None), scored=scored)
+        return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
 
     def evaluate(self, params, batch, step):
         """The prompts' perplexity under the policy: each row's shifted
