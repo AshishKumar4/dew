@@ -31,12 +31,13 @@ def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
     from dew.inputs import unit_range
 
     samples = frames(artifact)
-    targets = unit_range(batch[field])
-    if targets.shape[0] != samples.shape[0]:
+    targets = batch[field]
+    target_shape = np.shape(targets)
+    if target_shape != samples.shape:
         raise ValueError(
-            f"the artifact holds {samples.shape[0]} rows and batch[{field!r}] "
-            f"{targets.shape[0]}; paired metrics require equal counts")
-    return samples, targets
+            f"the artifact has pixel shape {samples.shape} and batch[{field!r}] "
+            f"{target_shape}; paired metrics require equal counts and pixel shapes")
+    return samples, unit_range(targets)
 
 
 @dataclass(frozen=True, eq=False)

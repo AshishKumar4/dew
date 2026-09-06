@@ -63,7 +63,7 @@ def worker_env(devices: int) -> dict:
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
-def spawn(mode, out, processes=1, process_id=0, coordinator=None, **flags):
+def spawn(mode, out, processes=1, process_id=0, coordinator=None, devices=None, **flags):
     """One worker process, started and not waited for.
 
     Its own session, so killing it takes down anything it spawned with it.
@@ -79,7 +79,7 @@ def spawn(mode, out, processes=1, process_id=0, coordinator=None, **flags):
         elif value is not None:
             command += [flag, str(value)]
     return subprocess.Popen(
-        command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes),
+        command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes if devices is None else devices),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True)
 
@@ -877,3 +877,20 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
+        for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
+            assert "deleted" in report["results"][failure]["error"]
+            assert failure in report["closed"]
+        assert "gather plans differ" in report["results"]["mismatched_plan"]["error"]
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("axis", ["stage", "sequence"])
+def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, axis):
+    reports = run_pool("evaluation_replicas", tmp_path, 2, devices=1, name=axis)
+    assert reports[0]["measured"] == reports[1]["measured"]
+    for report in reports:
+        assert report["measured"]["val/count"] == 3
+        assert report["measured"]["evaluation/records"] == 3
+        assert report["no_consumer"]["evaluation/records"] == 3
+    assert reports[0]["local"] == [0, 1, 2]
+    assert reports[1]["local"] is None

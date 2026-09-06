@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
-from dew.artifacts import ImageGrid, VideoGrid, host
+from dew.artifacts import ImageGrid, VideoGrid, collective_host
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -186,7 +186,7 @@ class DiffusionObjective(Objective):
         tokens = {keyword: jax.tree.map(lambda value: value[:count], batch[condition.field])
                   for keyword, condition in self.inputs.conditions.items()}
         samples = self._sample(params, tokens, step.key, count=count)
-        samples, tokens = host((samples, tokens))
+        samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None
         captions = ()
