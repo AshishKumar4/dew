@@ -23,7 +23,6 @@ def test_fid_pools_unequal_batches_and_singletons():
         accumulated = contribution if accumulated is None else metric.merge(accumulated, contribution)
     expected = frechet_distance(generated.mean(0), np.cov(generated, rowvar=False),
                                 real.mean(0), np.cov(real, rowvar=False))
-    assert accumulated is not None
     assert (accumulated.generated.count, accumulated.real.count) == (19, 23)
     np.testing.assert_allclose(accumulated.generated.covariance(population="generated"),
                                np.cov(generated, rowvar=False), rtol=1e-13, atol=1e-13)

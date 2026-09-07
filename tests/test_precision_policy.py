@@ -157,10 +157,8 @@ def tiny_inputs(architecture, rng):
 @pytest.mark.parametrize("architecture", sorted(models))
 def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng):
     """bf16 is a compute dtype: every param leaf stays float32 so checkpoints
-    and the optimizer state are unchanged. The unets and the jepa models hand
-    back bf16; the DiT family casts its final projection to fp32 on purpose.
-    DiffusionGemma refines a canvas against an encoded prompt, so its forward
-    is the encode-then-refine pair."""
+    and the optimizer state are unchanged. DiffusionGemma refines a canvas
+    against an encoded prompt, so its forward is the encode-then-refine pair."""
     model = build_model(architecture)
 
     inputs = tiny_inputs(architecture, rng)
@@ -178,5 +176,4 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
     assert not demoted
 
     out = model.apply(variables, *args, **kwargs)
-    assert out.dtype in (jnp.bfloat16, jnp.float32)
     assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))

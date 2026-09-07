@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inputs import Condition, Field, InputSpec, T5Text
+from dew.inputs import T5Text
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "t5"
 TINY = FIXTURES / "tiny"

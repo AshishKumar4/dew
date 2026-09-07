@@ -1,0 +1,817 @@
+{
+  "revision": "d040717b21af2e23e8e789a3e354cff2394ae2de",
+  "outputs": [
+    {
+      "wire": {
+        "prompt_ids": [
+          1
+        ],
+        "response_ids": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "reward_score": 0.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 0,
+                "seed": [
+                  2584501222,
+                  817857610
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}",
+              "reward": 0.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 0,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.5981389284133911,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "status": 0,
+              "detail": "square(3) = 9"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1
+        ],
+        "responses": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "response_ids": [
+          6,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.8875784277915955,
+          0.0
+        ],
+        "reward_score": 0.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 0,
+                "seed": [
+                  2584501222,
+                  817857610
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}",
+              "reward": 0.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 1,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.825939416885376,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [],
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "responses": [
+          6,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.8875784277915955,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1
+        ],
+        "response_ids": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "reward_score": 1.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 1,
+                "seed": [
+                  190324081,
+                  936983346
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}",
+              "reward": 1.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 0,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.5981389284133911,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "status": 0,
+              "detail": "square(3) = 9"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1
+        ],
+        "responses": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "response_ids": [
+          5,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.5304355621337891,
+          0.0
+        ],
+        "reward_score": 1.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 1,
+                "seed": [
+                  190324081,
+                  936983346
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}",
+              "reward": 1.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 1,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.575939416885376,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [],
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "responses": [
+          5,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.5304355621337891,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1
+        ],
+        "response_ids": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "reward_score": 1.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 2,
+                "seed": [
+                  2160167688,
+                  4285582716
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}",
+              "reward": 1.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 0,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.5981389284133911,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "status": 0,
+              "detail": "square(3) = 9"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1
+        ],
+        "responses": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "response_ids": [
+          5,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.5304355621337891,
+          0.0
+        ],
+        "reward_score": 1.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 2,
+                "seed": [
+                  2160167688,
+                  4285582716
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}",
+              "reward": 1.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 1,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.575939416885376,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [],
+              "status": 1,
+              "detail": "{\"answer\": 9, \"expected\": 9}"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "responses": [
+          5,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.5304355621337891,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1
+        ],
+        "response_ids": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "reward_score": 0.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 3,
+                "seed": [
+                  3326343637,
+                  3126843924
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}",
+              "reward": 0.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 0,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.5981389284133911,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "status": 0,
+              "detail": "square(3) = 9"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1
+        ],
+        "responses": [
+          2,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.560459554195404,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "wire": {
+        "prompt_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "response_ids": [
+          6,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "response_logprobs": [
+          -0.8875784277915955,
+          0.0
+        ],
+        "reward_score": 0.0,
+        "num_turns": 1,
+        "metrics": {},
+        "extra_fields": {
+          "dew": {
+            "episode": {
+              "identity": {
+                "task": 31,
+                "attempt": 0,
+                "sample": 3,
+                "seed": [
+                  3326343637,
+                  3126843924
+                ]
+              },
+              "policy_step": 0,
+              "initial": {
+                "context": [
+                  1
+                ],
+                "status": 0,
+                "detail": ""
+              },
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}",
+              "reward": 0.0,
+              "_binding_id": "fixture"
+            },
+            "turn": 1,
+            "turns": 2,
+            "action": {
+              "raw_log_probs": [
+                -0.825939416885376,
+                0.0
+              ],
+              "terminated": true,
+              "policy_step": 0,
+              "sampling": {
+                "temperature": 0.7,
+                "top_k": 2,
+                "eos_id": [
+                  3
+                ],
+                "pad_id": 0,
+                "top_p": 1.0,
+                "min_p": 0.0
+              },
+              "_binding_id": "fixture"
+            },
+            "observation": {
+              "context": [],
+              "status": 1,
+              "detail": "{\"answer\": 8, \"expected\": 9}"
+            }
+          }
+        }
+      },
+      "tensors": {
+        "prompts": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "responses": [
+          6,
+          3
+        ],
+        "response_mask": [
+          1,
+          1
+        ],
+        "rollout_log_probs": [
+          -0.8875784277915955,
+          0.0
+        ],
+        "rm_scores": [
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ]
+}

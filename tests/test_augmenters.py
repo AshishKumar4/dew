@@ -12,7 +12,6 @@ prove nothing in the module's import or construction path reaches it.
 """
 
 import dataclasses
-import hashlib
 import itertools
 import os
 import random
@@ -23,7 +22,6 @@ from pathlib import Path
 
 from absl import flags
 import cv2
-import grain.python as pygrain
 import numpy as np
 import pytest
 
@@ -88,10 +86,6 @@ def _spec(kind, labels_file, augmentation="flip_jitter"):
     return CC12M(image_size=SCALE, augmentation=augmentation)
 
 
-def _make_transform(kind, labels_file, monkeypatch, augmentation="flip_jitter"):
-    return ImageTransform(_spec(kind, labels_file, augmentation))
-
-
 def _resized(kind, element):
     """The deterministic prefix of random_map: decode, convert, resize.
     For arrayrecord, `element` is still the packed byte blob the transform unpacks."""
@@ -125,7 +119,6 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
         "sys.modules['transformers'] = None",
         "",
         "import numpy as np",
-        "import grain.python as pygrain",
         "from dew.data import CC12M, OxfordFlowers",
         "from dew.data.images import ImageTransform, augment_image, image_augmentations",
         "",
@@ -133,8 +126,7 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
         "image = np.zeros((9, 11, 3), dtype=np.uint8)",
         "for mode in ('none', 'flip_only', 'flip_jitter'):",
         "    for spec in (OxfordFlowers(labels=labels, augmentation=mode), CC12M(augmentation=mode)):",
-        "        assert image_augmentations(spec.augmentation) is not None",
-        "    assert issubclass(ImageTransform, pygrain.RandomMapTransform)",
+        "        ImageTransform(spec)",
         "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
         "    assert out.dtype == np.uint8 and out.shape == image.shape",
         "print('ok')",
@@ -153,24 +145,27 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path, monkeypatch):
+def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="none")
+    transform = ImageTransform(_spec(kind, labels_file, "none"))
 
     out = transform.random_map(element, _record_rng(0))
 
     assert out["image"].dtype == np.uint8
     np.testing.assert_array_equal(out["image"], _resized(kind, element))
-    # the surrounding record wiring stays intact
-    assert out["caption"] == "a yellow tulip" if kind == "gcs" else out["caption"]
+    if kind == "gcs":
+        assert out["caption"] == "a yellow tulip"
+    else:
+        assert out["caption"] in {template.format(LABELS[2])
+                                  for template in images.PROMPT_TEMPLATES}
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path, monkeypatch):
+def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="flip_only")
+    transform = ImageTransform(_spec(kind, labels_file, "flip_only"))
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -186,10 +181,10 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path, mon
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path, monkeypatch):
+def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _make_transform(kind, labels_file, monkeypatch, augmentation="flip_jitter")
+    transform = ImageTransform(_spec(kind, labels_file, "flip_jitter"))
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -210,7 +205,7 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_the_default_augmentation_is_flip_jitter(kind, tmp_path, monkeypatch):
+def test_the_default_augmentation_is_flip_jitter(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
     spec = dataclasses.replace(_spec(kind, labels_file), augmentation=OxfordFlowers().augmentation)
@@ -229,13 +224,13 @@ def test_the_default_augmentation_is_flip_jitter(kind, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path, monkeypatch):
+def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path):
     """The same record must get the same augmentation and the same caption
     whatever the worker or process count, and neither global RNG may move."""
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    first = _make_transform(kind, labels_file, monkeypatch)
-    other = _make_transform(kind, labels_file, monkeypatch)
+    first = ImageTransform(_spec(kind, labels_file))
+    other = ImageTransform(_spec(kind, labels_file))
 
     numpy_state = np.random.get_state()[1]
     python_state = random.getstate()
@@ -275,7 +270,7 @@ def test_a_record_with_no_caption_column_says_what_it_has():
         images.record_caption({"image": None, "url": "x"})
 
 
-def test_a_hub_record_captions_from_the_record_and_reads_no_label_file(monkeypatch):
+def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
     transform = ImageTransform(images.HFImages(name="acme/pets", image_size=SCALE,

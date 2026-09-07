@@ -136,7 +136,7 @@ class Registry(Mapping[str, T], Generic[T]):
         return Union[tuple(members)] if len(members) > 1 else members[0]
 
 
-def _describe(member: Any) -> str:
+def _describe(member: object) -> str:
     return getattr(member, "__name__", repr(member))
 
 
@@ -173,7 +173,7 @@ def _unwrapped(annotation: object) -> object:
     return members[0] if len(members) == 1 else None
 
 
-def entry_types(annotation: Any, count: int) -> list[Any]:
+def entry_types(annotation: object, count: int) -> list[object]:
     """The annotation of each of the `count` entries of an annotated
     container: a fixed tuple's per-position types, otherwise its one element
     type repeated (a mapping's value type, a sequence's element). None is an
@@ -196,7 +196,7 @@ def wants_tuple(annotation: object) -> bool:
     return annotation is tuple or typing.get_origin(annotation) is tuple
 
 
-def from_record(annotation: Any, value: Any) -> Any:
+def from_record(annotation: object, value: Any) -> Any:
     """`value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
 

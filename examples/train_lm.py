@@ -14,7 +14,6 @@ import tyro
 
 from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
-import dew.nn.backbones  # registers the models
 from dew.registry import models
 from dew.inference import RunProcessor
 from dew.sampling import Sampling

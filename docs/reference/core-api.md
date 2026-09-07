@@ -128,7 +128,7 @@ Each factory call must return a fresh, exclusively owned iterator. Ordinary `clo
 
 `DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership on successful construction and starts its worker lazily on the first `next()`. Saved-position restoration also runs there, so its failures unwind through the already-owned iterator. Closing an unused iterator starts only its finalization, not a read or restoration. Use it in a `with` block, or call `close(timeout=5.0)`, even when a loop consumes only a fixed number of batches. Depth must be positive; the bound is `depth` queued device batches plus at most one in-flight batch, excluding the consumer and upstream buffers. Its `source_state` describes the last delivered batch, never speculative read-ahead. EOF and source failures follow preceding queued batches; early close discards unread data and speculative failures, but reports finalization failures.
 
-The prefetch worker performs iteration, checkpoint operations, and final source close. Closing requests cancellation, discards queued batches, and joins the worker. A `TimeoutError` means the source read, placement, or finalization did not cooperate: the thread was **not** killed and its in-flight references may remain. Cancellation stays requested and close can be retried. After close, further iteration stops.
+The prefetch worker performs iteration, checkpoint operations, and final source close. Closing requests cancellation, discards queued batches, and joins the worker. A `TimeoutError` means the source read, placement, or finalization did not cooperate: the thread was not killed and its in-flight references may remain. Cancellation stays requested and close can be retried. After close, further iteration stops.
 
 Grain lifecycle limits: the installed `DataLoaderIterator` exposes no public close, so Dew releases its owned references without reaching into private iterators or changing the sampling pipeline. Local-record probes release the source and child processes, but that is not a deterministic upstream shutdown contract. Grain also keeps a process-wide shared-memory deletion thread pool. Its `DatasetIterator.close()` is called on the iteration thread, but read-executor shutdown does not wait for already-running record reads. Arbitrary blocked upstream reads remain outside Dew's shutdown guarantee.
 
@@ -203,6 +203,7 @@ TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance
 TextToImage.from_objective(objective, variables) -> TextToImage
 TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None)
 TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None)
+LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
 image_task.prepare(prompts, *, key=None, seed=None, steps=None) -> DenoisingInputs
 image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, seed=None) -> Images
@@ -212,6 +213,8 @@ RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task proce
 A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
 
 `max_new_tokens` defaults to the budget the source declares (a checkpoint's `max_new_tokens`, an LM run's `sample_tokens`, an objective's `Samples`); without one the call must pass it. Equal shapes and controls reuse the compiled executable, across calls and across `bind`.
+
+`LMObjective.policy(params)` returns the `TextGeneration` bound to those parameters, which is the task `SampledRollout` samples with, so a rollout and a hand-written draw share one decode path. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
 
@@ -238,13 +241,13 @@ with openai.OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local") as clie
                   extra_body={"top_k": 40, "min_p": 0.05})
 ```
 
-The convenience call returns `Completion(texts, finish_reasons, token_counts, usage, responses)`. Missing per-choice token counts and finish reasons remain `None`. Aggregate OpenAI usage is separate; it is never split among choices or replaced with zeros. `responses` retains the SDK models, including reported logprobs, token data and extensions. These are backend reports, not invented native raw/behavior policy likelihoods.
+The convenience call returns `Completion(texts, finish_reasons, token_counts, usage, responses)`. Missing per-choice token counts and finish reasons remain `None`. Aggregate OpenAI usage stays separate from the per-choice fields. `responses` retains the SDK models, including the logprobs, token data and extensions the backend reported.
 
-An explicit `sampling=Sampling(...)` sets the native policy controls supported by the selected backend. Ollama receives neutral repetition/presence/frequency penalties and explicit top-k/top-p/min-p values, so its hidden `repeat_penalty=1.1` default does not alter the request. Conflicting explicit options are refused. `OpenAICompletion(..., provider="vllm")` enables vLLM-specific Sampling translation, including `repetition_penalty=1.0` and optional EOS-token IDs. Without a Sampling value, provider defaults or the caller's SDK options apply. Native and backend tokenizers can still differ; this is not an RL interoperability guarantee.
+An explicit `sampling=Sampling(...)` sets the native policy controls supported by the selected backend. Ollama receives neutral repetition/presence/frequency penalties and explicit top-k/top-p/min-p values, so its hidden `repeat_penalty=1.1` default does not alter the request. Conflicting explicit options are refused. `OpenAICompletion(..., provider="vllm")` enables vLLM-specific Sampling translation, including `repetition_penalty=1.0` and optional EOS-token IDs; without it the client refuses `top_k`, `min_p` and `eos_id` rather than dropping them. Without a Sampling value, provider defaults or the caller's SDK options apply. A backend's tokenizer can segment the same prompt differently from the exported one, so prompt token counts agree more often than prompt ids do.
 
 `stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama requests go through the SDK's public `generate` and `chat` methods, which own request conversion, HTTP behavior, error handling and line-stream framing; the adapter rejects request fields the installed SDK does not accept and negative token counts, and the SDK's own parsing rejects unparsable values. OpenAI completions use the SDK's public `with_raw_response` hook, so choice and usage fields are checked on the wire before parsing. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget, requested choice count and an explicit `Sampling` policy cannot be overridden through provider extensions; the SDK writes `extra_body` over the named parameters, so a policy field there must equal the policy or the request is refused before any network call.
 
-Live CPU verification imported a locally trained Dew model through `Pretrained.save`, including tokenizer assets, then exercised official SDK completion and streaming on Ollama and its OpenAI-compatible endpoint. Native save/reload was exact. This does not establish numerical parity between Dew and Ollama, or a live vLLM run.
+A decoder trained through the LM recipe, exported with `save_pretrained_decoder` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. `Pretrained.save` and `save_pretrained_decoder` leave the same files, so either export converts.
 
 ## Diffusion and JEPA objectives
 
@@ -266,4 +269,4 @@ A registry maps names to known classes or factories. For example, `models.build(
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 
-For complete family restrictions, model-specific data, quantization, and deployment scope, use the [capability reference](support.md) and the relevant task guide.
+The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.
