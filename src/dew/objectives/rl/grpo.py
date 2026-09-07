@@ -24,12 +24,12 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.objectives.base import Aux, Mean, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
-from dew.rl import k3_kl, token_log_ratio
+from dew.rl import behavior_importance_weights, k3_kl, token_log_ratio
 from dew.rl.surrogate import clipped_surrogate_terms
 
 from ..lm import LMObjective
 from ..lm.objective import _shift_rows
-from .rollout import ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
+from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
 
 
 @objectives("grpo")
@@ -46,11 +46,17 @@ class GRPOObjective(LMObjective):
     prompt width plus the response width. An `ema_decay` argument is refused,
     and `loss_role` is refused with it: the response mask already says which
     targets count.
+
+    `behavior_importance_cap` opts into verl's detached token TIS correction:
+    exp(recorded raw old log-probability minus recorded behavior log-probability),
+    capped at this positive value. None preserves the uncorrected default.
+    It weights policy terms before the ordinary token-count reduction; PPO
+    clipping and the KL term retain their original definitions.
     """
 
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                 dual_clip: float = 3.0, **kwargs):
+                 dual_clip: float = 3.0, behavior_importance_cap: float | None = None, **kwargs):
         if beta < 0:
             raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
         if "ema_decay" in kwargs:
@@ -66,6 +72,10 @@ class GRPOObjective(LMObjective):
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high
         self.dual_clip = dual_clip
+        if behavior_importance_cap is not None and (isinstance(behavior_importance_cap, bool)
+                                                    or not behavior_importance_cap > 0):
+            raise ValueError("behavior_importance_cap must be positive, or None to disable correction")
+        self.behavior_importance_cap = behavior_importance_cap
 
     def _window(self, batch):
         """The rollout batch validated: the concatenation width, the response
@@ -109,6 +119,15 @@ class GRPOObjective(LMObjective):
     def loss(self, params, batch, step):
         ids, start, width = self._window(batch)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
+        importance = None
+        if self.behavior_importance_cap is not None:
+            if BEHAVIOR_LOG_PROBS_KEY not in batch:
+                raise ValueError("behavior_importance_cap requires recorded behavior_log_probs")
+            behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY])
+            old = jnp.asarray(batch[OLD_LOG_PROBS_KEY])
+            if behavior.shape != old.shape:
+                raise ValueError("behavior_log_probs must have the same shape as old_log_probs")
+            importance = behavior_importance_weights(old, behavior, mask, self.behavior_importance_cap)
         padding = (None if LENGTH_KEY not in batch else
                    start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32))
         policy = self.per_token_log_probs(params, ids, left_padding=padding)[:, start:start + width]
@@ -117,6 +136,8 @@ class GRPOObjective(LMObjective):
             ratio, jnp.asarray(batch[ADVANTAGES_KEY]), mask,
             epsilon_low=self.epsilon_low, epsilon_high=self.epsilon_high,
             dual_clip=self.dual_clip)
+        if importance is not None:
+            terms = terms * importance
         mass = jax.lax.stop_gradient(jnp.sum(mask, dtype=jnp.promote_types(mask.dtype, jnp.float32)))
         pg = Mean(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), mass)
         pg_loss, _ = mean_loss(pg)

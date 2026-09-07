@@ -1,5 +1,5 @@
 # Copyright 2026 Google LLC
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2024-2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -206,3 +206,20 @@ def preference_logsigmoid(policy_chosen: jax.Array, policy_rejected: jax.Array,
         policy_chosen, policy_rejected, ref_chosen, ref_rejected,
         mask_chosen, mask_rejected, beta)
     return jnp.mean(terms)
+
+
+def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: jax.Array,
+                                mask: jax.Array, cap: float) -> jax.Array:
+    """Detached token TIS weights from recorded raw and behavior policies.
+
+    Port of verl compute_rollout_correction_weights(token), revision
+    d040717b21af2e23e8e789a3e354cff2394ae2de: exponentiate the log ratio
+    clamped to +-20, mask padding, then cap the weight. No batch normalization
+    or rejection sampling is implied. Token TIS and filtered sampling do
+    not recover an unbiased full-trajectory raw-policy expectation.
+    """
+    if isinstance(cap, bool) or not cap > 0:
+        raise ValueError("behavior importance cap must be positive")
+    ratio = token_log_ratio(old_log_probs, behavior_log_probs)
+    weights = jnp.where(mask != 0, jnp.exp(ratio) * mask, 0)
+    return jax.lax.stop_gradient(jnp.minimum(weights, cap))
