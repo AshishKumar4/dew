@@ -158,6 +158,9 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     # `((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()`.
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))
     diff = gc[..., :, None] - gc[..., None, :]  # [B, H, NC, C, C]
+    # The reference masks before exp too. Unused positive differences can
+    # overflow; an outer where alone leaves 0*inf in the decay gradient.
+    diff = jnp.where(inclusive, diff, 0.0)
     decay = jnp.where(inclusive, jnp.exp(diff), 0.0)
     # The strictly-lower operator the reference inverts row by row: its loop
     # `attn[i, :i] += sum_k attn[i, k] attn[k, :i]`, iterated to the last row,
