@@ -223,3 +223,18 @@ def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: ja
     ratio = token_log_ratio(old_log_probs, behavior_log_probs)
     weights = jnp.where(mask != 0, jnp.exp(ratio) * mask, 0)
     return jax.lax.stop_gradient(jnp.minimum(weights, cap))
+
+
+def clipped_value_loss_terms(predicted: jax.Array, returns: jax.Array, old_values: jax.Array,
+                             clip: float = 0.2) -> jax.Array:
+    """verl d040717 compute_value_loss, before its token-mask reduction.
+
+    The larger squared error of the live prediction and the prediction
+    clipped around recorded values is multiplied by one half. Targets and
+    recorded values are detached rollout data.
+    """
+    returns = jax.lax.stop_gradient(jnp.asarray(returns, jnp.float32))
+    old_values = jax.lax.stop_gradient(jnp.asarray(old_values, jnp.float32))
+    predicted = jnp.asarray(predicted, jnp.float32)
+    clipped = jnp.clip(predicted, old_values - clip, old_values + clip)
+    return 0.5 * jnp.maximum(jnp.square(predicted - returns), jnp.square(clipped - returns))

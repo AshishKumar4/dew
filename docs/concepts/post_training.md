@@ -1,8 +1,8 @@
 # Post-training
 
-Post-training changes a model's behavior after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Flow-GRPO scores samples from a rectified-flow model.
+Post-training changes a model's behavior after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Proximal policy optimization (PPO) learns a critic to estimate future rewards. Flow-GRPO scores samples from a rectified-flow model.
 
-Dew provides objectives and data specifications for the three language-model methods, plus a Flow-GRPO objective and rollout. They use the same `Trainer`, but they do not consume interchangeable batches. Start with [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for the model/objective/trainer relationship. The first example below trains a tiny DPO model without a tokenizer download, a dataset download, or a pretrained checkpoint.
+Dew provides these objectives on the same `Trainer`; their batches carry different supervision. Start with [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for the model/objective/trainer relationship. The first example below trains a tiny DPO model without a tokenizer download, a dataset download, or a pretrained checkpoint.
 
 ## SFT: learn from assistant answers
 
@@ -184,6 +184,44 @@ Recovery restores completed turns and their exact contexts, raw/behavior likelih
 
 Use one journal directory per run. Recovery checks task identities, sampling controls, topology, training clocks, key and a digest of the local policy shards; hashing reads local weights once per collection. It refuses concurrent writers and a different policy at identical clocks. FULL-synchronous SQLite commits preserve turn boundaries. `tests/test_episode_recovery.py` kills a real two-device training process while a subprocess tool call is pending, restores it, and obtains identical sampled actions and updated parameters. Its audit log confirms each completed square call executes once.
 
+## PPO with a critic
+
+`PPOObjective(model, seq_len, critic=..., value_coefficient=.5, value_clip=.2, beta=...)` trains policy and critic subtrees in one variables tree with the ordinary optimizer. `ValueHead(backbone)` adds a scalar Dense head to a decoder's hidden states; a custom critic can instead return one scalar per token position from token ids and an attention mask. The critic initializes independently of the policy. The unit-decay reference follows only the policy subtree.
+
+`PPORollout(objective, episodes, gamma=1., lam=.95)` composes an `EpisodeRollout` with critic evaluation and GAE. The collector's policy is `objective.policy(variables)`, which selects the policy subtree when it binds the Trainer snapshot. GAE runs over the sampled actions of an entire episode, across tool turns and past masked slots. The verifier reward is placed on the last action. Advantages are whitened over global action support before training, requiring at least two action tokens. Completed and budget-truncated episodes have zero tail bootstrap, following the pinned verl convention.
+
+The prepared batch retains `old_log_probs`, `behavior_log_probs` and `response_mask`, and adds `old_values`, `advantages` and `returns`, each shaped `[episode_count * max_turns, max_new_tokens]`. Both losses reduce over the same action-token mass. `value_coefficient` scales the half-squared critic loss; `value_clip` clips predictions around recorded values. Policy clipping, KL strength and the explicit behavior-importance option are the same controls as GRPO. These targets can also be retained in a dataset for repeated PPO updates without resampling.
+
+This repository-fixture example runs on CPU with `PYTHONPATH=src:tests JAX_PLATFORMS=cpu`. It samples square-tool calls, executes the in-memory square environment and learns from the final answer reward; it needs no checkpoint or network service. The fixtures define a small bigram policy and trainable token features, not a useful pretrained language model.
+
+```python
+import itertools
+import jax
+import numpy as np
+import optax
+from dew import Trainer
+from dew.data import Dataset
+from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHead
+from test_tool_episodes import ToolPolicy, Harness, verify, SAMPLING
+from test_ppo import TokenFeatures
+
+key = jax.random.key(19)
+objective = PPOObjective(ToolPolicy(), seq_len=10,
+                         critic=ValueHead(TokenFeatures()), beta=.03)
+episodes = EpisodeRollout(objective.policy(objective.init(key)), Harness(), verify,
+                          max_prompt_tokens=8, max_new_tokens=3, max_turns=3,
+                          groups=4, sampling=SAMPLING)
+trainer = Trainer(objective, optax.sgd(.05), key=key,
+                  rollout=PPORollout(objective, episodes, gamma=.97, lam=.9))
+data = Dataset(train=lambda: itertools.repeat({
+    "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
+    val=None, records=None, batch=jax.device_count())
+state = trainer.fit(data, steps=2, log_every=1)
+assert int(state.updates) == 2
+```
+
+`tools/parity_ppo.py` records installed verl's GAE, clipped policy/value losses and autograd gradients at revision `d040717b21af2e23e8e789a3e354cff2394ae2de`. `tests/test_ppo.py` checks those tensors, the complete Objective loss and parameter gradients, and a two-update run that changes policy and critic weights, reduces critic error and keeps the policy reference fixed. Removing the critic, KL or policy-clipping term makes the composite reference comparison fail.
+
 ## Flow-GRPO
 
 Flow-GRPO optimizes generated samples with a reward function. It requires a rectified-flow Process with velocity prediction. The objective reuses DiffusionObjective's InputSpec, conditioning encoders, and optional autoencoder. The reward receives decoded samples in [-1, 1] and the repeated source batch, and returns one finite scalar per sample.
@@ -250,5 +288,9 @@ The recorded fixed-tensor comparisons are:
 | DPO gradients | TRL 1.12 autograd | Exact |
 | GRPO loss | verl 0.9 | 7.45e-08 |
 | GRPO gradients | PyTorch autograd | Exact |
+| PPO composite loss | verl d040717 | 3.26e-08 |
+| PPO parameter gradients | verl/PyTorch autograd | 1.50e-08 |
+| PPO episode GAE advantages | verl d040717 | 2.39e-07 |
+| PPO episode returns | verl d040717 | 5.97e-08 |
 
 These are narrow numerical comparisons, not benchmarks of learned behavior or evidence of multi-host post-training. They do not establish tokenizer coverage, model-family coverage, or parity with a full TRL/verl training run. See [references](../references.md) for the methods and upstream projects.
