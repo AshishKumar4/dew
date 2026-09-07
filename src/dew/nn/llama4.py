@@ -24,6 +24,7 @@ from dew.nn.attention import (
     RopeScaling, causal_attention_mask, open_kv_cache, rotary_freqs,
     scaled_dot_product_attention,
 )
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import apply_rotary_interleave
 from dew.nn.sharding import logical_axes
@@ -114,8 +115,11 @@ class Llama4Attention(nn.Module):
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         batch, length, _ = x.shape
+        valid = None if attention_metadata is None else attention_metadata.valid
+        logical_positions = positions
         query = self.q_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
         key = self.k_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
         value = self.v_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
@@ -124,14 +128,15 @@ class Llama4Attention(nn.Module):
         if decode:
             if not self.causal:
                 raise ValueError("full attention has no KV cache to decode against")
-            positions, append = open_kv_cache(self, key, self.max_seq_len)
+            positions, append = open_kv_cache(self, key, self.max_seq_len, valid=valid)
         elif positions is None:
             positions = jnp.arange(length)
         else:
             positions = jnp.asarray(positions)
 
+        rotary_positions = positions if logical_positions is None else logical_positions
         if self.use_rope:
-            freqs_cos, freqs_sin = rotary_freqs(positions, self.head_dim, self.rope_theta,
+            freqs_cos, freqs_sin = rotary_freqs(rotary_positions, self.head_dim, self.rope_theta,
                                                 rope_scaling=self.rope_scaling)
             query = apply_rotary_interleave(query, freqs_cos, freqs_sin)
             key = apply_rotary_interleave(key, freqs_cos, freqs_sin)
@@ -151,7 +156,8 @@ class Llama4Attention(nn.Module):
         if append is not None:
             key, value = append(key, value)
             key_positions = jnp.arange(key.shape[-3])
-            mask = causal_attention_mask(positions, key.shape[-3])
+            mask = causal_attention_mask(
+                positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
             causal = False
         elif segment_ids is not None:
             segment_ids = jnp.asarray(segment_ids)
@@ -164,6 +170,11 @@ class Llama4Attention(nn.Module):
         if self.attention_chunk_size is not None:
             chunks = chunk_mask(positions, key_positions, self.attention_chunk_size)
             mask = chunks if mask is None else jnp.logical_and(mask, chunks)
+        if valid is not None:
+            live = jnp.asarray(valid, bool)[:, None, :, None]
+            mask = live if mask is None else mask & live
+            if not decode:
+                mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         implementation = self.attention_impl
         if mask is not None and implementation in ('auto', 'cudnn'):
             # cuDNN takes no mask, and the reference mixer's measurement of

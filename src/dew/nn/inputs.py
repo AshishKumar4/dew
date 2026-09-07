@@ -33,7 +33,8 @@ class ModelInputs:
         """Check the numeric layout on the host before dispatching a model."""
         if self.tokens.ndim != 2 or not jnp.issubdtype(self.tokens.dtype, jnp.integer):
             raise ValueError("tokens must be an integer [B, S] array")
-        reserved = {"tokens", "conditioning", "train", "decode"}
+        reserved = {"tokens", "conditioning", "train", "decode", "rngs", "method",
+                    "mutable", "capture_intermediates"}
         if reserved.intersection(self.token_fields):
             raise ValueError(f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}")
         for name, value in self.token_fields.items():
