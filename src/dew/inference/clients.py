@@ -349,21 +349,25 @@ class OpenAICompletion:
             raise ValueError("remote text completion does not implement padded token rows")
         if self.provider == "openai" and (sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None):
             raise ValueError("top-k, min-p and EOS-token controls require provider='vllm'")
-        native = {"temperature": sampling.temperature, "top_p": sampling.top_p,
-                  "frequency_penalty": 0.0, "presence_penalty": 0.0}
-        conflicts = [name for name in native.keys() & fields.keys() if fields[name] != native[name]]
+        native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
+                                     "frequency_penalty": 0.0, "presence_penalty": 0.0}
+        controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
+                                      "min_p": sampling.min_p, "repetition_penalty": 1.0}
+        if sampling.eos_id is not None:
+            controls["stop_token_ids"] = list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
+        extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
+        if self.provider == "openai" and controls.keys() & extra.keys():
+            raise ValueError("top-k, min-p, repetition and EOS-token controls in extra_body require provider='vllm'")
+        # The SDK writes extra_body over the named parameters, so the policy
+        # is checked against both namespaces of the final request body.
+        policy = {**native, **controls}
+        conflicts = sorted(name for name in policy
+                           if (name in fields and fields[name] != policy[name])
+                           or (name in extra and extra[name] != policy[name]))
         if conflicts:
-            raise ValueError(f"parameters conflict with Sampling: {sorted(conflicts)}")
+            raise ValueError(f"parameters conflict with Sampling: {conflicts}")
         fields.update(native)
         if self.provider == "vllm":
-            extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
-            controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
-                                          "min_p": sampling.min_p, "repetition_penalty": 1.0}
-            if sampling.eos_id is not None:
-                controls["stop_token_ids"] = list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
-            clashes = [name for name in controls.keys() & extra.keys() if extra[name] != controls[name]]
-            if clashes:
-                raise ValueError(f"extra_body conflicts with Sampling: {sorted(clashes)}")
             fields["extra_body"] = {**extra, **controls}
         return fields
 
