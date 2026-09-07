@@ -3,7 +3,6 @@
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
-from functools import partial
 import json
 
 from flax import linen as nn
@@ -14,12 +13,13 @@ import optax
 import pytest
 
 from dew.data import Dataset
+from dew.inference import TextGeneration
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.episodes import (
     EpisodeCancelled, EpisodeFailure, EpisodeRollout, EpisodeStatus, Observation,
 )
-from dew.sampling import Sampling, generate
+from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 
 # Compact tool vocabulary: a call, a tool result, a final answer, and EOS.
@@ -133,7 +133,7 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
-    rollout = EpisodeRollout(partial(generate, model), harness or Harness(), verify,
+    rollout = EpisodeRollout(TextGeneration(model, objective.init(jax.random.key(0))), harness or Harness(), verify,
                              PROMPT, RESPONSE, TURNS, groups=GROUPS,
                              sampling=SAMPLING, record=record)
     return trainer, replace(rollout, **changes)
@@ -333,7 +333,7 @@ def test_trainer_update_and_checkpoint_continue_without_replaying_committed_epis
     assert int(first.step) == 1 and int(first.updates) == 1 // accumulation
     second = run(tmp_path / "interrupted", 2, resumed, accumulation)
     assert int(second.step) == 2 and int(second.updates) == 2 // accumulation
-    logits = ToolPolicy().apply(second.params, jnp.array([[NINE], [SIXTEEN]]))[:, 0]
+    logits = np.asarray(ToolPolicy().apply(second.params, jnp.array([[NINE], [SIXTEEN]])))[:, 0]
     probabilities = jax.nn.softmax(logits, axis=-1)
     initial = jax.nn.softmax(jnp.asarray(transition_logits()[[NINE, SIXTEEN]]), axis=-1)
     assert float(probabilities[0, ANSWER_NINE] + probabilities[1, ANSWER_SIXTEEN]) > float(
@@ -399,16 +399,21 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
 def test_inference_provenance_is_checked_before_tool_execution(corruption):
     harness = Harness()
     trainer, rollout = build(harness)
-    native = rollout.inference
+    class CorruptPolicy:
+        def __init__(self, inner):
+            self.inner = inner
 
-    def corrupt(variables, inputs, max_new_tokens, *, key, sampling):
-        result = native(variables, inputs, max_new_tokens, key=key, sampling=sampling)
-        if corruption == "context":
-            return replace(result, tokens=result.tokens.at[0, 0].set(PAD))
-        return replace(result, terminated=~result.terminated)
+        def bind(self, variables):
+            return CorruptPolicy(self.inner.bind(variables))
+
+        def __call__(self, inputs, max_new_tokens, *, key, sampling):
+            result = self.inner(inputs, max_new_tokens, key=key, sampling=sampling)
+            if corruption == "context":
+                return replace(result, tokens=result.tokens.at[0, 0].set(PAD))
+            return replace(result, terminated=~result.terminated)
 
     with pytest.raises(EpisodeFailure, match="inference") as caught:
-        collect(replace(rollout, inference=corrupt), trainer.initial_state())
+        collect(replace(rollout, policy=CorruptPolicy(rollout.policy)), trainer.initial_state())
     assert harness.calls == [] and harness.opened == harness.closed
     assert caught.value.episode.reward is None
 
@@ -421,3 +426,17 @@ def test_projection_refuses_replayed_samples_and_cross_attempt_groups():
     changed = replace(episodes[0], identity=replace(episodes[0].identity, attempt=7))
     with pytest.raises(ValueError, match="policy snapshot and attempt"):
         rollout.project((changed, *episodes[1:]))
+
+
+def test_verifier_runs_before_environment_resources_are_released():
+    harness = Harness()
+
+    def live_verifier(episode):
+        assert episode.identity in harness.opened
+        assert episode.identity not in harness.closed, "verifier lost its environment resources"
+        return verify(episode)
+
+    trainer, rollout = build(harness, verifier=live_verifier)
+    episodes = collect(rollout, trainer.initial_state())
+    assert {episode.reward for episode in episodes} == {0., 1.}
+    assert harness.opened == harness.closed
