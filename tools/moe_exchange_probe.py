@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Measure bounded fp32 exchange and the unresolved bf16 gradient boundary.
+"""Measure the working memory and CPU time of exchange dispatch against
+global dispatch on identical placements.
 
-Reference environment: JAX/jaxlib 0.11.1, NumPy 2.5.2, ml_dtypes 0.6.0.
-Run from the checkout whose source is being measured:
+Reference environment: JAX/jaxlib 0.11.1, NumPy 2.5.2. Run from the checkout
+whose source is being measured:
 
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \
         PYTHONPATH=src python tools/moe_exchange_probe.py
 
-The precision oracle uses NumPy float64 products of explicitly bf16-rounded
-operands, independently of JAX's dot and autodiff. It reports both unrounded
-fp32 gradients and gradients rounded once to bf16 before returning to fp32.
-No tolerance is widened to make these disagreeing global paths equivalent.
+Both dispatches share `moe.expert_projection`'s precision contract, which
+tests/test_moe_precision.py checks against float64 oracles; this measures
+cost, and asserts the two agree on the way.
 """
 
 import json
@@ -19,7 +19,6 @@ import time
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -78,50 +77,7 @@ def measure_exchange() -> None:
                               'max_errors': errors}), flush=True)
 
 
-def probe_precision() -> None:
-    rng = np.random.default_rng(271)
-    x = rng.normal(size=(24, 8)).astype(np.float32)
-    kernel = rng.normal(size=(8, 8, 16)).astype(np.float32)
-    cotangent = rng.normal(size=(24, 16)).astype(np.float32)
-    sizes = np.full(8, 3, np.int32)
-
-    def bf16(value):
-        return np.asarray(value).astype(ml_dtypes.bfloat16).astype(np.float64)
-
-    reference = np.stack([bf16(x)[3*e:3*(e+1)].T @ bf16(cotangent)[3*e:3*(e+1)]
-                          for e in range(8)]).astype(np.float32)
-    rounded = bf16(reference).astype(np.float32)
-
-    def loss(kernel, x, cotangent, sizes):
-        y = jax.lax.ragged_dot(x.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16), sizes,
-                               preferred_element_type=jnp.bfloat16)
-        return jnp.sum(y.astype(jnp.float32) * cotangent)
-
-    def report(label, gradient):
-        gradient = np.asarray(gradient)
-        print(json.dumps({'precision_case': label,
-                          'fp64_operand_oracle_error': float(np.max(abs(gradient - reference))),
-                          'bf16_gradient_oracle_error': float(np.max(abs(gradient - rounded))),
-                          'non_bf16_elements': int(np.count_nonzero(gradient != bf16(gradient)))}), flush=True)
-
-    arrays = tuple(map(jnp.asarray, (kernel, x, cotangent, sizes)))
-    report('unplaced_jit', jax.jit(jax.grad(loss))(*arrays))
-    report('unplaced_eager', jax.grad(loss)(*arrays))
-    for expert, fsdp in ((2, 4), (4, 2), (8, 1)):
-        mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
-        kernels = NamedSharding(mesh, P('expert', None, 'fsdp'))
-        tokens = NamedSharding(mesh, P(('expert', 'fsdp')))
-        replicated = NamedSharding(mesh, P())
-        arguments = tuple(jax.device_put(value, spec) for value, spec in zip(
-            arrays, (kernels, tokens, tokens, replicated), strict=True))
-        with jax.set_mesh(mesh):
-            for spec, placement in ((kernels, 'placed'), (replicated, 'replicated-output')):
-                report(f'expert{expert}/fsdp{fsdp}/{placement}',
-                       jax.jit(jax.grad(loss), out_shardings=spec)(*arguments))
-
-
 if __name__ == '__main__':
     print(json.dumps({'jax': jax.__version__, 'numpy': np.__version__,
-                      'ml_dtypes': ml_dtypes.__version__, 'device': jax.devices()[0].device_kind}))
+                      'device': jax.devices()[0].device_kind}))
     measure_exchange()
-    probe_precision()

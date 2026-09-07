@@ -9,7 +9,7 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.moe import grouped_matmul
+from dew.nn.moe import expert_projection
 from dew.nn.sharding import logical_axes
 
 
@@ -50,7 +50,7 @@ def unpack_mxfp4(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
 class GptOssExperts(nn.Module):
     """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU.
 
-    `implementation` names the grouped matmul, as `moe.grouped_matmul` takes it.
+    `implementation` names the grouped matmul, as `moe.expert_projection` takes it.
     """
 
     hidden_size: int
@@ -72,22 +72,21 @@ class GptOssExperts(nn.Module):
                           (self.num_local_experts, self.intermediate_size, self.hidden_size))
         down_bias = self.param("down_proj_bias", nn.initializers.zeros,
                                (self.num_local_experts, self.hidden_size))
-        x, gate_up, gate_bias, down, down_bias = promote_dtype(
-            x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
+        x, gate_bias, down_bias = promote_dtype(x, gate_bias, down_bias, dtype=self.dtype)
         experts = indices.reshape(-1)
         order = jnp.argsort(experts)
         sorted_experts = experts[order]
         group_sizes = jnp.bincount(experts, length=self.num_local_experts)
         tokens = x.reshape(-1, self.hidden_size)[order // indices.shape[-1]]
-        projected = grouped_matmul(
-            tokens, gate_up, group_sizes, implementation=self.implementation,
-            precision=self.precision) + gate_bias[sorted_experts]
+        projected = jnp.asarray(expert_projection(
+            tokens, gate_up, group_sizes, self.dtype, self.implementation,
+            self.precision)) + gate_bias[sorted_experts]
         gate = jnp.minimum(projected[..., ::2], 7.0)
         up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
         activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
-        output = grouped_matmul(
-            activated, down, group_sizes, implementation=self.implementation,
-            precision=self.precision) + down_bias[sorted_experts]
+        output = jnp.asarray(expert_projection(
+            activated, down, group_sizes, self.dtype, self.implementation,
+            self.precision)) + down_bias[sorted_experts]
         per_slot = output[jnp.argsort(order)].reshape(*indices.shape, self.hidden_size)
         return jnp.sum(per_slot * weights[..., None], axis=-2)
 

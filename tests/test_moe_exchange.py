@@ -108,15 +108,6 @@ def test_decoder_exchange_retains_logits_and_expert_bias_observations(parallel):
         np.testing.assert_allclose(actual_leaf, expected_leaf, atol=1e-7, rtol=1e-6)
 
 
-def test_exchange_refuses_unverified_bfloat16_gradients():
-    x, weights, indices = map(jnp.asarray, routing_case(8, 4, 2, False))
-    reference = ExpertMLP(4, 12, 8, dtype=jnp.bfloat16)
-    parameters = reference.init(jax.random.key(0), x, weights, indices)
-    mesh = build_mesh(MeshSpec(expert=2))
-    with jax.set_mesh(mesh), pytest.raises(ValueError, match='bf16 chunk gradients'):
-        reference.clone(dispatch='exchange').apply(parameters, x, weights, indices)
-
-
 def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
     x, weights, indices = map(jnp.asarray, routing_case(8, 6, 2, False))
     module = ExpertMLP(6, 12, 8, dispatch='exchange')
