@@ -31,12 +31,17 @@ class Sampling:
     top_k: int | None = None
     eos_id: int | tuple[int, ...] | None = None
     pad_id: int = 0
+    top_p: float = 1.0
+    min_p: float = 0.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.temperature) or self.temperature < 0:
             raise ValueError("temperature must be finite and non-negative")
         if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
             raise ValueError("top_k must be a positive integer or None")
+        for name, value in (("top_p", self.top_p), ("min_p", self.min_p)):
+            if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be finite and between zero and one")
         if type(self.pad_id) is not int or self.pad_id < 0:
             raise ValueError("pad_id must be a non-negative token id")
         if self.eos_id is not None:
@@ -53,7 +58,7 @@ class Generation:
     ``lengths`` counts response actions, including EOS. ``terminated`` marks
     EOS termination; false marks a length limit. Both log-probability arrays
     have shape [B, max_new_tokens]. Only positions below ``lengths`` are valid.
-    ``behavior_log_probs`` describes the temperature/top-k distribution that
+    ``behavior_log_probs`` describes the temperature/top-k/top-p/min-p distribution that
     drew each action. ``raw_log_probs`` describes the unmodified model policy.
     """
 
@@ -77,6 +82,19 @@ def _sample_token(logits: jax.Array, keys: jax.Array, sampling: Sampling
             keep = min(sampling.top_k, scores.shape[-1])
             cutoff = lax.top_k(scores, keep)[0][..., -1:]
             scores = jnp.where(scores < cutoff, -jnp.inf, scores)
+        if sampling.top_p < 1.0:
+            # Transformers TopPLogitsWarper removes the ascending tail at
+            # cumulative mass <= 1-p, while retaining at least one token.
+            order = jnp.argsort(scores, axis=-1, stable=True)
+            sorted_scores = jnp.take_along_axis(scores, order, axis=-1)
+            tail = jnp.cumsum(jax.nn.softmax(sorted_scores), axis=-1) <= 1.0 - sampling.top_p
+            tail = tail.at[:, -1].set(False)
+            removed = jnp.zeros_like(tail).at[jnp.arange(scores.shape[0])[:, None], order].set(tail)
+            scores = jnp.where(removed, -jnp.inf, scores)
+        if sampling.min_p > 0.0:
+            probabilities = jax.nn.softmax(scores)
+            cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * sampling.min_p
+            scores = jnp.where(probabilities < cutoff, -jnp.inf, scores)
         token = jax.vmap(jax.random.categorical)(keys, scores).astype(jnp.int32)
         behavior = jnp.take_along_axis(jax.nn.log_softmax(scores), token[:, None], -1)[:, 0]
     selected_raw = jnp.take_along_axis(raw, token[:, None], -1)[:, 0]
