@@ -59,6 +59,7 @@ The base package currently installs Transformers, Hugging Face Hub, WandB, and i
 | Extra | Use |
 |---|---|
 | `interop` | Read or write safetensors checkpoints |
+| `inference-clients` | Official Ollama/OpenAI Python clients, including vLLM-compatible endpoints |
 | `vision` | Run the checkpoint's HF image processor using torchvision on the host |
 | `streaming` | Hugging Face datasets and online sources |
 | `av` | Video readers and image resizing |
