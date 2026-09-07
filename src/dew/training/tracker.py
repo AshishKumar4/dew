@@ -387,7 +387,8 @@ class Trackers(_OwnedTracker):
         for tracker in self.trackers:
             try:
                 if isinstance(tracker, _OwnedTracker):
-                    tracker.__exit__(exc_type, exc, tb)
+                    tracker.__exit__(type(error) if error is not None else None, error,
+                                     error.__traceback__ if error is not None else None)
                 else:
                     tracker.close()
             except BaseException as failure:
