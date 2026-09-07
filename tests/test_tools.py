@@ -10,6 +10,7 @@ benchmark runs its pure pieces, and its real entry point where the step
 compiles on CPU in seconds.
 """
 
+import dataclasses
 import importlib.util
 import json
 from pathlib import Path
@@ -291,6 +292,37 @@ TINY_LM = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2
            "mlp_features": 32, "max_seq_len": 8}
 
 
+def composite_case(tool, architecture: str, **changes):
+    """The cpu-smoke preset's case for one composite, resized by `changes`."""
+    (case,) = [c for c in tool.cpu_smoke_cases() if c.architecture == architecture]
+    return dataclasses.replace(case, **changes)
+
+
+def parameter_movement(tool, case, steps: int = 2):
+    """How far every parameter moved over `steps` of the case's real compiled
+    step, by tree path, with the loss and the step's measured FLOPs.
+
+    The trainer, the batches and the compiled step are the tool's own: a
+    parameter that does not move here is one the measured step never trains.
+    """
+    def named(tree):
+        return {jax.tree_util.keystr(path): leaf
+                for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+    trainer = tool.build_trainer(case, "reference")
+    source = tool.batches(case)
+    state = jax.jit(trainer.initial_state)()
+    before = named(state.params)
+    compiled = trainer.compile(state, next(source))
+    for _ in range(steps):
+        state, loss, _, finite, _ = compiled(state, next(source))
+    after = named(state.params)
+    assert bool(finite) and np.isfinite(float(loss))
+    moved = {name: float(jnp.max(jnp.abs(value - before[name])))
+             for name, value in after.items()}
+    return moved, trainer.flops_per_step
+
+
 def test_step_benchmark_keeps_the_cases_it_measured_when_a_later_one_fails(tmp_path):
     """A sweep writes --json-out after every case, so the rows measured before
     a case that cannot be built are kept: the file holds the finished row,
@@ -314,8 +346,9 @@ def test_step_benchmark_keeps_the_cases_it_measured_when_a_later_one_fails(tmp_p
 
 def test_step_benchmark_overrides_reach_only_the_cases_they_apply_to():
     """--frames resizes the video cases and leaves an image model's rank
-    alone; --packed-documents packs the language models and nobody else;
-    --batch-size reaches every case."""
+    alone; --packed-documents packs the plain token windows and nobody else,
+    so a canvas row keeps the geometry its objective reads and a media row
+    keeps the one its processor emitted; --batch-size reaches every case."""
     tool = load("benchmark_step")
     cases = tool.build_cases(tool.BenchmarkConfig(
         preset="small", frames=4, packed_documents=2, batch_size=2))
@@ -327,12 +360,15 @@ def test_step_benchmark_overrides_reach_only_the_cases_they_apply_to():
     assert {c.frames for c in by_name["simple_dit"] + by_name["unet"]} == {0}
     assert {c.packed_documents for c in by_name["causal_transformer"]} == {2}
     assert all(c.packed_documents == 0 for c in cases if not c.is_lm)
+    composites = by_name["multimodal_transformer"] + by_name["diffusion_gemma"]
+    assert [c.packed_documents for c in composites] == [0, 0]
     assert {c.batch_size for c in cases} == {2}
 
 
 def test_step_benchmark_refuses_a_case_it_cannot_name():
     """An architecture outside the preset and a JSON field outside Case are
-    both errors before anything compiles."""
+    both errors before anything compiles, and so is a composite whose row
+    does not hold what its wrapper reads."""
     tool = load("benchmark_step")
     with pytest.raises(ValueError, match="no_such"):
         tool.build_cases(tool.BenchmarkConfig(preset="cpu-smoke", architectures=["no_such"]))
@@ -340,6 +376,12 @@ def test_step_benchmark_refuses_a_case_it_cannot_name():
         tool.cases_from_json('[{"architecture": "unet", "bogus": 1}]')
     with pytest.raises(ValueError, match="JSON list"):
         tool.cases_from_json('{"architecture": "unet"}')
+    ragged = composite_case(tool, "diffusion_gemma", seq_len=14)
+    with pytest.raises(ValueError, match="whole canvases"):
+        tool.build_trainer(ragged, "reference")
+    crowded = composite_case(tool, "multimodal_transformer", seq_len=2)
+    with pytest.raises(ValueError, match="no room"):
+        next(tool.batches(crowded))
 
 
 def test_step_benchmark_packed_rows_restart_positions_at_every_document():
@@ -356,6 +398,94 @@ def test_step_benchmark_packed_rows_restart_positions_at_every_document():
     for row in range(2):
         assert batch["text_segment_ids"][row].tolist() == [1] * 5 + [2] * 5 + [3] * 5 + [4] * 2
         assert batch["text_positions"][row].tolist() == [0, 1, 2, 3, 4] * 3 + [0, 1]
+
+
+def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
+    """Every registry architecture has a case of its own except
+    jepa_predictor, which has no step of its own: the JEPA cases build it
+    through the registry inside their objective, so their rows are its rows.
+    An architecture named as covered without a case measuring it would leave
+    the difference here nonempty."""
+    from dew import models
+
+    tool = load("benchmark_step")
+    cases = tool.small_cases("bfloat16")
+
+    assert set(models) - {case.architecture for case in cases} == {"jepa_predictor"}
+    (jepa,) = [case for case in cases if case.architecture == "jepa_encoder"]
+    predictor = tool.build_trainer(jepa, "reference").objective.predictor
+    assert models.name_of(type(predictor)) == "jepa_predictor"
+
+
+def test_step_benchmark_media_rows_mark_one_slot_per_projected_feature():
+    """A media row is what a processor hands the model: the image tokens fill
+    exactly the slots the projector has features for, each slot naming its
+    own feature and every other slot naming none. Fewer slots would pay for
+    features the decoder never reads."""
+    tool = load("benchmark_step")
+    case = composite_case(tool, "multimodal_transformer", batch_size=2)
+    case = dataclasses.replace(case, media={**case.media, "images": 2})
+
+    inputs = next(tool.batches(case))["text"]
+
+    slots = 2 * tool.image_tokens(case)
+    assert slots == 8  # two images, four soft tokens each from a 2x2 patch grid
+    indices = np.asarray(inputs.token_fields["image_indices"])
+    assert inputs.tokens.shape == (2, 16)
+    assert np.array_equal(np.asarray(inputs.tokens)[:, :slots], np.full((2, slots), 255))
+    for row in range(2):
+        assert indices[row].tolist() == list(range(slots)) + [-1] * (16 - slots)
+    assert np.asarray(inputs.conditioning["pixel_values"]).shape == (2, 2, 3, 16, 16)
+
+
+def test_step_benchmark_canvas_rows_are_whole_unpadded_canvases():
+    """A canvas row is a clean prompt followed by whole canvases, and carries
+    no pad id: the block loss reads its target masks off that id, so a drawn
+    zero would move the measured target support with the batch seed."""
+    tool = load("benchmark_step")
+    case = composite_case(tool, "diffusion_gemma", batch_size=2)
+
+    assert tool.canvas_split(case) == (8, 4, 2)
+    tokens = next(tool.batches(case))["text"]
+    assert tokens.shape == (2, 16) and tokens.min() >= 1 and tokens.max() < 256
+
+
+def test_step_benchmark_media_step_trains_the_image_tower():
+    """The measured step is the whole conditioned model's: the tower and the
+    projector move under it, and a second image a row raises the FLOPs the
+    row reports. A step that fed no pixels would leave both untouched."""
+    tool = load("benchmark_step")
+    case = composite_case(tool, "multimodal_transformer")
+
+    moved, flops = parameter_movement(tool, case)
+
+    media = {name: value for name, value in moved.items()
+             if "tower" in name or "projector" in name}
+    assert media and min(media.values()) > 0
+    assert min(value for name, value in moved.items() if "language_model" in name) > 0
+    _, wider = parameter_movement(
+        tool, dataclasses.replace(case, media={**case.media, "images": 2}), steps=1)
+    assert wider > flops
+
+
+def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
+    """The measured step is the official fine-tuning step: the
+    self-conditioning MLP the second decoder pass feeds moves under it, and a
+    wider response raises the FLOPs the row reports. A plain next-token step
+    on the same trunk has no such parameter to move."""
+    tool = load("benchmark_step")
+    narrow = composite_case(tool, "diffusion_gemma",
+                            canvas={"prompt_length": 12, "canvas_size": 4})
+
+    moved, one_canvas = parameter_movement(tool, narrow)
+
+    conditioning = {name: value for name, value in moved.items()
+                    if "self_conditioning" in name}
+    assert conditioning and min(conditioning.values()) > 0
+    assert min(value for name, value in moved.items() if "text" in name) > 0
+    _, two_canvases = parameter_movement(
+        tool, composite_case(tool, "diffusion_gemma"), steps=1)
+    assert two_canvases > one_canvas
 
 
 def test_step_benchmark_table_shows_each_column_in_its_unit():
