@@ -1,1 +1,2 @@
-from .objective import TEXT_KEY, LMObjective, Perplexity, Samples, balance, perplexity, prompt_batch
+from .objective import (FROZEN, TEXT_KEY, IndexerTraining, LMObjective, Perplexity, Samples,
+                        balance, perplexity, prompt_batch)

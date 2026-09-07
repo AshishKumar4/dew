@@ -14,8 +14,13 @@ and the reason. Padding is excluded only when the run names the pad id.
 Packed token files have no padding, and masking out a real id would drop
 those tokens from the average.
 
-Evaluation returns teacher-forced per-token scores for streaming perplexity.
-The separate preview hook writes text from a fixed prompt once per event.
+The auxiliary terms ride on the same batch: DeepSeek's router balancing and
+balance loss, the multi-token prediction depths, and V3.2's lightning
+indexer, which the attention layers score and sow the KL of when the
+objective opens their `indexer` collection (`IndexerTraining` names the
+phase). Evaluation returns teacher-forced per-token scores for streaming
+perplexity. The separate preview hook writes text from a fixed prompt once
+per event.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from typing import Literal, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -35,15 +40,105 @@ from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collect
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
+from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
+from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
+                                 mean_loss, merge, select)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
+
+FROZEN = "frozen"
+"""The collection the dense warm-up keeps the main model's weights under.
+The optimizer moves the `params` collection and nothing else, so what the
+warm-up leaves there is the indexer alone; the rest of the tree rides
+beside it as state, and the model sees them merged."""
+
+
+@dataclass(frozen=True)
+class IndexerTraining:
+    """DeepSeek-V3.2's lightning-indexer objective, one stage at a time.
+
+    The two stages of the continued pre-training (arXiv 2512.02556, section
+    2.1.1). `warmup` trains a fresh indexer alone: the model runs dense
+    attention with the indexer scoring beside it (an mla mixer with the
+    indexer's heads and no top-k), every other weight is frozen, and the
+    loss is the KL of the indexer's softmax from the dense attention
+    distribution over every allowed key. `sparse` trains everything: the
+    model selects its top-k (a mixer with `index_topk`), the cross entropy
+    trains the main weights, and the KL over the selected keys alone trains
+    the indexer, whose inputs are detached so neither reaches the other.
+    `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`);
+    the reference sets the indexer's pace by its learning rate, 1e-3 for
+    the 1000 warm-up steps and 7.3e-6 for the sparse stage.
+    """
+
+    phase: Literal["warmup", "sparse"]
+    weight: float = 1.0
+
+    def __post_init__(self):
+        if self.phase not in ("warmup", "sparse"):
+            raise ValueError(
+                f"the indexer trains in the 'warmup' or the 'sparse' phase, "
+                f"not {self.phase!r}")
+        if self.weight <= 0:
+            raise ValueError(
+                f"weight scales the indexer's KL, so it is positive, got "
+                f"{self.weight}")
+
+
+def indexed_mixers(model) -> list[MLAMixer]:
+    """The model's mla mixers that carry the indexer, the model's own and
+    each layer kind's, in that order."""
+    candidates = [getattr(model, "mixer", None)]
+    candidates += [kind.mixer for kind in (getattr(model, "kinds", None) or {}).values()]
+    return [mixer for mixer in candidates
+            if isinstance(mixer, MLAMixer) and mixer.indexed]
+
+
+def _is_indexer(path: tuple[str, ...]) -> bool:
+    return INDEXER in path
+
+
+def _indexer_kls(sown: Variables) -> list[jax.Array]:
+    """Every attention layer's sown per-query indexer KL, `[B, S]` each,
+    in the tree's key order."""
+    found: list[jax.Array] = []
+
+    def visit(node) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if "kl" in node:
+            (kl,) = node["kl"]
+            found.append(kl)
+            return
+        for key in sorted(node):
+            visit(node[key])
+
+    visit(sown)
+    return found
+
+
+def _leaf_paths(tree: Variables) -> set[tuple[str, ...]]:
+    """The dict-key path of every leaf of a variables subtree."""
+    return {tuple(entry.key for entry in path)
+            for path, _ in jax.tree_util.tree_leaves_with_path(tree)}
+
+
+def _packing_of(segment_ids, positions) -> dict:
+    """The keywords a packed batch hands the model, cut to the input side
+    of its rows. Only a packed batch names these, and only a model that
+    packs takes them; an unpacked run calls the model without them."""
+    packing = {}
+    if positions is not None:
+        packing["positions"] = positions[:, :-1]
+    if segment_ids is not None:
+        packing["segment_ids"] = segment_ids[:, :-1]
+    return packing
 
 
 def prompt_batch(prompt) -> jax.Array:
@@ -158,7 +253,8 @@ class Scores(NamedTuple):
     and 1 where the target counts. `correct` is 1 where the argmax was the
     target. `routing` is what the routers sowed, `depths` the prediction
     depths' (losses, weights) pairs, `qk` the attention layers' per-head
-    logit maxima; each is None or empty unless its flag asked for it.
+    logit maxima, `indexer` their per-query indexer KL; each is None or
+    empty unless its flag asked for it.
     """
 
     losses: jax.Array
@@ -167,6 +263,7 @@ class Scores(NamedTuple):
     routing: Optional[dict]
     depths: list
     qk: Optional[dict]
+    indexer: Optional[dict]
 
 
 @struct.dataclass
@@ -199,6 +296,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         loss_role: Role | None = None,
         mtp_weight: Optional[float] = None,
         qk_stats: bool = False,
+        indexer: Optional[IndexerTraining] = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
         in; the `[tokens, vocab]` logits are built one slice at a time. Four costs
@@ -236,7 +334,18 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         `qk_stats` opens the `qk` collection the attention layers sow their
         per-head logit maxima under, and reports them for the optimizer's
         QK-Clip; the recipe sets it when the optimizer is `muonclip`. Unset
-        leaves the collection closed, which costs no extra matmul."""
+        leaves the collection closed, which costs no extra matmul.
+
+        `indexer` trains DeepSeek-V3.2's lightning indexer, one
+        `IndexerTraining` phase at a time, on a model whose mla mixer
+        carries the indexer. The warm-up phase keeps only the indexer in
+        the `params` collection and the rest of the model under `frozen`,
+        which is what `init` returns and a checkpoint stores; a
+        `pretrained` tree for that phase may omit the indexer's weights, as
+        a dense checkpoint does, and the fresh init fills them. The sparse
+        phase reads a whole tree, either layout. The warm-up trains nothing
+        but the indexer, so the terms of the main loss (`balance_rate`,
+        `aux_loss_alpha`, `mtp_weight`, `loss_role`) are refused there."""
         if getattr(model, "causal", True) is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
         self.model = model
@@ -265,28 +374,94 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     "None leaves the term out")
         self.mtp_weight = mtp_weight
         self.qk_stats = qk_stats
+        self.indexer = indexer
+        if indexer is not None:
+            mixers = indexed_mixers(model)
+            if not mixers:
+                raise ValueError(
+                    "indexer training needs an mla mixer with the indexer's "
+                    "index_n_heads and index_head_dim")
+            sparse = {mixer.sparse for mixer in mixers}
+            if indexer.phase == "warmup" and sparse != {False}:
+                raise ValueError(
+                    "the warm-up keeps dense attention while the indexer "
+                    "learns it, so its mixers name no index_topk")
+            if indexer.phase == "sparse" and sparse != {True}:
+                raise ValueError(
+                    "the sparse phase trains the model on its selection, so "
+                    "its mixers name an index_topk")
+            if indexer.phase == "warmup":
+                lm_terms = {"balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
+                            "mtp_weight": mtp_weight, "loss_role": loss_role}
+                asked = sorted(name for name, value in lm_terms.items() if value is not None)
+                if asked:
+                    raise ValueError(
+                        f"the warm-up trains the indexer alone, so {', '.join(asked)} "
+                        "would move nothing")
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
+        # The EMA follows what moves; the frozen collection never does.
+        self.ema = None if ema_decay is None else EMASpec(
+            decay=optax.constant_schedule(ema_decay),
+            select=lambda path: path[0] != FROZEN)
         if samples is not None:
             self._prompt = prompt_batch(samples.prompt)
 
+    @property
+    def _warmup(self) -> bool:
+        return self.indexer is not None and self.indexer.phase == "warmup"
+
     def init(self, key):
-        if self.pretrained is not None:
-            if "params" not in self.pretrained:
-                raise ValueError(
-                    "pretrained is the variables dict ({'params': ...}) that "
-                    "load_pretrained and model.init return")
-            return self.pretrained
-        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+        variables = self._whole_tree(key)
+        if not self._warmup:
+            return variables
+        indexer = select(variables, lambda path: path[0] == "params" and _is_indexer(path))
+        frozen = select(variables, lambda path: path[0] == "params" and not _is_indexer(path))
+        return {**variables, "params": indexer["params"], FROZEN: frozen["params"]}
+
+    def _whole_tree(self, key) -> Variables:
+        """The model's variables in one `params` collection: the pretrained
+        tree with its frozen split undone, or a fresh init."""
+        fresh = lambda: self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+        if self.pretrained is None:
+            return fresh()
+        pretrained = self.pretrained
+        if "params" not in pretrained:
+            raise ValueError(
+                "pretrained is the variables dict ({'params': ...}) that "
+                "load_pretrained and model.init return")
+        if FROZEN in pretrained:
+            pretrained = {name: value for name, value in pretrained.items() if name != FROZEN}
+            pretrained = {**pretrained, "params": merge(self.pretrained[FROZEN], self.pretrained["params"])}
+        if not self._warmup:
+            return pretrained
+        # The warm-up may start from a dense checkpoint that has no indexer
+        # yet; the fresh init supplies exactly those weights.
+        variables = fresh()
+        given = _leaf_paths(pretrained["params"])
+        missing = _leaf_paths(variables["params"]) - given
+        outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
+        if outside:
+            raise ValueError(
+                "the warm-up initialises the indexer and nothing else, but the "
+                f"pretrained tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
+        return merge(variables, pretrained)
+
+    def _model_variables(self, params: Variables) -> Variables:
+        """The tree the model applies: the frozen split merged back."""
+        if FROZEN not in params:
+            return params
+        variables = {name: value for name, value in params.items() if name != FROZEN}
+        return {**variables, "params": merge(params[FROZEN], params["params"])}
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
-                     depths: bool = False, roles=None, qk_stats: bool = False):
+                     depths: bool = False, roles=None, qk_stats: bool = False,
+                     indexer: bool = False):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
-        prediction was right, and what `routing`, `depths` and `qk_stats`
-        asked for.
+        prediction was right, and what `routing`, `depths`, `qk_stats` and
+        `indexer` asked for.
 
         A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
@@ -297,11 +472,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         tokens = prepared.tokens
-        if tokens.shape[-1] != self.seq_len + 1:
-            raise ValueError(
-                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
-                f"so the targets can be the shifted input, got {tokens.shape[-1]}")
-        inputs, targets = tokens[:, :-1], tokens[:, 1:]
+        inputs, targets = self._rows(tokens)
         # Only a packed batch names these, and only a model that packs takes
         # them. An unpacked run calls the model without them.
         packing = prepared.slice_tokens(stop=-1).kwargs()
@@ -313,18 +484,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             packing["positions"] = positions[:, :-1]
         if segment_ids is not None:
             packing["segment_ids"] = segment_ids[:, :-1]
-        collections = (["router"] if routing else []) + (["qk"] if qk_stats else [])
-        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method=type(self.model).hidden_states,
-                                  mutable=collections or False, **packing)
-        sown = None
-        qk = None
-        if collections:
-            hidden, gathered = hidden
-            if routing:
-                sown = gathered.get("router", {})
-            if qk_stats:
-                qk = gathered.get("qk")
+        params = self._model_variables(params)
+        collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
+                       + ([INDEXER_COLLECTION] if indexer else []))
+        hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections, packing)
+        sown = gathered.get("router", {}) if routing else None
+        qk = gathered.get("qk") if qk_stats else None
+        kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
         losses, predicted = chunked_cross_entropy(
@@ -355,12 +521,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 method=type(self.model).mtp_hidden_states,
                 mutable=collections or False, **packing)
             if collections:
-                # A routed depth balances and counts like a trunk layer.
+                # A routed depth balances, counts and indexes like a trunk layer.
                 states, depth_sown = states
                 if routing:
                     sown = {**(sown or {}), **depth_sown.get("router", {})}
                 if qk_stats:
                     qk = {**(qk or {}), **depth_sown.get("qk", {})}
+                if indexer:
+                    kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
                 depth_losses, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
@@ -371,7 +539,18 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 if roles is not None and self.loss_role is not None:
                     depth_weights = depth_weights * (roles[:, depth + 1:] == int(self.loss_role))
                 depth_scores.append((depth_losses, depth_weights))
-        return Scores(losses, weights, correct, sown, depth_scores, qk)
+        return Scores(losses, weights, correct, sown, depth_scores, qk, kls)
+
+    def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
+                       packing: dict[str, object]):
+        """The model's final states over `inputs`, with what the open
+        `collections` gathered (empty when none was opened)."""
+        hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
+                                  method=type(self.model).hidden_states,
+                                  mutable=collections or False, **packing)
+        if not collections:
+            return hidden, {}
+        return hidden
 
     def per_token_log_probs(self, params: Variables, tokens: jax.Array | ModelInputs, *,
                             left_padding: jax.Array | None = None) -> jax.Array:
@@ -422,18 +601,76 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return jnp.asarray(batch[ROLES_KEY])
 
-    def loss(self, params, batch, step: Step):
+    def _query_weights(self, inputs, segment_ids, dtype):
+        """1 where a query's indexer KL counts: a real token, and in a
+        packed batch one inside a document."""
+        weights = (jnp.ones_like(inputs, dtype) if self.pad_id is None
+                   else (inputs != self.pad_id).astype(dtype))
+        if segment_ids is not None:
+            weights = weights * (segment_ids[:, :-1] != 0).astype(dtype)
+        return weights
+
+    def _indexer_term(self, sown, inputs, segment_ids) -> tuple[jax.Array, jax.Array]:
+        """The batch's summed indexer KL, averaged over the layers that sowed
+        one, and the number of queries it counted.
+
+        A prediction depth's layer sows one query fewer per depth; its
+        leading queries are the rows' leading positions, so the weights
+        are cut to match."""
+        kls = _indexer_kls(sown)
+        if not kls:
+            raise ValueError(
+                "no attention layer sowed an indexer KL, though the model's mla "
+                "mixer carries the indexer")
+        weights = self._query_weights(inputs, segment_ids, jnp.float32)
+        total = jnp.sum(jnp.stack([
+            jnp.sum(kl.astype(jnp.float32) * weights[:, :kl.shape[1]]) for kl in kls]))
+        mass = jax.lax.stop_gradient(jnp.sum(weights))
+        return total / len(kls), mass
+
+    def _warmup_loss(self, params, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
+        """The dense warm-up's loss: the indexer's KL alone, the main loss
+        never scored since nothing it reaches moves."""
+        assert self.indexer is not None
+        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        inputs, _ = self._rows(tokens)
+        segment_ids, positions = _packing(batch)
+        collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
+        _, gathered = self._hidden_states(
+            self._model_variables(params), inputs, True, {"dropout": step.key},
+            collections, _packing_of(segment_ids, positions))
+        total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], inputs, segment_ids)
+        reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
+        qk = gathered.get("qk") if self.qk_stats else None
+        if self.qk_stats:
+            peak = _global_qk_max(qk)
+            if peak is not None:
+                reported["qk/max_logit"] = peak
+        return Mean(self.indexer.weight * total, mass), Aux(reported, qk_stats=qk)
+
+    def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
+        """A `[B, seq_len + 1]` batch as its inputs and shifted targets."""
+        if tokens.shape[-1] != self.seq_len + 1:
+            raise ValueError(
+                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
+                f"so the targets can be the shifted input, got {tokens.shape[-1]}")
+        return tokens[:, :-1], tokens[:, 1:]
+
+    def loss(self, params, batch, step: Step) -> tuple[Mean | LMStatistics, Aux[Variables]]:
+        if self._warmup:
+            return self._warmup_loss(params, batch, step)
         tokens = batch[TEXT_KEY]
+        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
-            params, tokens, train=True, rngs={"dropout": step.key},
+            params, prepared, train=True, rngs={"dropout": step.key},
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
-            qk_stats=self.qk_stats)
-        losses, weights, correct, routing, depths, qk = scores
+            qk_stats=self.qk_stats, indexer=self.indexer is not None)
+        losses, weights, correct, routing, depths, qk, kls = scores
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         prediction = Mean(jnp.sum(losses * weights), mass)
         ce, _ = mean_loss(prediction)
@@ -446,6 +683,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 for depth_losses, depth_weights in depths]))
             reported["mtp_ce"], _ = mean_loss(Mean(mtp_total, mass))
             prediction = Mean(prediction.total + self.mtp_weight * mtp_total, mass)
+        if self.indexer is not None:
+            # The KL shares the cross entropy's denominator, as the depths
+            # do, so one Mean carries the step: the queries counted differ
+            # from the targets only by the documents' last tokens. The
+            # report is the KL per counted query, the paper's quantity.
+            total, queries = self._indexer_term(kls, prepared.tokens[:, :-1], segment_ids)
+            reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
+            prediction = Mean(prediction.total + self.indexer.weight * total, mass)
         statistics: Mean | LMStatistics = prediction
         if alpha is not None:
             if not routing:
@@ -519,7 +764,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             if settings is not None:
                 from dew.sampling.text import generate as generate_text
 
-                params = params if step.ema is None else step.ema
+                params = self._model_variables(params if step.ema is None else step.ema)
                 prepared = (self.model, self._prompt, settings.max_new_tokens, settings.sampling)
         except BaseException as failure:
             error = failure
