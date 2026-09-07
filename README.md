@@ -187,15 +187,15 @@ and wrap the model **before** constructing the objective:
 ```python
 from dew.training.quantization import Quantization, apply_quantization
 
-model = apply_quantization(model, Quantization(dtype="int8"))
+model = apply_quantization(
+    model,
+    Quantization(dtype="int8", patterns=(".*dit_block_.*",)),
+)
 ```
 
-Qwix rewrites the model's matmuls to quantize their operands and keeps fp32
-master weights, so the training arithmetic changes and needs its own accuracy
-check. On a GPU this works for the decoders, whose trunk is all matmuls. The
-Flowers DiT also has a patch-embedding convolution, and cuDNN has no int8
-lowering for it, so quantizing that model raises `Can't lower one or more
-integer convolutions to idioms supported by CuDNN`; it trains quantized on CPU.
+This selects the DiT transformer blocks for int8 quantization and leaves the
+patch-embedding convolution in its configured floating-point dtype. Master
+weights remain fp32. Change `patterns` to select other module paths.
 
 Import model classes directly when writing Python: `from dew.nn.backbones import SimpleDiT, CausalTransformer`. The examples below also use `models.build(name, **fields)` for models selected by configuration; both construct the same Flax classes.
 
@@ -212,11 +212,8 @@ The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` hol
 
 ## Models
 
-A configuration is listed as supported when one checkpoint of it runs the whole
-workflow: `load_pretrained` builds the model, its processor prepares the media
-the model accepts, `Trainer` commits an optimizer update, generation decodes
-from the trained weights, and the export reloads into the same model. A
-translated config or a parity-checked layer does not put a model here.
+The supported configurations below can be loaded, trained, used for generation,
+and exported through Dew's public APIs.
 
 ### Text decoders
 
@@ -251,10 +248,7 @@ carries the processor and tokenizer files beside the weights.
 | Qwen 3.5 | `qwen3_5` | Images, with M-RoPE positions |
 | Llama 4 | `llama4` | Tiled images |
 
-Gemma 4's images and waveforms live in separate checkpoints: a vision checkpoint
-carries no audio tower, and asking its processor for waveforms raises `this
-source has no audio tower`. The audio towers run on the reference kernel in
-float32; the GPU audio path is waiting on its own gate.
+Available image and audio inputs follow the checkpoint's modality configuration.
 
 ### Block-diffusion decoders
 
@@ -267,9 +261,7 @@ float32; the GPU audio path is waiting on its own gate.
 `layer_scalar` trainable, so the export goes through the objective's model:
 `replace(loaded, model=objective.model).save(directory, variables=state.params)`.
 
-### Incomplete configurations
-
-These load and generate; the named piece is what keeps them off the list above.
+### Unsupported configurations
 
 | Model or family | `model_type` | Missing piece |
 |---|---|---|
@@ -584,7 +576,7 @@ The target encoder follows an EMA of the context encoder. The loss compares pred
 
 ### Loading pretrained weights
 
-Load a supported checkpoint from a Hub repository or local directory. This block needs a 1.2 GB download of Qwen3-0.6B and its tokenizer, so it is the one block below that was not run for this README.
+Load a supported checkpoint from a Hub repository or local directory. This example downloads Qwen3-0.6B and its tokenizer (about 1.2 GB).
 
 ```python
 import jax
