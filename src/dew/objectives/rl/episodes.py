@@ -91,6 +91,9 @@ class Action:
 
     Raw probabilities belong to the unmodified model; behavior probabilities
     include Sampling controls. EOS ends the model turn, not the episode.
+    Context and action ids are nonnegative integers. Actions stop at the
+    first configured EOS, and terminated agrees with that final token.
+    Vocabulary upper bounds belong to the model-aware caller.
     """
 
     context: tuple[int, ...]
@@ -103,10 +106,25 @@ class Action:
     _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
 
     def __post_init__(self) -> None:
-        if not self.tokens or len(self.tokens) != len(self.raw_log_probs) or len(self.tokens) != len(self.behavior_log_probs):
+        for name, ids in (("context", self.context), ("tokens", self.tokens)):
+            if not ids:
+                raise ValueError(f"sampled action {name} must be nonempty")
+            if any(type(token) is not int or token < 0 for token in ids):
+                raise ValueError(f"sampled action {name} must contain nonnegative integer token ids")
+        if len(self.tokens) != len(self.raw_log_probs) or len(self.tokens) != len(self.behavior_log_probs):
             raise ValueError("every sampled action token needs raw and behavior likelihoods")
-        if not all(math.isfinite(value) for value in (*self.raw_log_probs, *self.behavior_log_probs)):
-            raise ValueError("sampled action likelihoods must be finite")
+        for probabilities in (self.raw_log_probs, self.behavior_log_probs):
+            if not all(math.isfinite(value) for value in probabilities):
+                raise ValueError("sampled action likelihoods must be finite")
+        if type(self.terminated) is not bool:
+            raise ValueError("sampled action terminated must be a boolean")
+        eos = self.sampling.eos_id
+        stops = () if eos is None else (eos,) if isinstance(eos, int) else eos
+        if self.terminated != (self.tokens[-1] in stops):
+            raise ValueError("inference termination disagrees with the sampled EOS token")
+        for index, token in enumerate(self.tokens):
+            if token in stops and index != len(self.tokens) - 1:
+                raise ValueError("sampled action cannot contain tokens after EOS")
 
 
 @dataclass(frozen=True)
@@ -425,10 +443,6 @@ class EpisodeRollout:
             raise ValueError("inference must record a boolean EOS termination flag")
         count = int(lengths[row])
         actions = tuple(int(value) for value in tokens[width:width + count])
-        stops = self.sampling.eos_id
-        assert stops is not None
-        if bool(ended[row]) != bool(np.isin(actions[-1], stops)):
-            raise ValueError("inference termination disagrees with the sampled EOS token")
         return Action(context, actions, tuple(float(value) for value in raw[:count]),
                       tuple(float(value) for value in behavior[:count]),
                       bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
