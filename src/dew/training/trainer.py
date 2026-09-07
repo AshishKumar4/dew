@@ -39,6 +39,7 @@ from dew.training.distributed import (
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
+from dew.telemetry.records import FitStarted, FitEnded, CheckpointRequested, ProfileWindow, Record
 
 if TYPE_CHECKING:
     from dew.data import Dataset
@@ -566,7 +567,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def fit(self, data: "Dataset", *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | None = None,
-            metrics: Sequence[Metric] = ()) -> TrainState:
+            metrics: Sequence[Metric] = (), preview: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
 
@@ -577,6 +578,7 @@ class Trainer(Generic[Loss, Effects]):
         Every `checkpoint_every` steps, and at the end, the state and the data
         position are written; every `checkpoints.local_every` steps they are
         written to the local directory as well.
+        Preview generation is opt-in through preview=True, independent of scalar sinks.
         """
         started = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
@@ -584,11 +586,18 @@ class Trainer(Generic[Loss, Effects]):
         tracing, traced = False, 0
         loss = None
         other = 0.0
+        current = 0
+        first_step = None
+        process_zero = jax.process_index() == 0
         try:
             mesh = self.device_mesh
             process_zero = jax.process_index() == 0
             state, shardings, position = self.place()
             current = int(state.step)
+            self._report(FitStarted(current, steps,
+                checkpoints.source(current) if checkpoints is not None and position is not None else None,
+                sum(leaf.size for leaf in jax.tree.leaves(state.params["params"])), mesh.devices.size,
+                jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape)), current)
             if current > steps:
                 raise ValueError(f"the run is at step {current}, past the {steps} asked for")
 
@@ -630,9 +639,14 @@ class Trainer(Generic[Loss, Effects]):
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
-            if process_zero:
-                print(f"Training from step {current} to {steps} on "
-                      f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
+            error = None
+            try:
+                if process_zero:
+                    print(f"Training from step {current} to {steps} on "
+                          f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
+            except BaseException as failure:
+                error = failure
+            agree_process_phase(error, phase="training announcement")
             while current < steps:
                 assert train is not None
                 batch = next(train)
@@ -670,30 +684,36 @@ class Trainer(Generic[Loss, Effects]):
                     traced += 1
                     if traced == profile.steps:
                         tracing = False
-                        self._stop_trace(traced, loss, profile)
+                        self._stop_trace(traced, loss, profile, step=current)
 
                 if current % log_every == 0:
                     interval_loss, _, worst_bad_run = book
                     self._check_finite(worst_bad_run, current)
                     book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                    if process_zero:
-                        # The interval's numbers need the loss on the host, so
-                        # this is where the loop waits on the device.
-                        loss.block_until_ready()
-                        now = time.time()
-                        scalars = {"train/step": current, "train/loss": float(loss),
-                                   **{f"train/{k}": float(v) for k, v in aux.items()},
-                                   **self._throughput(now - last_log_time, steps_since_log,
-                                                      data.batch)}
-                        scalars["train/accepted"] = float(accepted)
-                        if state.scale is not None:
-                            scalars["train/loss_scale"] = float(state.scale.scale)
-                        if self.rollout is not None:
-                            scalars["train/rollout_seconds"] = rollout_seconds
-                        print(f"step {current}: loss {scalars['train/loss']:.4f}")
-                        if self.tracker is not None:
-                            self.tracker.log(scalars, current)
-                        last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                    error = None
+                    try:
+                        if process_zero:
+                            # The interval's numbers need the loss on the host, so
+                            # this is where the loop waits on the device.
+                            loss.block_until_ready()
+                            now = time.time()
+                            scalars = {"train/step": current, "train/loss": float(loss),
+                                       **{f"train/{k}": float(v) for k, v in aux.items()},
+                                       **self._throughput(now - last_log_time, steps_since_log,
+                                                          data.batch)}
+                            scalars["train/accepted"] = float(accepted)
+                            if state.scale is not None:
+                                scalars["train/loss_scale"] = float(state.scale.scale)
+                            if self.rollout is not None:
+                                scalars["train/rollout_seconds"] = rollout_seconds
+                            print(f"step {current}: loss {scalars['train/loss']:.4f}")
+                            if self.tracker is not None:
+                                self.tracker.log(scalars, current)
+                            last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+
+                    except BaseException as failure:
+                        error = failure
+                    agree_process_phase(error, phase="training reporting")
 
                 if eval_every and current % eval_every == 0 and current < steps:
                     paused = time.perf_counter()
@@ -701,7 +721,7 @@ class Trainer(Generic[Loss, Effects]):
                         self.objective, state.params, data.val, metrics=metrics, key=state.key,
                         step=state.step, schedule_step=state.microstep,
                         averaged=with_ema(state.params, state.ema),
-                        preview=self.tracker is not None, mesh=mesh))
+                        preview=preview, mesh=mesh))
                     other += time.perf_counter() - paused
 
                 # On its own clock, not the logging one: nested inside the log
@@ -711,6 +731,7 @@ class Trainer(Generic[Loss, Effects]):
                     paused = time.perf_counter()
                     checkpoints.save(current, state, position,
                                      {"loss": float(book[0] / interval_steps)})
+                    self._report(CheckpointRequested(checkpoints.directory), current)
                     other += time.perf_counter() - paused
                     last_saved = current
                     book = (jnp.zeros_like(book[0]), book[1], book[2])
@@ -719,6 +740,7 @@ class Trainer(Generic[Loss, Effects]):
                         and current % local_every == 0 and current < steps):
                     paused = time.perf_counter()
                     checkpoints.save_local(current, state, position)
+                    self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), current)
                     other += time.perf_counter() - paused
 
             paused = time.perf_counter()
@@ -730,7 +752,7 @@ class Trainer(Generic[Loss, Effects]):
                 tracing = False
                 # The window outlived the run, and a trace left running takes the
                 # next one down with it.
-                self._stop_trace(traced, loss, profile)
+                self._stop_trace(traced, loss, profile, step=current)
             interval_loss, _, worst_bad_run = book
             self._check_finite(worst_bad_run, current)
             if loss is not None:
@@ -742,7 +764,7 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, state.params, data.val, metrics=metrics, key=state.key,
                     step=state.step, schedule_step=state.microstep,
                     averaged=with_ema(state.params, state.ema),
-                    preview=self.tracker is not None, mesh=mesh))
+                    preview=preview, mesh=mesh))
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -751,6 +773,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoints.save(
                     current, state, position,
                     {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
+                self._report(CheckpointRequested(checkpoints.directory), current)
             other += time.perf_counter() - paused
         finally:
             paused = time.perf_counter()
@@ -760,7 +783,7 @@ class Trainer(Generic[Loss, Effects]):
             stop_trace = None
             if tracing and profile is not None:
                 tracing = False
-                stop_trace = lambda: self._stop_trace(traced, loss, profile)
+                stop_trace = lambda: self._stop_trace(traced, loss, profile, step=current)
             for label, cleanup in (
                 ("Training iterator", close),
                 ("Profiler", stop_trace),
@@ -776,15 +799,44 @@ class Trainer(Generic[Loss, Effects]):
                             error.add_note(f"{label} cleanup failed: {failure!r}")
             source = train = close = cleanup = None
             other += time.perf_counter() - paused
+            try:
+                agree_process_phase(error, phase="fit cleanup")
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+            if error is None:
+                try:
+                    if process_zero:
+                        scalars = goodput(time.perf_counter() - started, first_step, other)
+                        print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
+                              f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
+                        if self.tracker is not None:
+                            self.tracker.log(scalars, current)
+                except BaseException as failure:
+                    error = failure
+                try:
+                    agree_process_phase(error, phase="goodput reporting")
+                except BaseException as failure:
+                    error = failure
+            try:
+                self._report(FitEnded.outcome(time.perf_counter() - started, error), current)
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+                else:
+                    error.add_note(f'Reporting fit outcome failed: {failure!r}')
             if primary is None and error is not None:
                 raise error
-        if process_zero:
-            scalars = goodput(time.perf_counter() - started, first_step, other)
-            print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
-                  f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
-            if self.tracker is not None:
-                self.tracker.log(scalars, current)
         return state
+
+    def _report(self, value: Record, step: int) -> None:
+        error = None
+        if jax.process_index() == 0 and self.tracker is not None:
+            try:
+                self.tracker.artifact(value, step)
+            except BaseException as failure:
+                error = failure
+        agree_process_phase(error, phase=type(value).__name__)
 
     # ------------------------------------------------------------------
     # Validation
@@ -812,20 +864,32 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: Profile) -> None:
-        """Close the profiler window once its last step has actually landed."""
+    def _stop_trace(self, traced: int, loss, profile: Profile, *, step: int = 0) -> None:
+        """Stop every owned trace before reporting its window on process zero."""
+        error = None
         try:
-            if loss is not None:
-                loss.block_until_ready()
-        finally:
-            primary = sys.exception()
             try:
-                jax.profiler.stop_trace()
-            except BaseException as error:
-                if primary is None:
-                    raise
-                primary.add_note(f"Profiler stop failed: {error!r}")
-        print(f"Wrote profile for {traced} steps to {profile.directory}")
+                if loss is not None:
+                    loss.block_until_ready()
+            finally:
+                primary = sys.exception()
+                try:
+                    jax.profiler.stop_trace()
+                except BaseException as failure:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"Profiler stop failed: {failure!r}")
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="profile stop")
+        self._report(ProfileWindow(profile.directory, traced), step)
+        error = None
+        try:
+            if jax.process_index() == 0:
+                print(f"Wrote profile for {traced} steps to {profile.directory}")
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="profile announcement")
 
     def _check_finite(self, worst_bad_run, step: int):
         """Raise RuntimeError once the loss has been non-finite for BAD_LOSS_STEPS steps.

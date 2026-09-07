@@ -397,7 +397,7 @@ def run_case(case: Case, tmp_path, fsdp):
         batch, records, steps_per_epoch = BATCH, None, None
 
     state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
-                        metrics=(Spread(seen, artifact),))
+                        metrics=(Spread(seen, artifact),), preview=True)
 
     assert dict(trainer.device_mesh.shape) == {"data": jax.device_count() // fsdp, "expert": 1,
                                                "fsdp": fsdp, "tensor": 1, "sequence": 1, "stage": 1}
@@ -408,7 +408,9 @@ def run_case(case: Case, tmp_path, fsdp):
     assert seen == [shape] * 2, seen
     scores = [s["val/artifact_spread"] for _, s in tracker.scalars if "val/artifact_spread" in s]
     assert len(scores) == 2 and all(np.isfinite(score) for score in scores)
-    assert [type(value) for _, value in tracker.artifacts] == ([] if case.is_lm else [artifact] * 2)
+    assert [type(value) for _, value in tracker.artifacts
+            if isinstance(value, (ImageGrid, Representations, TokenScores, VideoGrid))] == (
+                [] if case.is_lm else [artifact] * 2)
     assert Checkpoints(trainer.checkpoints.directory).latest == 2
     return trainer, state
 

@@ -16,9 +16,11 @@ class does not have, or one the file lacks, raises.
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
+import sys
 import types
 import typing
 from collections.abc import Sequence
@@ -42,7 +44,9 @@ from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
 from dew.training.state import TrainState
-from dew.training.tracker import WandbTracker
+from dew.training.tracker import WandbTracker, LocalTracker, Trackers
+from dew.telemetry.records import RunRecord, packages_installed, json_value
+from dew.artifacts import agree_process_phase
 from dew.training.trainer import Profile, Trainer
 
 JsonDict = Annotated[
@@ -151,7 +155,7 @@ class TrainerConfig:
     """Persisted XLA cache, so a restart skips recompiling the step. None
     compiles from scratch every run."""
     wandb: Optional[Wandb] = None
-    """Unset runs without a tracker."""
+    """Optional W&B sink in addition to the local tracking journal."""
     multi_host: Optional[bool] = None
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
     xla_flags: Optional[str] = None
@@ -309,39 +313,74 @@ class RunConfig:
         recipe's own view of the run) and the step count as its config, and
         the checkpoint the run ends on is published to the registry under the
         name with slashes and spaces replaced, since an artifact name allows
-        neither. Without one the run trains and checkpoints alone.
+        neither. Local tracking journals live in a separate tracking directory.
         """
         trainer = self.trainer
         steps = trainer.total_steps(data)
-        print("Experiment_Name:", name)
         tracker = None
-        if trainer.wandb is not None:
-            tracker = WandbTracker(
-                trainer.wandb.project, name, entity=trainer.wandb.entity,
-                offline=trainer.wandb.offline,
-                config={"run_config": self.to_dict(), **(summary or {}), "steps": steps})
-        checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
-        if jax.process_index() == 0:
-            self.save(checkpoints.directory)
-        state = Trainer(
-            objective, build_optimizer(self.optim, steps),
-            key=jax.random.key(trainer.seed),
-            mesh=trainer.mesh,
-            layout=trainer.layout,
-            accumulation=trainer.accumulation,
-            dynamic_scale=trainer.dynamic_scale,
-            checkpoints=checkpoints,
-            tracker=tracker,
-            profile=trainer.profile,
-        ).fit(
-            data, steps=steps,
-            log_every=trainer.log_every,
-            eval_every=trainer.eval_interval(data),
-            checkpoint_every=trainer.checkpoint_interval(data),
-            metrics=metrics,
-        )
-        if tracker is not None:
-            # fit wrote the step it ended on, so that checkpoint is the run's.
-            dew.io.publish(checkpoints.path(int(state.step)), re.sub(r"[^\w.-]", "-", name),
-                           tracker=tracker)
-        return state
+        try:
+            wandb_tracker = None
+            if trainer.wandb is not None:
+                wandb_tracker = WandbTracker(
+                    trainer.wandb.project, name, entity=trainer.wandb.entity,
+                    offline=trainer.wandb.offline)
+            checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
+            local = LocalTracker(os.path.join(checkpoints.directory, "tracking"))
+            if "://" in checkpoints.directory:
+                local = LocalTracker(os.path.join(os.path.expanduser("~/.cache/dew/tracking"),
+                                                 re.sub(r"[^\w.-]", "-", name) + "-"
+                                                 + hashlib.sha256(checkpoints.directory.encode()).hexdigest()[:12]))
+            tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
+            error = None
+            try:
+                if jax.process_index() == 0:
+                    print("Experiment_Name:", name)
+                    print(f"Local tracking: {local.directory}")
+                    self.save(checkpoints.directory)
+                    tracker.artifact(RunRecord(name, json_value(self.to_dict()),
+                        json_value(summary or {}), steps, packages_installed()), 0)
+            except BaseException as failure:
+                error = failure
+            agree_process_phase(error, phase="run metadata")
+            state = Trainer(
+                objective, build_optimizer(self.optim, steps),
+                key=jax.random.key(trainer.seed),
+                mesh=trainer.mesh,
+                layout=trainer.layout,
+                accumulation=trainer.accumulation,
+                dynamic_scale=trainer.dynamic_scale,
+                checkpoints=checkpoints,
+                tracker=tracker,
+                profile=trainer.profile,
+            ).fit(
+                data, steps=steps,
+                log_every=trainer.log_every,
+                eval_every=trainer.eval_interval(data),
+                checkpoint_every=trainer.checkpoint_interval(data),
+                metrics=metrics, preview=trainer.wandb is not None,
+            )
+            error = None
+            try:
+                if wandb_tracker is not None:
+                    # fit wrote the step it ended on, so that checkpoint is the run's.
+                    dew.io.publish(checkpoints.path(int(state.step)), re.sub(r"[^\w.-]", "-", name),
+                                   tracker=wandb_tracker)
+            except BaseException as failure:
+                error = failure
+            agree_process_phase(error, phase="checkpoint publishing")
+            return state
+
+        finally:
+            primary = sys.exception()
+            error = None
+            try:
+                if tracker is not None:
+                    tracker.__exit__(type(primary), primary, None)
+            except BaseException as failure:
+                error = failure
+            try:
+                agree_process_phase(error, phase="tracker close")
+            except BaseException as failure:
+                if primary is None:
+                    raise
+                primary.add_note(f"Tracker close failed: {failure!r}")

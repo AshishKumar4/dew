@@ -527,7 +527,7 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts(tmp_path)
     tracker = RecordingTracker()
     trainer = make_trainer(objective=Features(), tracker=tracker)
     trainer.fit(Data(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
-                metrics=(Spread(seen),))
+                metrics=(Spread(seen),), preview=True)
 
     # Two passes: at step 2, and at the end of the run.
     assert seen == [((BATCH, 2), (BATCH, FEATURES))] * 6
@@ -535,8 +535,7 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts(tmp_path)
     assert [step for step, _ in scored] == [2, 4]
     assert all(np.isfinite(s["val/spread"]) for _, s in scored)
     # The first batch's artifact of each pass reaches the tracker.
-    assert [step for step, _ in tracker.artifacts] == [2, 4]
-    assert all(isinstance(value, Representations) for _, value in tracker.artifacts)
+    assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [2, 4]
 
 
 def test_a_failing_metric_fails_the_validation_pass():

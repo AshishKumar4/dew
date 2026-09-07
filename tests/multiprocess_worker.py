@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from dew.telemetry.records import RECORD_TYPES
 from dew.data import Loading
 from dew.training.evaluation import evaluate
 
@@ -127,6 +128,8 @@ class ScoreRecorder(LossRecorder):
                             if name.startswith("val/")})
 
     def artifact(self, value, step):
+        if isinstance(value, RECORD_TYPES):
+            return
         images = getattr(value, "images", None)
         self.drawn.append({"type": type(value).__name__,
                            "shape": [] if images is None else list(np.shape(images)),
@@ -541,7 +544,7 @@ def mode_validate(args) -> dict:
     data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
-                        metrics=(clip(modelname=tiny), GlobalMean()))
+                        metrics=(clip(modelname=tiny), GlobalMean()), preview=True)
     return {
         "process_index": jax.process_index(),
         "process_count": jax.process_count(),
@@ -569,6 +572,8 @@ def mode_tracked(args) -> dict:
 
     class Drawing(LossRecorder):
         def artifact(self, value, step):
+            if isinstance(value, RECORD_TYPES):
+                return
             payload = render(value)
             drawn.append({
                 "type": type(value).__name__,
@@ -587,7 +592,7 @@ def mode_tracked(args) -> dict:
                       checkpoints=None, tracker=Drawing())
     data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
-    state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps)
+    state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps, preview=True)
     return {"process_index": jax.process_index(), "drawn": drawn,
             "step": int(as_numpy(state.step))}
 
