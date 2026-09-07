@@ -423,8 +423,10 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     for a step count it answers the process and the explicit time grid the
     trajectory walks, and the prior the noise is drawn from. The process's
     own grid at the same points reproduces the plain task; a different grid
-    changes the draw; `final_denoise=False` skips the closing clean
-    prediction; a grid of the wrong length is refused."""
+    changes the draw; the grid decides the length, so `steps + 1` points
+    walk one more interval; `final_denoise=False` skips the closing clean
+    prediction, and over a one-point grid hands the noise itself to the
+    decode and clip that end every call."""
     import jax.numpy as jnp
 
     objective, state = make_run(tmp_path)
@@ -437,6 +439,11 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     assert not np.allclose(warped(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
     open_ended = dataclasses.replace(plain, final_denoise=False)
     assert not np.allclose(open_ended(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
-    short = dataclasses.replace(plain, grid=lambda steps: (plain.process, jnp.linspace(1.0, 0.0, steps + 1)))
-    with pytest.raises(ValueError, match="grid points"):
-        short(["a"], steps=4, sampler=Heun(), key=key)
+    longer = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps + 1)))
+    np.testing.assert_array_equal(longer(["a"], steps=3, sampler=Heun(), key=key).host().images,
+                                  plain(["a"], steps=4, sampler=Heun(), key=key).host().images)
+    start = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)[:1]),
+                                final_denoise=False)
+    prepared = start.prepare(["a"], key=key, steps=4)
+    np.testing.assert_array_equal(start(prepared, steps=4, sampler=Heun(), key=key).images,
+                                  np.clip(np.asarray(prepared.noise), -1.0, 1.0))
