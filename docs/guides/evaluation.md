@@ -52,21 +52,66 @@ The trainer calls `Objective.preview` once per evaluation event only when `fit(p
 
 ## Use a tracker
 
-Import `LocalTracker`, `WandbTracker`, and `Trackers` from `dew.training`.
+Import `LocalTracker`, `WandbTracker`, `MLflowTracker`, `TensorBoardTracker`, and `Trackers` from `dew.training`.
 
 `Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)`, and `close()`. A tracker is borrowed by `Trainer.fit`; its constructing owner closes it. Context managers preserve the active exception if closing also fails.
 
 `LocalTracker("runs/example/tracking")` writes synchronous scalar and typed-record JSONL journals plus preview files. It never overwrites the recipe's `run.json`. Recipes preserve the existing W&B preview request but do not enable previews for local-only reporting. Recipes create this local sink under their checkpoint directory; URI-backed checkpoint runs print their local tracking path. Optional W&B reporting uses the same interface. Explicitly use `offline=True` to prevent a W&B online session.
 
-Use `with Trackers(LocalTracker(path), WandbTracker(project, offline=True)) as tracker:` to own both sinks. Every sink receives each report even if another fails; the first failure propagates. There is no asynchronous reporting queue or silent drop policy: synchronous I/O has a cost at the log cadence.
+`MLflowTracker("experiment", name, uri=store)` opens one MLflow run through `MlflowClient`, so it never uses MLflow's global active run: scalars are the run's metrics, each record is a JSON artifact under `records/<type>-<step>.json`, a preview is uploaded as the files the local renderers write, and a `FitEnded` that did not complete terminates the run `FAILED`. A record is an artifact rather than a param because MLflow refuses a second value for a param and a run reports several records of one type. `uri` is any store MLflow reads; a local file store needs MLflow's own `MLFLOW_ALLOW_FILE_STORE=true` from 3.16 on. Install `dew-ml[mlflow]`.
+
+`TensorBoardTracker("runs/example/events")` writes one event file with tensorboard's own `EventFileWriter` and needs no TensorFlow: scalars are scalar summaries, records are text summaries under `reporting/<type>`, images are image summaries under `val/samples/<index>`, a clip is the animated GIF the image plugin renders, and representations are a histogram of their per-dimension spread. `TokenScores` has no summary and raises, as it does for W&B. Install `dew-ml[tensorboard]`.
+
+Use `with Trackers(LocalTracker(path), TensorBoardTracker(events)) as tracker:` to own several sinks. Every sink receives each report even if another fails; the first failure propagates. There is no asynchronous reporting queue or silent drop policy: synchronous I/O has a cost at the log cadence. One report of six scalars measured 0.005 ms into a local journal, 0.033 ms into an event file and 0.26 ms into an MLflow file store on an i9-12900K, so a thousand reports cost 5 ms, 33 ms and 0.26 s. Over 10,000 steps of the small regression at `log_every=10` the local and TensorBoard sinks stayed inside the run-to-run spread of the untracked run; MLflow's run creation, batch logging and termination added 0.5 s to 6.2 s.
 
 Local JSON encodes nonfinite metric values as strings `"NaN"`, `"+Inf"`, and `"-Inf"`. Perfect PSNR remains positive infinity, not null or a fabricated finite score. Use `float(value)` when reading these fields.
 
 Plotting is explicit: install `dew-ml[plots]`, then call `tracker.plot()` or construct `LocalTracker(path, plots=True)` to render at close. Matplotlib uses Agg, never a display backend. No plots render on training log ticks. Nonfinite points are annotated and omitted from curve segments; their exact values remain in the journal.
 
-Run records in `dew.telemetry.records` are `RunRecord` (resolved model/data/optimizer configuration and package versions), `FitStarted`, `CheckpointRequested`, `ProfileWindow`, and `FitEnded`. Checkpoint requests record asynchronous submission, not durability; existing checkpoint waits are unchanged. Profile records link explicit JAX trace windows, without per-step layer tensor copies. Data contents and source revisions are not automatically hashed: include their identities in the run summary when needed.
+Run records in `dew.telemetry.records` are `RunRecord` (resolved model/data/optimizer configuration and package versions), `FitStarted`, `CheckpointRequested`, `ProfileWindow`, `FitEnded`, and `TrialFinished` (one sweep trial). Checkpoint requests record asynchronous submission, not durability; existing checkpoint waits are unchanged. Profile records link explicit JAX trace windows, without per-step layer tensor copies. Data contents and source revisions are not automatically hashed: include their identities in the run summary when needed.
 
 Training metrics use names under `train/`; reduced validation metrics use `val/`. The logging cadence controls when the tracker receives values. Save the configuration separately from checkpoints when you need a record of the optimizer, data source, and evaluation settings.
+
+## Search a hyperparameter space
+
+`dew.config.sweep.sweep` trains one trial per point of a search space through `RunConfig.train`, so a trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. It takes the config, the space, the entry point that trains a config and returns that trial's score, a trial budget, a ledger path and a tracker. There is no second training loop and no scheduler.
+
+A space maps dotted paths into the run record to the values a trial draws from. `override` applies a point through `to_dict`/`from_dict`, so a path the config class does not declare raises rather than training the unchanged config. The backends are `random_search` (one independent draw per field, reproducible from the trial number), `grid_search` (the cartesian product in order) and `optuna_search` (Optuna's sampler, asked for the point and told the ledger's trials; install `dew-ml[hpo]`).
+
+A finished trial reaches the ledger before it is reported, so rerunning the same call continues an interrupted sweep at the trial it stopped on and retrains no finished one. A ledger written over another space is refused. The caller's tracker receives each trial's score as `sweep/value` at the trial's number and its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
+
+```python
+from dew import LocalTracker, evaluate
+from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config.sweep import grid_search, sweep
+from dew.registry import datasets
+
+config = RunConfig(
+    model=ModelConfig("causal_transformer", {"vocab_size": 4, "emb_features": 16,
+                                             "num_layers": 1, "num_heads": 2,
+                                             "mlp_features": 32, "max_seq_len": 16}),
+    # The synthetic batches above stand in for the dataset this names.
+    data=datasets["token_windows"](seq_len=8),
+    optim=OptimConfig(optimizer="adam"),
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
+                          eval_every=None, checkpoint_every=None),
+)
+
+
+def trial(run: RunConfig) -> float:
+    """Train one point and score it: the perplexity its own run ends on."""
+    state = run.train(objective, data, name=run.trainer.name or "lm-rate")
+    return float(evaluate(objective, state.params, data.val, metrics=(metrics.perplexity(),),
+                          key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
+
+
+with LocalTracker("runs/sweep/tracking") as tracker:
+    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+print(min(trials, key=lambda trial: trial.value).overrides)
+```
+
+The two trials train under `runs/sweep/lm-rate/trial-0` and `-1`, each with its own `run.json` recording the rate it trained with, and the better rate is printed. `sweep` returns the ledger, so `trial.value` is the score the entry point returned and `trial.overrides` the point it trained.
 
 ## Reproducibility and limits
 

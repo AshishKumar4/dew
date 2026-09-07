@@ -680,18 +680,56 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
 
 This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. Plots render when the tracker closes, rather than on every training step. Use `plots=False` for scalar/artifact recording only, or call `tracker.plot()` explicitly.
 
-For W&B, install `dew-ml[wandb]` and pass a `WandbTracker`. `Trackers` sends the same reports to multiple backends:
+`Trackers` sends the same reports to several backends, and switching one is a constructor. Install `dew-ml[wandb]`, `dew-ml[mlflow]` or `dew-ml[tensorboard]` for the sink you want:
 
 ```python
-from dew import LocalTracker, Trackers, WandbTracker
+from dew import LocalTracker, TensorBoardTracker, Trackers
 
 tracker = Trackers(
     LocalTracker("runs/experiment/tracking"),
-    WandbTracker(project="dew-experiments", offline=True),
+    TensorBoardTracker("runs/experiment/events"),
 )
 ```
 
-Use this tracker in the same `with` block and `Trainer` call above. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, and failures use typed reporting records. `Profile` enables detailed device traces.
+Use this tracker in the same `with` block and `Trainer` call above. `WandbTracker(project="dew-experiments", offline=True)` and `MLflowTracker("dew-experiments", uri="sqlite:///runs/mlflow.db")` take the same place. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, sweep trials, and failures use typed reporting records. `Profile` enables detailed device traces.
+
+### Sweeping a hyperparameter
+
+`sweep` trains one trial per point of a search space through the ordinary `RunConfig.train`, keeps a resumable JSON ledger, and reports each trial through the tracker you pass it:
+
+```python
+from dew import LocalTracker, evaluate, metrics
+from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config.sweep import grid_search, sweep
+from dew.registry import datasets
+
+config = RunConfig(
+    model=ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 32,
+                                             "num_layers": 1, "num_heads": 2,
+                                             "mlp_features": 64, "max_seq_len": 32}),
+    # The synthetic batches above stand in for the dataset this names.
+    data=datasets["token_windows"](seq_len=16),
+    optim=OptimConfig(optimizer="adam"),
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
+                          eval_every=None, checkpoint_every=None),
+)
+
+
+def trial(run: RunConfig) -> float:
+    """Train one point and score it: the perplexity its own run ends on."""
+    state = run.train(objective, data, name=run.trainer.name or "lm-rate")
+    return float(evaluate(objective, state.params, data.val, metrics=(metrics.perplexity(),),
+                          key=jax.random.key(1), step=int(state.step)).scores["val/perplexity"])
+
+
+with LocalTracker("runs/sweep/tracking") as tracker:
+    trials = sweep(config, {"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+                   ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+best = min(trials, key=lambda trial: trial.value)
+print(best.overrides, round(best.value, 4))
+```
+
+This prints `{'optim.learning_rate': 0.01} 1.0024` against 1.015 for the slower rate. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>` with its own `run.json`, checkpoints and tracking journal, and every finished trial is written to the ledger before it is reported, so rerunning the call continues an interrupted sweep instead of retraining. `random_search` and `grid_search` are built in; `optuna_search` needs `dew-ml[hpo]`.
 
 ## Diffusion and sampling
 
