@@ -107,7 +107,7 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
 def dataset(batch):
     rows = next(iter(batch.values())).shape[0]
     records = [{name: value[row] for name, value in batch.items()} for row in range(rows)]
-    stream = grain.MapDataset.source(records).repeat().batch(rows, drop_remainder=True).to_iter_dataset()
+    stream = grain.MapDataset.source(records).repeat().to_iter_dataset().batch(rows, drop_remainder=True)
     return Dataset(train=lambda: iter(stream), val=None, records=rows, batch=rows)
 
 

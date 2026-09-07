@@ -1422,15 +1422,26 @@ class CausalTransformer(nn.Module):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
-        holding the full `[B, S, vocab]` logits tensor. A packed batch passes
-        its per-document `positions` and `segment_ids` through to the layers,
-        where RoPE and the mask read them.
+        A packed batch passes per-document `positions` and `segment_ids`
+        through to the layers, where RoPE and the mask read them.
 
         A caller that fuses another encoder's outputs passes them as
         `input_embeddings` with their token positions in
         `embedding_positions`: both or neither, and the values replace the
         scaled token embeddings before the layers read them.
+
+        `attention_pairwise_mask` is an explicit boolean [B, queries, keys]
+        visibility mask for ordinary attention mixers. Optional
+        `attention_key_positions` supplies logical [B, keys] coordinates;
+        local layers apply their configured window to those coordinates.
+        These are call-local cached-read metadata, not sliceable token fields.
         """
+        if attention_key_positions is not None and attention_pairwise_mask is None:
+            raise ValueError("attention_key_positions requires attention_pairwise_mask")
+        if attention_pairwise_mask is not None:
+            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
+            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
+                raise ValueError("explicit pairwise masks require ordinary attention mixers")
         attention_metadata = (None if attention_mask is None and image_groups is None
                               and rotary_positions is None and attention_pairwise_mask is None
                               and attention_key_positions is None else AttentionMetadata(

@@ -17,6 +17,7 @@ from flax import struct
 import jax
 import jax.numpy as jnp
 
+from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Variables
@@ -153,7 +154,8 @@ class BlockProcess:
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
-    def generate(self, model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
                  max_new_tokens: int, *, key: jax.Array, eos_token_ids: tuple[int, ...] = (),
                  pad_token_id: int = 0) -> CanvasGeneration:
         """Run prefill, refinement and clean-token commits as one device computation.
@@ -162,22 +164,31 @@ class BlockProcess:
         output is cropped to the token limit. Finished rows are padded after
         their first EOS. No host-side decisions depend on generated tokens.
         """
-        inputs.validate()
-        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
-            raise ValueError("max_new_tokens must be a nonnegative integer")
-        if self.vocab_size != model.vocab_size or self.canvas_length != model.canvas_length:
-            raise ValueError("BlockProcess geometry must match the loaded model")
-        if not 0 <= pad_token_id < self.vocab_size:
-            raise ValueError("pad_token_id is outside the vocabulary")
-        if any(not 0 <= token < self.vocab_size for token in eos_token_ids):
-            raise ValueError("eos_token_ids contain an id outside the vocabulary")
-        batch, prompt_length = inputs.tokens.shape
-        if prompt_length == 0:
-            raise ValueError("a block-diffusion prompt must contain at least one token")
-        blocks = (max_new_tokens + self.canvas_length - 1) // self.canvas_length
-        if prompt_length + blocks * self.canvas_length > model.max_seq_len:
-            raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
-        return _generate(model, variables, inputs, max_new_tokens, key, self,
+        prepared = None
+        error = None
+        try:
+            prepared = ModelInputs.from_value(inputs)
+            if jax.random.key_data(key).ndim != 1:
+                raise ValueError("key must be one PRNG key, not a batch of keys")
+            if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+                raise ValueError("max_new_tokens must be a nonnegative integer")
+            if self.vocab_size != model.vocab_size or self.canvas_length != model.canvas_length:
+                raise ValueError("BlockProcess geometry must match the loaded model")
+            if not 0 <= pad_token_id < self.vocab_size:
+                raise ValueError("pad_token_id is outside the vocabulary")
+            if any(not 0 <= token < self.vocab_size for token in eos_token_ids):
+                raise ValueError("eos_token_ids contain an id outside the vocabulary")
+            _, prompt_length = prepared.tokens.shape
+            if prompt_length == 0:
+                raise ValueError("a block-diffusion prompt must contain at least one token")
+            blocks = (max_new_tokens + self.canvas_length - 1) // self.canvas_length
+            if prompt_length + blocks * self.canvas_length > model.max_seq_len:
+                raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="canvas generation setup")
+        assert prepared is not None
+        return _generate(model, variables, prepared, max_new_tokens, key, self,
                          eos_token_ids, pad_token_id)
 
 

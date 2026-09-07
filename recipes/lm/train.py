@@ -1,4 +1,4 @@
-"""Train an autoregressive language model over a directory of token files.
+"""Train autoregressive, masked-diffusion or block-diffusion models on token files.
 
 A sibling of the diffusion and JEPA recipes: same trainer, same sharding, same
 checkpoints, and a different objective. The data is not images but the
@@ -29,8 +29,6 @@ from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
 from dew.training.quantization import Quantization, apply_quantization
 
-DEFAULT_MODEL_CONFIG = {"emb_features": 512, "num_layers": 8, "num_heads": 8}
-
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
     # a type checker cannot read a variable in a type expression. Statically
@@ -45,7 +43,7 @@ class LmRunConfig(RunConfig):
     """A run, plus the language model's own knobs."""
 
     model: ModelConfig = field(
-        default_factory=lambda: ModelConfig("causal_transformer", dict(DEFAULT_MODEL_CONFIG)))
+        default_factory=lambda: ModelConfig("causal_transformer"))
     data: TokenSpec = field(default_factory=TokenWindows)
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
@@ -71,9 +69,12 @@ class LmRunConfig(RunConfig):
     """DeepSeek's lambda on the multi-token-prediction term. Needs a model
     with num_nextn_predict_layers above zero; unset leaves the term out."""
     objective: str = "lm"
-    """Which loss trains: 'lm' for next-token prediction, 'masked_diffusion'
-    for MDLM masked denoising on a bidirectional model (a --pretrained
-    diffusion checkpoint carries its mask token id)."""
+    """Loss convention: lm, masked_diffusion (MDLM), or block_diffusion
+    (the official DiffusionGemma fine-tuning objective)."""
+    block_prompt_tokens: int = 256
+    """Clean prompt prefix in a block-diffusion token row."""
+    block_canvas_size: int | None = None
+    """Training canvas width; None uses the checkpoint canvas length."""
     quantization: Optional[Quantization] = None
     """Quantized-training spec, wrapped around the built model before the
     objective sees it; unset trains in the compute dtype."""
@@ -83,9 +84,16 @@ class LmRunConfig(RunConfig):
             raise ValueError(
                 "the language model recipe trains on token files: "
                 "data:token-windows or data:packed-tokens")
-        if self.objective not in ("lm", "masked_diffusion"):
+        if self.objective not in ("lm", "masked_diffusion", "block_diffusion"):
             raise ValueError(
-                f"--objective {self.objective!r} is 'lm' or 'masked_diffusion'")
+                f"--objective {self.objective!r} is not lm, masked_diffusion or block_diffusion")
+        if self.objective == "block_diffusion":
+            if not isinstance(self.data, TokenWindows):
+                raise ValueError("block_diffusion requires data:token-windows, not packed documents")
+            if self.pretrained is None:
+                raise ValueError("block_diffusion fine-tuning requires --pretrained")
+            if self.balance_rate is not None or self.mtp_weight is not None or self.quantization is not None:
+                raise ValueError("block_diffusion has no balancing, MTP or quantized-training term")
 
 
 def token_directory(path: Optional[str]) -> Path:
@@ -107,6 +115,8 @@ def context_length(config: LmRunConfig, samples: Optional[Samples]) -> int:
     budget longer than the training context is what decides the model's
     max_seq_len; the sequence length being trained on is the floor.
     """
+    if config.objective == "block_diffusion":
+        return config.data.seq_len + 1
     if samples is None:
         return config.data.seq_len
     return max(config.data.seq_len, len(samples.prompt) + samples.max_new_tokens)
@@ -131,7 +141,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     trained with: continuing pretraining on ids from another vocabulary trains
     the embedding table against noise.
     """
-    from dew.interop.hf_decoders import load_pretrained_decoder
+    from dew.interop import load_pretrained as load_checkpoint
 
     overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
@@ -139,10 +149,10 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
             f"--model.config carries {overridden}, which the checkpoint at "
             f"{pretrained} decides. Only max_seq_len is still a choice.")
 
-    model, variables, fields = load_pretrained_decoder(
-        pretrained,
-        dtype=model_config.dtype, attention_impl=model_config.attention_impl,
+    loaded = load_checkpoint(
+        pretrained, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
         max_seq_len=model_config.config.get("max_seq_len", max_seq_len))
+    model, variables, fields = loaded.model, loaded.variables, loaded.model_config
     expected = checkpoint_tokenizer(pretrained)
     if meta["tokenizer"] != expected:
         raise ValueError(
@@ -225,6 +235,22 @@ def build_masked_objective(config: LmRunConfig, model, fields):
         ema_decay=config.ema_decay, decode=decode)
 
 
+def build_block_objective(config: LmRunConfig, model, pretrained):
+    """Split each complete token-window row into a clean prompt and response canvases."""
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+
+    if not isinstance(model, DiffusionGemma):
+        raise ValueError("block_diffusion requires a DiffusionGemma checkpoint")
+    width = model.canvas_length if config.block_canvas_size is None else config.block_canvas_size
+    response = config.data.seq_len + 1 - config.block_prompt_tokens
+    if width < 1 or response < width or response % width:
+        raise ValueError("seq_len + 1 must equal block_prompt_tokens plus whole training canvases")
+    return BlockDiffusionObjective(
+        model, prompt_length=config.block_prompt_tokens, num_canvases=response // width,
+        canvas_size=width, pretrained=pretrained, ema_decay=config.ema_decay)
+
+
 def main(config: LmRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir)
@@ -247,7 +273,7 @@ def main(config: LmRunConfig) -> TrainState:
             f"{config.trainer.batch_size}, so an epoch is no steps at all: read "
             "more data or lower --trainer.batch-size")
 
-    samples = build_samples(config)
+    samples = None if config.objective == "block_diffusion" else build_samples(config)
     context = context_length(config, samples)
 
     pretrained = None
@@ -260,8 +286,7 @@ def main(config: LmRunConfig) -> TrainState:
     if config.quantization is not None:
         model = apply_quantization(model, config.quantization)
     name = config.trainer.name or (
-        f"lm-{tokens.name}/seq-{config.data.seq_len}/"
-        f"emb-{model.emb_features}/layers-{model.num_layers}/"
+        f"{config.objective}-{tokens.name}/seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
     summary = {"model": fields, "arguments": run_summary(config, fields),
@@ -269,6 +294,9 @@ def main(config: LmRunConfig) -> TrainState:
                            "tokens": meta.get("train_tokens")}}
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields), data,
+                            name=name, summary=summary)
+    if config.objective == "block_diffusion":
+        return config.train(build_block_objective(config, model, pretrained), data,
                             name=name, summary=summary)
     objective = LMObjective(
         model,

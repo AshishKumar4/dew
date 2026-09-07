@@ -168,7 +168,8 @@ def main():
     eos_id = int(generated.sequences[0, prompt.shape[1]])
     eos_result, _, eos_counts = reference_generation(model, prompt, eos=[eos_id])
     pixels = torch.rand((2, 1, 3, 4, 4), generator=torch.Generator().manual_seed(91))
-    patches = pixels[:, 0].reshape(2, 3, 2, 2, 2, 2).permute(0, 2, 4, 1, 3, 5).reshape(2, 4, 12)
+    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    patches = torch.from_numpy(np.stack([convert_image_to_patches(image.numpy(), 2) for image in pixels[:, 0]]))
     image_positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
     image_prompt = torch.tensor([[2, 5, 60, 9, 11], [2, 6, 8, 60, 12]])
     media = {"pixel_values": patches, "image_position_ids": image_positions}
