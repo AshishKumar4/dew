@@ -44,8 +44,6 @@ nav:
       - Distributed training: concepts/distributed.md
       - Mixture of experts: concepts/moe.md
   - Reference:
-      - Capabilities and limitations: reference/support.md
-      - Decoder and vision families: reference/model-families.md
       - Core API: reference/core-api.md
       - Performance measurements: performance.md
       - Benchmark results: benchmarks.md

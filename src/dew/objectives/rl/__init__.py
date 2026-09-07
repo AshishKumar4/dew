@@ -10,12 +10,15 @@ from dew.data.preferences import MASK_KEY as PREFERENCE_MASK_KEY
 
 from .episodes import (Action, Environment, EnvironmentFactory, Episode, EpisodeCancelled,
                        EpisodeFailure, EpisodeId, EpisodeInference, EpisodeRecorder,
-                       EpisodeRollout, EpisodeStatus, Observation, Transition, Verifier)
+                       EpisodeRollout, EpisodeStatus, Observation, RecoverableEnvironment, Transition, Verifier)
 from .grpo import GRPOObjective
 from .flow import FlowGRPOObjective, FlowReward, FlowRollout
 from .preference import DPOObjective
 from .rollout import (ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY,
                       REWARDS_KEY, Reward, SampledRollout)
+from .sandbox import SandboxLimits, SubprocessEnvironment
+from .journal import EpisodeJournal
+from .ppo import PPOObjective, PPORollout, ValueHead
 
 __all__ = [
     "ADVANTAGES_KEY", "DPOObjective", "GRPOObjective", "IDS_KEY", "OLD_LOG_PROBS_KEY",
@@ -25,4 +28,7 @@ __all__ = [
     "Action", "Environment", "EnvironmentFactory", "Episode", "EpisodeCancelled",
     "EpisodeFailure", "EpisodeId", "EpisodeInference", "EpisodeRecorder", "EpisodeRollout",
     "EpisodeStatus", "Observation", "Transition", "Verifier",
+    "SandboxLimits", "SubprocessEnvironment",
+    "EpisodeJournal", "RecoverableEnvironment",
+    "PPOObjective", "PPORollout", "ValueHead",
 ]

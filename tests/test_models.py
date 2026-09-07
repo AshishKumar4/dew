@@ -36,14 +36,18 @@ def small_inputs(rng, res=RES, channels=3):
 
 def test_a_bf16_dit_predicts_in_fp32(rng):
     """The output head runs in fp32 whatever the model's compute dtype, so the
-    loss the objective takes from the prediction is an fp32 one."""
+    loss the objective takes from the prediction is an fp32 one. A head that
+    computed in bf16 and cast the result up keeps the dtype and loses the
+    mantissa, so the prediction has to carry bits bf16 cannot hold."""
     model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
                       mlp_ratio=2, dtype=jnp.bfloat16)
     x, temb, textcontext = small_inputs(rng)
-    params = model.init(rng, x, temb, textcontext)
+    # The zero-initialized head predicts exactly zero, a value every dtype
+    # holds, so the weights are nudged off init first.
+    params = jax.tree.map(lambda p: p + 0.02, model.init(rng, x, temb, textcontext))
     out = model.apply(params, x, temb, textcontext)
     assert out.dtype == jnp.float32
-    assert jnp.all(jnp.isfinite(out))
+    assert not jnp.array_equal(out, out.astype(jnp.bfloat16).astype(jnp.float32))
 
 
 @pytest.mark.parametrize("architecture, extra", [
@@ -283,9 +287,12 @@ def test_unet3d_temporal_mixing_after_training_signal(rng):
     assert other_frame > 1e-3 * same_frame, "no information flow across frames"
 
 
-def test_non_symmetric_attention_configs_init(rng):
-    """attention_configs is per stage and need not be symmetric: a stage that
-    is None must not decide anything for the stages that are not."""
+def test_non_symmetric_attention_configs_place_attention_on_that_stage_alone(rng):
+    """attention_configs is per stage and need not be symmetric: attention on
+    the first of two stages builds one block on the way down and its mirror on
+    the way up, and the middle block follows the deepest stage, which names
+    none. A stage that is None must not decide anything for the stages that
+    are not, in either the image or the video stack."""
     from dew.nn.backbones.unet3d import UNet3D
 
     config = dict(
@@ -299,11 +306,15 @@ def test_non_symmetric_attention_configs_init(rng):
     temb = jnp.ones((2,))
     textcontext = text()
 
-    image = jax.random.normal(rng, (2, 16, 16, 3))
-    Unet(**config).init(rng, image, temb, textcontext)
+    def attention_blocks(variables):
+        return sorted(name for name in variables["params"] if "attention" in name)
 
+    image = jax.random.normal(rng, (2, 16, 16, 3))
     video = jax.random.normal(rng, (2, 3, 16, 16, 3))
-    UNet3D(**config, temporal_heads=2).init(rng, video, temb, textcontext)
+    expected = ["down_0_attention_0", "up_1_attention_0"]
+    assert attention_blocks(Unet(**config).init(rng, image, temb, textcontext)) == expected
+    assert attention_blocks(UNet3D(**config, temporal_heads=2).init(
+        rng, video, temb, textcontext)) == expected
 
 
 def test_a_stage_with_an_unknown_field_is_refused():

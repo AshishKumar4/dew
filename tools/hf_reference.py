@@ -371,7 +371,7 @@ class _RmsWeight(torch.nn.Module):
 class LladaTinyBlock(torch.nn.Module):
     """One LLaDA llama block under the released tensor names."""
 
-    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int, eps: float):
+    def __init__(self, hidden: int, heads: int, kv_heads: int, intermediate: int):
         super().__init__()
         self.attn_norm = _RmsWeight(hidden)
         self.q_proj = torch.nn.Linear(hidden, heads * hidden // heads, bias=False)
@@ -398,11 +398,11 @@ class _LladaTransformer(torch.nn.Module):
     """The transformer holder, so the checkpoint keys read model.transformer.*."""
 
     def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
-                 vocab: int, eps: float):
+                 vocab: int):
         super().__init__()
         self.wte = torch.nn.Embedding(vocab, hidden)
         self.blocks = torch.nn.ModuleList(
-            [LladaTinyBlock(hidden, heads, heads, intermediate, eps) for _ in range(layers)])
+            [LladaTinyBlock(hidden, heads, heads, intermediate) for _ in range(layers)])
         self.ln_f = _RmsWeight(hidden)
         self.ff_out = torch.nn.Linear(hidden, vocab, bias=False)
 
@@ -411,18 +411,18 @@ class _LladaModel(torch.nn.Module):
     """The model holder, so the checkpoint keys read model.*."""
 
     def __init__(self, hidden: int, layers: int, heads: int, intermediate: int,
-                 vocab: int, eps: float):
+                 vocab: int):
         super().__init__()
-        self.transformer = _LladaTransformer(hidden, layers, heads, intermediate, vocab, eps)
+        self.transformer = _LladaTransformer(hidden, layers, heads, intermediate, vocab)
 
 
 class LladaTiny(torch.nn.Module):
     """LLaDA-8B's computation at toy width, under its OLMo-style names."""
 
     def __init__(self, hidden=32, layers=2, heads=4, intermediate=64, vocab=128,
-                 theta=500000.0, eps=1e-5):
+                 theta=500000.0):
         super().__init__()
-        self.model = _LladaModel(hidden, layers, heads, intermediate, vocab, eps)
+        self.model = _LladaModel(hidden, layers, heads, intermediate, vocab)
         self.theta = theta
         self.head_dim = hidden // heads
 

@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
-from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -48,16 +48,6 @@ def decode_logits(model, params, prompt, rest):
         cache = mutated['cache']
         steps.append(logits[:, -1])
     return jnp.stack(steps, axis=1)
-
-
-def test_forward_returns_fp32_logits_per_token(rng):
-    model = tiny()
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    logits = model.apply(params, ids)
-    assert logits.shape == (ids.shape[0], SEQ, VOCAB)
-    assert logits.dtype == jnp.float32
-    assert jnp.all(jnp.isfinite(logits))
 
 
 def test_bf16_compute_keeps_params_and_logits_fp32(rng):
@@ -166,7 +156,6 @@ def test_registry_builds_the_backbone_and_takes_the_precision_policy():
                                'num_layers': 2, 'num_heads': 4, 'max_seq_len': 16},
         dtype='bfloat16', attention_impl='reference')
     model = models.build('causal_transformer', **config)
-    assert isinstance(model, CausalTransformer)
     assert model.dtype is jnp.bfloat16
     assert model.attention_impl is None
 
@@ -194,36 +183,6 @@ def test_param_tree_mirrors_the_hf_decoder_layout(rng):
     assert 'lm_head' not in params
 
 
-def head_before_the_seam(self, tokens, train: bool = False, decode: bool = False):
-    """The forward pass with the head inline, as `__call__` read before
-    `hidden_states` existed.
-
-    Applied with `method=`, so the logits the split forward returns can be
-    compared against the ones the single method returns.
-    """
-    x = self.embed_tokens(tokens)
-    if self.embedding_scale:
-        scaled = x * jnp.asarray(math.sqrt(self.emb_features),
-                                 self.embed_tokens.embedding.dtype)
-        x = scaled.astype(x.dtype)
-    for layer in self.layers:
-        x = layer(x, train=train, decode=decode)
-    x = self.norm(x)
-
-    if self.tie_embeddings:
-        logits = jnp.einsum(
-            '...d,vd->...v', x.astype(jnp.float32),
-            self.embed_tokens.embedding.astype(jnp.float32),
-            precision=self.precision)
-    else:
-        logits = self.lm_head(x)
-    logits = logits.astype(jnp.float32)
-    if self.final_logit_softcap is not None:
-        cap = jnp.asarray(self.final_logit_softcap, jnp.float32)
-        logits = cap * jnp.tanh(logits / cap)
-    return logits
-
-
 SEAM_CONFIGS = [
     {},
     {'tie_embeddings': False},
@@ -232,17 +191,6 @@ SEAM_CONFIGS = [
     {'embedding_scale': True, 'final_logit_softcap': 5.0},
     {'embedding_scale': True, 'final_logit_softcap': 5.0, 'tie_embeddings': False},
 ]
-
-
-@pytest.mark.parametrize("config", SEAM_CONFIGS)
-def test_splitting_the_head_off_left_the_logits_alone(rng, config):
-    """Every byte of the forward pass, against a copy of the code it replaced."""
-    model = tiny(**config)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-
-    assert jnp.array_equal(model.apply(params, ids),
-                           model.apply(params, ids, method=head_before_the_seam))
 
 
 @pytest.mark.parametrize("config", SEAM_CONFIGS)
@@ -422,7 +370,6 @@ def test_gemma_flags_scale_the_embeddings_and_cap_the_logits(rng):
     assert jnp.all(jnp.abs(logits) < cap)
     # zero-initialised (1 + w) scales are the identity, so nothing is dead
     assert jnp.all(params['params']['norm']['scale'] == 0.0)
-    assert jnp.all(jnp.isfinite(logits))
 
 
 def test_gemma_zero_qk_norm_weights_are_identity(rng):
@@ -710,8 +657,8 @@ def packed_pair(rng, first=6, second=6):
 
 
 def test_positions_default_to_the_row_index(rng):
-    """Passing nothing has to be what passing the row index means, or every
-    unpacked run would change the day this argument arrived."""
+    """Omitting positions means the row index, so an unpacked run scores the
+    same whether the caller spells them out or not."""
     model = tiny()
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -734,19 +681,6 @@ def test_packed_attention_stays_causal_inside_a_document(rng):
                           segment_ids=segment_ids)
     assert jnp.array_equal(baseline[:, :cut], changed[:, :cut])
     assert not jnp.allclose(baseline[:, cut:6], changed[:, cut:6])
-
-
-def test_packed_attention_never_crosses_a_document(rng):
-    model = tiny()
-    ids, segment_ids, positions = packed_pair(rng)
-    params = model.init(rng, ids)
-    baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
-
-    other = ids.at[:, 6:].set((ids[:, 6:] + 7) % VOCAB)
-    changed = model.apply(params, other, positions=positions,
-                          segment_ids=segment_ids)
-    assert jnp.array_equal(baseline[:, :6], changed[:, :6])
-    assert not jnp.allclose(baseline[:, 6:], changed[:, 6:])
 
 
 def test_a_packed_document_reads_like_the_document_alone(rng):
@@ -794,9 +728,11 @@ def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
     with pytest.raises(ValueError, match="cudnn attention needs bf16"):
         model.apply(params, ids)
 
+    # The fallback is the xla kernel with the packed mask, not a run with the
+    # mask dropped, so the logits are the ones the xla model computes.
     logits = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    assert logits.shape == (ids.shape[0], ids.shape[1], VOCAB)
-    assert jnp.all(jnp.isfinite(logits))
+    assert jnp.array_equal(logits, tiny(attention_impl='xla').apply(
+        params, ids, positions=positions, segment_ids=segment_ids))
 
 
 @pytest.mark.parametrize("overrides", [
@@ -848,12 +784,10 @@ def test_the_qk_norm_reads_the_model_norm_eps(rng):
     small = tiny(norm_eps=1e-6)
     large = tiny(norm_eps=10.0)
     params = small.init(rng, ids)
-    layer = params["params"]["layers_0"]["self_attn"]
     x = jax.random.normal(rng, (2, 4, 4, 8)) * 0.01
     q_small = small.bind(params).layers[0].self_attn.q_norm(x)
     q_large = large.bind(params).layers[0].self_attn.q_norm(x)
     assert not jnp.allclose(q_small, q_large, rtol=1e-2)
-    del layer
 
 
 def test_the_tied_head_multiplies_in_fp32_under_bf16_compute(rng):

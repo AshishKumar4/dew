@@ -394,7 +394,7 @@ def run_case(case: Case, tmp_path, fsdp):
     class Data:
         train = staticmethod(source)
         val = staticmethod(lambda: (batch for batch in [next(source())]))
-        batch, records, steps_per_epoch = BATCH, None, None
+        batch = BATCH
 
     state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True)

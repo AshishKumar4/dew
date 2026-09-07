@@ -41,10 +41,14 @@ tokamax is not a Dew dependency, and its current release does not install cleanl
 
 The `expert` mesh axis partitions the expert dimension. Dense parameter dimensions can use FSDP or tensor placement independently. See [distributed training](distributed.md) for the global batch and layout requirements.
 
+The mixture's separate `dispatch` field defaults to `"global"`, the global sort/gather. `"exchange"` opts into bounded token exchange through public JAX `all_to_all` collectives. It needs an `expert` mesh axis larger than one that divides the expert count. Every selected token is retained, including when all traffic goes to one shard: later rounds drain that shard's bucket. Initialisation still works outside a mesh; applying the exchange model requires the mesh. GPT OSS's biased experts do not yet support this dispatch choice.
+
+Both dispatches run their expert projections through `moe.expert_projection`, which fixes the arithmetic a routed layer trains under whatever the activation dtype and placement: each contraction accumulates in at least fp32 and rounds once to the compute dtype, kernel gradients keep the master dtype, input gradients keep their input's dtype, and the exact GELU rounds once. Forward and reverse differentiation follow the same law. `tests/test_moe_precision.py` checks it against float64 arithmetic on the rounded operands and through three Adam steps of both dispatches in bf16. `tools/moe_exchange_probe.py` measures the exchange's working memory against the global path on CPU; no multiaccelerator throughput claim follows from it.
+
 More experts increase parameter storage even when `top_k` is fixed. Routing, communication, shared experts, and load imbalance still contribute to runtime. Estimate optimizer and EMA storage as well as the parameters, and measure a representative forward/backward step on the intended topology.
 
 ## Validate a sparse run
 
 For a reference model, compare router selections and weights, the sparse layer output, the loss, and parameter updates. For distributed training, verify that the balancing statistics represent the global batch and that replicated state remains identical across shards.
 
-The current documentation does not claim a completed large-scale sparse-model training run. Consult [family translation coverage](../reference/model-families.md) and [capabilities and limitations](../reference/support.md) for the implemented and measured scope.
+The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which sparse checkpoints load and which lack an export writer.

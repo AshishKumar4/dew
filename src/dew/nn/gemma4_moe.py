@@ -69,6 +69,7 @@ class Gemma4Experts(nn.Module):
     out_features: int
     activation: str = 'geglu'
     implementation: str = 'xla'
+    dispatch: str = 'global'
     norm_eps: float = 1e-6
     scale_offset: bool = False
     scale_after_cast: bool = False
@@ -87,7 +88,7 @@ class Gemma4Experts(nn.Module):
         routed = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
-            implementation=self.implementation, dtype=self.dtype,
+            implementation=self.implementation, dispatch=self.dispatch, dtype=self.dtype,
             precision=self.precision, name='experts')(norm('experts_input_norm')(x), weights, indices)
         return norm('mlp_branch_norm')(mlp_out) + norm('experts_output_norm')(routed)
 

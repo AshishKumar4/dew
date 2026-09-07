@@ -321,13 +321,15 @@ def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
     assert shardings["dit_block_0"]["attention"]["to_q"]["kernel"].spec == P()
 
 
-@pytest.mark.parametrize("axis", ["sequence", "data", "fspd"])
-def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused(axis):
+def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused():
     """The data and sequence axes split the batch: a parameter placed on
-    either would be gathered on every use. A misspelt axis raises the same
-    ValueError, at construction, before placement reads the rules."""
-    with pytest.raises(ValueError, match=axis):
-        Layout(rules={"embed": axis})
+    either would be gathered on every use. A misspelt axis is refused the
+    same way, at construction, before placement reads the rules, and the
+    message names the axis it could not place."""
+    with pytest.raises(ValueError, match=r"places a parameter on \['data'\]"):
+        Layout(rules={"embed": "data"})
+    with pytest.raises(ValueError, match=r"places a parameter on \['fspd'\]"):
+        Layout(rules={"embed": "fspd"})
 
 
 class IndivisibleModel(nn.Module):

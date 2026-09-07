@@ -313,9 +313,7 @@ def build_optimizer(config: "OptimConfig", steps: int) -> optax.GradientTransfor
     if config.weight_decay is not None:
         opts['weight_decay'] = config.weight_decay
         if config.optimizer in ('muon', 'muonclip'):
-            # Weight decay reaches the AdamW group as well. That is where the
-            # norm scales live, and Moonlight calls it crucial for stability
-            # there (docs/research/frontier-training.md:184).
+            # Muon's weight_decay does not cover the AdamW group's norm scales.
             opts.setdefault('adam_weight_decay', config.weight_decay)
     solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 

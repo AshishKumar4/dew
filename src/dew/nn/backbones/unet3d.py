@@ -27,7 +27,6 @@ class TemporalBlock(nn.Module):
     The output projection is zero-initialized, so the block is an exact
     identity at init and an inflated model starts as the per-frame 2D model.
     """
-    features: int
     heads: int = 8
     norm_epsilon: float = 1e-5
     dtype: Optional[Dtype] = None
@@ -73,7 +72,7 @@ class UNet3D(Unet):
         text = None if textcontext is None else jnp.repeat(textcontext.hidden, T, axis=0)
 
         def temporal(x, name):
-            return TemporalBlock(features=x.shape[-1], heads=self.temporal_heads,
+            return TemporalBlock(heads=self.temporal_heads,
                                  dtype=self.dtype, precision=self.precision, name=name)(x, T)
 
         out = unet_body(self, x.reshape(B * T, H, W, C), jnp.repeat(temb, T, axis=0), text,

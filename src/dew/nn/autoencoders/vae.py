@@ -423,16 +423,6 @@ class FlaxEncoder(nn.Module):
     r"""
     Flax Implementation of VAE Encoder.
 
-    This model is a Flax Linen [flax.linen.Module](https://flax.readthedocs.io/en/latest/flax.linen.html#module)
-    subclass. Use it as a regular Flax linen Module and refer to the Flax documentation for all matter related to
-    general usage and behavior.
-
-    Finally, this model supports inherent JAX features such as:
-    - [Just-In-Time (JIT) compilation](https://jax.readthedocs.io/en/latest/jax.html#just-in-time-compilation-jit)
-    - [Automatic Differentiation](https://jax.readthedocs.io/en/latest/jax.html#automatic-differentiation)
-    - [Vectorization](https://jax.readthedocs.io/en/latest/jax.html#vectorization-vmap)
-    - [Parallelization](https://jax.readthedocs.io/en/latest/jax.html#parallelization-pmap)
-
     Parameters:
         in_channels (:obj:`int`, *optional*, defaults to 3):
             Input channels
@@ -536,16 +526,6 @@ class FlaxDecoder(nn.Module):
     r"""
     Flax Implementation of VAE Decoder.
 
-    This model is a Flax Linen [flax.linen.Module](https://flax.readthedocs.io/en/latest/flax.linen.html#module)
-    subclass. Use it as a regular Flax linen Module and refer to the Flax documentation for all matter related to
-    general usage and behavior.
-
-    Finally, this model supports inherent JAX features such as:
-    - [Just-In-Time (JIT) compilation](https://jax.readthedocs.io/en/latest/jax.html#just-in-time-compilation-jit)
-    - [Automatic Differentiation](https://jax.readthedocs.io/en/latest/jax.html#automatic-differentiation)
-    - [Vectorization](https://jax.readthedocs.io/en/latest/jax.html#vectorization-vmap)
-    - [Parallelization](https://jax.readthedocs.io/en/latest/jax.html#parallelization-pmap)
-
     Parameters:
         in_channels (:obj:`int`, *optional*, defaults to 3):
             Input channels
@@ -561,8 +541,6 @@ class FlaxDecoder(nn.Module):
             norm num group
         act_fn (:obj:`str`, *optional*, defaults to `silu`):
             Activation function
-        double_z (:obj:`bool`, *optional*, defaults to `False`):
-            Whether to double the last output channels
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             parameters `dtype`
     """
@@ -615,7 +593,6 @@ class FlaxDecoder(nn.Module):
                 dtype=self.dtype,
             )
             up_blocks.append(up_block)
-            prev_output_channel = output_channel
 
         self.up_blocks = up_blocks
 

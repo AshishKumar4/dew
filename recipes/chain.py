@@ -32,9 +32,6 @@ from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
 from dew.objectives.rl.rollout import Reward
 from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 
-"""The stage losses a chain links: supervised fine-tuning, preference
-optimization, online RL."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Stage:

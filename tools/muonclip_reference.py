@@ -76,10 +76,8 @@ def clip_mla_reference(param: np.ndarray, scale: np.ndarray, qk_nope: int,
 def write_maxtext_fixture() -> None:
     sys.path.insert(0, "/tmp/mt")
     qk_clip_utils = importlib.import_module("maxtext.utils.qk_clip_utils")
-    rng = np.random.default_rng(7)
     cases = []
-    for seed_case, (batches, heads, nope, dim) in enumerate(
-            [(4, 3, 16, 24), (2, 8, 32, 48)]):
+    for seed_case, (batches, heads, nope) in enumerate([(4, 3, 16), (2, 8, 32)]):
         case_rng = np.random.default_rng(100 + seed_case)
         max_logits = (case_rng.normal(60, 60, (batches, heads))
                       .astype(np.float32))
@@ -98,7 +96,6 @@ def write_maxtext_fixture() -> None:
                 "param": param.tolist(),
                 "expected": np.asarray(expected).tolist(),
             })
-    del rng
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     FIXTURE.write_text(json.dumps(
         {"maxtext": "0.2.4", "source": "maxtext/utils/qk_clip_utils.py:85-101",

@@ -9,7 +9,6 @@ checkpoints
 good models
 *(old).ipynb
 .env
-.env
 tensorboard
 # the run-output directory above, not the stub package the checker reads
 !stubs/tensorboard/
@@ -23,7 +22,6 @@ gcsfuse.yml
 *.parquet
 *.arrow
 artifacts
-*.parquet
 dataset-prep/datasets
 # local working docs
 PLAN.md

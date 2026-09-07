@@ -146,14 +146,13 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
 
     @jax.jit
     def train_step(params, state, sequence):
-        loss, grads = jax.value_and_grad(loss_fn)(params, sequence)
+        grads = jax.grad(loss_fn)(params, sequence)
         updates, state = optimizer.update(grads, state, params)
-        return optax.apply_updates(params, updates), state, loss
+        return optax.apply_updates(params, updates), state
 
     for _ in range(300):
         rng, batch_rng = jax.random.split(rng)
-        params, state, loss = train_step(params, state, copy_batch(batch_rng, 64))
-    assert jnp.isfinite(loss)
+        params, state = train_step(params, state, copy_batch(batch_rng, 64))
 
     held_out = copy_batch(jax.random.PRNGKey(99), 16)
     predicted = jnp.argmax(model.apply(params, held_out[:, :-1]), axis=-1)

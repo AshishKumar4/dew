@@ -85,4 +85,4 @@ Local process-pool tests exercise real `jax.distributed` processes, but do not v
 
 Compare a small global mathematical operation across the intended placements. Check loss and gradients, record identity, optimizer and EMA state, and save/restore behavior. Capture compiler/backend versions and tolerances. Device count and a finite loss alone are insufficient evidence of equivalent training.
 
-CPU global-array tests cover unequal-mask loss normalization and partial-window restart. These checks do not establish large-model throughput or accelerator cross-host recovery. Read the [capability reference](../reference/support.md), [checkpoint guide](../guides/checkpoints.md), and [evaluation limits](../guides/evaluation.md) before making a production claim.
+CPU global-array tests cover unequal-mask loss normalization and partial-window restart. Read the [checkpoint guide](../guides/checkpoints.md) and [evaluation limits](../guides/evaluation.md) for what a resumed run and a reported metric each guarantee.

@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib

@@ -17,8 +17,8 @@ their notice; the rest of Dew is MIT.
 
 from .advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
 from .surrogate import (
-    clipped_surrogate, k3_kl, preference_logsigmoid, sequence_log_ratio, token_log_ratio,
-    token_mean,
+    behavior_importance_weights, clipped_surrogate, k3_kl, preference_logsigmoid, sequence_log_ratio, token_log_ratio,
+    clipped_value_loss_terms, token_mean,
 )
 
 __all__ = [
@@ -33,4 +33,6 @@ __all__ = [
     "sequence_log_ratio",
     "token_log_ratio",
     "token_mean",
+    "behavior_importance_weights",
+    "clipped_value_loss_terms",
 ]

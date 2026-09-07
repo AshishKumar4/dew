@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generic, Mapping, Optional, Self, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Mapping, Optional, Self, Sequence, TypeVar
 
 import jax.numpy as jnp
 import numpy as np
@@ -28,6 +28,8 @@ from dew.nn.text_encoders import (
 )
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
@@ -90,7 +92,7 @@ class CLIPText(ConditionEncoder[str]):
     checkpoint: str
     transformer: CLIPTextTransformer
     params: Variables
-    tokenizer: Any
+    tokenizer: PreTrainedTokenizerBase
     dtype: Optional[Dtype] = None
     revision: Optional[str] = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
@@ -146,7 +148,7 @@ class T5Text(ConditionEncoder[str]):
     checkpoint: str
     transformer: T5EncoderTransformer
     params: Variables
-    tokenizer: Any
+    tokenizer: PreTrainedTokenizerBase
     max_length: int = 256
     dtype: Optional[Dtype] = None
     revision: Optional[str] = None

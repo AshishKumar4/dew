@@ -478,7 +478,7 @@ def test_a_role_the_template_does_not_read_is_refused(tools_tokenizer):
         render(tools_tokenizer, with_developer)
 
 
-def test_an_assistant_turn_rewritten_by_later_turns_is_refused(tools_tokenizer):
+def test_an_assistant_turn_rewritten_by_later_turns_is_refused():
     """A template that keeps thinking only on the last assistant turn
     renders an earlier turn differently once followed; masking it from the
     whole conversation would drop its thinking silently, so it fails."""

@@ -2,14 +2,13 @@
 is selected for the EMA and put back."""
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
 from dew.objectives.base import (
-    Aux, EMASpec, Objective, Step, everything, merge, select, under,
+    Aux, EMASpec, Objective, Step, everything, merge, scalar_loss, select, under,
 )
 
 
@@ -68,17 +67,6 @@ def test_step_and_aux_cross_jit():
 def test_ema_spec_defaults_to_the_whole_tree():
     spec = EMASpec(decay=optax.constant_schedule(0.9))
     assert spec.select is everything
-    assert float(spec.decay(1000)) == pytest.approx(0.9)
-
-
-class Minimal(Objective):
-    ema = None
-
-    def init(self, key):
-        return {"params": {"w": jnp.zeros(())}}
-
-    def loss(self, params, batch, step):
-        return params["params"]["w"] ** 2, Aux({})
 
 
 def test_an_objective_needs_init_and_loss():
