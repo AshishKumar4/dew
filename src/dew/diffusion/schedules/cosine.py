@@ -56,7 +56,10 @@ class CosineContinuousNoiseScheduler(ContinuousNoiseScheduler):
 
     def rates(self, t):
         t = jnp.asarray(t, jnp.float32)
-        return jnp.cos(jnp.pi * t / 2), jnp.sin(jnp.pi * t / 2)
+        # float32 pi/2 rounds past the root of cosine. The endpoint is
+        # exactly noise-only; its spurious negative alpha invalidates log-SNR.
+        alpha = jnp.where(t == 1, 0.0, jnp.cos(jnp.pi * t / 2))
+        return alpha, jnp.sin(jnp.pi * t / 2)
 
     def weight(self, t):
         alpha, sigma = self.rates(t)

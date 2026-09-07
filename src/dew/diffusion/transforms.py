@@ -3,7 +3,9 @@
 A `PredictionTransform` is the parameterization: the target the model is
 trained to output at `(x_t, t)` and the way `x_0` and `epsilon` are read back
 out of an output. `rates` throughout is the schedule's `(alpha, sigma)` pair,
-already shaped to broadcast against the batch.
+already shaped to broadcast against the batch; `pred_transform` also sees
+`t` itself, for a parameterization whose scaling is a function of the time
+rather than of the rates.
 
 A `Weighting` turns a schedule and a parameterization into the per-example
 loss weight. The schedule's own weight is stated in the space its paired
@@ -25,7 +27,8 @@ from dew.diffusion.schedules import NoiseScheduler, expand
 class PredictionTransform:
     """The identity parameterization: the model outputs x_0's target space."""
 
-    def pred_transform(self, x_t, preds, rates) -> jax.Array:
+    def pred_transform(self, x_t, preds, rates, t) -> jax.Array:
+        """The model's raw output at `(x_t, t)` as a prediction in target space."""
         return preds
 
     def forward_diffusion(self, x_0, epsilon,
@@ -123,7 +126,7 @@ class KarrasPredictionTransform(PredictionTransform):
         signal_rate, noise_rate = rates
         return preds, (x_t - preds * signal_rate) / noise_rate
 
-    def pred_transform(self, x_t, preds, rates):
+    def pred_transform(self, x_t, preds, rates, t):
         _, sigma = rates
         c_out = sigma * self.sigma_data / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
         c_skip = self.sigma_data ** 2 / (self.sigma_data ** 2 + sigma ** 2)
@@ -137,6 +140,37 @@ class KarrasPredictionTransform(PredictionTransform):
         # x_0 error is c_out times the raw error, and alpha = 1 here so
         # sigma^2 = 1 / SNR
         return 1 / self.sigma_data ** 2 + snr
+
+
+class ConsistencyBoundary(PredictionTransform):
+    """The boundary parameterization of a latent consistency model (Luo et
+    al. 2023, arXiv 2310.04378), as Diffusers' `LCMScheduler` reads it: the
+    model predicts x_0 in `inner`'s space, and the consistency function is
+    f = c_skip x_t + c_out x_0 with c_skip = sigma_data^2 / (s^2 +
+    sigma_data^2) and c_out = s / sqrt(s^2 + sigma_data^2) at the scaled time
+    s = `timestep_scaling` t, so f is x_t itself at t = 0. `x_0` and
+    `epsilon` are read out of f."""
+
+    def __init__(self, inner: PredictionTransform, timestep_scaling: float = 10.0,
+                 sigma_data: float = 0.5) -> None:
+        self.inner = inner
+        self.timestep_scaling = timestep_scaling
+        self.sigma_data = sigma_data
+
+    def pred_transform(self, x_t, preds, rates, t):
+        preds = self.inner.pred_transform(x_t, preds, rates, t)
+        x_0, _ = self.inner.backward_diffusion(x_t, preds, rates)
+        scaled = expand(jnp.asarray(t, jnp.float32) * self.timestep_scaling, x_t)
+        c_skip = self.sigma_data ** 2 / (scaled ** 2 + self.sigma_data ** 2)
+        c_out = scaled / (scaled ** 2 + self.sigma_data ** 2) ** 0.5
+        return c_out * x_0 + c_skip * x_t
+
+    def backward_diffusion(self, x_t, preds, rates):
+        signal_rate, noise_rate = rates
+        return preds, (x_t - preds * signal_rate) / noise_rate
+
+    def get_input_scale(self, rates):
+        return self.inner.get_input_scale(rates)
 
 
 class Weighting(Protocol):
