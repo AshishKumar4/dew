@@ -1,6 +1,6 @@
 # References and attribution
 
-These papers explain methods used in Dew, and these projects provide dependencies, reference implementations, or code that Dew adapts. A citation is not a claim that Dew reproduces every result or supports every model in the cited project. Use the [API overview](api.md) for Dew's interfaces and [benchmarks](benchmarks.md) for measurements with their hardware and revision context.
+These papers explain methods used in Dew, and these projects provide dependencies, reference implementations, or code that Dew adapts. A citation is not a claim that Dew reproduces every result or supports every model in the cited project. Use the [core API reference](reference/core-api.md) for Dew's interfaces and [benchmarks](benchmarks.md) for measurements with their hardware and revision context.
 
 ## Diffusion and flow models
 
