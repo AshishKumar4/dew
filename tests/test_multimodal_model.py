@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from safetensors.numpy import load_file
 
 from dew.data.dataset import Dataset
 from dew.interop.pretrained import load_pretrained
@@ -140,4 +141,37 @@ def test_public_cached_generation_preserves_image_conditioning(source):
     altered = loaded.generate(blank, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
     # The observed maximum change is 0.0840, even though greedy tokens agree.
     assert np.max(np.abs(generated.raw_log_probs - altered.raw_log_probs)) > 1e-2
+
+
+
+def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_path):
+    """The exported HF buffers stay bitwise unchanged while AdamW updates weights."""
+    directory = FIXTURE.parent / "gemma4-tiny-mm"
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    patches = np.load(directory / "pixels.npy")
+    batch, count, _ = patches.shape
+    side = int(count ** 0.5)
+    patch = loaded.model.vision.patch_size
+    images = patches.reshape(batch, side, side, patch, patch, 3).transpose(
+        0, 5, 1, 3, 2, 4).reshape(batch, 1, 3, side * patch, side * patch)
+    tokens = jnp.asarray(np.load(directory / "input_ids.npy"))
+    marks = tokens == loaded.model.image_token_id
+    inputs = ModelInputs(tokens, {"image_indices": jnp.where(marks, jnp.cumsum(marks, axis=1) - 1, -1)},
+                         {"pixel_values": jnp.asarray(images)})
+    rows = 2 * jax.device_count()
+    repeated = inputs.take_rows(jnp.arange(rows) % 2)
+    objective = LMObjective(loaded.model, tokens.shape[1] - 1, pretrained=loaded.variables,
+                            ema_decay=None, pad_id=0)
+    data = Dataset(train=lambda: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
+    trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
+                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+    state = trainer.fit(data, steps=1, log_every=1)
+    loaded.save(tmp_path, variables=state.params)
+    before = load_file(str(directory / "model.safetensors"))
+    after = load_file(str(tmp_path / "model.safetensors"))
+    for name in ("std_bias", "std_scale"):
+        key = "model.vision_tower." + name
+        np.testing.assert_array_equal(after[key], before[key])
+    trained = "model.vision_tower.patch_embedder.input_proj.weight"
+    assert np.max(np.abs(after[trained] - before[trained])) > 1e-4
 
