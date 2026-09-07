@@ -28,6 +28,7 @@ from dew.rl import k3_kl, token_log_ratio
 from dew.rl.surrogate import clipped_surrogate_terms
 
 from ..lm import LMObjective
+from ..lm.objective import _shift_rows
 from .rollout import ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
 
 
@@ -108,7 +109,9 @@ class GRPOObjective(LMObjective):
     def loss(self, params, batch, step):
         ids, start, width = self._window(batch)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        policy = self.per_token_log_probs(params, ids)[:, start:start + width]
+        padding = (None if LENGTH_KEY not in batch else
+                   start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32))
+        policy = self.per_token_log_probs(params, ids, left_padding=padding)[:, start:start + width]
         ratio = token_log_ratio(policy, jnp.asarray(batch[OLD_LOG_PROBS_KEY]))
         terms, aux = clipped_surrogate_terms(
             ratio, jnp.asarray(batch[ADVANTAGES_KEY]), mask,
@@ -123,7 +126,7 @@ class GRPOObjective(LMObjective):
                 raise ValueError(
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
-            ref = self.per_token_log_probs(step.ema, ids)[:, start:start + width]
+            ref = self.per_token_log_probs(step.ema, ids, left_padding=padding)[:, start:start + width]
             kl_terms = k3_kl(policy, ref)
             kl = Mean(jnp.sum(jnp.where(mask != 0, kl_terms, 0) * mask), mass)
             metrics["kl"], _ = mean_loss(kl)
@@ -153,16 +156,16 @@ class GRPOObjective(LMObjective):
         if prompts.shape[1] < 2:
             raise ValueError(
                 f"a prompt needs two tokens to score one target, got {prompts.shape[1]}")
-        hidden = self.model.apply(params, prompts[:, :-1], train=False,
+        padding = prompts.shape[1] - lengths
+        aligned = _shift_rows(prompts, padding)
+        hidden = self.model.apply(params, aligned[:, :-1], train=False,
                                   method=type(self.model).hidden_states)
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
         losses, _ = chunked_cross_entropy(
-            hidden, head, prompts[:, 1:], self.head_chunks,
+            hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        positions = jnp.broadcast_to(
-            jnp.arange(prompts.shape[1] - 1), losses.shape)
-        starts = (prompts.shape[1] - lengths - 1)[:, None]
-        weights = (positions >= starts).astype(losses.dtype)
+        losses = _shift_rows(losses, -padding)
+        weights = (jnp.arange(losses.shape[1])[None, :] >= padding[:, None]).astype(losses.dtype)
         return TokenScores(losses=losses, weights=weights)

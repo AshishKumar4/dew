@@ -21,6 +21,7 @@ from flax import linen as nn
 
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
+from dew.sampling import Sampling
 from dew.objectives.rl import SampledRollout
 from dew.rl import group_advantage, rloo_advantage
 from dew.training import Checkpoints, Layout, Trainer
@@ -251,7 +252,7 @@ class Calls:
 
     def __call__(self, data_source, completion, ground_truth, extra_info):
         self.seen.append((data_source, completion, ground_truth, extra_info))
-        return 1.0 if completion.split()[0] == ground_truth else 0.0
+        return 1.0 if completion.split()[:1] == [ground_truth] else 0.0
 
 
 def tiny_objective(seq=PROMPT_WIDTH + NEW_TOKENS - 1):
@@ -289,7 +290,7 @@ def test_a_sampled_rollout_packs_fixed_shapes():
     params = objective.init(jax.random.key(0))
     reward = Calls()
     rollout = SampledRollout(objective, reward, groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0)
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
     batch = prompt_batch()
 
     out = rollout(FakeState(params), batch, jax.random.key(1))
@@ -315,7 +316,7 @@ def test_rewards_and_advantages_follow_the_calls():
     params = objective.init(jax.random.key(0))
     reward = Calls()
     rollout = SampledRollout(objective, reward, groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0)
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -338,7 +339,7 @@ def test_old_log_probs_come_from_the_sampling_head():
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     rollout = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0)
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -355,13 +356,12 @@ def test_the_mask_stops_after_the_first_stop_token():
     params = objective.init(jax.random.key(0))
     batch = prompt_batch()
     first = SampledRollout(objective, Calls(), groups=GROUPS,
-                           max_new_tokens=NEW_TOKENS, temperature=0.0)(
+                           max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))(
                                FakeState(params), batch, jax.random.key(1))
     stop = int(np.asarray(first["input_ids"])[0, PROMPT_WIDTH])
 
     stopped = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0,
-                             eos_id=stop)(FakeState(params), batch, jax.random.key(1))
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0, eos_id=stop))(FakeState(params), batch, jax.random.key(1))
 
     np.testing.assert_array_equal(np.asarray(stopped["response_mask"])[0], [1, 0, 0, 0])
 
@@ -371,8 +371,7 @@ def test_rloo_advantages_keep_fixed_shapes():
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     rollout = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0,
-                             sample="rloo")
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0), sample="rloo")
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -397,7 +396,7 @@ def test_a_misaligned_objective_is_refused():
     the prompt width plus new tokens, else the rescoring reads the wrong
     slice."""
     rollout = SampledRollout(tiny_objective(seq=4), Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, temperature=0.0)
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
     params = tiny_objective(seq=4).init(jax.random.key(0))
     with pytest.raises(ValueError, match="one below"):
         rollout(FakeState(params), prompt_batch(), jax.random.key(1))

@@ -16,7 +16,7 @@ from dew import Trainer
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.sampling import generate
+from dew.sampling import Sampling, generate
 
 row = np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], dtype=np.int32)
 tokens = np.tile(row, (8, 1))
@@ -30,17 +30,16 @@ trainer = Trainer(objective, optax.adam(0.01), key=jax.random.key(0))
 state = trainer.fit(data, steps=30, log_every=15)
 prompt = jnp.array([[0, 1]], dtype=jnp.int32)
 result = generate(model, state.params, prompt, max_new_tokens=6,
-                  key=jax.random.key(1), temperature=0.0)
-print("Generated token IDs:", np.asarray(result).tolist())
-assert result.shape == (1, 8)
-np.testing.assert_array_equal(np.asarray(result[:, :2]), np.asarray(prompt))
+                  key=jax.random.key(1), sampling=Sampling(temperature=0.0))
+print("Generated token IDs:", np.asarray(result.tokens).tolist())
+np.testing.assert_array_equal(np.asarray(result.tokens[:, :2]), np.asarray(prompt))
 ```
 
 `LMObjective` reads token rows of shape `(B, S + 1)`. It feeds the first `S` tokens to the model and scores predictions against the next `S` tokens. Here each row has nine tokens, so `seq_len=8`. Token IDs must be integers inside the model's vocabulary.
 
 The model's causal attention prevents a position from reading later tokens. Its hidden width is 16, with two attention heads and a feed-forward width of 32. The example uses float32 and XLA attention on CPU. These dimensions are for teaching, not model-quality or throughput comparisons.
 
-The training loss should decrease as the decoder learns the repeating pattern. Generation returns the prompt followed by six token IDs. `temperature=0.0` chooses the highest-scoring token at each step; the key is still an explicit API argument. The output may differ with library versions and initialization details. Inspect the continuation as a sequence of IDs in this synthetic vocabulary.
+The training loss should decrease as the decoder learns the repeating pattern. `result.tokens` contains the prompt followed by six token IDs. `Sampling(temperature=0.0)` chooses the highest-scoring token at each step; its behavior log-probability is zero. The key remains an explicit argument. Outputs may differ with library versions and initialization.
 
 ## Tokenize real text
 
@@ -70,9 +69,11 @@ Accumulation weights CE and MTP by the main supported-target mass, including tar
 
 ## Generate from a checkpoint
 
-`generate(model, variables, prompt, max_new_tokens, key=..., temperature=..., top_k=...)` accepts the complete Flax variables mapping, including its outer `params` key. Prompts have shape `(B, P)` and int32 IDs. The returned array has shape `(B, P + max_new_tokens)` and includes the prompt.
+`generate(model, variables, prompt, max_new_tokens, key=..., sampling=Sampling(...), prompt_lengths=...)` accepts the complete Flax variables mapping, including its outer `params` key. Prompts have shape `(B, P)` and integer IDs. `prompt_lengths` contains each row's real suffix length; omit it for unpadded prompts. The `Generation` result has a `tokens` array of shape `(B, P + max_new_tokens)` with the original prompt preserved.
 
-The prompt plus continuation must fit `model.max_seq_len`. Generation prefills a KV cache and decodes a fixed number of new tokens. Current public controls are temperature and top-k; this API is not a serving engine with streaming requests or continuous batching.
+The real prompt plus continuation must fit `model.max_seq_len`. `Sampling` carries temperature, top-k, EOS and the output padding id. EOS counts as a valid generated action. `Generation.lengths` counts response actions; `terminated` distinguishes EOS from the token budget. Likelihood arrays cover only the response: `behavior_log_probs` includes temperature/top-k, while `raw_log_probs` records the original policy. Ignore slots beyond each response length.
+
+Generation is a host operation. It trims left padding and runs the same compiled cached decoder for each exact prompt-length group. This keeps recurrent and latent caches free of padded input. Many distinct lengths create many compiled shapes and separate prefills. It is a correctness path with an execution cost, not continuous batching or a serving engine. Full-sequence RL rescoring left-aligns real tokens within one fixed shape.
 
 Checkpoint loading needs the `interop` extra and may download substantial files. The following complete checkpoint-to-text example is not part of the offline quickstart and has not been run during this documentation validation:
 
@@ -81,7 +82,7 @@ Checkpoint loading needs the `interop` extra and may download substantial files.
 import jax
 import jax.numpy as jnp
 from dew.interop import load_pretrained_decoder
-from dew.sampling import generate
+from dew.sampling import Sampling, generate
 from transformers import AutoTokenizer
 
 name = "Qwen/Qwen3-0.6B"
@@ -90,12 +91,13 @@ model, variables, config = load_pretrained_decoder(name, max_seq_len=64)
 encoded = tokenizer("A short prompt", return_tensors="np")
 ids = jnp.asarray(encoded["input_ids"], dtype=jnp.int32)
 generated = generate(model, variables, ids, max_new_tokens=24,
-                     key=jax.random.key(1), temperature=0.8, top_k=40)
-continuation = generated[0, ids.shape[1]:]
+                     key=jax.random.key(1), sampling=Sampling(temperature=0.8, top_k=40,
+                                                            eos_id=tokenizer.eos_token_id))
+continuation = generated.tokens[0, ids.shape[1]:ids.shape[1] + int(generated.lengths[0])]
 print(tokenizer.decode(continuation.tolist(), skip_special_tokens=True))
 ```
 
-The displayed string contains only the continuation; the returned token array also contains the prompt. The base model is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model.
+The displayed string contains only valid continuation tokens. `Generation.tokens` also contains the original prompt and padded response slots. The base model is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model.
 
 Use the returned model configuration when continuing training. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
 

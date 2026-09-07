@@ -130,16 +130,19 @@ With `N = B * G`, the objective consumes:
 | Field | Shape | Meaning |
 | --- | --- | --- |
 | `input_ids` | `[N, P + R]` | Prompt followed by sampled response, with each prompt's group contiguous. |
-| `old_log_probs` | `[N, R]` | Response log-probabilities rescored under the untempered model distribution. |
+| `old_log_probs` | `[N, R]` | Raw model-policy likelihoods recorded at each sampled action. |
+| `behavior_log_probs` | `[N, R]` | Actual temperature/top-k sampling likelihoods. |
+| `response_length` | `[N]` | Valid response actions, including EOS. |
+| `terminated` | `[N]` | True for EOS termination, false for the token budget. |
 | `advantages` | `[N, R]` | Each completion's advantage repeated across response positions. |
 | `response_mask` | `[N, R]` | Response positions that count toward the loss. |
 | `rewards` | `[N]` | Scalar reward for each completion. |
 
 Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. GRPO combines a clipped policy-ratio loss with a k3 KL penalty against the frozen reference when `beta > 0`. The clipping parameters are `epsilon_low`, `epsilon_high`, and `dual_clip`.
 
-With `eos_id` set, the response mask includes the first end token and excludes later tokens. The current rollout still generates a fixed response width and sends the full sampled row to `decode`; a reward must handle trailing tokens deliberately. Generation and rescoring receive the left-padded IDs without a prompt-length attention mask. Do not assume variable-length padded prompts are equivalent to separate unpadded generation. Validate that behavior for your decoder before using this path on real tasks. GRPO validation scores prompt perplexity; it does not generate and score an independent reward evaluation.
+Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)` from `dew.sampling`. The response mask includes EOS. `response_length` counts valid actions; `terminated` marks EOS termination. Reward text excludes EOS and padding. Generation trims left padding into exact-length groups before cached execution. Full rescoring left-aligns real context within a fixed shape. Many prompt lengths can create many compiled decode shapes and separate prefills. GRPO validation scores prompt perplexity over real next-token transitions; it does not generate an independent reward evaluation.
 
-Sampling temperature changes the distribution that draws tokens. The recorded `old_log_probs` come from untempered model rescoring, so they do not represent that sampling distribution at non-unit temperature. Exact likelihood provenance and correction semantics remain under review; fixed-tensor loss parity does not resolve this collection mismatch.
+`old_log_probs` records raw policy likelihoods from the cached forward at sampling time. `behavior_log_probs` records the distribution after temperature/top-k; greedy behavior has log-probability zero for its selected action. GRPO retains its current/old raw-policy PPO ratio. A behavior-to-proximal importance correction is a separate algorithm choice and is not applied implicitly.
 
 ## Flow-GRPO
 

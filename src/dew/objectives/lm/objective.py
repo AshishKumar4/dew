@@ -39,6 +39,7 @@ from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
+from dew.sampling.text import Sampling
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -66,9 +67,14 @@ class Samples:
     """
     prompt: Sequence[int] | Sequence[Sequence[int]]
     max_new_tokens: int
-    temperature: float = 1.0
-    top_k: Optional[int] = None
+    sampling: Sampling = Sampling()
     decode: Callable[[list[int]], str] = lambda ids: str(ids)
+
+
+def _shift_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
+    """Shift each row left by its count, wrapping padding to the right."""
+    indices = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
+    return jnp.take_along_axis(values, indices, axis=1)
 
 
 def _packing(batch):
@@ -230,6 +236,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         per-head logit maxima under, and reports them for the optimizer's
         QK-Clip; the recipe sets it when the optimizer is `muonclip`. Unset
         leaves the collection closed, which costs no extra matmul."""
+        if getattr(model, "causal", True) is False:
+            raise ValueError("LMObjective requires a causal model for next-token likelihoods")
         self.model = model
         self.seq_len = seq_len
         self.pad_id = pad_id
@@ -354,11 +362,23 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights))
         return Scores(losses, weights, correct, sown, depth_scores, qk)
 
-    def per_token_log_probs(self, params, tokens):
-        """Next-token log-probabilities, negated cross entropies, over a
-        `[B, seq_len + 1]` batch: the `[B, seq_len]` row per token the
-        rollout reads back for `old_log_probs`."""
-        return -self.token_scores(params, tokens).losses
+    def per_token_log_probs(self, params: Variables, tokens: jax.Array, *,
+                            left_padding: jax.Array | None = None) -> jax.Array:
+        """Raw policy likelihoods aligned to next-token targets.
+
+        Explicit left-padding counts move real context to position zero before
+        scoring. Returned slots whose input is padding are zero and unscored.
+        """
+        if left_padding is None:
+            return -self.token_scores(params, tokens).losses
+        padding = jnp.asarray(left_padding, jnp.int32)
+        if padding.shape != (tokens.shape[0],):
+            raise ValueError("left_padding must have one count per token row")
+        aligned = _shift_rows(tokens, padding)
+        losses = self.token_scores(params, aligned).losses
+        restored = -_shift_rows(losses, -padding)
+        return jnp.where(jnp.arange(restored.shape[1])[None, :] >= padding[:, None],
+                         restored, 0.0)
 
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """1 where a target counts: not padding, and in a packed batch inside
@@ -488,18 +508,17 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 from dew.sampling.text import generate as generate_text
 
                 params = params if step.ema is None else step.ema
-                prepared = (self.model, self._prompt, settings.max_new_tokens,
-                            settings.temperature, settings.top_k)
+                prepared = (self.model, self._prompt, settings.max_new_tokens, settings.sampling)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview setup")
         error = None
         try:
             if prepared is not None:
-                model, prompt, max_new_tokens, temperature, top_k = prepared
+                model, prompt, max_new_tokens, sampling = prepared
                 assert generate_text is not None
                 generated = generate_text(model, params, prompt, max_new_tokens,
-                                          key=step.key, temperature=temperature, top_k=top_k)
+                                          key=step.key, sampling=sampling).tokens
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview generation")

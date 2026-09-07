@@ -23,6 +23,7 @@ from flax import linen as nn
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.base import Step
+from dew.sampling import Sampling
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.rollout import (ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY,
                                        RESPONSE_MASK_KEY, SampledRollout)
@@ -272,9 +273,9 @@ def test_evaluation_scores_prompt_perplexity():
     scores = objective.evaluate(params, batch, step)
 
     expected = np.asarray(objective.per_token_log_probs(params, prompts))
-    np.testing.assert_allclose(np.asarray(scores.losses), -expected, rtol=1e-5)
-    np.testing.assert_array_equal(
-        np.asarray(scores.weights), [[1, 1, 1, 1], [0, 1, 1, 1]])
+    weights = np.asarray(scores.weights)
+    np.testing.assert_allclose(np.asarray(scores.losses) * weights, -expected * weights, rtol=1e-5)
+    np.testing.assert_array_equal(weights, [[1, 1, 1, 1], [0, 0, 1, 1]])
 
     with pytest.raises(ValueError, match="prompt"):
         objective.evaluate(params, {}, step)
@@ -303,7 +304,7 @@ def test_the_rollout_batch_feeds_the_objective():
     }
     state = SimpleNamespace(params=params)
     rollout = SampledRollout(objective, lambda *args: 1.0, groups=2,
-                             max_new_tokens=RESPONSE_WIDTH, temperature=0.0)
+                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=0.0))
     rolled = rollout(state, batch, jax.random.key(1))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
 
