@@ -244,3 +244,72 @@ def test_gemma4_source_backward_and_trained_export_match_reference(gemma4_source
         if name.endswith(("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max")):
             np.testing.assert_array_equal(saved[name], tensor)
 
+
+
+@pytest.fixture(scope="module")
+def qwen_source():
+    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Qwen processor")
+    directory = FIXTURE.parent / "qwen35-native-tiny"
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    images = np.load(directory / "raw_images.npy")
+    assert loaded.processor is not None
+    inputs = loaded.processor(json.loads((directory / "prompts.json").read_text()),
+                              images=[[images[0]], [images[1], images[2]]])
+    return loaded, inputs, directory
+
+
+def test_qwen_processor_spatial_rotary_and_cached_generation_match_reference(qwen_source):
+    """Actual Qwen3VLProcessor to hybrid decoder; fp32 max error 4.37e-5.
+
+    The interleaved spatial positions survive cached continuation. Removing
+    them must fail the same 1e-4 reference assertion.
+    """
+    loaded, inputs, directory = qwen_source
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    expected = np.load(directory / "logits.npy")
+    output = jax.jit(lambda variables: loaded.model.apply(
+        variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    np.testing.assert_allclose(np.asarray(output)[valid], expected[valid], atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), expected[valid].argmax(-1))
+    without_spatial = dataclasses.replace(inputs, token_fields={
+        name: value for name, value in inputs.token_fields.items() if name != "rotary_positions"})
+    wrong = loaded.model.apply(loaded.variables, without_spatial.tokens, **without_spatial.kwargs())
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(np.asarray(wrong)[valid], expected[valid], atol=1e-4, rtol=0)
+    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
+
+
+def test_qwen_source_head_ownership_backward_and_export_match_reference(qwen_source, tmp_path):
+    """Root tie_word_embeddings=False overrides the nested text flag.
+
+    Pixel-gradient error 1.60e-6 and post-SGD logit error 4.14e-5. Incorrectly
+    tying the head preserves the initial logits but misses this update by
+    0.00167, so forward-only evidence cannot cover this source contract.
+    """
+    loaded, inputs, directory = qwen_source
+    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
+                            pretrained=loaded.variables, ema_decay=None, pad_id=0)
+    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
+
+    def loss(params, pixels):
+        data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+        statistics, _ = objective.loss({"params": params}, {"text": data}, step)
+        return objective.reduce_loss(statistics)[0]
+
+    value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        loaded.variables["params"], inputs.conditioning["pixel_values"])
+    expected = json.loads((directory / "training.json").read_text())
+    np.testing.assert_allclose(value, expected["loss"], atol=1e-5, rtol=0)
+    real = jnp.concatenate([pixels[0, 0], pixels[1, 0], pixels[1, 1]])
+    np.testing.assert_allclose(real, np.load(directory / "pixel_gradient.npy"), atol=1e-5, rtol=1e-4)
+    optimizer = optax.sgd(expected["learning_rate"])
+    params = loaded.variables["params"]
+    updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+    updated = {"params": optax.apply_updates(params, updates)}
+    loaded.save(tmp_path, variables=updated)
+    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    np.testing.assert_allclose(np.asarray(output)[valid], np.load(directory / "updated_logits.npy")[valid], atol=1e-4, rtol=0)
+

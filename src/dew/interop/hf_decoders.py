@@ -1431,6 +1431,15 @@ def _wrapper_text(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         _refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     used.add("text_config")
+    if hf_config.get("model_type") != "llama4":
+        # These conditional models own their lm_head at wrapper scope; the
+        # nested text model has no head. Llama4 nests a complete causal LM.
+        default_tied = hf_config.get("model_type") != "qwen3_5"
+        tied = hf_config.get("tie_word_embeddings", default_tied)
+        if tied is not None and not isinstance(tied, bool):
+            _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
+        text = {**text, "tie_word_embeddings": bool(tied)}
+        used.add("tie_word_embeddings")
     return translate_config(text)
 
 

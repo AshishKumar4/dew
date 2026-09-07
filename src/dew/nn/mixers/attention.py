@@ -144,8 +144,8 @@ class CausalSelfAttention(nn.Module):
     def _multimodal_rotary(self, positions: jax.Array):
         """Qwen's interleaved temporal/height/width rotary frequency selection."""
         rotated = self._rot_dim() or self.head_dim
-        if self.mrope_section is None or sum(self.mrope_section) != rotated // 2:
-            raise ValueError("mrope_section must partition the rotated frequency pairs")
+        if self.mrope_section is None:
+            raise ValueError("multimodal rotary requires mrope_section")
         if positions.shape[-1] != 3 or self.partial_rotary_type != "default":
             raise ValueError("M-RoPE requires three coordinates and default partial rotary")
         indices = jnp.arange(rotated // 2)

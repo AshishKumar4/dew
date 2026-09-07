@@ -57,7 +57,7 @@ class Processor:
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
-                 "image_position_ids"}
+                 "image_position_ids", "image_grid_thw"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -73,6 +73,9 @@ class Processor:
         if "pixel_values" in values:
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
+            if self.config.get("model_type") == "qwen3_5":
+                token_fields["rotary_positions"] = self._image_rotary_positions(
+                    tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
         return result
@@ -83,6 +86,8 @@ class Processor:
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
         pixels = np.asarray(values["pixel_values"])
+        if pixels.ndim not in (2, 3, 4):
+            raise ValueError("pixel_values must contain image tensors or patch vectors")
         if not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must be floating processor output")
         runs = []
@@ -90,10 +95,29 @@ class Processor:
             locations = np.flatnonzero(row == image_id)
             runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
         image_counts = np.array([len(row) for row in runs], np.int32)
-        if pixels.shape[0] != int(image_counts.sum()):
-            raise ValueError("pixel_values and image placeholder counts disagree")
         patch_positions = None
-        if "image_position_ids" in values:
+        grid = None
+        merge = 1
+        if "image_grid_thw" in values:
+            vision = self.config.get("vision_config")
+            if not isinstance(vision, Mapping):
+                raise ValueError("image_grid_thw requires a vision config")
+            merge = vision.get("spatial_merge_size")
+            if type(merge) is not int or merge < 1:
+                raise ValueError("spatial_merge_size must be a positive integer")
+            grid = np.asarray(values["image_grid_thw"])
+            if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
+                    or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
+                raise ValueError("image_grid_thw must contain positive integer grids tiled by spatial_merge_size")
+            counts = np.prod(grid, axis=1)
+            if pixels.ndim != 2 or int(counts.sum()) != pixels.shape[0]:
+                raise ValueError("packed pixel_values do not match image_grid_thw")
+            offsets = np.concatenate([[0], np.cumsum(counts)])
+            chunks = [pixels[start:stop] for start, stop in zip(offsets[:-1], offsets[1:])]
+            shape = (int(counts.max()), pixels.shape[-1])
+            lengths = counts // merge ** 2
+            capacity = shape[0] // merge ** 2
+        elif "image_position_ids" in values:
             vision = self.config.get("vision_config")
             if not isinstance(vision, Mapping):
                 raise ValueError("image_position_ids require a vision config")
@@ -116,16 +140,23 @@ class Processor:
                 raise ValueError("patch counts must divide into complete pooling blocks")
             lengths = counts // kernel ** 2
             capacity = pixels.shape[1] // kernel ** 2
+            chunks, shape = list(pixels), pixels.shape[1:]
         else:
             count = self.record.get("tokens_per_image")
             if type(count) is not int or count < 1 or pixels.ndim != 4:
                 raise ValueError("fixed-resolution pixel_values require a positive tokens_per_image")
             lengths = np.full(pixels.shape[0], count, np.int32)
             capacity = count
+            chunks, shape = list(pixels), pixels.shape[1:]
+        if len(chunks) != int(image_counts.sum()):
+            raise ValueError("pixel_values and image placeholder counts disagree")
         width = int(image_counts.max())
         if width < 1:
             raise ValueError("pixels require image placeholders")
-        padded = np.zeros((tokens.shape[0], width, *pixels.shape[1:]), pixels.dtype)
+        padded = np.zeros((tokens.shape[0], width, *shape), pixels.dtype)
+        padded_grid = None if grid is None else np.zeros((tokens.shape[0], width, 3), np.int32)
+        if padded_grid is not None:
+            padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, *patch_positions.shape[1:]), -1, np.int32))
         indices = np.full(tokens.shape, -1, np.int32)
@@ -137,7 +168,10 @@ class Processor:
                 length = int(lengths[offset])
                 if len(slots) != length:
                     raise ValueError("image placeholder counts do not match the projector's feature count")
-                padded[row, image] = pixels[offset]
+                chunk = chunks[offset]
+                padded[row, image, :chunk.shape[0]] = chunk
+                if padded_grid is not None and grid is not None:
+                    padded_grid[row, image] = grid[offset]
                 if padded_positions is not None and patch_positions is not None:
                     padded_positions[row, image] = patch_positions[offset]
                 token_lengths[row, image] = length
@@ -148,7 +182,48 @@ class Processor:
                         "image_token_lengths": jnp.asarray(token_lengths)}
         if padded_positions is not None:
             conditioning["image_position_ids"] = jnp.asarray(padded_positions)
+        if padded_grid is not None:
+            conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
         return {"image_indices": jnp.asarray(indices), "image_groups": jnp.asarray(groups)}, conditioning
+
+
+    def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
+                                groups: jax.Array, grids: jax.Array) -> jax.Array:
+        """Qwen3.5's get_rope_index on host-normalized image grids.
+
+        Text advances one coordinate per token. An image occupies its merged
+        temporal/height/width grid, and following text starts after its longest
+        spatial side. Padding keeps coordinate zero, as in the reference.
+        """
+        vision = self.config.get("vision_config")
+        if not isinstance(vision, Mapping):
+            raise ValueError("image rotary positions require a vision config")
+        merge = vision.get("spatial_merge_size")
+        if type(merge) is not int or merge < 1:
+            raise ValueError("spatial_merge_size must be a positive integer")
+        image_groups, grid_values = np.asarray(groups), np.asarray(grids)
+        result = np.zeros((*tokens.shape, 3), np.int32)
+        for row in range(tokens.shape[0]):
+            slots = np.flatnonzero(valid[row])
+            start = cursor = 0
+            while start < len(slots):
+                group = int(image_groups[row, slots[start]])
+                stop = start + 1
+                while stop < len(slots) and image_groups[row, slots[stop]] == group:
+                    stop += 1
+                span = slots[start:stop]
+                if group < 0:
+                    result[row, span] = (cursor + np.arange(len(span)))[:, None]
+                    cursor += len(span)
+                else:
+                    time, height, width = (int(value) for value in grid_values[row, group])
+                    coordinates = np.indices((time, height // merge, width // merge)).reshape(3, -1).T
+                    if len(span) != len(coordinates):
+                        raise ValueError("image tokens do not match their multimodal rotary grid")
+                    result[row, span] = coordinates + cursor
+                    cursor += max(height, width) // merge
+                start = stop
+        return jnp.asarray(result)
 
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
@@ -466,6 +541,18 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             sliding["mixer"] = AttentionMixer(bidirectional_images=True)
             kinds["sliding_attention"] = sliding
             text_fields["kinds"] = kinds
+        if family == "qwen3_5":
+            rope = config["text_config"].get("rope_parameters") or {}
+            sections = rope.get("mrope_section", [11, 11, 10])
+            if (not isinstance(sections, (list, tuple)) or len(sections) != 3
+                    or any(type(value) is not int or value < 0 for value in sections)):
+                raise ValueError("mrope_section must contain three nonnegative integer widths")
+            kinds = dict(text_fields["kinds"])
+            full = dict(kinds.get("full_attention", {}))
+            full["mixer"] = AttentionMixer(mrope_section=(sections[0], sections[1], sections[2]))
+            kinds["full_attention"] = full
+            text_fields["kinds"] = kinds
+
         language_model = models.build("causal_transformer", **with_precision(
             "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl))
         if not isinstance(language_model, CausalTransformer):
