@@ -179,8 +179,6 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
     assert np.max(np.abs(after[trained] - before[trained])) > 1e-4
 
 
-
-
 @pytest.fixture(scope="module")
 def gemma4_source():
     pytest.importorskip("torchvision", reason="the optional vision extra supplies the actual Gemma4 processor")
@@ -244,5 +242,3 @@ def test_gemma4_source_backward_and_trained_export_match_reference(gemma4_source
     for name, tensor in original.items():
         if name.endswith(("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max")):
             np.testing.assert_array_equal(saved[name], tensor)
-
-

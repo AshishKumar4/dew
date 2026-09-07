@@ -2,11 +2,12 @@
 
 Both canvases are evaluated. Row zero selects its second, two-token canvas;
 row one selects its first, three-token canvas. Encoder target supports also
- differ. The self-conditioning draw enables row zero and disables row one.
+differ. The self-conditioning draw enables row zero and disables row one.
 """
 
 from pathlib import Path
 import math
+from dataclasses import replace
 
 import grain.python as grain
 import jax
@@ -38,9 +39,15 @@ def source():
     return loaded, batch, step, reference
 
 
-def objective(loaded, **kwargs):
+def objective(loaded, *, pretrained=None, **kwargs):
+    values = loaded.variables if pretrained is None else pretrained
     return BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=2,
-                                   pretrained=loaded.variables, **kwargs)
+                                   pretrained=values, **kwargs)
+
+
+def reference_variables(loaded, name):
+    values = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
+    return objective(loaded, pretrained=values).init(jax.random.key(0))
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -59,16 +66,16 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
     """
     loaded, batch, step, reference = source
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, loaded.variables)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     (loss, aux), gradient = jax.value_and_grad(
         lambda values: scalar_loss(obj, values, batch, step), has_aux=True)(variables)
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
     np.testing.assert_allclose(aux.metrics["canvas_ce"], reference["canvas_loss"].mean(), atol=1e-5, rtol=0)
     np.testing.assert_allclose(aux.metrics["encoder_ce"], reference["encoder_loss"].mean(), atol=1e-5, rtol=0)
-    expected = translate_weights(load_file(str(REFERENCES / "gradient.safetensors")), loaded.config)
+    expected = reference_variables(loaded, "gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     updated = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
-    reference_update = translate_weights(load_file(str(REFERENCES / "updated.safetensors")), loaded.config)
+    reference_update = reference_variables(loaded, "updated.safetensors")
     assert_tree_close(updated, reference_update, 2e-6)
 
 
@@ -76,10 +83,10 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     loaded, batch, step, _ = source
     obj = objective(loaded, stop_gradient_from_denoiser_to_encoder=True)
     gradient = jax.grad(lambda values: scalar_loss(obj, values, batch, step)[0])(
-        jax.tree.map(jnp.asarray, loaded.variables))
-    expected = translate_weights(load_file(str(REFERENCES / "detached_gradient.safetensors")), loaded.config)
+        jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))))
+    expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
-    full = translate_weights(load_file(str(REFERENCES / "gradient.safetensors")), loaded.config)
+    full = reference_variables(loaded, "gradient.safetensors")
     assert max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(jax.tree.leaves(gradient), jax.tree.leaves(full))) > 1e-3
 
 
@@ -87,14 +94,14 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
 def test_both_self_conditioning_branches_match_the_official_adapter(source, probability, reference_key):
     loaded, batch, step, reference = source
     obj = objective(loaded, self_cond_prob=probability)
-    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, loaded.variables), batch, step)
+    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
 
 def test_loss_weights_apply_after_independent_row_normalization(source):
     loaded, batch, step, reference = source
     obj = objective(loaded, encoder_loss_weight=0.3, decoder_loss_weight=2.7)
-    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, loaded.variables), batch, step)
+    loss, _ = scalar_loss(obj, jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     expected = 0.3 * reference["encoder_loss"].mean() + 2.7 * reference["canvas_loss"].mean()
     np.testing.assert_allclose(loss, expected, atol=1e-5, rtol=0)
     canvas_mass = reference["selected_mask"].sum(axis=(1, 2))
@@ -118,15 +125,15 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     obj = objective(loaded)
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
-    variables = jax.tree.map(jnp.asarray, loaded.variables)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     gradient = jax.grad(lambda values: scalar_loss(obj, values, batch, step)[0])(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     assert_tree_close(updated.params, expected, 2e-6)
-    loaded.save(tmp_path / "published", variables=updated.params)
+    replace(loaded, model=obj.model).save(tmp_path / "published", variables=updated.params)
     readback = load_pretrained(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert_tree_close(readback.variables, updated.params, 0)
+    assert_tree_close(objective(readback).init(jax.random.key(0)), updated.params, 0)
 
     resumed = Trainer(obj, optax.sgd(0.001), key=run_key,
                       checkpoints=Checkpoints(str(tmp_path / "run"))).fit(

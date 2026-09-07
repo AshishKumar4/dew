@@ -104,7 +104,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             raise ValueError("encoder_loss_weight and decoder_loss_weight must be nonnegative")
         if not encoder_loss_weight + decoder_loss_weight:
             raise ValueError("at least one SFT loss must be active")
-        self.model = model
+        if model.text.layer_scalar not in ("frozen", "trainable"):
+            raise ValueError("official SFT requires the model layer_scalar value")
+        self._initial_scalar_mode = model.text.layer_scalar
+        self.model = model.clone(text=model.text.clone(layer_scalar="trainable"))
         self.prompt_length = prompt_length
         self.canvas_size = canvas_size
         self.num_canvases = num_canvases
@@ -113,7 +116,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             raise ValueError("the SFT sequence exceeds model.max_seq_len")
         # The reference allocates one full-sequence cache for training, not the
         # model's potentially much larger serving capacity. Weights are unchanged.
-        self.training_model = model.clone(text=model.text.clone(max_seq_len=self.sequence_length))
+        self.training_model = self.model.clone(text=self.model.text.clone(max_seq_len=self.sequence_length))
         self.pretrained = pretrained
         self.pad_token_id = pad_token_id
         self.self_cond_prob = self_cond_prob
@@ -128,7 +131,39 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if self.pretrained is not None:
             if "params" not in self.pretrained:
                 raise ValueError("pretrained must contain the params collection")
-            return self.pretrained
+            if self._initial_scalar_mode == "trainable":
+                return self.pretrained
+            # Google makes skip_scale a parameter; Transformers declares the
+            # same tensor a buffer. Move references once, under an explicit
+            # model policy, without copying any parameter arrays.
+            values = dict(self.pretrained)
+            params = dict(values["params"])
+            text = dict(params["text"])
+            constants = dict(values["constants"])
+            text_constants = dict(constants["text"])
+            for index in range(self.model.text.num_layers):
+                layer = f"layers_{index}"
+                fixed = dict(text_constants[layer])
+                learned = dict(text[layer])
+                if "layer_scalar" in learned:
+                    raise ValueError("frozen source unexpectedly contains a trainable layer_scalar")
+                learned["layer_scalar"] = fixed.pop("layer_scalar")
+                text[layer] = learned
+                if fixed:
+                    text_constants[layer] = fixed
+                else:
+                    del text_constants[layer]
+            params["text"] = text
+            values["params"] = params
+            if text_constants:
+                constants["text"] = text_constants
+            else:
+                del constants["text"]
+            if constants:
+                values["constants"] = constants
+            else:
+                del values["constants"]
+            return values
         if self.model.conditioner is not None:
             raise ValueError("multimodal SFT initialization requires the complete pretrained variables")
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))

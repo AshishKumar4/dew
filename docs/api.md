@@ -20,7 +20,7 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Quantization`, `Rollout`, `Step`, `Tracker`, `TrainState`, `Trainer`, `WandbTracker`, `apply_quantization`, `build_mesh`, `build_optimizer`, `ema_update`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
-| `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
+| `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `build_mesh`, `local_rows`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers`, `scale_by_qk_clip` |
 | `dew.training.quantization` | `Quantization`, `apply_quantization` |
 | `dew.training.runtime` | `prepare_process`, `run_timestamp` |
@@ -32,7 +32,7 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.objectives` |  |
-| `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
+| `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `BlockDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |
 | `dew.objectives.rl` | `ADVANTAGES_KEY`, `DPOObjective`, `GRPOObjective`, `IDS_KEY`, `OLD_LOG_PROBS_KEY`, `PREFERENCE_IDS_KEY`, `PREFERENCE_MASK_KEY`, `RESPONSE_MASK_KEY`, `REWARDS_KEY`, `Reward`, `SampledRollout`, `FlowGRPOObjective`, `FlowReward`, `FlowRollout` |
@@ -53,7 +53,7 @@ module has no importable names.
 | --- | --- |
 | `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
 | `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
-| `dew.sampling.text` | `Generation`, `Sampling`, `generate` |
+| `dew.sampling.text` | `DecoderState`, `Generation`, `Sampling`, `TokenSample`, `generate` |
 
 ## Models
 
@@ -78,5 +78,5 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.eval` | `ImageMetric`, `frames`, `clip`, `clip_score`, `fid`, `frechet_distance`, `peak_signal_noise_ratio`, `psnr`, `structural_similarity`, `ssim` |
-| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
+| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights`, `Pretrained`, `Processor`, `load_pretrained` |
 | `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `preference_logsigmoid`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |

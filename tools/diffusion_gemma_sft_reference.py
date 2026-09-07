@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
