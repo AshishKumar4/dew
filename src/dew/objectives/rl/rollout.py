@@ -10,9 +10,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.artifacts import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.nn.inputs import ModelInputs
 from dew.rl import group_advantage, rloo_advantage
-from dew.sampling.text import Sampling, generate
+from dew.sampling.text import Sampling, _mesh, generate
 from dew.training.distributed import local_rows
 
 from ..lm import LMObjective
@@ -68,19 +70,35 @@ class SampledRollout:
             raise ValueError("the advantage families are 'group' and 'rloo'")
 
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
-        # The trainer hands over globally sharded arrays; this process samples
-        # the rows its devices hold and returns exactly those rows.
-        prompts = local_rows(batch[PROMPT_KEY])
-        prompt_lengths = local_rows(batch[LENGTH_KEY])
-        sources, truths, infos = (_texts(local_rows(batch[name]))
-                                  for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+        # Validation completes on every rank before generation enters collectives.
+        prepared = None
+        error = None
+        try:
+            prompts = local_rows(batch[PROMPT_KEY])
+            prompt_lengths = local_rows(batch[LENGTH_KEY])
+            sources, truths, infos = (_texts(local_rows(batch[name]))
+                                      for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+            rows, width = prompts.shape
+            if width + self.max_new_tokens != self.objective.seq_len + 1:
+                raise ValueError("size the objective one below the prompt width plus max_new_tokens")
+            if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
+                    or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
+                raise ValueError("prompt_length must contain one valid integer length per row")
+            inputs = ModelInputs(jnp.asarray(prompts), {
+                "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]})
+            prepared = prompts, prompt_lengths, sources, truths, infos, inputs
+        except BaseException as failure:
+            error = failure
+        if _mesh(state.params) is not None:
+            agree_process_phase(error, phase="rollout input preparation")
+        elif error is not None:
+            raise error
+        assert prepared is not None
+        prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
-        if width + self.max_new_tokens != self.objective.seq_len + 1:
-            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
         generated = [generate(
-            self.objective.model, state.params, prompts, self.max_new_tokens,
-            key=jax.random.fold_in(key, group), sampling=self.sampling,
-            prompt_lengths=prompt_lengths) for group in range(self.groups)]
+            self.objective.model, state.params, inputs, self.max_new_tokens,
+            key=jax.random.fold_in(key, group), sampling=self.sampling) for group in range(self.groups)]
         sampled = np.stack([np.asarray(result.tokens)[:, width:] for result in generated], axis=1)
         lengths = np.stack([np.asarray(result.lengths) for result in generated], axis=1)
         terminated = np.stack([np.asarray(result.terminated) for result in generated], axis=1)
