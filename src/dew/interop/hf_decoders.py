@@ -1341,6 +1341,11 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         _refuse("attn_output_gate=False",
                 "Qwen3_5Attention always gates its output")
     used.update(('attn_output_gate', 'full_attention_interval'))
+    # Published checkpoints call the DeltaNet SiLU gate "swish". Full
+    # attention always uses sigmoid; this field never changes that branch.
+    if hf_config.get('output_gate_type', 'swish') != 'swish':
+        _refuse('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate')
+    used.add('output_gate_type')
     rope_theta, partial = _qwen35_rope(hf_config)
     used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
     kinds = dict(config['kinds'])
@@ -1371,6 +1376,27 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
                  'mtp_use_dedicated_embeddings'))
 
     return config
+
+
+def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
+    """The hybrid Qwen decoder with routed SwiGLU and a sigmoid-gated shared expert.
+
+    Qwen3_5MoeTopKRouter always renormalizes selected softmax probabilities;
+    SparseMoeBlock gates the shared expert independently (Transformers
+    modeling_qwen3_5_moe.py:763-801). The checkpoint has no dense MLP width.
+    """
+    width = _record_int(hf_config, "moe_intermediate_size")
+    config = _qwen35_config({**hf_config, "intermediate_size": width}, used)
+    config["mixture"] = asdict(Mixture(
+        experts=_record_int(hf_config, "num_experts"),
+        top_k=_record_int(hf_config, "num_experts_per_tok"),
+        expert_features=width,
+        shared_features=_record_int(hf_config, "shared_expert_intermediate_size"),
+        shared_gate=True))
+    used.update(("moe_intermediate_size", "num_experts", "num_experts_per_tok",
+                 "shared_expert_intermediate_size", "output_router_logits", "router_aux_loss_coef"))
+    return config
+
 
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1557,6 +1583,9 @@ def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
 
 def _qwen35_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
     """A Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
+    if hf_config.get('language_model_only', False) is not False:
+        _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
+    used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
@@ -2579,6 +2608,21 @@ _GEMMA4_MOE: Dict[Tuple[str, ...], Tuple[str, ...]] = {
 }
 
 
+def _qwen35_moe_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    parts = name.split(".")
+    if len(parts) >= 5 and parts[:2] == ["model", "layers"] and parts[2].isdigit():
+        tail = parts[3:]
+        layer = ("params", f"layers_{parts[2]}", "mlp")
+        if len(tail) == 3 and tail[:2] == ["mlp", "experts"] and tail[2] in _MOE_SHARED:
+            return (*layer, "experts", tail[2], "kernel")
+        if tail == ["mlp", "shared_expert_gate", "weight"]:
+            return (*layer, "shared_expert_gate", "kernel")
+        if len(tail) == 4 and tail[:2] == ["mlp", "shared_expert"] and tail[2] in _MOE_SHARED and tail[3] == "weight":
+            return (*layer, "shared_experts", tail[2], "kernel")
+    return _dew_path(name, config)
+
+
+
 def _gemma4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
@@ -2671,6 +2715,10 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
+    DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
+                  lambda fields: bool(fields['output_gate'] and _mixture_value(fields) is not None),
+                  'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
+                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare),
     DecoderFamily((_QWEN35,), _qwen35_config,
                   lambda fields: bool(fields['output_gate']
                                       or 'linear_attention' in (fields['layer_types'] or ())),
