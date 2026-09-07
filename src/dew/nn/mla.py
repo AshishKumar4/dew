@@ -178,7 +178,7 @@ def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *
     if max_seq_len is None:
         raise ValueError("decoding needs max_seq_len for its fixed-capacity latent cache")
     batch, length = latent.shape[:2]
-    if length > max_seq_len:
+    if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a latent cache of {max_seq_len}.")
     cached_latent = module.variable("cache", "cached_latent", jnp.zeros,
                                     (batch, max_seq_len, latent.shape[-1]), latent.dtype)
@@ -209,7 +209,7 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
     if max_seq_len is None:
         raise ValueError("decoding needs max_seq_len for its fixed-capacity sparse cache")
     batch, length = key.shape[:2]
-    if length > max_seq_len:
+    if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a sparse cache of {max_seq_len}.")
     cached_key = module.variable("cache", "cached_key", jnp.zeros,
                                  (batch, max_seq_len) + key.shape[2:], key.dtype)
