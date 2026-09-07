@@ -2452,7 +2452,7 @@ def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     fields = {**translate_config(fixture_config("gemma4-moe-tiny")), "layer_scalar": mode}
     variables = translate_weights(load_file(str(GEMMA4_MOE / "model.safetensors")), fields)
     plain = base.clone(layer_scalar=mode)
-    scanned = plain.clone(scan_layers=True, remat=True)
+    scanned = plain.clone(scan_layers=True, remat="full")
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
 
     def loss(model, params):
