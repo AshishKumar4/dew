@@ -1,13 +1,12 @@
-"""Block diffusion: schedule, acceptance, renoise and self-conditioning.
+"""Published DiffusionGemma inference with tiny released-code reference weights.
 
-The sampler side of DiffusionGemma needs no model: uniform canvases, a
-temperature annealed by the remaining step count, entropy-bound acceptance
-and uniform renoising, all against hand-computed cases. The one model piece,
-the self-conditioning MLP, meets its reference at fp32 on a tiny fixture
-(max |difference| 1.1e-06, tolerance 1e-4); with its gate dead the same
-fixture leaves by 3.3, so the branch is live.
+The full checkpoint contains sliding/full attention, routed experts, shared
+encoder/decoder weights, self-conditioning, and a vision tower. The committed
+Transformers generate trajectory uses matched random inputs, not an assumed
+identity between Torch and JAX seeds (tools/diffusion_gemma_reference.py).
 """
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -17,190 +16,151 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.diffusion.block import (
-    BlockProcess, denoise_logits, prefill_cache, sample_canvas,
-)
-from dew.interop.hf_decoders import translate_config, translate_denoiser_weights
+from dew.diffusion.block import BlockProcess
+from dew.interop import diffusion_gemma as adapter
 from dew.nn.diffusion_gemma import SelfConditioning, soft_embeddings, translate_weights
-from dew.registry import models, with_precision
+from dew.nn.inputs import ModelInputs
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
 
 
-def process() -> BlockProcess:
-    return BlockProcess(canvas_length=6, vocab_size=8)
+@pytest.fixture(scope="module")
+def system():
+    config = json.loads((WORKFLOW / "config.json").read_text())
+    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    variables = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    process = adapter.generation_process(config, json.loads((WORKFLOW / "generation_config.json").read_text()))
+    with np.load(WORKFLOW / "reference.npz") as stored:
+        reference = {name: stored[name] for name in stored.files}
+    return model, variables, process, reference, config
 
 
-def test_entropy_bound_accepts_the_confident_positions():
-    """Entropies near 0.09, 0.37 and 0.69 under a bound of 0.05: the first
-    row always stays (its own excess is zero) while the other two break the
-    bound, so the denoiser token lands at position zero alone."""
-    current = np.array([[1, 1, 1]], np.int32)
-    denoised = np.array([[2, 2, 2]], np.int32)
-    logits = np.array([[[2.0, -2.0], [1.0, -1.0], [0.0, 0.0]]], np.float32)
-    accepted, mask = BlockProcess(
-        canvas_length=3, vocab_size=2, entropy_bound=0.05).accept(
-            current, denoised, logits)
-    assert mask.tolist() == [[True, False, False]]
-    assert accepted.tolist() == [[2, 1, 1]]
+def prefill(model, variables, prompt):
+    cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+    return model.apply({**variables, "cache": cache}, prompt, method=model.encode,
+                       mutable=["cache"])[1]["cache"]
 
 
-def test_renoise_keeps_accepted_positions_and_resamples_the_rest():
-    """Accepted ids pass through bit-identical; the rest come back uniform
-    over the vocabulary."""
-    rerun = process().renoise(jax.random.key(0), np.array([[4, 4, 4, 4]]),
-                              np.array([[True, False, True, False]]))
-    assert rerun[0, 0] == 4 and rerun[0, 2] == 4
-    assert bool(((rerun[0, 1::2] >= 0) & (rerun[0, 1::2] < 8)).all())
-    kept = process().renoise(jax.random.key(1), np.array([[4, 4]]),
-                             np.array([[True, True]]))
-    assert kept.tolist() == [[4, 4]]
+def test_entropy_bound_accepts_by_entropy_not_position():
+    process = BlockProcess(canvas_length=3, vocab_size=2, entropy_bound=0.05)
+    accepted, mask = process.accept(
+        np.array([[0, 0, 0]]), np.array([[1, 1, 1]]),
+        np.array([[[0., 0.], [2., -2.], [1., -1.]]], np.float32))
+    np.testing.assert_array_equal(mask, [[False, True, False]])
+    np.testing.assert_array_equal(accepted, [[0, 1, 0]])
 
 
-@pytest.mark.parametrize("field,value", [
-    ("canvas_length", 0), ("vocab_size", 0), ("entropy_bound", 0.0),
-    ("max_steps", 0), ("t_min", 0.9),
+@pytest.mark.parametrize("fields", [
+    {"canvas_length": 0}, {"vocab_size": 0}, {"max_steps": 0},
+    {"entropy_bound": float("nan")}, {"t_min": 0.9},
+    {"confidence_threshold": float("inf")}, {"stability_threshold": -1},
 ])
-def test_a_process_with_no_sensible_schedule_is_refused(field, value):
-    with pytest.raises(ValueError, match=field):
-        fields: dict = {"canvas_length": 6, "vocab_size": 8}
-        fields[field] = value
-        BlockProcess(**fields)
+def test_invalid_sampling_geometry_is_rejected(fields):
+    with pytest.raises(ValueError):
+        BlockProcess(**({"canvas_length": 4, "vocab_size": 64} | fields))
 
 
-def test_a_certain_denoiser_writes_its_tokens():
-    """A stub sure of token 3 everywhere ends all 3s: boundless acceptance
-    keeps every draw, and the first step conditions on nothing while later
-    steps condition on tempered logits."""
-    seen = []
+def test_native_shared_model_forward_matches_reference(system):
+    """fp32 maximum error 2.2e-6, identical argmax, tolerance 1e-4.
 
-    class Stub:
-        process = BlockProcess(canvas_length=6, vocab_size=8, entropy_bound=1e9)
+    Five prompt tokens exceed the four-token local window. Every canvas query
+    reads the same last three prefix keys and all four canvas keys; the old
+    query-relative mask changes these logits.
+    """
+    model, variables, _, reference, _ = system
+    cache = prefill(model, variables, reference["prompt"])
+    before = jax.tree.map(np.asarray, cache)
+    bare = model.apply({**variables, "cache": cache}, reference["canvas"])
+    conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
+                              self_conditioning_logits=reference["previous"])
+    np.testing.assert_allclose(bare, reference["bare"], atol=1e-4, rtol=0)
+    np.testing.assert_allclose(conditioned, reference["conditioned"], atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(jnp.argmax(conditioned, -1), reference["conditioned"].argmax(-1))
+    for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache)):
+        np.testing.assert_array_equal(actual, expected)
 
-        def __call__(self, canvas, prev):
-            seen.append(None if prev is None else True)
-            logits = np.full((2, 6, 8), -100.0, np.float32)
-            logits[..., 3] = 100.0
-            return logits
 
-    out = sample_canvas(jax.random.key(0), Stub(), (2, 6), steps=4)
-    assert out.shape == (2, 6) and out.dtype == np.int32
-    assert bool((np.asarray(out) == 3).all())
-    assert seen[0] is None and all(seen[1:])
+def test_multi_canvas_generation_matches_full_reference_loop(system):
+    model, variables, process, reference, _ = system
+    inputs = ModelInputs(jnp.asarray(reference["prompt"]))
+    result = process.generate(model, variables, inputs, 7, key=jax.random.key(11))
+    # Transformers returns the whole final canvas. Dew honors max_new_tokens
+    # at its public result while refining the same four-token canvas internally.
+    np.testing.assert_array_equal(result.tokens, reference["tokens"][:, :12])
+    np.testing.assert_array_equal(result.lengths, [7, 7])
+    np.testing.assert_array_equal(result.decoder_steps, reference["steps"])
+    assert not bool(result.terminated.any())
+
+
+def test_refinements_return_the_last_prediction_without_an_extra_call(system):
+    """Raw final-step error below 1e-4 on the complete reference trajectory."""
+    model, variables, process, reference, _ = system
+    cache = prefill(model, variables, reference["prompt"])
+    state = process.refine(model, variables, cache, jax.random.fold_in(jax.random.key(11), 0),
+                           2, jnp.zeros((2,), bool))
+    np.testing.assert_allclose(state.logits * process.temperature(1),
+                               reference["trajectory"][3], atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(state.decoder_steps, [4, 4])
+    np.testing.assert_array_equal(state.argmax, reference["tokens"][:, 5:9])
+
+
+def test_adaptive_stopping_resets_for_each_canvas(system):
+    model, variables, process, reference, _ = system
+    quick = replace(process, stability_threshold=0, confidence_threshold=10.0)
+    result = quick.generate(model, variables, ModelInputs(jnp.asarray(reference["prompt"])),
+                            7, key=jax.random.key(11))
+    np.testing.assert_array_equal(result.tokens, reference["stopped"][:, :12])
+    np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
+    np.testing.assert_array_equal(result.lengths, [7, 7])
+
+
+def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
+    model, variables, process, reference, _ = system
+    eos = int(reference["eos_id"])
+    result = process.generate(model, variables, ModelInputs(jnp.asarray(reference["prompt"])),
+                              7, key=jax.random.key(11), eos_token_ids=(eos,), pad_token_id=0)
+    expected = reference["eos_tokens"][:, :12]
+    np.testing.assert_array_equal(result.tokens, expected)
+    np.testing.assert_array_equal(result.decoder_steps, reference["eos_steps"])
+    np.testing.assert_array_equal(result.lengths, [1, 7])
+    np.testing.assert_array_equal(result.terminated, [True, False])
+
+
+def test_checkpoint_export_keeps_updated_weights_and_generation(system):
+    model, variables, process, reference, config = system
+    changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
+    restored = adapter.translate_weights(adapter.export_weights(changed, config), config)
+    for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored)):
+        np.testing.assert_array_equal(actual, wanted)
+    inputs = ModelInputs(jnp.asarray(reference["prompt"]))
+    wanted = process.generate(model, changed, inputs, 7, key=jax.random.key(11))
+    actual = process.generate(model, restored, inputs, 7, key=jax.random.key(11))
+    np.testing.assert_array_equal(actual.tokens, wanted.tokens)
+
+
+def test_zero_tokens_does_not_prefill_and_capacity_uses_whole_canvases(system):
+    model, variables, process, reference, _ = system
+    inputs = ModelInputs(jnp.asarray(reference["prompt"]))
+    empty = process.generate(model, variables, inputs, 0, key=jax.random.key(11))
+    np.testing.assert_array_equal(empty.tokens, inputs.tokens)
+    np.testing.assert_array_equal(empty.decoder_steps, [0, 0])
+    small = model.clone(text=model.text.clone(max_seq_len=11))
+    with pytest.raises(ValueError, match="rounded-up canvases"):
+        process.generate(small, variables, inputs, 6, key=jax.random.key(11))
 
 
 def test_self_conditioning_matches_the_reference_implementation():
-    """fp32 parity on the tiny self-conditioning MLP, and the gate is live."""
+    """Independent self-conditioning fixture: observed fp32 error 1.1e-6."""
     directory = FIXTURES / "diffusion-gemma-sc-tiny"
-    config = json.loads((directory / "config.json").read_text())
-    module = SelfConditioning(
-        hidden_size=config["hidden_size"],
-        intermediate_size=config["intermediate_size"],
-        norm_eps=config["rms_norm_eps"])
-    variables = {"params": translate_weights(
-        load_file(str(directory / "model.safetensors")))}
-    embeds = np.load(directory / "inputs.npy")
-    signal = np.load(directory / "signal.npy")
-    reference = np.load(directory / "ref.npy")
-    assert np.max(np.abs(np.asarray(
-        module.apply(variables, embeds, signal)) - reference)) < 1e-4
-    dead = dict(variables["params"])
-    dead["gate_proj"] = {"kernel": np.zeros_like(dead["gate_proj"]["kernel"])}
-    assert np.max(np.abs(np.asarray(
-        module.apply({"params": dead}, embeds, signal)) - reference)) > 1.0
+    module = SelfConditioning(hidden_size=32, intermediate_size=64)
+    variables = {"params": translate_weights(load_file(str(directory / "model.safetensors")))}
+    embeds, signal = np.load(directory / "inputs.npy"), np.load(directory / "signal.npy")
+    np.testing.assert_allclose(np.asarray(module.apply(variables, embeds, signal)),
+                               np.load(directory / "ref.npy"), atol=1e-4, rtol=0)
 
 
-def test_soft_embeddings_is_softmax_against_the_table():
-    table = np.array([[1.0, 0.0], [0.0, 1.0]], np.float32)
-    got = np.asarray(soft_embeddings(
-        np.array([[[10.0, 0.0], [0.0, 0.0]]], np.float32), table, 2.0),
-        dtype=np.float32)
-    np.testing.assert_allclose(got, [[[2.0, 0.0], [1.0, 1.0]]], atol=1e-3)
-
-
-def test_the_released_diffusiongemma_text_config_translates():
-    """google/diffusiongemma-26B-A4B-it's text_config: 30 layers of width 2816
-    routing 8 of 128 experts beside every dense MLP, values off keys on full
-    layers with no flag saying so, the head's divide-by-30, and decoder mode.
-    The config carries no per_layer_config key, so the full layers take the
-    global head dim 512 and 2 key/value heads."""
-    text = json.loads(
-        (FIXTURES / "diffusiongemma-26b" / "config.json").read_text())["text_config"]
-    config = translate_config({**text, "model_type": "diffusion_gemma_text"})
-    assert (config["emb_features"], config["num_layers"]) == (2816, 30)
-    assert config["mixture"] == {"experts": 128, "top_k": 8,
-                                 "expert_features": 704, "parallel": True}
-    assert config["attention_k_eq_v"] is True
-    assert config["final_logit_softcap"] == 30.0
-    assert config["causal"] is False
-    assert config["kinds"]["full_attention"]["head_dim"] == 512
-
-
-def _denoiser():
-    """The tiny fixture as encoder, decoder, self-conditioning and arrays."""
-    import dew.nn.backbones.causal_transformer  # noqa: F401, registers the backbone
-
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    record = translate_config(json.loads((directory / "config.json").read_text()))
-    assert record["mixture"] == {"experts": 4, "top_k": 2,
-                                 "expert_features": 16, "parallel": True}
-    variables = translate_denoiser_weights(
-        load_file(str(directory / "model.safetensors")), record)
-    encoder = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**record, "causal": True}, dtype="float32",
-        attention_impl="reference"))
-    decoder = models.build("causal_transformer", **with_precision(
-        "causal_transformer", record, dtype="float32", attention_impl="reference"))
-    sc = SelfConditioning(hidden_size=32, intermediate_size=64)
-    return {
-        "encoder": encoder, "decoder": decoder, "sc": sc,
-        "variables": variables,
-        "prompt": np.load(directory / "prompt.npy"),
-        "canvas": np.load(directory / "canvas.npy"),
-        "prev": np.load(directory / "prev_logits.npy"),
-        "bare": np.load(directory / "ref_bare.npy"),
-        "conditioned": np.load(directory / "ref_conditioned.npy"),
-    }
-
-
-def test_prefill_plus_canvas_matches_the_reference_denoiser():
-    """One denoise step end to end, fp32: the causal prefill fills the cache,
-    the canvas reads it bidirectionally with self-conditioning folded in.
-    Tolerance 1e-4; observed max |logit difference| 1.8e-07 bare and 2.4e-07
-    conditioned, identical argmax both. A prefill over a different prompt
-    misses by more than 0.1, so the cache is live."""
-    system = _denoiser()
-    cache = prefill_cache(system["encoder"], system["variables"]["text"],
-                          system["prompt"])
-    bare = np.asarray(denoise_logits(
-        system["decoder"], system["sc"], system["variables"]["text"],
-        system["variables"]["self_conditioning"], cache, system["canvas"], None))
-    assert np.max(np.abs(bare - system["bare"])) < 1e-4
-    assert (bare.argmax(-1) == system["bare"].argmax(-1)).all()
-    conditioned = np.asarray(denoise_logits(
-        system["decoder"], system["sc"], system["variables"]["text"],
-        system["variables"]["self_conditioning"], cache, system["canvas"],
-        system["prev"]))
-    assert np.max(np.abs(conditioned - system["conditioned"])) < 1e-4
-    assert (conditioned.argmax(-1) == system["conditioned"].argmax(-1)).all()
-    other = prefill_cache(system["encoder"], system["variables"]["text"],
-                          np.array([[9, 9, 9, 9]], np.int32))
-    assert np.max(np.abs(np.asarray(denoise_logits(
-        system["decoder"], system["sc"], system["variables"]["text"],
-        system["variables"]["self_conditioning"], other, system["canvas"], None))
-        - system["bare"])) > 0.1
-
-
-def test_a_denoiser_tensor_outside_the_text_prefixes_is_refused():
-    """Vision weights ride no prefix this map reads, so they name themselves;
-    and halves that disagree refuse naming the leaf."""
-    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
-    record = translate_config(json.loads((directory / "config.json").read_text()))
-    tensors = dict(load_file(str(directory / "model.safetensors")))
-    tensors["model.encoder.vision_tower.weight"] = np.zeros((2, 2), np.float32)
-    with pytest.raises(ValueError, match="unknown tensor name"):
-        translate_denoiser_weights(tensors, record)
-    tensors = dict(load_file(str(directory / "model.safetensors")))
-    tensors["model.decoder.layers.0.mlp.gate_proj.weight"] += 1.0
-    with pytest.raises(ValueError, match="differs between the encoder and the decoder"):
-        translate_denoiser_weights(tensors, record)
+def test_soft_embeddings_averages_the_table_under_the_distribution():
+    table = np.array([[1., 0.], [0., 1.]], np.float32)
+    got = soft_embeddings(np.array([[[10., 0.], [0., 0.]]], np.float32), table, 2.)
+    np.testing.assert_allclose(got, [[[2., 0.], [1., 1.]]], atol=1e-3)
