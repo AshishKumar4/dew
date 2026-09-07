@@ -1,0 +1,112 @@
+{
+ "diffusers": "0.34.0",
+ "mpmath": "1.3.0",
+ "cases": {
+  "source.multi_pp3": {
+   "solver_order": 3,
+   "algorithm_type": "dpmsolver++"
+  },
+  "source.multi_eps3": {
+   "solver_order": 3,
+   "algorithm_type": "dpmsolver"
+  },
+  "source.multi_sdepp3": {
+   "solver_order": 3,
+   "algorithm_type": "sde-dpmsolver++"
+  },
+  "source.single_pp2m": {
+   "solver_order": 2,
+   "solver_type": "midpoint"
+  },
+  "source.single_pp2h": {
+   "solver_order": 2,
+   "solver_type": "heun"
+  },
+  "source.single_pp3m": {
+   "solver_order": 3,
+   "solver_type": "midpoint"
+  },
+  "source.single_pp3h": {
+   "solver_order": 3,
+   "solver_type": "heun"
+  },
+  "source.single_sdepp2h": {
+   "solver_order": 2,
+   "algorithm_type": "sde-dpmsolver++",
+   "solver_type": "heun"
+  },
+  "source.single_sdepp3m": {
+   "solver_order": 3,
+   "algorithm_type": "sde-dpmsolver++"
+  },
+  "source.single_sdepp3h_final_zero": {
+   "solver_order": 3,
+   "algorithm_type": "sde-dpmsolver++",
+   "solver_type": "heun",
+   "final_sigmas_type": "zero"
+  },
+  "source.deis2": {
+   "solver_order": 2
+  },
+  "source.deis3": {
+   "solver_order": 3
+  },
+  "source.unipc_x0_bh2": {
+   "predict_x0": true,
+   "solver_type": "bh2"
+  },
+  "source.unipc_x0_bh1_disabled": {
+   "predict_x0": true,
+   "solver_type": "bh1",
+   "disable_corrector": [
+    0
+   ]
+  },
+  "source.unipc_eps_bh2_disabled": {
+   "predict_x0": false,
+   "solver_type": "bh2",
+   "disable_corrector": [
+    0
+   ]
+  },
+  "source.unipc_eps_bh1_disabled": {
+   "predict_x0": false,
+   "solver_type": "bh1",
+   "disable_corrector": [
+    0
+   ]
+  },
+  "target.deis2": {
+   "solver_order": 2,
+   "lower_order_final": false
+  },
+  "target.deis3": {
+   "solver_order": 3,
+   "lower_order_final": false
+  },
+  "target.unipc_eps3": {
+   "solver_order": 3,
+   "predict_x0": false
+  },
+  "target.unipc_x03": {
+   "solver_order": 3,
+   "predict_x0": true
+  },
+  "target.sde_eps1": {
+   "solver_order": 1,
+   "algorithm_type": "sde-dpmsolver"
+  },
+  "target.sde_eps2_lowered": {
+   "solver_order": 2,
+   "algorithm_type": "sde-dpmsolver"
+  },
+  "target.kdpm2_false": {
+   "sigma": 0.029167532920837402,
+   "ancestral": false
+  },
+  "target.kdpm2_true": {
+   "sigma": 0.029167532920837402,
+   "ancestral": true
+  }
+ }
+}

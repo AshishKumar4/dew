@@ -56,6 +56,8 @@ The objective samples noise and noise levels and computes the flow-matching loss
 
 `Euler()` is the numerical solver used for preview generation. Changing a solver, noise schedule, or prediction transform changes sampling semantics; choose a compatible process and solver. Other supplied solvers include DDPM, DDIM, Heun, RK4 and Euler ancestral, and the Diffusers scheduler updates: `DPMSolverMultistep` (every algorithm, order and second-order form of `DPMSolverMultistepScheduler`, and the EDM scheduler's update over the EDM process), `DPMSolverSinglestep`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral), `TCD`, and `Consistency` with the `ConsistencyBoundary` prediction transform for latent consistency models. Each reproduces Diffusers 0.34.0's trajectories on the fixtures `tools/diffusers_reference.py` records. The named `MultiStepDPM` implementation is a finite-difference sigma integrator, not a Diffusers scheduler.
 
+The former `DPMSolverPP()` configuration is `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. Keep `lower_order_final=False` when migrating existing short runs; the general solver defaults to Diffusers’ short-run lowering. Solver initialization takes `(x_T, times, process)`, with a concrete grid, so invalid endpoint combinations fail before the compiled scan.
+
 ## Inspect the preview
 
 The script writes `preview.npy` in its working directory. It contains four float32-compatible image arrays in `[-1, 1]`. For display, convert with `(output + 1) / 2` and clip to `[0, 1]`. Three updates on stripe images will not produce a useful generative model.

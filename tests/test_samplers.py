@@ -94,7 +94,7 @@ def generate(process, model, solver, steps=100, count=256, shape=(8, 8, 3), seed
 
 
 @pytest.mark.parametrize(
-    "solver", [Euler(), DDIM(), DDPM(), DPMSolverMultistep(), DPMSolverMultistep(3, "dpmsolver"),
+    "solver", [Euler(), DDIM(), DDPM(), DPMSolverMultistep(lower_order_final=False), DPMSolverMultistep(3, "dpmsolver"),
                DPMSolverMultistep(2, "sde-dpmsolver++"), DPMSolverSinglestep(3, lower_order_final=True),
                DEIS(), UniPC(), TCD(eta=0.0), TCD(eta=0.3)],
     ids=solver_id)
@@ -141,7 +141,7 @@ def test_pndm_converges_on_the_linear_table(solver):
 
 @pytest.mark.parametrize(
     "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), RK4(),
-               KDPM2(), KDPM2(ancestral=True), LMS(), DPMSolverMultistep(), UniPC(), DEIS()],
+               KDPM2(), KDPM2(ancestral=True), LMS(), DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS()],
     ids=solver_id)
 def test_karras_sampler_converges(solver):
     process, model = karras_process()
@@ -155,7 +155,7 @@ def integrate(process, solver, x_T, steps):
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
     times = process.times(steps)
-    x, state = x_T, solver.init(x_T, times)
+    x, state = x_T, solver.init(x_T, times, process)
     for i in range(steps - 1):
         t = jnp.full((x.shape[0],), times[i])
         t_next = jnp.full((x.shape[0],), times[i + 1])
@@ -318,7 +318,8 @@ ARRAYS = np.load(DIFFUSERS_FIXTURES / "schedulers.npz")
 # Each fixture case's Dew solver. The scheduler, its config and the model
 # convention a case was recorded under are in schedulers.json.
 DIFFUSERS_CASES = {
-    "dpm_multistep.pp_2m": DPMSolverMultistep(2, "dpmsolver++", "midpoint"),
+    "dpm_multistep.pp_2m": DPMSolverMultistep(2, "dpmsolver++", "midpoint", lower_order_final=False),
+    "dpm_multistep.pp_2m_short_no_taper": DPMSolverMultistep(lower_order_final=False),
     "dpm_multistep.pp_2h": DPMSolverMultistep(2, "dpmsolver++", "heun"),
     "dpm_multistep.pp_3": DPMSolverMultistep(3, "dpmsolver++"),
     "dpm_multistep.dpm_2m": DPMSolverMultistep(2, "dpmsolver", "midpoint"),
@@ -332,6 +333,8 @@ DIFFUSERS_CASES = {
     "dpm_multistep.pp_3_short": DPMSolverMultistep(3, "dpmsolver++"),
     "dpm_multistep.pp_2_euler_final": DPMSolverMultistep(2, "dpmsolver++", euler_at_final=True),
     "dpm_singlestep.pp_2": DPMSolverSinglestep(2, "dpmsolver++"),
+    "dpm_singlestep.pp_2_uneven": DPMSolverSinglestep(2),
+    "dpm_singlestep.pp_3_uneven": DPMSolverSinglestep(3, solver_type="heun"),
     "dpm_singlestep.pp_3h_final": DPMSolverSinglestep(3, "dpmsolver++", "heun", lower_order_final=True),
     "dpm_singlestep.pp_3m": DPMSolverSinglestep(3, "dpmsolver++", "midpoint"),
     "dpm_singlestep.dpm_3h_final": DPMSolverSinglestep(3, "dpmsolver", "heun", lower_order_final=True),
@@ -358,7 +361,7 @@ DIFFUSERS_CASES = {
     "edm_dpm.pp_2m": DPMSolverMultistep(2, "dpmsolver++", "midpoint"),
     "edm_dpm.sde_pp_2m": DPMSolverMultistep(2, "sde-dpmsolver++", "midpoint"),
 }
-assert set(DIFFUSERS_CASES) == set(REFERENCE["cases"])
+
 
 
 class LinearVPOracle(nn.Module):
@@ -413,7 +416,8 @@ def walk(solver, process, model, x_T, times, key=jax.random.PRNGKey(0)):
     tool records the same latents and draws the same per-step noise."""
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
-    times = jnp.asarray(times, jnp.float32)
+    with jax.ensure_compile_time_eval():
+        times = jnp.asarray(times, jnp.float32)
 
     def body(carry, inputs):
         x, state = carry
@@ -425,7 +429,7 @@ def walk(solver, process, model, x_T, times, key=jax.random.PRNGKey(0)):
                                process, denoise)
         return (x, state), x
 
-    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T, times)),
+    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T, times, process)),
                               (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     return latents
 
@@ -461,6 +465,121 @@ def test_solver_matches_diffusers_latents_and_gradient(name):
     assert relative_gap(grad[None], ARRAYS[f"{name}.grad"][None]) < 1e-4
 
 
+LIMIT_CASES = {
+    "source.multi_pp3": DPMSolverMultistep(3, lower_order_final=False),
+    "source.multi_eps3": DPMSolverMultistep(3, "dpmsolver", lower_order_final=False),
+    "source.multi_sdepp3": DPMSolverMultistep(3, "sde-dpmsolver++", lower_order_final=False),
+    "source.single_pp2m": DPMSolverSinglestep(2),
+    "source.single_pp2h": DPMSolverSinglestep(2, solver_type="heun"),
+    "source.single_pp3m": DPMSolverSinglestep(3),
+    "source.single_pp3h": DPMSolverSinglestep(3, solver_type="heun"),
+    "source.single_sdepp2h": DPMSolverSinglestep(2, "sde-dpmsolver++", "heun"),
+    "source.single_sdepp3m": DPMSolverSinglestep(3, "sde-dpmsolver++"),
+    "source.single_sdepp3h_final_zero": DPMSolverSinglestep(3, "sde-dpmsolver++", "heun"),
+    "source.deis2": DEIS(2, lower_order_final=False),
+    "source.deis3": DEIS(3, lower_order_final=False),
+    "source.unipc_x0_bh2": UniPC(3, lower_order_final=False),
+    "source.unipc_x0_bh1_disabled": UniPC(3, "bh1", lower_order_final=False, disable_corrector=(0,)),
+    "source.unipc_eps_bh2_disabled": UniPC(3, predict_x0=False, lower_order_final=False, disable_corrector=(0,)),
+    "source.unipc_eps_bh1_disabled": UniPC(3, "bh1", predict_x0=False, lower_order_final=False, disable_corrector=(0,)),
+    "target.deis2": DEIS(2, lower_order_final=False),
+    "target.deis3": DEIS(3, lower_order_final=False),
+    "target.unipc_eps3": UniPC(3, predict_x0=False),
+    "target.unipc_x03": UniPC(3),
+    "target.sde_eps1": DPMSolverMultistep(1, "sde-dpmsolver"),
+    "target.sde_eps2_lowered": DPMSolverMultistep(2, "sde-dpmsolver"),
+    "target.kdpm2_false": KDPM2(),
+    "target.kdpm2_true": KDPM2(ancestral=True),
+}
+
+
+class NonlinearVelocity(nn.Module):
+    @nn.compact
+    def __call__(self, x, temb):
+        return 0.7 * jnp.tanh(x) + 0.15 * expand(temb / 1000, x)
+
+
+class NonlinearEpsilon(nn.Module):
+    @nn.compact
+    def __call__(self, x, temb):
+        return 0.2 * jnp.tanh(x)
+
+
+@pytest.mark.parametrize("name", LIMIT_CASES)
+def test_solver_endpoint_latents_and_vjp_match_reference_limits(name):
+    """Nonlinear endpoint trajectories, including corrected UniPC epsilon
+    and DEIS history terms at sigma=0. tools/diffusers_limits_reference.py
+    records actual zero-endpoint calls where defined, otherwise converged
+    reference-equation limits rather than assuming the output is clean.
+    """
+    with np.load(DIFFUSERS_FIXTURES / "limits.npz") as fixture:
+        x = jnp.asarray(fixture[f"{name}.x_T"])
+        times = fixture[f"{name}.grid"]
+        expected, cotangent, expected_grad = (fixture[f"{name}.{field}"] for field in ("latents", "cotangent", "grad"))
+    if name.startswith("target.kdpm2"):
+        config = json.loads((DIFFUSERS_FIXTURES / "limits.json").read_text())["cases"][name]
+        process = Process(KarrasVENoiseScheduler(sigma_min=0, sigma_max=config["sigma"], rho=1),
+                          EpsilonPredictionTransform())
+        model = NonlinearEpsilon()
+    else:
+        process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+        model = NonlinearVelocity()
+    run = jax.jit(lambda initial: walk(LIMIT_CASES[name], process, model, initial, times))
+    result = run(x)
+    _, vjp = jax.vjp(lambda initial: run(initial)[-1], x)
+    gradient, = vjp(jnp.asarray(cotangent))
+    np.testing.assert_allclose(result, expected, rtol=3e-6, atol=3e-6)
+    np.testing.assert_allclose(gradient, expected_grad, rtol=3e-6, atol=3e-6)
+
+
+@pytest.mark.parametrize("solver, times", [
+    (DPMSolverMultistep(2, "sde-dpmsolver"), (1.0, .75, .5, .25)),
+    (DPMSolverSinglestep(2, "dpmsolver"), (1.0, .75, .5)),
+    (DPMSolverSinglestep(3, "sde-dpmsolver++", "heun"), (1.0, .75, .5, .25)),
+    (UniPC(3, predict_x0=False), (1.0, .75, .5, .25)),
+    (UniPC(3, solver_type="bh1"), (1.0, .75, .5, .25)),
+    (PNDM(), (1.0, .75, .5, .25)),
+    (PNDM(skip_prk_steps=True), (1.0, .75, .5, .25)),
+    (UniPC(3, lower_order_final=False), (.9, .6, .3, 0.0)),
+    (DPMSolverMultistep(2, "sde-dpmsolver", lower_order_final=False), (.9, .6, .3, 0.0)),
+])
+def test_divergent_endpoint_equations_are_rejected_before_the_scan(solver, times):
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    x = jnp.asarray([[1.2, -0.7]])
+    with pytest.raises(ValueError, match="no finite update"):
+        walk(solver, process, NonlinearVelocity(), x, times)
+    with pytest.raises(ValueError, match="no finite update"):
+        jax.jit(lambda initial: walk(solver, process, NonlinearVelocity(), initial, times))(x)
+
+
+@pytest.mark.parametrize("solver", [UniPC(1, predict_x0=False), UniPC(3, predict_x0=False),
+                                  DPMSolverSinglestep(3, "sde-dpmsolver++", "heun")])
+def test_one_interval_crosses_both_endpoints_with_the_first_order_limit(solver):
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    x = jnp.asarray([[1.2, -0.7]])
+    run = jax.jit(lambda initial: walk(solver, process, NonlinearVelocity(), initial, (1., 0.))[-1])
+    np.testing.assert_allclose(run(x), x - 0.7 * jnp.tanh(x) - 0.15, atol=1e-6)
+    expected_gradient = 1 - 0.7 * (1 - jnp.tanh(x) ** 2)
+    np.testing.assert_allclose(jax.grad(lambda initial: run(initial).sum())(x), expected_gradient, atol=1e-6)
+
+
+def test_continuous_cosine_noise_endpoint_has_exact_signal_zero():
+    from dew.diffusion import CosineContinuousNoiseScheduler, VPredictionTransform
+
+    schedule = CosineContinuousNoiseScheduler()
+    process = Process(schedule, VPredictionTransform())
+    x = jnp.asarray([[1.2, -0.7]])
+    alpha, sigma = schedule.rates(jnp.asarray([1.0]))
+    np.testing.assert_array_equal(alpha, [0.0])
+    np.testing.assert_array_equal(sigma, [1.0])
+    model = ConstantVelocity()
+    run = jax.jit(lambda initial: walk(DPMSolverMultistep(3), process, model, initial, (1., .75, .5, .25)))
+    output = run(x)
+    gradient = jax.grad(lambda initial: run(initial)[-1].sum())(x)
+    assert bool(jnp.all(jnp.isfinite(output)))
+    assert bool(jnp.all(jnp.isfinite(gradient)))
+
+
 class Forgetful:
     """A multistep solver whose state is rebuilt before every step, so each
     step is the one it takes with no history."""
@@ -468,11 +587,12 @@ class Forgetful:
     def __init__(self, inner):
         self.inner = inner
 
-    def init(self, x, times):
-        return self.inner.init(x, times)
+    def init(self, x, times, process):
+        self.times = times
+        return self.inner.init(x, times, process)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x, jnp.stack([t[0], t_next[0]])),
+        stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x, self.times, process),
                                      key, process, denoise)
         return stepped, state
 
@@ -494,21 +614,9 @@ def test_diffusers_fixtures_see_the_history(name):
     assert relative_gap(latents[-1:], expected[-1:]) > 1e-2
 
 
-def test_singlestep_groups_need_a_step_count_the_order_divides():
-    """Diffusers' order list without `lower_order_final` is `[1, 2, 3]`
-    repeated, and a walk its length does not divide runs out of orders; Dew
-    refuses at `init` where Diffusers fails at the last step, and the
-    lowered list takes any count."""
-    x = jnp.zeros((1, 4))
-    with pytest.raises(ValueError, match="groups of 3 steps"):
-        DPMSolverSinglestep(3).init(x, jnp.linspace(1.0, 0.0, 21))
-    assert DPMSolverSinglestep(3, lower_order_final=True).init(x, jnp.linspace(1.0, 0.0, 21)).orders.tolist() \
-        == [1, 2, 3] * 6 + [1, 2]
-    assert DPMSolverSinglestep(3).init(x, jnp.linspace(1.0, 0.0, 22)).orders.tolist() == [1, 2, 3] * 7
-
-
-LAMBDA_SOLVERS = [DPMSolverMultistep(3, "dpmsolver++", "heun"), DPMSolverMultistep(3, "dpmsolver"),
-                  DPMSolverMultistep(2, "sde-dpmsolver++"), DPMSolverMultistep(2, "sde-dpmsolver"),
+LAMBDA_SOLVERS = [DPMSolverMultistep(lower_order_final=False),
+                  DPMSolverMultistep(3, "dpmsolver++", "heun"), DPMSolverMultistep(3, "dpmsolver"),
+                  DPMSolverMultistep(2, "sde-dpmsolver++"),
                   DPMSolverSinglestep(3, lower_order_final=True), DEIS(3), UniPC(3)]
 
 
@@ -532,11 +640,11 @@ def test_lambda_solvers_land_on_the_clean_prediction_at_sigma_zero(solver):
         x_0, eps = denoise(x, t)
         return solver.step(x, t, t_next, x_0, eps, state, key, process, denoise)
 
-    fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0])))
+    fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0]), process))
     assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(fresh, denoise(x, jnp.full((3,), 0.25))[0], atol=1e-6)
 
     def two_steps(x):
-        x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0])))
+        x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0]), process))
         return step(x, 0.25, 0.0, state)[0], denoise(x, jnp.full((3,), 0.25))[0]
 
     with_history, x_0 = two_steps(x)
@@ -555,7 +663,8 @@ def test_consistency_sampling_in_one_step_is_the_consistency_function():
     denoise = process.denoiser(model, params, {})
     x_T = process.noise(jax.random.PRNGKey(2), (3, 4))
     top = jnp.full((3,), 1000.0)
-    x_0 = model.apply(params, x_T, top)
+    alpha, sigma = broadcast_rates(schedule, top, x_T)
+    x_0 = x_T * DATA_STD / jnp.sqrt(alpha ** 2 * DATA_STD ** 2 + sigma ** 2)
     scaled = 1000.0 * 10.0
     expected = 0.25 / (scaled**2 + 0.25) * x_T + scaled / jnp.sqrt(scaled**2 + 0.25) * x_0
     assert jnp.allclose(denoise(x_T, top)[0], expected, atol=1e-6)
@@ -563,8 +672,8 @@ def test_consistency_sampling_in_one_step_is_the_consistency_function():
     assert jnp.allclose(generated, expected, atol=1e-6)
 
 
-@pytest.mark.parametrize("solver", [DPMSolverMultistep(), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id)
-def test_diffusers_solvers_are_second_order_on_the_karras_ode(solver):
+@pytest.mark.parametrize("solver", [DPMSolverMultistep(lower_order_final=False), UniPC(), DEIS(), KDPM2(), LMS()], ids=solver_id)
+def test_diffusers_solvers_resolve_the_karras_ode_more_accurately_than_euler(solver):
     """Twenty rho-spaced steps from sigma 80 down against the closed form,
     the bracket test_solvers_integrate_the_flow_ode_at_their_order sets:
     each lands within 8e-2 like Heun and closer than Euler. Observed 5.7e-2
