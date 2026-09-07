@@ -79,3 +79,12 @@ class ModelInputs:
         if self.conditioning:
             result["conditioning"] = self.conditioning
         return result
+
+
+@struct.dataclass
+class AttentionMetadata:
+    """Per-token attention data independent of physical cache-slot addresses."""
+
+    valid: jax.Array | None = None
+    image_groups: jax.Array | None = None
+    rotary_positions: jax.Array | None = None
