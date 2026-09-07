@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Literal, Optional
 
-from dew.config import JsonDict, ModelConfig, RunConfig
+from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OxfordFlowers, VideoDataset
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild

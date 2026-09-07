@@ -1,7 +1,7 @@
 """A run's checkpoints: the train state and the data position, through orbax.
 
-A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
-data iterator can report one, `position`. Metrics, the loss scale and epoch
+A checkpoint holds the `STATE_LEAVES` of the train state and, when the data
+iterator can report one, each process's `position`. Metrics and epoch
 counters are the loop's business and are rebuilt on resume.
 
 Beside the persistent directory a run may keep a local checkpoint on every
@@ -33,6 +33,8 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
+"""The train-state fields a checkpoint persists; anything outside this tuple
+is rebuilt on resume."""
 
 RUN_FILE = "run.json"
 """The run record `RunConfig.save` writes into the run directory, beside the
@@ -40,13 +42,7 @@ step directories, and `dew.io.publish` ships with a step."""
 
 
 def is_uri(path: str) -> bool:
-    """A `<scheme>://` location, such as a gs:// bucket, which has no local form.
-
-    The package's one test for it, because the two callers need opposite
-    things from the answer: orbax wants an absolute path for a local
-    directory, and a tracker uploads a directory it can open while a bucket
-    is referenced where it already lies.
-    """
+    """Whether a path names a `<scheme>://` location, such as a gs:// bucket."""
     return '://' in path
 
 
@@ -115,8 +111,8 @@ class Checkpoints:
     running several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
     local checkpoint restores onto the placement it was written with, since
-    no process holds another process's shards; the
-    persistent checkpoint restores onto any mesh, as before.
+    no process holds another process's shards; the persistent checkpoint
+    restores onto any mesh.
     """
 
     def __init__(self, directory: str, *, keep: int = 2,

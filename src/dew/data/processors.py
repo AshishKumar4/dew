@@ -37,8 +37,6 @@ class AutoAudioProcessor:
         from transformers import AutoFeatureExtractor
         self.processor = AutoFeatureExtractor.from_pretrained(modelname)
         self.tensor_type = tensor_type
-        self.modelname = modelname
-        # The processor knows the rate its model was trained at
         self.sampling_rate = sampling_rate or getattr(self.processor, "sampling_rate", 16000)
 
     def __call__(self, audio):

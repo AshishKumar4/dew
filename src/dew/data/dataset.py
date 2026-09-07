@@ -118,11 +118,6 @@ class Checkpointable(Protocol):
     def set_state(self, state: Any) -> None: ...
 
 
-def _no_captions(captions: Sequence[str]) -> Mapping[str, Any]:
-    """Nothing out of a batch's captions; an unconditional run passes this as `tokenize`."""
-    return {}
-
-
 def tokenized(stream: Callable[[], Iterator[Batch]],
               tokenize: Callable[[Sequence[str]], Mapping[str, Any]] | None
               ) -> Callable[[], Iterator[Batch]]:
@@ -140,8 +135,6 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     takes numbers. Pass None for an unconditional run, or a reader that hands
     the words back to keep them.
     """
-    read = tokenize if tokenize is not None else _no_captions
-
     class Tokenizing:
         """The stream's iterator with each batch's captions tokenized."""
 
@@ -156,7 +149,8 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
                 raise StopIteration
             batch = dict(next(self.source))
             captions = [str(caption) for caption in batch.pop(CAPTION)]
-            batch.update(read(captions))
+            if tokenize is not None:
+                batch.update(tokenize(captions))
             return batch
 
         def request_stop(self) -> None:
@@ -268,7 +262,7 @@ def hold_out(source: Any, records: int, held_out: int, name: str):
             SourceSlice(source, 0, held_out))
 
 
-def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
+def train_stream(source: pygrain.RandomAccessDataSource[object], operations: Sequence[pygrain.Transformation], *,
                  batch: int, seed: int,
                  loading: Loading) -> Callable[[], Iterator[Batch]]:
     """An endless shuffled stream over `source`, batched per process.
@@ -292,18 +286,15 @@ def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
     return stream
 
 
-def validation_pass(source: Any, transformations: Sequence[pygrain.Transformation], *,
+def validation_pass(source: pygrain.RandomAccessDataSource[object], transformations: Sequence[pygrain.Transformation], *,
                     batch: int, seed: int,
                     loading: Loading) -> Callable[[], Iterator[Batch]]:
     """One pass over `source` in record order, batched in this process.
 
     Grain's DataLoader applies its operations inside the worker processes,
     where each worker fills a whole batch out of its own slice of the split.
-    At the default eight workers a 512-record split becomes batches of 64
-    read four times over, and with the sampler unbounded the pass has no end.
-    Here the workers read and transform records and the batch is formed
-    behind them, as the packed loader does with its packer, which leaves the
-    batches independent of worker_count.
+    This pass batches after workers read and transform records, so batch
+    boundaries do not depend on worker_count.
 
     Sharding is grain's slice convention, so process p of n reads records
     p, p + n, ... of the split. The transforms are applied before that slice.

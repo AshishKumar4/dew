@@ -4,17 +4,10 @@
 import hashlib
 import pickle
 
-import flax
-import jax
-import numpy as np
-
 
 def _check_digest(path: str, repo: str, filename: str, revision: str, digest: str) -> str:
-    """`path` back, once its bytes hash to `digest`.
-
-    A separate function so the pin is testable over local bytes. This
-    comparison is what stands between a downloaded pickle and the unpickler.
-    """
+    """Separate verification lets tests check the pin against local bytes
+    without downloading the weights."""
     with open(path, 'rb') as handle:
         found = hashlib.file_digest(handle, 'sha256').hexdigest()
     if found != digest:
@@ -25,12 +18,8 @@ def _check_digest(path: str, repo: str, filename: str, revision: str, digest: st
 
 
 def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
-    """The path to `filename` of `repo` at `revision`, once its bytes hash to
-    `digest`.
-
-    The repo pins the revision and the digest is checked here as well, so the
-    bytes are what this code was written against whatever the transport did.
-    """
+    """The digest check rejects altered weight bytes before unpickling, even
+    when the download resolves to the pinned revision."""
     from huggingface_hub import hf_hub_download
 
     return _check_digest(hf_hub_download(repo, filename, revision=revision),
