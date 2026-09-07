@@ -70,8 +70,8 @@ def batches():
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
 class ShortScaleTrainer(Trainer):
-    def initial_state(self):
-        state = super().initial_state()
+    def initial_state(self, initializer=None, key=None):
+        state = super().initial_state(initializer, key)
         return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))
 
 

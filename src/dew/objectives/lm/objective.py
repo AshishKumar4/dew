@@ -32,7 +32,6 @@ from typing import Literal, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
-from jax.tree_util import Partial
 from flax import struct
 import numpy as np
 import optax
@@ -44,7 +43,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import (Aux, EMASpec, Initializer, Mean, Objective, Step, Variables,
+from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
                                  mean_loss, merge, select)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
@@ -412,28 +411,23 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
 
-    @property
-    def initializer(self) -> Initializer:
-        """The held checkpoint as the initializer's argument, not its closure.
+    def held_variables(self) -> Optional[Variables]:
+        """The checkpoint a continued-pretraining run starts from.
 
-        A continued-pretraining run holds the whole parameter tree here. Bound
-        as a `Partial` argument it reaches the trainer's state JIT as data;
-        read off `self` inside a nullary trace it would be compiled into the
-        executable as a constant.
+        Bound as the initializer's argument this reaches the trainer's state
+        JIT as data; read off `self` inside a nullary trace it would be
+        compiled into the executable as a constant.
         """
-        return Partial(self._initialize, self.pretrained)
+        return self.pretrained
 
-    def init(self, key):
-        return self._initialize(self.pretrained, key)
-
-    def _initialize(self, pretrained: Optional[Variables], key) -> Variables:
-        """The one initialization implementation `init` and `initializer` share."""
-        variables = self._whole_tree(pretrained, key)
+    def init(self, key, variables: Optional[Variables] = None) -> Variables:
+        pretrained = self.pretrained if variables is None else variables
+        tree = self._whole_tree(pretrained, key)
         if not self._warmup:
-            return variables
-        indexer = select(variables, lambda path: path[0] == "params" and _is_indexer(path))
-        frozen = select(variables, lambda path: path[0] == "params" and not _is_indexer(path))
-        return {**variables, "params": indexer["params"], FROZEN: frozen["params"]}
+            return tree
+        indexer = select(tree, lambda path: path[0] == "params" and _is_indexer(path))
+        frozen = select(tree, lambda path: path[0] == "params" and not _is_indexer(path))
+        return {**tree, "params": indexer["params"], FROZEN: frozen["params"]}
 
     def _whole_tree(self, pretrained: Optional[Variables], key) -> Variables:
         """The model's variables in one `params` collection: the pretrained
