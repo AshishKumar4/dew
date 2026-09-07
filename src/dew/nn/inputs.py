@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
 from dataclasses import replace
 
 import jax
@@ -114,3 +115,16 @@ class AttentionMetadata:
     valid: jax.Array | None = None
     image_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
+
+def generation_signature(inputs: ModelInputs, controls: object) -> np.ndarray:
+    """Digest execution shapes and stable host controls without reading payloads.
+
+    Algorithms agree this fixed-width signature after local validation and
+    before distributed execution. Controls must have a deterministic repr,
+    such as frozen configuration values, tuples and dictionaries of scalars.
+    Tensor contents are excluded: this is not a prefix-cache identity.
+    """
+    schema = (str(jax.tree.structure(inputs)),
+              [(leaf.shape, str(leaf.dtype)) for leaf in jax.tree.leaves(inputs)], controls)
+    return np.frombuffer(hashlib.sha256(repr(schema).encode()).digest(), np.uint8)
+
