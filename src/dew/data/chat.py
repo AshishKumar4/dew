@@ -13,10 +13,10 @@ chat-template contract reads: a role, content that is a string, a list of
 typed parts, or nothing, an assistant's `tool_calls`, a tool response's
 `tool_call_id` and `name`, and any further keys the template wants
 (`reasoning_content`, `thinking`) untouched. A `Conversation` adds the
-`tools` schemas the template renders into its system block. The boundary
-validates the shape the loss and the renderer depend on and passes
-everything else through verbatim, so a source row loses nothing between the
-file and the template.
+`tools` schemas the template renders into its system block. The stored
+messages retain typed content. Text-tokenizer rendering joins all-text parts
+into strings and refuses other part types, which require a processor.
+Tool-call fields and message metadata reach the template unchanged.
 """
 
 from __future__ import annotations
@@ -107,8 +107,8 @@ class ContentPart:
     """One typed block of a message's content.
 
     `type` names the block; `fields` is the rest of it verbatim, `text` for
-    a text block, a url or a path for media. The template decides what each
-    type renders to.
+    a text block, a url or a path for media. Text rendering accepts text
+    parts only; media stays available in the stored conversation.
     """
 
     type: str
@@ -252,8 +252,8 @@ class Message:
             extra)
 
     def as_template(self) -> dict[str, object]:
-        """The dict the template reads: the typed fields in the contract's
-        layout, then `extra` verbatim."""
+        """The structured HF message, retaining content parts and metadata.
+        Conversation.text_rows adapts these fields for text tokenizers."""
         if isinstance(self.content, tuple):
             content: object = [part.as_template() for part in self.content]
         else:
@@ -295,6 +295,27 @@ class Conversation:
     def rows(self) -> list[dict[str, object]]:
         return [message.as_template() for message in self.messages]
 
+    def text_rows(self, source: str) -> list[dict[str, object]]:
+        """The text-tokenizer input, with all-text parts joined in order.
+
+        The stored messages and `rows` retain their structured content.
+        Media needs a processor to expand its payload into model inputs;
+        a text tokenizer cannot do that, even if its template emits a marker.
+        """
+        rows = self.rows()
+        for index, (message, row) in enumerate(zip(self.messages, rows, strict=True)):
+            if isinstance(message.content, tuple):
+                texts: list[str] = []
+                for part in message.content:
+                    where = f"{source} message {index}"
+                    if part.type != "text":
+                        raise ValueError(
+                            f"{where}: content part {part.type!r} requires a processor; "
+                            "text tokenizers accept only text parts")
+                    texts.append(_text(part.fields.get("text"), "a text part's text", where))
+                row["content"] = "".join(texts)
+        return rows
+
 
 def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
                generation_prompt: bool, source: str) -> list[int]:
@@ -324,6 +345,17 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
                 f"non-id {token!r}")
         ids.append(token)
     return ids
+
+
+def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
+                  source: str) -> list[int]:
+    """Tokenize a text conversation with the next assistant header.
+
+    SFT and prompt sampling use the same message conversion and tool schemas.
+    All-text parts concatenate in order; nontext parts require a processor.
+    """
+    return _token_ids(tokenizer, conversation.text_rows(source), conversation.tools,
+                      True, source)
 
 
 def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
@@ -357,7 +389,7 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
     `source` names the tokenizer and the row for those refusals. The arrays
     are int32 ids and int8 roles.
     """
-    rows = conversation.rows()
+    rows = conversation.text_rows(source)
     tools = conversation.tools
     full = _token_ids(tokenizer, rows, tools, False, source)
     roles = np.zeros(len(full), np.int8)

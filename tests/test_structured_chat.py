@@ -3,7 +3,7 @@ through a real chat template, with the ids and the mask read back.
 
 Two fixture tokenizers render the same conversation. `tiny-tools` carries
 a ChatML template that reads tool-call ids, the id and name a tool response
-answers, and typed content parts, over a BPE model with every byte, so the
+answers, over a BPE model with every byte. Text parts join before rendering;
 rendered JSON tokenizes to distinct ids. `tiny-chat` carries TRL's Qwen3
 training template, which reads `tool_calls` and `reasoning_content` and
 merges a run of tool responses into one block. Every expectation here is
@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import ChatMessages, Loading
+from dew.data import ChatMessages, Checkpointable, Loading, Prompts
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
@@ -80,12 +80,126 @@ def render(tokenizer, messages, tools=None, where="test"):
     return render_conversation(tokenizer, Conversation.parse(messages, tools, where), where)
 
 
-def reference_mask(tokenizer, conversation):
-    """Transformers' generation-marker mask over the same rows and tools."""
+def reference_messages():
+    """Plain-string HF inputs for the fixed structured fixture."""
+    messages = json.loads(json.dumps(CONVERSATION))
+    messages[1]["content"] = "Weather in Paris and Athens?"
+    messages[2]["tool_calls"][0]["function"]["arguments"] = {"city": "Paris"}
+    return messages
+
+
+def reference_mask(tokenizer):
+    """HF generation-marker masks from independently specified text inputs."""
     rendered = tokenizer.apply_chat_template(
-        conversation.rows(), tools=[dict(tool) for tool in conversation.tools] or None,
+        reference_messages(), tools=[WEATHER],
         tokenize=True, return_dict=True, return_assistant_tokens_mask=True)
     return np.asarray(rendered["input_ids"]), np.asarray(rendered["assistant_masks"])
+
+
+@pytest.mark.parametrize("tokenizer_path", [TOOLS_TOKENIZER, CHAT_TOKENIZER])
+@pytest.mark.parametrize("storage", ["records", "parquet"])
+def test_prompt_sources_keep_structured_chat(tmp_path, tokenizer_path, storage):
+    """Prompt generation keeps the SFT conversation and its tool schemas.
+
+    HF text inputs independently specify the expected tokens, including
+    reasoning metadata in Qwen and tool ids/names in the tools template.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    messages = parquet_conversation()
+    for message in messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = [{"type": "text", "text": message["content"]}]
+    row = {"prompt": messages, "tools": json.dumps([WEATHER]), "ground_truth": "25"}
+    if storage == "parquet":
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = tmp_path / "prompts.parquet"
+        pq.write_table(pa.Table.from_pylist([row]), path)
+        source = Prompts(tokenizer=str(tokenizer_path), path=str(path),
+                         max_prompt_len=1024, loading=Loading(workers=0))
+    else:
+        source = Prompts(tokenizer=str(tokenizer_path), records=(json.dumps(row),),
+                         max_prompt_len=1024, loading=Loading(workers=0))
+
+    batch = next(source.load(batch=1).train())
+
+    expected = tokenizer.apply_chat_template(
+        reference_messages(), tools=[WEATHER], return_dict=False, add_generation_prompt=True)
+    np.testing.assert_array_equal(batch["prompt"][0, -len(expected):], expected)
+    assert int(batch["prompt_length"][0]) == len(expected)
+    np.testing.assert_array_equal(batch["prompt"][0, :-len(expected)], 0)
+    if tokenizer_path == TOOLS_TOKENIZER:
+        assert tokenizer.decode(expected) == TOOLS_TEXT + '<|im_start|>assistant\n'
+
+
+def test_prompt_media_is_refused_before_truncation():
+    row = {"prompt": [{"role": "user", "content": [
+        {"type": "image", "url": "file:///map.png"},
+        {"type": "text", "text": "Weather in Paris?"}]}]}
+    spec = Prompts(tokenizer=str(TOOLS_TOKENIZER), records=(json.dumps(row),),
+                   max_prompt_len=4, loading=Loading(workers=0))
+    with pytest.raises(ValueError, match=r"row 0 message 0.*image.*processor"):
+        next(spec.load(batch=1).train())
+
+
+def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_tokenizer):
+    """A saved packer position restores the pending typed conversation.
+
+    Each row has different completion text, so replaying a previous row or
+    losing an assistant part changes the expected tokens or target mask.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows, expected = [], []
+    for answer in ("First answer.", "Second answer.", "Third answer."):
+        messages = parquet_conversation()
+        messages[-1]["content"] = answer
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = [{"type": "text", "text": content[:2]},
+                                      {"type": "text", "text": content[2:]}]
+        rows.append({"prompt": messages, "tools": json.dumps([WEATHER])})
+        desired = TOOLS_TEXT.replace('Athens, at 25.<|im_end|>', answer + '<|im_end|>')
+        hf_rows = reference_messages()
+        hf_rows[-1]["content"] = answer
+        hf = tools_tokenizer.apply_chat_template(
+            hf_rows, tools=[WEATHER], return_dict=True, return_assistant_tokens_mask=True)
+        expected.append((tools_tokenizer.encode(desired, add_special_tokens=False),
+                         hf["assistant_masks"]))
+    path = tmp_path / "sft.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    spec = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
+                        seq_len=511, packing_bins=1, val_batches=None,
+                        loading=Loading(workers=0))
+    data = spec.load(batch=1)
+    assert data.val is not None
+    stream = data.val()
+    assert isinstance(stream, Checkpointable)
+
+    first = next(stream)
+    position = stream.get_state()
+    remaining = list(stream)
+    fresh = spec.load(batch=1)
+    assert fresh.val is not None
+    restored = fresh.val()
+    assert isinstance(restored, Checkpointable)
+    restored.set_state(position)
+    resumed = list(restored)
+
+    assert len(resumed) == len(remaining) == 2
+    for uninterrupted, restarted in zip(remaining, resumed, strict=True):
+        for key in uninterrupted:
+            np.testing.assert_array_equal(uninterrupted[key], restarted[key])
+    for batch, (ids, assistant_mask) in zip([first, *resumed], expected, strict=True):
+        np.testing.assert_array_equal(batch["text"][0, :len(ids)], ids)
+        np.testing.assert_array_equal(batch["text_roles"][0, :len(ids)] == Role.ASSISTANT,
+                                      assistant_mask)
+        np.testing.assert_array_equal(batch["text_positions"][0, :len(ids)], np.arange(len(ids)))
+        np.testing.assert_array_equal(batch["text_segment_ids"][0, :len(ids)], 1)
+        np.testing.assert_array_equal(batch["text_roles"][0, len(ids):], 0)
 
 
 def decode(tokenizer, ids, roles, role):
@@ -105,7 +219,7 @@ def test_tool_calls_render_to_the_template_ids(tools_tokenizer):
 
     expected = tools_tokenizer.encode(TOOLS_TEXT, add_special_tokens=False)
     assert ids.tolist() == expected
-    hf_ids, hf_mask = reference_mask(tools_tokenizer, conversation)
+    hf_ids, hf_mask = reference_mask(tools_tokenizer)
     np.testing.assert_array_equal(ids, hf_ids)
     np.testing.assert_array_equal((roles == Role.ASSISTANT).astype(np.int64), hf_mask)
     assert decode(tools_tokenizer, ids, roles, Role.ASSISTANT) == (
@@ -180,22 +294,71 @@ def test_tool_schemas_render_into_the_system_span(tools_tokenizer):
 
 
 def test_typed_parts_render_their_text(tools_tokenizer):
-    """A user turn given as parts renders the text parts' text, and a
-    media part the template does not read changes nothing: the parts reach
-    the template as parts."""
+    """Text parts concatenate in order without separators or list repr."""
     as_text = json.loads(json.dumps(CONVERSATION))
     as_text[1]["content"] = "Weather in Paris and Athens?"
-    with_image = json.loads(json.dumps(CONVERSATION))
-    with_image[1]["content"] = [{"type": "image", "url": "file:///map.png"},
-                                {"type": "text", "text": "Weather in Paris and Athens?"}]
     two_parts = json.loads(json.dumps(CONVERSATION))
     two_parts[1]["content"] = [{"type": "text", "text": "Weather in Paris"},
                                {"type": "text", "text": " and Athens?"}]
 
-    base = render(tools_tokenizer, CONVERSATION, [WEATHER])[0].tolist()
-    assert render(tools_tokenizer, as_text, [WEATHER])[0].tolist() == base
-    assert render(tools_tokenizer, with_image, [WEATHER])[0].tolist() == base
-    assert render(tools_tokenizer, two_parts, [WEATHER])[0].tolist() == base
+    expected = tools_tokenizer.encode(TOOLS_TEXT, add_special_tokens=False)
+    assert render(tools_tokenizer, as_text, [WEATHER])[0].tolist() == expected
+    assert render(tools_tokenizer, two_parts, [WEATHER])[0].tolist() == expected
+
+
+@pytest.mark.parametrize("body", ["{{ message.content }}",
+                                  "{% if message.content is string %}{{ message.content }}{% endif %}"])
+def test_text_parts_reach_string_templates_as_text(body):
+    """Both direct interpolation and string-guarded templates retain text.
+
+    Before the fix they trained list repr and empty bodies respectively.
+    The desired text and the HF assistant mask use plain-string messages.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(TOOLS_TOKENIZER)
+    tokenizer.chat_template = (
+        "{% for message in messages %}"
+        "{{ '<|im_start|>' + message.role + '\n' }}"
+        "{% if message.role == 'assistant' %}{% generation %}"
+        + body + "{{ '<|im_end|>\n' }}{% endgeneration %}"
+        "{% else %}" + body + "{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}")
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "Two "},
+                                      {"type": "text", "text": "plus two?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Four"},
+                                           {"type": "text", "text": "."}]},
+    ]
+    desired = [dict(role="user", content="Two plus two?"),
+               dict(role="assistant", content="Four.")]
+    expected_text = ("<|im_start|>user\nTwo plus two?<|im_end|>\n"
+                     "<|im_start|>assistant\nFour.<|im_end|>\n")
+
+    ids, roles = render(tokenizer, messages)
+
+    assert ids.tolist() == tokenizer.encode(expected_text, add_special_tokens=False)
+    expected = tokenizer.apply_chat_template(
+        desired, return_dict=True, return_assistant_tokens_mask=True)
+    np.testing.assert_array_equal(roles == Role.ASSISTANT, expected["assistant_masks"])
+    assert decode(tokenizer, ids, roles, Role.ASSISTANT) == 'Four.<|im_end|>\n'
+
+
+@pytest.mark.parametrize("parts, expected_text", [
+    ([{"type": "image", "url": "file:///map.png"}], "<image>"),
+    ([{"type": "text", "text": "Read this map"},
+      {"type": "image", "url": "file:///map.png"}], "Read this map<image>"),
+])
+def test_media_content_requires_a_processor(tools_tokenizer, parts, expected_text):
+    """Text tokenization refuses media without changing the stored parts."""
+    conversation = Conversation.parse([{"role": "user", "content": parts}])
+    with pytest.raises(ValueError, match=r"row 7 message 0.*image.*processor"):
+        render_conversation(tools_tokenizer, conversation, "chat.parquet row 7")
+    # A processor can still consume the structured content after refusal.
+    template = ("{% for part in messages[0].content %}"
+                "{% if part.type == 'image' %}{{ '<image>' }}"
+                "{% elif part.type == 'text' %}{{ part.text }}{% endif %}{% endfor %}")
+    raw_ids = tools_tokenizer.apply_chat_template(
+        conversation.rows(), chat_template=template, return_dict=False)
+    assert raw_ids == tools_tokenizer.encode(expected_text, add_special_tokens=False)
 
 
 # --- the Qwen3 training template -----------------------------------------------
@@ -209,7 +372,7 @@ def test_the_qwen_template_merges_parallel_tool_responses(chat_tokenizer):
 
     ids, roles = render_conversation(chat_tokenizer, conversation, "tiny-chat")
 
-    hf_ids, hf_mask = reference_mask(chat_tokenizer, conversation)
+    hf_ids, hf_mask = reference_mask(chat_tokenizer)
     np.testing.assert_array_equal(ids, hf_ids)
     np.testing.assert_array_equal((roles == Role.ASSISTANT).astype(np.int64), hf_mask)
     assert decode(chat_tokenizer, ids, roles, Role.TOOL) == (
@@ -297,9 +460,8 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
 # --- refusals ------------------------------------------------------------------
 
 def test_a_template_refusal_names_the_row(tools_tokenizer):
-    """A user turn with no content: the tools template iterates its parts
-    and finds none, and the failure carries the row and the template's
-    words."""
+    """The template concatenates user content with a closing delimiter.
+    Null content fails with the source row and the template's words."""
     silent = json.loads(json.dumps(CONVERSATION))
     silent[5]["content"] = None
     with pytest.raises(ValueError, match="row 7: the chat template refused"):
