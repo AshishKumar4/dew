@@ -104,6 +104,7 @@ class DiffusionGemma(nn.Module):
 
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
                attention_mask=None, image_groups=None, rotary_positions=None,
+               attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False):
         """Append a clean prompt or committed canvas, evaluating media only when supplied."""
         if not conditioning:
@@ -111,7 +112,9 @@ class DiffusionGemma(nn.Module):
                 raise ValueError("image_indices require conditioning payloads")
             return self.text(tokens, decode=True, train=train, positions=positions,
                              segment_ids=segment_ids, attention_mask=attention_mask,
-                             image_groups=image_groups, rotary_positions=rotary_positions)
+                             image_groups=image_groups, rotary_positions=rotary_positions,
+                             attention_pairwise_mask=attention_pairwise_mask,
+                             attention_key_positions=attention_key_positions)
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
@@ -123,10 +126,13 @@ class DiffusionGemma(nn.Module):
         return self.text(fused.tokens, decode=True, train=train, positions=positions,
                          segment_ids=segment_ids, input_embeddings=fused.embeddings,
                          embedding_positions=slots, attention_mask=attention_mask,
-                         image_groups=image_groups, rotary_positions=rotary_positions)
+                         image_groups=image_groups, rotary_positions=rotary_positions,
+                         attention_pairwise_mask=attention_pairwise_mask,
+                         attention_key_positions=attention_key_positions)
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
-                 self_conditioning_mask=None, train: bool = False):
+                 self_conditioning_mask=None, train: bool = False, positions=None,
+                 attention_pairwise_mask=None, attention_key_positions=None):
         tokens = jnp.asarray(tokens, jnp.int32)
         embedded = self.decoder.embed_tokens(tokens)
         table = self.decoder.embed_tokens.embedding
@@ -143,7 +149,9 @@ class DiffusionGemma(nn.Module):
         # Parameter initialization needs no prefix. Loaded inference always
         # takes the frozen-cache branch, which refuses an absent prefill.
         return self.decoder(tokens, train=train, decode=not self.is_initializing(),
-                            input_embeddings=conditioned, embedding_positions=indices)
+                            input_embeddings=conditioned, embedding_positions=indices,
+                            positions=positions, attention_pairwise_mask=attention_pairwise_mask,
+                            attention_key_positions=attention_key_positions)
 
 
 def translate_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:

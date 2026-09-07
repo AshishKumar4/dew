@@ -34,7 +34,8 @@ class ModelInputs:
         if self.tokens.ndim != 2 or not jnp.issubdtype(self.tokens.dtype, jnp.integer):
             raise ValueError("tokens must be an integer [B, S] array")
         reserved = {"tokens", "conditioning", "train", "decode", "rngs", "method",
-                    "mutable", "capture_intermediates"}
+                    "mutable", "capture_intermediates", "attention_pairwise_mask",
+                    "attention_key_positions"}
         if reserved.intersection(self.token_fields):
             raise ValueError(f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}")
         for name, value in self.token_fields.items():
@@ -90,3 +91,5 @@ class AttentionMetadata:
     valid: jax.Array | None = None
     image_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
+    pairwise_mask: jax.Array | None = None
+    key_positions: jax.Array | None = None
