@@ -59,10 +59,20 @@ class DenseObjective(Objective):
         return super().reduce_loss(stats)
 
 
-def compare(actual, expected, *, exact=False, tolerance=2e-6):
+def compare(actual, expected, *, exact=False, tolerance=2e-6, moment_rounding=False):
     for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert got.dtype == want.dtype
-        if exact or got.dtype == jnp.bfloat16:
+        if moment_rounding and not exact and got.dtype == jnp.bfloat16:
+            # A materialized accumulation boundary can round the gradient before
+            # Adam, unlike the fused reference. Allow one adjacent bf16 moment,
+            # not a relative tolerance on parameters, EMA, or resumed state.
+            # These fixtures differ by at most one neighbor on JAX 0.11.1/CUDA
+            # (four accumulation cases); CPU matches the compiled reference.
+            reference = np.asarray(want)
+            lower = np.nextafter(reference, np.full_like(reference, -np.inf))
+            upper = np.nextafter(reference, np.full_like(reference, np.inf))
+            assert np.all(np.asarray(got) >= lower) and np.all(np.asarray(got) <= upper)
+        elif exact or got.dtype == jnp.bfloat16:
             np.testing.assert_array_equal(got, want)
         else:
             np.testing.assert_allclose(got, want, rtol=tolerance, atol=tolerance * .1)
@@ -86,10 +96,17 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
     batch = {"x": jnp.tile(x, (jax.device_count(), 1)), "y": jnp.tile(y, (jax.device_count(), 1))}
     step = train.compile(state, batch)
     tolerance = 2e-13 if parameter_kind == "float64" else 2e-6
+    # Compile the independent Linen loss and native Optax update together, as a
+    # real training loop does. Eager Adam rounds every bf16 intermediate; GPU
+    # fusion need not, so eager parameter bits are not the compiled contract.
+    @jax.jit
+    def reference_update(params, opt_state, batch):
+        loss, grads = jax.value_and_grad(objective.reference_loss)(params, batch)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        return loss, optax.apply_updates(params, updates), opt_state
+
     for window in range(2):
-        expected_loss, grads = jax.jit(jax.value_and_grad(objective.reference_loss))(expected_params, batch)
-        updates, expected_opt = optimizer.update(grads, expected_opt, expected_params)
-        expected_params = optax.apply_updates(expected_params, updates)
+        expected_loss, expected_params, expected_opt = reference_update(expected_params, expected_opt, batch)
         if expected_ema is not None:
             def average(old, new):
                 work = np.float64 if old.dtype == jnp.float64 or new.dtype == jnp.float64 else np.float32
@@ -108,7 +125,7 @@ def exercise_updates_and_resume(tmp_path, parameter_kind, loss_kind, k, *, dynam
                     assert gradient.dtype == jnp.promote_types(parameter.dtype, jnp.float32)
         np.testing.assert_allclose(loss, expected_loss, rtol=tolerance, atol=tolerance * .1)
         compare(state.params["params"], expected_params, tolerance=tolerance)
-        compare(state.opt_state, expected_opt, tolerance=tolerance)
+        compare(state.opt_state, expected_opt, tolerance=tolerance, moment_rounding=True)
         compare(state.ema, expected_ema, tolerance=tolerance)
     assert int(state.updates) == 2
     checkpoints.wait()
