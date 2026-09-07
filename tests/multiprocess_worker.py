@@ -847,6 +847,7 @@ def mode_builtin_preview_failures(args) -> dict:
     """Exercise nested builtin preview failures while both ranks remain alive."""
     import jax
     import optax
+    import dew.sampling.text as text_sampling
     from dew.inference import TextGeneration
     from dew.data import Dataset
     from dew.diffusion import presets
