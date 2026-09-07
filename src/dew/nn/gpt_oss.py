@@ -1,15 +1,16 @@
 """GPT OSS's biased router, interleaved experts and MXFP4 checkpoint math."""
 
+import functools
 from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.linen.dtypes import canonicalize_dtype, promote_dtype
+from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.moe import expert_projection
+from dew.nn.moe import expert_dispatch, expert_projection, gather_expert_bias
 from dew.nn.sharding import logical_axes
 
 
@@ -57,6 +58,7 @@ class GptOssExperts(nn.Module):
     intermediate_size: int
     num_local_experts: int
     implementation: str = 'xla'
+    dispatch: str = 'global'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -75,23 +77,27 @@ class GptOssExperts(nn.Module):
         # Infer the shared compute dtype from every original operand, while
         # keeping master kernels uncast for the projection's derivative rule.
         compute_dtype = canonicalize_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
-        x, gate_bias, down_bias = promote_dtype(x, gate_bias, down_bias, dtype=compute_dtype)
-        experts = indices.reshape(-1)
-        order = jnp.argsort(experts)
-        sorted_experts = experts[order]
-        group_sizes = jnp.bincount(experts, length=self.num_local_experts)
-        tokens = x.reshape(-1, self.hidden_size)[order // indices.shape[-1]]
+        if weights.shape != indices.shape:
+            raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
+        slots = expert_dispatch(
+            functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
+            (gate_up, gate_bias, down, down_bias), num_experts=self.num_local_experts,
+            dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing())
+        return jnp.sum(slots * weights[..., None], axis=-2)
+
+    def _project(self, tokens: jax.Array, sizes: jax.Array, expert_ids: jax.Array,
+                 parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array], *,
+                 dtype: Dtype) -> jax.Array:
+        gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
-            tokens, gate_up, group_sizes, compute_dtype, self.implementation,
-            self.precision)) + gate_bias[sorted_experts]
+            tokens, gate_up, sizes, dtype, self.implementation, self.precision))
+        projected = projected + gather_expert_bias(gate_bias, expert_ids, dtype)
         gate = jnp.minimum(projected[..., ::2], 7.0)
         up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
         activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
         output = jnp.asarray(expert_projection(
-            activated, down, group_sizes, compute_dtype, self.implementation,
-            self.precision)) + down_bias[sorted_experts]
-        per_slot = output[jnp.argsort(order)].reshape(*indices.shape, self.hidden_size)
-        return jnp.sum(per_slot * weights[..., None], axis=-2)
+            activated, down, sizes, dtype, self.implementation, self.precision))
+        return output + gather_expert_bias(down_bias, expert_ids, dtype)
 
 
 @logical_axes({("router",): ("embed", "exp")}, heuristic=(
@@ -109,6 +115,7 @@ class GptOssMLP(nn.Module):
     num_local_experts: int
     num_experts_per_tok: int
     implementation: str = 'xla'
+    dispatch: str = 'global'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -120,5 +127,5 @@ class GptOssMLP(nn.Module):
         weights = jax.nn.softmax(top_logits, axis=-1)
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
-            implementation=self.implementation, dtype=self.dtype,
+            implementation=self.implementation, dispatch=self.dispatch, dtype=self.dtype,
             precision=self.precision, name="experts")(x, weights, indices)

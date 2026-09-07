@@ -1359,13 +1359,12 @@ class CausalTransformer(nn.Module):
         if self.mlp == 'swigluoai':
             if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
                 raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
-            if mixture.dispatch != 'global':
-                raise ValueError('swigluoai experts do not support exchange dispatch')
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,
                 num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
                 implementation=mixture.implementation,
+                dispatch=mixture.dispatch,
                 dtype=self.dtype, precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's

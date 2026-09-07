@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn, struct
-from flax.linen.dtypes import promote_dtype
+from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
 from jax.sharding import PartitionSpec as P
@@ -343,6 +343,18 @@ def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
     return jnp.asarray(_rounded_operand(primals[0], dtype)), tangents[0]
 
 
+def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
+    """Expert-major biases in compute dtype, with master-precision cotangent sums.
+
+    Out-of-range IDs are transport padding, contributing neither a value
+    nor a gradient. Promotion before gathering prevents a bf16 scatter-add
+    or scan carry from rounding partial bias gradients.
+    """
+    work = jnp.result_type(bias.dtype, dtype, jnp.float32)
+    values = jnp.asarray(_rounded_operand(bias, dtype)).astype(work)
+    return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
+
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Optional[Dtype], implementation: str,
@@ -445,6 +457,109 @@ class ExpertLinear(nn.Module):
             tokens, self.kernel, group_sizes, self.dtype, self.implementation, self.precision))
 
 
+def expert_dispatch[Parameters](
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        x: jax.Array, indices: jax.Array, parameters: Parameters, *,
+        num_experts: int, dispatch: str, output_dtype: Dtype,
+        input_weights: jax.Array | None = None, initializing: bool = False) -> jax.Array:
+    """Run residual experts and return every selected slot in token order.
+
+    `project` receives rows sorted by expert, group sizes, sorted expert IDs
+    and expert-major parameter leaves. Its output preserves the input width.
+    IDs are local to the owner under exchange; padding uses num_local_experts
+    and is discarded before the return exchange. The caller owns activation,
+    bias and output-weight arithmetic. Optional input weights are applied
+    before dispatch, as in Llama 4.
+
+    With S expert shards and L local routing slots, each all-to-all carries
+    S * ceil(L/S) rows. At most S rounds drain every destination bucket;
+    capacity bounds messages, never the number of accepted assignments.
+    """
+    if dispatch not in EXPERT_DISPATCHES:
+        raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
+    if indices.shape[:-1] != x.shape[:-1] or (
+            input_weights is not None and input_weights.shape != indices.shape):
+        raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
+    tokens = x.reshape(-1, x.shape[-1])
+    top_k = indices.shape[-1]
+    mesh = jax.sharding.get_abstract_mesh()
+    shards = mesh.shape.get(EXPERT_AXIS, 1)
+    if dispatch == 'exchange' and not initializing and (
+            shards <= 1 or num_experts % shards):
+        raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
+                         "that divides num_experts")
+    if dispatch == 'global' or initializing or not tokens.shape[0]:
+        experts = indices.ravel()
+        order = jnp.argsort(experts)
+        grouped = tokens[order // top_k]
+        if input_weights is not None:
+            grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+        projected = project(grouped, jnp.bincount(experts, length=num_experts),
+                            experts[order], parameters)
+        return projected[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+
+    @functools.partial(jax.shard_map, mesh=mesh, axis_names={EXPERT_AXIS},
+                       in_specs=(P(EXPERT_AXIS), P(EXPERT_AXIS), P(EXPERT_AXIS),
+                                 None if input_weights is None else P(EXPERT_AXIS)),
+                       out_specs=P(EXPERT_AXIS))
+    def local(tokens: jax.Array, indices: jax.Array, parameters: Parameters,
+              input_weights: jax.Array | None) -> jax.Array:
+        slots, per_shard = indices.size, num_experts // shards
+        order = jnp.argsort(indices.ravel())
+        experts = indices.ravel()[order]
+        grouped = tokens[order // top_k]
+        if input_weights is not None:
+            grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+        sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
+        starts = jnp.cumsum(sizes) - sizes
+        capacity = (slots + shards - 1) // shards
+        rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
+        lanes = jnp.arange(capacity)
+
+        @jax.checkpoint
+        def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
+            offsets = iteration * capacity + lanes
+            valid = offsets[None, :] < sizes[:, None]
+            addresses = starts[:, None] + offsets
+            send = jnp.where(valid[..., None], grouped[jnp.minimum(addresses, slots - 1)], 0)
+            ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
+                            per_shard)
+            received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
+                -1, tokens.shape[-1])
+            received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
+            permutation = jnp.argsort(received_ids)
+            groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
+            computed = project(received[permutation], groups, received_ids[permutation], parameters)[
+                jnp.argsort(permutation)]
+            computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
+            returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
+                                         EXPERT_AXIS, 0, 0, tiled=True)
+            # Only padding has an out-of-bounds address; every real slot has
+            # one unique writer across all rounds.
+            return returned, jnp.where(valid, addresses, slots)
+
+        def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
+            def active(out: jax.Array) -> jax.Array:
+                returned, addresses = exchange_round(iteration)
+                return out.at[addresses].set(returned, mode='drop')
+            return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
+
+        initial = jax.lax.pcast(jnp.zeros((slots, x.shape[-1]), output_dtype),
+                                EXPERT_AXIS, to='varying')
+        result, _ = jax.lax.scan(step, initial, jnp.arange(shards))
+        return result[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+
+    # Sentinel assignments from token-axis padding never enter send counts.
+    padding = -tokens.shape[0] % shards
+    token_indices = jnp.pad(indices.reshape(-1, top_k), ((0, padding), (0, 0)),
+                            constant_values=num_experts)
+    padded_weights = (None if input_weights is None else
+                      jnp.pad(input_weights.reshape(-1, top_k), ((0, padding), (0, 0))))
+    result = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices, parameters, padded_weights)
+    return result[:tokens.shape[0]].reshape(*indices.shape, x.shape[-1])
+
+
+
 class ExpertMLP(nn.Module):
     """The routed experts of one layer: each token through the gated MLPs its
     router chose.
@@ -491,8 +606,6 @@ class ExpertMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.dispatch not in EXPERT_DISPATCHES:
-            raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
         if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
                 f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
@@ -511,7 +624,7 @@ class ExpertMLP(nn.Module):
         self.down_proj = expert(in_features=self.hidden_features,
                                 features=self.out_features, name='down_proj')
 
-    def _project(self, tokens: jax.Array, sizes: jax.Array,
+    def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
         def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
             return jnp.asarray(expert_projection(
@@ -539,106 +652,15 @@ class ExpertMLP(nn.Module):
                           weights.astype(jnp.float32), precision=self.precision).astype(slots.dtype)
 
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
-        """`x` is `[..., embed]` and `weights` and `indices` are `[..., k]`."""
-        if weights.shape != indices.shape or indices.shape[:-1] != x.shape[:-1]:
-            raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
+        if weights.shape != indices.shape:
+            raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         kernels = (self.gate_proj.kernel, self.up_proj.kernel, self.down_proj.kernel)
-        tokens = x.reshape(-1, x.shape[-1])
-        mesh = jax.sharding.get_abstract_mesh()
-        shards = mesh.shape.get(EXPERT_AXIS, 1)
-        if self.dispatch == 'exchange' and not self.is_initializing() and (
-                shards <= 1 or self.num_experts % shards):
-            raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
-                             "that divides num_experts")
-        if self.dispatch == 'exchange' and not self.is_initializing() and tokens.shape[0]:
-            # Padding is only for a token axis the mesh cannot divide. The
-            # sentinel expert is excluded from send counts, never dispatched.
-            padding = -tokens.shape[0] % shards
-            result = self._exchange(
-                jnp.pad(tokens, ((0, padding), (0, 0))),
-                jnp.pad(weights.reshape(-1, indices.shape[-1]), ((0, padding), (0, 0))),
-                jnp.pad(indices.reshape(-1, indices.shape[-1]), ((0, padding), (0, 0)),
-                        constant_values=self.num_experts), kernels)
-            return result[:tokens.shape[0]].reshape(x.shape)
-
-        experts = indices.ravel()
-        order = jnp.argsort(experts)
-        sizes = jnp.bincount(experts, length=self.num_experts)
-        grouped = tokens[order // indices.shape[-1]]
-        if self.scale_inputs:
-            grouped = grouped * weights.ravel()[order][:, None].astype(grouped.dtype)
-        projected = self._project(grouped, sizes, kernels)
-        return self._combine(projected[jnp.argsort(order)].reshape(
-            *indices.shape, self.out_features), weights)
-
-    def _exchange(self, tokens: jax.Array, weights: jax.Array, indices: jax.Array,
-                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
-        """Stream destination buckets through fixed-size all-to-alls.
-
-        With S expert shards and L local routing slots, a round carries
-        S * ceil(L/S) rows. At most S rounds drain even a bucket holding all
-        L slots. Bucket sizes determine the actual round count collectively;
-        capacity bounds each message, never the number of accepted tokens.
-        The return exchange restores slots before the original top-k sum.
-        """
-        mesh = jax.sharding.get_abstract_mesh()
-        shards = mesh.shape[EXPERT_AXIS]
-
-        @functools.partial(jax.shard_map, mesh=mesh, axis_names={EXPERT_AXIS},
-                           in_specs=(P(EXPERT_AXIS), P(EXPERT_AXIS), P(EXPERT_AXIS),
-                                     (P(EXPERT_AXIS),) * 3), out_specs=P(EXPERT_AXIS))
-        def local(tokens: jax.Array, weights: jax.Array, indices: jax.Array,
-                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
-            slots, per_shard = indices.size, kernels[0].shape[0]
-            order = jnp.argsort(indices.ravel())
-            experts = indices.ravel()[order]
-            grouped = tokens[order // indices.shape[-1]]
-            if self.scale_inputs:
-                grouped = grouped * weights.ravel()[order][:, None].astype(grouped.dtype)
-            sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
-            starts = jnp.cumsum(sizes) - sizes
-            capacity = (slots + shards - 1) // shards
-            rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
-            lanes = jnp.arange(capacity)
-            dtype = jnp.dtype(self.dtype) if self.dtype is not None else jnp.result_type(tokens, *kernels)
-
-            @jax.checkpoint
-            def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
-                offsets = iteration * capacity + lanes
-                valid = offsets[None, :] < sizes[:, None]
-                addresses = starts[:, None] + offsets
-                send = grouped[jnp.minimum(addresses, slots - 1)]
-                send = jnp.where(valid[..., None], send, 0)
-                ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
-                                per_shard)
-                received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
-                    -1, tokens.shape[-1])
-                received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
-                permutation = jnp.argsort(received_ids)
-                groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
-                computed = self._project(received[permutation], groups, kernels)[
-                    jnp.argsort(permutation)]
-                computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
-                returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
-                                             EXPERT_AXIS, 0, 0, tiled=True)
-                # Only padding gets an out-of-bounds scatter address. All
-                # real slots have one unique writer across the rounds.
-                return returned, jnp.where(valid, addresses, slots)
-
-            def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
-                def active(out: jax.Array) -> jax.Array:
-                    returned, addresses = exchange_round(iteration)
-                    return out.at[addresses].set(returned, mode='drop')
-
-                return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
-
-            initial = jax.lax.pcast(jnp.zeros((slots, self.out_features), dtype),
-                                    EXPERT_AXIS, to='varying')
-            result, _ = jax.lax.scan(step, initial, jnp.arange(shards))
-            return self._combine(result[jnp.argsort(order)].reshape(
-                *indices.shape, self.out_features), weights)
-
-        return local(tokens, weights, indices, kernels)
+        slots = expert_dispatch(
+            self._project, x, indices, kernels, num_experts=self.num_experts,
+            dispatch=self.dispatch, initializing=self.is_initializing(),
+            output_dtype=canonicalize_dtype(x, *kernels, dtype=self.dtype),
+            input_weights=weights if self.scale_inputs else None)
+        return self._combine(slots, weights)
 
 
 @logical_axes({
