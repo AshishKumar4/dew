@@ -202,6 +202,13 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     return P(*entries)
 
 
+HOST_RESIDENT = ("opt_state", "ema")
+"""The train-state fields a layout may keep in pinned host memory between
+steps. The parameters are not among them: a host copy of the weights saves
+device memory only if each layer fetches its own just in time inside the
+stack, which the decoder does not do."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Layout:
     """How a train state is placed on a mesh.
@@ -215,11 +222,15 @@ class Layout:
     places itself from the stored tree. Below `min_shard` elements a
     parameter costs more in collectives than it saves in memory, so it stays
     replicated. `tolerance` is the fraction of shardable parameter elements
-    a layout may leave replicated before `check` refuses it.
+    a layout may leave replicated before `check` refuses it. `host` names
+    the fields of `HOST_RESIDENT` kept in pinned host memory between steps;
+    the step fetches them to the device, updates them as it would have, and
+    writes them back, so what they hold is the same and only where changes.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
+    host: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not 0.0 <= self.tolerance <= 1.0:
@@ -234,6 +245,13 @@ class Layout:
                     f"split over {list(PARAMETER_AXES)}, the data and sequence "
                     f"axes split the batch, and the stage axis holds the pipeline")
         object.__setattr__(self, "rules", rules)
+        host = tuple(self.host)
+        unknown = sorted(set(host) - set(HOST_RESIDENT))
+        if unknown:
+            raise ValueError(
+                f"host names the train-state fields kept in pinned host memory, "
+                f"{list(HOST_RESIDENT)}, got {unknown}")
+        object.__setattr__(self, "host", host)
 
     def shardings(self, mesh: Mesh, tree: Any) -> Placement:
         """A NamedSharding per leaf of `tree`, from the declared parameter axes.
