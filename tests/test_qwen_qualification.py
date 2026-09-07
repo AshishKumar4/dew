@@ -288,3 +288,29 @@ def test_source_templates_preserve_reasoning_controls_and_history(source):
     with pytest.raises(TemplateError, match="reasoning effort"):
         processor.chat(messages, reasoning_effort="invalid")
 
+
+
+
+def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source):
+    """Both published generation configs specify top-k 20 and top-p 0.95.
+
+    Validate the selected action's filtered likelihood against Transformers,
+    rather than merely inspecting the parsed fields.
+    """
+    import torch
+    from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsWarper
+
+    loaded, inputs, _ = source
+    task = loaded.text_generation()
+    actual = task(inputs, 1, key=jax.random.key(91))
+    logits = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())[:, -1]
+    scores = torch.FloatTensor(np.asarray(logits).copy())
+    ids = torch.LongTensor(np.asarray(inputs.tokens).copy())
+    scores = TopKLogitsWarper(20)(ids, scores)
+    scores = TopPLogitsWarper(0.95)(ids, scores)
+    token = np.asarray(actual.tokens[:, -1])
+    expected = scores.log_softmax(-1).numpy()[np.arange(token.shape[0]), token]
+    np.testing.assert_allclose(actual.behavior_log_probs[:, 0], expected, atol=1e-5, rtol=0)
+    repeated = task(inputs, 1, key=jax.random.key(91))
+    np.testing.assert_array_equal(actual.tokens, repeated.tokens)
+
