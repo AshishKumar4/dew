@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate GPT OSS primitive fixtures with transformers 5.16.1 on CPU.
 
+The exchange-gradient fixtures additionally require torch2.14.0+cpu.
+
 Run PYTHONPATH=src python tools/gpt_oss_reference.py from the checkout.
 """
 
@@ -128,10 +130,10 @@ def write_exchange_cases() -> None:
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
+    write_exchange_cases()
     write_attention()
     write_moe()
     write_mxfp4()
-    write_exchange_cases()
 
 
 if __name__ == "__main__":

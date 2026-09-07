@@ -107,6 +107,34 @@ def test_expert_bias_gradients_sum_before_returning_to_master_dtype(compute, cot
         assert gradient.dtype == jnp.float32
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize('tokens', [0, 1, 7])
+def test_biased_exchange_padding_never_creates_an_expert_contribution(tokens):
+    rng = np.random.default_rng(355)
+    x = jnp.asarray(rng.normal(size=(tokens, 8)), jnp.bfloat16)
+    weights = jnp.asarray(rng.uniform(.1, .9, size=(tokens, 2)), jnp.bfloat16)
+    indices = jnp.asarray(np.argsort(rng.normal(size=(tokens, 4)), axis=-1)[:, :2], jnp.int32)
+    model = GptOssExperts(8, 12, 4, dtype=jnp.bfloat16)
+    variables = model.init(jax.random.key(0), x, weights, indices)
+    variables['params']['gate_up_proj_bias'] = jnp.asarray(rng.normal(size=(4, 24)), jnp.float32)
+    variables['params']['down_proj_bias'] = jnp.asarray(rng.normal(size=(4, 8)), jnp.float32)
+    results = []
+    for dispatch in ('global', 'exchange'):
+        layer = model.clone(dispatch=dispatch)
+
+        def loss(p, x, weights, indices):
+            output = jnp.asarray(layer.apply(p, x, weights, indices))
+            return output.astype(jnp.float32).sum(), output
+
+        with jax.set_mesh(build_mesh(MeshSpec(expert=4))):
+            results.append(jax.jit(jax.value_and_grad(loss, (0, 1, 2), has_aux=True))(
+                variables, x, weights, indices))
+    for a, b in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
+        np.testing.assert_allclose(np.asarray(a, np.float64), np.asarray(b, np.float64),
+                                   atol=3e-5, rtol=3e-5)
+
+
+
 def reference_case(skewed: bool):
     name = 'exchange_skewed' if skewed else 'exchange_random'
     with np.load(Path(__file__).parent / 'fixtures' / 'gpt_oss' / (name + '.npz')) as fixture:
@@ -126,6 +154,7 @@ def reference_case(skewed: bool):
 def test_biased_mlp_matches_transformers_outputs_and_every_parameter_gradient(skewed, dispatch):
     # Generated with transformers5.16.1/torch2.14.0+cpu by
     # tools/gpt_oss_reference.py, including saturated gates/up values.
+    # CPU maxima: outputs1.91e-6, inputs3.17e-8, parameter gradients5.97e-7.
     arrays, parameters, expected_gradients = reference_case(skewed)
     model = GptOssMLP(8, 12, 4, 2, dispatch=dispatch)
     x = jnp.asarray(arrays['hidden'])
