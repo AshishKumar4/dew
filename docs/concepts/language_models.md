@@ -77,6 +77,23 @@ Generation prepares inputs on the host and runs prefill and decode in one compil
 
 On a mesh, rows split over the batch axes and parameters retain their placement. The decode executes a fixed number of steps. EOS disables cache writes and output recording for the finished row without skipping collectives. In a multi-process run, each process passes and receives its own rows. Processes validate inputs together and require matching input shapes and sampling settings. Invalid input on one rank raises on all ranks before device execution; this does not recover a failed device collective.
 
+### Serve concurrent requests
+
+`generate` is the fast path for one fixed batch. `Engine` from `dew.sampling` runs many requests over one model: it validates and admits each request, copies and versions weights, reuses deterministic prefill states, streams events and cancels. Requests with equal `Sampling` share one decode state; a `DiffusionGemma` request keeps its own. Each request pins the weight version current at submission; `publish` installs a copied newer version without disturbing them, which is the rollout boundary online RL needs.
+
+```python
+from dew.sampling import Engine, Sampling
+
+with Engine(model, variables, max_batch_size=8, prefix_cache_bytes=256 << 20) as engine:
+    jobs = [engine.submit(prompt, 64, key=jax.random.key(seed), generation=Sampling(temperature=0.8))
+            for seed, prompt in enumerate(prompts)]
+    for event in jobs[0].stream():
+        print(event.row, event.position, event.token, event.raw_log_prob)
+    results = [job.result() for job in jobs]
+```
+
+`dew.serve.serve(engine, processor=bundle.processor)` puts the engine behind `POST /generate` with JSON bodies and newline-delimited JSON streams. Each engine advance is one device call followed by host bookkeeping, so a small model on CPU generates far fewer tokens per second than the fused batch scan; the per-step model computation of a large model is what amortizes that loop. The engine schedules a single process.
+
 Checkpoint loading needs the `interop` extra and may download substantial files. The following complete checkpoint-to-text example is not part of the offline quickstart and has not been run during this documentation validation:
 
 ```python
