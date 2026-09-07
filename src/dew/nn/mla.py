@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
     RMSNorm, _cache_positions, _write_cache, apply_rotary, causal_attention_mask,
@@ -451,12 +452,15 @@ class MultiHeadLatentAttention(nn.Module):
         """`[B, S, H, nope+rope]` queries and the residual the indexer reads."""
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # The projections carry the names a remat policy saves or offloads
+        # (causal_transformer.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
         else:
             q_resid = self.q_a_layernorm(self.q_a_proj(x))
             queries = self.q_b_proj(q_resid)
+        queries = checkpoint_name(queries, 'q_proj')
         return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid
 
     def _latents(self, x):
@@ -474,7 +478,8 @@ class MultiHeadLatentAttention(nn.Module):
         """Latent and rope head into per-head keys and values."""
         batch, length = latent.shape[0], latent.shape[1]
         width = self.qk_nope_head_dim + self.v_head_dim
-        kv = self.kv_b_proj(latent).reshape(batch, length, self.num_heads, width)
+        kv = checkpoint_name(self.kv_b_proj(latent), 'kv_proj').reshape(
+            batch, length, self.num_heads, width)
         nope, values = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
         rot = jnp.broadcast_to(
             rot[:, :, None, :], (batch, length, self.num_heads, self.qk_rope_head_dim))
@@ -592,8 +597,8 @@ class MultiHeadLatentAttention(nn.Module):
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=implementation, causal=causal, mask=mask)
-        return self.o_proj(attention.reshape(
-            batch, length, self.num_heads * self.v_head_dim))
+        return checkpoint_name(self.o_proj(checkpoint_name(attention, 'context').reshape(
+            batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
 
     def _index_mask(self, x, q_resid, positions, kv_len: int, index_keys,
                     freqs_cos, freqs_sin, base=None):

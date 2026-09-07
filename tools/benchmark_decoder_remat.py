@@ -5,7 +5,10 @@ Run from the repository root with PYTHONPATH=src and JAX_PLATFORMS=cpu or
 cuda. GPU runs set XLA_PYTHON_CLIENT_PREALLOCATE=false. For example:
 
     python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256
-    python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256 --remat
+    python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256 --remat full
+
+`--remat` takes a name from `causal_transformer.REMAT_POLICIES`; absent, the
+blocks keep every residual.
 
 The timed operation is a donated AdamW update on next-token cross entropy.
 Compiler temporary bytes include activation and gradient workspaces. Device
@@ -17,7 +20,7 @@ logical residual shapes, before XLA scheduling and buffer reuse.
 RTX 4080 16 GiB, driver 595.84, JAX/jaxlib 0.11.1, Flax 0.12.9, Optax
 0.2.8: default dimensions with --dtype bfloat16 (FP32 master weights),
 three warmups and twenty timed steps. Each row was a separate process;
-columns compare --remat absent/present. MB means 1,000,000 bytes.
+columns compare --remat absent/`full`. MB means 1,000,000 bytes.
 
 case         activation MB   compiler temp MB   device peak MB   ms/step       compile s
 dense        326.24/13.48     138.49/31.88        326.68/177.21    2.555/3.026   7.52/8.18
@@ -47,7 +50,7 @@ import optax
 # read directly so the measurement need not parse printed shapes or HLO text.
 from jax._src.ad_checkpoint import saved_residuals
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer, Mixture
 from dew.objectives import scalar_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -63,7 +66,7 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--case", choices=("dense", "sparse", "shared"), default="dense")
     parser.add_argument("--scan", action="store_true")
-    parser.add_argument("--remat", action="store_true")
+    parser.add_argument("--remat", choices=sorted(REMAT_POLICIES), default=None)
     args = parser.parse_args()
     model = CausalTransformer(
         vocab_size=256, emb_features=args.width, num_layers=args.depth,
