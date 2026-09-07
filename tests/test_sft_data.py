@@ -83,11 +83,12 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
 
 
 def test_the_fixture_names_its_reference(reference):
-    """The parity claim is checkable: template, versions and TRL's own
-    template checks travel with the arrays."""
+    """The parity claim is checkable: the template, TRL's version and TRL's
+    own template checks travel with the arrays."""
     assert str(reference["template"]) == "trl_qwen3_training"
-    assert str(reference["trl_version"]) and str(reference["transformers_version"])
-    assert bool(reference["prefix_preserving"]) and bool(reference["stop_token_trained"])
+    assert str(reference["trl_version"]) == "1.12.0"
+    assert str(reference["prefix_preserving"]) == "True"
+    assert str(reference["stop_token_trained"]) == "True"
     roles = {message["role"] for message in json.loads(str(reference["conversation"]))}
     assert roles == {"system", "user", "assistant", "tool"}
 
@@ -142,7 +143,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     data = ChatMessages(tokenizer=str(TOKENIZER), path=path, val_path=path,
                         seq_len=window - 1, packing_bins=1,
                         loading=Loading(workers=0)).load(batch=1)
-    assert data.records == chunks
+    assert data.records == chunks, "records counts chunks, which a run turns into steps"
     assert data.val is not None
     batches = list(data.val())
     assert len(batches) == chunks
@@ -153,32 +154,32 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
 
 
 @pytest.mark.slow
-def test_the_train_stream_runs_end_to_end(tmp_path):
-    """The shuffled, endless train path emits the same four fields, rendered
-    inside real worker processes."""
+def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
+    """The four columns an SFT step reads, out of real worker processes: each
+    row holds whole conversations, one segment each, positions restarting
+    inside them, and the assistant turns marked."""
     path = write_parquet(tmp_path, [SHORT, MEDIUM, LONG])
+    rendered = {tuple(render(tokenizer, conversation)[0].tolist())
+                for conversation in (SHORT, MEDIUM, LONG)}
+    columns = ("text", ROLES_KEY, "text_segment_ids", "text_positions")
     data = ChatMessages(tokenizer=str(TOKENIZER), path=path, seq_len=95,
                         packing_bins=2, loading=Loading(workers=2)).load(batch=2)
 
     batch = next(data.train())
 
-    assert batch["text"].shape == (2, 96) and batch[ROLES_KEY].shape == (2, 96)
-
-
-def test_records_count_chunks_not_conversations(tmp_path, tokenizer):
-    """A run turns records into steps, so one conversation in several chunks
-    reports the chunk count."""
-    conversation = SHORT * 5
-    path = write_parquet(tmp_path, [conversation])
-    ids, _ = render(tokenizer, conversation)
-    chunks = -(-len(ids) // 64)
-    data = ChatMessages(tokenizer=str(TOKENIZER), path=path, val_path=path,
-                        seq_len=63, packing_bins=1,
-                        loading=Loading(workers=0)).load(batch=1)
-
-    assert data.records == chunks
-    assert data.val is not None
-    assert len(list(data.val())) == chunks, "the length is not the pass it counts"
+    assert set(columns) <= set(batch)
+    assert all(batch[column].shape == (2, 96) for column in columns)
+    assert batch["text"].dtype == np.int32 and batch[ROLES_KEY].dtype == np.int8
+    for row in range(2):
+        segments = batch["text_segment_ids"][row]
+        for segment in range(1, int(segments.max()) + 1):
+            span = segments == segment
+            assert tuple(batch["text"][row][span].tolist()) in rendered
+            np.testing.assert_array_equal(batch["text_positions"][row][span],
+                                          np.arange(int(span.sum())))
+    # Every conversation ends on an assistant turn, so a batch that lost the
+    # roles crossing back from a worker would carry no targets at all.
+    assert (batch[ROLES_KEY] == Role.ASSISTANT).any()
 
 
 def test_a_malformed_message_is_refused(tokenizer):

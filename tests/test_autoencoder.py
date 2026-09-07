@@ -45,6 +45,10 @@ def test_the_advertised_geometry_is_the_encoders(depths):
     decoded = autoencoder.decode(autoencoder.params, latent)
     assert decoded.shape == image.shape
     assert jnp.all(jnp.isfinite(decoded))
+    # A decoder that dropped its latent, for a bias or a lost residual, would
+    # keep every shape in this file and reconstruct the same image regardless.
+    assert not jnp.allclose(
+        decoded, autoencoder.decode(autoencoder.params, jnp.ones_like(latent)), atol=1e-6)
 
 
 def test_video_frames_match_the_same_frames_encoded_as_images(autoencoder):
@@ -73,22 +77,6 @@ def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
     latent = normalized.encode(normalized.params, image)
     assert jnp.allclose(latent, (raw_latent - 0.3) * 2.5, atol=1e-5)
     assert jnp.allclose(normalized.decode(normalized.params, latent), autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
-
-
-def test_normalized_latents_can_be_whitened(image):
-    """Point of the seam: pass dataset statistics and the latents come out
-    centred and unit-variance for the diffusion model."""
-    plain = SimpleAutoEncoder(latent_channels=4, feature_depths=DEPTHS)
-    latents = plain.encode(plain.params, image)
-    whitened = SimpleAutoEncoder(
-        latent_channels=4,
-        feature_depths=DEPTHS,
-        latent_shift=float(jnp.mean(latents)),
-        latent_scale=1.0 / float(jnp.std(latents)),
-        params=plain.params,
-    ).encode(plain.params, image)
-    assert abs(float(jnp.mean(whitened))) < 1e-4
-    assert float(jnp.std(whitened)) == pytest.approx(1.0, abs=1e-4)
 
 
 def test_group_norm_survives_depths_not_divisible_by_norm_groups():

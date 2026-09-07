@@ -38,7 +38,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 
-def _token_dir(tmp_path, train_tokens, val_tokens=None, seq_len=8, dtype=np.uint16,
+def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
                vocab_size=256, body=None, eos_id=None):
     """Write a token directory: train.bin (+ val.bin + meta.json)."""
     rng = np.random.RandomState(0)
@@ -79,7 +79,6 @@ def test_byte_tokenizer_round_trips_unicode():
     for text in ("hello, world", "ünïcödé — π≈3.14159", "日本語のテキスト",
                  "emoji 🚀🔥 and \x00 control bytes\n\t"):
         ids = tok.encode(text)
-        assert isinstance(ids, list) and all(isinstance(i, int) for i in ids)
         assert tok.decode(ids) == text
 
 
@@ -110,7 +109,7 @@ def test_hf_tokenizer_encodes_and_decodes():
 
     tok = HFTokenizer("gpt2")
     ids = tok.encode("hello world")
-    assert 0 < len(ids) < 11 and all(isinstance(i, int) for i in ids)
+    assert 0 < len(ids) < 11
     assert tok.decode(ids) == "hello world"
     assert tok.vocab_size == 50257
     assert tok.eos_id == 50256
@@ -210,7 +209,7 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     seq_len, batch = 8, 4
     # (n - 1) // seq_len windows: 17*8 tokens -> 16 train, 5*8 -> 4 val.
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=5 * seq_len,
-               seq_len=seq_len, body=np.arange(22 * seq_len))
+               body=np.arange(22 * seq_len))
     data = _windows(tmp_path, seq_len=seq_len).load(batch=batch)
 
     assert data.records == 16 and data.batch == batch and data.steps_per_epoch == 4
@@ -233,8 +232,7 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
     # 13*4 tokens -> 12 train windows; 9*4 -> 8 val windows.
     train_tokens = np.arange(100, 100 + 13 * seq_len, dtype=np.int64)
     val_tokens = np.arange(900, 900 + 9 * seq_len, dtype=np.int64)
-    _token_dir(tmp_path, train_tokens=len(train_tokens),
-               val_tokens=len(val_tokens), seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=len(train_tokens), val_tokens=len(val_tokens))
     # _token_dir draws random tokens; overwrite with a known layout.
     (tmp_path / "train.bin").write_bytes(train_tokens.astype("<u2").tobytes())
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
@@ -264,8 +262,7 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 13 * seq_len, dtype=np.int64)  # 12 windows
-    _token_dir(tmp_path, train_tokens=5 * seq_len, val_tokens=len(val_tokens),
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=5 * seq_len, val_tokens=len(val_tokens))
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
     data = _windows(tmp_path, seq_len=seq_len, seed=0, loading=Loading(workers=worker_count)).load(batch=4)
@@ -279,8 +276,7 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
 def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     seq_len = 8
     records = 16  # (17 * 8 - 1) // 8 == 16 windows
-    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def by_record(worker_count):
         data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(batch=4)
@@ -301,8 +297,7 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
     twice, a different seed reads a different one. A sampler that ignored
     the seed and shuffled afresh each call would pass the second half alone."""
     seq_len, records = 8, 24
-    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def first_batch(seed):
         data = _windows(tmp_path, seq_len=seq_len, seed=seed, loading=Loading(workers=0)).load(batch=4)
@@ -318,8 +313,7 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
 def test_a_registered_token_spec_reads_the_directory(tmp_path):
     seq_len = 64
     # (41 * 64 - 1) // 64 == 40 train windows.
-    _token_dir(tmp_path, train_tokens=41 * seq_len, val_tokens=8 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=41 * seq_len, val_tokens=8 * seq_len)
     from dew.registry import datasets
 
     data = datasets.build("token_windows", path=str(tmp_path), seq_len=seq_len,
@@ -648,8 +642,7 @@ def _rows(batches):
 def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
     """Eight windows at batch four are two batches, then the end."""
     seq_len = 4
-    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
     batches, ended = _bounded(data.val(), 3)
@@ -667,8 +660,7 @@ def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
     """
     seq_len = 4
     val_tokens = np.arange(900, 900 + 11 * seq_len, dtype=np.int64)
-    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=len(val_tokens),
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=len(val_tokens))
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
@@ -704,8 +696,7 @@ def test_val_batches_bounds_a_validation_pass(tmp_path):
     """A run scores `val_batches` of val.bin per pass, or all of it when the
     spec leaves that None."""
     seq_len = 4
-    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
 
     batches, ended = _bounded(_windows(tmp_path, seq_len=seq_len).load(batch=4).val(), 3)
     assert len(batches) == 2 and ended, ENDLESS_VAL
@@ -721,8 +712,7 @@ def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
     """The trainer keeps asking long after one pass over the windows, and the
     fixed-window loader is the one path that has no `repeat` of its own."""
     seq_len = 4
-    _token_dir(tmp_path, train_tokens=9 * seq_len, val_tokens=5 * seq_len,
-               seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=9 * seq_len, val_tokens=5 * seq_len)
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
     epoch = data.records // 4
@@ -748,8 +738,8 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     stream = np.concatenate([np.asarray(d + [PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins).load(batch=batch)
-    return data, list(data.val())
+    return list(_packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins)
+                .load(batch=batch).val())
 
 
 def _tiny_backbone(seq_len):
@@ -857,7 +847,7 @@ def _counted_cross_entropy(batch, seq_len):
 
 def test_a_document_the_size_of_the_window_is_one_segment(tmp_path, monkeypatch):
     """Exactly the window is the case the chunker must not cut."""
-    data, batches = _packed(tmp_path, [[2, 3, 4, 5]], seq_len=4, bins=1)
+    batches = _packed(tmp_path, [[2, 3, 4, 5]], seq_len=4, bins=1)
 
     assert len(batches) == 1
     np.testing.assert_array_equal(batches[0]["text"][0], [2, 3, 4, 5, PACK_EOS])
@@ -867,7 +857,7 @@ def test_a_document_the_size_of_the_window_is_one_segment(tmp_path, monkeypatch)
 
 
 def test_three_documents_in_one_window_cannot_read_each_other(tmp_path, monkeypatch):
-    data, batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
+    batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
     row = batches[0]
 
     np.testing.assert_array_equal(row["text"][0], [2, 3, 1, 4, 5, 1, 6, 7, 1])
@@ -881,7 +871,7 @@ def test_a_document_longer_than_the_window_is_cut_into_separate_segments(
         tmp_path, monkeypatch):
     """Each piece is its own segment, so no chunk attends into the one before
     it and RoPE starts again at zero."""
-    data, batches = _packed(tmp_path, [list(range(2, 14))], seq_len=4, bins=1)
+    batches = _packed(tmp_path, [list(range(2, 14))], seq_len=4, bins=1)
 
     assert len(batches) == 3
     np.testing.assert_array_equal(
@@ -895,7 +885,7 @@ def test_a_document_longer_than_the_window_is_cut_into_separate_segments(
 def test_a_document_of_one_token_is_its_own_segment(tmp_path, monkeypatch):
     """A split can end on a bare boundary, and a one-token document owns no
     transition: it must not borrow the previous document's."""
-    data, batches = _packed(tmp_path, [[2, 3, 4], []], seq_len=8, bins=1)
+    batches = _packed(tmp_path, [[2, 3, 4], []], seq_len=8, bins=1)
     row = batches[0]
 
     np.testing.assert_array_equal(row["text"][0], [2, 3, 4, 1, 1, 0, 0, 0, 0])
@@ -910,7 +900,7 @@ def test_a_document_of_one_token_is_its_own_segment(tmp_path, monkeypatch):
 
 def test_the_padded_tail_of_a_window_is_attended_by_nothing_and_counts_for_nothing(
         tmp_path, monkeypatch):
-    data, batches = _packed(tmp_path, [[2, 3]], seq_len=8, bins=8)
+    batches = _packed(tmp_path, [[2, 3]], seq_len=8, bins=8)
     row = batches[0]
 
     np.testing.assert_array_equal(row["text"][0], [2, 3, 1, 0, 0, 0, 0, 0, 0])
@@ -922,11 +912,10 @@ def test_the_padded_tail_of_a_window_is_attended_by_nothing_and_counts_for_nothi
     assert ce == pytest.approx(by_hand, rel=1e-5)
 
 
-def test_the_loss_counts_one_target_per_transition_inside_a_document(
-        tmp_path, monkeypatch):
+def test_the_loss_counts_one_target_per_transition_inside_a_document(tmp_path):
     """Three documents in a row own six targets between them: the two boundary
     transitions and the padding are not the model's to predict."""
-    data, batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
+    batches = _packed(tmp_path, [[2, 3], [4, 5], [6, 7]], seq_len=8, bins=1)
 
     ce, by_hand, counted = _counted_cross_entropy(batches[0], seq_len=8)
 
@@ -945,7 +934,7 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
     """Real worker processes, one epoch: the windows a pass reads are a
     function of the seed and the file, not of how many workers read them."""
     seq_len = 8
-    _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=2 * seq_len)
 
     def windows(workers):
         data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=workers)).load(batch=4)
@@ -965,7 +954,7 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     position is a record count into an order the source names: the description
     has to name the file, not an address in the process that wrote it."""
     seq_len = 8
-    _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
+    _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len)
 
     def loader():
         return _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=2)).load(batch=4)

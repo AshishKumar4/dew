@@ -74,22 +74,12 @@ class Counting:
 
 
 class Data:
-    """The `Dataset` contract the trainer reads: train, val, batch, records."""
+    """The `Dataset` contract the trainer reads: a train stream and its batch."""
 
-    def __init__(self, train=Counting, val=None, batch=8, records=None):
-        self._train, self._val = train, val
-        self.batch, self.records = batch, records
+    batch = 8
 
     def train(self):
-        return self._train()
-
-    @property
-    def val(self):
-        return self._val
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
+        return Counting()
 
 
 def make_trainer(tmp_path=None, **kwargs):
@@ -145,9 +135,7 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     state = poison(trainer.initial_state())
     before = frozen_bytes(state)
     batch = next(Counting())
-    
     step = trainer.compile(state, batch)
-
     new_state, loss, _, finite, _ = step(state, batch)
 
     assert not bool(finite), "the step should have seen the poison"

@@ -1,11 +1,14 @@
-"""Write processor-to-wrapper references from local tiny Gemma3 weights.
+"""Write processor-to-wrapper references for the native multimodal wrappers.
 
 Run with transformers 5.16.1, Torch and tokenizers installed:
     PYTHONPATH=src python tools/multimodal_reference.py
 
-No network access or pretrained downloads are used. The existing Gemma3
-fixture supplies weights; four soft tokens per image exercise bidirectional
-image attention, and unequal image counts exercise numeric batch alignment.
+No network access or pretrained downloads are used. Each family's existing
+tiny fixture supplies the weights, and every reference lands in
+tests/fixtures/hf/<family>-native-tiny: the padded batch encoding, the
+reference logits, a cached greedy continuation, the pixel gradient and the
+logits after one SGD step. Unequal image counts per row exercise numeric
+batch alignment.
 """
 
 import json
@@ -308,3 +311,7 @@ def write_qwen35_native() -> None:
 
 if __name__ == "__main__":
     write_gemma3_native()
+    write_gemma3n_native()
+    write_gemma4_native()
+    write_llama4_native()
+    write_qwen35_native()

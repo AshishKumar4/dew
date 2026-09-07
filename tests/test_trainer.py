@@ -22,7 +22,7 @@ import pytest
 from dew import position
 from dew.artifacts import Representations
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training import trainer as trainer_module
 from dew.training.trainer import ema_update, write_back
 
@@ -75,11 +75,11 @@ class Counting:
 
 
 class Data:
-    """The `Dataset` contract the trainer reads: train, val, batch, records."""
+    """The `Dataset` contract the trainer reads: train, val and batch."""
 
-    def __init__(self, train=Counting, val=None, batch=BATCH, records=None):
+    def __init__(self, train=Counting, val=None, batch=BATCH):
         self._train, self._val = train, val
-        self.batch, self.records = batch, records
+        self.batch = batch
 
     def train(self):
         return self._train()
@@ -87,10 +87,6 @@ class Data:
     @property
     def val(self):
         return self._val
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
 
 
 def endless():
@@ -275,15 +271,12 @@ def test_a_run_past_its_target_is_refused(tmp_path):
         make_trainer(tmp_path).fit(Data(), steps=2)
 
 
-
-
-
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trainer = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
     trained = trainer.fit(Data(), steps=3, log_every=1)
 
     resumed = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
-    state, shardings, position = resumed.place()
+    state, _, position = resumed.place()
 
     assert int(state.step) == 3, "the step counter was reset"
     for field in ("params", "opt_state", "ema"):
@@ -328,9 +321,6 @@ def test_the_best_step_is_the_lowest_loss(tmp_path):
     assert checkpoints.best == 2
     assert set(checkpoints._open().all_steps()) == {2, 4}
     assert Checkpoints(str(tmp_path / "best")).best == 2, "the metric did not survive a reopen"
-
-
-
 
 
 def test_a_bucket_uri_reaches_orbax_verbatim(tmp_path, monkeypatch):
@@ -553,18 +543,23 @@ class Spread:
         return accumulated[0] / accumulated[1]
 
 
-def test_eval_every_scores_the_validation_split_and_logs_the_artifacts(tmp_path):
+def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     seen = []
     tracker = RecordingTracker()
-    trainer = make_trainer(objective=Features(), tracker=tracker)
-    trainer.fit(Data(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
-                metrics=(Spread(seen),), preview=True)
+    objective = Features()
+    trainer = make_trainer(objective=objective, tracker=tracker)
+    state = trainer.fit(Data(val=val_batches(3)), steps=4, log_every=2, eval_every=2,
+                        metrics=(Spread(seen),), preview=True)
 
     # Two passes: at step 2, and at the end of the run.
     assert seen == [((BATCH, 2), (BATCH, FEATURES))] * 6
     scored = [(step, s) for step, s in tracker.scalars if "val/spread" in s]
     assert [step for step, _ in scored] == [2, 4]
-    assert all(np.isfinite(s["val/spread"]) for _, s in scored)
+    # The pass at the end scores the averaged weights over the whole split, so
+    # its spread is the mean of the three batches' own.
+    expected = np.mean([float(jnp.std(objective.model.apply(state.averaged, batch["x"])))
+                        for batch in val_batches(3)()])
+    assert scored[-1][1]["val/spread"] == pytest.approx(expected, rel=1e-6)
     # The first batch's artifact of each pass reaches the tracker.
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [2, 4]
 
@@ -739,8 +734,6 @@ def test_goodput_arithmetic():
     assert trainer_module.goodput(0.0, None, 0.0) == {"goodput/step_fraction": 0.0}
 
 
-
-
 # --------------------------------------------------------------------------
 # Divergence
 # --------------------------------------------------------------------------
@@ -780,9 +773,7 @@ class ScaledObjective(Objective):
 
 
 def host(state):
-    return (np.array(state.params["params"]["w"]),
-            np.array(state.ema["params"]["w"]),
-            int(state.step))
+    return np.array(state.params["params"]["w"]), np.array(state.ema["params"]["w"])
 
 
 @pytest.mark.parametrize("accum", [1, 2])
@@ -795,11 +786,11 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     step = trainer.compile(state, good)
     for _ in range(2 * accum - 1):
         state, *_ = step(state, good)
-    w, ema, count = host(state)
+    w, ema = host(state)
     np.testing.assert_allclose(w, .8, rtol=1e-6)
     np.testing.assert_allclose(ema, .9, rtol=1e-6)
     before = state
-    state, loss, _, finite, accepted = step(state, bad)
+    state, _, _, finite, accepted = step(state, bad)
     assert bool(finite) and not bool(accepted)
     assert int(state.step) == int(before.step) + 1
     assert int(state.microstep) == int(before.microstep)
@@ -807,15 +798,17 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     np.testing.assert_array_equal(state.params["params"]["w"], w)
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
     state, *_ = step(state, good)
-    w, ema, count = host(state)
+    w, ema = host(state)
     np.testing.assert_allclose(w, .64, rtol=1e-6)
     np.testing.assert_allclose(ema, .77, rtol=1e-6)
     assert int(state.microstep) == 2 * accum
 
 
 def test_mixed_precision_trains_through_fit():
+    """Every step of a healthy run is accepted, so the loop counts three
+    updates and not three rejections."""
     state = make_trainer(dynamic_scale=True).fit(Data(endless), steps=3, log_every=1)
-    assert int(state.step) == 3
+    assert int(state.step) == 3 and int(state.updates) == 3
 
 
 # --------------------------------------------------------------------------

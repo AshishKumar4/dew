@@ -2,7 +2,7 @@
 
 This tutorial assumes Python, NumPy-style arrays, and the idea of minimizing a loss with gradients. It introduces the Flax Linen and JAX concepts needed for this example. Complete [installation](installation.md) first.
 
-We will fit a line to 32 synthetic examples. The target is `y = 2x + 1`, so we can measure the trained model's error without a downloaded dataset or pretrained checkpoint. This is a training demonstration, not a benchmark or generalization result.
+This example fits a line to 32 synthetic examples. The target is `y = 2x + 1`, so you can measure the trained model's error without a downloaded dataset or pretrained checkpoint. This is a training demonstration, not a benchmark or generalization result.
 
 ## Prepare a batch
 
