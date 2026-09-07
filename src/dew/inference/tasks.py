@@ -1,12 +1,13 @@
 """Reusable inference tasks: a model, its weights and its host processing.
 
 A task binds what a generation needs beyond the request itself: the native
-model, one immutable variables tree and, when the source ships one, the host
+model, a captured variables mapping and, when the source ships one, the host
 processor that turns text and media into `ModelInputs`. Controls stay the
 typed values training already uses (`Sampling`, `BlockProcess`); results
 stay the typed records the kernels produce. `bind` gives the same task over
 other weights, which is how a training loop draws from a policy snapshot
-without holding the trainer's mutable state.
+without holding the trainer's mutable mapping. Array buffers are shared; do
+not mutate, donate or delete those buffers while the task is using them.
 """
 
 from __future__ import annotations
@@ -18,13 +19,15 @@ from typing import Protocol
 import jax
 import numpy as np
 from flax import linen as nn
+from flax.core import freeze
 from jax.typing import ArrayLike
 
 from dew.diffusion.block import BlockProcess, CanvasGeneration
+from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Variables
-from dew.sampling.text import Generation, Sampling, generate
+from dew.sampling.text import Generation, Sampling, _mesh, generate
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -38,32 +41,49 @@ class Processor(Protocol):
     def decode(self, tokens: ArrayLike) -> list[str]: ...
 
 
-def _text(request: Request) -> list[str] | None:
-    """The request as prompt strings, or None when it holds prepared rows."""
-    if isinstance(request, str):
-        return [request]
-    if isinstance(request, ModelInputs) or not isinstance(request, Sequence):
-        return None
-    strings = [item for item in request if isinstance(item, str)]
-    return strings if strings and len(strings) == len(request) else None
-
-
-def _rows(request: Request) -> Rows:
-    if isinstance(request, ModelInputs) or not isinstance(request, Sequence):
-        return request
-    return [[int(token) for token in row] for row in request if not isinstance(row, str)]
-
-
 def _prepared(processor: Processor | None, request: Request, *, images: object | None) -> ModelInputs:
-    """Numeric inputs from text through the processor, or from prepared rows."""
-    text = _text(request)
+    """Classify raw text without changing numeric token identities or row order."""
+    if isinstance(request, str):
+        text = [request]
+    elif isinstance(request, Sequence) and request and all(isinstance(item, str) for item in request):
+        text = [item for item in request if isinstance(item, str)]
+    else:
+        text = None
     if text is not None:
         if processor is None:
             raise ValueError("text requests need a processor; pass ModelInputs or token rows")
         return processor(text, images=images)
     if images is not None:
         raise ValueError("images travel with text through the processor; prepared rows carry them in ModelInputs")
-    return ModelInputs.from_value(_rows(request))
+    if isinstance(request, ModelInputs):
+        return ModelInputs.from_value(request)
+    if isinstance(request, Sequence):
+        for row in request:
+            if isinstance(row, str):
+                raise ValueError("a request cannot mix text prompts and numeric token rows")
+            if isinstance(row, np.ndarray) and not np.issubdtype(row.dtype, np.integer):
+                raise ValueError("token rows must contain integers")
+            if isinstance(row, Sequence):
+                if any(isinstance(token, (bool, np.bool_)) or not isinstance(token, (int, np.integer))
+                       for token in row):
+                    raise ValueError("token rows must contain integers, not coerced token IDs")
+    return ModelInputs.from_value(np.asarray(request))
+
+
+def _task_inputs(processor: Processor | None, request: Request, *, images: object | None,
+                 collective: bool) -> ModelInputs:
+    inputs = None
+    error = None
+    try:
+        inputs = _prepared(processor, request, images=images)
+    except Exception as failure:
+        error = failure
+    if collective:
+        agree_process_phase(error, phase="inference task input preparation")
+    elif error is not None:
+        raise error
+    assert inputs is not None
+    return inputs
 
 
 def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
@@ -89,13 +109,17 @@ class TextGeneration:
     processor: Processor | None = None
     sampling: Sampling = Sampling()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+
     def bind(self, variables: Variables) -> TextGeneration:
         """The same task over other weights, such as a training policy snapshot."""
         return replace(self, variables=variables)
 
     def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
                  sampling: Sampling | None = None, images: object | None = None) -> Generation:
-        inputs = _prepared(self.processor, request, images=images)
+        inputs = _task_inputs(self.processor, request, images=images,
+                              collective=_mesh(self.variables) is not None)
         return generate(self.model, self.variables, inputs, max_new_tokens, key=key,
                         sampling=self.sampling if sampling is None else sampling)
 
@@ -122,13 +146,16 @@ class BlockGeneration:
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+
     def bind(self, variables: Variables) -> BlockGeneration:
         """The same task over other weights."""
         return replace(self, variables=variables)
 
     def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
-                 process: BlockProcess | None = None) -> CanvasGeneration:
-        inputs = _prepared(self.processor, request, images=None)
+                 process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
+        inputs = _task_inputs(self.processor, request, images=images, collective=True)
         return (self.process if process is None else process).generate(
             self.model, self.variables, inputs, max_new_tokens, key=key,
             eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)

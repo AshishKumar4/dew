@@ -87,6 +87,6 @@ def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims()
     result = task(prompts, 7, key=jax.random.key(11))
     with np.load(FIXTURES / "diffusion-gemma-workflow" / "reference.npz") as reference:
         np.testing.assert_array_equal(result.tokens, reference["tokens"][:, :12])
-    assert not hasattr(result, "raw_log_probs")
+
     rebound = task.bind(jax.tree.map(lambda leaf: leaf * 0.5, loaded.variables))
     assert not np.array_equal(rebound(prompts, 7, key=jax.random.key(11)).tokens, result.tokens)

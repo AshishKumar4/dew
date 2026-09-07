@@ -73,6 +73,9 @@ streaming = ["datasets"]
 tfds = ["tensorflow-datasets>=4.9.10"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
+# Official client transports and native request/result schemas; no model runtime.
+inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
+image-pipelines = ["diffusers==0.34.0"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
 
