@@ -1,0 +1,50 @@
+{#- A ChatML template whose tool calls carry ids: an assistant turn renders
+    its text, if any, then each call as <tool_call id="..."> with the function
+    name and its arguments as JSON; a tool turn renders the id and name of the
+    call it answers; a user turn's typed content parts render their text.
+    Generation markers wrap each assistant turn so the assistant mask can be
+    read back through transformers as an independent reference. -#}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- 'Tools:' }}
+    {%- for tool in tools %}
+        {{- '\n' + (tool | tojson) }}
+    {%- endfor %}
+    {{- '<|im_end|>\n' }}
+{%- elif messages[0].role == 'system' %}
+    {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+{%- endif %}
+{%- for message in messages %}
+    {%- if message.role == 'user' or (message.role == 'system' and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' }}
+        {%- if message.content is string %}
+            {{- message.content }}
+        {%- else %}
+            {%- for part in message.content %}
+                {%- if part.type == 'text' %}
+                    {{- part.text }}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == 'assistant' %}
+        {{- '<|im_start|>assistant\n' }}
+        {%- generation %}
+        {%- if message.content is string %}
+            {{- message.content }}
+        {%- endif %}
+        {%- for call in message.tool_calls %}
+            {{- '<tool_call id="' + call.id + '">' + call.function.name + ' ' + (call.function.arguments | tojson) + '</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+        {%- endgeneration %}
+    {%- elif message.role == 'tool' %}
+        {{- '<|im_start|>tool\n<tool_response id="' + message.tool_call_id + '" name="' + message.name + '">' + message.content + '</tool_response><|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
