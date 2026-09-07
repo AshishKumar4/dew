@@ -659,7 +659,7 @@ The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parall
 
 Models use configurable compute dtypes and hardware-dependent attention kernels: cuDNN on compatible NVIDIA GPU shapes, a Pallas TPU path, and XLA implementations for other configurations. Qwix supplies optional int8/fp8 computation, and MuonClip adds per-head QK clipping to Muon. Quantized weight loading is separate from quantized training.
 
-Set `remat=True` on a decoder to recompute block activations during the backward pass. This reduces retained activation memory at the cost of additional computation; it composes with layer scanning.
+Set `remat` on a decoder to a policy name such as `"full"`, `"minimal"`, or `"save_qkv_proj"` to recompute block activations during the backward pass while keeping the named projections. Offloaded policies such as `"minimal_offloaded"` keep those residuals in pinned host memory, and `Layout(host=("opt_state", "ema"))` places optimizer state there between steps. Both reduce device memory at the cost of additional computation or transfers; they compose with layer scanning.
 
 Start with [distributed training](docs/concepts/distributed.md) and the [TPU guide](docs/tpu.md). [Benchmarks](docs/benchmarks.md) and [performance notes](docs/performance.md) record workload sizes, hardware, memory, and timing. Physical multi-host GPU/TPU qualification is still limited.
 
