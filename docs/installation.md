@@ -54,7 +54,7 @@ For NVIDIA hardware, validate that JAX reports a CUDA device before running a GP
 
 ## Add optional dependencies
 
-The base package currently installs Transformers, Hugging Face Hub, WandB, and image-processing dependencies. These are not all optional in the package metadata. Additional extras cover the following uses:
+The base package currently installs Transformers, Hugging Face Hub, and image-processing dependencies. These are not all optional in the package metadata. Additional extras cover the following uses:
 
 | Extra | Use |
 |---|---|

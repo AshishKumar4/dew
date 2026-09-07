@@ -56,7 +56,7 @@ dew-tpu setup dew-16 --zone us-central2-b --type v5e-16 \
     --from-source --dry-run
 ```
 
-Run source setup from the Dew Git checkout. Dew translates `v5e-16` to the API name `v5litepod-16` and predicts two workers for the preview. `runtime_version="auto"` selects a runtime from Dew's generation table. That table is a default, not a live availability check; verify the runtime against the current [Cloud TPU software versions](https://cloud.google.com/tpu/docs/runtimes) before creating the slice. `--version` on **create** overrides the TPU runtime. `--version` on **setup** instead selects the Dew package release.
+Run source setup from the Dew Git checkout. Dew translates `v5e-16` to the API name `v5litepod-16` and predicts two workers for the preview. `runtime_version="auto"` selects a runtime from Dew's generation table. That table is a default, not a live availability check; verify the runtime against the current [Cloud TPU software versions](https://cloud.google.com/tpu/docs/runtimes) before creating the slice. `--version` on `create` overrides the TPU runtime. `--version` on `setup` instead selects the Dew package release.
 
 A real create waits for the TPU's READY state. `--spot` requests interruptible capacity; `--queued` uses the queued-resources API. An optional `--disk NAME` attaches a persistent disk and mounts it at `/mnt/persist`. Confirm disk location, permissions, and data ownership before attaching it.
 
