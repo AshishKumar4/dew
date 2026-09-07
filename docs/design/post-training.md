@@ -72,7 +72,7 @@ In: `prompt` `[B, P]` int32, left-padded, `prompt_length` `[B]` int32, and the t
 | `rewards` | `[N]` | float32 | raw scores, for telemetry |
 | `prompt_length` | `[N]` | int32 | real tokens before padding |
 
-The rollout returns fixed-width arrays even when EOS ends a completion early. The response mask and lengths describe valid actions. Generation groups equal prompt lengths before its cached decoder; those groups can create different JIT shapes. The returned training rectangle keeps `Trainer.compile` independent of completion lengths.
+The rollout returns fixed-width arrays even when EOS ends a completion early. The response mask and lengths describe valid actions. Generation groups equal prompt lengths before its cached decoder; those groups can create different JIT shapes. The returned training rectangle keeps `Trainer.compile` independent of completion lengths. The rollout receives the globally sharded batch, samples the rows this process's devices hold, and returns those rows; the group plan and decode trip count are agreed across processes, so ranks holding different lengths or stopping at different steps issue the same collectives over sharded parameters.
 
 ### 1.4 verl's parquet schema, mapped
 

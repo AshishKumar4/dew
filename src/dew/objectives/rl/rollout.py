@@ -13,6 +13,7 @@ import numpy as np
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.rl import group_advantage, rloo_advantage
 from dew.sampling.text import Sampling, generate
+from dew.training.distributed import local_rows
 
 from ..lm import LMObjective
 
@@ -67,9 +68,12 @@ class SampledRollout:
             raise ValueError("the advantage families are 'group' and 'rloo'")
 
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
-        prompts = np.asarray(batch[PROMPT_KEY])
-        prompt_lengths = np.asarray(batch[LENGTH_KEY])
-        sources, truths, infos = (_texts(batch[name]) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+        # The trainer hands over globally sharded arrays; this process samples
+        # the rows its devices hold and returns exactly those rows.
+        prompts = local_rows(batch[PROMPT_KEY])
+        prompt_lengths = local_rows(batch[LENGTH_KEY])
+        sources, truths, infos = (_texts(local_rows(batch[name]))
+                                  for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
         rows, width = prompts.shape
         if width + self.max_new_tokens != self.objective.seq_len + 1:
             raise ValueError("size the objective one below the prompt width plus max_new_tokens")
