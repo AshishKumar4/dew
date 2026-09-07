@@ -100,7 +100,8 @@ class Processor:
             audio_fields, audio_conditioning = self._audio(values, tokens)
             token_fields.update(audio_fields)
             conditioning = {**conditioning, **audio_conditioning}
-        text = self.record["text"]
+        # Wrapper records nest the decoder under "text"; text-only sources are the decoder record.
+        text = self.record.get("text", self.record)
         if not isinstance(text, Mapping) or type(text.get("vocab_size")) is not int:
             raise ValueError("the text record must carry its integer vocab_size")
         if np.any(tokens < 0) or np.any(tokens >= text["vocab_size"]):
