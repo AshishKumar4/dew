@@ -8,6 +8,7 @@ boundary. Dew never selects or executes this environment by default.
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+import base64
 import json
 import math
 import os
@@ -132,6 +133,17 @@ class _ProcessEnvironment:
         record = {"context": list(action.context), "tokens": list(action.tokens),
                   "terminated": action.terminated, "policy_step": action.policy_step}
         return _observation(self._request("step", {"action": record}))
+
+    def get_state(self) -> bytes:
+        reply = self._request("get_state", {})
+        if not isinstance(reply, Mapping) or not isinstance(reply.get("state"), str):
+            raise ValueError("sandbox get_state must return a base64 state string")
+        return base64.b64decode(reply["state"], validate=True)
+
+    def set_state(self, state: bytes) -> None:
+        reply = self._request("set_state", {"state": base64.b64encode(state).decode("ascii")})
+        if not isinstance(reply, Mapping) or reply.get("restored") is not True:
+            raise ValueError("sandbox set_state must acknowledge restored state")
 
     def close(self) -> None:
         try:
