@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.linen.dtypes import promote_dtype
+from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.moe import expert_projection
@@ -72,20 +72,23 @@ class GptOssExperts(nn.Module):
                           (self.num_local_experts, self.intermediate_size, self.hidden_size))
         down_bias = self.param("down_proj_bias", nn.initializers.zeros,
                                (self.num_local_experts, self.hidden_size))
-        x, gate_bias, down_bias = promote_dtype(x, gate_bias, down_bias, dtype=self.dtype)
+        # Infer the shared compute dtype from every original operand, while
+        # keeping master kernels uncast for the projection's derivative rule.
+        compute_dtype = canonicalize_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
+        x, gate_bias, down_bias = promote_dtype(x, gate_bias, down_bias, dtype=compute_dtype)
         experts = indices.reshape(-1)
         order = jnp.argsort(experts)
         sorted_experts = experts[order]
         group_sizes = jnp.bincount(experts, length=self.num_local_experts)
         tokens = x.reshape(-1, self.hidden_size)[order // indices.shape[-1]]
         projected = jnp.asarray(expert_projection(
-            tokens, gate_up, group_sizes, self.dtype, self.implementation,
+            tokens, gate_up, group_sizes, compute_dtype, self.implementation,
             self.precision)) + gate_bias[sorted_experts]
         gate = jnp.minimum(projected[..., ::2], 7.0)
         up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
         activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
         output = jnp.asarray(expert_projection(
-            activated, down, group_sizes, self.dtype, self.implementation,
+            activated, down, group_sizes, compute_dtype, self.implementation,
             self.precision)) + down_bias[sorted_experts]
         per_slot = output[jnp.argsort(order)].reshape(*indices.shape, self.hidden_size)
         return jnp.sum(per_slot * weights[..., None], axis=-2)

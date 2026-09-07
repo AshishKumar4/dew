@@ -1,6 +1,7 @@
 """Compare local shards of real-process expert exchange with whole-array routing."""
 
 import functools
+import itertools
 import json
 from pathlib import Path
 import sys
@@ -24,11 +25,13 @@ def main() -> None:
     split = NamedSharding(mesh, P('expert'))
     replicated = NamedSharding(mesh, P())
     errors: dict[str, list[float]] = {}
-    for skewed in (False, True):
+    for dtype, activation, skewed in itertools.product(
+            (jnp.float32, jnp.bfloat16), ('swiglu', 'geglu_exact'), (False, True)):
         inputs, routing_weights, choices = routing_case(16, 4, 2, skewed)
-        model = ExpertMLP(4, 12, 8)
+        model = ExpertMLP(4, 12, 8, dtype=dtype, activation=activation)
         with jax.default_device(jax.local_devices()[0]):
-            x, weights, ids = map(jnp.asarray, (inputs, routing_weights, choices))
+            x = jnp.asarray(inputs, dtype)
+            weights, ids = jnp.asarray(routing_weights), jnp.asarray(choices)
             parameters = model.init(jax.random.key(19), x, weights, ids)
             expected = jax.jit(jax.value_and_grad(functools.partial(objective, model, ids),
                                                 (0, 1, 2), has_aux=True))(parameters, x, weights)
@@ -46,13 +49,15 @@ def main() -> None:
                 return objective(model.clone(dispatch='exchange'), ids, p, x, weights)
             actual = jax.jit(jax.value_and_grad(loss, (0, 1, 2), has_aux=True),
                              out_shardings=out_specs)(parameters, x, weights, ids)
+        assert actual[0][1].dtype == dtype
         maxima = []
         for ours, theirs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             for shard in ours.addressable_shards:
-                a, b = np.asarray(shard.data), np.asarray(theirs)[shard.index]
+                a = np.asarray(shard.data).astype(np.float64)
+                b = np.asarray(theirs)[shard.index].astype(np.float64)
                 np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-5)
                 maxima.append(float(np.max(np.abs(a - b), initial=0)))
-        errors['skewed' if skewed else 'random'] = maxima
+        errors[f'{jnp.dtype(dtype).name}/{activation}/{skewed}'] = maxima
     output.write_text(json.dumps({'processes': jax.process_count(), 'errors': errors}))
     jax.distributed.shutdown()
 

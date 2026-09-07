@@ -19,6 +19,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from scipy.special import erfc
 
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_projection
+from dew.nn.gpt_oss import GptOssExperts
 from dew.training import MeshSpec, build_mesh
 
 # The multi-device layouts need the eight simulated CPU devices conftest
@@ -223,6 +224,25 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand():
     for dx, dk in jax.jit(mixed)(x, kernel, direction):
         np.testing.assert_array_equal(dx, np.full(x.shape, epsilon, np.float32))
         np.testing.assert_array_equal(dk, np.zeros(kernel.shape, np.float64))
+
+
+@pytest.mark.usefixtures('x64')
+def test_gpt_oss_infers_one_compute_dtype_from_all_expert_operands():
+    x = jnp.asarray([[2**24, 1, -2**24]], jnp.float32)
+    variables = {'params': {
+        'gate_up_proj': jnp.asarray([[[1, 0], [1, 0], [1, 0]]], jnp.float32),
+        'gate_up_proj_bias': jnp.zeros((1, 2), jnp.float32),
+        'down_proj': jnp.ones((1, 1, 3), jnp.float64),
+        'down_proj_bias': jnp.zeros((1, 3), jnp.float32)}}
+    model = GptOssExperts(3, 1, 1)
+    actual = jax.jit(model.apply)(variables, x, jnp.ones((1, 1), jnp.float32),
+                                 jnp.zeros((1, 1), jnp.int32))
+    # The fp64 down matrix promotes the gate too: 2^24 + 1 - 2^24 is 1,
+    # so the gated intermediate is sigmoid(1.702), not the fp32 zero.
+    expected = np.full((1, 3), 1 / (1 + np.exp(-1.702)), np.float64)
+    assert actual.dtype == jnp.float64
+    np.testing.assert_allclose(actual, expected, atol=2e-15, rtol=2e-15)
+
 
 
 @pytest.mark.usefixtures('x64')

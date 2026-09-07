@@ -194,9 +194,9 @@ class Mixture:
     contraction and nothing about the routing.
 
     `dispatch='exchange'` sends selected tokens to their expert shard in
-    bounded rounds on the existing expert mesh axis. It requires fp32 and
-    an expert count divisible by that axis. The default `'global'` retains
-    the global sort/gather path, including its low-precision gradients.
+    bounded rounds on an expert mesh axis larger than one that divides the
+    expert count. The default `'global'` retains global sort/gather. Both
+    dispatches share the projection precision and differentiation contract.
     """
 
     experts: int
