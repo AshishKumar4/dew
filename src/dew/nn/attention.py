@@ -301,7 +301,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None):
     if max_seq_len is None:
         raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
     batch, length, heads, head_dim = key.shape
-    if length > max_seq_len:
+    if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     cached_key = module.variable("cache", "cached_key", jnp.zeros,
                                  (batch, max_seq_len, heads, head_dim), key.dtype)
