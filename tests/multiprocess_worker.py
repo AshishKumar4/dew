@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from dew.telemetry.records import RECORD_TYPES
 from dew.data import Loading
+from dew.position import ENVELOPE
 from dew.training.evaluation import evaluate
 
 RES = 8
@@ -202,6 +203,34 @@ def indexed_loader(records: int, batch: int = BATCH):
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
         worker_count=0,
     )
+
+
+def elastic_loader(records: int, workers: int):
+    """`train_stream` over the same records, whose position is a global count.
+
+    The loader above is grain's own `DataLoader`, whose position is one
+    process's offset into its shard. This one is the path every dataset spec
+    takes, so what a pool reading it exercises is a position every process
+    reports alike and a pool of another size reads back.
+    """
+    from dew.data.dataset import Loading as ReadLoading
+    from dew.data.dataset import local_batch, train_stream
+
+    class Indexed:
+        """Records that say which they are, in the field the objective reads."""
+
+        def __repr__(self):
+            return f"Indexed(records={records})"
+
+        def __len__(self):
+            return records
+
+        def __getitem__(self, index):
+            return {"image": np.full((RES, RES, 3), index, np.uint8)}
+
+    return train_stream(Indexed(), [], batch=local_batch(BATCH), seed=0,
+                        loading=ReadLoading(workers=workers, threads=2, read_buffer=8,
+                                            worker_buffer=2))
 
 
 def batch_records(batch) -> list[int]:
@@ -438,9 +467,13 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    loader = indexed_loader(args.records, rows)
-    if args.block_after:
-        loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+    if args.elastic:
+        open_train = elastic_loader(args.records, args.workers)
+    else:
+        loader = indexed_loader(args.records, rows)
+        if args.block_after:
+            loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+        open_train = lambda: iter(loader)
     val, available = None, None
     scored = []
     evaluate = trainer.objective.evaluate
@@ -455,7 +488,7 @@ def mode_fit(args) -> dict:
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
         available = sum(1 for _ in data.val())
-    state = trainer.fit(Data(lambda: iter(loader), val=val, records=args.records),
+    state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(Batches(),))
@@ -848,8 +881,10 @@ def mode_builtin_preview_failures(args) -> dict:
     import jax
     import optax
     import dew.sampling.text as text_sampling
+    from dew.inference import TextGeneration
     from dew.data import Dataset
     from dew.diffusion import presets
+    from dew.sampling import text as text_sampling
     from dew.diffusion.discrete import MDLM
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -886,7 +921,7 @@ def mode_builtin_preview_failures(args) -> dict:
         state, _, _ = trainer.place()
         field = "_prompt" if kind == "lm" else "_sample"
         original = getattr(objective, field)
-        original_generate = text_sampling.generate
+        original_generate = TextGeneration.__call__
         closed = []
 
         def validation():
@@ -916,14 +951,14 @@ def mode_builtin_preview_failures(args) -> dict:
                             tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
                             terminated=jax.numpy.zeros((1,), bool),
                             behavior_log_probs=jax.numpy.zeros((1, 1)),
-                            raw_log_probs=jax.numpy.zeros((1, 1)))
+                            raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
                     return result
 
                 if phase == "setup":
                     if rank == source:
                         delattr(objective, field)
                 elif kind == "lm":
-                    text_sampling.generate = sample_failure
+                    TextGeneration.__call__ = sample_failure
                 else:
                     objective._sample = sample_failure
                 try:
@@ -937,7 +972,7 @@ def mode_builtin_preview_failures(args) -> dict:
                     reports[case] = {"error": None}
                 finally:
                     setattr(objective, field, original)
-                    text_sampling.generate = original_generate
+                    TextGeneration.__call__ = original_generate
                 # Files keep the successful escapee alive without accidentally
                 # matching the stranded rank's next JAX phase agreement.
                 ready = args.out.parent / f"{case}.{rank}.ready"
@@ -1082,7 +1117,17 @@ def mode_rollout(args) -> dict:
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
     drawn = generate(model, state.params, inputs_for(local), 4, key=jax.random.key(21),
-                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12))
+                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)).host()
+    # A resident global array reaches the task as it is: a process cannot
+    # fetch the rows the other process's devices hold, so a host round trip
+    # would fail here before any model ran.
+    from dew.inference import TextGeneration
+    from dew.training.distributed import shard_batch
+
+    resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
+    controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
+    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls).host()
+    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
         for fault in ("token", "length", "key"):
@@ -1128,12 +1173,51 @@ def mode_rollout(args) -> dict:
         "drawn_lengths": np.asarray(drawn.lengths).tolist(),
         "drawn_behavior": np.asarray(drawn.behavior_log_probs).tolist(),
         "drawn_raw": np.asarray(drawn.raw_log_probs).tolist(),
+        "resident_addressable": bool(resident.is_fully_addressable),
+        "resident_tokens": np.asarray(through_task.tokens).tolist(),
+        "resident_behavior": np.asarray(through_task.behavior_log_probs).tolist(),
+        "direct_tokens": np.asarray(direct.tokens).tolist(),
+        "direct_behavior": np.asarray(direct.behavior_log_probs).tolist(),
         "single": None if single is None else {
             name: np.asarray(value).tolist() for name, value in single.items()},
     }
 
 
+def mode_pipeline(args) -> dict:
+    """The front door on a pool: a diffusion run and an LM run placed on the
+    mesh, each rank handing in its own prompts, results read back per rank."""
+    import jax
+    import dew
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    rank = jax.process_index()
+    mesh, layout = MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY)
+    images = dew.pipeline(args.run_dir, mesh=mesh, layout=layout)
+    prompts = ["a", "b", "c", "d", "e", "f"]
+    text = dew.pipeline(args.lm_dir, mesh=mesh, layout=layout)
+    requests = ["the ", "a ", "some ", "one ", "two ", "four "]
+    if args.processes > 1:
+        rows = len(prompts) // args.processes
+        prompts = prompts[rank * rows:(rank + 1) * rows]
+        requests = requests[rank * rows:(rank + 1) * rows]
+    drawn = images(prompts, steps=3, seed=5)
+    generated = text(requests, seed=5, sampling=Sampling(temperature=0, eos_id=255))
+    return {
+        "process_count": jax.process_count(),
+        "image_spec": str(drawn.images.sharding.spec),
+        "image_rows": drawn.rows,
+        "images": drawn.host().images.tolist(),
+        "token_spec": str(generated.tokens.sharding.spec),
+        "rows": generated.rows,
+        "tokens": generated.host().tokens.tolist(),
+        "text": list(generated.text),
+        "parameter_specs": sorted({str(leaf.sharding.spec) for leaf in jax.tree.leaves(text.variables)}),
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "pipeline": mode_pipeline,
          "rollout": mode_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
@@ -1155,6 +1239,7 @@ def parse_args(argv=None):
     parser.add_argument("--microbatches", type=int)
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
+    parser.add_argument("--lm-dir", help="an LM run directory for the pipeline mode")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)
@@ -1169,6 +1254,9 @@ def parse_args(argv=None):
     parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--elastic", action="store_true",
+                        help="read the training records through train_stream, whose "
+                             "saved position is a global record count")
     return parser.parse_args(argv)
 
 

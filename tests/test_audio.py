@@ -28,6 +28,10 @@ from dew.nn.vision import (Gemma3nProjectorModule, Gemma4ProjectorModule,
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 
 
+on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
+                            reason="needs a cuda device")
+
+
 def _audio(kind):
     path = FIXTURES / kind
     record = json.loads((path / "config.json").read_text())
@@ -70,6 +74,32 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
     np.testing.assert_allclose(projected, data["projected"], rtol=0, atol=1e-4)
     assert encoded.mask.dtype == jnp.bool_
     assert encoded.features.dtype == jnp.float32
+
+
+@on_gpu
+def test_encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
+    """Frame subsampling must leave no strided slice on a dot's operand chain.
+
+    XLA's Triton GEMM fusion propagates a dot's tiling into its operands and
+    mishandles a strided slice, aborting the process with
+    `triton_tiling_propagation.cc: Check failed: src_fragment_it !=
+    src_fragments_order.end()` as soon as anything fusible produces the
+    sliced tensor. Deriving the mask from clip lengths inside the same jit
+    puts such a producer above every frame subsample, which the encoder's
+    former `mask[:, ::stride]` did not survive. Run with JAX_PLATFORMS=cuda.
+    """
+    path, _, variables, model, _, _, _ = audio
+    data = np.load(path / "reference.npz")
+
+    @jax.jit
+    def encode(variables, features, lengths):
+        return model.apply(variables, features,
+                           jnp.arange(features.shape[1])[None, :] < lengths[:, None])
+
+    encoded = encode(variables, jnp.asarray(data["input_features"]),
+                     jnp.asarray(data["input_features_mask"].sum(1, dtype=np.int32)))
+    np.testing.assert_array_equal(encoded.mask, data["valid"])
+    np.testing.assert_allclose(encoded.features, data["encoded"], rtol=0, atol=1e-4)
 
 
 def test_audio_input_gradients_and_sgd_step_match_reference(audio):
@@ -156,3 +186,20 @@ def test_processor_rejects_wrong_sampling_rate_without_resampling():
         processor(np.ones(1000, np.float32), sampling_rate=8000)
     with pytest.raises(ValueError, match="nonempty mono"):
         processor([np.ones((100, 2), np.float32)], sampling_rate=16000)
+
+
+def test_released_geometries_emit_the_processor_token_counts():
+    """30 s of 10 ms frames become 188 Gemma 3n and 750 Gemma 4 soft tokens.
+
+    Those are the counts the checkpoint processors expand (Gemma3nProcessor
+    audio_seq_length=188, Gemma4Processor audio_seq_length=750). Checked
+    abstractly, without allocating the 681M and 305M encoder parameters.
+    """
+    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())["audio_config"]
+    for record, tokens in ((released, 188), ({"model_type": "gemma4_audio"}, 750)):
+        encoder = audio_config(record).build()
+        output, _ = jax.eval_shape(encoder.init_with_output, jax.random.key(0),
+                                   jax.ShapeDtypeStruct((1, 3000, 128), jnp.float32),
+                                   jax.ShapeDtypeStruct((1, 3000), jnp.bool_))
+        assert output.features.shape[:2] == (1, tokens)
+        assert output.mask.shape == (1, tokens)

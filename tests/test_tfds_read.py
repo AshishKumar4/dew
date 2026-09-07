@@ -67,7 +67,7 @@ def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
 def test_an_unprepared_directory_requests_external_preparation(tmp_path):
     with pytest.raises(ValueError, match="prepared TFDS ArrayRecords"):
         OxfordFlowers().source()
-    with pytest.raises(FileNotFoundError, match="separate preparation environment"):
+    with pytest.raises(FileNotFoundError, match="separate environment"):
         OxfordFlowers(path=str(tmp_path)).source()
     assert list(tmp_path.iterdir()) == []
 
@@ -79,7 +79,7 @@ def test_a_tfrecord_preparation_is_refused_before_reading(tmp_path):
     metadata = json.loads(metadata_path.read_text())
     metadata["fileFormat"] = "tfrecord"
     metadata_path.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="reads ArrayRecords without TensorFlow"):
+    with pytest.raises(ValueError, match="dew reads ArrayRecords"):
         OxfordFlowers(path=str(directory)).source()
 
 

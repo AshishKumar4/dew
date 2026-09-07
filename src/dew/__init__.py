@@ -23,14 +23,15 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     )
     from dew.data import Dataset
     from dew.diffusion import Process
+    from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.registry import datasets, encoders, metrics, models, presets, samplers
     from dew.sampling import CFG, sample
     from dew.training import (
-        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, Tracker, Trackers,
-        Trainer, TrainState, WandbTracker, evaluate,
+        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, MLflowTracker,
+        TensorBoardTracker, Tracker, Trackers, Trainer, TrainState, WandbTracker, evaluate,
     )
 
 __version__ = "0.1.0"
@@ -50,12 +51,14 @@ _EXPORTS = {
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
+    "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
     "Evaluation": "dew.training", "evaluate": "dew.training",
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
+    "pipeline": "dew.inference",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -82,8 +85,9 @@ def __dir__() -> list[str]:
 __all__ = [
     "__version__",
     "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Evaluation", "Field",
-    "ImageGrid", "InputSpec", "Layout", "MeshSpec", "Objective", "Process",
-    "Representations", "Step", "TextSamples", "TokenScores", "Tracker",
+    "ImageGrid", "InputSpec", "Layout", "MLflowTracker", "MeshSpec", "Objective", "Process",
+    "Representations", "Step", "TensorBoardTracker", "TextSamples", "TokenScores", "Tracker",
     "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
-    "datasets", "encoders", "evaluate", "metrics", "models", "presets", "sample", "samplers",
+    "datasets", "encoders", "evaluate", "metrics", "models", "pipeline", "presets", "sample",
+    "samplers",
 ]

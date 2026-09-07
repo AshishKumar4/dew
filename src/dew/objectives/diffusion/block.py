@@ -127,6 +127,18 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
 
+    def pipeline(self, state, *, ema: bool = True, processor=None):
+        """The DiffusionGemma over the state's published weights as a
+        `BlockGeneration` task with the published sampler defaults; the
+        tokenizer's EOS ids are the caller's to set."""
+        from dew.diffusion.block import BlockProcess
+        from dew.inference.tasks import BlockGeneration
+        from dew.objectives.base import published
+
+        process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
+        return BlockGeneration(self.model, published(state, ema), process, processor,
+                               pad_token_id=self.pad_token_id)
+
     def init(self, key: jax.Array) -> Variables:
         if self.pretrained is not None:
             if "params" not in self.pretrained:

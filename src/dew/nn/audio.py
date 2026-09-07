@@ -166,6 +166,23 @@ class CumulativeGroupNorm(nn.Module):
         return ((fp32 - mean) * jax.lax.rsqrt(variance + self.epsilon) * scale).astype(dtype)
 
 
+def _every_nth_frame(z, stride: int):
+    """`z[:, ::stride]` as an explicit frame gather.
+
+    A strided slice anywhere on the value chain of a dot operand aborts the
+    XLA GPU compiler. Propagating a dot's tiling through a slice rewrites a
+    fragment's element count only where `slice_limit - slice_start` differs
+    from the operand's dimension, which a full-range strided slice never
+    does, so the operand's dim order keeps the sliced count for a dimension
+    that is `stride` times longer and the next dim-altering op walks off the
+    end of the fragment list: `triton_tiling_propagation.cc:698 Check failed:
+    src_fragment_it != src_fragments_order.end()` under xla::gpu::GemmFusion,
+    jaxlib 0.11.1. A gather is not fused into a GEMM operand, so it ends the
+    propagation rather than corrupting it.
+    """
+    return z if stride == 1 else z[:, jnp.arange(-(-z.shape[1] // stride)) * stride]
+
+
 class AudioSubsampleLayer(nn.Module):
     features: int
     kernel: tuple[int, int]
@@ -189,7 +206,7 @@ class AudioSubsampleLayer(nn.Module):
         else:
             x = nn.LayerNorm(epsilon=self.norm_eps, use_bias=False, dtype=self.dtype,
                              name="norm")(x)
-        return jax.nn.relu(x), mask[:, ::self.stride[0]][:, :x.shape[1]]
+        return jax.nn.relu(x), _every_nth_frame(mask, self.stride[0])[:, :x.shape[1]]
 
 
 class AudioSubsample(nn.Module):
@@ -474,7 +491,7 @@ class Gemma3nAudioEncoder(nn.Module):
         for index in range(cfg.conf_num_hidden_layers):
             x = Gemma3nConformer(cfg, dtype=self.dtype, precision=self.precision,
                                  name=f"conformer_{index}")(x, mask)
-        x, mask = x[:, ::cfg.conf_reduction_factor], mask[:, ::cfg.conf_reduction_factor]
+        x, mask = (_every_nth_frame(z, cfg.conf_reduction_factor) for z in (x, mask))
         return AudioEncoding(jnp.where(mask[..., None], x, 0), mask)
 
 
@@ -522,6 +539,21 @@ def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
     if unknown:
         raise ValueError(f"audio config fields {sorted(unknown)} have no counterpart")
     return from_record(cls, {key: value for key, value in record.items() if key in fields})
+
+
+def encoded_frame_stride(config: Gemma3nAudio | Gemma4Audio) -> int:
+    """Input frames per encoded frame: the subsampling strides and any reduction.
+
+    The encoders keep every stride-th frame of the input mask, so a host can
+    count a clip's encoded frames as mask[::stride] without running them.
+    """
+    if isinstance(config, Gemma3nAudio):
+        stride = config.conf_reduction_factor
+        for time_stride, _ in config.sscp_conv_stride_size:
+            stride *= time_stride
+        return stride
+    return 4
+
 
 
 @functools.cache

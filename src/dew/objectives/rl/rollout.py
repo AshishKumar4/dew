@@ -12,10 +12,9 @@ import numpy as np
 
 from dew.artifacts import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.rl import group_advantage, rloo_advantage
-from dew.sampling.text import Sampling, _mesh
-from dew.training.distributed import local_rows
+from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
 
@@ -92,7 +91,7 @@ class SampledRollout:
             prepared = prompts, prompt_lengths, sources, truths, infos, inputs
         except BaseException as failure:
             error = failure
-        if _mesh(state.params) is not None:
+        if mesh_of(state.params) is not None:
             agree_process_phase(error, phase="rollout input preparation")
         elif error is not None:
             raise error
@@ -100,13 +99,13 @@ class SampledRollout:
         prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
         policy = self.objective.policy(state.params, self.sampling)
-        generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group))
+        generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group)).host()
                      for group in range(self.groups)]
-        sampled = np.stack([np.asarray(result.tokens)[:, width:] for result in generated], axis=1)
-        lengths = np.stack([np.asarray(result.lengths) for result in generated], axis=1)
-        terminated = np.stack([np.asarray(result.terminated) for result in generated], axis=1)
-        raw = np.stack([np.asarray(result.raw_log_probs) for result in generated], axis=1)
-        behavior = np.stack([np.asarray(result.behavior_log_probs) for result in generated], axis=1)
+        sampled = np.stack([result.tokens[:, width:] for result in generated], axis=1)
+        lengths = np.stack([result.lengths for result in generated], axis=1)
+        terminated = np.stack([result.terminated for result in generated], axis=1)
+        raw = np.stack([result.raw_log_probs for result in generated], axis=1)
+        behavior = np.stack([result.behavior_log_probs for result in generated], axis=1)
         rewards = np.asarray([
             [self.reward(sources[row], self.decode(sampled[row, group,
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),

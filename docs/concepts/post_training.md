@@ -144,6 +144,30 @@ Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)` from `dew.sampl
 
 `old_log_probs` records raw policy likelihoods from the cached forward at sampling time. `behavior_log_probs` records the distribution after temperature/top-k; greedy behavior has log-probability zero for its selected action. GRPO retains its current/old raw-policy PPO ratio. A behavior-to-proximal importance correction is a separate algorithm choice and is not applied implicitly.
 
+## Tool episodes
+
+`dew.objectives.rl.EpisodeRollout` collects multi-turn episodes through a user-supplied environment and a bindable inference policy. It uses the ordinary `Trainer(rollout=...)` capability and `GRPOObjective`; it supplies no executor or sandbox. Pass `dew.inference.TextGeneration(model, variables)` as its policy. Collection calls `policy.bind(snapshot)` once. Each subsequent call receives exact context token IDs, a response budget, a key and `Sampling`, and returns `Generation` with raw and behavior log-probabilities. Canvas generation is not an autoregressive policy and cannot supply these likelihoods.
+
+The input dataset emits integer `task_id` rows. Your environment factory receives an `EpisodeId` containing the task, attempted step, sample index and random seed, then yields a context-managed `Environment`. Its `reset()` returns an `Observation` with the initial context; `step(action)` handles a completed model turn and returns either the exact next context or a terminal result. The environment owns decoding, tool-call validation, chat formatting, execution, timeouts and resource cleanup. Nothing in Dew executes generated code by default.
+
+`Observation.status` distinguishes running, completed, truncated, cancelled and error outcomes. Model EOS completes an action, while the environment decides when the episode ends. A response that reaches its token limit without EOS is recorded as truncated and is not sent to a tool. A context exceeding `max_prompt_tokens` also truncates the episode without cutting away its recorded input. `max_turns` bounds the number of model calls.
+
+The verifier takes an `Episode` and returns a finite scalar reward. It sees the termination status, result detail and every `Transition(action, observation)`, so it can score terminal and truncated outcomes differently. Group-relative advantages are computed over episodes of the same task and shared across their action tokens. This is a terminal-reward objective, not inferred per-tool credit. Exceptions, cancellation and verifier failures abort the group before an update. The optional `record` callback receives completed or failed host records; `EpisodeFailure` and `EpisodeCancelled` carry the partial episode.
+
+Verification runs while the environment context is still open, so a harness-owned verifier can inspect temporary files or a live sandbox. Resource release follows verification on both success and failure. A release failure invalidates the episode rather than admitting an otherwise scored trajectory.
+
+Every model call becomes a separate GRPO row. For B tasks, G samples and K allowed turns, the batch has B*G*K rows, each with `max_prompt_tokens + max_new_tokens` IDs. Set `GRPOObjective.seq_len` to that width minus one. The prompt contains the exact context, including observations, and the response contains only sampled actions, including EOS. Unused turn slots and response padding have zero loss mask. Observations are never response targets. Raw and behavior likelihoods are copied from the actual inference result without retokenizing or rescoring a transcript.
+
+Collection holds one variables snapshot until it returns. Its host records and numeric `policy_step` column retain the committed optimizer-update clock; episode identities retain the attempted-work clock. Projection refuses mixed policy clocks or attempts. Checkpoint continuation restores the Trainer and input iterator, so committed episode groups are not replayed. Recovery inside an external tool call, durable trajectory journals and exactly-once external effects remain the harness's responsibility. Variable-turn multi-process collection is explicitly refused pending a distributed environment coordinator; the numerical update still uses the local device mesh.
+
+Projection accepts records from one collection binding. Each episode and action retains an internal origin identity, so splicing records from separately bound policies fails even when their attempt and update clocks match. This identity is neither a user-configured version handle nor a weight-content hash; separately collected batches must be projected separately. It does not affect numerical randomness or equality of replayed public records.
+
+Raised asyncio and concurrent-futures cancellations both produce `EpisodeCancelled` with `CANCELLED` status. The original cancellation object remains its `__cause__`, and the environment exits under that original exception before the wrapper is raised. Explicit cancelled observations have no source exception.
+
+`tests/test_tool_episodes.py` exercises a trainable small policy that samples a square-tool call, receives its computed observation and samples a final answer. It checks action-only categorical gradients, raw/behavior probabilities, resource cleanup, failures and cancellation, and uninterrupted versus checkpoint-restored Trainer updates. These are offline lifecycle and numerical proofs, not evidence of remote sandbox operation.
+
+The lifecycle fits the responsibilities documented by [verl BaseTool](https://github.com/volcengine/verl/blob/main/verl/tools/base_tool.py): create, execute, calculate reward and release. Its [multi-turn guide](https://verl.readthedocs.io/en/latest/sglang_multiturn/multiturn.html) describes assistant-only masks and warns about retokenization differences. Dew retains each actual model call instead of reconstructing sampled tokens from message deltas. A remote sandbox adapter would additionally own creation, timeout policy and termination, as in the [E2B Python SDK](https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_sync/main.py). Neither an E2B client nor a verl runtime adapter is bundled here.
+
 ## Flow-GRPO
 
 Flow-GRPO optimizes generated samples with a reward function. It requires a rectified-flow Process with velocity prediction. The objective reuses DiffusionObjective's InputSpec, conditioning encoders, and optional autoencoder. The reward receives decoded samples in [-1, 1] and the repeated source batch, and returns one finite scalar per sample.
@@ -197,9 +221,9 @@ The chain exposes `beta`, `reward`, `groups`, `max_new_tokens`, and `sample`, bu
 
 ## Limits and evidence
 
-Agentic language-model RL (multi-turn interaction with tools or environments) remains planned work. A Python reward callback does not supply a sandbox, tool execution, agent trajectory management, or a serving system.
+Multi-turn text episodes are available through `EpisodeRollout` and a user-supplied environment. Built-in sandbox execution, pooled environment coordination and mid-tool recovery are not provided.
 
-Known trainer defects also affect planning real runs: overflow/resume can diverge, accumulation with unequal valid-token masks does not reproduce a globally token-weighted update, repeated evaluation can reuse random draws, and prefetch lifetime has an open issue. Keep `accumulation=1` for masked-loss comparisons, and do not treat this tiny run as proof of recovery or long-run stability. See [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before relying on those paths.
+The episode tests cover checkpoint continuation both after an optimizer update and inside a two-microbatch accumulation window. They also check that an environment error or cancellation leaves the previous checkpoint intact. External environment recovery is not included in that guarantee. See [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before relying on those paths in a long run.
 
 The recorded fixed-tensor comparisons are:
 

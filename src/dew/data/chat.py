@@ -481,8 +481,8 @@ class ConversationSource:
         self.path = path
 
     def __repr__(self) -> str:
-        # Grain writes repr(source) into a data loader iterator's checkpoint,
-        # so a resumed run needs the file here, not an address in this process.
+        # A saved data position names its source, so a resumed run needs the
+        # file here, not an address in this process.
         return f"{self.__class__.__name__}(path={self.path!r})"
 
     def __len__(self) -> int:
