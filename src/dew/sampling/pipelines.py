@@ -60,7 +60,8 @@ class TextToImage:
 
     @classmethod
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
-        return cls(objective.model, objective.process, objective.inputs, variables, objective.autoencoder)
+        """The objective's own inference counterpart, bound to these variables."""
+        return objective.text_to_image(variables)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool = True,
@@ -105,8 +106,8 @@ class TextToImage:
                        local_files_only: bool = False, from_pt: bool = False,
                        task: str | None = None) -> DiffusersTextToImage:
         """Load a Diffusers saved pipeline through its source-specific adapter."""
-        from dew.interop.diffusers import load_pipeline
-        return load_pipeline(directory, revision=revision, dtype=dtype, height=height, width=width,
+        from dew.interop.diffusers import load_diffusers_pipeline
+        return load_diffusers_pipeline(directory, revision=revision, dtype=dtype, height=height, width=width,
                              local_files_only=local_files_only, from_pt=from_pt, task=task)
 
     @property

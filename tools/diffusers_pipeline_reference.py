@@ -121,14 +121,15 @@ def build(directory, task):
 
 
 def bundle(root, destination):
-    """Bundle four generated task directories; xz shares their repeated weights.
+    """Bundle saved task directories; xz shares their repeated weights.
 
-    Generate ROOT/sd, ROOT/xl, ROOT/img2img, ROOT/inpaint first, then call
-    bundle(ROOT, "tests/fixtures/tiny_diffusers.tar.xz"). No model downloads.
+    Generate sd/xl/img2img/inpaint with this tool and the four additional
+    tasks with diffusers_extended_reference.py, then call bundle(ROOT,
+    "tests/fixtures/tiny_diffusers.tar.xz"). No model downloads.
     """
     import tarfile
     with tarfile.open(destination, "w:xz") as archive:
-        for task in ("sd", "xl", "img2img", "inpaint"):
+        for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"):
             archive.add((Path(root) / task).resolve(), arcname=task)
 
 

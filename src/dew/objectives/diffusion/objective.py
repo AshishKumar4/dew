@@ -110,6 +110,11 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
+    def text_to_image(self, variables):
+        """The inference task paired with this objective and variables snapshot."""
+        from dew.sampling.pipelines import TextToImage
+        return TextToImage(self.model, self.process, self.inputs, variables, self.autoencoder)
+
     def init(self, key):
         encoders = self.encoder_params()
         variables = self.model.init(
@@ -127,6 +132,23 @@ class DiffusionObjective(Objective[Mean]):
         return {name: value for name, value in params.items()
                 if name not in ("encoders", "autoencoder")}
 
+    def _conditions(self, params, batch, key, *, dropout):
+        tokens = {keyword: batch[condition.field]
+                  for keyword, condition in self.inputs.conditions.items()}
+        given = self.encode(params["encoders"], tokens)
+        if dropout:
+            count = batch[self.inputs.sample.key].shape[0]
+            dropped = jax.random.bernoulli(key, self.unconditional_prob, (count,))
+            given = jax.tree.map(
+                lambda value, blank: jnp.where(
+                    expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
+                given, self.unconditional)
+        return given, self.unconditional
+
+    def _sampling_batch(self, batch):
+        return {name: batch[name] for name in (self.inputs.sample.key,
+                *(condition.field for condition in self.inputs.conditions.values()))}
+
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
@@ -134,16 +156,7 @@ class DiffusionObjective(Objective[Mean]):
             data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
         count = data.shape[0]
 
-        # Conditioning dropout. A row drawn for the unconditional branch reads
-        # the unconditional value in every one of its conditions.
-        dropped = jax.random.bernoulli(drop_key, self.unconditional_prob, (count,))
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in self.inputs.conditions.items()}
-        given = self.encode(params["encoders"], tokens)
-        conditions = jax.tree.map(
-            lambda value, blank: jnp.where(
-                expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-            given, self.unconditional)
+        conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
 
         schedule = self.process.schedule
         t = schedule.sample_t(time_key, count)
@@ -161,11 +174,11 @@ class DiffusionObjective(Objective[Mean]):
         return Mean(jnp.sum(losses * weights),
                     jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
-    def _sample_impl(self, params, tokens, key, *, count: int):
-        given = self.encode(params["encoders"], tokens)
+    def _sample_impl(self, params, batch, key, *, count: int):
+        given, unconditional = self._conditions(params, batch, key, dropout=False)
         variables = self.trainable(params)
         denoise = self.process.denoiser(
-            self.model, variables, given, None if self.guidance is None else self.unconditional)
+            self.model, variables, given, None if self.guidance is None else unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
@@ -178,9 +191,7 @@ class DiffusionObjective(Objective[Mean]):
         """One generated sample for every real row, without display decoding."""
         params = params if step.ema is None else step.ema
         count = batch[self.inputs.sample.key].shape[0]
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in self.inputs.conditions.items()}
-        samples = self._sample(params, tokens, step.key, count=count)
+        samples = self._sample(params, self._sampling_batch(batch), step.key, count=count)
         assert self.artifact is not None
         return self.artifact(samples)
 
@@ -191,9 +202,7 @@ class DiffusionObjective(Objective[Mean]):
         try:
             params = params if step.ema is None else step.ema
             count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-            raw_tokens = {keyword: batch[condition.field]
-                          for keyword, condition in self.inputs.conditions.items()}
-            prepared = (self._sample, count, raw_tokens)
+            prepared = (self._sample, count, self._sampling_batch(batch))
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="diffusion preview setup")
@@ -201,9 +210,11 @@ class DiffusionObjective(Objective[Mean]):
         samples = tokens = None
         try:
             assert prepared is not None
-            sample, count, raw_tokens = prepared
-            tokens = jax.tree.map(lambda value: value[:count], raw_tokens)
-            samples = sample(params, tokens, step.key, count=count)
+            sample, count, raw_batch = prepared
+            selected = jax.tree.map(lambda value: value[:count], raw_batch)
+            samples = sample(params, selected, step.key, count=count)
+            tokens = {keyword: selected[condition.field]
+                      for keyword, condition in self.inputs.conditions.items()}
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="diffusion preview generation")
