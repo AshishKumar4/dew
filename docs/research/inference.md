@@ -147,6 +147,14 @@ Diffusers combines time-grid configuration, prediction conversion and numerical 
 
 Dew's `steps` counts grid points, followed by a final clean prediction. Diffusers schedulers own their inference timestep sequences. Numerical comparison must fix the initial noise, model prediction convention, grid, guidance and terminal behavior (`src/dew/sampling/sample.py:19-35`; `src/dew/diffusion/process.py:40-47`; [scheduler overview][D-overview]). The DiffusionGemma canvas is a separate token-sampling process. The Gaussian scheduler matrix does not establish its serving compatibility (`src/dew/diffusion/block.py:149-170`).
 
+### DiffusionGemma training contract and open prerequisites
+
+The [Google technical report, v1, §4 Eq. 11](https://arxiv.org/html/2608.00146v1#S4) specifies multinomial corruption: sample one noise level uniformly on [0, 1] per canvas, independently replace each token with a uniform vocabulary token with that probability, and minimize cross-entropy over every clean target in the canvas, not only changed tokens. The context is the clean prompt and previous clean canvases encoded into KV. This is not the MDLM masked-token loss and has no inverse-noise-level weighting in the stated equation.
+
+Full official training remains open. Section 4 conditions the loss on a self-conditioning signal but does not specify its training construction, detachment, dropout probability or coupling to the corruption sample. [Section 5](https://arxiv.org/html/2608.00146v1#S5) describes sampler distillation combined with RL without publishing the joint objective or teacher-target construction. Reproducing those stages requires those definitions; supplying an explicit signal can exercise Eq. 11 but does not recover the undisclosed recipe. Inference parity does not close these training prerequisites.
+
+A separate, concrete [NVIDIA NeMo AutoModel fine-tuning recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/dllm/diffusiongemma.mdx) is public: uniform corruption with an epsilon floor, one supervised canvas per example, flat canvas CE plus encoder AR CE, a detached first pass with self-conditioning probability 0.5, and frozen MoE routers. Those are documented third-party fine-tuning choices, not evidence that Google used them. Porting that recipe would need its own named numerical contract and objective tests; Dew does not currently claim that training parity.
+
 ## Ollama and llama.cpp
 
 | What it is | Who ships it (source) | What Dew has today | Gap | Fit |
