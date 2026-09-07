@@ -20,15 +20,20 @@ for ever.
 Position: `datasets` restores an unshuffled stream exactly, and grain
 composes that with the state of the transform and the batch behind it, so a
 stream read in file order resumes on the record it stopped at with the same
-per-record draws. A shuffled stream does not: what would come back is the
-library's place in the rows, not the contents of the buffer the shuffle was
-drawing from. `resumes` is that distinction, and `providers` withholds the
-state pair for the streams on the wrong side of it, which is the
-non-checkpointable contract `Dataset` already documents.
+per-record draws. Two kinds of stream cannot promise that. A stream dew
+shuffles loses the contents of the buffer the shuffle was drawing from,
+which are not in the state. A stream a caller hands over has come through
+transformations dew did not apply and cannot see, and one of them may lose
+as much; the library's own `.shuffle` is the example the reviewer found, and
+there is no public way to ask an `IterableDataset` what it has been through.
+`refusal` is that distinction, and `providers` withholds the state pair
+wherever it is set, which is the non-checkpointable contract `Dataset`
+already documents.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Optional
 
@@ -39,11 +44,25 @@ if TYPE_CHECKING:  # `datasets` is imported on the first row, not at import
 
 Row = dict[str, object]
 
-NO_POSITION = (
+SHUFFLED = (
     "a shuffled streamed split cannot be put back where it stopped: what "
     "`datasets` restores is its place in the rows, and the contents of the "
     "shuffle buffer it was drawing from are not in it. Read the split with "
     "shuffle_buffer=0, which resumes exactly, or train it with "
+    "checkpoint_every=None.")
+
+UNSUPPORTED = (
+    "`datasets` implements no state for this streamed split's source, so it "
+    "cannot be put back where it stopped; train it with "
+    "checkpoint_every=None.")
+
+GIVEN = (
+    "a streamed dataset handed to load() cannot be put back where it stopped: "
+    "it arrives through transformations dew did not apply, an upstream "
+    "`.shuffle` among the possibilities, and an `IterableDataset` cannot be "
+    "asked what it has been through, so no position over it can be promised "
+    "to restore the rows exactly. Name the split with data_files= or the "
+    "dataset id, which dew builds and can resume, or train this one with "
     "checkpoint_every=None.")
 
 NO_ROWS = (
@@ -64,25 +83,28 @@ def shared(rows: "IterableDataset", *, rank: int, world_size: int) -> "IterableD
     return split_dataset_by_node(rows, rank=rank, world_size=world_size)
 
 
-def resumes(rows: "IterableDataset", *, shuffled: bool) -> bool:
-    """Whether this stream can be put back where it stopped.
+def refusal(rows: "IterableDataset", *, shuffled: bool, given: bool) -> Optional[str]:
+    """Why this stream cannot be put back where it stopped, or None if it can.
 
-    A shuffled stream cannot, whatever the library reports, because the
-    buffer the shuffle drew from is not in the state. An unshuffled one can
-    when `datasets` implements the pair for its source, which is what
-    calling `state_dict` once, before any row is read, answers.
+    Three questions, in the order they can be answered without reading a row:
+    whether dew shuffled the stream, whether a caller supplied it and dew
+    therefore does not know what it has been through, and whether `datasets`
+    implements the state pair for its source at all, which is what calling
+    `state_dict` once answers.
     """
     if shuffled:
-        return False
+        return SHUFFLED
+    if given:
+        return GIVEN
     state = getattr(rows, "state_dict", None)
     load = getattr(rows, "load_state_dict", None)
     if state is None or load is None:
-        return False
+        return UNSUPPORTED
     try:
         state()
     except (NotImplementedError, AttributeError, TypeError, KeyError):
-        return False
-    return True
+        return UNSUPPORTED
+    return None
 
 
 class _Rows(pygrain.DatasetIterator):
@@ -96,12 +118,12 @@ class _Rows(pygrain.DatasetIterator):
     """
 
     def __init__(self, open_pass: Callable[[int], "IterableDataset"], *,
-                 epochs: Optional[int], resumable: bool, what: str, rank: int,
+                 epochs: Optional[int], refused: Optional[str], what: str, rank: int,
                  world_size: int):
         super().__init__()
         self._open_pass = open_pass
         self._epochs = epochs
-        self._resumable = resumable
+        self._refused = refused
         self._what = what
         self._rank = rank
         self._world_size = world_size
@@ -150,8 +172,8 @@ class _Rows(pygrain.DatasetIterator):
                 "rows": None if split is None else split.state_dict()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        if not self._resumable:
-            raise NotImplementedError(NO_POSITION)
+        if self._refused is not None:
+            raise NotImplementedError(self._refused)
         epoch, read, rows = state["epoch"], state["read"], state["rows"]
         if not isinstance(epoch, int) or not isinstance(read, int):
             raise ValueError(f"a streamed position counts passes and rows, not {state}")
@@ -171,7 +193,9 @@ class HFRows(pygrain.IterDataset):
     """A streamed split's rows for this process, as a grain `IterDataset`.
 
     Constructing one opens nothing; the first iterator opens the split.
-    `open_split()` returns the whole split, freshly: this shares it out, and
+    `open_split()` returns the whole split, freshly -- a pass may restore the
+    library's state into it, so two passes sharing one object would leave the
+    second starting where the first stopped. This shares it out, and
     shuffles it before the share when `shuffle_buffer` is set, because the
     share is over the shuffled shard list and two ranks that shuffled
     differently would disagree about which shards each of them owns. The
@@ -181,7 +205,7 @@ class HFRows(pygrain.IterDataset):
 
     def __init__(self, open_split: Callable[[], "IterableDataset"], *, what: str,
                  seed: int, rank: int, world_size: int, shuffle_buffer: int,
-                 epochs: Optional[int]):
+                 epochs: Optional[int], given: bool):
         super().__init__()
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} is not one of {world_size} processes")
@@ -191,16 +215,20 @@ class HFRows(pygrain.IterDataset):
             raise ValueError("a shuffle buffer holds no rows or more")
         self._open_split = open_split
         self.what = what
+        self.given = given
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
         self.shuffle_buffer = shuffle_buffer
         self.epochs = epochs
+        self._asked = threading.Lock()
+        self._refused: Optional[Optional[str]] = ...  # type: ignore[assignment]
 
     def __repr__(self) -> str:
         return (f"HFRows({self.what}, seed={self.seed}, "
                 f"share={self.rank}/{self.world_size}, "
-                f"shuffle_buffer={self.shuffle_buffer}, epochs={self.epochs})")
+                f"shuffle_buffer={self.shuffle_buffer}, epochs={self.epochs}, "
+                f"given={self.given})")
 
     def _pass(self, epoch: int) -> "IterableDataset":
         rows = self._open_split()
@@ -209,12 +237,28 @@ class HFRows(pygrain.IterDataset):
         return shared(rows, rank=self.rank, world_size=self.world_size)
 
     @property
+    def refused(self) -> Optional[str]:
+        """Why a position over these rows would not restore them, or None.
+
+        Answered once: the question opens the split, which for a hub dataset
+        is a request, and every iterator of these rows has the same answer.
+        Under a lock because grain's prefetch thread reads it while the
+        caller that made the iterator is still holding one.
+        """
+        with self._asked:
+            if self._refused is ...:
+                self._refused = refusal(self._pass(0),
+                                        shuffled=bool(self.shuffle_buffer),
+                                        given=self.given)
+            return self._refused
+
+    @property
     def resumable(self) -> bool:
         """Whether a position saved over these rows puts them back exactly."""
-        return resumes(self._pass(0), shuffled=bool(self.shuffle_buffer))
+        return self.refused is None
 
     def __iter__(self) -> pygrain.DatasetIterator[Row]:
-        return _Rows(self._pass, epochs=self.epochs, resumable=self.resumable,
+        return _Rows(self._pass, epochs=self.epochs, refused=self.refused,
                      what=self.what, rank=self.rank, world_size=self.world_size)
 
 
