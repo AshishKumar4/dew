@@ -389,6 +389,7 @@ def main() -> None:
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
     write_mirrored_config("gemma4-26b-a4b", "unsloth/gemma-4-26B-A4B-it")
 
+    write_tiny("gemma4-moe-tiny", tiny_gemma4_moe())
     write_gemma4_moe_block(FIXTURES.parent / "gemma4")
     write_tiny("gemma3n-tiny", tiny_gemma3n())
     write_gemma3n_blocks(FIXTURES.parent / "gemma3n")

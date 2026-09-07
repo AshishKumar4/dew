@@ -308,3 +308,7 @@ def write_qwen35_native() -> None:
 
 if __name__ == "__main__":
     write_gemma3_native()
+    write_gemma3n_native()
+    write_gemma4_native()
+    write_llama4_native()
+    write_qwen35_native()
