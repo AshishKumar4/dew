@@ -290,19 +290,41 @@ class Router(nn.Module):
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
-class ExpertLinear(nn.Module):
-    """One matrix per expert, `[exp, in_features, features]`, over tokens
-    already sorted by expert.
+def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
+                   implementation: str, precision: PrecisionLike = None,
+                   preferred_element_type: Optional[Dtype] = None) -> jax.Array:
+    """Each row of `tokens`, `[rows, in]`, through the matrix of its expert in
+    `kernel`, `[exp, in, out]`, for rows already sorted by expert.
 
     `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on, the form both grouped matmuls take.
-    `implementation` picks between them, the seam
-    `dew.nn.attention.scaled_dot_product_attention` has:
+    1, and so on, the form both grouped matmuls take. `implementation` picks
+    between them, the seam `dew.nn.attention.scaled_dot_product_attention`
+    has:
 
     - 'xla': `jax.lax.ragged_dot`, which lowers on every backend.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`).
+      kernels (`maxtext layers/moe.py:1633`); tokamax picks its Mosaic or
+      Triton kernel where one exists and lowers to XLA elsewhere.
     """
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(
+            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
+            f"{implementation!r}")
+    if implementation == 'tokamax':
+        # tokamax is not a dependency (docs/concepts/moe.md), so it is
+        # imported at the call.
+        tokamax = importlib.import_module('tokamax')
+        return tokamax.ragged_dot(
+            tokens, kernel, group_sizes, precision=precision,
+            preferred_element_type=preferred_element_type)
+    return jax.lax.ragged_dot(
+        tokens, kernel, group_sizes, precision=precision,
+        preferred_element_type=preferred_element_type)
+
+
+class ExpertLinear(nn.Module):
+    """One matrix per expert, `[exp, in_features, features]`, over tokens
+    already sorted by expert, through `grouped_matmul` on `implementation`."""
     num_experts: int
     in_features: int
     features: int
@@ -311,10 +333,6 @@ class ExpertLinear(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.implementation not in GROUPED_MATMULS:
-            raise ValueError(
-                f"implementation must be one of {list(GROUPED_MATMULS)}, got "
-                f"{self.implementation!r}")
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching nn.Dense of a dense MLP.
         self.kernel = self.param(
@@ -326,16 +344,9 @@ class ExpertLinear(nn.Module):
 
     def __call__(self, tokens, group_sizes):
         tokens, kernel = promote_dtype(tokens, self.kernel, dtype=self.dtype)
-        if self.implementation == 'tokamax':
-            # tokamax is not a dependency (docs/concepts/moe.md), so it is
-            # imported at the call.
-            tokamax = importlib.import_module('tokamax')
-            return tokamax.ragged_dot(
-                tokens, kernel, group_sizes, precision=self.precision,
-                preferred_element_type=tokens.dtype)
-        return jax.lax.ragged_dot(
-            tokens, kernel, group_sizes, precision=self.precision,
-            preferred_element_type=tokens.dtype)
+        return grouped_matmul(
+            tokens, kernel, group_sizes, implementation=self.implementation,
+            precision=self.precision, preferred_element_type=tokens.dtype)
 
 
 class ExpertMLP(nn.Module):

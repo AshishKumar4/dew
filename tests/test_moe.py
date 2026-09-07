@@ -524,15 +524,47 @@ def test_the_grouped_matmul_matches_a_per_expert_loop():
     assert np.max(np.abs(np.asarray(output) - reference)) < 1e-6
 
 
+def random_routing(key, tokens, top_k, num_experts=8):
+    """Distinct experts per token, as a router chooses them, under random
+    positive weights; some experts stay idle and the loads differ."""
+    choice_key, weight_key = jax.random.split(key)
+    _, indices = jax.lax.top_k(jax.random.normal(choice_key, (tokens, num_experts)), top_k)
+    return jax.random.uniform(weight_key, (tokens, top_k)), indices
+
+
 def test_the_tokamax_grouped_matmul_agrees_with_the_xla_one():
     """The optional kernel path, on a machine that has tokamax installed."""
     pytest.importorskip("tokamax")
-    experts, variables, x, weights, indices = routed_experts(top_k=2)
+    experts, variables, x, _, _ = routed_experts(top_k=2, tokens=24)
+    weights, indices = random_routing(jax.random.key(2), 24, 2)
     expected = experts.apply(variables, x, weights, indices)
     other = experts.clone(implementation='tokamax').apply(
         variables, x, weights, indices)
 
+    # Observed 0 on CPU, where tokamax lowers to the same ragged_dot; the
+    # bound leaves room for a Mosaic or Triton kernel's accumulation order.
     assert np.max(np.abs(np.asarray(other) - np.asarray(expected))) < 1e-6
+
+
+def test_the_tokamax_grouped_matmul_backs_the_same_gradients():
+    """Both kernels differentiate: the expert weights and the tokens get the
+    same gradient through either, under routing that loads experts unevenly."""
+    pytest.importorskip("tokamax")
+    experts, variables, x, _, _ = routed_experts(top_k=3, tokens=24)
+    weights, indices = random_routing(jax.random.key(3), 24, 3)
+    probe = jax.random.normal(jax.random.key(4), x.shape)
+
+    def gradients(module):
+        def loss(variables, x):
+            return jnp.sum(module.apply(variables, x, weights, indices) * probe)
+        return jax.grad(loss, argnums=(0, 1))(variables, x)
+
+    expected = gradients(experts)
+    other = gradients(experts.clone(implementation='tokamax'))
+
+    for theirs, ours in zip(jax.tree.leaves(expected), jax.tree.leaves(other), strict=True):
+        assert np.max(np.abs(np.asarray(ours) - np.asarray(theirs))) < 1e-6
+    assert all(float(jnp.max(jnp.abs(leaf))) > 0 for leaf in jax.tree.leaves(expected))
 
 
 def test_an_unknown_grouped_matmul_is_rejected():
@@ -683,6 +715,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     ({"experts": 4, "layers": (4,)}, "outside"),
     ({"experts": 4, "every": 0}, "positive"),
     ({"experts": 4, "top_k": 5}, "top_k"),
+    ({"experts": 4, "implementation": "megablox"}, "implementation"),
 ])
 def test_a_misconfigured_mixture_is_rejected(mixture, message):
     """A mixture's own dials are checked where they are set, and the ones
@@ -691,6 +724,32 @@ def test_a_misconfigured_mixture_is_rejected(mixture, message):
     with pytest.raises(ValueError, match=message):
         models.build("causal_transformer", **decoder_fields(mixture=mixture)).init(
             jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
+
+
+def test_a_tokamax_mixture_computes_the_xla_mixtures_logits():
+    """The mixture's implementation reaches every sparse layer's experts: the
+    same weights through either kernel give the same logits."""
+    pytest.importorskip("tokamax")
+    tokens = jax.random.randint(jax.random.key(0), (2, SEQ_LEN), 0, VOCAB)
+    reference = decoder(mixture=Mixture(experts=4, top_k=2, every=2))
+    variables = reference.init(jax.random.key(1), tokens)
+    expected = reference.apply(variables, tokens)
+    logits = decoder(mixture=Mixture(
+        experts=4, top_k=2, every=2, implementation='tokamax')).apply(variables, tokens)
+
+    # Observed 0 on CPU, where tokamax lowers to the same ragged_dot.
+    assert np.max(np.abs(np.asarray(logits) - np.asarray(expected))) < 1e-5
+
+
+def test_a_tokamax_mixture_runs_on_nothing_else(monkeypatch):
+    """The experts import tokamax at their call, so a model that names it
+    fails to initialise where the package cannot be imported instead of
+    running the XLA kernel under the tokamax name."""
+    # None in sys.modules is Python's own way to make an import fail.
+    monkeypatch.setitem(sys.modules, "tokamax", None)
+    model = decoder(mixture=Mixture(experts=4, top_k=2, layers=(1,), implementation='tokamax'))
+    with pytest.raises(ModuleNotFoundError, match="tokamax"):
+        model.init(jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))
 
 
 # --------------------------------------------------------------------------
