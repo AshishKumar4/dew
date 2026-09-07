@@ -83,16 +83,16 @@ Checkpoint loading needs the `interop` extra and may download substantial files.
 # runs elsewhere: downloads Qwen weights and requires enough host/device memory
 import jax
 import jax.numpy as jnp
-from dew.interop import load_pretrained_decoder
+from dew.interop import load_pretrained
 from dew.sampling import Sampling, generate
 from transformers import AutoTokenizer
 
 name = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(name)
-model, variables, config = load_pretrained_decoder(name, max_seq_len=64)
+pretrained = load_pretrained(name, max_seq_len=64)
 encoded = tokenizer("A short prompt", return_tensors="np")
 ids = jnp.asarray(encoded["input_ids"], dtype=jnp.int32)
-generated = generate(model, variables, ids, max_new_tokens=24,
+generated = generate(pretrained.model, pretrained.variables, ids, max_new_tokens=24,
                      key=jax.random.key(1), sampling=Sampling(temperature=0.8, top_k=40,
                                                             eos_id=tokenizer.eos_token_id))
 continuation = generated.tokens[0, ids.shape[1]:ids.shape[1] + int(generated.lengths[0])]
@@ -101,7 +101,7 @@ print(tokenizer.decode(continuation.tolist(), skip_special_tokens=True))
 
 The displayed string contains only valid continuation tokens. `Generation.tokens` also contains the original prompt and padded response slots. The base model is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model.
 
-Use the returned model configuration when continuing training. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
+Use `pretrained.model_config` when continuing training. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
 
 ## Diffusion language models and vision inputs
 

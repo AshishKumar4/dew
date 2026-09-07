@@ -2,11 +2,10 @@
 
 translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
-wrappers around them fetch a repo (or read a local directory), read the
-safetensors shards as fp32 without torch, and build the model, so
-load_pretrained_decoder returns a (model, variables, config) triple that a
-forward pass takes straight away. `config` is the dew config the model was
-built from.
+helpers around them fetch a repo (or read a local directory) and read the
+safetensors shards as fp32 without torch, so dew.interop.load_pretrained
+builds a model whose variables a forward pass takes straight away, and
+save_pretrained_decoder writes one back out in the HF layout.
 
 Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
 model_type: the config translation, the tensor path rule and the export
@@ -40,7 +39,6 @@ from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 import ml_dtypes
 import numpy as np
 
-from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
@@ -48,10 +46,9 @@ from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.nn import vision as vision_nn
 
-CONFIG_FILE = "config.json"
 GENERATION_CONFIG_FILE = "generation_config.json"
 
 # The KV cache is allocated at the full decode length, so a 128k-context
@@ -2064,45 +2061,11 @@ def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
         allow_patterns=["*.safetensors", "*.json"]))
 
 
-def load_pretrained_decoder(name_or_dir: str, *, dtype: str = 'bfloat16',
-                            attention_impl: str = 'auto',
-                            max_seq_len: Optional[int] = None,
-                            revision: Optional[str] = None
-                            ) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
-    """A Hugging Face decoder checkpoint, as (model, variables, config).
-
-    `name_or_dir` is a hub repo id or a local directory in the HF layout.
-    The config is translated, the weights mapped onto that tree in fp32, and
-    the model built with the run's precision policy, so `variables` fits the
-    model and the policy's `dtype` reaches every module the same way it does
-    in a training run. max_seq_len defaults to the config's context clamped
-    to 8192, because the KV cache is allocated at that length. `config` is
-    what the model was built from, in dew's own vocabulary. A caller logs
-    the model it ran.
-    """
-    directory = _snapshot(name_or_dir, revision)
-    with open(directory / CONFIG_FILE) as handle:
-        hf_config = json.load(handle)
-
-    config = translate_config(hf_config)
-    if max_seq_len is not None:
-        config['max_seq_len'] = int(max_seq_len)
-
-    tensors = dequantize_checkpoint(_load_shards(directory), fp8_block(hf_config))
-    variables = translate_weights(tensors, config)
-
-    built = with_precision('causal_transformer', config,
-                           dtype=dtype, attention_impl=attention_impl)
-    model = models.build('causal_transformer', **built)
-    _check_tree(variables, model)
-    return model, variables, built
-
-
 def save_pretrained_decoder(model, variables, directory, *,
                             tokenizer_name: Optional[str] = None) -> None:
     """Write a decoder back out in the HF layout: config.json, model.safetensors.
 
-    The inverse of load_pretrained_decoder, the same field map run backwards.
+    The inverse of load_pretrained, the same field map run backwards.
     A round-trip through dew hands transformers a checkpoint it accepts and
     a load hands back bitwise-equal parameters. The family entry whose
     predicate matches the model names the model_type: a model with the

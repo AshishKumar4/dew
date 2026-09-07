@@ -78,5 +78,5 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.eval` | `ImageMetric`, `frames`, `clip`, `clip_score`, `fid`, `frechet_distance`, `peak_signal_noise_ratio`, `psnr`, `structural_similarity`, `ssim` |
-| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights`, `Pretrained`, `Processor`, `load_pretrained` |
+| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights`, `Pretrained`, `Processor`, `load_pretrained` |
 | `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `preference_logsigmoid`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |

@@ -475,12 +475,12 @@ import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
 
-from dew.interop import load_pretrained_decoder
+from dew.interop import load_pretrained
 from dew.sampling import Sampling, generate
 
 checkpoint = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-pretrained_model, variables, config = load_pretrained_decoder(
+pretrained = load_pretrained(
     checkpoint,
     dtype="bfloat16",
     max_seq_len=512,
@@ -490,8 +490,8 @@ prompt = jnp.asarray(
     dtype=jnp.int32,
 )
 result = generate(
-    pretrained_model,
-    variables,
+    pretrained.model,
+    pretrained.variables,
     prompt,
     max_new_tokens=128,
     key=jax.random.key(0),
@@ -500,7 +500,7 @@ result = generate(
 print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 ```
 
-Pass `pretrained=variables` to `LMObjective` or a post-training objective to continue from those weights. Tokenize training data with the checkpoint's own tokenizer. For pretrained diffusion runs, `TextToImage.from_run` reads the saved recipe and checkpoint; CLIP/T5 conditioning and a configured VAE are restored with the run.
+Pass `pretrained=pretrained.variables` to `LMObjective` or a post-training objective to continue from those weights. Tokenize training data with the checkpoint's own tokenizer. For pretrained diffusion runs, `TextToImage.from_run` reads the saved recipe and checkpoint; CLIP/T5 conditioning and a configured VAE are restored with the run.
 
 ### Custom Flax models
 
