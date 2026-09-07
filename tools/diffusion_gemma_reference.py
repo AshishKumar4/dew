@@ -150,10 +150,11 @@ def main():
         eos_token_id=1,
         sampler_config={"_cls_name": "EntropyBoundSamplerConfig", "entropy_bound": 0.1})
     generation.save_pretrained(FIXTURE)
-    tokenizer = Tokenizer(WordLevel({f"t{i}": i for i in range(64)}, unk_token="t3"))
+    vocabulary = {("<pad>", "<eos>", "<bos>", "<unk>")[i] if i < 4 else f"t{i}": i for i in range(64)}
+    tokenizer = Tokenizer(WordLevel(vocabulary, unk_token="<unk>"))
     tokenizer.pre_tokenizer = WhitespaceSplit()
-    processor = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t3",
-                                       pad_token="t0", bos_token="t2", eos_token="t1")
+    processor = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="<unk>",
+                                       pad_token="<pad>", bos_token="<bos>", eos_token="<eos>")
     processor.save_pretrained(FIXTURE)
     prompt = torch.tensor([[2, 5, 7, 9, 11], [2, 6, 8, 10, 12]])
     canvas = torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]])
