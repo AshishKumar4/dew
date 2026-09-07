@@ -828,6 +828,53 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
+    """Two ranks own prompts of different lengths and stop at different steps.
+
+    Bucket plans and the decode trip count are agreed from every rank's
+    prompt lengths over parameters sharded across both ranks, so the ranks
+    issue the same collectives and both reach the rendezvous after sampling.
+    The sampled rows, lengths and likelihoods match a single process over
+    the same prompts, and the update that follows moves the same parameters.
+    """
+    reports = run_pool("rollout", tmp_path, 2, fsdp_size=2)
+    single = run_worker("rollout", tmp_path / "single.json", fsdp_size=1)
+
+    assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
+    assert all(report["sampled_seconds"] < 300 for report in reports)
+    for report in reports:
+        assert report["process_count"] == 2
+        assert report["sharding"]["fully_addressable"] == [False]
+        assert report["step"] == 1
+    expected = single["single"]
+    pooled = {name: reports[0][name] + reports[1][name]
+              for name in ("input_ids", "response_length", "terminated",
+                           "response_mask", "old_log_probs", "behavior_log_probs")}
+    assert pooled["input_ids"] == expected["input_ids"]
+    assert pooled["response_length"] == expected["response_length"]
+    assert pooled["terminated"] == expected["terminated"]
+    assert pooled["response_mask"] == expected["response_mask"]
+    np.testing.assert_allclose(pooled["old_log_probs"], expected["old_log_probs"],
+                               rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(pooled["behavior_log_probs"], expected["behavior_log_probs"],
+                               rtol=1e-5, atol=1e-6)
+    # The ranks stop at different steps and hold different prompt lengths.
+    assert len(set(pooled["response_length"])) > 1
+    assert reports[0]["response_length"] != reports[1]["response_length"]
+    assert sorted(set(reports[0]["prompt_lengths"])) != sorted(set(reports[1]["prompt_lengths"]))
+    # Stochastic draws: each rank's rows are drawn with their global row keys,
+    # so the pool reproduces the single process token for token.
+    for name in ("drawn_tokens", "drawn_lengths"):
+        assert reports[0][name] + reports[1][name] == single[name]
+    for name in ("drawn_behavior", "drawn_raw"):
+        np.testing.assert_allclose(reports[0][name] + reports[1][name], single[name],
+                                   rtol=1e-5, atol=1e-6)
+    assert any(value < 0 for row in single["drawn_behavior"] for value in row)
+    assert_same_parameters(dumped_params(tmp_path / "process0.json"),
+                           dumped_params(tmp_path / "single.json"))
+
+
+@pytest.mark.distributed
 def test_a_pool_draws_a_jepa_artifact(tmp_path):
     """A tracker attached to a real pool run gets a complete artifact.
 
