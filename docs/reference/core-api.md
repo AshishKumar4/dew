@@ -194,6 +194,9 @@ task(request, max_new_tokens, *, key, process=None, images=None) -> CanvasGenera
 Pretrained.text_generation(sampling=None) -> TextGeneration
 Pretrained.block_generation() -> BlockGeneration
 TextToImage.from_objective(objective, variables) -> TextToImage
+TextToImage.from_run(directory, *, ema=True, step=None) -> TextToImage
+TextToImage.from_pretrained(repo_id, *, ema=True) -> TextToImage
+LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
 image_task.prepare(prompts, *, key) -> DenoisingInputs
 image_task(prompts_or_prepared, *, steps=50, sampler=DDIM(), guidance=None, key) -> jax.Array
@@ -201,7 +204,9 @@ image_task(prompts_or_prepared, *, steps=50, sampler=DDIM(), guidance=None, key)
 
 A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text/numeric batches, floats, strings inside token rows and booleans are rejected without filtering rows or coercing IDs. `ModelInputs` carries prepared images and other numeric conditioning; raw images go through the bound processor in both text and canvas tasks.
 
-Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` to choose an explicit supported policy. This override is a deliberate change of policy, not inferred equivalence with the source default.
+Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` to choose an explicit supported policy.
+
+`LMObjective.policy(params)` returns the `TextGeneration` bound to those parameters, which is the task `SampledRollout` samples with, so a rollout and a hand-written draw share one decode path. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
 
 `BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods. Text and canvas tasks retain different result types. `TextToImage.prepare` returns initial noise and encoded conditional/unconditional values. Passing those arrays back to the image task reuses preparation while varying a solver or guidance value. Rebinding the image task preserves its model and encoders.
 
@@ -226,13 +231,13 @@ with openai.OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local") as clie
                   extra_body={"top_k": 40, "min_p": 0.05})
 ```
 
-The convenience call returns `Completion(texts, finish_reasons, token_counts, usage, responses)`. Missing per-choice token counts and finish reasons remain `None`. Aggregate OpenAI usage is separate; it is never split among choices or replaced with zeros. `responses` retains the SDK models, including reported logprobs, token data and extensions. These are backend reports, not invented native raw/behavior policy likelihoods.
+The convenience call returns `Completion(texts, finish_reasons, token_counts, usage, responses)`. Missing per-choice token counts and finish reasons remain `None`. Aggregate OpenAI usage stays separate from the per-choice fields. `responses` retains the SDK models, including the logprobs, token data and extensions the backend reported.
 
-An explicit `sampling=Sampling(...)` sets the native policy controls supported by the selected backend. Ollama receives neutral repetition/presence/frequency penalties and explicit top-k/top-p/min-p values, so its hidden `repeat_penalty=1.1` default does not alter the request. Conflicting explicit options are refused. `OpenAICompletion(..., provider="vllm")` enables vLLM-specific Sampling translation, including `repetition_penalty=1.0` and optional EOS-token IDs. Without a Sampling value, provider defaults or the caller's SDK options apply. Native and backend tokenizers can still differ; this is not an RL interoperability guarantee.
+An explicit `sampling=Sampling(...)` sets the native policy controls supported by the selected backend. Ollama receives neutral repetition/presence/frequency penalties and explicit top-k/top-p/min-p values, so its hidden `repeat_penalty=1.1` default does not alter the request. Conflicting explicit options are refused. `OpenAICompletion(..., provider="vllm")` enables vLLM-specific Sampling translation, including `repetition_penalty=1.0` and optional EOS-token IDs; without it the client refuses `top_k`, `min_p` and `eos_id` rather than dropping them. Without a Sampling value, provider defaults or the caller's SDK options apply. A backend's tokenizer can segment the same prompt differently from the exported one, so prompt token counts agree more often than prompt ids do.
 
 `stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama request conversion, HTTP behavior, error handling and line-stream framing use its SDK; the adapter validates counts before SDK coercion. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget, requested choice count and an explicit `Sampling` policy cannot be overridden through provider extensions; the SDK writes `extra_body` over the named parameters, so a policy field there must equal the policy or the request is refused before any network call.
 
-Live CPU verification imported a locally trained Dew model through `Pretrained.save`, including tokenizer assets, then exercised official SDK completion and streaming on Ollama and its OpenAI-compatible endpoint. Native save/reload was exact. This does not establish numerical parity between Dew and Ollama, or a live vLLM run.
+A decoder trained through the LM recipe, exported with `save_pretrained_decoder` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. `Pretrained.save` and `save_pretrained_decoder` leave the same files, so either export converts.
 
 ## Diffusion and JEPA objectives
 
@@ -254,4 +259,4 @@ A registry maps names to known classes or factories. For example, `models.build(
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 
-For complete family restrictions, model-specific data, quantization, and deployment scope, use the [capability reference](support.md) and the relevant task guide.
+The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.

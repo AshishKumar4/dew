@@ -76,14 +76,14 @@ uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/
 For HF vision processors, install matching CPU PyTorch and torchvision wheels first,
 then add Dew's vision extra. This keeps image preprocessing on the host without
 installing CUDA PyTorch packages beside JAX's accelerator runtime. The native
-Gemma4 processor path was checked with torch 2.14.0+cpu and torchvision 0.29.0+cpu.
+Gemma4 processor path was checked with torch 2.14.0+cpu and torchvision 0.29.0+cpu; without the extra, the native multimodal checkpoints load but their processors raise on images.
 
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 uv pip install 'dew-ml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-Qwix quantization and tokamax kernels require their respective external packages; they are not declared as installable Dew extras in the current package metadata. See [capabilities and limitations](reference/support.md) before enabling them.
+Qwix quantization and tokamax kernels need their own packages; neither is a declared Dew extra. `uv pip install qwix` adds the quantization one.
 
 ## Prepare TFDS data separately
 
