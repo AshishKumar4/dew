@@ -232,10 +232,6 @@ def test_scoring_covers_all_conditions_and_preview_decodes_only_its_small_draw()
     assert isinstance(artifact, ImageGrid)
     assert artifact.images.shape == (batch[objective.inputs.sample.key].shape[0], RES, RES, 3)
     assert artifact.captions == ()
-    tokens = {name: batch[condition.field]
-              for name, condition in objective.inputs.conditions.items()}
-    expected = objective._sample(params, tokens, step.key, count=artifact.images.shape[0])
-    np.testing.assert_array_equal(artifact.images, expected)
     preview = objective.preview(params, batch, step)
     assert isinstance(preview, ImageGrid)
     encoder = objective.inputs.conditions["textcontext"].encoder

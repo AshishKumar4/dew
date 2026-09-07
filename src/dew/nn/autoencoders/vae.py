@@ -1,10 +1,8 @@
-"""
-Flax VAE (Stable Diffusion AutoencoderKL) modules, vendored from
-huggingface/diffusers v0.29.2 `src/diffusers/models/vae_flax.py` (Apache-2.0),
-since diffusers ships no Flax modules any more (huggingface/diffusers#14169).
-Only the plain linen modules are kept; `load_pretrained_vae` below reads the
-config and the weights from the Hub or a directory in place of the diffusers
-ConfigMixin/FlaxModelMixin machinery.
+"""Convolutional VAE building blocks originally ported from
+huggingface/diffusers v0.29.2 src/diffusers/models/vae_flax.py (Apache-2.0).
+
+These are independent linen modules in Dew. The loader below reads source
+configuration and checkpoint files; no external model implementation runs.
 """
 
 import json
