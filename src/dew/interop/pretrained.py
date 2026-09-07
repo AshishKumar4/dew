@@ -24,6 +24,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
+from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 
 
@@ -379,7 +380,7 @@ class Pretrained:
     """
 
     model: nn.Module
-    variables: Mapping[str, Mapping[str, object]]
+    variables: Variables
     processor: Processor | None
     config: Mapping[str, object]
     source: Path
