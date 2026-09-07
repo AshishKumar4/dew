@@ -1,25 +1,28 @@
 """Prepared TFDS ArrayRecords as a grain source.
 
-Preparation is a separate job: it downloads, generates and writes shards, and
-it needs TensorFlow. Reading them does not, so this reads what preparation
-left behind through TFDS's read-only builder and never generates anything.
-A training run that could prepare its own data would download a corpus from
-inside the step loop and write it into whatever directory it happened to
-have, so the absence of a preparation path here is the feature.
+Preparation downloads, generates and writes the shards, and needs
+TensorFlow. Reading them needs neither: TFDS's read-only builder opens what
+preparation left behind, and nothing here prepares or generates.
 
-`prepared` resolves the version directory: the directory itself when it holds
-the metadata, otherwise `<data_dir>/<builder>/<config>/<version>` built from
-the names a caller gave. `TFDSSource` is then the builder's own data source,
-checked for the file format and the shards dew can read.
+`prepared` resolves the version directory: the directory itself when it
+holds the metadata, otherwise `<data_dir>/<builder>/<config>/<version>` from
+the names a caller gave, taking the newest version when none is named.
+`read_only_builder` compares the builder, config and version asked for with
+what the metadata reports and refuses a file format other than ArrayRecord.
+`prepared_source` is the builder's own data source behind those checks and a
+check that every shard of the split is present.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from etils import epath
+
+if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
+    from tensorflow_datasets import DecoderTree
 
 METADATA = ("dataset_info.json", "features.json")
 """What a prepared version directory holds beside its shards."""
@@ -61,11 +64,9 @@ def prepared(path: str, *, builder: Optional[str] = None, config: Optional[str] 
     if not root.is_dir():
         raise FileNotFoundError(f"No prepared TFDS data at {path!r}. " + PREPARE)
     if all((root / name).is_file() for name in METADATA):
-        if config is not None or version is not None:
-            raise ValueError(
-                f"{path!r} is a prepared version directory, so it names its own "
-                f"config and version; drop config= and version= or pass the "
-                f"data_dir above it")
+        # A resolved directory needs no names to find it. A caller who gives
+        # them anyway is constraining what it must hold, and the metadata
+        # checks in `read_only_builder` are where that is answered.
         return root
     if builder is None:
         raise FileNotFoundError(
@@ -165,8 +166,8 @@ def shards(builder, split: str, directory: epath.Path) -> None:
 
 
 def prepared_source(path: str, split: str, *, builder: Optional[str] = None,
-                    config: Optional[str] = None,
-                    version: Optional[str] = None) -> Sequence[object]:
+                    config: Optional[str] = None, version: Optional[str] = None,
+                    decoders: Optional["DecoderTree"] = None) -> Sequence[object]:
     """Random access over one split of a prepared TFDS dataset.
 
     The builder's own `as_data_source` is already grain's protocol, so what
@@ -175,12 +176,14 @@ def prepared_source(path: str, split: str, *, builder: Optional[str] = None,
     directory earns. There is no wrapper object, because there would be
     nothing for one to do.
 
-    `split` takes TFDS's own syntax, slicing included. A record is whatever
-    the prepared features make it, which for a features dict is a mapping and
-    for a single feature is a bare array, so the type here says `object` and
-    the run's own `preprocess` is where it becomes batch fields.
+    `split` takes TFDS's own syntax, slicing included, and `decoders` reaches
+    the builder unchanged, so a caller can hand it `SkipDecoding()` for a
+    feature it wants as the bytes on disk. A record is whatever the prepared
+    features and those decoders make it, which for a features dict is a
+    mapping and for a single feature a bare array, so the type here says
+    `object` and the run's own `preprocess` is where it becomes batch fields.
     """
     directory = prepared(path, builder=builder, config=config, version=version)
     reader = read_only_builder(directory, builder=builder, config=config, version=version)
     shards(reader, split, directory)
-    return reader.as_data_source(split)
+    return reader.as_data_source(split, decoders=decoders)

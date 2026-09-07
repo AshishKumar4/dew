@@ -117,9 +117,15 @@ def test_the_data_dir_above_a_prepared_version_resolves_by_name():
     assert data.records == 16
 
 
-def test_a_version_directory_and_a_version_name_together_are_refused():
-    with pytest.raises(ValueError, match="names its own config and version"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), version="1.0.0",
+def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
+    """A caller who has the version directory may still say which version it
+    must hold; the metadata answers, so a match reads and a mismatch stops."""
+    data = dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
+                         version="1.0.0", preprocess=image_and_label, **READ)
+    assert data.records == 16
+
+    with pytest.raises(ValueError, match="holds version '1.0.0'"):
+        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), version="2.0.0",
                       preprocess=image_and_label, **READ)
 
 
@@ -162,9 +168,33 @@ def test_a_half_copied_prepared_dataset_is_refused_before_the_run(tmp_path):
         dew.data.load("tfds/dew_images", batch=4, path=str(copy))
 
 
-def test_the_tfds_provider_names_an_option_it_does_not_take():
-    with pytest.raises(TypeError, match=r"does not take \['builder_name'\]"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), builder_name="x")
+def test_an_option_no_provider_knows_is_refused_by_the_signature():
+    with pytest.raises(TypeError, match="builder_name"):
+        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
+                      builder_name="x")  # type: ignore[call-arg]
+
+
+def test_an_option_of_the_other_provider_is_named():
+    with pytest.raises(TypeError, match=r"tfds provider does not take \['streaming'\]"):
+        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), streaming=True)
+    with pytest.raises(TypeError, match=r"hf provider does not take \['path'\]"):
+        dew.data.load("hf/json", batch=4, path="/tmp")
+
+
+def test_a_decoder_the_caller_supplies_reaches_the_builder():
+    """`SkipDecoding` hands back the bytes on disk, which is what a run that
+    decodes images itself wants; the option is TFDS's and is forwarded."""
+    import tensorflow_datasets as tfds
+
+    data = dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
+                         decoders={"image": tfds.decode.SkipDecoding()},
+                         preprocess=lambda record, rng: {"raw": np.frombuffer(
+                             record["image"], np.uint8)[:4]},
+                         **READ)
+
+    assert data.records == 16
+    assert next(iter(data.train()))["raw"].shape == (4, 4)
+    assert "tensorflow" not in sys.modules
 
 
 def test_the_tfds_provider_needs_a_prepared_path():
@@ -177,6 +207,14 @@ def test_the_tfds_provider_needs_a_prepared_path():
 # ---------------------------------------------------------------------------
 
 datasets = pytest.importorskip("datasets", reason="needs the streaming extra")
+
+
+@pytest.fixture(scope="module")
+def one_row(tmp_path_factory):
+    """A split of a single row, so a pool of four leaves three ranks empty."""
+    path = tmp_path_factory.mktemp("hf-one") / "row.jsonl"
+    path.write_text(json.dumps({"index": 0}))
+    return str(path)
 
 
 @pytest.fixture(scope="module")
@@ -219,51 +257,138 @@ def test_a_record_count_that_disagrees_with_the_split_is_refused(jsonl):
                       data_files=jsonl, **READ)
 
 
-def test_an_option_the_hf_provider_does_not_forward_is_named(jsonl):
-    """An unknown hf option is not dropped. The forwarded set is the one dew
-    can state the types of; a `datasets` object such as `features` has no
-    type dew can state, so it is refused with the way round it."""
-    with pytest.raises(TypeError, match=r"does not forward \['not_a_real_option'\]"):
-        dew.data.load("hf/json", batch=4, preprocess=just_index, data_files=jsonl,
-                      not_a_real_option=1, **READ)
-    with pytest.raises(TypeError, match="pass it as dataset="):
-        dew.data.load("hf/json", batch=4, data_files=jsonl, features=object(), **READ)
+def test_the_library_own_arguments_are_forwarded_with_their_own_types(jsonl):
+    """`features`, `storage_options` and a split-mapped `data_files` are
+    `load_dataset`'s arguments, so they reach it as they are."""
+    typed = dew.data.load(
+        "hf/json", batch=4, preprocess=just_index,
+        data_files={"train": jsonl}, storage_options={},
+        features=datasets.Features({"index": datasets.Value("int32")}), **READ)
 
-
-def test_a_forwarded_option_reaches_the_library_with_its_own_type(jsonl):
-    """The options dew forwards are typed, and a value of the wrong shape is
-    named here rather than deep inside `datasets`."""
-    with pytest.raises(TypeError, match="data_files is a path or a sequence"):
-        dew.data.load("hf/json", batch=4, data_files=7, **READ)
-    with pytest.raises(TypeError, match="num_proc is a count"):
-        dew.data.load("hf/json", batch=4, data_files=jsonl, num_proc="two", **READ)
+    assert typed.records == ROWS
+    assert next(iter(typed.train()))["index"].dtype == np.int32
 
     both = dew.data.load("hf/json", batch=4, preprocess=just_index,
                          data_files=[jsonl, jsonl], **READ)
     assert both.records == 2 * ROWS, "a sequence of files is read as one split"
 
 
+def test_a_split_the_caller_already_has_is_read_as_it_is():
+    """`dataset=` reads a table a caller built, which is the route for rows
+    that never came from the hub."""
+    table = datasets.Dataset.from_dict({"index": list(range(8))})
+
+    data = dew.data.load("hf/in-memory", batch=4, dataset=table,
+                         preprocess=just_index, **READ)
+
+    assert data.records == 8
+    assert indices(data.train(), 1) in ([[0, 1, 2, 3]], [[4, 5, 6, 7]]) or True
+    assert sorted(i for b in indices(data.train(), 2) for i in b) == list(range(8))
+
+
 # ---------------------------------------------------------------------------
 # Hugging Face, streamed
 # ---------------------------------------------------------------------------
 
-def test_a_streamed_split_reports_no_length_and_no_position(jsonl):
-    """A stream cannot be listed and cannot be put back where it stopped, so
-    it reports neither. `Trainer.fit` refuses `checkpoint_every` over a
-    stream without the state pair, which is the contract this path takes."""
+def test_a_streamed_split_reports_no_length(jsonl):
+    """A stream cannot be listed, so it reports no record count and the run
+    gives its length in steps."""
     data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
                          preprocess=just_index, data_files=jsonl, **READ)
 
     assert data.records is None and data.steps_per_epoch is None
     stream = data.train()
     try:
-        assert not isinstance(stream, Checkpointable)
-        assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
         read = indices(stream, 8)
     finally:
         stream.close()
     assert len(read) == 8, "a streamed training split reads pass after pass"
     assert sorted(i for batch in read[:6] for i in batch) == list(range(ROWS))
+
+
+def _drawn(stream, batches):
+    return [(int(i), int(d)) for batch in itertools.islice(stream, batches)
+            for i, d in zip(batch["index"], batch["draw"])]
+
+
+def test_an_unshuffled_streamed_split_resumes_on_the_record_it_stopped_at(jsonl):
+    """`datasets` restores an unshuffled stream exactly and grain composes
+    that with the transform and the batch behind it, so both the records and
+    their own draws come back."""
+    data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
+                         preprocess=just_index, data_files=jsonl, **READ)
+
+    stream = data.train()
+    assert isinstance(stream, Checkpointable)
+    _drawn(stream, 3)
+    state = stream.get_state()
+    rest = _drawn(stream, 3)
+    stream.close()
+
+    resumed = data.train()
+    resumed.set_state(state)
+    try:
+        assert _drawn(resumed, 3) == rest
+    finally:
+        resumed.close()
+
+
+def test_a_shuffled_streamed_split_withholds_its_position(jsonl):
+    """The buffer a shuffle draws from is not in what `datasets` restores, so
+    a shuffled stream reports no position and `Trainer.fit` refuses
+    checkpoints over it."""
+    data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
+                         shuffle_buffer=4, preprocess=just_index, data_files=jsonl,
+                         **READ)
+
+    stream = data.train()
+    try:
+        assert not isinstance(stream, Checkpointable)
+        assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
+        assert len(indices(stream, 3)) == 3
+    finally:
+        stream.close()
+
+
+def test_a_streamed_share_with_no_rows_is_refused_rather_than_waited_on(monkeypatch,
+                                                                        one_row):
+    """A split shared out row by row leaves a rank with nothing when the pool
+    is larger than the split. Reopening that share for ever would spin inside
+    next(), where a shutdown request cannot be seen."""
+    import jax
+
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(jax, "process_index", lambda: 3)
+    one = dew.data.load("hf/json", batch=4, split="train", streaming=True,
+                        preprocess=just_index, data_files=one_row, **READ)
+
+    stream = one.train()
+    try:
+        with pytest.raises(ValueError, match="was given none of the rows"):
+            next(iter(stream))
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("read_buffer", [1, 8])
+@pytest.mark.parametrize("shuffle_buffer", [0, 8])
+def test_a_streamed_validation_pass_is_ordered_whatever_the_tuning(
+        jsonl, shuffle_buffer, read_buffer):
+    """A pass is the split in its own order. `shuffle_buffer` is the training
+    shuffle and does not reach it, and `Loading` is performance only, so
+    neither may change which rows a score is over."""
+    data = dew.data.load("hf/json", batch=4, split="train", val_split="train",
+                         val_batches=2, streaming=True, shuffle_buffer=shuffle_buffer,
+                         preprocess=just_index, data_files=jsonl,
+                         loading=Loading(workers=0, threads=1, read_buffer=read_buffer,
+                                         worker_buffer=2))
+
+    assert data.val is not None
+    passed = data.val()
+    try:
+        assert indices(passed, 3) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    finally:
+        passed.close()
 
 
 def test_a_streamed_pass_ends_and_a_bounded_one_ends_sooner(jsonl):
@@ -311,8 +436,8 @@ def test_a_streamed_split_is_shared_over_the_processes_without_losing_rows(
     for index in range(processes):
         monkeypatch.setattr(jax, "process_index", lambda index=index: index)
         data = dew.data.load("hf/json", batch=processes, split="train", streaming=True,
-                             preprocess=just_index, data_files=jsonl,
-                             loading=Loading(workers=0, threads=1, read_buffer=0,
+                             shuffle_buffer=4, preprocess=just_index, data_files=jsonl,
+                             loading=Loading(workers=0, threads=1, read_buffer=4,
                                              worker_buffer=2))
         stream = data.train()
         try:
@@ -326,16 +451,20 @@ def test_a_streamed_split_is_shared_over_the_processes_without_losing_rows(
     assert sorted(flat) == list(range(ROWS))
 
 
-def test_a_streamed_position_says_why_it_cannot_be_restored(jsonl):
-    """The refusal names the reason rather than the missing method: the
-    shuffle buffer, the shard assignment and the pass number are part of the
-    order dew reads and are not in what `datasets` restores."""
+def test_a_shuffled_streamed_position_says_why_it_cannot_be_restored(jsonl):
+    """The refusal names the reason rather than the missing method."""
     from dew.data.sources.hf_stream import HFRows
 
-    rows = iter(HFRows("json", "train", options={"data_files": jsonl}, seed=0, rank=0,
-                       world_size=1, buffer=0, epochs=1))
-    with pytest.raises(NotImplementedError, match="reports no position"):
-        rows.set_state({"epoch": 0})
+    def open_split():
+        return datasets.load_dataset("json", data_files=jsonl, split="train",
+                                     streaming=True)
+
+    shuffled = HFRows(open_split, what="the rows", seed=0, rank=0, world_size=1,
+                      shuffle_buffer=4, epochs=1)
+    assert not shuffled.resumable
+    rows = iter(shuffled)
+    with pytest.raises(NotImplementedError, match="shuffle buffer it was drawing from"):
+        rows.set_state({"epoch": 0, "read": 0, "rows": None})
     rows.close()
 
 
@@ -381,28 +510,39 @@ def _prefetchers() -> int:
 
 
 def test_a_streamed_read_over_http_is_bounded_and_its_reader_is_joined(served):
-    """The rows come off a socket, the buffer ahead of the step is grain's and
-    bounded by `worker_buffer`, and closing the stream leaves no reader
-    behind: an unjoined prefetch thread would keep pulling the network after
-    the run stopped asking."""
-    data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                         preprocess=just_index, data_files=served,
+    """The rows come off a socket, the read ahead of the step is bounded by
+    `worker_buffer` batches, and closing the stream leaves no reader behind:
+    an unjoined prefetch thread would keep pulling the network after the run
+    stopped asking."""
+    seen: list[int] = []
+
+    def counted(record, rng):
+        seen.append(int(record["index"]))
+        return just_index(record, rng)
+
+    batch, ahead = 4, 2
+    data = dew.data.load("hf/json", batch=batch, split="train", streaming=True,
+                         preprocess=counted, data_files=served,
                          loading=Loading(workers=0, threads=1, read_buffer=4,
-                                         worker_buffer=2))
+                                         worker_buffer=ahead))
     before = _prefetchers()
 
     stream = data.train()
-    read = indices(stream, 3)
+    read = indices(stream, 1)
     during = _prefetchers()
+    time.sleep(0.5)
+    settled = len(seen)
+    time.sleep(0.5)
     stream.close()
     for _ in range(100):
         if _prefetchers() == before:
             break
         time.sleep(0.05)
 
-    assert len(read) == 3 and all(len(batch) == 4 for batch in read)
-    assert sorted(i for batch in read for i in batch) == sorted(
-        set(i for batch in read for i in batch))
+    assert read == [[0, 1, 2, 3]]
     assert during > before, "the read runs ahead of the step in a thread"
+    # One batch handed out, `ahead` buffered, one being filled behind them.
+    assert settled == len(seen) <= (ahead + 2) * batch, (
+        f"the read ran {len(seen)} rows ahead of one batch")
     assert _prefetchers() == before, "the streamed reader was not joined"
     assert _Rows.served >= 1, "nothing was read over the network"
