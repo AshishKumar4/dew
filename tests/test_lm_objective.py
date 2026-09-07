@@ -29,6 +29,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity, Samples, TEXT_KEY
 from dew.registry import metrics
+from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 VOCAB = 8
@@ -413,8 +414,7 @@ def test_preview_generates_reproducible_text_from_ema():
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
                               dtype="float32", attention_impl="xla")
-    objective = LMObjective(model, seq_len=SEQ, samples=Samples(
-        prompt=[1, 2, 3], max_new_tokens=4, temperature=0.0))
+    objective = LMObjective(model, seq_len=SEQ, samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)))
     params = objective.init(jax.random.key(0))
     ema = jax.tree.map(lambda leaf: leaf + 0.1, params)
     averaged = objective.preview(params, token_batch(), step_at(key=5, ema=ema))

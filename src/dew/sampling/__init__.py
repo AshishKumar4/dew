@@ -5,7 +5,7 @@ from .solvers import (
 )
 from .guidance import CFG
 from .sample import sample
-from .text import generate
+from .text import Generation, Sampling, generate
 from .pipelines import TextToImage
 from .flow import FlowSDE, FlowTrajectory, GaussianTransition, flow_transition, sample_trajectory
 
@@ -21,6 +21,7 @@ __all__ = [
     "CFG",
     "sample",
     "generate",
+    "Generation", "Sampling",
     "TextToImage",
     "FlowSDE", "FlowTrajectory", "GaussianTransition", "flow_transition", "sample_trajectory",
 ]

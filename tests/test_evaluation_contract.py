@@ -70,20 +70,20 @@ def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objectiv
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.base import Step
     from dew.objectives.lm import Samples
-    from dew.sampling.text import generate
+    from dew.sampling.text import Sampling, generate
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=16, tie_embeddings=False,
                               dtype="float32", attention_impl="xla")
     objective = objective_type(model, seq_len=8,
-                               samples=Samples(prompt=[1, 2], max_new_tokens=3, temperature=0))
+                               samples=Samples(prompt=[1, 2], max_new_tokens=3, sampling=Sampling(temperature=0)))
     policy = objective.init(jax.random.key(0))
     reference = objective.init(jax.random.key(1))
     key = jax.random.key(9)
     step = Step(step=jnp.asarray(0), key=key, ema=reference)
     preview = objective.preview(policy, {}, step)
-    expected = generate(model, policy, jnp.asarray([[1, 2]]), 3, key=key, temperature=0)
-    frozen = generate(model, reference, jnp.asarray([[1, 2]]), 3, key=key, temperature=0)
+    expected = generate(model, policy, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)).tokens
+    frozen = generate(model, reference, jnp.asarray([[1, 2]]), 3, key=key, sampling=Sampling(temperature=0)).tokens
     assert not np.array_equal(expected, frozen)
     np.testing.assert_array_equal(preview.tokens, expected)
 
