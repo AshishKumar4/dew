@@ -34,7 +34,7 @@ import grain.python as pygrain
 import jax
 import numpy as np
 
-from .dataset import Dataset, Loading, local_batch, train_stream, validation_pass
+from .dataset import Batch, Dataset, Loading, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
 PROVIDERS = ("tfds", "hf")
@@ -43,7 +43,7 @@ Row = Mapping[str, object]
 Options = Mapping[str, object]
 Preprocess = Callable[[Row, np.random.Generator], Row]
 
-TFDS_OPTIONS = ("path", "config", "version", "decoders")
+TFDS_OPTIONS = ("path", "config", "version")
 """What the tfds provider takes beside the shared arguments."""
 
 
@@ -113,7 +113,7 @@ def _text(option: object, name: str) -> Optional[str]:
     return option
 
 
-def tfds_source(name: str, split: str, options: Options) -> Sequence[Row]:
+def tfds_source(name: str, split: str, options: Options) -> pygrain.RandomAccessDataSource[object]:
     """One split of a prepared TFDS dataset, checked against its own metadata."""
     from .sources.tfds import prepared_source
 
@@ -131,30 +131,32 @@ def tfds_source(name: str, split: str, options: Options) -> Sequence[Row]:
             f"never prepares its own data.")
     return prepared_source(path, split, builder=name,
                            config=_text(options.get("config"), "tfds config="),
-                           version=_text(options.get("version"), "tfds version="),
-                           decoders=options.get("decoders"))
+                           version=_text(options.get("version"), "tfds version="))
 
 
-def hf_source(name: str, split: str, options: Options) -> Sequence[Row]:
+def hf_source(name: str, split: str,
+              options: Options) -> pygrain.RandomAccessDataSource[object]:
     """One Arrow-backed split of a hub dataset, through grain's random access."""
     from .sources.hf import HFDatasetSource
 
     return HFDatasetSource(name=name, split=split, options=_load_options(options))
 
 
-def _load_options(options: Options) -> dict[str, object]:
-    """The `load_dataset` arguments in `options`.
+def _load_options(options: Options):
+    """The `load_dataset` arguments in `options`, typed.
 
     `streaming` is dew's own switch between two source kinds, so it does not
-    travel; everything else goes to `datasets.load_dataset` unchanged, which
-    is what makes a misspelled option raise there instead of vanishing here.
+    travel; `HFOptions` names what does and refuses what dew cannot type.
     """
-    return {key: value for key, value in options.items() if key != "streaming"}
+    from .sources.hf import HFOptions
+
+    return HFOptions.of({key: value for key, value in options.items()
+                         if key != "streaming"})
 
 
 def hf_stream(name: str, split: str, options: Options, *, batch: int, seed: int,
               loading: Loading, epochs: Optional[int],
-              preprocess: Optional[Preprocess]) -> Callable[[], Iterator[Row]]:
+              preprocess: Optional[Preprocess]) -> Callable[[], Iterator[Batch]]:
     """A factory over one process's share of a streamed split.
 
     The rows are grain's from the first stage on: the per-record transform is

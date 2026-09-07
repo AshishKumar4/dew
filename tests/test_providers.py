@@ -219,12 +219,28 @@ def test_a_record_count_that_disagrees_with_the_split_is_refused(jsonl):
                       data_files=jsonl, **READ)
 
 
-def test_an_option_the_loader_does_not_know_reaches_datasets(jsonl):
-    """An unknown hf option is not dropped: `load_dataset` owns those names,
-    so a misspelling raises from the library that owns it."""
-    with pytest.raises(TypeError, match="not_a_real_option"):
+def test_an_option_the_hf_provider_does_not_forward_is_named(jsonl):
+    """An unknown hf option is not dropped. The forwarded set is the one dew
+    can state the types of; a `datasets` object such as `features` has no
+    type dew can state, so it is refused with the way round it."""
+    with pytest.raises(TypeError, match=r"does not forward \['not_a_real_option'\]"):
         dew.data.load("hf/json", batch=4, preprocess=just_index, data_files=jsonl,
                       not_a_real_option=1, **READ)
+    with pytest.raises(TypeError, match="pass it as dataset="):
+        dew.data.load("hf/json", batch=4, data_files=jsonl, features=object(), **READ)
+
+
+def test_a_forwarded_option_reaches_the_library_with_its_own_type(jsonl):
+    """The options dew forwards are typed, and a value of the wrong shape is
+    named here rather than deep inside `datasets`."""
+    with pytest.raises(TypeError, match="data_files is a path or a sequence"):
+        dew.data.load("hf/json", batch=4, data_files=7, **READ)
+    with pytest.raises(TypeError, match="num_proc is a count"):
+        dew.data.load("hf/json", batch=4, data_files=jsonl, num_proc="two", **READ)
+
+    both = dew.data.load("hf/json", batch=4, preprocess=just_index,
+                         data_files=[jsonl, jsonl], **READ)
+    assert both.records == 2 * ROWS, "a sequence of files is read as one split"
 
 
 # ---------------------------------------------------------------------------

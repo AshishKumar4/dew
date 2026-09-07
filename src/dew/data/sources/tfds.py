@@ -16,7 +16,7 @@ checked for the file format and the shards dew can read.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Optional
 
 from etils import epath
@@ -166,8 +166,7 @@ def shards(builder, split: str, directory: epath.Path) -> None:
 
 def prepared_source(path: str, split: str, *, builder: Optional[str] = None,
                     config: Optional[str] = None,
-                    version: Optional[str] = None,
-                    decoders: object = None) -> Sequence[Mapping[str, object]]:
+                    version: Optional[str] = None) -> Sequence[object]:
     """Random access over one split of a prepared TFDS dataset.
 
     The builder's own `as_data_source` is already grain's protocol, so what
@@ -176,11 +175,12 @@ def prepared_source(path: str, split: str, *, builder: Optional[str] = None,
     directory earns. There is no wrapper object, because there would be
     nothing for one to do.
 
-    `split` takes TFDS's own syntax, slicing included, and `decoders` reaches
-    the builder unchanged, so a caller can skip the per-record image decode
-    TFDS would otherwise do.
+    `split` takes TFDS's own syntax, slicing included. A record is whatever
+    the prepared features make it, which for a features dict is a mapping and
+    for a single feature is a bare array, so the type here says `object` and
+    the run's own `preprocess` is where it becomes batch fields.
     """
     directory = prepared(path, builder=builder, config=config, version=version)
     reader = read_only_builder(directory, builder=builder, config=config, version=version)
     shards(reader, split, directory)
-    return reader.as_data_source(split, decoders=decoders)
+    return reader.as_data_source(split)

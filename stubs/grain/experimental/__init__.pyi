@@ -1,4 +1,5 @@
-"""The grain experiments dew uses: first-fit packing of token chunks."""
+"""The grain experiments dew uses: first-fit packing of token chunks, and
+the bounded thread buffer a streamed split reads through."""
 
 from collections.abc import Sequence
 from typing import Any, Generic, TypeVar
@@ -25,3 +26,10 @@ class FirstFitPackIterDataset(IterDataset[T], Generic[T]):
         padding_struct: Any = ...,
         max_sequences_per_bin: int | None = ...,
     ) -> None: ...
+
+
+class ThreadPrefetchIterDataset(IterDataset[T], Generic[T]):
+    """`parent` read by one background thread, at most `prefetch_buffer_size`
+    elements ahead of the consumer."""
+
+    def __init__(self, parent: IterDataset[T], *, prefetch_buffer_size: int) -> None: ...
