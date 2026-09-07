@@ -9,12 +9,14 @@ from typing import Protocol
 from flax import linen as nn
 import jax
 import jax.numpy as jnp
+from jax.tree_util import Partial
 import numpy as np
 from jax.experimental import multihost_utils
 
 from dew.data.prompts import LENGTH_KEY
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
+from dew.objectives.base import (Aux, EMASpec, Initializer, Mean, Objective, Step, Variables,
+                                 mean_loss)
 from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
 from dew.rl import gae
@@ -92,10 +94,25 @@ class PPOObjective(Objective[Mean, Variables]):
         self.ema = None if reference is None else EMASpec(reference.decay,
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
 
+    @property
+    def initializer(self) -> Initializer:
+        """The actor's initializer bound as this one's argument.
+
+        A `Partial` is itself a pytree, so whatever the actor holds - a
+        loaded policy checkpoint - travels as data through this objective's
+        initializer too, rather than being captured when the trainer traces
+        the initial state.
+        """
+        return Partial(self._initialize, self.actor.initializer)
+
     def init(self, key: jax.Array) -> Variables:
-        policy = self.actor.init(key)
-        critic = self.critic.init(jax.random.fold_in(key, 1), jnp.zeros((1, self.seq_len), jnp.int32))
-        return _join(policy, critic)
+        return self._initialize(self.actor.initializer, key)
+
+    def _initialize(self, policy: Initializer, key: jax.Array) -> Variables:
+        """The one initialization implementation `init` and `initializer` share."""
+        critic = self.critic.init(jax.random.fold_in(key, 1),
+                                  jnp.zeros((1, self.seq_len), jnp.int32))
+        return _join(policy(key), critic)
 
     def policy(self, variables: Variables) -> EpisodeInference:
         """Bind the policy subtree when an episode collector supplies the full tree."""

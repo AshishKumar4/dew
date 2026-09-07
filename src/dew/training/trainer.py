@@ -29,7 +29,8 @@ from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Aux, Batch, Effects, Loss, Mean, Metric, Objective, Step, Variables, merge, select, mean_loss
+from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
+                                 Step, Variables, merge, select, mean_loss)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
@@ -250,8 +251,19 @@ class Trainer(Generic[Loss, Effects]):
     def initial_state(self) -> TrainState:
         """The state a fresh run starts from. Pure, so `fit` traces it once
         for its shapes and once, sharded, for its values."""
-        init_key, run_key = jax.random.split(self.key)
-        params = nn.unbox(self.objective.init(init_key))
+        return self.state_from(self.objective.initializer, self.key)
+
+    def state_from(self, initializer: Initializer, key: jax.Array) -> TrainState:
+        """The initial state built from an initializer and a run key alone.
+
+        Everything the state is built out of arrives here as data, so `place`
+        compiles this with both as arguments and a held checkpoint reaches
+        the device as an argument rather than as a constant embedded in the
+        executable. `initial_state` passes the objective's own initializer,
+        so there is one construction path and one key split.
+        """
+        init_key, run_key = jax.random.split(key)
+        params = nn.unbox(initializer(init_key))
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -318,7 +330,8 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         resume = None if checkpoints is None else checkpoints.latest
         if checkpoints is None or resume is None:
-            state = jax.jit(self.initial_state, out_shardings=shardings)()
+            state = jax.jit(self.state_from, out_shardings=shardings)(
+                self.objective.initializer, self.key)
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)

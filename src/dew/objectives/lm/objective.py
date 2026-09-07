@@ -32,6 +32,7 @@ from typing import Literal, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
+from jax.tree_util import Partial
 from flax import struct
 import numpy as np
 import optax
@@ -43,7 +44,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
+from dew.objectives.base import (Aux, EMASpec, Initializer, Mean, Objective, Step, Variables,
                                  mean_loss, merge, select)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
@@ -411,28 +412,42 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
 
+    @property
+    def initializer(self) -> Initializer:
+        """The held checkpoint as the initializer's argument, not its closure.
+
+        A continued-pretraining run holds the whole parameter tree here. Bound
+        as a `Partial` argument it reaches the trainer's state JIT as data;
+        read off `self` inside a nullary trace it would be compiled into the
+        executable as a constant.
+        """
+        return Partial(self._initialize, self.pretrained)
+
     def init(self, key):
-        variables = self._whole_tree(key)
+        return self._initialize(self.pretrained, key)
+
+    def _initialize(self, pretrained: Optional[Variables], key) -> Variables:
+        """The one initialization implementation `init` and `initializer` share."""
+        variables = self._whole_tree(pretrained, key)
         if not self._warmup:
             return variables
         indexer = select(variables, lambda path: path[0] == "params" and _is_indexer(path))
         frozen = select(variables, lambda path: path[0] == "params" and not _is_indexer(path))
         return {**variables, "params": indexer["params"], FROZEN: frozen["params"]}
 
-    def _whole_tree(self, key) -> Variables:
+    def _whole_tree(self, pretrained: Optional[Variables], key) -> Variables:
         """The model's variables in one `params` collection: the pretrained
         tree with its frozen split undone, or a fresh init."""
         fresh = lambda: self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-        if self.pretrained is None:
+        if pretrained is None:
             return fresh()
-        pretrained = self.pretrained
         if "params" not in pretrained:
             raise ValueError(
                 "pretrained is the variables dict ({'params': ...}) that "
                 "load_pretrained and model.init return")
         if FROZEN in pretrained:
-            pretrained = {name: value for name, value in pretrained.items() if name != FROZEN}
-            pretrained = {**pretrained, "params": merge(self.pretrained[FROZEN], self.pretrained["params"])}
+            rest = {name: value for name, value in pretrained.items() if name != FROZEN}
+            pretrained = {**rest, "params": merge(pretrained[FROZEN], pretrained["params"])}
         if not self._warmup:
             return pretrained
         # The warm-up may start from a dense checkpoint that has no indexer

@@ -271,6 +271,44 @@ def test_a_run_past_its_target_is_refused(tmp_path):
         make_trainer(tmp_path).fit(Data(), steps=2)
 
 
+def test_the_state_is_built_from_the_initializer_and_the_key_alone(tmp_path):
+    """What `place` compiles takes the objective's held variables and the run
+    key as arguments, so a loaded checkpoint reaches the device as data.
+
+    Compiled with no arguments the same construction captures the whole tree
+    as a constant: 2.2 GiB inside the executable for a 0.6B checkpoint, which
+    is past the compilation cache's 2 GiB entry limit. The two paths build the
+    same state, so this is where the arrays travel, not what they are.
+    """
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
+    objective = LMObjective(model, seq_len=4, pretrained=weights)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    shardings = trainer.shardings(jax.eval_shape(trainer.initial_state))
+
+    held = jax.make_jaxpr(trainer.state_from)(objective.initializer, trainer.key).consts
+    captured = jax.make_jaxpr(trainer.initial_state)().consts
+    explicit = jax.jit(trainer.state_from, out_shardings=shardings)(
+        objective.initializer, trainer.key)
+    nullary = jax.jit(trainer.initial_state, out_shardings=shardings)()
+
+    def raw(leaf):
+        return jax.random.key_data(leaf) if jnp.issubdtype(
+            leaf.dtype, jax.dtypes.prng_key) else leaf
+
+    assert held == [], "the state JIT still captures arrays it was handed as data"
+    assert sum(int(np.asarray(raw(value)).nbytes) for value in captured) >= sum(
+        int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(weights)), (
+            "the nullary construction no longer captures the tree, so this proves nothing")
+    for before, after in zip(jax.tree.leaves(nullary), jax.tree.leaves(explicit), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw(before)), np.asarray(raw(after)))
+
+
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     trainer = make_trainer(tmp_path, optimizer=optax.adam(1e-3))
     trained = trainer.fit(Data(), steps=3, log_every=1)

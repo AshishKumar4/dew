@@ -10,6 +10,38 @@ The trainer traces initialization to determine shapes and then initializes varia
 
 The [regression tutorial](../getting-started.md#define-initialization-and-loss) includes a complete custom objective. Register an objective when a configuration needs to look it up through a registry. Passing an instance directly to `Trainer` requires no decorator.
 
+### Objectives that start from held weights
+
+An objective that continues from a checkpoint, or that keeps a frozen tower beside the model it trains, holds real arrays. Those arrays cross into the trainer's compiled state construction at one boundary: `Objective.initializer`, a `jax.tree_util.Partial` whose bound arguments are the held variables.
+
+The default is `Partial(self.init)`, which binds nothing, and an objective that draws its whole tree from the key needs no more. An objective that holds arrays overrides the property and delegates `init` to the same implementation:
+
+```python
+from jax.tree_util import Partial
+
+
+class Continued(Objective):
+    def __init__(self, model, pretrained=None):
+        self.model, self.pretrained = model, pretrained
+
+    @property
+    def initializer(self):
+        return Partial(self._initialize, self.pretrained)
+
+    def init(self, key):
+        return self._initialize(self.pretrained, key)
+
+    def _initialize(self, pretrained, key):
+        if pretrained is not None:
+            return pretrained
+        return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
+```
+
+`_initialize` reads the held tree from its argument and never from `self`. That is the whole requirement, and it is why the boundary is a contract rather than a convention: a `Partial` is itself a pytree, so the arrays stay arguments however deeply the implementation nests its own `jax.jit`, and an objective that composes another one binds that objective's initializer as its own argument.
+
+What it buys is the difference between a parameter tree that arrives on the device as an argument and one that is compiled into the state executable as a constant. For a 0.6B checkpoint the second is 2.2 GiB inside the module, which is past the 2 GiB limit on a compilation cache entry, so the cache silently stops working for the run that most needs it. `init(key)` keeps its signature and its meaning for every caller; `Trainer.initial_state()` stays pure and nullary and still describes the state for `eval_shape`, `place` and a resume.
+
+
 ## Loss and auxiliary values
 
 `loss(variables, batch, step)` returns `(statistics, aux)`. Return `Mean(total, mass)` for additive terms sharing one nonnegative, parameter-independent denominator. The default reducer divides the summed numerator by the summed mass and treats zero support as inactive. A plain scalar explicitly denotes one unit-mass term. Dew does not infer token or row weights from a scalar.
