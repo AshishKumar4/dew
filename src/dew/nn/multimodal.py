@@ -51,6 +51,22 @@ class VisionConditioner(nn.Module):
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
 
+    def initialize_parameters(self) -> None:
+        """Create the media leaves during an ordinary token-only model init.
+
+        Fixed-resolution towers use their configured image size. Other towers
+        need only one pooling/merge block to create resolution-independent
+        parameters; real batches supply their processed geometry later.
+        """
+        side = getattr(self.vision, "image_size", None)
+        if side is None:
+            patch = getattr(self.vision, "patch_size", 16)
+            block = getattr(self.vision, "pooling_kernel_size", getattr(self.vision, "spatial_merge_size", 2))
+            side = patch * block
+        channels = getattr(self.vision, "num_channels", getattr(self.vision, "in_channels", getattr(self.vision, "in_chans", 3)))
+        self({"pixel_values": jnp.zeros((1, 1, channels, side, side), self.dtype or jnp.float32)})
+
+
     def fuse(self, tokens: jax.Array, embeddings: jax.Array,
              image_indices: jax.Array, conditioning: Mapping[str, jax.Array],
              train: bool = False) -> Fusion:
@@ -109,11 +125,26 @@ class MultimodalTransformer(nn.Module):
     def causal(self) -> bool:
         return self.language_model.causal
 
+    @nn.compact
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None):
+        if decode:
+            allocated = self.has_variable("cache", "next_position")
+            next_position = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
+            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+            logical = rotary_positions if rotary_positions is not None else positions
+            if logical is None:
+                logical = next_position.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                positions = logical
+            mask = valid if logical.ndim == 2 else valid[..., None]
+            maximum = jnp.max(jnp.where(mask, logical, -1), axis=tuple(range(1, logical.ndim)))
+            if allocated:
+                next_position.value = jnp.where(valid.any(axis=1), maximum + 1, next_position.value)
         if conditioning is None:
+            if self.is_initializing():
+                self.conditioner.initialize_parameters()
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
             return self.language_model.hidden_states(
@@ -146,6 +177,8 @@ class MultimodalTransformer(nn.Module):
         """The decoder's shared fp32 head matrix for chunked objective scoring."""
         return self.language_model.head_weight(params["language_model"])
 
+    @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the nested language cache without evaluating media."""
+        self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)

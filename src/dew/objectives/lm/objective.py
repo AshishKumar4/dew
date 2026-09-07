@@ -34,6 +34,7 @@ import optax
 from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
+from dew.nn.inputs import ModelInputs
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
@@ -294,6 +295,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         carries `roles` for the same rows; with `loss_role` set, only the
         targets whose role matches keep their weight.
         """
+        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
+        tokens = prepared.tokens
         if tokens.shape[-1] != self.seq_len + 1:
             raise ValueError(
                 f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row "
@@ -301,7 +304,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
         # Only a packed batch names these, and only a model that packs takes
         # them. An unpacked run calls the model without them.
-        packing = {}
+        packing = prepared.slice_tokens(stop=-1).kwargs()
+        if positions is not None and "positions" in packing:
+            raise ValueError("positions must come from either ModelInputs or the packing column")
+        if segment_ids is not None and "segment_ids" in packing:
+            raise ValueError("segment_ids must come from either ModelInputs or the packing column")
         if positions is not None:
             packing["positions"] = positions[:, :-1]
         if segment_ids is not None:
@@ -324,7 +331,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        weights = self._target_weights(targets, segment_ids, losses.dtype)
+        packed_segments = segment_ids if segment_ids is not None else prepared.token_fields.get("segment_ids")
+        weights = self._target_weights(targets, packed_segments, losses.dtype)
+        valid = prepared.token_fields.get("attention_mask")
+        if valid is not None:
+            weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
         if roles is not None:
             if roles.shape != tokens.shape:
                 raise ValueError(
@@ -362,7 +373,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights))
         return Scores(losses, weights, correct, sown, depth_scores, qk)
 
-    def per_token_log_probs(self, params: Variables, tokens: jax.Array, *,
+    def per_token_log_probs(self, params: Variables, tokens: jax.Array | ModelInputs, *,
                             left_padding: jax.Array | None = None) -> jax.Array:
         """Raw policy likelihoods aligned to next-token targets.
 
@@ -371,10 +382,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         if left_padding is None:
             return -self.token_scores(params, tokens).losses
+        prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         padding = jnp.asarray(left_padding, jnp.int32)
-        if padding.shape != (tokens.shape[0],):
+        if padding.shape != (prepared.tokens.shape[0],):
             raise ValueError("left_padding must have one count per token row")
-        aligned = _shift_rows(tokens, padding)
+        aligned = prepared.align_left(padding)
         losses = self.token_scores(params, aligned).losses
         restored = -_shift_rows(losses, -padding)
         return jnp.where(jnp.arange(restored.shape[1])[None, :] >= padding[:, None],
@@ -411,7 +423,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return jnp.asarray(batch[ROLES_KEY])
 
     def loss(self, params, batch, step: Step):
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        tokens = batch[TEXT_KEY]
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
@@ -492,7 +504,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced scores over the complete batch, using EMA when present."""
         params = params if step.ema is None else step.ema
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        tokens = batch[TEXT_KEY]
         segment_ids, positions = _packing(batch)
         losses, weights = self._scored(params, tokens, segment_ids, positions,
                                        self._batch_roles(batch))

@@ -1656,6 +1656,14 @@ def _wrapper_projector_weights(kind: str,
     raise ValueError(f"projector kind {kind!r} has no weight map here")
 
 
+_WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
+                         "gemma4": "vision_tower.", "qwen3_5": "visual.",
+                         "gemma3n": "vision_tower."}
+_WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
+                             "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
+                             "gemma3n": "embed_vision."}
+
+
 def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
                               record: Mapping[str, Any]) -> Dict[str, Any]:
     """Wrapper tensors into language, tower and projector trees, in fp32.
@@ -1670,12 +1678,8 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
-    tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model.",
-                    "gemma4": "vision_tower.", "qwen3_5": "visual.",
-                    "gemma3n": "vision_tower."}[tower_kind]
-    projector_prefix = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
-                        "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
-                        "gemma3n": "embed_vision."}[projector_kind]
+    tower_prefix = _WRAPPER_TOWER_PREFIX[tower_kind]
+    projector_prefix = _WRAPPER_PROJECTOR_PREFIX[projector_kind]
     text_tensors: Dict[str, np.ndarray] = {}
     tower_tensors: Dict[str, np.ndarray] = {}
     projector_tensors: Dict[str, np.ndarray] = {}
