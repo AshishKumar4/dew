@@ -7,13 +7,15 @@ likelihoods; observations are inputs to later calls and never loss targets.
 
 from __future__ import annotations
 
+from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 import math
 from typing import Protocol
+from uuid import uuid4
 
 import jax
 import jax.numpy as jnp
@@ -91,6 +93,7 @@ class Action:
     terminated: bool
     policy_step: int
     sampling: Sampling
+    _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.tokens or len(self.tokens) != len(self.raw_log_probs) or len(self.tokens) != len(self.behavior_log_probs):
@@ -114,6 +117,11 @@ class Episode:
     status: EpisodeStatus
     detail: str = ""
     reward: float | None = None
+    # A collection binds exactly once. Its private origin is independent of
+    # clocks, which can coincide across different runs or parameter trees.
+    # Exclude the origin from value equality so replayed numerical records
+    # remain comparable; project checks it explicitly before admitting data.
+    _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
 
 
 class Environment(Protocol):
@@ -195,7 +203,7 @@ class EpisodeRollout:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
     def _episode(self, identity: EpisodeId, policy: EpisodeInference,
-                 policy_step: int, key: jax.Array) -> Episode:
+                 policy_step: int, key: jax.Array, binding_id: str) -> Episode:
         initial = None
         transitions: list[Transition] = []
         status = EpisodeStatus.RUNNING
@@ -219,7 +227,7 @@ class EpisodeRollout:
                         key=jax.random.fold_in(key, len(transitions)), sampling=self.sampling)
                     if not isinstance(result, Generation):
                         raise TypeError("tool episodes require autoregressive Generation likelihoods")
-                    pending = self._action(result, observation.context, policy_step)
+                    pending = self._action(result, observation.context, policy_step, binding_id)
                     if not pending.terminated:
                         observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
                     else:
@@ -227,7 +235,8 @@ class EpisodeRollout:
                     transitions.append(Transition(pending, observation))
                     pending = None
                     status, detail = observation.status, observation.detail
-                episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail)
+                episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail,
+                                  _binding_id=binding_id)
                 if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
                     # A verifier may inspect files or services owned by the
                     # environment. Score before its context releases them.
@@ -239,12 +248,13 @@ class EpisodeRollout:
                                    and episode.reward is None):
                 raise RuntimeError("environment exited before episode verification completed")
         except BaseException as error:
-            status = (EpisodeStatus.CANCELLED if isinstance(error, (CancelledError, KeyboardInterrupt))
-                      else EpisodeStatus.ERROR)
+            status = (EpisodeStatus.CANCELLED if isinstance(
+                error, (AsyncCancelledError, CancelledError, KeyboardInterrupt)) else EpisodeStatus.ERROR)
             detail = f"{type(error).__name__}: {error}"
             if pending is not None:
                 transitions.append(Transition(pending, Observation((), status, detail)))
-            episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail)
+            episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail,
+                              _binding_id=binding_id)
             if self.record is not None:
                 self.record(episode)
             if status == EpisodeStatus.CANCELLED:
@@ -258,7 +268,8 @@ class EpisodeRollout:
             raise EpisodeFailure(episode)
         return episode
 
-    def _action(self, result: Generation, context: tuple[int, ...], policy_step: int) -> Action:
+    def _action(self, result: Generation, context: tuple[int, ...], policy_step: int,
+                binding_id: str) -> Action:
         """Validate recorded tokens and likelihoods before an environment acts."""
         tokens = np.asarray(result.tokens)
         lengths, ended = np.asarray(result.lengths), np.asarray(result.terminated)
@@ -283,7 +294,7 @@ class EpisodeRollout:
             raise ValueError("inference termination disagrees with the sampled EOS token")
         return Action(context, actions, tuple(float(value) for value in raw[0, :count]),
                       tuple(float(value) for value in behavior[0, :count]),
-                      bool(ended[0]), policy_step, self.sampling)
+                      bool(ended[0]), policy_step, self.sampling, _binding_id=binding_id)
 
     def collect(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> tuple[Episode, ...]:
         """Collect task-major groups without optimizer effects."""
@@ -299,6 +310,7 @@ class EpisodeRollout:
         # the policy halfway through an episode.
         variables = jax.tree.map(lambda leaf: leaf, state.params)
         policy = self.policy.bind(variables)
+        binding_id = uuid4().hex
         episodes = []
         for index, task in enumerate(tasks):
             for group in range(self.groups):
@@ -306,7 +318,7 @@ class EpisodeRollout:
                 draw = jax.random.fold_in(key, sample)
                 identity = EpisodeId(int(task), int(state.step), sample,
                                      tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))
-                episodes.append(self._episode(identity, policy, policy_step, draw))
+                episodes.append(self._episode(identity, policy, policy_step, draw, binding_id))
         return tuple(episodes)
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
@@ -314,14 +326,24 @@ class EpisodeRollout:
         return self.project(episodes)
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Project actual action tokens only; padded turns have zero support."""
+        """Project action tokens from one collection; padded turns have zero support.
+
+        Every episode and action must retain that collection's private binding
+        origin. Equal training clocks do not establish equal weight snapshots.
+        """
         if not episodes or len(episodes) % self.groups:
             raise ValueError("projection requires complete episode groups")
         if len({episode.identity for episode in episodes}) != len(episodes):
             raise ValueError("each episode sample must have a distinct identity")
         policy_step = episodes[0].policy_step
+        binding_id = episodes[0]._binding_id
+        if not binding_id:
+            raise ValueError("episode records must retain their collection binding")
         rewards = []
         for index, episode in enumerate(episodes):
+            if (episode._binding_id != binding_id
+                    or any(turn.action._binding_id != binding_id for turn in episode.transitions)):
+                raise ValueError("episode records must come from the same collection binding")
             if (episode.policy_step != policy_step
                     or episode.identity.attempt != episodes[0].identity.attempt
                     or any(turn.action.policy_step != policy_step for turn in episode.transitions)):
