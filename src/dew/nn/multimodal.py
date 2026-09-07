@@ -11,6 +11,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.registry import models
 
@@ -111,12 +112,16 @@ class MultimodalTransformer(nn.Module):
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
-                      conditioning: Mapping[str, jax.Array] | None = None):
+                      conditioning: Mapping[str, jax.Array] | None = None,
+                      attention_mask=None, image_groups=None, rotary_positions=None):
+        metadata = (None if attention_mask is None and image_groups is None and rotary_positions is None
+                    else AttentionMetadata(attention_mask, image_groups, rotary_positions))
         if conditioning is None:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
             return self.language_model.hidden_states(
-                tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids)
+                tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+                attention_metadata=metadata)
         if image_indices is None:
             raise ValueError("conditioned inputs require image_indices")
         safe_tokens = jnp.where(image_indices >= 0, 0, tokens)
@@ -128,14 +133,16 @@ class MultimodalTransformer(nn.Module):
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=fused.embeddings, embedding_positions=slots)
+            input_embeddings=fused.embeddings, embedding_positions=slots, attention_metadata=metadata)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
-                 conditioning: Mapping[str, jax.Array] | None = None):
+                 conditioning: Mapping[str, jax.Array] | None = None,
+                      attention_mask=None, image_groups=None, rotary_positions=None):
         hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
                                     segment_ids=segment_ids, image_indices=image_indices,
-                                    conditioning=conditioning)
+                                    conditioning=conditioning, attention_mask=attention_mask,
+                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self.language_model._logits(hidden)
 
     def head_weight(self, params):

@@ -22,6 +22,7 @@ from dew.nn.attention import (
     max_attention_logits, open_kv_cache, rotary_freqs,
     scaled_dot_product_attention,
 )
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
@@ -83,6 +84,8 @@ class CausalSelfAttention(nn.Module):
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
     force_fp32_for_softmax: bool = True
+    bidirectional_images: bool = False
+    mrope_section: tuple[int, int, int] | None = None
 
     def setup(self):
         dense = functools.partial(
@@ -138,10 +141,64 @@ class CausalSelfAttention(nn.Module):
                 f"head dims, got {factor} of head_dim {self.head_dim}")
         return rot_dim
 
+    def _multimodal_rotary(self, positions: jax.Array):
+        """Qwen's interleaved temporal/height/width rotary frequency selection."""
+        rotated = self._rot_dim() or self.head_dim
+        if self.mrope_section is None or sum(self.mrope_section) != rotated // 2:
+            raise ValueError("mrope_section must partition the rotated frequency pairs")
+        if positions.shape[-1] != 3 or self.partial_rotary_type != "default":
+            raise ValueError("M-RoPE requires three coordinates and default partial rotary")
+        indices = jnp.arange(rotated // 2)
+        axes = jnp.zeros((rotated // 2,), jnp.int32)
+        for axis in (1, 2):
+            axes = jnp.where((indices % 3 == axis) & (indices < self.mrope_section[axis] * 3), axis, axes)
+        selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
+        inv = self.rope_theta ** (-2 * indices.astype(jnp.float32) / rotated)
+        angles = selected.astype(jnp.float32) * inv
+        return jnp.cos(angles), jnp.sin(angles)
+
+    def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
+                       batch: int, length: int, key_length: int, decode: bool):
+        """Combine key validity, causality, image groups and the layer's window."""
+        query_slots = (slots if decode else jnp.broadcast_to(jnp.arange(length), (batch, length)))
+        groups = (None if metadata is None else metadata.image_groups)
+        if groups is None:
+            groups = jnp.full((batch, length), -1, jnp.int32)
+        key_groups = groups
+        if decode and self.bidirectional_images:
+            from dew.nn.attention import _write_cache
+            allocated = self.has_variable("cache", "cached_image_groups")
+            stored = self.variable("cache", "cached_image_groups", jnp.full,
+                                   (batch, self.max_seq_len), -1, jnp.int32)
+            if allocated:
+                stored.value = _write_cache(stored.value, groups, query_slots)
+            key_groups = stored.value
+        if decode:
+            valid = self.get_variable("cache", "cache_valid")
+        else:
+            valid = None if metadata is None else metadata.valid
+        keep = (causal_attention_mask(query_slots, key_length)
+                if self.causal else jnp.ones((batch, 1, length, key_length), bool))
+        if self.bidirectional_images:
+            same_image = ((groups[:, :, None] == key_groups[:, None, :])
+                          & (groups[:, :, None] >= 0))
+            keep = keep | same_image[:, None]
+        if self.sliding_window is not None:
+            keep = keep & (jnp.arange(key_length)[None, None, None, :]
+                           > query_slots[:, None, :, None] - self.sliding_window)
+        if valid is not None:
+            keep = keep & valid[:, None, None, :]
+        if decode:
+            keep = keep & (query_slots[:, None, :, None] >= 0)
+        return keep
+
+
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         B, S, _ = x.shape
+        logical_positions = positions
         projected = self.q_proj(x)
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
@@ -195,7 +252,9 @@ class CausalSelfAttention(nn.Module):
         if decode:
             if self.causal:
                 if not self.kv_shared:
-                    positions, append = open_kv_cache(self, key, self.max_seq_len)
+                    positions, append = open_kv_cache(
+                        self, key, self.max_seq_len,
+                        valid=None if attention_metadata is None else attention_metadata.valid)
             elif self.kv_shared or segment_ids is not None:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
@@ -210,14 +269,19 @@ class CausalSelfAttention(nn.Module):
                 # The encoder's frozen prefix: positions continue past it, and
                 # the decoder never writes it back.
                 prefix = self.get_variable("cache", "cache_index")
-                positions = prefix + jnp.arange(S)
+                positions = prefix[:, None] + jnp.arange(S)
         elif positions is None and not self.kv_shared:
             positions = jnp.arange(S)
         elif not self.kv_shared:
             positions = jnp.asarray(positions)
-        if self.yarn is None:
+        rotary_positions = positions if logical_positions is None else logical_positions
+        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
+            rotary_positions = attention_metadata.rotary_positions
+        if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
+            freqs_cos, freqs_sin = self._multimodal_rotary(rotary_positions)
+        elif self.yarn is None:
             freqs_cos, freqs_sin = rotary_freqs(
-                positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+                rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
                 partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
         else:
             if self.partial_rotary_factor is not None or self.rope_scaling is not None:
@@ -225,7 +289,7 @@ class CausalSelfAttention(nn.Module):
                     "yarn rotates whole heads at its own frequencies, so it takes "
                     "neither partial_rotary_factor nor rope_scaling")
             freqs_cos, freqs_sin = mla_rope_freqs(
-                positions, self.head_dim, self.rope_theta, self.yarn)
+                rotary_positions, self.head_dim, self.rope_theta, self.yarn)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
@@ -242,27 +306,20 @@ class CausalSelfAttention(nn.Module):
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
         if prefix is not None:
-            # Canvas queries read every cached prefix key and every canvas key
-            # (modeling_diffusion_gemma.py, create_diffusion_decoder_attention_mask).
-            # The cache stays at its allocated width with zeroed slots past the
-            # prefix, so those slots mask out and no dynamic slice is needed. A
-            # sliding layer windows the same absolute positions its prefill wrote.
+            # Every canvas query reads the same retained encoder keys and all
+            # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
+            # layer retains the last window-1 prefix keys.
             cached_key = self.get_variable("cache", "cached_key")
             cached_value = self.get_variable("cache", "cached_value")
             alloc = cached_key.shape[-3]
-            prefix_index: jax.Array = prefix
-            canvas_pos = prefix_index + jnp.arange(S)
-            positions = canvas_pos
-            valid = jnp.concatenate(
-                [jnp.arange(alloc) < prefix_index, jnp.ones(S, bool)])
-            slot = jnp.concatenate([jnp.arange(alloc), canvas_pos])
-            query_pos = canvas_pos[:, None]
-            key_pos = slot[None, :]
-            canvas_key = jnp.arange(alloc + S)[None, :] >= alloc
-            keep = valid[None, :] & ((key_pos <= query_pos) | canvas_key)
+            prefix_slots = jnp.arange(alloc)[None, :]
+            valid_prefix = self.get_variable("cache", "cache_valid")
             if self.sliding_window is not None:
-                keep = keep & (key_pos > query_pos - self.sliding_window)
-            mask = jnp.broadcast_to(keep[None, None], (B, 1, S, alloc + S))
+                valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.sliding_window)
+            canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
+                            or attention_metadata.valid is None else attention_metadata.valid)
+            keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
+            mask = jnp.broadcast_to(keep[:, None, None, :], (B, 1, S, alloc + S))
             key = jnp.concatenate([cached_key, key], axis=-3)
             value = jnp.concatenate([cached_value, value], axis=-3)
             causal, window = False, None
@@ -274,7 +331,9 @@ class CausalSelfAttention(nn.Module):
             causal = False
         elif append is not None:
             key, value = append(key, value)
-            mask = causal_attention_mask(positions, key.shape[-3], self.sliding_window)
+            mask = causal_attention_mask(
+                positions, key.shape[-3], self.sliding_window,
+                key_valid=self.get_variable("cache", "cache_valid"))
             causal = False
             if kv_store is not None and self.kv_store_key is not None:
                 kv_store[self.kv_store_key] = (key, value, positions)
@@ -304,6 +363,15 @@ class CausalSelfAttention(nn.Module):
                 # 75.8 ms and 4.99 GiB, measured in
                 # docs/concepts/language_models.md.
                 implementation = 'xla'
+        if prefix is None and (attention_metadata is not None or self.bidirectional_images):
+            mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
+            if segment_ids is not None and not decode:
+                inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
+                          & (segment_ids[:, :, None] != 0))
+                mask = mask & inside[:, None]
+            causal, window = False, None
+            if implementation in ("auto", "cudnn"):
+                implementation = "xla"
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
@@ -328,12 +396,20 @@ class CausalSelfAttention(nn.Module):
 @mixers("attention")
 @dataclasses.dataclass(frozen=True)
 class AttentionMixer(MixerBase):
-    """Grouped-query causal attention: no fields of its own.
+    """Grouped-query attention with optional image-block masking and M-RoPE.
 
-    Every dial is the model's (heads, norms, bias, scale, kernel), read from
-    the context, so this value only selects the kind. A record names it with
-    `{"kind": "attention"}`.
+    Geometry, norms and kernel policy come from the decoder context. Image
+    bidirectionality and spatial rotary sections configure this mixer only.
     """
+
+    bidirectional_images: bool = False
+    mrope_section: tuple[int, int, int] | None = None
+
+    def __post_init__(self):
+        if self.mrope_section is not None:
+            object.__setattr__(self, "mrope_section", tuple(self.mrope_section))
+            if len(self.mrope_section) != 3 or any(value < 0 for value in self.mrope_section):
+                raise ValueError("mrope_section must contain three nonnegative section widths")
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         return functools.partial(
@@ -368,5 +444,6 @@ class AttentionMixer(MixerBase):
             attention_impl=ctx.attention_impl,
             force_fp32_for_softmax=ctx.force_fp32_for_softmax,
             partial_rotary_factor=ctx.partial_rotary_factor,
-            partial_rotary_type=ctx.partial_rotary_type)
+            partial_rotary_type=ctx.partial_rotary_type,
+            bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
 
