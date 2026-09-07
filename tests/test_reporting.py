@@ -121,3 +121,21 @@ def test_plotting_is_explicit_and_infinity_remains_in_journal(tmp_path):
         assert not list(tmp_path.glob('*.png'))
     assert Image.open(tmp_path / 'metric-0.png').size[0] > 0
     assert '+Inf' in (tmp_path / 'scalars.jsonl').read_text()
+
+
+@pytest.mark.parametrize('preview', [False, True])
+def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview):
+    generated = []
+
+    class Display(Regression):
+        def preview(self, params, batch, step, *, scored=None):
+            generated.append(int(step.step))
+            return ImageGrid(np.zeros((1, 8, 8, 3)))
+
+    with LocalTracker(tmp_path) as sink:
+        trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
+        trainer.fit(Dataset(batches, lambda: iter([next(batches())]), None, 8),
+                    steps=2, eval_every=1, preview=preview)
+    assert generated == ([1, 2] if preview else [])
+    assert len(list(tmp_path.glob('*.png'))) == (2 if preview else 0)
+

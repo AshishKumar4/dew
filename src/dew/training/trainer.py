@@ -573,7 +573,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def fit(self, data: "Dataset", *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | None = None,
-            metrics: Sequence[Metric] = ()) -> TrainState:
+            metrics: Sequence[Metric] = (), preview: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
         step when the directory holds one.
 
@@ -584,6 +584,7 @@ class Trainer(Generic[Loss, Effects]):
         Every `checkpoint_every` steps, and at the end, the state and the data
         position are written; every `checkpoints.local_every` steps they are
         written to the local directory as well.
+        Preview generation is opt-in through preview=True, independent of scalar sinks.
         """
         started = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
@@ -722,7 +723,7 @@ class Trainer(Generic[Loss, Effects]):
 
                 if eval_every and current % eval_every == 0 and current < steps:
                     paused = time.perf_counter()
-                    self._evaluate(state, data, metrics, mesh, current)
+                    self._evaluate(state, data, metrics, mesh, current, preview_requested=preview)
                     other += time.perf_counter() - paused
 
                 # On its own clock, not the logging one: nested inside the log
@@ -761,7 +762,7 @@ class Trainer(Generic[Loss, Effects]):
                 loss.block_until_ready()
             paused = time.perf_counter()
             if eval_every:
-                self._evaluate(state, data, metrics, mesh, current)
+                self._evaluate(state, data, metrics, mesh, current, preview_requested=preview)
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -840,7 +841,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
-                  mesh, step: int) -> dict[str, float]:
+                  mesh, step: int, *, preview_requested: bool = True) -> dict[str, float]:
         """Score the coordinated shard prefix and produce one optional preview.
 
         Every rank participates in numerical work and global-array gathers.
@@ -868,7 +869,7 @@ class Trainer(Generic[Loss, Effects]):
             "validation availability and ordered metric names/types must agree across ranks")
         agree_process_phase(error, phase="configuration agreement")
         preview_enabled = bool(broadcast_from_process_zero(
-            process_zero and self.tracker is not None))
+            process_zero and preview_requested and self.tracker is not None))
         if data.val is None or not (metrics or preview_enabled):
             return {}
 

@@ -357,7 +357,7 @@ class RunConfig:
                 log_every=trainer.log_every,
                 eval_every=trainer.eval_interval(data),
                 checkpoint_every=trainer.checkpoint_interval(data),
-                metrics=metrics,
+                metrics=metrics, preview=trainer.wandb is not None,
             )
             error = None
             try:

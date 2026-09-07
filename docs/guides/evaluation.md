@@ -48,7 +48,7 @@ Perplexity sums weighted losses and target weights before exponentiating. Image 
 
 JEPA's `linear_probe` and `knn_probe` fit on the first half of each batch and test on its second half. They log the arithmetic mean of batch accuracies as `val/batch_linear_probe_accuracy` and `val/batch_knn_probe_accuracy`. These diagnostics depend on the batch partition and do not measure a full-dataset probe.
 
-The trainer calls `Objective.preview` once per evaluation event when process zero has a tracker and a coordinated batch exists. LM uses its `Samples` configuration; diffusion draws at most four separate display samples; masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference rather than averaged policy weights. The base preview reuses the first scoring artifacts, retaining JEPA's representation histogram without another encoder pass. Preview draws do not enter scoring metrics. Without metrics, evaluation skips scoring work; without a tracker, it skips preview work.
+The trainer calls `Objective.preview` once per evaluation event only when `fit(preview=True)` is explicitly requested, process zero has a tracker, and a coordinated batch exists. A scalar-reporting sink alone does not enable preview computation. LM uses its `Samples` configuration; diffusion draws at most four separate display samples; masked diffusion uses its configured preview count. DPO and GRPO preview the live policy, because their EMA holds a frozen reference rather than averaged policy weights. The base preview reuses the first scoring artifacts, retaining JEPA's representation histogram without another encoder pass. Preview draws do not enter scoring metrics. Without metrics, evaluation skips scoring work; without a tracker, it skips preview work.
 
 ## Use a tracker
 
@@ -56,7 +56,7 @@ Import `LocalTracker`, `WandbTracker`, and `Trackers` from `dew.training`.
 
 `Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)`, and `close()`. A tracker is borrowed by `Trainer.fit`; its constructing owner closes it. Context managers preserve the active exception if closing also fails.
 
-`LocalTracker("runs/example/tracking")` writes synchronous scalar and typed-record JSONL journals plus preview files. It never overwrites the recipe's `run.json`. Recipes create this local sink under their checkpoint directory; URI-backed checkpoint runs print their local tracking path. Optional W&B reporting uses the same interface. Explicitly use `offline=True` to prevent a W&B online session.
+`LocalTracker("runs/example/tracking")` writes synchronous scalar and typed-record JSONL journals plus preview files. It never overwrites the recipe's `run.json`. Recipes preserve the existing W&B preview request but do not enable previews for local-only reporting. Recipes create this local sink under their checkpoint directory; URI-backed checkpoint runs print their local tracking path. Optional W&B reporting uses the same interface. Explicitly use `offline=True` to prevent a W&B online session.
 
 Use `with Trackers(LocalTracker(path), WandbTracker(project, offline=True)) as tracker:` to own both sinks. Every sink receives each report even if another fails; the first failure propagates. There is no asynchronous reporting queue or silent drop policy: synchronous I/O has a cost at the log cadence.
 

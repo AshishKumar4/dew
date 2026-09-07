@@ -9,6 +9,7 @@ import sys
 
 import jax
 import numpy as np
+from dew.telemetry.records import RECORD_TYPES
 
 
 def main() -> None:
@@ -72,6 +73,8 @@ def main() -> None:
             self.scalars.update(scalars)
 
         def artifact(self, artifact, step):
+            if isinstance(artifact, RECORD_TYPES):
+                return
             self.preview_rows += artifact.images.shape[0]
 
     tracker, metric = Capture(), PixelMean()
@@ -90,7 +93,7 @@ def main() -> None:
                                 reassembled["advantages"]), phase="flow test likelihoods")
     error = float(np.max(np.abs(compared[0] - compared[1])))
     data = Dataset(train=lambda: itertools.repeat(local), val=lambda: iter((local,)), records=4, batch=4)
-    final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,))
+    final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,), preview=True)
     change = float(optax.tree.norm(jax.tree.map(
         lambda a, b: a - b, final.params["params"], initial.params["params"])))
     frozen = all(np.array_equal(np.asarray(a), np.asarray(b))

@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from dew.telemetry.records import RECORD_TYPES
 import pytest
 import optax
 from dew.training import Trainer
@@ -491,6 +492,8 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
             self.scalars.update(scalars)
 
         def artifact(self, artifact, step):
+            if isinstance(artifact, RECORD_TYPES):
+                return
             self.images.append(np.asarray(artifact.images).copy())
 
     count = jax.device_count()
@@ -519,7 +522,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert len(previewed.captions) == min(4, count)
     data = Dataset(train=lambda: itertools.repeat(prompts), val=lambda: iter((prompts, prompts)),
                    records=count, batch=count)
-    final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,))
+    final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,), preview=True)
     assert int(final.updates) == 1
     observed = np.concatenate(metric.images)
     assert observed.shape == (count * 2, 4, 4, 1)
