@@ -300,7 +300,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
             paths_list.append(nested(path))
         paths = tuple(paths_list)
         concatenate = -1
-        if model_type == "gemma4_text":
+        if model_type in ("gemma4_text", "qwen3_5_moe_text"):
             transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
@@ -309,7 +309,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
             transpose = (1, 0)
-        elif text_name.endswith(".experts.down_proj") and model_type == "gemma4_text":
+        elif text_name.endswith(".experts.down_proj") and model_type in ("gemma4_text", "qwen3_5_moe_text"):
             transpose = (0, 2, 1)
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate)
 
@@ -559,7 +559,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text"):
+        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text"):
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
@@ -569,7 +569,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
                     bindings.append(layout)
             layouts = tuple(bindings)
     processor = None
-    if (directory / "processor_config.json").exists():
+    if any((directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json")):
         from transformers import AutoProcessor
         options = {"backend": "pil"} if family == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)

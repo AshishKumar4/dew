@@ -189,6 +189,8 @@ class Mixture:
     routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
     as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
     product is the whole record of them.
+    The optional shared_gate multiplies that output by a learned scalar
+    sigmoid per token, independently of routing, as Qwen3.5 MoE does.
 
     `implementation` is the grouped matmul the experts run on,
     `moe.grouped_matmul`'s 'xla' or 'tokamax', the way `attention_impl`
@@ -211,6 +213,7 @@ class Mixture:
     parallel: bool = False
     expert_features: Optional[int] = None
     shared_features: int = 0
+    shared_gate: bool = False
     implementation: str = 'xla'
 
     def __post_init__(self):
@@ -234,6 +237,8 @@ class Mixture:
             raise ValueError(
                 f"shared_features is the shared branch's width, got "
                 f"{self.shared_features}; 0 is a layer without one")
+        if self.shared_gate and not self.shared_features:
+            raise ValueError("shared_gate requires shared_features")
         if self.implementation not in GROUPED_MATMULS:
             raise ValueError(
                 f"implementation is the experts' grouped matmul, one of "
@@ -1326,6 +1331,7 @@ class CausalTransformer(nn.Module):
             expert_bias=mixture.bias,
             scale_inputs=mixture.scale_inputs,
             shared=shared,
+            shared_gate=mixture.shared_gate,
             dtype=self.dtype,
             precision=self.precision)
         parallel = None if mixture is None or not mixture.parallel else functools.partial(

@@ -1,0 +1,22 @@
+{
+  "dense": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "moe": {
+    "repo": "Qwen/Qwen3.8-2.4T-A95B",
+    "revision": "207bd685a7e3696cfaff12ded7c6a7ea0f88c996"
+  },
+  "transformers": {
+    "version": "5.16.1",
+    "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+  },
+  "vllm": {
+    "revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+    "mtp_file": "vllm/model_executor/models/qwen3_5_mtp.py"
+  },
+  "official": {
+    "repo": "QwenLM/Qwen3.8",
+    "revision": "2ea10dc725823bf7c3e21ce8557cbe15245132ae"
+  }
+}

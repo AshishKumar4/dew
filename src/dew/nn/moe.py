@@ -455,6 +455,7 @@ class ExpertMLP(nn.Module):
     ("shared_experts", "gate_proj"): ("embed", "mlp"),
     ("shared_experts", "up_proj"): ("embed", "mlp"),
     ("shared_experts", "down_proj"): ("mlp", "embed"),
+    ("shared_expert_gate",): ("embed", None),
 })
 class SparseMLP(nn.Module):
     """A router over `num_experts` gated MLPs, `top_k` of them per token.
@@ -483,6 +484,7 @@ class SparseMLP(nn.Module):
     swiglu_limit: Optional[float] = None
     scale_inputs: bool = False
     shared: Optional[Callable[..., nn.Module]] = None
+    shared_gate: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -503,12 +505,21 @@ class SparseMLP(nn.Module):
             implementation=self.implementation, swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
             dtype=self.dtype, precision=self.precision, name='experts')
+        if self.shared_gate and self.shared is None:
+            raise ValueError("shared_gate requires a shared expert")
         if self.shared is not None:
             self.shared_experts = self.shared(name='shared_experts')
+            if self.shared_gate:
+                self.shared_expert_gate = nn.Dense(
+                    1, use_bias=False, dtype=self.dtype, precision=self.precision,
+                    name='shared_expert_gate')
 
     def __call__(self, x):
         weights, indices = self.gate(x)
         routed = self.experts(x, weights, indices)
         if self.shared is None:
             return routed
-        return routed + self.shared_experts(x)
+        shared = self.shared_experts(x)
+        if self.shared_gate:
+            shared = shared * jax.nn.sigmoid(self.shared_expert_gate(x))
+        return routed + shared
