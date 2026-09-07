@@ -51,8 +51,8 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
-| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `KDPM2`, `MultiStepDPM`, `DPMSolverMultistep`, `DPMSolverSinglestep`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `Consistency`, `TCD`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
+| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `KDPM2`, `MultiStepDPM`, `DPMSolverMultistep`, `DPMSolverSinglestep`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `Consistency`, `TCD` |
 | `dew.sampling.text` | `Generation`, `Sampling`, `generate` |
 
 ## Models

@@ -41,9 +41,10 @@ def check_solver(process, sampler) -> None:
     validation pass an epoch in."""
     x = jnp.zeros((1, 1), jnp.float32)
     t = jnp.ones((1,), jnp.float32)
+    times = jnp.asarray([1.0, 0.5], jnp.float32)
     key = jax.ShapeDtypeStruct((2,), jnp.uint32)
     jax.eval_shape(
-        lambda x, key: sampler.step(x, t, t * 0.5, x, x, sampler.init(x), key, process,
+        lambda x, key: sampler.step(x, t, t * 0.5, x, x, sampler.init(x, times), key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
 
@@ -152,7 +153,7 @@ class DiffusionObjective(Objective[Mean]):
         preds = self.model.apply(
             variables, noisy * c_in, schedule.model_time(t), **conditions,
             train=True, rngs={"dropout": dropout_key})
-        preds = self.process.prediction.pred_transform(noisy, preds, rates)
+        preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
         return Mean(jnp.sum(losses * weights),

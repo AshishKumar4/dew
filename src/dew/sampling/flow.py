@@ -139,7 +139,7 @@ class FlowSDE:
         if not math.isfinite(schedule.shift) or schedule.shift <= 0:
             raise ValueError("a rectified-flow timestep shift must be finite and positive")
 
-    def init(self, x: jax.Array) -> tuple[()]:
+    def init(self, x: jax.Array, times: jax.Array) -> tuple[()]:
         return ()
 
     def transition(self, x: jax.Array, t: jax.Array, t_next: jax.Array,

@@ -150,7 +150,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     noise = jax.random.normal(noise_key, x0.shape)
     rates = broadcast_rates(process.schedule, t, x0)
     x_t = rates[0] * x0 + rates[1] * noise
-    predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates)
+    predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates, t)
     expected = jnp.mean(expand(process.weight(t), x0) * optax.l2_loss(predicted, x0))
     assert float(loss) == pytest.approx(float(expected), rel=1e-6)
     assert aux.metrics == {}
