@@ -60,7 +60,7 @@ def test_single_prompt_processor_does_not_require_an_unneeded_pad_token(task):
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
     assert tokenizer.pad_token_id is None
-    policy = replace(task, processor=Processor(tokenizer, {}, {}))
+    policy = replace(task, processor=Processor(tokenizer, {}, {}, task.model.vocab_size))
     generated = policy("one two", 2, key=jax.random.key(0))
     np.testing.assert_array_equal(generated.tokens[:, :2], [[1, 2]])
     assert generated.lengths[0] == 2

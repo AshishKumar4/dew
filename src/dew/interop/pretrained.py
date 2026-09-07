@@ -49,6 +49,7 @@ class Processor:
     reference: HostProcessor
     config: Mapping[str, object]
     record: Mapping[str, object]
+    vocab_size: int
 
     def __call__(self, text: str | Sequence[str], *, images: object | None = None,
                  audio: object | None = None) -> ModelInputs:
@@ -100,11 +101,7 @@ class Processor:
             audio_fields, audio_conditioning = self._audio(values, tokens)
             token_fields.update(audio_fields)
             conditioning = {**conditioning, **audio_conditioning}
-        # Wrapper records nest the decoder under "text"; text-only sources are the decoder record.
-        text = self.record.get("text", self.record)
-        if not isinstance(text, Mapping) or type(text.get("vocab_size")) is not int:
-            raise ValueError("the text record must carry its integer vocab_size")
-        if np.any(tokens < 0) or np.any(tokens >= text["vocab_size"]):
+        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
             raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
@@ -710,11 +707,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         from transformers import AutoProcessor
         options = {"backend": "pil"} if family == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        processor = Processor(reference, config, record)
+        processor = Processor(reference, config, record, model.vocab_size)
     elif (directory / "tokenizer_config.json").exists():
         from transformers import AutoTokenizer
         reference = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
-        processor = Processor(reference, config, record)
+        processor = Processor(reference, config, record, model.vocab_size)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     error = None
