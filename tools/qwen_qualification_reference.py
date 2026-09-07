@@ -1,9 +1,10 @@
 """Write tiny Qwen3.8 checkpoint references using the released Qwen3.5 classes.
 
 No full weights are downloaded. Source metadata and revisions are committed in
-qwen38-source; the fixture changes geometry and vocabulary only. Run with the
-CPU vision environment and Transformers 5.16.1. MTP is recorded separately
-because Transformers does not execute the shipped mtp.* tensors.
+qwen38-source. Tiny model geometry, vocabulary and processor size bounds keep
+the reference runs local; video frame sampling is disabled for temporal-padding
+coverage. Run with the CPU vision environment and Transformers 5.16.1. MTP
+is recorded separately because Transformers does not execute its tensors.
 """
 
 import copy

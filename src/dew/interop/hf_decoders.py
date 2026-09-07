@@ -547,8 +547,8 @@ def _qwen35_rope(hf_config: Mapping[str, Any]) -> Tuple[float, float]:
     image share the rotated pairs; with one position per token every grid
     has the same angles and the interleave reads the same value from each
     (modeling_qwen3_5.py:129-164), so text-only input is this partial rope
-    exactly (difference 0.0 against the reference's cos/sin) and both keys
-    map to nothing. The image grids themselves are not modelled.
+    exactly (difference 0.0 against the reference cos/sin). Wrapper loading
+    retains the three-axis layout on its attention mixer for visual inputs.
     """
     entry = hf_config.get('rope_parameters') or {}
     rope_type = entry.get('rope_type', entry.get('type', 'default'))

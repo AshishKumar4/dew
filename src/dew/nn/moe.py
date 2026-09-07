@@ -467,6 +467,8 @@ class SparseMLP(nn.Module):
     name, the shape of `DecoderBlock`'s slots, so the backbone hands in its
     own `GatedMLP` at the shared width and the sum is what `DeepseekV3MoE`
     computes: the routed output plus the shared branch of the same input.
+    With shared_gate, a learned scalar sigmoid independently weights the
+    shared branch, as Qwen3_5MoeSparseMoeBlock does.
     """
     num_experts: int
     top_k: int
