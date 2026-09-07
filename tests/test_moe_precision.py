@@ -7,8 +7,6 @@ tangent that dropped a representable 2^-30 residue. The Adam checks compare
 the exchange dispatch with the global one, whose gradients the oracle checks.
 """
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import ml_dtypes
