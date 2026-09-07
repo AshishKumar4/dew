@@ -2112,7 +2112,7 @@ def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
     from huggingface_hub import snapshot_download
     return Path(snapshot_download(
         name_or_dir, revision=revision,
-        allow_patterns=["*.safetensors", "*.json"]))
+        allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]))
 
 
 class ExportTokenizer(Protocol):

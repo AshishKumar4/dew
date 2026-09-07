@@ -270,9 +270,10 @@ def _run(rows: jax.sharding.NamedSharding | None):
             params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-        samples = sample(denoise, x_T, None if times is not None else steps, solver=sampler, guidance=guidance,
-                         key=key, times=None if times is None else jnp.asarray(times, jnp.float32),
-                         final_denoise=final_denoise)
+        with jax.ensure_compile_time_eval():
+            grid = None if times is None else jnp.asarray(times, jnp.float32)
+        samples = sample(denoise, x_T, None if grid is not None else steps, solver=sampler, guidance=guidance,
+                         key=key, times=grid, final_denoise=final_denoise)
         if autoencoder is not None:
             samples = autoencoder.decode(params["autoencoder"], samples)
         samples = jnp.clip(samples, -1.0, 1.0)
