@@ -40,7 +40,7 @@ The translator validates supported computational fields. A new checkpoint releas
 | Llama 4 | Vision rotary, patch ordering, adapter, and projection | Still-image wrapper fixtures; inspect input resolution and token placement requirements |
 | Gemma 4 | Position tables, vision rotary, pooler, and multimodal embedder | Fixed square still-image path; ragged/padded/video behavior is restricted |
 | Qwen 3.5 | Temporal-patch layout for stills, vision rotary, and merger | Fixed-resolution stills; mixed-resolution packed inputs are restricted |
-| Gemma 3n | MobileNet-v5 vision tower | Not implemented |
+| Gemma 3n | MobileNet-v5 encoder and hard/soft vision embeddings | Image-only bundles; audio config and weights are rejected. Tiny forward, gradient, and update comparisons run on CPU |
 
 Audio towers are not implemented. A vision wrapper's successful forward comparison does not automatically qualify its tokenizer, image processor, generation loop, training gradients, or multi-host placement.
 

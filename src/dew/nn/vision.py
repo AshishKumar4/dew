@@ -1,4 +1,4 @@
-"""SigLIP, Llama 4, Gemma 4 and Qwen 3.5 vision towers with projectors, and weights.
+"""Vision towers, projectors and reference checkpoint maps.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
 `dew/nn/text_encoders.py` vendors CLIP, in the reference layout, with each
@@ -24,6 +24,8 @@ and the merger MLP as its projector. Each tower's projector is a registered
 value beside it: Gemma 3's averages each patch block, norms and maps to the
 decoder width, Llama 4's maps the shuffled output to the decoder width,
 Gemma 4's norms without a scale and maps, and Qwen 3.5's is the merger.
+Gemma 3n uses the MobileNet-v5 encoder in ``dew.nn.mobilenet`` and the hard/soft
+vision embedder defined here.
 """
 
 import dataclasses
@@ -32,13 +34,15 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import checkify
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.text_encoders import CLIPAttention, MLP
-from dew.registry import Registry
+from dew.registry import Registry, from_record
+from .mobilenet import MobileNetV5Encoder
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -1833,3 +1837,274 @@ def translate_qwen35_projector_config(vision: Mapping[str, Any],
         "merge_size": int(vision["spatial_merge_size"]),
         "out_width": merged,
     }
+
+
+@towers("gemma3n")
+@dataclasses.dataclass(frozen=True)
+class Gemma3nVision(TowerBase):
+    """MobileNet-v5's encoder construction fields, as timm model_args names them."""
+
+    channel_multiplier: float = 1.0
+    stem_size: int = 64
+    stem_bias: bool = True
+    fix_stem: bool | None = None
+    in_chans: int = 3
+    pad_type: str = "same"
+    group_size: int | None = None
+    msfa_indices: tuple[int, ...] = (-2, -1)
+    msfa_output_resolution: int = 16
+    layer_scale_init_value: float | None = 1e-5
+    drop_path_rate: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "msfa_indices", tuple(self.msfa_indices))
+
+    def build(self) -> nn.Module:
+        return MobileNetV5Encoder(**dataclasses.asdict(self))
+
+
+class Gemma3nProjectorModule(nn.Module):
+    """Gemma3nMultimodalEmbedder's vision hard and soft token paths."""
+
+    vision_width: int
+    text_width: int
+    vocab_size: int = 128
+    vocab_offset: int = 262144
+    norm_eps: float = 1e-6
+    dtype: Optional[Dtype] = None
+    precision: PrecisionLike = None
+
+    def setup(self):
+        if min(self.vision_width, self.text_width, self.vocab_size) < 1 or self.vocab_offset < 0:
+            raise ValueError("vision/text widths and vocab_size must be positive; vocab_offset is nonnegative")
+        if self.norm_eps <= 0:
+            raise ValueError("norm_eps must be positive")
+        self.embedding = nn.Embed(self.vocab_size, self.vision_width, dtype=self.dtype,
+                                  name="embedding")
+        norm = functools.partial(RMSNorm, epsilon=self.norm_eps, dtype=self.dtype)
+        self.hard_embedding_norm = norm(name="hard_embedding_norm")
+        self.soft_embedding_norm = norm(name="soft_embedding_norm")
+        self.embedding_projection = nn.Dense(self.text_width, use_bias=False,
+                                              dtype=self.dtype, precision=self.precision,
+                                              name="embedding_projection")
+        self.embedding_post_projection_norm = norm(with_scale=False,
+                                                   name="embedding_post_projection_norm")
+
+    def __call__(self, features):
+        features = jnp.asarray(features)
+        if features.ndim != 3 or features.shape[-1] != self.vision_width:
+            raise ValueError(f"vision features must be [B, N, {self.vision_width}], got {features.shape}")
+        if not jnp.issubdtype(features.dtype, jnp.floating):
+            raise ValueError("vision features must be floating point")
+        if self.is_initializing():
+            # Both paths belong to one checkpoint even when init starts with
+            # image features. Linen creates an embedding only when called.
+            self.hard_embedding_norm(self.embedding(jnp.zeros((1, 1), jnp.int32)))
+        features = features * jnp.asarray(self.vision_width ** 0.5, features.dtype)
+        return self.embedding_post_projection_norm(
+            self.embedding_projection(self.soft_embedding_norm(features)))
+
+    def hard_embeddings(self, input_ids):
+        """Embed checked vision IDs in [vocab_offset, vocab_offset + vocab_size).
+
+        Eager calls raise on invalid IDs. Compiled callers use checkify.checkify
+        around apply, then call the returned Error.throw() on the host before
+        consuming embeddings. Plain jit does not functionalize these checks.
+        """
+        ids = jnp.asarray(input_ids)
+        if ids.ndim != 2 or not jnp.issubdtype(ids.dtype, jnp.integer):
+            raise ValueError("vision token IDs must be an integer [B, S] array")
+        upper = self.vocab_offset + self.vocab_size
+        checkify.check(jnp.all((ids >= self.vocab_offset) & (ids < upper)),
+                       f"vision token IDs must be in [{self.vocab_offset}, {upper})")
+        return self._hard_embeddings(ids)
+
+    def _hard_embeddings(self, ids):
+        """Numerical lookup after the public token-domain check."""
+        embedded = self.embedding(ids - self.vocab_offset)
+        if self.is_initializing():
+            self.soft_embedding_norm(jnp.zeros_like(embedded))
+        return self.embedding_post_projection_norm(
+            self.embedding_projection(self.hard_embedding_norm(embedded)))
+
+    def _merge_hard_embeddings(self, token_embeddings, ids):
+        """Fuse admitted text/vision IDs using the reference's dummy vision ID."""
+        mask = (ids >= self.vocab_offset) & (ids < self.vocab_offset + self.vocab_size)
+        chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
+        hard = self._hard_embeddings(chosen).astype(token_embeddings.dtype)
+        return jnp.where(mask[..., None], hard, token_embeddings)
+
+    def model_inputs(self, token_embeddings, input_ids, soft_tokens=None,
+                     image_positions=None, *, per_layer_input_vocab: int) -> dict[str, jax.Array]:
+        """CausalTransformer inputs after vision fusion and the PLE vocabulary mask.
+
+        token_embeddings are the decoder's scaled embeddings. Image positions
+        are a precomputed integer [B, N] array, matching the [B, N, D] soft
+        tokens. Eager calls reject IDs outside the text/vision vocabulary.
+        Compile the caller with jit(checkify.checkify(...)); it returns an
+        Error alongside the inputs. Call Error.throw() on the host before
+        using the inputs. The checkified path remains differentiable.
+        """
+        ids = jnp.asarray(input_ids)
+        embeddings = jnp.asarray(token_embeddings)
+        if ids.ndim != 2 or not jnp.issubdtype(ids.dtype, jnp.integer):
+            raise ValueError("input_ids must be an integer [B, S] array")
+        if embeddings.shape != ids.shape + (self.text_width,):
+            raise ValueError("token embeddings must align with input_ids and text_width")
+        upper = self.vocab_offset + self.vocab_size
+        checkify.check(jnp.all((ids >= 0) & (ids < upper)),
+                       f"image-only input_ids must be in [0, {upper}); audio IDs are unsupported")
+        if not jnp.issubdtype(embeddings.dtype, jnp.floating):
+            raise ValueError("token_embeddings must be floating point")
+        if per_layer_input_vocab < 1:
+            raise ValueError("per_layer_input_vocab must be positive")
+        if (soft_tokens is None) != (image_positions is None):
+            raise ValueError("soft_tokens and image_positions arrive together")
+        merged = self._merge_hard_embeddings(embeddings, ids)
+        if soft_tokens is not None:
+            soft, positions = jnp.asarray(soft_tokens), jnp.asarray(image_positions)
+            if (soft.ndim != 3 or soft.shape[0] != ids.shape[0]
+                    or soft.shape[-1] != self.text_width or positions.shape != soft.shape[:2]):
+                raise ValueError("soft_tokens and image_positions must be [B, N, D] and [B, N]")
+            if not jnp.issubdtype(positions.dtype, jnp.integer):
+                raise ValueError("image_positions must be integers")
+            merged = merged.at[jnp.arange(ids.shape[0])[:, None], positions].set(
+                soft.astype(merged.dtype))
+        tokens = jnp.where((ids >= 0) & (ids < per_layer_input_vocab), ids, 0)
+        return {"tokens": tokens, "input_embeddings": merged,
+                "embedding_positions": jnp.broadcast_to(
+                    jnp.arange(ids.shape[1], dtype=jnp.int32), ids.shape)}
+
+@projectors("gemma3n")
+@dataclasses.dataclass(frozen=True)
+class Gemma3nProjector(ProjectorBase):
+    vision_width: int
+    text_width: int
+    vocab_size: int = 128
+    vocab_offset: int = 262144
+    norm_eps: float = 1e-6
+
+    def build(self) -> nn.Module:
+        return Gemma3nProjectorModule(**dataclasses.asdict(self))
+
+
+def gemma3n_vision_path(hf_name: str) -> Tuple[str, ...]:
+    """A timm MobileNet-v5 weight into the corresponding Linen module."""
+    from .mobilenet import _ARCHITECTURE
+
+    bare = hf_name.removeprefix("timm_model.")
+    parts = tuple(bare.split("."))
+    prefix: tuple[str, ...] = ()
+    tails: set[tuple[str, ...]]
+    if parts[:1] == ("blocks",) and len(parts) >= 5 and parts[1].isdigit() and parts[2].isdigit():
+        stage, index = int(parts[1]), int(parts[2])
+        if stage >= len(_ARCHITECTURE) or index >= len(_ARCHITECTURE[stage]):
+            raise ValueError(f"unknown tensor name {hf_name!r}")
+        spec = _ARCHITECTURE[stage][index]
+        prefix = (f"stages_{stage}", f"blocks_{index}")
+        parts = parts[3:]
+        if spec.kind == "edge":
+            tails = {(name, "weight") for name in ("conv_exp", "conv_pwl", "bn1", "bn2")}
+        elif spec.kind == "inverted":
+            modules = ["pw_exp", "pw_proj"]
+            if spec.start_kernel:
+                modules.append("dw_start")
+            if spec.middle_kernel:
+                modules.append("dw_mid")
+            tails = {(name, child, "weight") for name in modules for child in ("conv", "bn")}
+            tails.add(("layer_scale", "gamma"))
+        else:
+            tails = {("norm", "weight"), ("layer_scale", "gamma")}
+            tails.update(("attn", name, "proj", "weight") for name in ("query", "key", "value", "output"))
+            if spec.kv_stride > 1:
+                tails.update(("attn", name, child, "weight") for name in ("key", "value")
+                             for child in ("down_conv", "norm"))
+    elif parts[:1] == ("conv_stem",):
+        tails = {("conv", "weight"), ("conv", "bias"), ("bn", "weight")}
+        prefix, parts = ("conv_stem",), parts[1:]
+    elif parts[:1] == ("msfa",):
+        tails = {("norm", "weight")}
+        tails.update(("ffn", name, child, "weight") for name in ("pw_exp", "pw_proj")
+                     for child in ("conv", "bn"))
+        prefix, parts = ("msfa",), parts[1:]
+    else:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    if len(parts) < 2 or parts not in tails:
+        raise ValueError(f"unknown tensor name {hf_name!r}")
+    if parts[-1] != "weight":
+        return prefix + parts
+    norm = parts[-2] in ("bn", "bn1", "bn2", "norm")
+    return prefix + parts[:-1] + ("scale" if norm else "kernel",)
+
+
+def translate_gemma3n_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, object]:
+    return _translate(hf_tensors, gemma3n_vision_path)
+
+
+def translate_gemma3n_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, object]:
+    paths = {
+        "embedding.weight": ("embedding", "embedding"),
+        "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
+        "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
+        "embedding_projection.weight": ("embedding_projection", "kernel"),
+    }
+    if set(hf_tensors) != set(paths):
+        raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
+                         f"unknown {sorted(set(hf_tensors) - set(paths))}")
+    return _translate(hf_tensors, paths.__getitem__)
+
+
+def _gemma3n_vision_record(
+        hf_config: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Validate the whole vision record before either component consumes it."""
+    vision = hf_config.get("vision_config", hf_config)
+    if not isinstance(vision, Mapping):
+        raise ValueError("vision_config must be a mapping")
+    if vision.get("model_type", "gemma3n_vision") != "gemma3n_vision":
+        raise ValueError(f"vision model_type {vision.get('model_type')!r} is not gemma3n_vision")
+    used = {"model_type", "architecture", "hidden_size", "do_pooling", "model_args",
+            "vocab_size", "vocab_offset", "rms_norm_eps"}
+    # These are serialized HF metadata. Vocabulary and RMS fields above feed
+    # the vision embedder; construction fields feed the MobileNet encoder.
+    metadata = {"architectures", "transformers_version", "torch_dtype", "dtype",
+                "initializer_range", "label_names", "num_classes", "id2label",
+                "label2id", "output_hidden_states", "output_attentions", "return_dict",
+                "is_encoder_decoder", "problem_type", "chunk_size_feed_forward"}
+    unknown = (set(vision) - used - metadata
+               - {key for key in vision if str(key).startswith("_")})
+    if unknown:
+        raise ValueError(f"vision_config fields {sorted(unknown)} have no counterpart")
+    if vision.get("architecture", "mobilenetv5_300m_enc") != "mobilenetv5_300m_enc":
+        raise ValueError(f"architecture {vision.get('architecture')!r} is not the MobileNet-v5 encoder")
+    if int(vision.get("hidden_size", 2048)) != 2048:
+        raise ValueError("hidden_size must be 2048; timm's MobileNet-v5 encoder fixes its adapter width")
+    if vision.get("do_pooling", False):
+        raise ValueError("do_pooling=True requests a classifier head the encoder does not have")
+    options = vision.get("model_args")
+    if options is None:
+        options = {}
+    if not isinstance(options, Mapping):
+        raise ValueError("model_args must be a mapping")
+    allowed = {field.name for field in dataclasses.fields(Gemma3nVision)}
+    unknown = set(options) - allowed
+    if unknown:
+        raise ValueError(f"MobileNet-v5 model_args {sorted(unknown)} are not supported")
+    return vision, options
+
+
+def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> dict[str, object]:
+    _, options = _gemma3n_vision_record(hf_config)
+    value: Gemma3nVision = from_record(Gemma3nVision, options)
+    return {"kind": "gemma3n", **dataclasses.asdict(value)}
+
+
+def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
+                                       text_width: int) -> dict[str, object]:
+    vision, _ = _gemma3n_vision_record(hf_config)
+    value: Gemma3nProjector = from_record(Gemma3nProjector, {
+        "vision_width": vision.get("hidden_size", 2048), "text_width": text_width,
+        "vocab_size": vision.get("vocab_size", 128),
+        "vocab_offset": vision.get("vocab_offset", 262144),
+        "norm_eps": vision.get("rms_norm_eps", 1e-6),
+    })
+    return {"kind": "gemma3n", **dataclasses.asdict(value)}

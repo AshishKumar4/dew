@@ -217,16 +217,6 @@ def test_a_wrapper_without_an_image_token_is_refused():
         translate_wrapper_config(config)
 
 
-def test_a_gemma3n_wrapper_is_refused_naming_mobilenet():
-    """google/gemma-3n-E2B's wrapper carries a gemma3n_vision tower, which is
-    MobileNet-v5: an image classifier with no counterpart here. Only its
-    text_config translates."""
-    config = json.loads((FIXTURES / "gemma-3n-e2b" / "config.json").read_text())
-    assert translate_config(config["text_config"])["emb_features"] > 0
-    with pytest.raises(ValueError, match="MobileNet"):
-        translate_wrapper_config(config)
-
-
 def _multimodal_logits(name, image_id, shift=0):
     """Pixels through the translated tower and projector, merged at the image
     marks, into the translated decoder through the input-embeddings hook."""

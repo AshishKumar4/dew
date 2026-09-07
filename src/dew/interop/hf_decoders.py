@@ -1093,6 +1093,8 @@ def _gemma3n_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, A
                  'altup_active_idx', 'altup_coef_clip', 'altup_correct_scale',
                  'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
                  'num_kv_shared_layers', 'final_logit_softcapping'))
+    # PreTrainedConfig serializes this field; Gemma3nTextMLP never reads it.
+    used.add('chunk_size_feed_forward')
     clip = hf_config.get('altup_coef_clip', 120.0)
     # AltUp's own checks name the reference's fields, so a config out of
     # their range is refused here.
@@ -1570,17 +1572,35 @@ def _qwen35_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
     }
 
 
+def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
+    """An image-only Gemma 3n wrapper with MobileNet and both vision embeddings."""
+    if hf_config.get("audio_config") is not None:
+        _refuse("audio_config", "Gemma 3n audio is not implemented; an image-only bundle must omit its audio config and weights")
+    used.update(("audio_config", "chunk_size_feed_forward"))
+    text = _wrapper_text(hf_config, used)
+    tower = vision_nn.translate_gemma3n_vision_config(hf_config)
+    projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
+    used.add("vision_config")
+    count = _record_int(tower, "msfa_output_resolution") ** 2
+    if hf_config.get("vision_soft_tokens_per_image", count) != count:
+        _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
+    image = _wrapper_image_id(hf_config, used, "image_token_id")
+    _wrapper_tokens(hf_config, used)
+    used.update(("vision_soft_tokens_per_image", "audio_soft_tokens_per_image", "audio_token_id",
+                 "boa_token_id", "eoa_token_id"))
+    return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
+            "tower": tower, "projector": projector, "image_token_id": image,
+            "tokens_per_image": count}
+
+
 def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4 and qwen3_5 wrappers translate: text_config through
-    the decoder map, vision_config into the tower value's fields, and the
-    projector fields beside them, with the image token id and the soft-token
-    count. The count is fixed for gemma3 and llama4 and open for gemma4 and
-    qwen3_5, whose towers pool to a count the image resolution decides. A
-    gemma3n wrapper refuses: its tower is MobileNet-v5, an image classifier
-    outside this tree, and its soft tokens ride a vocab offset the text
-    embeddings here do not model.
+    gemma3, llama4, gemma4, qwen3_5 and image-only gemma3n bundles translate.
+    Records retain the decoder, tower, projector, image token ID and token
+    count. Gemma 3n's projector also embeds hard vision-vocabulary IDs.
+    Callers mask non-text IDs before the per-layer embedding lookup.
+    Audio config and weights remain unsupported.
     """
     model_type = hf_config.get("model_type")
     used = {"model_type"}
@@ -1592,18 +1612,11 @@ def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         record = _gemma4_wrapper(hf_config, used)
     elif model_type == "qwen3_5":
         record = _qwen35_wrapper(hf_config, used)
+    elif model_type == "gemma3n":
+        record = _gemma3n_wrapper(hf_config, used)
     else:
-        vision = hf_config.get("vision_config")
-        tower_type = vision.get("model_type") if isinstance(vision, Mapping) else None
-        if tower_type == "gemma3n_vision":
-            _refuse("vision_config (model_type 'gemma3n_vision')",
-                    "its MobileNet-v5 tower is an image classifier with no "
-                    "counterpart here; only the wrapper's text_config translates "
-                    "today")
         _refuse(f"model_type {model_type!r}",
-                "translate_wrapper_config loads the gemma3, llama4, gemma4 and "
-                "qwen3_5 wrappers; any other multimodal wrapper names a tower "
-                "with no counterpart")
+                "no supported multimodal wrapper is registered for this model")
     unknown = (set(hf_config) - used - _IGNORED_FIELDS
                - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
@@ -1622,6 +1635,8 @@ def _wrapper_tower_weights(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> D
         return vision_nn.translate_gemma4_vision_weights(hf_tensors)
     if kind == "qwen3_5":
         return vision_nn.translate_qwen35_vision_weights(hf_tensors)
+    if kind == "gemma3n":
+        return vision_nn.translate_gemma3n_vision_weights(hf_tensors)
     raise ValueError(f"tower kind {kind!r} has no weight map here")
 
 
@@ -1636,6 +1651,8 @@ def _wrapper_projector_weights(kind: str,
         return vision_nn.translate_gemma4_projector_weights(hf_tensors)
     if kind == "qwen3_5":
         return vision_nn.translate_qwen35_projector_weights(hf_tensors)
+    if kind == "gemma3n":
+        return vision_nn.translate_gemma3n_projector_weights(hf_tensors)
     raise ValueError(f"projector kind {kind!r} has no weight map here")
 
 
@@ -1654,9 +1671,11 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
     tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model.",
-                    "gemma4": "vision_tower.", "qwen3_5": "visual."}[tower_kind]
+                    "gemma4": "vision_tower.", "qwen3_5": "visual.",
+                    "gemma3n": "vision_tower."}[tower_kind]
     projector_prefix = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
-                        "gemma4": "embed_vision.", "qwen3_5": "visual.merger."}[projector_kind]
+                        "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
+                        "gemma3n": "embed_vision."}[projector_kind]
     text_tensors: Dict[str, np.ndarray] = {}
     tower_tensors: Dict[str, np.ndarray] = {}
     projector_tensors: Dict[str, np.ndarray] = {}
