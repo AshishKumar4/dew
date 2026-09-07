@@ -6,6 +6,7 @@ import functools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -174,6 +175,38 @@ def _mesh(params: Variables) -> jax.sharding.Mesh | None:
     return None
 
 
+def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+               conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling) -> ModelInputs:
+    """Host checks shared by batch generation and the engine; returns device inputs."""
+    if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError("inputs must contain non-empty [B, P] integer token ids")
+    if type(max_new_tokens) is not int or max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be a non-negative integer")
+    valid = np.asarray(fields.get("attention_mask", np.ones(ids.shape, bool)))
+    if valid.shape != ids.shape or not np.all((valid == 0) | (valid == 1)):
+        raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
+    if not np.all(valid.any(axis=1)):
+        raise ValueError("each prompt must contain at least one valid token")
+    cache_len = getattr(model, "max_seq_len", None)
+    if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
+        raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
+    vocab = getattr(model, "vocab_size", None)
+    if np.any(ids < 0):
+        raise ValueError("token ids must be non-negative")
+    media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
+    if vocab is not None and np.any((ids >= vocab) & ~media):
+        raise ValueError("text token ids must be inside the vocabulary")
+    if vocab is not None and (sampling.pad_id >= vocab or
+                             (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
+        raise ValueError("sampling token ids must be inside the vocabulary")
+    prepared = ModelInputs(jnp.asarray(ids, jnp.int32),
+                           {**{name: jnp.asarray(value) for name, value in fields.items()},
+                            "attention_mask": jnp.asarray(valid.astype(bool))},
+                           {name: jnp.asarray(value) for name, value in conditioning.items()})
+    prepared.validate()
+    return prepared
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_generate, static_argnames=("model", "max_new_tokens", "sampling"),
@@ -211,34 +244,9 @@ def generate(model: nn.Module, params: Variables,
         ids = local_rows(canonical.tokens)
         fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
         conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
-        if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
-            raise ValueError("inputs must contain non-empty [B, P] integer token ids")
         if "params" not in params:
             raise ValueError("generate takes the full variables dict ({'params': ...})")
-        if type(max_new_tokens) is not int or max_new_tokens < 0:
-            raise ValueError("max_new_tokens must be a non-negative integer")
-        valid = np.asarray(fields.get("attention_mask", np.ones(ids.shape, bool)))
-        if valid.shape != ids.shape or not np.all((valid == 0) | (valid == 1)):
-            raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
-        if not np.all(valid.any(axis=1)):
-            raise ValueError("each prompt must contain at least one valid token")
-        cache_len = getattr(model, "max_seq_len", None)
-        if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
-            raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
-        vocab = getattr(model, "vocab_size", None)
-        if np.any(ids < 0):
-            raise ValueError("token ids must be non-negative")
-        media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
-        if vocab is not None and np.any((ids >= vocab) & ~media):
-            raise ValueError("text token ids must be inside the vocabulary")
-        if vocab is not None and (sampling.pad_id >= vocab or
-                                 (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
-            raise ValueError("sampling token ids must be inside the vocabulary")
-        fields["attention_mask"] = valid.astype(bool)
-        prepared = ModelInputs(jnp.asarray(ids, jnp.int32),
-                               {name: jnp.asarray(value) for name, value in fields.items()},
-                               {name: jnp.asarray(value) for name, value in conditioning.items()})
-        prepared.validate()
+        prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling)
     except BaseException as failure:
         error = failure
     if processes > 1:
@@ -283,3 +291,142 @@ def generate(model: nn.Module, params: Variables,
         output = jax.tree.map(lambda leaf: leaf[:batch], output)
         return jax.device_put(output, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))
     return jax.tree.map(lambda leaf: jnp.asarray(local_rows(leaf)[:batch]), output)
+
+
+@dataclass(frozen=True)
+class TextPlan:
+    """Static controls of one request; the sampling value identifies a decode cohort."""
+
+    sampling: Sampling
+    max_new_tokens: int
+
+    @property
+    def controls(self) -> Sampling:
+        return self.sampling
+
+    @property
+    def geometry(self) -> None:
+        return None
+
+    @property
+    def steps(self) -> int:
+        return self.max_new_tokens
+
+
+@dataclass(frozen=True)
+class TokenEvent:
+    """One emitted response action of one row, in emission order."""
+
+    row: int
+    position: int
+    token: int
+    behavior_log_prob: float
+    raw_log_prob: float
+    terminated: bool
+
+
+class TextProgress:
+    """Host record of one job's rows; the same arithmetic as the compiled scan."""
+
+    def __init__(self, inputs: ModelInputs, plan: TextPlan) -> None:
+        self.prompt = np.asarray(inputs.tokens)
+        self.plan = plan
+        batch, budget = self.prompt.shape[0], plan.max_new_tokens
+        self.tokens = np.full((batch, budget), plan.sampling.pad_id, np.int32)
+        self.behavior = np.zeros((batch, budget), np.float32)
+        self.raw = np.zeros((batch, budget), np.float32)
+        self.lengths = np.zeros(batch, np.int32)
+        self.terminated = np.zeros(batch, bool)
+        self.active = np.full(batch, budget > 0)
+        self.order = np.zeros((batch * budget, 2), np.int32)
+        self.count = 0
+
+    @property
+    def bytes(self) -> int:
+        return self.tokens.nbytes + self.behavior.nbytes + self.raw.nbytes + self.order.nbytes
+
+    @property
+    def done(self) -> bool:
+        return not bool(self.active.any())
+
+    def record(self, outputs: TokenSample) -> None:
+        """Consume [steps, rows] samples; positions follow each row's own count."""
+        stops = None if self.plan.sampling.eos_id is None else np.asarray(self.plan.sampling.eos_id)
+        tokens, valid = np.asarray(outputs.tokens), np.asarray(outputs.valid)
+        behavior, raw = np.asarray(outputs.behavior_log_probs), np.asarray(outputs.raw_log_probs)
+        for step in range(tokens.shape[0]):
+            for row in np.flatnonzero(self.active):
+                if not valid[step, row]:
+                    self.active[row] = False
+                    continue
+                position = int(self.lengths[row])
+                self.tokens[row, position] = tokens[step, row]
+                self.behavior[row, position] = behavior[step, row]
+                self.raw[row, position] = raw[step, row]
+                self.lengths[row] = position + 1
+                stop = stops is not None and bool(np.isin(tokens[step, row], stops))
+                self.terminated[row] = stop
+                self.active[row] = not stop and position + 1 < self.plan.max_new_tokens
+                self.order[self.count] = (row, position)
+                self.count += 1
+
+    def events(self, start: int) -> list[TokenEvent]:
+        return [TokenEvent(int(row), int(position), int(self.tokens[row, position]),
+                           float(self.behavior[row, position]), float(self.raw[row, position]),
+                           bool(self.terminated[row] and position + 1 == self.lengths[row]))
+                for row, position in self.order[start:self.count]]
+
+    def result(self, state: DecoderState | None = None) -> Generation:
+        return Generation(jnp.concatenate([jnp.asarray(self.prompt), jnp.asarray(self.tokens)], axis=1),
+                          jnp.asarray(self.lengths), jnp.asarray(self.terminated),
+                          jnp.asarray(self.behavior), jnp.asarray(self.raw))
+
+
+@dataclass(frozen=True)
+class AutoregressiveFamily:
+    """Next-token generation over the shared cached prefill and decode kernels.
+
+    Rows of different requests are independent, so an engine may place them
+    in one decode state. ``sampling`` is the policy used when a request
+    passes no generation value.
+    """
+
+    sampling: Sampling = Sampling()
+    shared_rows: ClassVar[bool] = True
+
+    def prepare(self, model: nn.Module, inputs: ModelInputs, max_new_tokens: int,
+                generation: object | None) -> tuple[ModelInputs, TextPlan]:
+        sampling = self.sampling if generation is None else generation
+        if not isinstance(sampling, Sampling):
+            raise TypeError("autoregressive generation takes a Sampling value")
+        prepared = _validated(
+            model, np.asarray(inputs.tokens),
+            {name: np.asarray(value) for name, value in inputs.token_fields.items()},
+            {name: np.asarray(value) for name, value in inputs.conditioning.items()},
+            max_new_tokens, sampling)
+        return prepared, TextPlan(sampling, max_new_tokens)
+
+    def begin(self, model: nn.Module, variables: Variables, inputs: ModelInputs,
+              geometry: None) -> DecoderState:
+        return _prefill(model, variables, inputs)
+
+    def advance(self, model: nn.Module, variables: Variables, state: DecoderState,
+                keys: jax.Array, controls: Sampling, steps: int) -> tuple[DecoderState, TokenSample]:
+        def step(carry, _):
+            return _decode(model, variables, carry, keys, controls)
+
+        return lax.scan(step, state, None, length=steps)
+
+    def keys(self, key: jax.Array, rows: int) -> jax.Array:
+        return jax.vmap(lambda row: jax.random.fold_in(key, row))(jnp.arange(rows))
+
+    def progress(self, inputs: ModelInputs, plan: TextPlan) -> TextProgress:
+        return TextProgress(inputs, plan)
+
+    def generate(self, model: nn.Module, variables: Variables,
+                 inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+                 *, key: jax.Array, generation: object | None = None) -> Generation:
+        sampling = self.sampling if generation is None else generation
+        if not isinstance(sampling, Sampling):
+            raise TypeError("autoregressive generation takes a Sampling value")
+        return generate(model, variables, inputs, max_new_tokens, key=key, sampling=sampling)
