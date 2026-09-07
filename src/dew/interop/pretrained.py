@@ -574,40 +574,86 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
+# Transformers 5.16.1 generation controls (GenerationConfig.to_dict keys) by
+# what they do to the token distribution. Every value is None when unset.
+# SUPPORTED: the native Sampling value carries them. TASK_OWNED: prompt
+# creation, output size, execution and metadata; they leave the distribution
+# alone. NEUTRAL: unset or the value at which generate() adds no processor,
+# criterion or search mode (utils._get_logits_processor,
+# configuration_utils.get_generation_mode); anything else is an active
+# control the native sampler cannot honor. BEAM_ONLY matter only when
+# num_beams is active. tests/test_inference_sampling.py holds the union of
+# these names equal to the pinned library's keys.
+_SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
+                                 "eos_token_id", "pad_token_id"})
+_TASK_OWNED_CONTROLS = frozenset({
+    "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens", "max_time",
+    "num_return_sequences", "use_cache", "cache_implementation", "cache_config",
+    "max_cache_len", "prefill_chunk_size", "continuous_batching_config", "compile_config",
+    "disable_compile", "low_memory", "use_mtp", "speculation_type", "is_assistant",
+    "num_assistant_tokens", "num_assistant_tokens_schedule", "assistant_confidence_threshold",
+    "assistant_early_exit", "assistant_lookbehind", "assistant_ensemble_weight",
+    "target_lookbehind", "prompt_lookup_num_tokens", "max_matching_ngram_size",
+    "output_attentions", "output_hidden_states", "output_scores", "output_logits",
+    "return_dict_in_generate", "transformers_version", "_from_model_config", "_commit_hash",
+    "tokenizer_name",
+})
+_NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
+    "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
+    "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
+    "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),
+    "typical_p": (1.0,), "epsilon_cutoff": (0.0,), "eta_cutoff": (0.0,), "top_h": (),
+    "guidance_scale": (1.0,), "remove_invalid_values": (False,), "renormalize_logits": (False,),
+    "token_healing": (False,), "sequence_bias": (), "bad_words_ids": (), "force_words_ids": (),
+    "constraints": (), "forced_bos_token_id": (), "forced_eos_token_id": (),
+    "exponential_decay_length_penalty": (), "suppress_tokens": (), "begin_suppress_tokens": (),
+    "watermarking_config": (), "dola_layers": (), "stop_strings": (),
+}
+_BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
+    "early_stopping": (False,), "length_penalty": (1.0,), "num_beam_groups": (1,),
+    "diversity_penalty": (0.0,),
+}
+_SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"})
+
+
+def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
+    if value is None:
+        return True
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return any(value == item and (numeric and not isinstance(item, bool) or type(value) is type(item))
+               for item in neutral)
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
     """Construct only policies whose active controls the native sampler implements."""
-    from transformers import GenerationConfig
-
-    defaults = GenerationConfig().to_dict()
     do_sample = _generation_value(config, generation_config, "do_sample", False)
+    if do_sample is None:
+        do_sample = False
     if type(do_sample) is not bool:
         raise ValueError("do_sample must be a boolean")
-    supported = {"do_sample", "temperature", "top_k", "top_p", "min_p", "eos_token_id", "pad_token_id"}
-    # Prompt creation, requested output size and output representation belong
-    # to the task. These source fields do not transform its token distribution.
-    task_owned = {"bos_token_id", "max_length", "max_new_tokens", "use_cache",
-                  "cache_implementation", "cache_config", "return_legacy_cache", "compile_config",
-                  "disable_compile", "output_attentions", "output_hidden_states", "output_scores",
-                  "output_logits", "return_dict_in_generate", "transformers_version",
-                  "_from_model_config", "_commit_hash", "tokenizer_name"}
-    sampled_only = {"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"}
+    beams = _generation_value(config, generation_config, "num_beams")
+    judged = dict(_NEUTRAL_CONTROLS)
+    if not _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
+        judged.update(_BEAM_ONLY_CONTROLS)
     unsupported = []
-    for name in set(defaults) | set(generation_config):
-        if name in supported or name in task_owned:
+    for name in sorted(set(judged) | set(generation_config)):
+        if name in _SUPPORTED_CONTROLS or name in _TASK_OWNED_CONTROLS or (
+                name in _BEAM_ONLY_CONTROLS and name not in judged):
             continue
-        if not do_sample and name in sampled_only:
+        if not do_sample and name in _SAMPLED_ONLY_CONTROLS:
             continue
-        default = defaults.get(name)
-        value = _generation_value(config, generation_config, name, default)
-        if value != default:
+        value = _generation_value(config, generation_config, name)
+        if not _neutral(value, judged.get(name, ())):
             unsupported.append(name)
     if unsupported:
-        raise ValueError(f"native sampling cannot honor active source controls {sorted(unsupported)}; "
+        raise ValueError(f"native sampling cannot honor active source controls {unsupported}; "
                          "pass an explicit sampling=Sampling(...) policy to text_generation")
     temperature = _generation_value(config, generation_config, "temperature", 1.0)
+    if temperature is None:
+        temperature = 1.0
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
-    top_k = _generation_value(config, generation_config, "top_k", defaults["top_k"])
+    top_k = _generation_value(config, generation_config, "top_k")
     if top_k is not None and type(top_k) is not int:
         raise ValueError("top_k must be an integer")
     return Sampling(
