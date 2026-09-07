@@ -473,6 +473,7 @@ class Engine(Generic[R, E]):
         self._serial += 1
         self._versions[token] = _Version(token, snapshot)
         self._current = token
+        self._retire()
         return token
 
     def _retire(self) -> None:
