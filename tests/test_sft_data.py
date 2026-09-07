@@ -16,7 +16,7 @@ import pytest
 from transformers import AutoTokenizer
 
 from dew.data import ChatMessages, Loading
-from dew.data.chat import ROLES_KEY, Role, render_conversation
+from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "chat.npz"
@@ -61,7 +61,7 @@ def write_parquet(path, conversations):
 
 
 def render(tokenizer, conversation):
-    return render_conversation(tokenizer, conversation, "tiny-chat")
+    return render_conversation(tokenizer, Conversation.parse(conversation), "tiny-chat")
 
 
 # --- parity against TRL ----------------------------------------------------
@@ -107,6 +107,7 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
     data = ChatMessages(tokenizer=str(TOKENIZER), path=path, val_path=path,
                         seq_len=window - 1, packing_bins=2,
                         loading=Loading(workers=0)).load(batch=2)
+    assert data.val is not None
     batches = list(data.val())
     assert len(batches) == 1
     batch = batches[0]
@@ -142,6 +143,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
                         seq_len=window - 1, packing_bins=1,
                         loading=Loading(workers=0)).load(batch=1)
     assert data.records == chunks
+    assert data.val is not None
     batches = list(data.val())
     assert len(batches) == chunks
     np.testing.assert_array_equal(
@@ -175,16 +177,19 @@ def test_records_count_chunks_not_conversations(tmp_path, tokenizer):
                         loading=Loading(workers=0)).load(batch=1)
 
     assert data.records == chunks
+    assert data.val is not None
     assert len(list(data.val())) == chunks, "the length is not the pass it counts"
 
 
-
-def test_a_non_string_message_is_refused(tokenizer):
-    with pytest.raises(ValueError, match="pair of strings"):
+def test_a_malformed_message_is_refused(tokenizer):
+    """A message is an object with a string role; its content is text,
+    typed parts, or nothing."""
+    with pytest.raises(ValueError, match="an object"):
         render(tokenizer, ["just a string"])
-    with pytest.raises(ValueError, match="pair of strings"):
-        render(tokenizer, [{"role": "assistant", "content": None}])
-
+    with pytest.raises(ValueError, match="content is a list"):
+        render(tokenizer, [{"role": "user", "content": 4}])
+    with pytest.raises(ValueError, match="role as a string"):
+        render(tokenizer, [{"content": "hi"}])
 
 
 def test_an_empty_conversation_is_refused(tokenizer):

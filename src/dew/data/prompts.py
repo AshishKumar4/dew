@@ -6,8 +6,11 @@ plus `prompt_length`, and the reward columns `data_source`, `ground_truth`
 and `extra_info` as fixed-width UTF-8 byte arrays, so every leaf survives
 the device transfer. A row's prompt is messages rendered with the tokenizer's
 chat template and generation prompt, a string encoded on its own, or token
-ids used as they are. Prompts longer than the window keep their tail; the
-three reward columns default to the empty string when the row lacks them.
+ids used as they are. Chat messages use the SFT parser and carry optional
+top-level `tools` schemas into the template. Text parts join in order;
+nontext parts require a processor and are refused before truncation.
+Prompts longer than the window keep their tail; the three reward columns
+default to the empty string when the row lacks them.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .chat import load_tokenizer
+from .chat import Conversation, load_tokenizer, render_prompt
 from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch,
                       train_stream, validation_pass)
 from .tokens import bounded
@@ -40,15 +43,16 @@ TRUTH_KEY = "ground_truth"
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
 
-FIELDS = ("prompt", "data_source", "ground_truth", "extra_info")
+FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools")
 """The row fields the source reads; anything else raises."""
 
 
 @dataclasses.dataclass(frozen=True)
 class _Row:
-    """One normalized row: the raw prompt and the three reward strings."""
+    """One row's raw prompt, tool schemas and three reward strings."""
 
     prompt: object
+    tools: object
     data_source: str
     ground_truth: str
     extra_info: str
@@ -64,52 +68,29 @@ def _text(value: object) -> str:
     return json.dumps(value, sort_keys=True)
 
 
-def _message_rows(prompt: Sequence[object], origin: str) -> list[dict[str, str]]:
-    """The list as template rows, each a `{role, content}` pair of strings."""
-    rows: list[dict[str, str]] = []
-    for message in prompt:
-        role = message.get("role") if isinstance(message, Mapping) else None
-        content = message.get("content") if isinstance(message, Mapping) else None
-        if not isinstance(role, str) or not isinstance(content, str):
-            raise ValueError(
-                f"{origin}: a message is a {{role, content}} pair of strings, "
-                f"got {message!r}")
-        rows.append({"role": role, "content": content})
-    return rows
-
-
-def _list_ids(tokenizer: str, prompt: Sequence[object], origin: str) -> list[int]:
-    """Token ids used as they are, or messages rendered with the generation
-    prompt. The first non-integer switches meaning; a list mixing either with
-    anything else fails as a malformed message, naming it."""
+def _list_ids(tokenizer: str, prompt: list[object], tools: object, origin: str) -> list[int]:
+    """Read token ids directly, or render messages through the SFT parser."""
     ids: list[int] = []
     for token in prompt:
         if not isinstance(token, int):
-            rendered = load_tokenizer(tokenizer).apply_chat_template(
-                _message_rows(prompt, origin), tokenize=True, return_dict=False,
-                add_generation_prompt=True)
-            if not isinstance(rendered, list):
-                return []
-            ids = []
-            for output in rendered:
-                if not isinstance(output, int):
-                    raise ValueError(
-                        f"{origin}: the template answered with a non-id {output!r}")
-                ids.append(output)
-            return ids
+            conversation = Conversation.parse(prompt, tools, origin)
+            return render_prompt(load_tokenizer(tokenizer), conversation, origin)
         ids.append(token)
+    if tools is not None:
+        raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
     return ids
 
-def _prompt_ids(tokenizer: str, prompt: object, origin: str) -> list[int]:
-    """One row's prompt as token ids. An empty prompt refuses: generation
-    starts from real tokens."""
+
+def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> list[int]:
+    """Encode a prompt, retaining structured messages until text rendering."""
     if isinstance(prompt, str):
+        if tools is not None:
+            raise ValueError(f"{origin}: tools require chat messages, not a plain string")
         if not prompt.strip():
             raise ValueError(f"{origin}: the prompt is blank")
-        load = load_tokenizer(tokenizer)
-        ids = load.encode(prompt, add_special_tokens=False)
+        ids = load_tokenizer(tokenizer).encode(prompt, add_special_tokens=False)
     elif isinstance(prompt, list):
-        ids = _list_ids(tokenizer, prompt, origin)
+        ids = _list_ids(tokenizer, prompt, tools, origin)
     else:
         raise ValueError(
             f"{origin}: a prompt is messages, a string or token ids, "
@@ -157,6 +138,7 @@ class PromptSource:
                     f"{where}: a row without a prompt has nothing to sample from")
             normalized.append(_Row(
                 prompt=row["prompt"],
+                tools=row.get("tools"),
                 data_source=_text(row.get("data_source")),
                 ground_truth=_text(row.get("ground_truth")),
                 extra_info=_text(row.get("extra_info"))))
@@ -211,7 +193,7 @@ class PromptSource:
 
     def __getitem__(self, index: int) -> Batch:
         row = self._rows[index]
-        ids = _prompt_ids(self._tokenizer, row.prompt,
+        ids = _prompt_ids(self._tokenizer, row.prompt, row.tools,
                           f"{self._origin} row {index}")[-self._window:]
         prompt = np.full(self._window, self._pad_id, np.int32)
         prompt[self._window - len(ids):] = ids
@@ -232,8 +214,10 @@ class Prompts(DatasetSpec):
     `path` is a parquet file in the verl layout; `records` is JSON rows for
     tests and small sweeps; exactly one of the two is set. Each batch holds
     `prompt` left-padded to `max_prompt_len` with `pad_id`, `prompt_length`,
-    and the reward columns as UTF-8 bytes. `val_path` is a second parquet
-    file scored as one pass; None trains without validation.
+    and the reward columns as UTF-8 bytes. An optional `tools` column holds
+    schemas as a list or JSON string for chat prompts; schemas are rendered
+    into prompt tokens and never copied into the device batch. `val_path` is
+    a second parquet file scored as one pass; None trains without validation.
     """
 
     tokenizer: str
