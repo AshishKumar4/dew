@@ -1,80 +1,88 @@
 """A Hugging Face `IterableDataset` as a grain `IterDataset`.
 
 A streamed split is not random access: no length, no index, no second look at
-a row that has gone by. So it cannot be a grain source, and nothing here may
-list one. What it can be is the head of a grain iterator pipeline, which is
+a row that has gone by. So it cannot be a grain source, and nothing here
+lists one. It is the head of a grain iterator pipeline instead, which is
 what `HFRows` is: the rows of one process's share, in order, once per pass.
-Everything behind it -- the per-record transform, the batch, the bounded
-buffer ahead of the step -- is grain's own, the same machinery the
-random-access paths use.
+Everything behind it -- the per-record transform, the batch, the buffer
+ahead of the step -- is grain's own.
 
-Two honest limits are written into the types here.
+Sharding is `datasets.distributed.split_dataset_by_node`, not
+`IterableDataset.shard`. A stream's physical shard count is a property of
+how the data was written; on a split with two shards,
+`shard(num_shards=4, index=3)` raises IndexError, so a pool larger than the
+shard count would lose ranks. The node split assigns whole shards when the
+counts divide and keeps one row in `world_size` otherwise, which every rank
+can do. A rank that still gets no rows at all is a misconfiguration, not a
+stream to wait on, and `_Rows` says so rather than reopening an empty share
+for ever.
 
-`split_dataset_by_node` does the sharding, not `IterableDataset.shard`. A
-stream's physical shard count is a property of how the data was written; on
-a split with two shards, `shard(num_shards=4, index=3)` raises IndexError,
-so a pool larger than the shard count would lose ranks. The public node
-split assigns whole shards when the counts divide and keeps one row in
-`world_size` otherwise, which every rank can do.
-
-`HFRows` reports no position, so a run over one is not checkpointable. What
-a streamed split would restore is not the record sequence a run consumed:
-`datasets`' state covers its own iterables, while the shuffle buffer, the
-shard-to-node assignment and the pass number are part of the order dew
-reads, and a restore that put some of that back would resume onto a
-sequence nobody verified. `Trainer.fit` already refuses `checkpoint_every`
-over a stream that reports no position, and that refusal is the contract
-this path takes.
+Position: `datasets` restores an unshuffled stream exactly, and grain
+composes that with the state of the transform and the batch behind it, so a
+stream read in file order resumes on the record it stopped at with the same
+per-record draws. A shuffled stream does not: what would come back is the
+library's place in the rows, not the contents of the buffer the shuffle was
+drawing from. `resumes` is that distinction, and `providers` withholds the
+state pair for the streams on the wrong side of it, which is the
+non-checkpointable contract `Dataset` already documents.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Optional
+from collections.abc import Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Optional
 
 import grain.python as pygrain
 
-from .hf import HFOptions
+if TYPE_CHECKING:  # `datasets` is imported on the first row, not at import
+    from datasets import IterableDataset
 
 Row = dict[str, object]
 
-STREAMING_HINT = ("streaming a Hugging Face dataset needs the streaming extra: "
-                  "pip install 'dew-ml[streaming]'")
-
 NO_POSITION = (
-    "a streamed Hugging Face split reports no position: its shuffle buffer, "
-    "its shard-to-node assignment and its pass number are part of the order "
-    "dew reads and are not in what `datasets` restores, so no saved state "
-    "names the record sequence a run consumed. Train it with "
-    "checkpoint_every=None, or read the split without streaming=True, which "
-    "is random access and resumes on any process count.")
+    "a shuffled streamed split cannot be put back where it stopped: what "
+    "`datasets` restores is its place in the rows, and the contents of the "
+    "shuffle buffer it was drawing from are not in it. Read the split with "
+    "shuffle_buffer=0, which resumes exactly, or train it with "
+    "checkpoint_every=None.")
+
+NO_ROWS = (
+    "process {rank} of {world_size} was given none of the rows of {what}. A "
+    "streamed split is shared out row by row when its shards do not divide "
+    "over the processes, so a split with fewer rows than the pool has "
+    "processes leaves a rank with nothing to read and no batch to contribute. "
+    "Read it on at most as many processes as it has rows, or read it without "
+    "streaming=True.")
 
 
-def open_rows(name: str, split: str, *, options: HFOptions, seed: int, epoch: int,
-              rank: int, world_size: int, buffer: int) -> Iterable[Row]:
-    """One process's rows of `split`, shuffled through a bounded buffer.
+def shared(rows: "IterableDataset", *, rank: int, world_size: int) -> "IterableDataset":
+    """`rows` reduced to the share process `rank` of `world_size` reads."""
+    if world_size <= 1:
+        return rows
+    from datasets.distributed import split_dataset_by_node
 
-    The shuffle comes before the node split and takes a seed every rank
-    computes the same way, because the split is over the shuffled shard list:
-    two ranks that shuffled differently would disagree about which shards
-    each of them owns. `epoch` goes into that seed, so a second pass over the
-    same shard is a different order and no pass is held in memory.
+    return split_dataset_by_node(rows, rank=rank, world_size=world_size)
+
+
+def resumes(rows: "IterableDataset", *, shuffled: bool) -> bool:
+    """Whether this stream can be put back where it stopped.
+
+    A shuffled stream cannot, whatever the library reports, because the
+    buffer the shuffle drew from is not in the state. An unshuffled one can
+    when `datasets` implements the pair for its source, which is what
+    calling `state_dict` once, before any row is read, answers.
     """
-    import datasets
-
-    rows = options.load(name, split, streaming=True)
-    if not isinstance(rows, datasets.IterableDataset):
-        raise TypeError(
-            f"streaming {name!r} split {split!r} gave "
-            f"{type(rows).__name__}; a streamed split is an IterableDataset, so "
-            f"name one split rather than a whole dataset")
-    if buffer > 0:
-        rows = rows.shuffle(seed=seed + epoch, buffer_size=buffer)
-    if world_size > 1:
-        from datasets.distributed import split_dataset_by_node
-
-        rows = split_dataset_by_node(rows, rank=rank, world_size=world_size)
-    return rows
+    if shuffled:
+        return False
+    state = getattr(rows, "state_dict", None)
+    load = getattr(rows, "load_state_dict", None)
+    if state is None or load is None:
+        return False
+    try:
+        state()
+    except (NotImplementedError, AttributeError, TypeError, KeyError):
+        return False
+    return True
 
 
 class _Rows(pygrain.DatasetIterator):
@@ -82,15 +90,33 @@ class _Rows(pygrain.DatasetIterator):
 
     `epochs` of None reopens the share when it runs out, which is what an
     endless training stream is; `epochs=1` stops after one pass, which is
-    what a validation pass is.
+    what a validation pass is. A pass that yields nothing is the empty-share
+    misconfiguration and raises, so the reopening cannot spin and a caller
+    closing the pipeline is not waiting on a `next` that never returns.
     """
 
-    def __init__(self, open_pass: Callable[[int], Iterable[Row]], epochs: Optional[int]):
+    def __init__(self, open_pass: Callable[[int], "IterableDataset"], *,
+                 epochs: Optional[int], resumable: bool, what: str, rank: int,
+                 world_size: int):
         super().__init__()
         self._open_pass = open_pass
         self._epochs = epochs
+        self._resumable = resumable
+        self._what = what
+        self._rank = rank
+        self._world_size = world_size
         self._epoch = 0
+        self._read = 0
+        self._restore: Optional[Mapping[str, object]] = None
+        self._split: Optional["IterableDataset"] = None
         self._rows: Optional[Iterator[Row]] = None
+
+    def _open(self) -> Iterator[Row]:
+        split = self._split = self._open_pass(self._epoch)
+        restore, self._restore = self._restore, None
+        if restore is not None:
+            split.load_state_dict(dict(restore))
+        return iter(split)
 
     def __next__(self) -> Row:
         while True:
@@ -98,88 +124,118 @@ class _Rows(pygrain.DatasetIterator):
                 raise StopIteration
             rows = self._rows
             if rows is None:
-                rows = self._rows = iter(self._open_pass(self._epoch))
+                rows = self._rows = self._open()
             row = next(rows, None)
             if row is not None:
-                return row
-            self._rows = None
+                self._read += 1
+                return dict(row)
+            if self._read == 0:
+                raise ValueError(NO_ROWS.format(rank=self._rank,
+                                                world_size=self._world_size,
+                                                what=self._what))
+            self._rows = self._split = None
+            self._read = 0
             self._epoch += 1
 
     def get_state(self) -> dict[str, object]:
-        """The pass this iterator is on, which is all it knows.
+        """The pass, the rows read in it, and the library's own place in them.
 
-        Grain's iterator protocol declares the pair, and grain's own thread
-        prefetch reads the parent's state when it starts, so this cannot
-        raise. It is not a resume point: `Unresumable` keeps it away from the
-        trainer, and `set_state` says why.
+        grain's iterator protocol declares the pair and grain's thread
+        prefetch reads the parent's state when it starts, so this reports
+        what it has whether or not the stream can be restored from it.
+        `set_state` is where an unrestorable stream refuses.
         """
-        return {"epoch": self._epoch}
+        split = self._split
+        return {"epoch": self._epoch, "read": self._read,
+                "rows": None if split is None else split.state_dict()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        raise NotImplementedError(NO_POSITION)
+        if not self._resumable:
+            raise NotImplementedError(NO_POSITION)
+        epoch, read, rows = state["epoch"], state["read"], state["rows"]
+        if not isinstance(epoch, int) or not isinstance(read, int):
+            raise ValueError(f"a streamed position counts passes and rows, not {state}")
+        if rows is not None and not isinstance(rows, Mapping):
+            raise ValueError(f"a streamed position holds the library's state, not {rows}")
+        self._epoch, self._read = epoch, read
+        self._restore = rows
+        self._split = None
+        self._rows = None
 
     def close(self) -> None:
         self._rows = None
+        self._split = None
 
 
 class HFRows(pygrain.IterDataset):
     """A streamed split's rows for this process, as a grain `IterDataset`.
 
-    Constructing one opens nothing; the first iterator opens the split. Every
-    grain iterator transformation applies to it, which is how the streamed
-    path shares the transform and buffering machinery with the random-access
-    ones rather than growing a reader of its own.
+    Constructing one opens nothing; the first iterator opens the split.
+    `open_split()` returns the whole split, freshly: this shares it out, and
+    shuffles it before the share when `shuffle_buffer` is set, because the
+    share is over the shuffled shard list and two ranks that shuffled
+    differently would disagree about which shards each of them owns. The
+    pass number goes into the shuffle seed, so a second pass over the same
+    share is a different order and no pass is held in memory.
     """
 
-    def __init__(self, name: str, split: str, *, options: HFOptions, seed: int,
-                 rank: int, world_size: int, buffer: int, epochs: Optional[int]):
+    def __init__(self, open_split: Callable[[], "IterableDataset"], *, what: str,
+                 seed: int, rank: int, world_size: int, shuffle_buffer: int,
+                 epochs: Optional[int]):
         super().__init__()
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} is not one of {world_size} processes")
         if epochs is not None and epochs < 1:
             raise ValueError("a streamed pass count is positive or None for endless")
-        self.name = name
-        self.split = split
-        self.options = options
+        if shuffle_buffer < 0:
+            raise ValueError("a shuffle buffer holds no rows or more")
+        self._open_split = open_split
+        self.what = what
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
-        self.buffer = buffer
+        self.shuffle_buffer = shuffle_buffer
         self.epochs = epochs
 
     def __repr__(self) -> str:
-        return (f"HFRows(name={self.name!r}, split={self.split!r}, "
-                f"options={self.options!r}, seed={self.seed}, "
-                f"shard={self.rank}/{self.world_size}, buffer={self.buffer}, "
-                f"epochs={self.epochs})")
+        return (f"HFRows({self.what}, seed={self.seed}, "
+                f"share={self.rank}/{self.world_size}, "
+                f"shuffle_buffer={self.shuffle_buffer}, epochs={self.epochs})")
 
-    def _pass(self, epoch: int) -> Iterable[Row]:
-        return open_rows(self.name, self.split, options=self.options, seed=self.seed,
-                         epoch=epoch, rank=self.rank, world_size=self.world_size,
-                         buffer=self.buffer)
+    def _pass(self, epoch: int) -> "IterableDataset":
+        rows = self._open_split()
+        if self.shuffle_buffer:
+            rows = rows.shuffle(seed=self.seed + epoch, buffer_size=self.shuffle_buffer)
+        return shared(rows, rank=self.rank, world_size=self.world_size)
+
+    @property
+    def resumable(self) -> bool:
+        """Whether a position saved over these rows puts them back exactly."""
+        return resumes(self._pass(0), shuffled=bool(self.shuffle_buffer))
 
     def __iter__(self) -> pygrain.DatasetIterator[Row]:
-        return _Rows(self._pass, self.epochs)
+        return _Rows(self._pass, epochs=self.epochs, resumable=self.resumable,
+                     what=self.what, rank=self.rank, world_size=self.world_size)
 
 
 class Unresumable:
-    """`iterator` with its position withheld, because it does not have one.
+    """`iterator` with its position withheld, because it has none to give.
 
     The grain iterators behind a streamed split carry `get_state` and
-    `set_state` because grain's iterator protocol declares them, and the
-    rows underneath cannot honour either. Forwarding them would make a run
-    look checkpointable and resume it onto a sequence nobody verified, so
-    this hands on the batches and the shutdown and nothing else. `Trainer.fit`
-    reads the pair statically and refuses `checkpoint_every` over this.
+    `set_state` because grain's iterator protocol declares them. Forwarding
+    them for a stream that cannot be restored exactly would make a run look
+    checkpointable and resume it onto a sequence nobody verified, so this
+    hands on the batches and the shutdown and nothing else. `Trainer.fit`
+    reads the pair statically and refuses `checkpoint_every` over it.
     """
 
-    def __init__(self, iterator: pygrain.DatasetIterator[dict[str, object]]):
+    def __init__(self, iterator: pygrain.DatasetIterator[Row]):
         self._iterator = iterator
 
-    def __iter__(self) -> Iterator[dict[str, object]]:
+    def __iter__(self) -> Iterator[Row]:
         return self
 
-    def __next__(self) -> dict[str, object]:
+    def __next__(self) -> Row:
         return next(self._iterator)
 
     def close(self) -> None:

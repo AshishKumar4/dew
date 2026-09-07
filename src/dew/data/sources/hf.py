@@ -16,8 +16,9 @@ import threading
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-if TYPE_CHECKING:  # the import itself happens on the first record
-    from datasets import Dataset as ArrowDataset
+if TYPE_CHECKING:  # the imports themselves happen on the first record
+    from datasets import (Dataset as ArrowDataset, DownloadConfig, DownloadMode, Features,
+                          VerificationMode, Version)
 
 import numpy as np
 
@@ -40,83 +41,52 @@ def _hf_datasets():
     return datasets
 
 
-def _name(option: object, field: str) -> Optional[str]:
-    """A `load_dataset` argument that has to be a name, or None when unset."""
-    if option is None or isinstance(option, str):
-        return option
-    raise TypeError(f"{field} is a name, and this one is {type(option).__name__}")
-
-
-def _files(option: object) -> Optional[str | tuple[str, ...]]:
-    """`data_files` as one path or a tuple of them."""
-    if option is None or isinstance(option, str):
-        return option
-    if isinstance(option, Sequence) and all(isinstance(one, str) for one in option):
-        return tuple(str(one) for one in option)
-    raise TypeError(
-        f"data_files is a path or a sequence of paths, and this one is "
-        f"{type(option).__name__}")
-
-
 @dataclasses.dataclass(frozen=True)
 class HFOptions:
-    """The `load_dataset` arguments dew forwards, each with the type it has.
+    """`datasets.load_dataset`'s arguments, as one value with their own types.
 
-    `datasets.load_dataset` takes more than this, and several of the rest are
-    library objects (`Features`, `DownloadConfig`, `storage_options`) whose
-    types dew cannot state without inventing them. Those are refused by name
-    rather than passed as something dew claims not to know: a caller who
-    needs one builds the dataset itself and hands it over as `dataset=`.
-
-    `load` is the one place either hf route calls the library, so the Arrow
-    and the streamed source cannot drift apart in what they forward.
+    Both hf routes call `load`, so the Arrow source and the streamed source
+    cannot drift apart in what they forward. The fields are the library's,
+    named as the library names them apart from `config`, which is
+    `load_dataset`'s `name`: dew already uses `name` for which dataset this
+    is.
     """
 
     config: Optional[str] = None
-    """`load_dataset`'s `name`: which configuration of the dataset."""
-    data_files: Optional[str | tuple[str, ...]] = None
     data_dir: Optional[str] = None
+    data_files: Optional[str | Sequence[str] | Mapping[str, str | Sequence[str]]] = None
     cache_dir: Optional[str] = None
-    revision: Optional[str] = None
+    features: Optional["Features"] = None
+    download_config: Optional["DownloadConfig"] = None
+    download_mode: Optional["DownloadMode | str"] = None
+    verification_mode: Optional["VerificationMode | str"] = None
+    keep_in_memory: Optional[bool] = None
+    save_infos: bool = False
+    revision: Optional["str | Version"] = None
     token: Optional[str | bool] = None
     num_proc: Optional[int] = None
-
-    FIELDS = ("config", "data_files", "data_dir", "cache_dir", "revision", "token",
-              "num_proc")
-
-    @classmethod
-    def of(cls, options: Mapping[str, object]) -> "HFOptions":
-        """`options` as these arguments, refusing the ones dew cannot type."""
-        unknown = sorted(set(options) - set(cls.FIELDS))
-        if unknown:
-            raise TypeError(
-                f"the hf provider does not forward {unknown}; it forwards "
-                f"{', '.join(cls.FIELDS)} to datasets.load_dataset. An argument "
-                f"that is a datasets object, such as features or "
-                f"storage_options, has no type dew can state: load the dataset "
-                f"yourself and pass it as dataset=.")
-        token = options.get("token")
-        if token is not None and not isinstance(token, (str, bool)):
-            raise TypeError(f"token is a name or a flag, not {type(token).__name__}")
-        count = options.get("num_proc")
-        if count is not None and not isinstance(count, int):
-            raise TypeError(f"num_proc is a count, not {type(count).__name__}")
-        return cls(config=_name(options.get("config"), "config"),
-                   data_files=_files(options.get("data_files")),
-                   data_dir=_name(options.get("data_dir"), "data_dir"),
-                   cache_dir=_name(options.get("cache_dir"), "cache_dir"),
-                   revision=_name(options.get("revision"), "revision"),
-                   token=token, num_proc=count)
+    storage_options: Optional[Mapping[str, Any]] = None
+    """`datasets` passes this to fsspec, whose backends declare their own
+    options; the mapping is theirs to read."""
 
     def load(self, path: str, split: str, *, streaming: bool):
-        """`datasets.load_dataset` with these arguments and no others."""
+        """The split at `path`, through `datasets.load_dataset`.
+
+        This is where a hub dataset is downloaded and an Arrow cache written,
+        by the library, on its own terms; a streamed split reads as it goes
+        instead. Dew adds nothing to either.
+        """
         datasets = _hf_datasets()
-        files = (list(self.data_files) if isinstance(self.data_files, tuple)
-                 else self.data_files)
         return datasets.load_dataset(
             path, name=self.config, split=split, streaming=streaming,
-            data_files=files, data_dir=self.data_dir, cache_dir=self.cache_dir,
-            revision=self.revision, token=self.token, num_proc=self.num_proc)
+            data_dir=self.data_dir, data_files=self.data_files,
+            cache_dir=self.cache_dir, features=self.features,
+            download_config=self.download_config, download_mode=self.download_mode,
+            verification_mode=self.verification_mode,
+            keep_in_memory=self.keep_in_memory, save_infos=self.save_infos,
+            revision=self.revision, token=self.token, num_proc=self.num_proc,
+            storage_options=None if self.storage_options is None
+            else dict(self.storage_options))
 
 
 def _plain_value(value: Any) -> Any:
