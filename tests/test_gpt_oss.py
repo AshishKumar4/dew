@@ -12,8 +12,10 @@ FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 
 
 def test_biased_interleaved_experts_match_reference():
-    """fp32 atol 5e-5, maximum observed absolute difference 3.4e-05, with gates
-    above the clamp and both expert biases in play."""
+    """fp32 atol 1.6e-4: twice the fixture's own 7.8e-5 deviation from the float64
+    equation, the most two fp32 evaluations of it can disagree. Observed 3.4e-5
+    locally and 6.1e-5 on the CI runner, with gates above the clamp and both
+    expert biases in play. Dropping the down bias moves the output by 2.57."""
     with np.load(FIXTURES / "moe.npz") as fixture:
         arrays = {name: jnp.asarray(value) for name, value in fixture.items()}
     params = {
@@ -26,7 +28,7 @@ def test_biased_interleaved_experts_match_reference():
     def run(tree: dict) -> jax.Array:
         return jnp.asarray(module.apply({"params": tree}, arrays["hidden"]))
 
-    np.testing.assert_allclose(run(params), arrays["output"], atol=5e-5, rtol=0)
+    np.testing.assert_allclose(run(params), arrays["output"], atol=1.6e-4, rtol=0)
     params["experts"]["down_proj_bias"] = jnp.zeros_like(params["experts"]["down_proj_bias"])
     assert float(jnp.max(jnp.abs(run(params) - arrays["output"]))) > 0.5
 
