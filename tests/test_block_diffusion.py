@@ -164,3 +164,37 @@ def test_soft_embeddings_averages_the_table_under_the_distribution():
     table = np.array([[1., 0.], [0., 1.]], np.float32)
     got = soft_embeddings(np.array([[[10., 0.], [0., 0.]]], np.float32), table, 2.)
     np.testing.assert_allclose(got, [[[2., 0.], [1., 1.]]], atol=1e-3)
+
+
+def test_media_prefill_and_canvas_generation_match_reference(system):
+    """Complete image-conditioned forward: observed fp32 maximum error 1.4e-6."""
+    model, variables, process, reference, _ = system
+    inputs = ModelInputs(
+        jnp.asarray(reference["image_prompt"]),
+        {"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
+        {"pixel_values": jnp.asarray(reference["pixels"])})
+    cache = model.apply(variables, 2, method=model.init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply(
+        {**variables, "cache": cache}, inputs,
+        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+        mutable=["cache"])[1]["cache"]
+    logits = model.apply({**variables, "cache": cache}, reference["canvas"])
+    np.testing.assert_allclose(np.asarray(logits), reference["image_logits"], atol=1e-4, rtol=0)
+    generated = process.generate(model, variables, inputs, 7, key=jax.random.key(11))
+    np.testing.assert_array_equal(generated.tokens, reference["image_tokens"][:, :12])
+    np.testing.assert_array_equal(generated.decoder_steps, reference["image_steps"])
+
+
+def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
+    model, variables, _, reference, _ = system
+    tokens = jnp.array([[0, 0, 2, 3, 4], [2, 5, 7, 9, 11]], jnp.int32)
+    mask = jnp.array([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], bool)
+    positions = jnp.maximum(jnp.cumsum(mask, axis=1) - 1, 0)
+    cache = model.apply(variables, 2, method=model.init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply({**variables, "cache": cache}, tokens, attention_mask=mask,
+                        positions=positions, method=model.encode, mutable=["cache"])[1]["cache"]
+    batched = np.asarray(model.apply({**variables, "cache": cache}, reference["canvas"]))
+    for row, start in ((0, 2), (1, 0)):
+        individual = prefill(model, variables, tokens[row:row + 1, start:])
+        expected = model.apply({**variables, "cache": individual}, reference["canvas"][row:row + 1])
+        np.testing.assert_allclose(batched[row:row + 1], np.asarray(expected), atol=1e-5, rtol=0)
