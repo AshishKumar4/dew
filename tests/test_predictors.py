@@ -65,4 +65,4 @@ def test_karras_preconditioning_matches_paper(rng):
     c_skip = sd**2 / (sd**2 + sigma**2)
     c_out = sigma * sd / jnp.sqrt(sd**2 + sigma**2)
     expected = c_skip * x_t + c_out * raw
-    assert jnp.allclose(transform.pred_transform(x_t, raw, rates), expected, rtol=1e-4)
+    assert jnp.allclose(transform.pred_transform(x_t, raw, rates, steps), expected, rtol=1e-4)

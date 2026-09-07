@@ -1,0 +1,605 @@
+{
+ "diffusers": "0.34.0",
+ "train_steps": 1000,
+ "data_std": 0.3,
+ "shape": [
+  2,
+  2,
+  4,
+  4
+ ],
+ "karras": {
+  "sigma_min": 0.010000500037502575,
+  "sigma_max": 157.40728081040757,
+  "rho": 7.0
+ },
+ "edm": {
+  "sigma_min": 0.002,
+  "sigma_max": 80.0,
+  "sigma_data": 0.5,
+  "rho": 7.0
+ },
+ "cases": {
+  "dpm_multistep.pp_2m": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "solver_type": "midpoint",
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_multistep.pp_2m_short_no_taper": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 10,
+   "latent_scale": 3.1449522972106934
+  },
+  "dpm_multistep.pp_2h": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "solver_type": "heun"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_multistep.pp_3": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_multistep.dpm_2m": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver",
+    "solver_order": 2,
+    "solver_type": "midpoint"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1452016830444336
+  },
+  "dpm_multistep.dpm_2h": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver",
+    "solver_order": 2,
+    "solver_type": "heun"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1452016830444336
+  },
+  "dpm_multistep.dpm_3": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1452016830444336
+  },
+  "dpm_multistep.sde_pp_2m": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "sde-dpmsolver++",
+    "solver_order": 2,
+    "solver_type": "midpoint"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.25997257232666
+  },
+  "dpm_multistep.sde_pp_2h": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "sde-dpmsolver++",
+    "solver_order": 2,
+    "solver_type": "heun"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.2600486278533936
+  },
+  "dpm_multistep.sde_pp_3": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "sde-dpmsolver++",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.260533571243286
+  },
+  "dpm_multistep.sde_2m": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "sde-dpmsolver",
+    "solver_order": 2,
+    "solver_type": "midpoint"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 4.444569110870361
+  },
+  "dpm_multistep.sde_2h": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "sde-dpmsolver",
+    "solver_order": 2,
+    "solver_type": "heun"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 4.322695732116699
+  },
+  "dpm_multistep.pp_3_short": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 10,
+   "latent_scale": 3.1449522972106934
+  },
+  "dpm_multistep.pp_2_euler_final": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "euler_at_final": true
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_singlestep.pp_2": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_singlestep.pp_2_uneven": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 19,
+   "latent_scale": 3.145190477371216
+  },
+  "dpm_singlestep.pp_3_uneven": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3,
+    "solver_type": "heun"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_singlestep.pp_3h_final": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3,
+    "solver_type": "heun",
+    "lower_order_final": true
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_singlestep.pp_3m": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3,
+    "solver_type": "midpoint",
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 21,
+   "latent_scale": 3.1452057361602783
+  },
+  "dpm_singlestep.dpm_3h_final": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver",
+    "solver_order": 3,
+    "solver_type": "heun",
+    "lower_order_final": true
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1452014446258545
+  },
+  "dpm_singlestep.sde_pp_2": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "sde-dpmsolver++",
+    "solver_order": 2,
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1450986862182617
+  },
+  "dpm_singlestep.sde_pp_3h_final": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "sde-dpmsolver++",
+    "solver_order": 3,
+    "solver_type": "heun",
+    "lower_order_final": true
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.874246597290039
+  },
+  "deis.2": {
+   "scheduler": "DEISMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "solver_order": 2
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1451969146728516
+  },
+  "deis.3": {
+   "scheduler": "DEISMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1451969146728516
+  },
+  "deis.3_short": {
+   "scheduler": "DEISMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "solver_order": 3
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 10,
+   "latent_scale": 3.1449458599090576
+  },
+  "unipc.bh2_2": {
+   "scheduler": "UniPCMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "final_sigmas_type": "sigma_min",
+    "solver_order": 2,
+    "solver_type": "bh2"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1451969146728516
+  },
+  "unipc.bh1_3": {
+   "scheduler": "UniPCMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "final_sigmas_type": "sigma_min",
+    "solver_order": 3,
+    "solver_type": "bh1"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1451969146728516
+  },
+  "unipc.eps_bh2_2": {
+   "scheduler": "UniPCMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "final_sigmas_type": "sigma_min",
+    "solver_order": 2,
+    "solver_type": "bh2",
+    "predict_x0": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.1451969146728516
+  },
+  "unipc.bh2_3_short_nocorr": {
+   "scheduler": "UniPCMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "timestep_spacing": "trailing",
+    "final_sigmas_type": "sigma_min",
+    "solver_order": 3,
+    "solver_type": "bh2",
+    "disable_corrector": [
+     2,
+     5
+    ]
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 10,
+   "latent_scale": 3.144944906234741
+  },
+  "pndm.plms": {
+   "scheduler": "PNDMScheduler",
+   "config": {
+    "skip_prk_steps": true,
+    "set_alpha_to_one": false,
+    "timestep_spacing": "leading",
+    "steps_offset": 0
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 19,
+   "latent_scale": 3.14506459236145
+  },
+  "pndm.prk": {
+   "scheduler": "PNDMScheduler",
+   "config": {
+    "skip_prk_steps": false,
+    "set_alpha_to_one": false,
+    "timestep_spacing": "leading",
+    "steps_offset": 0
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 19,
+   "latent_scale": 3.14506196975708
+  },
+  "lcm.4": {
+   "scheduler": "LCMScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "original_inference_steps": 50,
+    "timestep_spacing": "leading"
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 4,
+   "latent_scale": 2.512265682220459
+  },
+  "tcd.eta_0": {
+   "scheduler": "TCDScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "original_inference_steps": 50,
+    "timestep_spacing": "leading"
+   },
+   "convention": "vp",
+   "step_kwargs": {
+    "eta": 0.0
+   },
+   "intervals": 4,
+   "latent_scale": 3.140918016433716
+  },
+  "tcd.eta_03": {
+   "scheduler": "TCDScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "original_inference_steps": 50,
+    "timestep_spacing": "leading"
+   },
+   "convention": "vp",
+   "step_kwargs": {
+    "eta": 0.3
+   },
+   "intervals": 4,
+   "latent_scale": 2.9240336418151855
+  },
+  "tcd.eta_1": {
+   "scheduler": "TCDScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "original_inference_steps": 50,
+    "timestep_spacing": "leading"
+   },
+   "convention": "vp",
+   "step_kwargs": {
+    "eta": 1.0
+   },
+   "intervals": 4,
+   "latent_scale": 2.512633800506592
+  },
+  "kdpm2.plain": {
+   "scheduler": "KDPM2DiscreteScheduler",
+   "config": {
+    "use_karras_sigmas": true,
+    "prediction_type": "epsilon"
+   },
+   "convention": "ve",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 379.07763671875
+  },
+  "kdpm2.ancestral": {
+   "scheduler": "KDPM2AncestralDiscreteScheduler",
+   "config": {
+    "use_karras_sigmas": true,
+    "prediction_type": "epsilon"
+   },
+   "convention": "ve",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 392.1865234375
+  },
+  "lms.4": {
+   "scheduler": "LMSDiscreteScheduler",
+   "config": {
+    "use_karras_sigmas": true,
+    "prediction_type": "epsilon"
+   },
+   "convention": "ve",
+   "step_kwargs": {
+    "order": 4
+   },
+   "intervals": 20,
+   "latent_scale": 379.07757568359375
+  },
+  "lms.2": {
+   "scheduler": "LMSDiscreteScheduler",
+   "config": {
+    "use_karras_sigmas": true,
+    "prediction_type": "epsilon"
+   },
+   "convention": "ve",
+   "step_kwargs": {
+    "order": 2
+   },
+   "intervals": 20,
+   "latent_scale": 379.07757568359375
+  },
+  "edm_dpm.pp_2m": {
+   "scheduler": "EDMDPMSolverMultistepScheduler",
+   "config": {
+    "sigma_min": 0.002,
+    "sigma_max": 80.0,
+    "sigma_data": 0.5,
+    "rho": 7.0,
+    "solver_order": 2,
+    "solver_type": "midpoint",
+    "algorithm_type": "dpmsolver++",
+    "final_sigmas_type": "sigma_min"
+   },
+   "convention": "edm",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 190.48573303222656
+  },
+  "edm_dpm.sde_pp_2m": {
+   "scheduler": "EDMDPMSolverMultistepScheduler",
+   "config": {
+    "sigma_min": 0.002,
+    "sigma_max": 80.0,
+    "sigma_data": 0.5,
+    "rho": 7.0,
+    "solver_order": 2,
+    "solver_type": "midpoint",
+    "algorithm_type": "sde-dpmsolver++",
+    "final_sigmas_type": "sigma_min"
+   },
+   "convention": "edm",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 196.6217498779297
+  }
+ }
+}

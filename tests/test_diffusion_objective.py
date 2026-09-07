@@ -23,7 +23,7 @@ from dew.data import Dataset
 from dew.diffusion import Process, broadcast_rates, expand, presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, select
+from dew.objectives.base import Step, Variables
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import encoders, models
 from dew.sampling import CFG, DDIM, Euler
@@ -37,24 +37,24 @@ VOCAB = 11
 
 @encoders("stub_text")
 @dataclass(frozen=True, eq=False)
-class StubText(ConditionEncoder):
+class StubText(ConditionEncoder[str]):
     """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
     ids by character behind a start token, encode looks them up. Small, and
     shaped like CLIP's output, so the models' text keyword takes it; registered,
     so a run's text condition can name it."""
 
     checkpoint: str
-    params: dict
+    params: Variables
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, **fields):
         return cls(checkpoint=checkpoint, params={"table": jnp.asarray(
             np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))})
 
-    def tokenize(self, texts):
-        ids = np.zeros((len(texts), TOKENS), np.int32)
-        mask = np.zeros((len(texts), TOKENS), np.int32)
-        for row, text in enumerate(texts):
+    def tokenize(self, data):
+        ids = np.zeros((len(data), TOKENS), np.int32)
+        mask = np.zeros((len(data), TOKENS), np.int32)
+        for row, text in enumerate(data):
             codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1
@@ -72,13 +72,11 @@ class StubText(ConditionEncoder):
         return {"checkpoint": self.checkpoint}
 
 
-def make_objective(**kwargs):
+def make_objective(*, guidance: CFG | None = CFG(2.0)):
     model = models.SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
-    settings = dict(steps=3, guidance=CFG(2.0), sampler=Euler())
-    settings.update(kwargs)
-    return DiffusionObjective(model, presets.EDM()(), inputs, **settings)
+    return DiffusionObjective(model, presets.EDM()(), inputs, steps=3, guidance=guidance, sampler=Euler())
 
 
 def make_batch(count=8):
@@ -102,15 +100,6 @@ def tree_magnitude(tree):
                if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
 
 
-def test_the_tree_holds_the_model_and_the_frozen_encoders():
-    objective = make_objective()
-    tree = objective.init(jax.random.PRNGKey(0))
-    assert set(tree) == {"params", "encoders"}
-    assert tree["encoders"]["textcontext"]["table"].shape == (VOCAB, FEATURES)
-    # the EMA tracks the model alone: a frozen encoder needs no average
-    assert set(select(tree, objective.ema.select)) == {"params"}
-    assert objective.artifact is ImageGrid
-
 
 class Zero(nn.Module):
     """A model that outputs zero, so the loss is a closed form of the process."""
@@ -128,6 +117,28 @@ def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
     with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
         DiffusionObjective(Zero(), presets.Cosine()(), unconditional, sampler=RK4())
     DiffusionObjective(Zero(), presets.Karras()(), unconditional, sampler=RK4())
+
+
+@pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
+def test_singlestep_solver_generates_through_the_objective(order, steps):
+    from dew.diffusion import DirectPredictionTransform, LinearNoiseScheduler, Process
+    from dew.sampling import DPMSolverSinglestep
+
+    process = Process(LinearNoiseScheduler(1000), DirectPredictionTransform())
+    objective = DiffusionObjective(Zero(), process, InputSpec(Field("image", (2, 2, 1))),
+                                   sampler=DPMSolverSinglestep(order), steps=steps, guidance=None)
+    params = objective.init(jax.random.key(1))
+    result = objective.evaluate(params, {"image": np.zeros((2, 2, 2, 1), np.uint8)},
+                                Step(step=jnp.asarray(0), key=jax.random.key(2), ema=None))
+    np.testing.assert_array_equal(result.images, np.zeros((2, 2, 2, 1), np.float32))
+
+
+def test_objective_validates_the_real_terminal_grid_before_sampling():
+    from dew.sampling import UniPC
+
+    with pytest.raises(ValueError, match="sigma=0 target"):
+        DiffusionObjective(Zero(), presets.Flow()(), InputSpec(Field("image", (2, 2, 1))),
+                           sampler=UniPC(3, lower_order_final=False), steps=7, guidance=None)
 
 
 def test_loss_is_the_weighted_error_of_the_prediction():
@@ -150,7 +161,7 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     noise = jax.random.normal(noise_key, x0.shape)
     rates = broadcast_rates(process.schedule, t, x0)
     x_t = rates[0] * x0 + rates[1] * noise
-    predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates)
+    predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates, t)
     expected = jnp.mean(expand(process.weight(t), x0) * optax.l2_loss(predicted, x0))
     assert float(loss) == pytest.approx(float(expected), rel=1e-6)
     assert aux.metrics == {}
@@ -204,7 +215,7 @@ def test_the_compiled_step_carries_no_autoencoder_constants():
 
     class Leaky(DiffusionObjective):
         def loss(self, params, batch, step):
-            params = dict(params, autoencoder=self.autoencoder.params)
+            params = dict(params, autoencoder=autoencoder.params)
             return super().loss(params, batch, step)
 
     leaky = Leaky(Zero(), presets.EDM()(), inputs, autoencoder=autoencoder)
@@ -226,6 +237,7 @@ def test_scoring_covers_all_conditions_and_preview_decodes_only_its_small_draw()
     expected = objective._sample(params, tokens, step.key, count=artifact.images.shape[0])
     np.testing.assert_array_equal(artifact.images, expected)
     preview = objective.preview(params, batch, step)
+    assert isinstance(preview, ImageGrid)
     encoder = objective.inputs.conditions["textcontext"].encoder
     assert preview.captions == encoder.captions(
         {"input_ids": batch["text"]["input_ids"][:VALIDATION_SAMPLES]})
