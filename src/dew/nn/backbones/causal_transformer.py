@@ -24,7 +24,7 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import flax.core
 import jax
@@ -299,14 +299,18 @@ class BlockWiring:
     stream as it is and its output is normed before it is added. The output
     pair norms the sublayer outputs and not their inputs, so the input norms
     keep their names and their places, and a checkpoint without the output
-    pair loads into the same tree minus two leaves per layer. `output_scale`
-    multiplies the block's output by a learned scalar. One wiring serves
+    pair loads into the same tree minus two leaves per layer. `layer_scalar`
+    selects the reference's frozen or trainable output scalar. One wiring serves
     every layer, so it stays off the per-layer specs the scan groups by.
     """
 
     pre_norms: bool = True
     output_norms: bool = False
-    output_scale: bool = False
+    layer_scalar: Literal["frozen", "trainable"] | None = None
+
+    def __post_init__(self):
+        if self.layer_scalar not in (None, "frozen", "trainable"):
+            raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
 
 
 @logical_axes({
@@ -377,10 +381,10 @@ class DecoderBlock(nn.Module):
         self.mlp = self.feedforward(name='mlp')
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
-        if self.wiring.output_scale:
-            # The reference's layer_scalar buffer, a checkpoint leaf of one
-            # value, which the released Gemma 4 checkpoints carry.
-            self.output_scalar = self.param('layer_scalar', nn.initializers.ones, (1,), jnp.float32)
+        if self.wiring.layer_scalar == "frozen":
+            self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
+        elif self.wiring.layer_scalar == "trainable":
+            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
                 nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
@@ -390,7 +394,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_projection')
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         if self.altup is not None:
-            if not self.wiring.pre_norms or self.parallel is not None or self.wiring.output_scale:
+            if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
                 raise ValueError(
                     "altup runs Gemma 3n's block, which has its pre-norms and "
                     "neither a parallel branch nor a layer scalar")
@@ -470,7 +474,7 @@ class DecoderBlock(nn.Module):
             return corrected
         if self.per_layer_input_dim and per_layer_input is not None:
             x = x + self._per_layer_residual(x, per_layer_input)
-        if self.wiring.output_scale:
+        if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
 
@@ -874,7 +878,7 @@ class CausalTransformer(nn.Module):
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
-    layer_scalar: bool = False               # Gemma 4 scales each layer's output by a learned scalar
+    layer_scalar: Literal["frozen", "trainable"] | None = None
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
     o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: Optional[float] = None  # None: head_dim ** -0.5
@@ -909,6 +913,8 @@ class CausalTransformer(nn.Module):
     follow the direct block path; stored parameters have the same layout."""
 
     def __post_init__(self):
+        if self.layer_scalar not in (None, "frozen", "trainable"):
+            raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
         if isinstance(self.mlp_features, (tuple, list)):
@@ -1251,7 +1257,7 @@ class CausalTransformer(nn.Module):
                 provider=index if index in providers else None)
             for index, layer_type in enumerate(types))
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             output_scale=self.layer_scalar)
+                             layer_scalar=self.layer_scalar)
 
         def block(index: int, name: str) -> DecoderBlock:
             spec = specs[index]
