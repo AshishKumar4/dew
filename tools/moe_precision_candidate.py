@@ -8,6 +8,10 @@ master dtype; input cotangents accumulate at least in fp32 before returning
 to their declared input dtype. Higher supplied precision is retained. Exact
 GELU uses at least fp32 for its expression and derivative, then returns to
 activation dtype. These rules do not depend on placement.
+The tangent law is delta_x @ Q(kernel) + Q(x) @ delta_kernel, where Q keeps
+the configured rounded operand values but carries straight-through tangents
+in the original input/master dtype. Its automatic transpose follows the
+same gradient boundaries; higher-order differentiation retains this law.
 
 Reference environment: JAX/jaxlib 0.11.1, NumPy 2.5.2, ml_dtypes 0.6.0,
 SciPy 1.18.1.
@@ -24,8 +28,9 @@ in the other terminal, both with `JAX_PLATFORMS=cpu PYTHONPATH=src`.
 This proposal needs independent numerical review before any production
 precision/default change. NumPy float64 operand sums and SciPy's float64
 GELU equation supply independent oracles; no tolerance is widened for bf16.
-The candidate primitives currently define reverse-mode rules only; retaining
-the existing forward-mode interface is also a production-review requirement.
+Custom JVP rules support both differentiation directions. Independent checks
+cover primal values, JVPs, VJPs and both mixed second-order directions, as
+well as full expert-transport JVPs and real optimizer updates.
 """
 
 import functools
@@ -48,31 +53,42 @@ from dew.nn.moe import ExpertMLP, grouped_matmul
 from dew.training import MeshSpec, build_mesh
 
 
-@jax.custom_vjp
+@jax.custom_jvp
 def exact_gelu(x: jax.Array) -> jax.Array:
-    # Declare the activation's dtype boundary before the wider expression.
     x = jax.lax.optimization_barrier(x)
     work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
     return nn.gelu(work, approximate=False).astype(x.dtype)
 
 
-def exact_gelu_forward(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    return exact_gelu(x), x
-
-
-def exact_gelu_backward(x: jax.Array, dy: jax.Array) -> tuple[jax.Array]:
+@exact_gelu.defjvp
+def exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
+                   ) -> tuple[jax.Array, jax.Array]:
+    x, = primals
+    dx, = tangents
+    output = exact_gelu(x)
     work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-    # The cotangent entering and leaving this bf16 activation is bf16 even
-    # when its producer/consumer could otherwise fuse at greater precision.
-    dy = jax.lax.optimization_barrier(dy).astype(work.dtype)
-    _, pullback = jax.vjp(lambda value: nn.gelu(value, approximate=False), work)
-    return (jax.lax.optimization_barrier(pullback(dy)[0].astype(x.dtype)),)
+    _, derivative = jax.jvp(lambda value: nn.gelu(value, approximate=False),
+                            (work,), (jnp.ones_like(work),))
+    # These barriers declare activation/cotangent dtype boundaries in both
+    # differentiation directions, independently of producer/consumer fusion.
+    tangent = derivative * jax.lax.optimization_barrier(dx).astype(work.dtype)
+    return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
 
 
-exact_gelu.defvjp(exact_gelu_forward, exact_gelu_backward)
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
+    # Keep rounded values in the original dtype so their straight-through
+    # master tangent does not acquire a second low-precision rounding step.
+    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
+@rounded_operand.defjvp
+def rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array], tangents: tuple[jax.Array]
+                        ) -> tuple[jax.Array, jax.Array]:
+    return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
 def projection(x: jax.Array, kernel: jax.Array, sizes: jax.Array,
                dtype: Dtype | None, implementation: str, precision: PrecisionLike) -> jax.Array:
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
@@ -82,29 +98,27 @@ def projection(x: jax.Array, kernel: jax.Array, sizes: jax.Array,
     return accumulated.astype(x.dtype)
 
 
-def projection_forward(x: jax.Array, kernel: jax.Array, sizes: jax.Array,
-                       dtype: Dtype | None, implementation: str, precision: PrecisionLike
-                       ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
+@projection.defjvp
+def projection_jvp(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
+                   primals: tuple[jax.Array, jax.Array, jax.Array],
+                   tangents: tuple[jax.Array, jax.Array, jax.Array]
+                   ) -> tuple[jax.Array, jax.Array]:
+    x, kernel, sizes = primals
+    dx, dk, _ = tangents
+    dx, dk = jax.lax.optimization_barrier((dx, dk))
     output = jnp.asarray(projection(x, kernel, sizes, dtype, implementation, precision))
-    return output, (x, kernel, sizes)
-
-
-def projection_backward(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
-                        residual: tuple[jax.Array, jax.Array, jax.Array], dy: jax.Array
-                        ) -> tuple[jax.Array, jax.Array, None]:
-    x, kernel, sizes = residual
-    inputs, matrix = promote_dtype(x, kernel, dtype=dtype)
-    dx = grouped_matmul(dy, matrix.swapaxes(1, 2), sizes, implementation=implementation,
-                        precision=precision,
-                        preferred_element_type=jnp.promote_types(x.dtype, jnp.float32)).astype(x.dtype)
-    dk = jax.lax.ragged_dot_general(
-        inputs, dy, sizes,
-        jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ()),
-        precision=precision, preferred_element_type=kernel.dtype)
-    return dx, dk, None
-
-
-projection.defvjp(projection_forward, projection_backward)
+    input_work = jnp.promote_types(x.dtype, jnp.float32)
+    kernel_work = jnp.promote_types(kernel.dtype, jnp.float32)
+    inputs = jnp.asarray(rounded_operand(x, output.dtype))
+    matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
+    input_term = grouped_matmul(dx.astype(input_work), matrix.astype(input_work), sizes,
+                                implementation=implementation, precision=precision,
+                                preferred_element_type=input_work)
+    kernel_term = grouped_matmul(inputs.astype(kernel_work), dk.astype(kernel_work), sizes,
+                                 implementation=implementation, precision=precision,
+                                 preferred_element_type=kernel_work)
+    tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
+    return output, tangent
 
 
 
@@ -220,11 +234,174 @@ def check_projection() -> None:
                                 'input_oracle_error': float(np.max(abs(actual[2] - expected[2])))}), flush=True)
 
 
+def check_projection_higher_order() -> None:
+    rng = np.random.default_rng(943)
+    values = rng.normal(size=(24, 16))
+    matrices = rng.normal(size=(8, 16, 16))
+    input_direction = rng.normal(scale=.3, size=values.shape)
+    kernel_direction = rng.normal(scale=.3, size=matrices.shape)
+    cotangent = rng.normal(size=(24, 16))
+    sizes = jnp.full(8, 3, jnp.int32)
+
+    def forward(a, b):
+        return (np.asarray(a, np.float64).reshape(8, 3, 16) @ np.asarray(b, np.float64)).reshape(24, 16)
+
+    def backward(a, b):
+        return forward(a, np.asarray(b).swapaxes(1, 2))
+
+    def parameters(a, b):
+        return (np.asarray(a, np.float64).reshape(8, 3, 16).swapaxes(1, 2)
+                @ np.asarray(b, np.float64).reshape(8, 3, 16))
+
+    for compute, input_dtype, master in (
+            (jnp.bfloat16, jnp.bfloat16, jnp.float32),
+            (jnp.bfloat16, jnp.float32, jnp.float64),
+            (jnp.float32, jnp.float32, jnp.float32),
+            (jnp.float64, jnp.float64, jnp.float64)):
+        x, kernel = values.astype(input_dtype), matrices.astype(master)
+        dx, dk = input_direction.astype(input_dtype), kernel_direction.astype(master)
+
+        def typed(a, dtype):
+            return np.asarray(a, dtype=dtype).astype(np.float64)
+
+        qx, qk, qc = (typed(a, compute) for a in (x, kernel, cotangent))
+        y_oracle = typed(forward(qx, qk), compute)
+        tangent_oracle = typed(forward(dx, qk) + forward(qx, dk), compute)
+        gradient_oracle = (typed(backward(qc, qk), input_dtype), typed(parameters(qx, qc), master))
+        mixed_oracle = (typed(backward(qc, dk), input_dtype), typed(parameters(dx, qc), master))
+        expected = (y_oracle, tangent_oracle, gradient_oracle, mixed_oracle, mixed_oracle)
+
+        def evaluate(x, kernel, dx, dk, cotangent, sizes):
+            def fn(x, kernel):
+                return jnp.asarray(projection(x, kernel, sizes, compute, 'xla', None))
+            y, tangent = jax.jvp(fn, (x, kernel), (dx, dk))
+
+            def scalar(x, kernel):
+                return jnp.sum(fn(x, kernel).astype(jnp.float64) * cotangent)
+
+            gradient = jax.grad(scalar, (0, 1))(x, kernel)
+            _, forward_reverse = jax.jvp(jax.grad(scalar, (0, 1)), (x, kernel), (dx, dk))
+
+            def directional(x, kernel):
+                _, direction = jax.jvp(fn, (x, kernel), (dx, dk))
+                return jnp.sum(direction.astype(jnp.float64) * cotangent)
+
+            reverse_forward = jax.grad(directional, (0, 1))(x, kernel)
+            return y, tangent, gradient, forward_reverse, reverse_forward
+
+        for expert, fsdp in ((2, 4), (4, 2), (8, 1)):
+            mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+            for orientation in ('rows', 'columns'):
+                rows = orientation == 'rows'
+                kernels = NamedSharding(mesh, P('expert', 'fsdp', None) if rows
+                                        else P('expert', None, 'fsdp'))
+                inputs = NamedSharding(mesh, P('expert', 'fsdp') if rows else P('expert'))
+                outputs = NamedSharding(mesh, P('expert') if rows else P('expert', 'fsdp'))
+                specs = (inputs, kernels, inputs, kernels, outputs, NamedSharding(mesh, P()))
+                args = tuple(jax.device_put(jnp.asarray(value), spec) for value, spec in zip(
+                    (x, kernel, dx, dk, cotangent, sizes), specs, strict=True))
+                derivative_specs = (inputs, kernels)
+                with jax.set_mesh(mesh):
+                    actual = jax.jit(evaluate, out_shardings=(
+                        outputs, outputs, derivative_specs, derivative_specs, derivative_specs))(*args)
+                errors = []
+                for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+                    a = np.asarray(a).astype(np.float64)
+                    np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-5)
+                    errors.append(float(np.max(abs(a - b))))
+                print(json.dumps({'higher_projection':
+                                  f'{jnp.dtype(compute).name}/{jnp.dtype(input_dtype).name}'
+                                  f'/{jnp.dtype(master).name}/expert{expert}/fsdp{fsdp}/{orientation}',
+                                  'primal_jvp_vjp_forward_reverse_reverse_forward_errors': errors}), flush=True)
+
+
+def check_activation_higher_order() -> None:
+    rng = np.random.default_rng(1041)
+    values, cotangents, directions = rng.normal(size=(3, 1024))
+    values *= 3
+    directions *= .2
+    for dtype in (jnp.bfloat16, jnp.float32, jnp.float64):
+        x, ct, dx = (array.astype(dtype) for array in (values, cotangents, directions))
+        v, c, t = (array.astype(np.float64) for array in (x, ct, dx))
+        density = np.exp(-v*v/2) / np.sqrt(2*np.pi)
+        first = .5 * erfc(-v / np.sqrt(2)) + v * density
+        second = (2 - v*v) * density
+        expected = tuple(array.astype(dtype).astype(np.float64) for array in (
+            .5 * v * erfc(-v / np.sqrt(2)), first*t, first*c, second*c*t, second*t*c))
+
+        def evaluate(x, dx, ct):
+            y, tangent = jax.jvp(exact_gelu, (x,), (dx,))
+
+            def scalar(x):
+                return jnp.sum(exact_gelu(x).astype(jnp.float64) * ct.astype(jnp.float64))
+
+            gradient = jax.grad(scalar)(x)
+            _, forward_reverse = jax.jvp(jax.grad(scalar), (x,), (dx,))
+
+            def directional(x):
+                _, tangent = jax.jvp(exact_gelu, (x,), (dx,))
+                return jnp.sum(tangent.astype(jnp.float64) * ct.astype(jnp.float64))
+
+            return y, tangent, gradient, forward_reverse, jax.grad(directional)(x)
+
+        actual = jax.jit(evaluate)(jnp.asarray(x), jnp.asarray(dx), jnp.asarray(ct))
+        errors = []
+        for a, b in zip(actual, expected, strict=True):
+            a = np.asarray(a).astype(np.float64)
+            np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-5)
+            errors.append(float(np.max(abs(a - b))))
+        print(json.dumps({'higher_activation': jnp.dtype(dtype).name,
+                          'primal_jvp_vjp_forward_reverse_reverse_forward_errors': errors}), flush=True)
+
+
+
 def place(value: jax.Array, sharding: NamedSharding) -> jax.Array:
     if value.is_fully_addressable:
         host = np.asarray(value)
         return jax.make_array_from_callback(host.shape, sharding, lambda index: host[index])
     return jax.device_put(value, sharding)
+
+
+
+def check_transport_forward_mode() -> None:
+    rng = np.random.default_rng(523)
+    mesh = build_mesh(MeshSpec(expert=4, fsdp=2))
+    columns = NamedSharding(mesh, P('expert', None, 'fsdp'))
+    parameter_specs = {'params': {
+        'gate_proj': {'kernel': columns}, 'up_proj': {'kernel': columns},
+        'down_proj': {'kernel': NamedSharding(mesh, P('expert', 'fsdp'))}}}
+    tokens = NamedSharding(mesh, P(('expert', 'fsdp')))
+    for activation in ('swiglu', 'geglu', 'geglu_exact'):
+        model = MasterGradientExperts(8, 16, 8, dtype=jnp.bfloat16, activation=activation)
+        x = jnp.asarray(rng.normal(size=(24, 8)), jnp.bfloat16)
+        weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
+        ids = jnp.asarray(np.argsort(rng.normal(size=(24, 8)), axis=-1)[:, :2], jnp.int32)
+        parameters = model.init(jax.random.key(19), x, weights, ids)
+        dp = jax.tree.map(lambda value: jnp.asarray(rng.normal(scale=.05, size=value.shape),
+                                                   value.dtype), parameters)
+        dx = jnp.asarray(rng.normal(scale=.05, size=x.shape), x.dtype)
+        dw = jnp.asarray(rng.normal(scale=.05, size=weights.shape), weights.dtype)
+        parameters, dp = (jax.tree.map(place, value, parameter_specs) for value in (parameters, dp))
+        x, weights, ids, dx, dw = (place(value, tokens) for value in (x, weights, ids, dx, dw))
+        results = []
+        for method in (None, model.exchange):
+            def run(parameters, x, weights, dp, dx, dw, ids):
+                def forward(parameters, x, weights):
+                    return jnp.asarray(model.apply(parameters, x, weights, ids, method=method))
+                return jax.jvp(forward, (parameters, x, weights), (dp, dx, dw))
+            with jax.set_mesh(mesh):
+                results.append(jax.jit(run, out_shardings=(tokens, tokens))(
+                    parameters, x, weights, dp, dx, dw, ids))
+        errors = []
+        for first, second in zip(*results, strict=True):
+            maximum = 0.0
+            for a, b in zip(first.addressable_shards, second.addressable_shards, strict=True):
+                left, right = np.asarray(a.data).astype(np.float64), np.asarray(b.data).astype(np.float64)
+                np.testing.assert_allclose(left, right, atol=3e-5, rtol=3e-5)
+                maximum = max(maximum, float(np.max(abs(left - right))))
+            errors.append(maximum)
+        print(json.dumps({'transport_jvp': activation, 'process': jax.process_index(),
+                          'processes': jax.process_count(), 'primal_jvp_errors': errors}), flush=True)
 
 
 
@@ -318,7 +495,10 @@ if __name__ == '__main__':
         check_activation()
         with jax.enable_x64():
             check_projection()
+            check_projection_higher_order()
+            check_activation_higher_order()
     try:
+        check_transport_forward_mode()
         for skewed in (False, True):
             compare_updates(skewed=skewed, scale_inputs=skewed, limit=.7 if skewed else None)
     finally:
