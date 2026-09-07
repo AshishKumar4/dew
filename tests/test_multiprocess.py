@@ -952,6 +952,8 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
         assert report["process_count"] == 2
         assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
         assert report["image_rows"] == report["rows"] == 3
+        assert set(report["rejected"]) == {"prompts", "guidance", "steps", "row_count",
+                                           "prepared", "request_kind", "budget"}
         assert any("fsdp" in spec for spec in report["parameter_specs"])
     assert single["image_rows"] == single["rows"] == 6
     np.testing.assert_allclose(reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5)

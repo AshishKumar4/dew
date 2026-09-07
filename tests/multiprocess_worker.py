@@ -1203,8 +1203,36 @@ def mode_pipeline(args) -> dict:
         requests = requests[rank * rows:(rank + 1) * rows]
     drawn = images(prompts, steps=3, seed=5)
     generated = text(requests, seed=5, sampling=Sampling(temperature=0, eos_id=255))
+    default_images = dew.pipeline(args.run_dir)(prompts, steps=3, seed=5).host().images
+    np.testing.assert_allclose(default_images, drawn.host().images, atol=2e-5, rtol=2e-5)
+    rejected = []
+    if args.processes > 1:
+        from dataclasses import replace
+        from jax.experimental import multihost_utils
+
+        prepared = images.prepare(prompts, steps=3, seed=5)
+        calls = {
+            "prompts": lambda: images.prepare([] if rank == 1 else prompts, steps=3, seed=5),
+            "guidance": lambda: images(prompts, steps=3, seed=5, guidance="invalid" if rank == 1 else 3.0),
+            "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, seed=5),
+            "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, seed=5),
+            "prepared": lambda: images(replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared,
+                                        steps=3, seed=5),
+            "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, seed=5),
+            "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, seed=5),
+        }
+        for name, call in calls.items():
+            try:
+                call()
+            except (ValueError, RuntimeError, AssertionError):
+                rejected.append(name)
+            else:
+                raise AssertionError(f"{name}: a bad request on the peer was accepted")
+            arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+            assert arrivals.tolist() == [0, 1]
     return {
         "process_count": jax.process_count(),
+        "rejected": rejected,
         "image_spec": str(drawn.images.sharding.spec),
         "image_rows": drawn.rows,
         "images": drawn.host().images.tolist(),
