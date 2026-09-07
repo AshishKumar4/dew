@@ -75,6 +75,8 @@ The real prompt plus continuation must fit `model.max_seq_len`. `Sampling` carri
 
 Generation is a host operation. It trims left padding and runs the same compiled cached decoder for each exact prompt-length group. This keeps recurrent and latent caches free of padded input. Many distinct lengths create many compiled shapes and separate prefills. It is a correctness path with an execution cost, not continuous batching or a serving engine. Full-sequence RL rescoring left-aligns real tokens within one fixed shape.
 
+On a mesh the rows of each group split over the batch axes and the parameters stay where the trainer placed them. The decode runs a fixed number of steps; a row that reached EOS keeps stepping on padding with its outputs masked, so the collectives never depend on sampled content. In a multi-process run every process passes its own rows and gets its own back. The groups and their sizes come from every process's prompt lengths, so cooperating processes issue identical collectives; a process with fewer rows in a group fills the shape with rows whose outputs are discarded.
+
 Checkpoint loading needs the `interop` extra and may download substantial files. The following complete checkpoint-to-text example is not part of the offline quickstart and has not been run during this documentation validation:
 
 ```python

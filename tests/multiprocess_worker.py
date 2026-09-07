@@ -935,7 +935,106 @@ def mode_builtin_preview_failures(args) -> dict:
     return reports
 
 
+def rollout_prompts() -> dict:
+    """Eight left-padded prompts whose lengths and EOS timing differ by rank.
+
+    Rows 0-3 belong to process zero and rows 4-7 to process one under the
+    trainer's halving. Process zero holds one real length, process one holds
+    three, so the ranks would run different bucket counts on their own, and
+    the ranks stop at different steps. Eight rows split over the eight-device
+    mesh.
+    """
+    prompts = np.array([[3, 4, 5, 6], [9, 10, 5, 6], [1, 2, 3, 4], [7, 8, 9, 1],
+                        [0, 0, 0, 2], [0, 0, 7, 8], [0, 6, 5, 4], [0, 3, 8, 1]], np.int32)
+    return {"prompt": prompts, "prompt_length": np.array([4, 4, 4, 4, 1, 2, 3, 3], np.int32),
+            "data_source": np.full((8, 1), 97, np.int32),
+            "ground_truth": np.full((8, 1), 49, np.int32),
+            "extra_info": np.zeros((8, 1), np.int32)}
+
+
+def mode_rollout(args) -> dict:
+    """One sampled rollout and one GRPO update across the pool.
+
+    Each process generates its own rows over parameters sharded across both
+    processes' devices. The bucket plan and decode trip count come from every
+    process's prompt lengths, so ranks with different lengths and different
+    EOS steps still issue identical collectives. A bounded rendezvous after
+    sampling proves both ranks returned before the update runs.
+    """
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from jax.experimental import multihost_utils
+    from dew.data import Dataset
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.sampling import Sampling, generate
+    from dew.training import Layout, MeshSpec, Trainer
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    batch = rollout_prompts()
+    rows = len(batch["prompt"]) // processes
+    local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
+    # Every row decodes the same first token greedily, so that token is an
+    # EOS the ranks reach at different response positions.
+    greedy = generate(model, params, batch["prompt"], 4, key=jax.random.key(1),
+                      prompt_lengths=batch["prompt_length"], sampling=Sampling(temperature=0))
+    eos = int(np.asarray(greedy.tokens)[0, 4])
+    sampling = Sampling(temperature=0, eos_id=eos, pad_id=12)
+    objective = GRPOObjective(model, seq_len=7, pretrained=params)
+    rollout = SampledRollout(objective, lambda source, text, truth, info: float(len(text)),
+                             groups=2, max_new_tokens=4, sampling=sampling)
+    trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
+                      mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
+                      rollout=rollout)
+    state, _, _ = trainer.place()
+    facts = sharding_facts(state.params)
+    began = time.monotonic()
+    rolled = rollout(state, local, jax.random.key(9))
+    sampled_seconds = time.monotonic() - began
+    # Bounded rendezvous: a rank stranded in a collective never reaches it.
+    arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))
+    # Stochastic draws over the placed parameters: keys fold in the global
+    # row index, so the pool draws what one process draws for the same rows.
+    drawn = generate(model, state.params, local["prompt"], 4, key=jax.random.key(21),
+                     prompt_lengths=local["prompt_length"],
+                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12))
+    single = None
+    if processes == 1:
+        single = rolled
+    data = Dataset(train=lambda: iter([local]), val=None, records=rows * processes,
+                   batch=rows * processes)
+    final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
+    dump_params(args.out.with_suffix(".npz"), final.params["params"])
+    return {
+        "process_count": processes,
+        "arrivals": arrivals.tolist(),
+        "sampled_seconds": sampled_seconds,
+        "sharding": facts,
+        "eos": eos,
+        "prompt_lengths": local["prompt_length"].tolist(),
+        "input_ids": np.asarray(rolled["input_ids"]).tolist(),
+        "response_length": np.asarray(rolled["response_length"]).tolist(),
+        "terminated": np.asarray(rolled["terminated"]).tolist(),
+        "response_mask": np.asarray(rolled["response_mask"]).tolist(),
+        "old_log_probs": np.asarray(rolled["old_log_probs"]).tolist(),
+        "behavior_log_probs": np.asarray(rolled["behavior_log_probs"]).tolist(),
+        "step": int(final.step),
+        "drawn_tokens": np.asarray(drawn.tokens).tolist(),
+        "drawn_lengths": np.asarray(drawn.lengths).tolist(),
+        "drawn_behavior": np.asarray(drawn.behavior_log_probs).tolist(),
+        "drawn_raw": np.asarray(drawn.raw_log_probs).tolist(),
+        "single": None if single is None else {
+            name: np.asarray(value).tolist() for name, value in single.items()},
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "rollout": mode_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "evaluation_contract": mode_evaluation_contract,

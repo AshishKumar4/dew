@@ -159,7 +159,7 @@ generate(model, params, prompt, max_new_tokens, *, key,
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0)
 ```
 
-`params` is the complete variables tree. `prompt` is an integer `(B, P)` array. Optional `(B,)` `prompt_lengths` counts real tokens at each row's right edge. Each real prompt plus the token budget must fit the cache. The host groups equal lengths and removes padding before the compiled cached decoder; different lengths can produce different JIT shapes. This API does not provide streaming or continuous request batching.
+`params` is the complete variables tree. `prompt` is an integer `(B, P)` array. Optional `(B,)` `prompt_lengths` counts real tokens at each row's right edge. Each real prompt plus the token budget must fit the cache. The host groups equal lengths and removes padding before the compiled cached decoder; different lengths can produce different JIT shapes. The decode runs a fixed trip count with finished rows masked. On a mesh the group's rows split over the batch axes; in a pool each process passes and receives its own rows, and the group plan is agreed across processes so their collectives match. This API does not provide streaming or continuous request batching.
 
 `Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)`. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)` and zero invalid tails. Only slots below `lengths` are likelihoods. Behavior probabilities include temperature/top-k; raw probabilities describe the unmodified model. Greedy behavior has probability one for its selected action.
 
