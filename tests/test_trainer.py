@@ -668,7 +668,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, tracker=tracker)
-    compile_step, evaluate, save = trainer.compile, trainer._evaluate, trainer.checkpoints.save
+    compile_step, evaluate, save = trainer.compile, trainer_module.evaluate, trainer.checkpoints.save
 
     def compile_then_time_each_step(*args):
         executable = compile_step(*args)
@@ -680,16 +680,16 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
             return outputs
         return timed
 
-    def slow_evaluate(*args):
+    def slow_evaluate(*args, **kwargs):
         clock.now += 5.0
-        return evaluate(*args)
+        return evaluate(*args, **kwargs)
 
     def slow_save(*args):
         clock.now += 2.0
         return save(*args)
 
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
-    monkeypatch.setattr(trainer, "_evaluate", slow_evaluate)
+    monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
     trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2)
 

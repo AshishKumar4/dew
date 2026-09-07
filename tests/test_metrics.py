@@ -287,17 +287,14 @@ def test_a_video_metric_scores_the_clips(rng):
 @pytest.mark.parametrize("factory,raw", [(psnr_metric, psnr), (ssim_metric, ssim)],
                          ids=["psnr", "ssim"])
 def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
-    """A video run's metric reads `VideoGrid`: the factory default stays
-    `ImageGrid`, and the trainer's `_pick` finds the artifact the objective
-    produces."""
-    from dew.training.trainer import _pick
+    """A video run explicitly scores VideoGrid frames against the video field."""
     batch = {'video': _uint8_batch((6, 16, 16, 3), rng)['image'].reshape(2, 3, 16, 16, 3)}
     reference = (jnp.asarray(batch['video'], jnp.float32) - 127.5) / 127.5
     degraded = reference + 0.1
     assert factory().reads is ImageGrid
     metric = factory(field="video", reads=VideoGrid)
     assert metric.reads is VideoGrid
-    artifact = _pick((VideoGrid(degraded),), metric.reads)
+    artifact = VideoGrid(degraded)
     assert metric.finalize(metric(artifact, batch)) == pytest.approx(
         float(raw(degraded, reference, data_range=2.0)), rel=1e-5)
 
