@@ -1,6 +1,6 @@
 # Capabilities and limitations
 
-Use this page to choose a workflow and understand its validation scope. Dew is pre-1.0 software. An implemented API is not a guarantee that a released model fits your accelerator or that a multi-host run has been qualified.
+The [README model list](../../README.md#models) distinguishes complete supported models from unfinished integrations. This page covers configuration, execution, and recovery requirements.
 
 ## Training objectives
 
@@ -11,11 +11,11 @@ Use this page to choose a workflow and understand its validation scope. Dew is p
 | Masked-diffusion language modeling | Masked diffusion objective and LLaDA/Dream translation | Small-fixture parity does not establish a real-size checkpoint training run. |
 | Image and video diffusion | UNets, DiT variants, MMDiT, continuous diffusion and flow-matching processes | Some external weights and data paths need optional dependencies or downloads. |
 | Representation learning | I-JEPA and V-JEPA objectives and predictors | Evaluation requires a configured validation split and cadence. |
-| Post-training | Role-masked SFT, DPO, GRPO, local sampled rollouts | General multi-turn sandboxed agent training and FlowGRPO remain planned work. |
+| Post-training | Role-masked SFT, DPO, GRPO, FlowGRPO, local sampled rollouts | General multi-turn sandboxed agent training remains under development. |
 
 ## Models and checkpoint translation
 
-The [family reference](model-families.md) lists detailed translation coverage. The [language model guide](../concepts/language_models.md) teaches the training and checkpoint workflow. Current translation code covers Llama, Mistral/Mixtral, Qwen, Gemma, OLMo, DeepSeek, Kimi, GLM, gpt-oss, LLaDA, and Dream variants. Support varies by family and configuration; unimplemented fields or model types can raise errors.
+The [family reference](model-families.md) describes checkpoint translation. The [language model guide](../concepts/language_models.md) covers training and generation. Configuration translation alone does not make an unfinished model workflow supported.
 
 Gemma 3, Llama 4, Gemma 4, Qwen 3.5, and image-only Gemma 3n have vision towers and wrapper translation with small reference fixtures. Some image paths support fixed-resolution still images only. Gemma 3n includes the MobileNet-v5 encoder and hard/soft vision embeddings; complete audio-bearing bundles still raise an error. Audio towers are not implemented. Diffusion Gemma has a block sampler and denoiser comparison against a small reference model; this does not mean its full released checkpoint was loaded on the local GPU.
 
@@ -23,15 +23,6 @@ The Gemma 3n reference comparisons use float32. On GPU, the strict comparison se
 
 Gemma 3n hard-token embedding and input preparation check token ranges, including the image-only audio-ID restriction. Compiled callers must use `jit(checkify.checkify(...))` and call `Error.throw()` on the host before using the result. Ordinary `jit` alone does not support these checked boundaries.
 
-Distinguish these checks when reporting support:
-
-1. Configuration translation preserves the fields needed to construct a model.
-2. A small fixture compares outputs with the reference implementation.
-3. Backward/update and generation/cache tests exercise additional behavior.
-4. A real checkpoint run checks tensor files, loading, memory use, and representative inputs.
-5. Accelerator and multi-host qualification checks the intended deployment.
-
-The first two do not imply the last three. There is no verified claim of complete parity with MaxText, Transformers, Diffusers, vLLM, or Ollama.
 
 ## Devices and numerical computation
 
@@ -43,9 +34,9 @@ Qwix int8/fp8 training is optional and experimental. FP8 did not improve the mea
 
 ## Inference
 
-`generate` performs batched prefill and KV-cache decoding with temperature and top-k sampling. Diffusion sampling exposes solver and guidance values. Dew does not provide a production serving system, paged request management, continuous batching, or a vLLM-compatible server API. External serving integrations and more complete generation controls are research and design work.
+`generate` accepts token batches and `Sampling` settings for temperature, top-k, EOS, and padding. It returns tokens, response lengths, termination flags, and raw-policy and behavior log probabilities. Diffusion sampling uses solver and guidance values. A production serving system, paged request management, and continuous batching are not yet implemented.
 
-## Training and evaluation issues under review
+## Training state and evaluation
 
 Training state separates attempted batches, accepted microbatches and optimizer commits, and persists scaler history and partial accumulation records. CPU regressions compare unequal-role-mask CE/MTP, row/global router auxiliary and QK updates with a combined-batch reference, and compare resumed state after finite-forward/nonfinite-gradient rejection. Cross-host GPU/TPU recovery and production replay memory remain separate qualification work.
 
