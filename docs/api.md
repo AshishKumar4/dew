@@ -11,7 +11,7 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
-| `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `resolve_dtype`, `dtype_name`, `with_precision` |
+| `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `mixers`, `towers`, `projectors`, `REGISTRIES`, `resolve_dtype`, `dtype_name`, `with_precision` |
 | `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid`, `agree_process_phase`, `broadcast_from_process_zero`, `collective_host`, `host` |
 | `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig`, `Wandb` |
 
@@ -31,11 +31,11 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.objectives` | `Aux`, `EMASpec`, `Mean`, `Objective`, `Step`, `mean_loss`, `scalar_loss` |
+| `dew.objectives` |  |
 | `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |
-| `dew.objectives.rl` | `ADVANTAGES_KEY`, `DPOObjective`, `GRPOObjective`, `IDS_KEY`, `OLD_LOG_PROBS_KEY`, `PREFERENCE_IDS_KEY`, `PREFERENCE_MASK_KEY`, `RESPONSE_MASK_KEY`, `REWARDS_KEY`, `Reward`, `SampledRollout` |
+| `dew.objectives.rl` | `ADVANTAGES_KEY`, `DPOObjective`, `GRPOObjective`, `IDS_KEY`, `OLD_LOG_PROBS_KEY`, `PREFERENCE_IDS_KEY`, `PREFERENCE_MASK_KEY`, `RESPONSE_MASK_KEY`, `REWARDS_KEY`, `Reward`, `SampledRollout`, `FlowGRPOObjective`, `FlowReward`, `FlowRollout` |
 
 ## Diffusion
 
@@ -51,9 +51,9 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `CFG`, `sample`, `generate`, `TextToImage` |
-| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM` |
-| `dew.sampling.text` | `generate` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
+| `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
+| `dew.sampling.text` | `Generation`, `Sampling`, `generate` |
 
 ## Models
 
@@ -62,7 +62,7 @@ module has no importable names.
 | `dew.nn` |  |
 | `dew.nn.backbones` | `Unet`, `UViT`, `SimpleUDiT`, `SimpleDiT`, `SimpleMMDiT`, `HierarchicalMMDiT`, `HybridSSMAttentionDiT`, `CausalTransformer`, `VideoDiT`, `UNet3D` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
-| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `SparseMLP`, `calculate_load_balance_updates`, `deepseek_v2_aux_loss` |
+| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `RouterMoments`, `SparseMLP`, `calculate_load_balance_updates`, `deepseek_v2_aux_loss`, `global_router_loss`, `load_balance_update`, `router_moments`, `sequence_router_losses` |
 | `dew.nn.text_encoders` | `CLIP`, `CLIPAttention`, `CLIPEncoderLayer`, `CLIPModel`, `CLIPTextModel`, `CLIPTextTransformer`, `CLIPTowerOutput`, `CLIPVisionTransformer`, `MLP`, `T5Block`, `T5DenseGatedGeluDense`, `T5DenseReluDense`, `T5EncoderModel`, `T5EncoderTransformer`, `T5LayerNorm`, `T5SelfAttention`, `quick_gelu`, `translate_clip_config`, `translate_clip_weights`, `translate_config`, `translate_t5_config`, `translate_t5_weights`, `translate_vision_config`, `translate_weights` |
 | `dew.nn.sharding` | `declared_axes`, `is_heuristic`, `logical_axes`, `microbatches`, `parameter_path`, `pipeline_microbatches`, `pipeline_stages`, `sequence_shards` |
 
