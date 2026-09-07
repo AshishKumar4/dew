@@ -18,6 +18,7 @@ from dew.objectives.diffusion import DiffusionObjective, MaskedDiffusionObjectiv
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.rl import GRPOObjective
 from dew.registry import presets
+from dew.sampling import Sampling
 from dew.training import Trainer
 
 
@@ -36,7 +37,7 @@ def make_case(kind, decay):
     rows = jax.device_count()
     if kind == "lm":
         objective = LMObjective(decoder(), 4, ema_decay=decay, head_chunks=1,
-                                samples=Samples([1, 2], 2, temperature=0.))
+                                samples=Samples([1, 2], 2, sampling=Sampling(temperature=0.)))
         batch = {"text": jnp.tile(jnp.array([[1, 2, 3, 4, 5]], jnp.int32), (rows, 1))}
     elif kind == "masked":
         objective = MaskedDiffusionObjective(decoder(causal=False), MDLM(mask_id=7)(), 4,
@@ -93,7 +94,7 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
 
 def test_zero_beta_grpo_has_no_reference_and_keeps_live_updates_and_preview():
     objective = GRPOObjective(decoder(), 5, beta=0., head_chunks=1,
-                              samples=Samples([1, 2], 2, temperature=0.))
+                              samples=Samples([1, 2], 2, sampling=Sampling(temperature=0.)))
     optimizer = optax.sgd(.01)
     trainer = Trainer(objective, optimizer, key=jax.random.PRNGKey(5))
     initial = trainer.initial_state()

@@ -291,3 +291,11 @@ def test_checked_hard_embedding_gradients_remain_jittable(bundle):
     for actual, expected in zip(jax.tree.leaves(gradients), jax.tree.leaves(expected_grad), strict=True):
         np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
 
+
+@pytest.mark.parametrize("field,value", [("vocab_size", "8"), ("vocab_offset", "48"),
+                                         ("rms_norm_eps", "x"), ("vocab_size", True)])
+def test_wrapper_rejects_mistyped_vision_values_before_building(field, value):
+    config = json.loads((FIXTURE / "config.json").read_text())
+    config["vision_config"][field] = value
+    with pytest.raises(ValueError, match=field):
+        translate_wrapper_config(config)

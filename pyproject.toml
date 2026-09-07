@@ -34,7 +34,6 @@ dependencies = [
     "filelock",
     "huggingface_hub",
     "wandb",
-    "typing_extensions>=4.12",
 ]
 license = "MIT"
 
