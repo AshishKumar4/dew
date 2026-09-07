@@ -76,12 +76,62 @@ def tiny_gpt_oss() -> GptOssForCausalLM:
     return GptOssForCausalLM(config)
 
 
+def write_exchange_cases() -> None:
+    """Tiny fp32 full-MLP VJPs from the pinned transformers implementation."""
+    from importlib.metadata import version
+    import json
+
+    reference = {'transformers': '5.16.1', 'torch': '2.14.0+cpu'}
+    for package, expected in reference.items():
+        if version(package) != expected:
+            raise RuntimeError(f"exchange fixtures require {package}=={expected}")
+    for skewed in (False, True):
+        config = GptOssConfig(hidden_size=8, intermediate_size=12, num_local_experts=4,
+                             num_experts_per_tok=2)
+        config._experts_implementation = 'eager'
+        block = GptOssMLP(config).eval()
+        generator = torch.Generator().manual_seed(141)
+        with torch.no_grad():
+            for parameter in block.parameters():
+                parameter.copy_(torch.randn(parameter.shape, generator=generator) * .3)
+            biases = block.get_parameter('experts.gate_up_proj_bias')
+            biases[0, :2] = torch.tensor([12., -12.])
+            biases[1, :2] = torch.tensor([-12., 12.])
+            if skewed:
+                block.get_parameter('router.weight').mul_(.05)
+                block.get_parameter('router.bias').copy_(torch.tensor([2., 1., -20., -20.]))
+        hidden = torch.randn(2, 8, 8, generator=generator).requires_grad_()
+        output, scores = block(hidden)
+        loss = output.sin().mean()
+        loss.backward()
+        with torch.no_grad():
+            _, _, indices = block.router(hidden.reshape(-1, 8))
+        if hidden.grad is None:
+            raise RuntimeError('reference input gradient is absent')
+        arrays = {'hidden': hidden.detach().numpy(), 'output': output.detach().numpy(),
+                  'loss': loss.detach().numpy(), 'input_grad': hidden.grad.numpy(),
+                  'router_scores': scores.detach().numpy().reshape(2, 8, 2),
+                  'router_indices': indices.numpy().reshape(2, 8, 2)}
+        for name, parameter in block.named_parameters():
+            if parameter.grad is None:
+                raise RuntimeError(f'reference gradient is absent for {name}')
+            arrays[name] = parameter.detach().numpy()
+            arrays['grad.' + name] = parameter.grad.numpy()
+        name = 'exchange_skewed' if skewed else 'exchange_random'
+        np.savez(FIXTURES / (name + '.npz'), **arrays)
+    (FIXTURES / 'exchange_reference.json').write_text(json.dumps({
+        **reference, 'seed': 141, 'dtype': 'float32', 'loss': 'mean(sin(output))',
+        'hidden_size': 8, 'intermediate_size': 12, 'experts': 4, 'top_k': 2}, indent=2) + '\n')
+
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
     write_attention()
     write_moe()
     write_mxfp4()
+    write_exchange_cases()
 
 
 if __name__ == "__main__":
