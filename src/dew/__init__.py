@@ -29,8 +29,8 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.registry import datasets, encoders, metrics, models, presets, samplers
     from dew.sampling import CFG, sample
     from dew.training import (
-        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, Tracker, Trackers,
-        Trainer, TrainState, WandbTracker, evaluate,
+        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, MLflowTracker,
+        TensorBoardTracker, Tracker, Trackers, Trainer, TrainState, WandbTracker, evaluate,
     )
 
 __version__ = "0.1.0"
@@ -50,6 +50,7 @@ _EXPORTS = {
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
+    "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
     "Evaluation": "dew.training", "evaluate": "dew.training",
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
@@ -82,8 +83,8 @@ def __dir__() -> list[str]:
 __all__ = [
     "__version__",
     "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Evaluation", "Field",
-    "ImageGrid", "InputSpec", "Layout", "MeshSpec", "Objective", "Process",
-    "Representations", "Step", "TextSamples", "TokenScores", "Tracker",
+    "ImageGrid", "InputSpec", "Layout", "MLflowTracker", "MeshSpec", "Objective", "Process",
+    "Representations", "Step", "TensorBoardTracker", "TextSamples", "TokenScores", "Tracker",
     "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
     "datasets", "encoders", "evaluate", "metrics", "models", "presets", "sample", "samplers",
 ]
