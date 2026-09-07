@@ -181,30 +181,22 @@ The compiled decoder uses one padded input shape with per-row cache cursors and 
 
 `LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. GRPO compares current and old raw-policy likelihoods; it does not silently substitute the behavior distribution. Reward text excludes EOS and the invalid tail. Models explicitly declaring `causal=False` are refused by the next-token objective.
 
-### Engine and serving
+### Inference tasks
 
-Import `Engine`, `GenerationJob`, `WeightVersion`, `CapacityError` and `generation_family` from `dew.sampling`; import `serve` from `dew.serve`.
+Import `TextGeneration` and `BlockGeneration` from `dew.inference`.
 
 ```text
-Engine(source_or_model, variables=None, *, family=None, max_batch_size,
-       max_pending_requests=64, max_request_bytes=256 MiB, prefix_cache_bytes=0,
-       max_weight_versions=2, steps_per_dispatch=1)
-engine.start() / with engine: ...        engine.close(cancel=False, timeout=None)
-engine.submit(inputs, max_new_tokens, *, key, generation=None, version=None) -> GenerationJob
-engine.publish(variables) -> WeightVersion      engine.version      engine.stats()
-job.result(timeout=None)   job.stream()   job.cancel()   job.status   job.version
-serve(engine, *, processor=None, host="127.0.0.1", port=0) -> Server
+TextGeneration(model, variables, processor=None, sampling=Sampling())
+task(request, max_new_tokens, *, key, sampling=None, images=None) -> Generation
+task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
+BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0)
+task(request, max_new_tokens, *, key, process=None) -> CanvasGeneration
+Pretrained.text_generation() -> TextGeneration    Pretrained.block_generation() -> BlockGeneration
 ```
 
-A `Pretrained` source supplies its model, variables and generation family; a bare native model uses `generation_family(model)`, which is `AutoregressiveFamily` for decoders and `CanvasFamily` for `DiffusionGemma`. The family owns the science: host validation, the deterministic prefill, one advance step, the per-request host record and the typed result. `Engine.submit` validates on the caller's thread and raises `ValueError`/`TypeError` for bad input, `CapacityError` when a bound would be exceeded, and `RuntimeError` after `close`. `generation` is a `Sampling` or a `BlockProcess`; `None` uses the family default, which a loaded source fills from its generation config.
+A task binds a native model, one immutable variables tree and, when the source ships one, the host processor. `request` is prompt text (a string or a list of strings, which needs the processor; `images` travel with it), a `ModelInputs`, or integer token rows. A call runs the same `generate` kernel with the task's default `sampling` unless the call passes one; a loaded source's default comes from its generation config. `bind` returns the task over other weights and leaves the original untouched, which is how a rollout draws from one policy snapshot for its whole collection. `decode` returns each row's valid continuation through the processor and an empty tuple without one.
 
-`start` copies the initial variables; `publish` copies again and returns the new default version. Accepted requests keep the version they pinned, so the caller may donate or delete its arrays after `publish` returns. Unpinned older versions retire with their prefix entries; `publish` raises `CapacityError` while `max_weight_versions` snapshots are pinned, and `submit` rejects versions from another engine or already retired.
-
-Requests of an `AutoregressiveFamily` with equal `Sampling` and equal state layout share one decode state; its slot count grows and shrinks in powers of two up to `max_batch_size`, which bounds the rows allocated at once. A `CanvasFamily` request keeps its own state because refinement draws noise for its whole batch; rows of different requests are never merged and keys never change. The prefix cache retains only deterministic prefill states, keyed by weight version, all token fields, all conditioning arrays and the geometry the family declares; retained bytes stay under `prefix_cache_bytes` with LRU eviction.
-
-`result` blocks for the typed result; a timeout raises `TimeoutError` and leaves the request running. `stream` is a single-consumer iterator of `TokenEvent` (row, position, token, both log-probabilities, terminated) or `SpanEvent` (row, start, committed tokens, terminated, decoder steps). `cancel` returns false once the request is terminal; otherwise it ends with `CancelledError`, including a request whose last device step was in flight. A model error fails the request that caused it; a failure inside a shared decode step fails the requests of that state. `close` stops admission, finishes or cancels accepted work, then releases versions, prefixes and states. The engine schedules one process; pooled processes use `generate`.
-
-`serve` answers `POST /generate` with JSON: `prompt` (text; needs `processor`) or `input_ids`, `max_new_tokens`, optional `seed`, `sampling` or `process` fields, and `stream`. A plain response carries the result fields, decoded `text` when a processor exists, and the version serial. A streaming response is newline-delimited JSON events followed by the result. Bad input answers 400, a full engine 429, a closed engine 503; a client that disconnects mid-stream cancels its request. `GET /health` reports engine statistics.
+`BlockGeneration` wraps `BlockProcess.generate` for a `DiffusionGemma` model; its `CanvasGeneration` carries token lengths, termination and decoder steps and no autoregressive likelihoods. `Pretrained.text_generation` refuses a `DiffusionGemma` source and `block_generation` refuses every other model, so a task never changes its result type.
 
 ## Diffusion and JEPA objectives
 
