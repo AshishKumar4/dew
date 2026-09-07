@@ -87,9 +87,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.interop import load_pretrained
 from dew.interop.hf_decoders import (
-    load_pretrained_decoder, save_pretrained_decoder, translate_config,
-    translate_weights,
+    save_pretrained_decoder, translate_config, translate_weights,
 )
 from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
@@ -109,8 +109,9 @@ def fixture_config(name):
 
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
-    return load_pretrained_decoder(str(directory), dtype='float32',
-                                   attention_impl='reference', **kwargs)
+    pretrained = load_pretrained(str(directory), dtype='float32',
+                                 attention_impl='reference', **kwargs)
+    return pretrained.model, pretrained.variables
 
 
 def flat_tree(tree):
@@ -190,7 +191,7 @@ def test_released_qwen2_0_5b_config_translates_every_computational_field():
 def test_qwen2_loads_its_projection_biases_and_no_o_proj_bias():
     """The split dial in the loaded tree: zeroing the q/k/v biases moves the
     reference logits, and o_proj has no bias leaf to zero."""
-    model, variables, _ = fp32_decoder(FIXTURES / 'qwen2-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'qwen2-tiny')
     ids = np.load(FIXTURES / 'qwen2-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'qwen2-tiny' / 'logits.npy')
     attention = variables['params']['layers_0']['self_attn']
@@ -209,7 +210,7 @@ def test_released_mixtral_8x7b_config_translates_every_computational_field():
 
 
 def test_mixtral_experts_stack_in_checkpoint_order():
-    model, variables, _ = fp32_decoder(FIXTURES / 'mixtral-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'mixtral-tiny')
     ids = np.load(FIXTURES / 'mixtral-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'mixtral-tiny' / 'logits.npy')
     params = variables['params']
@@ -240,7 +241,7 @@ def test_qwen3_moe_picks_its_sparse_layers_like_the_reference():
     routes nothing is a dense qwen3 model and refuses."""
     config = translate_config(fixture_config("qwen3-moe-tiny"))
     assert config['mixture']['layers'] == (1,)
-    _, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    _, variables = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
     mlps = {layer: sorted(block['mlp']) for layer, block in variables['params'].items()
             if layer.startswith('layers_')}
     assert mlps == {'layers_0': ['down_proj', 'gate_proj', 'up_proj'],
@@ -254,7 +255,7 @@ def test_norm_topk_prob_off_keeps_the_raw_softmax_weights():
     """The fixture ships norm_topk_prob false, so a token's two weights are
     the softmax values themselves; renormalising them to sum to one, which
     Mixtral always does, moves the logits by 0.38 against the reference."""
-    model, variables, _ = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'qwen3-moe-tiny')
     ids = np.load(FIXTURES / 'qwen3-moe-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'qwen3-moe-tiny' / 'logits.npy')
     assert model.mixture is not None and not model.mixture.norm_topk_prob
@@ -289,7 +290,7 @@ def test_olmo3_norms_the_whole_projection_and_no_input():
     same scale (what a loader that split the projection's norm across heads
     would compute), the logits leave the reference by more than 0.1: the
     RMS over 16 dims is not the RMS over 64, so the scope is load-bearing."""
-    model, variables, _ = fp32_decoder(FIXTURES / 'olmo3-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'olmo3-tiny')
     ids = np.load(FIXTURES / 'olmo3-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'olmo3-tiny' / 'logits.npy')
     attention = variables['params']['layers_0']['self_attn']
@@ -329,7 +330,7 @@ def test_the_released_olmo_3_7b_config_refuses_its_full_layer_yarn_by_name():
     }
 
 def test_mistral_window_changes_the_reference_logits():
-    model, variables, _ = fp32_decoder(FIXTURES / 'mistral-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'mistral-tiny')
     ids = np.load(FIXTURES / 'mistral-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'mistral-tiny' / 'logits.npy')
     unwindowed = model.clone(kinds={}, layer_types=('full_attention',) * model.num_layers)
@@ -437,7 +438,7 @@ def test_a_gemma2_config_without_layer_types_alternates_like_the_reference():
 def test_dropping_the_attention_softcap_breaks_gemma2_parity():
     """The fixture caps at 5 so the tanh moves the logits by 1.45; a load
     that read the cap and applied none would pass no tolerance below that."""
-    model, variables, _ = fp32_decoder(FIXTURES / 'gemma2-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'gemma2-tiny')
     ids = np.load(FIXTURES / 'gemma2-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'gemma2-tiny' / 'logits.npy')
     uncapped = model.clone(attn_logit_softcap=None)
@@ -448,7 +449,7 @@ def test_the_erf_gelu_is_not_the_tanh_gelu_on_gemma():
     """gemma-tiny names hidden_act 'gelu'; run through the tanh approximation
     instead, its logits drift 1.7e-03 from the reference, above the 1e-4
     parity tolerance, so the two activations are two mlp values."""
-    model, variables, _ = fp32_decoder(FIXTURES / 'gemma-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'gemma-tiny')
     ids = np.load(FIXTURES / 'gemma-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'gemma-tiny' / 'logits.npy')
     approximate = model.clone(mlp='geglu')
@@ -509,7 +510,7 @@ def test_a_llama3_rope_scaling_translates_and_loads():
     assert config['rope_scaling'] == {
         'rope_type': 'llama3', 'factor': 8.0, 'low_freq_factor': 1.0,
         'high_freq_factor': 4.0, 'original_max_position_embeddings': 64}
-    model, variables, _ = fp32_decoder(FIXTURES / 'llama31-tiny')
+    model, variables = fp32_decoder(FIXTURES / 'llama31-tiny')
     ids = np.load(FIXTURES / 'llama31-tiny' / 'input_ids.npy')
     reference = np.load(FIXTURES / 'llama31-tiny' / 'logits.npy')
     plain = model.clone(rope_scaling=None)
@@ -584,7 +585,7 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
-    model, variables, _ = fp32_decoder(directory)
+    model, variables = fp32_decoder(directory)
     ids = np.load(directory / "input_ids.npy")
     reference = np.load(directory / "logits.npy")
 
@@ -601,8 +602,9 @@ def test_the_bf16_gemma_forward_still_tracks_the_reference():
     the fp32 reference logits the observed difference is 5.7e-02 on the
     reference kernel, tolerance 1e-01; dropping the scale moves them by 1.06."""
     directory = FIXTURES / "gemma3-tiny"
-    model, variables, _ = load_pretrained_decoder(
-        str(directory), dtype='bfloat16', attention_impl='reference')
+    pretrained = load_pretrained(str(directory), dtype='bfloat16',
+                                 attention_impl='reference')
+    model, variables = pretrained.model, pretrained.variables
     reference = np.load(directory / "logits.npy")
 
     logits = np.asarray(model.apply(
@@ -644,11 +646,11 @@ def test_an_unfamiliar_tensor_name_is_refused():
 
 @pytest.mark.parametrize("name", TINY)
 def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
-    model, variables, _ = fp32_decoder(FIXTURES / name)
+    model, variables = fp32_decoder(FIXTURES / name)
     export = tmp_path / name
 
     save_pretrained_decoder(model, variables, export, tokenizer_name="byte")
-    again, reloaded, _ = fp32_decoder(export)
+    again, reloaded = fp32_decoder(export)
 
     # against the fixture's config, not the exported one read twice: a field
     # the export changes and the model does not read back (the context length,
@@ -690,7 +692,7 @@ def test_a_biased_qwen3_round_trips_through_an_export(tmp_path, rng):
     export = tmp_path / "biased"
 
     save_pretrained_decoder(model, variables, export)
-    again, reloaded, _ = fp32_decoder(export)
+    again, reloaded = fp32_decoder(export)
 
     assert json.loads((export / "config.json").read_text())['attention_bias'] is True
     assert again == model, "the exported config rebuilds a different model"
@@ -746,9 +748,10 @@ def test_qwen3_0_6b_matches_the_reference_on_the_real_weights():
     reference = np.load(REAL / "reference.npz")
     ids = np.asarray(prompt['input_ids'], np.int32)[None]
 
-    model, variables, _ = load_pretrained_decoder(
-        prompt['repo'], dtype='float32', attention_impl='reference',
-        max_seq_len=int(ids.shape[1]))
+    pretrained = load_pretrained(prompt['repo'], dtype='float32',
+                                 attention_impl='reference',
+                                 max_seq_len=int(ids.shape[1]))
+    model, variables = pretrained.model, pretrained.variables
     logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
 
     assert np.array_equal(np.argmax(logits, axis=-1), reference['argmax'])
@@ -782,7 +785,7 @@ np.save(out, logits.to(torch.float32).numpy())
                     reason="no torch venv at /tmp/hfref to load the export with")
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
-    model, variables, _ = fp32_decoder(FIXTURES / "qwen3-tiny")
+    model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
     export = tmp_path / "exported"
     save_pretrained_decoder(model, variables, export)
 
@@ -1011,7 +1014,7 @@ def test_gemma4_checkpoints_load_through_the_translator(name):
     shape check. Sharing layers own no K/V leaves and the per-layer table
     lands; _check_tree enforces both leaf for leaf."""
     directory = FIXTURES / name
-    model, variables, _ = fp32_decoder(directory)
+    model, variables = fp32_decoder(directory)
     assert model.v_norm and model.attention_scale == 1.0
     leaves = flat_tree(variables["params"])
     sharing = {"gemma4-ple": set(), "gemma4-kvshare": {2, 3}, "gemma4-e2b": {4, 5}}[name]
@@ -1029,7 +1032,7 @@ def test_gemma4_logits_match_the_reference_implementation(name):
     |logit difference| on CPU: gemma4-ple 4.9e-07, gemma4-kvshare 8.6e-07,
     gemma4-e2b 1.4e-06."""
     directory = FIXTURES / name
-    model, variables, _ = fp32_decoder(directory)
+    model, variables = fp32_decoder(directory)
     ids = np.load(directory / "input_ids.npy")
     reference = np.load(directory / "logits.npy")
 
@@ -1210,7 +1213,7 @@ def test_the_router_bias_lands_in_the_moe_collection():
     assert not [path for path in flat_tree(variables['params'])
                 if path.endswith('e_score_correction_bias')]
 
-    model, loaded, _ = fp32_decoder(directory)
+    model, loaded = fp32_decoder(directory)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     zeroed = {**loaded, 'moe': jax.tree.map(jnp.zeros_like, loaded['moe'])}
     moved = float(np.max(np.abs(np.asarray(model.apply(loaded, ids))
@@ -1272,7 +1275,10 @@ def test_the_v32_fixture_is_the_sparse_model():
     fixture by 3.8, so the parity above covers the indexer's selection; a
     generator that lost the eager mask fold again would fail here."""
     directory = FIXTURES / "deepseek-v32-tiny"
-    _, variables, built = fp32_decoder(directory)
+    _, variables = fp32_decoder(directory)
+    built = with_precision('causal_transformer',
+                           translate_config(fixture_config("deepseek-v32-tiny")),
+                           dtype='float32', attention_impl='reference')
     dense = models.build('causal_transformer', **{
         **built, 'mixer': {**built['mixer'], 'index_topk': None,
                            'index_n_heads': None, 'index_head_dim': None}})
@@ -1292,7 +1298,7 @@ def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
     """The writer covers the three attention families; a model with the mla
     mixer raises naming the mixer, and one with routed experts on standard
     attention raises naming the mixture. Neither writes a checkpoint."""
-    model, variables, _ = fp32_decoder(FIXTURES / name)
+    model, variables = fp32_decoder(FIXTURES / name)
     with pytest.raises(ValueError, match="a mixer other than attention"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
@@ -1404,7 +1410,7 @@ def test_qwen35_logits_match_the_reference_implementation():
     argmax equal. Translating the rope as Gemma 4's proportional convention
     instead moves the logits by 7.8e-01."""
     directory = FIXTURES / "qwen35-tiny"
-    model, variables, _ = fp32_decoder(directory)
+    model, variables = fp32_decoder(directory)
     ids = np.load(directory / "input_ids.npy")
     reference = np.load(directory / "logits.npy")
 
@@ -1495,7 +1501,7 @@ def test_the_mtp_weights_of_a_qwen35_checkpoint_are_dropped_like_the_reference_d
 def test_export_refuses_the_qwen35_features(tmp_path):
     """Neither the gate, the delta net kind nor the partial rotary has a
     place in the three exported families."""
-    model, variables, _ = fp32_decoder(FIXTURES / "qwen35-tiny")
+    model, variables = fp32_decoder(FIXTURES / "qwen35-tiny")
     with pytest.raises(ValueError, match="output_gate"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
@@ -1505,7 +1511,7 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     steps against the parallel forward, every argmax equal. Largest
     observed logit difference 1.3e-05."""
     directory = FIXTURES / "qwen35-tiny"
-    model, variables, _ = fp32_decoder(directory, max_seq_len=16)
+    model, variables = fp32_decoder(directory, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
     full = model.apply(variables, ids)
 
@@ -1573,8 +1579,8 @@ def test_a_gpt_oss_field_with_no_counterpart_is_refused(field, value, message):
 def test_gpt_oss_logits_match_the_reference_implementation():
     """fp32 parity through xla sink attention: tolerance 1e-4, observed
     max |logit difference| 2.5e-06 with identical argmax."""
-    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
-                                                  attention_impl="xla")
+    pretrained = load_pretrained(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    model, variables = pretrained.model, pretrained.variables
     ids = np.load(GPT_OSS / "input_ids.npy")
     reference = np.load(GPT_OSS / "logits.npy")
 
@@ -1589,12 +1595,12 @@ def test_gpt_oss_logits_match_the_reference_implementation():
 
 
 def test_gpt_oss_export_round_trips_sinks_and_fused_experts(tmp_path):
-    model, variables, _ = load_pretrained_decoder(str(GPT_OSS), dtype="float32",
-                                                  attention_impl="xla")
+    pretrained = load_pretrained(str(GPT_OSS), dtype="float32", attention_impl="xla")
+    model, variables = pretrained.model, pretrained.variables
     export = tmp_path / "gpt-oss"
     save_pretrained_decoder(model, variables, export)
-    again, reloaded, _ = load_pretrained_decoder(str(export), dtype="float32",
-                                                 attention_impl="xla")
+    round_trip = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    again, reloaded = round_trip.model, round_trip.variables
     assert again == model
     for path, leaf in flat_tree(reloaded["params"]).items():
         assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(variables["params"])[path])), path
@@ -1624,8 +1630,8 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     (directory / "config.json").write_text(json.dumps(
         {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
 
-    model, variables, _ = load_pretrained_decoder(str(directory), dtype="float32",
-                                                  attention_impl="xla")
+    pretrained = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    model, variables = pretrained.model, pretrained.variables
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
@@ -1664,9 +1670,10 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     prompt = "The Cascade Range runs from northern California through Oregon"
     ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
         prompt, return_tensors="np")["input_ids"].astype(np.int32)
-    model, variables, _ = load_pretrained_decoder(
-        "openai/gpt-oss-20b", dtype="bfloat16", attention_impl="xla",
-        max_seq_len=int(ids.shape[1]))
+    pretrained = load_pretrained("openai/gpt-oss-20b", dtype="bfloat16",
+                                 attention_impl="xla",
+                                 max_seq_len=int(ids.shape[1]))
+    model, variables = pretrained.model, pretrained.variables
     logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
 
     reference = GptOssForCausalLM.from_pretrained("openai/gpt-oss-20b", dtype=torch.bfloat16)
@@ -1735,7 +1742,7 @@ def test_a_deepseek_v2_field_the_reference_does_not_run_is_refused(field, value,
 def test_deepseek_v2_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
     with identical argmax."""
-    model, variables, _ = fp32_decoder(DEEPSEEK_V2)
+    model, variables = fp32_decoder(DEEPSEEK_V2)
     ids = np.load(DEEPSEEK_V2 / "input_ids.npy")
     reference = np.load(DEEPSEEK_V2 / "logits.npy")
 
@@ -1774,7 +1781,7 @@ def test_a_kimi_k2_checkpoint_loads_as_the_deepseek_v3_it_is(tmp_path):
         **fixture_config("deepseek-v3-tiny"), "model_type": "kimi_k2",
         "aux_loss_alpha": 0.001, "seq_aux": True, "num_nextn_predict_layers": 0}))
 
-    model, variables, _ = fp32_decoder(directory)
+    model, variables = fp32_decoder(directory)
     reference = np.load(FIXTURES / "deepseek-v3-tiny" / "logits.npy")
     ids = np.load(FIXTURES / "deepseek-v3-tiny" / "input_ids.npy")
     logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
@@ -1835,7 +1842,7 @@ def test_a_glm4_moe_field_with_no_counterpart_is_refused(field, value, message):
 def test_glm4_moe_logits_match_the_reference_implementation():
     """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
     difference| 3.3e-06 with identical argmax."""
-    model, variables, _ = fp32_decoder(GLM4_MOE)
+    model, variables = fp32_decoder(GLM4_MOE)
     ids = np.load(GLM4_MOE / "input_ids.npy")
     reference = np.load(GLM4_MOE / "logits.npy")
 
@@ -1854,7 +1861,7 @@ def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     the two norms, the order today's from-scratch code had, disagrees."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    model, variables, _ = fp32_decoder(GLM4_MOE)
+    model, variables = fp32_decoder(GLM4_MOE)
     ids = jnp.asarray(np.load(GLM4_MOE / "input_ids.npy"), jnp.int32)
     reference = np.load(GLM4_MOE / "mtp_logits.npy")
     depth = variables["params"]["mtp_0"]
@@ -1963,7 +1970,7 @@ def test_a_llama4_field_with_no_counterpart_is_refused(field, value, message):
 def test_llama4_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
     with identical argmax. The fused expert kernels arrive split in place."""
-    model, variables, _ = fp32_decoder(LLAMA4)
+    model, variables = fp32_decoder(LLAMA4)
     ids = np.load(LLAMA4 / "input_ids.npy")
     reference = np.load(LLAMA4 / "logits.npy")
 
@@ -1980,7 +1987,7 @@ def test_llama4_logits_match_the_reference_implementation():
 
 
 def test_llama4_export_is_refused_by_name(tmp_path):
-    model, variables, _ = fp32_decoder(LLAMA4)
+    model, variables = fp32_decoder(LLAMA4)
     with pytest.raises(ValueError, match="a mixer other than attention"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
@@ -2061,7 +2068,7 @@ def test_gemma4_moe_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
     with identical argmax. The fused expert kernels arrive split in place,
     the global layer holds no v_proj, and every layer holds its scalar."""
-    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    model, variables = fp32_decoder(GEMMA4_MOE)
     ids = np.load(GEMMA4_MOE / "input_ids.npy")
     reference = np.load(GEMMA4_MOE / "logits.npy")
 
@@ -2083,7 +2090,7 @@ def test_the_layer_scalars_are_what_the_parity_tests():
     """The fixture's scalars are the reference's ones, so the parity above
     cannot tell a model that reads them from one that ignores them; a model
     fed other scalars disagrees with it, so the tree's leaf is live."""
-    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    model, variables = fp32_decoder(GEMMA4_MOE)
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
     reference = np.load(GEMMA4_MOE / "logits.npy")
     constants = dict(variables["constants"])
@@ -2124,7 +2131,7 @@ def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
 def test_gemma4_moe_export_is_refused_by_name(tmp_path):
     """The values norm every Gemma 4 carries is refused before the routed
     branch is reached, and by the field's name."""
-    model, variables, _ = fp32_decoder(GEMMA4_MOE)
+    model, variables = fp32_decoder(GEMMA4_MOE)
     with pytest.raises(ValueError, match="v_norm"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
@@ -2213,7 +2220,7 @@ def test_gemma3n_logits_match_the_reference_implementation():
     with identical argmax. The copies' projections, each layer's AltUp and
     LAuReL leaves and the sharing layer's missing K/V are what the tree
     holds."""
-    model, variables, _ = fp32_decoder(GEMMA3N)
+    model, variables = fp32_decoder(GEMMA3N)
     ids = np.load(GEMMA3N / "input_ids.npy")
     reference = np.load(GEMMA3N / "logits.npy")
 
@@ -2235,7 +2242,7 @@ def test_gemma3n_logits_match_the_reference_implementation():
 def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
     """The stream of copies rides the decode path: a prefill and single-token
     steps through the KV cache agree with the whole sequence."""
-    model, variables, _ = fp32_decoder(GEMMA3N, max_seq_len=16)
+    model, variables = fp32_decoder(GEMMA3N, max_seq_len=16)
     ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
     full = model.apply(variables, ids)
     state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
@@ -2285,7 +2292,7 @@ def test_a_gemma3n_wrapper_config_is_refused_by_name():
 
 
 def test_gemma3n_export_is_refused_by_name(tmp_path):
-    model, variables, _ = fp32_decoder(GEMMA3N)
+    model, variables = fp32_decoder(GEMMA3N)
     with pytest.raises(ValueError, match="v_norm"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
@@ -2441,8 +2448,8 @@ def test_layer_scalar_rejects_old_boolean_modes(legacy):
 def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     """Frozen HF buffers and trainable Google scalars retain each view's math."""
     from safetensors.numpy import load_file
-    base, _, fields = fp32_decoder(GEMMA4_MOE)
-    fields = {**fields, "layer_scalar": mode}
+    base, _ = fp32_decoder(GEMMA4_MOE)
+    fields = {**translate_config(fixture_config("gemma4-moe-tiny")), "layer_scalar": mode}
     variables = translate_weights(load_file(str(GEMMA4_MOE / "model.safetensors")), fields)
     plain = base.clone(layer_scalar=mode)
     scanned = plain.clone(scan_layers=True, remat=True)
