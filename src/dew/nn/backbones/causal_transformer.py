@@ -36,7 +36,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
-from ..moe import SparseMLP
+from ..moe import GROUPED_MATMULS, SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
@@ -187,6 +187,11 @@ class Mixture:
     routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
     as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
     product is the whole record of them.
+
+    `implementation` is the grouped matmul the experts run on,
+    `moe.grouped_matmul`'s 'xla' or 'tokamax', the way `attention_impl`
+    names the attention kernel; it changes which kernel computes the same
+    contraction and nothing about the routing.
     """
 
     experts: int
@@ -204,6 +209,7 @@ class Mixture:
     parallel: bool = False
     expert_features: Optional[int] = None
     shared_features: int = 0
+    implementation: str = 'xla'
 
     def __post_init__(self):
         if self.layers is not None:
@@ -226,6 +232,10 @@ class Mixture:
             raise ValueError(
                 f"shared_features is the shared branch's width, got "
                 f"{self.shared_features}; 0 is a layer without one")
+        if self.implementation not in GROUPED_MATMULS:
+            raise ValueError(
+                f"implementation is the experts' grouped matmul, one of "
+                f"{list(GROUPED_MATMULS)}, got {self.implementation!r}")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
@@ -1195,6 +1205,7 @@ class CausalTransformer(nn.Module):
                              else mixture.expert_features),
             out_features=self.emb_features,
             activation=self.mlp,
+            implementation=mixture.implementation,
             score_function=mixture.score_function,
             normalize_weights=mixture.norm_topk_prob,
             routed_scaling_factor=mixture.scaling,
@@ -1215,6 +1226,7 @@ class CausalTransformer(nn.Module):
                              else mixture.expert_features),
             out_features=self.emb_features,
             activation=self.mlp,
+            implementation=mixture.implementation,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
@@ -1230,6 +1242,7 @@ class CausalTransformer(nn.Module):
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,
                 num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
+                implementation=mixture.implementation,
                 dtype=self.dtype, precision=self.precision)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's

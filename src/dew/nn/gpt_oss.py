@@ -9,6 +9,7 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.moe import grouped_matmul
 from dew.nn.sharding import logical_axes
 
 
@@ -47,11 +48,15 @@ def unpack_mxfp4(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 
 class GptOssExperts(nn.Module):
-    """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU."""
+    """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU.
+
+    `implementation` names the grouped matmul, as `moe.grouped_matmul` takes it.
+    """
 
     hidden_size: int
     intermediate_size: int
     num_local_experts: int
+    implementation: str = 'xla'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -74,13 +79,15 @@ class GptOssExperts(nn.Module):
         sorted_experts = experts[order]
         group_sizes = jnp.bincount(experts, length=self.num_local_experts)
         tokens = x.reshape(-1, self.hidden_size)[order // indices.shape[-1]]
-        projected = jax.lax.ragged_dot(tokens, gate_up, group_sizes,
-                                       precision=self.precision) + gate_bias[sorted_experts]
+        projected = grouped_matmul(
+            tokens, gate_up, group_sizes, implementation=self.implementation,
+            precision=self.precision) + gate_bias[sorted_experts]
         gate = jnp.minimum(projected[..., ::2], 7.0)
         up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
         activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
-        output = jax.lax.ragged_dot(activated, down, group_sizes,
-                                    precision=self.precision) + down_bias[sorted_experts]
+        output = grouped_matmul(
+            activated, down, group_sizes, implementation=self.implementation,
+            precision=self.precision) + down_bias[sorted_experts]
         per_slot = output[jnp.argsort(order)].reshape(*indices.shape, self.hidden_size)
         return jnp.sum(per_slot * weights[..., None], axis=-2)
 
@@ -99,6 +106,7 @@ class GptOssMLP(nn.Module):
     intermediate_size: int
     num_local_experts: int
     num_experts_per_tok: int
+    implementation: str = 'xla'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -110,4 +118,5 @@ class GptOssMLP(nn.Module):
         weights = jax.nn.softmax(top_logits, axis=-1)
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
-            dtype=self.dtype, precision=self.precision, name="experts")(x, weights, indices)
+            implementation=self.implementation, dtype=self.dtype,
+            precision=self.precision, name="experts")(x, weights, indices)
