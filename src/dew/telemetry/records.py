@@ -7,6 +7,7 @@ import importlib.metadata
 import math
 import platform
 import traceback
+import typing
 from collections.abc import Mapping, Sequence
 from typing import Literal, TypeAlias
 
@@ -99,4 +100,4 @@ class FitEnded:
 
 
 Record: TypeAlias = RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
-RECORD_TYPES = (RunRecord, FitStarted, CheckpointRequested, ProfileWindow, FitEnded)
+RECORD_TYPES = typing.get_args(Record)

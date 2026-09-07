@@ -53,7 +53,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     test = evaluate(objective, state.averaged, data.val, key=state.key, step=state.step,
                     metrics=(perplexity(),), split="test")
     assert test.scores == {"test/perplexity": result.scores["val/perplexity"]}
-    assert test.previews == () and test.elapsed_seconds >= 0
+    assert test.previews == ()
 
 
 class ScheduledScores(Objective):

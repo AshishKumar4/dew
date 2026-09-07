@@ -10,7 +10,7 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `WandbTracker`, `LocalTracker`, `Trackers`, `datasets`, `encoders`, `metrics`, `models`, `presets`, `sample`, `samplers` |
+| `dew` | `__version__`, `Aux`, `CFG`, `Checkpoints`, `Condition`, `Dataset`, `EMASpec`, `Evaluation`, `Field`, `ImageGrid`, `InputSpec`, `Layout`, `MeshSpec`, `Objective`, `Process`, `Representations`, `Step`, `TextSamples`, `TokenScores`, `Tracker`, `TrainState`, `Trainer`, `VideoGrid`, `LocalTracker`, `Trackers`, `WandbTracker`, `datasets`, `encoders`, `evaluate`, `metrics`, `models`, `presets`, `sample`, `samplers` |
 | `dew.registry` | `Registry`, `models`, `presets`, `samplers`, `datasets`, `encoders`, `metrics`, `objectives`, `mixers`, `towers`, `projectors`, `REGISTRIES`, `resolve_dtype`, `dtype_name`, `with_precision` |
 | `dew.artifacts` | `ImageGrid`, `Representations`, `TextSamples`, `TokenScores`, `VideoGrid`, `agree_process_phase`, `broadcast_from_process_zero`, `collective_host`, `host` |
 | `dew.config` | `ModelConfig`, `OptimConfig`, `RunConfig`, `TrainerConfig`, `Wandb` |
@@ -19,8 +19,8 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Quantization`, `Rollout`, `Step`, `Tracker`, `TrainState`, `Trainer`, `WandbTracker`, `LocalTracker`, `Trackers`, `apply_quantization`, `build_mesh`, `build_optimizer`, `ema_update`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
-| `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `build_mesh`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
+| `dew.training` | `Aux`, `Checkpoints`, `DEFAULT_RULES`, `EMASpec`, `Evaluation`, `Layout`, `MeshSpec`, `Metric`, `Objective`, `Profile`, `Quantization`, `Rollout`, `Step`, `Tracker`, `TrainState`, `Trainer`, `LocalTracker`, `Trackers`, `WandbTracker`, `apply_quantization`, `build_mesh`, `build_optimizer`, `ema_update`, `evaluate`, `everything`, `prepare_process`, `run_timestamp`, `under`, `write_back` |
+| `dew.training.distributed` | `DevicePrefetchIterator`, `Layout`, `MeshSpec`, `batch_shardings`, `build_mesh`, `local_rows`, `minimum_across_processes`, `parameter_spec`, `shard_batch` |
 | `dew.training.optim` | `build_optimizer`, `muon_weight_dimension_numbers`, `scale_by_qk_clip` |
 | `dew.training.quantization` | `Quantization`, `apply_quantization` |
 | `dew.training.runtime` | `prepare_process`, `run_timestamp` |

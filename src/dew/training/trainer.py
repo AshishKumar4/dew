@@ -578,8 +578,10 @@ class Trainer(Generic[Loss, Effects]):
         Every `checkpoint_every` steps, and at the end, the state and the data
         position are written; every `checkpoints.local_every` steps they are
         written to the local directory as well.
-        Preview generation is opt-in through preview=True, independent of scalar sinks.
+        Previews are generated only when `preview=True` and a tracker receives
+        them; scalar reporting never triggers preview work.
         """
+        preview = preview and self.tracker is not None
         started = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
         source = train = None
@@ -591,7 +593,7 @@ class Trainer(Generic[Loss, Effects]):
         process_zero = jax.process_index() == 0
         try:
             mesh = self.device_mesh
-            process_zero = jax.process_index() == 0
+
             state, shardings, position = self.place()
             current = int(state.step)
             self._report(FitStarted(current, steps,
@@ -717,11 +719,7 @@ class Trainer(Generic[Loss, Effects]):
 
                 if eval_every and current % eval_every == 0 and current < steps:
                     paused = time.perf_counter()
-                    self._report_evaluation(evaluate(
-                        self.objective, state.params, data.val, metrics=metrics, key=state.key,
-                        step=state.step, schedule_step=state.microstep,
-                        averaged=with_ema(state.params, state.ema),
-                        preview=preview, mesh=mesh))
+                    self._evaluate(state, data, metrics, preview, mesh)
                     other += time.perf_counter() - paused
 
                 # On its own clock, not the logging one: nested inside the log
@@ -760,11 +758,7 @@ class Trainer(Generic[Loss, Effects]):
                 loss.block_until_ready()
             paused = time.perf_counter()
             if eval_every:
-                self._report_evaluation(evaluate(
-                    self.objective, state.params, data.val, metrics=metrics, key=state.key,
-                    step=state.step, schedule_step=state.microstep,
-                    averaged=with_ema(state.params, state.ema),
-                    preview=preview, mesh=mesh))
+                self._evaluate(state, data, metrics, preview, mesh)
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -842,6 +836,13 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
+    def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
+                  preview: bool, mesh) -> None:
+        self._report_evaluation(evaluate(
+            self.objective, state.params, data.val, metrics=metrics, key=state.key,
+            step=state.step, schedule_step=state.microstep,
+            averaged=with_ema(state.params, state.ema), preview=preview, mesh=mesh))
+
     def _report_evaluation(self, result: Evaluation) -> None:
         error = None
         if jax.process_index() == 0:
@@ -864,7 +865,7 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: Profile, *, step: int = 0) -> None:
+    def _stop_trace(self, traced: int, loss, profile: Profile, *, step: int) -> None:
         """Stop every owned trace before reporting its window on process zero."""
         error = None
         try:

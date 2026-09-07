@@ -66,7 +66,7 @@ print(builder.data_dir)
 PY
 ```
 
-The training program is [`examples/train_flowers.py`](examples/train_flowers.py):
+An abridged [`examples/train_flowers.py`](examples/train_flowers.py); the file adds a command-line configuration and the sampling step:
 
 ```python
 from pathlib import Path
@@ -87,7 +87,7 @@ def train():
         split="train",
         image_size=64,
         val_batches=0,
-        loading=Loading(workers=2, threads=2),
+        loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2),
     ).load(batch=16)
 
     model = models.build(
@@ -623,7 +623,7 @@ tracker = Trackers(
 )
 ```
 
-Use this tracker in the same `with` block and `Trainer` call above. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, and failures use typed reporting records. Detailed device traces are enabled through `Profile`; ordinary reporting does not copy model tensors every step.
+Use this tracker in the same `with` block and `Trainer` call above. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, and failures use typed reporting records. `Profile` enables detailed device traces.
 
 ## Diffusion and sampling
 
@@ -774,10 +774,10 @@ Install the JAX build for your hardware:
 | Hardware | JAX package |
 |---|---|
 | CPU | Included in the base installation |
-| NVIDIA GPU | `uv pip install -U "jax[cuda13]"` |
+| NVIDIA GPU | `uv pip install -U "jax[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
 | Google TPU | `uv pip install -U "jax[tpu]"` |
 
-Consult the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements and other platforms. Optional Dew extras include `tfds`, `av`, `streaming`, `metrics`, `interop`, and `test`. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+Consult the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements and other platforms. Optional Dew extras include `tfds`, `av`, `streaming`, `metrics`, `interop`, `plots`, `wandb`, and `test`. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 
