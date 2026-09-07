@@ -93,6 +93,28 @@ def test_multi_canvas_generation_matches_full_reference_loop(system):
     assert not bool(result.terminated.any())
 
 
+@pytest.mark.parametrize("budget", [0, 3, 7])
+def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
+    from dew.diffusion.block import _begin, _advance, _materialize
+
+    model, variables, process, reference, _ = system
+    inputs = ModelInputs(jnp.asarray(reference["prompt"]))
+    eos_ids = (int(reference["eos_id"]),)
+    expected = process.generate(model, variables, inputs, budget, key=jax.random.key(11),
+                                eos_token_ids=eos_ids, pad_token_id=0)
+    begin = jax.jit(lambda weights, data: _begin(model, weights, data, budget, process, 0))
+    advance = jax.jit(lambda weights, state: _advance(
+        model, weights, state, budget, jax.random.key(11), process, eos_ids, 0))
+    state = begin(variables, inputs)
+    for _ in range((budget + process.canvas_length - 1) // process.canvas_length):
+        state = advance(variables, jax.device_get(state))
+    result = _materialize(state, inputs.tokens.shape[1], budget)
+    np.testing.assert_array_equal(result.tokens, expected.tokens)
+    np.testing.assert_array_equal(result.lengths, expected.lengths)
+    np.testing.assert_array_equal(result.terminated, expected.terminated)
+    np.testing.assert_array_equal(result.decoder_steps, expected.decoder_steps)
+
+
 def test_refinements_return_the_last_prediction_without_an_extra_call(system):
     """Raw final-step error below 1e-4 on the complete reference trajectory."""
     model, variables, process, reference, _ = system
@@ -130,7 +152,7 @@ def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
 def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
-    restored = adapter.translate_weights(adapter.export_weights(changed, config), config)
+    restored = adapter.translate_weights(adapter.export_weights(model, changed, config), config)
     for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored)):
         np.testing.assert_array_equal(actual, wanted)
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
