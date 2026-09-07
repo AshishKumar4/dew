@@ -24,7 +24,7 @@ from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective
-from dew.sampling import Euler, generate
+from dew.sampling import Euler, Sampling, generate
 
 
 @dataclass
@@ -69,12 +69,15 @@ def language_model(out: Path):
                         eval_every=4, checkpoint_every=4,
                         metrics=(metrics.perplexity(),))
     prompt = jnp.array([[1, 2]], dtype=jnp.int32)
-    continuation = np.asarray(generate(
+    generation = generate(
         model, state.averaged, prompt, max_new_tokens=8,
-        key=jax.random.key(1), temperature=0.0,
-    ))[0].tolist()
-    print(f"LM resumed: {first_step} -> {int(state.step)}; tokens: {continuation}")
+        key=jax.random.key(1), sampling=Sampling(temperature=0.0),
+    )
+    continuation = np.asarray(generation.tokens)[0].tolist()
+    print(f"LM resumed: {first_step} -> {int(state.step)} attempts, "
+          f"{int(state.updates)} updates; tokens: {continuation}")
     return model, state, {"first_step": first_step, "resumed_step": int(state.step),
+                          "updates": int(state.updates),
                           "generated_ids": continuation}
 
 
@@ -94,8 +97,8 @@ def preferences(model, pretrained):
     delta = max(float(np.max(np.abs(np.asarray(after) - before)))
                 for before, after in zip(jax.tree.leaves(reference),
                                          jax.tree.leaves(state.ema), strict=True))
-    print(f"DPO: {int(state.step)} updates; reference max change: {delta:.1f}")
-    return {"updates": int(state.step), "reference_max_change": delta}
+    print(f"DPO: {int(state.updates)} updates; reference max change: {delta:.1f}")
+    return {"updates": int(state.updates), "reference_max_change": delta}
 
 
 def flow_images(out: Path):
@@ -127,8 +130,8 @@ def flow_images(out: Path):
     header = f"P6\n{grid.shape[1]} {grid.shape[0]}\n255\n".encode("ascii")
     (out / "flow-preview.ppm").write_bytes(header + grid.tobytes())
     finite = bool(np.isfinite(generated).all())
-    print(f"Flow: {int(state.step)} updates; preview {generated.shape}; finite={finite}")
-    return {"updates": int(state.step), "preview_shape": list(generated.shape),
+    print(f"Flow: {int(state.updates)} updates; preview {generated.shape}; finite={finite}")
+    return {"updates": int(state.updates), "preview_shape": list(generated.shape),
             "finite": finite, "range": [float(generated.min()), float(generated.max())]}
 
 
