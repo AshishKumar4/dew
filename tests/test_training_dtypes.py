@@ -34,7 +34,7 @@ class DenseObjective(Objective):
         self.model = (MixedDense(self.compute_dtype) if parameter_kind.startswith("mixed") else
                       nn.Dense(1, param_dtype=jnp.float64 if parameter_kind == "float64" else jnp.bfloat16))
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.ones((1, 2), self.compute_dtype))
 
     def reference_loss(self, params, batch):
@@ -193,7 +193,7 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     import dataclasses
 
     class Cancellation(Objective):
-        def init(self, key):
+        def init(self, key, variables=None):
             return {"params": {"w": jnp.array(0., jnp.float16)}}
         def loss(self, variables, batch, step):
             value = variables["params"]["w"].astype(jnp.float32)
