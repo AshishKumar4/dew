@@ -35,6 +35,7 @@ nav:
       - Image diffusion: guides/diffusion.md
       - Representation learning: guides/representation-learning.md
       - Training language models: concepts/language_models.md
+      - Inference: concepts/inference.md
       - SFT, DPO, and GRPO: concepts/post_training.md
       - Training recipes: recipes.md
       - TPU setup: tpu.md

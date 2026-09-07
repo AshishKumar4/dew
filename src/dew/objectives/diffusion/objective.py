@@ -89,6 +89,14 @@ class DiffusionObjective(Objective[Mean]):
             for keyword, condition in inputs.conditions.items()})
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
+    def pipeline(self, state, *, ema: bool = True):
+        """The model over the state's published weights as a `TextToImage`
+        task, sampling the way this objective's evaluation does."""
+        from dew.objectives.base import published
+        from dew.sampling.pipelines import TextToImage
+
+        return TextToImage.from_objective(self, published(state, ema))
+
     @property
     def latent_shape(self) -> tuple[int, ...]:
         """The per-example shape the model denoises: the sample field's, or

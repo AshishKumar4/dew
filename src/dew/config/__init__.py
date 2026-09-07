@@ -87,6 +87,11 @@ class ModelConfig:
         return with_precision(self.architecture, self.config,
                               dtype=self.dtype, attention_impl=self.attention_impl)
 
+    @classmethod
+    def from_dict(cls, values: Mapping[str, Any]) -> Self:
+        """Inverse of the record `RunConfig.to_dict` writes for this field."""
+        return _rebuild(cls, values)
+
     def build(self):
         return models.build(self.architecture, **self.fields())
 

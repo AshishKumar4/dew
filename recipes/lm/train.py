@@ -15,7 +15,7 @@ takes the vocabulary from the data, not the command line.
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -286,6 +286,10 @@ def main(config: LmRunConfig) -> TrainState:
             config.pretrained, config.model, vocab_size, context, meta)
     if config.quantization is not None:
         model = apply_quantization(model, config.quantization)
+    # The resolved config is the run's spec: run.json records the model as
+    # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
+    config = replace(config, model=replace(config.model, config={
+        name: value for name, value in fields.items() if name not in ("dtype", "attention_impl")}))
     name = config.trainer.name or (
         f"{config.objective}-{tokens.name}/seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"

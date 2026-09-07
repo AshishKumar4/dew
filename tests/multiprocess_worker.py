@@ -884,6 +884,7 @@ def mode_builtin_preview_failures(args) -> dict:
     from dew.inference import TextGeneration
     from dew.data import Dataset
     from dew.diffusion import presets
+    from dew.sampling import text as text_sampling
     from dew.diffusion.discrete import MDLM
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -950,7 +951,7 @@ def mode_builtin_preview_failures(args) -> dict:
                             tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
                             terminated=jax.numpy.zeros((1,), bool),
                             behavior_log_probs=jax.numpy.zeros((1, 1)),
-                            raw_log_probs=jax.numpy.zeros((1, 1)))
+                            raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
                     return result
 
                 if phase == "setup":
@@ -1116,7 +1117,7 @@ def mode_rollout(args) -> dict:
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
     drawn = generate(model, state.params, inputs_for(local), 4, key=jax.random.key(21),
-                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12))
+                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)).host()
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
     # would fail here before any model ran.
@@ -1125,8 +1126,8 @@ def mode_rollout(args) -> dict:
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
-    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls)
-    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls)
+    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls).host()
+    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
         for fault in ("token", "length", "key"):
@@ -1182,7 +1183,41 @@ def mode_rollout(args) -> dict:
     }
 
 
+def mode_pipeline(args) -> dict:
+    """The front door on a pool: a diffusion run and an LM run placed on the
+    mesh, each rank handing in its own prompts, results read back per rank."""
+    import jax
+    import dew
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    rank = jax.process_index()
+    mesh, layout = MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY)
+    images = dew.pipeline(args.run_dir, mesh=mesh, layout=layout)
+    prompts = ["a", "b", "c", "d", "e", "f"]
+    text = dew.pipeline(args.lm_dir, mesh=mesh, layout=layout)
+    requests = ["the ", "a ", "some ", "one ", "two ", "four "]
+    if args.processes > 1:
+        rows = len(prompts) // args.processes
+        prompts = prompts[rank * rows:(rank + 1) * rows]
+        requests = requests[rank * rows:(rank + 1) * rows]
+    drawn = images(prompts, steps=3, seed=5)
+    generated = text(requests, seed=5, sampling=Sampling(temperature=0, eos_id=255))
+    return {
+        "process_count": jax.process_count(),
+        "image_spec": str(drawn.images.sharding.spec),
+        "image_rows": drawn.rows,
+        "images": drawn.host().images.tolist(),
+        "token_spec": str(generated.tokens.sharding.spec),
+        "rows": generated.rows,
+        "tokens": generated.host().tokens.tolist(),
+        "text": list(generated.text),
+        "parameter_specs": sorted({str(leaf.sharding.spec) for leaf in jax.tree.leaves(text.variables)}),
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "pipeline": mode_pipeline,
          "rollout": mode_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
@@ -1204,6 +1239,7 @@ def parse_args(argv=None):
     parser.add_argument("--microbatches", type=int)
     parser.add_argument("--name", default="worker")
     parser.add_argument("--run-dir")
+    parser.add_argument("--lm-dir", help="an LM run directory for the pipeline mode")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--save-every", type=int)

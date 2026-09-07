@@ -22,22 +22,22 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
     objective, state = make_run(tmp_path)
     task = TextToImage.from_objective(objective, state.params)
     key = jax.random.key(23)
-    raw = task(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
+    raw = task(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
     prepared = task.prepare(["flower", "tree"], key=key)
-    assert isinstance(prepared, DenoisingInputs)
-    again = task(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
+    assert isinstance(prepared, DenoisingInputs) and prepared.rows == 2
+    again = task(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
     np.testing.assert_array_equal(again, raw)
     loaded = TextToImage.from_run(str(tmp_path), ema=False)
-    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key), raw,
-                               atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images,
+                               raw, atol=2e-6, rtol=2e-6)
     mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
-    np.testing.assert_array_equal(bound(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key), raw)
-    changed = task.bind(mutable)(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
-    assert np.max(np.abs(np.asarray(changed) - np.asarray(raw))) > 1e-4
-    np.testing.assert_allclose(task("flower", steps=3, sampler=Heun(), key=key),
-                               task(["flower"], steps=3, sampler=Heun(), key=key), atol=0, rtol=0)
+    np.testing.assert_array_equal(bound(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images, raw)
+    changed = task.bind(mutable)(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
+    assert np.max(np.abs(changed - raw)) > 1e-4
+    np.testing.assert_allclose(task("flower", steps=3, sampler=Heun(), key=key).host().images,
+                               task(["flower"], steps=3, sampler=Heun(), key=key).host().images, atol=0, rtol=0)
     with pytest.raises(ValueError, match="initial noise"):
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 

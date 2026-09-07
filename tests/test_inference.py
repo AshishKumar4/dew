@@ -10,6 +10,7 @@ trainer has just written.
 import dataclasses
 from dataclasses import dataclass
 
+import dew
 import jax
 import numpy as np
 import optax
@@ -33,22 +34,22 @@ RES = 8
 MODEL = dict(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
 
 
-def run_config(directory, preset=presets.EDM()):
+def run_config(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
     """The resolved config of a tiny conditional DiT run in `directory`; the
-    text condition names the registered stub encoder."""
+    text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
         data=OxfordFlowers(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, sampler=samplers.Euler(), sampling_steps=3,
-        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"))
+        text=TextCondition(encoder=encoder, checkpoint=checkpoint))
 
 
-def make_run(directory, preset=presets.EDM()):
+def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="stub-clip"):
     """Two training steps of the tiny conditional DiT, its checkpoint and its
     `run.json` in `directory`, as the recipe leaves them: the objective is
     the config's own build."""
-    config = run_config(directory, preset)
+    config = run_config(directory, preset, encoder, checkpoint)
     objective = config.build()
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
@@ -92,11 +93,18 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
     assert pipe.inputs.sample == Field("image", (RES, RES, 3))
     assert pipe.inputs.conditions["textcontext"].encoder.checkpoint == "stub-clip"
 
-    images = pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0,
+    result = pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0,
                   key=jax.random.PRNGKey(0))
+    images = result.host().images
     assert images.shape == (2, RES, RES, 3)
     assert np.all(np.isfinite(images))
     assert images.min() >= -1.0 and images.max() <= 1.0
+    # The front door names the same run and answers with the same task.
+    front = dew.pipeline(str(tmp_path))
+    assert isinstance(front, TextToImage) and front.steps == pipe.steps
+    np.testing.assert_array_equal(
+        front(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images,
+        pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, seed=0).host().images)
 
 
 def test_from_run_restores_the_averaged_weights_by_default(tmp_path):
@@ -147,13 +155,13 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
     loaded = TextToImage.from_run(str(tmp_path))
     pipe = dataclasses.replace(loaded, params=jax.tree.map(lambda leaf: leaf + 0.05, loaded.params))
     key = jax.random.PRNGKey(1)
-    plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key)
-    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key)
+    plain = pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images
+    guided = pipe(["x"], steps=8, guidance=CFG(4.0, interval=(0.2, 0.8)), sampler=Heun(), key=key).host().images
     assert plain.shape == guided.shape == (1, RES, RES, 3)
     assert not np.allclose(plain, guided)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key), plain)
-    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, sampler=Heun(), key=key),
-                          pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key))
+    assert np.array_equal(pipe(["x"], steps=8, guidance=None, sampler=Heun(), key=key).host().images, plain)
+    assert np.array_equal(pipe(["x"], steps=8, guidance=4.0, sampler=Heun(), key=key).host().images,
+                          pipe(["x"], steps=8, guidance=CFG(4.0), sampler=Heun(), key=key).host().images)
 
 
 def test_the_run_record_refuses_a_field_it_does_not_know(tmp_path):
@@ -298,3 +306,113 @@ def test_the_text_condition_pins_a_revision(tmp_path, monkeypatch):
     dataclasses.replace(pinned, text=TextCondition(encoder="stub_text",
                                                    checkpoint="stub-clip")).text.build()
     assert "revision" not in seen and "max_length" not in seen
+
+
+def make_lm_run(directory, *, mesh=None):
+    """Two training steps of a tiny byte-level decoder, its checkpoint and the
+    `run.json` the LM recipe writes: the resolved model, tokenizer and budget."""
+    import json
+
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Sampling
+    from dew.training import MeshSpec
+
+    fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                  mlp_features=32, max_seq_len=16)
+    model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
+    objective = LMObjective(model_config.build(), 8, ema_decay=0.9,
+                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
+    rng = np.random.RandomState(0)
+    batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
+
+    class Stream:
+        def __init__(self):
+            self.position = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.position += 1
+            return batch
+
+        def get_state(self):
+            return str(self.position).encode()
+
+        def set_state(self, state):
+            self.position = int(state.decode())
+
+    checkpoints = Checkpoints(str(directory), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints,
+                      mesh=MeshSpec() if mesh is None else mesh)
+    state = trainer.fit(Dataset(train=Stream, val=None, records=None, batch=8),
+                        steps=2, log_every=100, checkpoint_every=2)
+    checkpoints.wait()
+    (directory / "run.json").write_text(json.dumps({
+        "objective": "lm", "model": dataclasses.asdict(model_config), "tokenizer": "byte",
+        "sample_tokens": 4, "ema_decay": 0.9, "data": {"seq_len": 8}}))
+    return objective, state
+
+
+def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
+    """A just-trained state is the pipeline: the averaged weights when the
+    objective keeps them, the live ones on request, the objective's own
+    sampling defaults, and the same images `from_run` restores."""
+    objective, state = make_run(tmp_path)
+    pipe = objective.pipeline(state)
+    assert isinstance(pipe, TextToImage)
+    assert (pipe.steps, pipe.guidance, pipe.sampler) == (objective.steps, objective.guidance, objective.sampler)
+    for expected, bound in zip(jax.tree.leaves(state.averaged), jax.tree.leaves(pipe.params), strict=True):
+        assert bound is expected
+    live = objective.pipeline(state, ema=False)
+    for expected, bound in zip(jax.tree.leaves(state.params), jax.tree.leaves(live.params), strict=True):
+        assert bound is expected
+    drawn = pipe(["a", "b"], seed=4).host().images
+    assert drawn.shape == (2, RES, RES, 3)
+    np.testing.assert_allclose(TextToImage.from_run(str(tmp_path))(["a", "b"], seed=4).host().images, drawn,
+                               atol=2e-6, rtol=2e-6)
+
+
+def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
+    """An LM run directory becomes a `TextGeneration` over the rebuilt model
+    and restored weights, decoding through the run's tokenizer, budgeted by
+    its sample setting, and drawing what the trained objective draws."""
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+
+    objective, state = make_lm_run(tmp_path)
+    task = dew.pipeline(str(tmp_path))
+    assert isinstance(task, TextGeneration)
+    assert task.max_new_tokens == 4 and task.sampling.eos_id == (255,)
+    result = task("the ", seed=2, sampling=Sampling(temperature=0, eos_id=255))
+    assert result.rows == 1 and result.host().tokens.shape == (1, 4 + 4)
+    assert isinstance(result.text[0], str)
+    trained = objective.pipeline(state, processor=task.processor)
+    assert trained.max_new_tokens == 4
+    np.testing.assert_array_equal(
+        trained("the ", seed=2, sampling=Sampling(temperature=0, eos_id=255)).host().tokens,
+        result.host().tokens)
+    with pytest.raises(ValueError, match="exactly one of key and seed"):
+        task("the ", seed=2, key=jax.random.key(2))
+    with pytest.raises(ValueError, match="max_new_tokens is required"):
+        dataclasses.replace(task, max_new_tokens=None)("the ", seed=2)
+
+
+@pytest.mark.mesh
+def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
+    """Placed under the trainer's layout, the weights shard over the mesh,
+    prompts split over its batch axes, the result keeps that sharding, and
+    `host()` reads back exactly what the single device draws."""
+    from dew.nn.inputs import BATCH_AXES
+    from dew.training import Layout, MeshSpec
+
+    make_run(tmp_path)
+    plain = TextToImage.from_run(str(tmp_path))
+    placed = dew.pipeline(str(tmp_path), mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=2 ** 6))
+    specs = {leaf.sharding.spec for leaf in jax.tree.leaves(placed.params)}
+    assert any("fsdp" in str(spec) for spec in specs)
+    result = placed(["a", "b", "c"], steps=3, seed=7)
+    assert result.images.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert result.rows == 3
+    np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, seed=7).host().images,
+                               atol=2e-5, rtol=2e-5)
