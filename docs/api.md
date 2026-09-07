@@ -54,7 +54,7 @@ module has no importable names.
 | `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
 | `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
 | `dew.sampling.text` | `DecoderState`, `Generation`, `Sampling`, `TokenSample`, `generate` |
-| `dew.inference` | `BlockGeneration`, `Completion`, `OllamaCompletion`, `OpenAICompletion`, `Processor`, `TextGeneration` |
+| `dew.inference` | `BlockGeneration`, `Completion`, `DenoisingInputs`, `OllamaCompletion`, `OpenAICompletion`, `Processor`, `TextGeneration`, `TextToImage`, `Usage` |
 
 ## Models
 
