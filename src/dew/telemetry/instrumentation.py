@@ -13,6 +13,7 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -405,11 +406,14 @@ def model_flops_utilization(
 def default_compilation_cache_dir() -> str:
     """Where compiled executables go unless a run names somewhere else.
 
-    Under the user's cache home, where a directory that can be deleted at any
-    moment belongs.
+    Python minors have separate defaults: JAX 0.11.1 can label Python 3.14
+    stdlib-zstd data as zlib in its cache key. Sharing it with an older
+    interpreter can therefore read bytes using the wrong codec. Explicit
+    paths passed to enable_compilation_cache remain unchanged.
     """
     home = os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache')
-    return os.path.expanduser(os.path.join(home, 'dew', 'xla'))
+    runtime = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    return os.path.expanduser(os.path.join(home, 'dew', 'xla', runtime))
 
 
 def enable_compilation_cache(path: str):

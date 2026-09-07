@@ -1,13 +1,13 @@
 # Install Dew
 
-This guide assumes you can create a Python virtual environment and run commands in a terminal. The package declares Python 3.11 or newer. Use Python 3.12 for the examples on these pages.
+This guide assumes you can create a Python virtual environment and run commands in a terminal. Dew requires Python 3.12 or newer; Python 3.14 is the recommended training runtime and primary CI version. This is a compatibility and maintenance choice, not a claim that changing Python accelerates compiled JAX kernels.
 
 These commands use a POSIX shell and require [uv](https://docs.astral.sh/uv/getting-started/installation/) on your PATH. Install uv first if the command is unavailable; use the equivalent environment activation for your shell.
 
 ## Install from source
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
 ```
@@ -19,13 +19,13 @@ For a checkout you plan to edit:
 ```bash
 git clone https://github.com/AshishKumar4/dew.git
 cd dew
-uv venv --python 3.12
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e '.[test,av,tfds,metrics]'
 ```
 
-This development install includes reference-test, optional data, and metric packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI uses the same extras. Ordinary users can start with the smaller base installation above.
+This development install includes reference-test, optional data, and metric packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI runs these extras on Python 3.12 and 3.14, with static type checking on the 3.12 compatibility floor. Ordinary users can start with the smaller base installation above.
 
 ## Check the environment
 
@@ -41,6 +41,8 @@ print("Devices:", jax.devices())
 ```
 
 A CPU device is enough for [the first training example](getting-started.md). `jax.devices()` lists the devices visible to this process, not every accelerator physically installed in the machine.
+
+Compiled executables go to `~/.cache/dew/xla/python3.X`, one directory per Python minor version, so two interpreters on one machine never read each other's entries. JAX 0.11.1 compresses cache entries with the standard-library `compression.zstd` module on Python 3.14 but still labels them `zlib` in its cache key, so an older interpreter reading the same directory fails to decode them. A run that passes an explicit `compilation_cache_dir` keeps that exact path; do not share one explicit directory between Python versions until upstream JAX keys the codec.
 
 ## Use a GPU or TPU
 
@@ -58,7 +60,7 @@ The base package currently installs Transformers, Hugging Face Hub, WandB, and i
 | `streaming` | Hugging Face datasets and online sources |
 | `av` | Video readers and image resizing |
 | `metrics` | SciPy and download support used by image metrics |
-| `tfds` | TensorFlow Datasets sources |
+| `tfds` | Read prepared TFDS ArrayRecords without TensorFlow |
 | `test` | Development tests and pinned reference-library version |
 
 For example:
@@ -68,6 +70,55 @@ uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/
 ```
 
 Qwix quantization and tokamax kernels require their respective external packages; they are not declared as installable Dew extras in the current package metadata. See [capabilities and limitations](reference/support.md) before enabling them.
+
+## Prepare TFDS data separately
+
+The training environment reads prepared ArrayRecords without TensorFlow.
+Dataset preparation can require TensorFlow and dataset-specific packages;
+Oxford Flowers uses SciPy to read its MATLAB label and split files. Keep
+those dependencies in a separate Python 3.13 environment:
+
+```bash
+uv venv --python 3.13 .venv-tfds-prepare
+uv pip install --python .venv-tfds-prepare/bin/python \
+    tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy
+export TFDS_DATA_DIR="$HOME/tensorflow_datasets"
+.venv-tfds-prepare/bin/python - <<'PY'
+import shlex
+import tensorflow_datasets as tfds
+
+builder = tfds.builder("oxford_flowers102", try_gcs=False)
+builder.download_and_prepare(
+    file_format="array_record",
+    download_config=tfds.download.DownloadConfig(try_download_gcs=False),
+)
+print("export DEW_FLOWERS_PATH=" + shlex.quote(str(builder.data_dir)))
+PY
+```
+
+Preparation downloads the corpus when needed. Copy its final printed export
+line into the training shell. The path is the prepared version directory,
+not the parent TFDS cache directory:
+
+```python
+import os
+from dew.data import Loading, OxfordFlowers
+
+data = OxfordFlowers(
+    path=os.environ["DEW_FLOWERS_PATH"],
+    image_size=64,
+    loading=Loading(workers=0),
+).load(batch=4)
+```
+
+Recipes receive the same location as `--data.path "$DEW_FLOWERS_PATH"`.
+TFDS writes `label.labels.txt` there; `labels=None` reads that file, and
+`--data.labels` can supply a different class-name file. The reader uses
+`tfds.builder_from_directory(...).as_data_source(...)`. Missing metadata or
+selected shards produce an error requesting external preparation; training
+does not download, prepare, or fall back to dataset generation code.
+TensorFlow 2.21.0 has no Python 3.14 wheels; that restricts preparation, not
+this TensorFlow-free training path.
 
 ## Build the documentation
 

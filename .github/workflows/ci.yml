@@ -17,13 +17,17 @@ jobs:
   test:
 
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14", "3.12"]
 
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python 3.11
+    - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
-        python-version: "3.11"
+        python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
@@ -34,10 +38,11 @@ jobs:
       run: |
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-    - name: Type check with pyright
+    - name: Type check the Python 3.12 compatibility floor
+      if: matrix.python-version == '3.12'
       run: |
-        # dew ships py.typed; the declared boundary is src/dew at zero errors.
-        # The runner has no .venv, so the interpreter is named explicitly.
+        # Check minimum syntax against its matching standard library.
+        # Both interpreters run the runtime tests below.
         pip install uv
         uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
     - name: Test with pytest
@@ -64,5 +69,5 @@ jobs:
       if: always() && hashFiles('pytest-report.xml') != ''
       uses: actions/upload-artifact@v4
       with:
-        name: pytest-report
+        name: pytest-report-${{ matrix.python-version }}
         path: pytest-report.xml
