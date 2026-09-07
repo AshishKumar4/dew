@@ -15,13 +15,13 @@ import optax
 import transformers
 from PIL import Image
 
-from dew.interop.diffusers import load_pipeline
+from dew.inference import TextToImage
 from dew.objectives.base import Step
 
 
 def check(directory, train=True):
     reference = np.load(Path(directory) / "reference.npz")
-    pipe = load_pipeline(directory, local_files_only=True)
+    pipe = TextToImage.from_diffusers(directory, local_files_only=True)
     errors = {}
 
     def compare(name, actual, expected, atol=3e-5):
@@ -81,7 +81,7 @@ def check(directory, train=True):
         jax.clear_caches()
     with tempfile.TemporaryDirectory(prefix="dew-diffusers-reload-") as saved:
         pipe.save_pretrained(saved)
-        loaded = load_pipeline(saved, local_files_only=True)
+        loaded = TextToImage.from_diffusers(saved, local_files_only=True)
         before = pipe(["cat"], negative_prompts=["dog"], key=key, steps=2, guidance=3.0, latents=noise, **kwargs)
         after = loaded(["cat"], negative_prompts=["dog"], key=key, steps=2, guidance=3.0, latents=noise, **kwargs)
         compare("reload", after, before, atol=0)
