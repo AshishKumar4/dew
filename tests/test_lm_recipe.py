@@ -182,7 +182,7 @@ def pretrained_config(recipe, tokens, pretrained, *args, model_config="{}"):
 
 def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     """The path a --pretrained user runs, end to end: a local HF-layout
-    checkpoint through load_pretrained_decoder, the tokenizer of the token
+    checkpoint through load_pretrained, the tokenizer of the token
     files checked against the one the checkpoint records, a step taken on
     the loaded weights and the run spec written back.
 
@@ -207,7 +207,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     """Zero steps hold what the checkpoint carries, leaf for leaf: the load
     is a continuation, not a fresh init of the same shape."""
-    from dew.interop.hf_decoders import load_pretrained_decoder
+    from dew.interop import load_pretrained
 
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -217,8 +217,8 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
 
     state = recipe.main(config)
 
-    _, expected, _ = load_pretrained_decoder(str(checkpoint), dtype="float32",
-                                             attention_impl="reference")
+    expected = load_pretrained(str(checkpoint), dtype="float32",
+                               attention_impl="reference").variables
     for path, leaf in jax.tree_util.tree_flatten_with_path(expected["params"])[0]:
         held = state.params["params"]
         for entry in path:
