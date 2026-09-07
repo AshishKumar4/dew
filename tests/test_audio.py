@@ -19,7 +19,8 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.data.audio import AudioProcessor
-from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
+from dew.nn import vision as V
+from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import (Gemma3nProjectorModule, Gemma4ProjectorModule,
                            translate_gemma3n_projector_weights, translate_gemma4_projector_weights)
 
@@ -132,6 +133,21 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
         audio_config({**record, "extra_computational_field": True})
     rebuilt = audio_config({**dataclasses.asdict(config), "model_type": record["model_type"]})
     assert rebuilt == config
+    assert V.tower_from_record({"kind": record["model_type"], **dataclasses.asdict(config)}) == config
+
+
+def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
+    """The canonical mapper resolves each source tensor to its loaded leaf."""
+    path, config, variables, _, _, _, _ = audio
+    tensors = load_file(str(path / "encoder.safetensors"))
+    for name, tensor in tensors.items():
+        leaf = variables
+        for part in audio_weight_path(name, config):
+            leaf = leaf[part]
+        restored = np.asarray(leaf)
+        if tensor.ndim > 1:
+            restored = restored.transpose(restored.ndim - 1, restored.ndim - 2, *range(restored.ndim - 2))
+        np.testing.assert_array_equal(restored, tensor)
 
 
 def test_processor_rejects_wrong_sampling_rate_without_resampling():
