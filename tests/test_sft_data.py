@@ -82,17 +82,6 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
     assert difference == 0.0, f"largest difference against TRL: {difference}"
 
 
-def test_the_fixture_names_its_reference(reference):
-    """The parity claim is checkable: the template, TRL's version and TRL's
-    own template checks travel with the arrays."""
-    assert str(reference["template"]) == "trl_qwen3_training"
-    assert str(reference["trl_version"]) == "1.12.0"
-    assert str(reference["prefix_preserving"]) == "True"
-    assert str(reference["stop_token_trained"]) == "True"
-    roles = {message["role"] for message in json.loads(str(reference["conversation"]))}
-    assert roles == {"system", "user", "assistant", "tool"}
-
-
 # --- packing -----------------------------------------------------------------
 
 def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):

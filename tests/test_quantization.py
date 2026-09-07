@@ -206,29 +206,27 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():
-    """The gradient moves with the stream's key and repeats under the same
-    one: an option that never reached the backward pass would round the same
-    way whatever key the apply handed it. Observed on CPU: 8.4e-08 between
-    keys, on gradients of order 0.16, and bitwise equal under one key."""
+    """Test rounding without the decoder embedding scatter's GPU reduction order."""
     pytest.importorskip("qwix")
-    _, qmodel, variables, ids = quantized_forward(
-        Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform"))
+    from flax import linen as nn
+
+    model = nn.Dense(16)
+    values = jax.random.normal(jax.random.key(3), (32, 8))
+    variables = model.init(jax.random.key(2), values)
+    quantized = apply_quantization(
+        model, Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform"))
 
     def loss(params, key):
-        hidden = qmodel.apply({**variables, "params": params}, ids,
-                              rngs={"stochastic_rounding": key},
-                              method=type(qmodel).hidden_states)
-        return jnp.mean(hidden ** 2)
+        result = quantized.apply({"params": params}, values,
+                                 rngs={"stochastic_rounding": key})
+        return jnp.mean(result ** 2)
 
-    def distance(left, right):
-        return max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
-
-    differentiate = jax.jit(jax.value_and_grad(loss))
-    value, grads = differentiate(variables["params"], jax.random.key(0))
-    _, again = differentiate(variables["params"], jax.random.key(0))
-    _, other = differentiate(variables["params"], jax.random.key(1))
-    assert bool(jnp.isfinite(value))
-    assert all(bool(jnp.all(jnp.isfinite(g))) for g in jax.tree.leaves(grads))
-    assert distance(grads, again) == 0.0
-    assert distance(grads, other) > 0.0
+    differentiate = jax.jit(jax.grad(loss))
+    gradients = differentiate(variables["params"], jax.random.key(0))
+    repeated = differentiate(variables["params"], jax.random.key(0))
+    other = differentiate(variables["params"], jax.random.key(1))
+    for first, second in zip(jax.tree.leaves(gradients), jax.tree.leaves(repeated), strict=True):
+        np.testing.assert_array_equal(first, second)
+    assert max(float(jnp.max(jnp.abs(first - second)))
+               for first, second in zip(jax.tree.leaves(gradients),
+                                        jax.tree.leaves(other), strict=True)) > 0.0
