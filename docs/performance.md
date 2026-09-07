@@ -165,6 +165,63 @@ The reference and xla paths materialize the S x S logits, so they run out of
 everywhere they fit. cudnn is the kernel for a GPU run, forward and
 backward, and `'auto'` picks it wherever it can.
 
+### Head dimension 256 through tokamax's Triton flash attention
+
+cudnn refuses head dimensions above 128 before Hopper, so a Gemma 3 4B or
+12B shape (heads of 256) trains through the xla path on every Ampere and
+Ada card, materializing the S x S logits. tokamax 0.0.13 ships a
+Pallas-Triton flash attention for compute capability 8.0 and up with a
+forward and a backward, grouped query heads, causal masks, windows and any
+power-of-two head dimension, and JAX 0.11.1 deprecates its own
+`jax.experimental.pallas.ops.gpu.attention` in its favour. Measured on the
+RTX 4080 (compute capability 8.9, 99 KiB of shared memory per block),
+driver 595.84, jax/jaxlib 0.11.1, tokamax 0.0.13, bf16 inputs, 8 query and
+4 key/value heads, causal, 3 warmup and 20 timed calls, error against the
+fp32 reference einsum on the same values. `tools/benchmark_attention.py`
+with `--implementations xla triton --head-dims 256 --kv-groups 2
+--reference-error --triton-device-kind "NVIDIA GeForce RTX 4090"`; the
+device kind is needed because JAX's Pallas-Triton backend compiles for a
+table of named cards that lists the 4090 and not the 4080.
+
+| S | window | xla fwd | triton fwd | xla temp | triton temp | xla fwd+bwd | triton fwd+bwd |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1024 (B=2) | none | 0.468 | 0.210 | 96 MiB | 0 | 1.47 | fails, shared memory |
+| 2048 (B=1) | none | 1.19 | 0.380 | 192 MiB | 0 | 2.66 | fails, shared memory |
+| 4096 (B=1) | none | 3.97 | 1.03 | 768 MiB | 0 | 10.5 | fails, shared memory |
+| 4096 (B=1) | 1024 | 4.10 | 0.540 | 768 MiB | 0 | 10.7 | fails, shared memory |
+
+The forward is 2.2 to 7.6 times faster with no temporary memory and a
+smaller error (0.0081 against xla's 0.0112 on outputs of size 3.4). The
+backward does not run: tokamax's Triton VJP has one fixed tiling for every
+card (`pallas_triton_vjp.py` carries a `TODO: Implement heuristics`), and
+at head dimension 256 it asks for 102784 bytes of shared memory against the
+card's 101376, `RESOURCE_EXHAUSTED: Shared memory size limit exceeded`.
+Probing other tilings through tokamax's private classes, a 32x32 tiling
+with one stage fits and is correct (gradient error 0.031, the same as xla)
+at 1.80 ms forward+backward against xla's 2.66 at S=2048, while two 16-row
+tilings compile, run at the same speed and return wrong gradients (error
+6.6 on gradients of size 6.3). tokamax's autotuner picks tilings by time on
+random inputs and never compares numerics, so autotuning cannot be trusted
+to find the correct one. At head dimension 128 the Triton kernel ties
+cudnn (0.235 against 0.236 ms forward, 0.75 against 0.78 forward+backward
+at S=2048), so there is nothing to gain where cudnn already runs.
+
+Two other gaps stay closed. Gemma 2's logit softcap: the Triton forward
+takes it (0.35 against xla's 1.01 ms at S=2048, head dimension 256) and
+the VJP raises `NotImplementedError: logits_soft_cap unsupported`; tokamax
+also caps after adding the bias where Gemma caps before it (1.4e-2 apart on
+CPU with a bias, identical without one). Attention sinks: no tokamax
+implementation takes them.
+
+No Dew route was added. A forward-only kernel cannot serve training, and
+the working backward tiling is reachable only through private tokamax
+classes. The prerequisite is an upstream tokamax release whose VJP picks a
+tiling that fits the card, or a public tiling knob, with a correctness
+check beside it. Installing tokamax 0.0.13 next to Dew also pins
+`typeguard==2.13.3` while tyro 1.0.16 requires `typeguard>=4.0.0`, which
+breaks every recipe's command line, so the measurements ran the tool
+through its `main` function in a separate environment.
+
 ## Odd sequence lengths on cudnn
 
 cudnn's fused kernel has no backward pass for an odd query or key length. The
