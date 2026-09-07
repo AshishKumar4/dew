@@ -12,17 +12,15 @@ import json
 from pathlib import Path
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import translate_config
 
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec, build_mesh
@@ -237,7 +235,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     """The routers sow through the scanned view, so the balance loss and the
     aux-loss-free bias move as they do under the plain loop. Observed loss
     difference on CPU 0.0, bias difference 0.0."""
-    plain, scanned, variables, ids = scanned_pair(deepseek_shaped)
+    plain, scanned, variables, _ = scanned_pair(deepseek_shaped)
     batch = {"text": jax.random.randint(jax.random.key(2), (BATCH, 12), 0, VOCAB)}
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 

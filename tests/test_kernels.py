@@ -59,7 +59,6 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal):
 
     for got, want in zip(fused, reference):
         assert got.shape == want.shape
-        assert np.all(np.isfinite(got))
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 

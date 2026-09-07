@@ -117,11 +117,11 @@ def test_restoration_and_position_capture_share_the_iteration_thread():
     assert source.owners[0] != threading.get_ident()
 
 
-@pytest.mark.parametrize("depth", [0, -1])
-def test_unbounded_depth_is_rejected_without_taking_ownership(depth):
+def test_unbounded_depth_is_rejected_without_taking_ownership():
+    """depth 0 is the value queue.Queue reads as unbounded."""
     source = Source()
     with pytest.raises(ValueError, match="positive"):
-        DevicePrefetchIterator(source, build_mesh(), depth=depth)
+        DevicePrefetchIterator(source, build_mesh(), depth=0)
     assert not source.owners
     source.close()
 

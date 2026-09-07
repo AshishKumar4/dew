@@ -23,12 +23,12 @@ from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
 from dew.registry import models
 
 VOCAB = 37
+TINY = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
+            mlp_features=64, max_seq_len=16)
 
 
 def tiny(**overrides):
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
-    return CausalTransformer(**{**config, **overrides})
+    return CausalTransformer(**{**TINY, **overrides})
 
 
 class ScaleMixerModule(nn.Module):
@@ -66,15 +66,13 @@ def test_none_and_the_attention_value_build_the_same_tree():
 
 
 def test_mixer_records_and_values_compute_the_same_logits():
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16)
     expected = tiny(mixer=ScaleMixer(3.0))
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
     logits = expected.apply(params, ids)
     record = {"kind": "test_scale", "scale": 3.0}
     for model in (tiny(mixer=record),
-                  models.build("causal_transformer", **config, mixer=record)):
+                  models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
     assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
 
@@ -157,12 +155,9 @@ def test_invalid_kind_mixer_records_are_refused():
 
 def test_models_build_takes_kind_mixer_records():
     """The CLI path builds per-kind mixers through `models.build`."""
-    config = dict(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=4,
-                  mlp_features=64, max_seq_len=16,
-                  layer_types=("full_attention", "linear"),
-                  kinds={"linear": {"mixer": {"kind": "test_scale", "scale": 3.0}}})
-
-    model = models.build("causal_transformer", **config)
+    model = models.build(
+        "causal_transformer", **TINY, layer_types=("full_attention", "linear"),
+        kinds={"linear": {"mixer": {"kind": "test_scale", "scale": 3.0}}})
     expected = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(3.0))})
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)

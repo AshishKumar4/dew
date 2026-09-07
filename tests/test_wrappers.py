@@ -25,7 +25,6 @@ import json
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from safetensors.numpy import load_file
@@ -183,21 +182,16 @@ def test_wrapper_tower_and_projector_match_the_reference():
             - projector_ref)) < tolerance
 
 
-def test_wrapper_language_halves_build_and_score():
-    """The language halves are complete decoder trees: they build and score a
-    row of ids. The tied Gemma halves keep one leaf for head and embedding."""
+def test_only_the_untied_wrappers_get_an_lm_head_leaf():
+    """Gemma ties its head to the embedding table and Llama 4 and Qwen 3.5 do
+    not, so the map writes an lm_head leaf for exactly the untied families.
+    The four parity tests below score these same trees."""
     for name, tied in (("gemma3-tiny-mm", True), ("llama4-tiny-mm", False),
-                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", False)):
-        _, record, variables = load_wrapper(name)
-        model = models.build("causal_transformer", **with_precision(
-            "causal_transformer", record["text"], dtype="float32",
-            attention_impl="reference"))
+                       ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", False)):
+        _, _, variables = load_wrapper(name)
         leaves, _ = jax.tree_util.tree_flatten_with_path(variables["language_model"])
         names = {".".join(str(entry.key) for entry in path) for path, _ in leaves}
-        assert ("params.lm_head.kernel" in names) is not tied
-        ids = np.zeros((1, 4), np.int32)
-        assert np.asarray(model.apply(
-            variables["language_model"], ids)).shape == (1, 4, model.vocab_size)
+        assert ("params.lm_head.kernel" in names) is not tied, name
 
 
 def test_a_wrapper_tensor_outside_the_three_prefixes_is_refused():

@@ -1,6 +1,5 @@
 """The three examples run end to end on stub data: train, evaluate, export."""
 
-import dataclasses
 import importlib.util
 import itertools
 import json
@@ -11,8 +10,9 @@ import jax
 import numpy as np
 import pytest
 
-from dew.data import Dataset, TokenWindows
+from dew.data import Dataset
 from dew.inputs import Condition, Field, InputSpec
+from dew.interop import load_params
 from test_diffusion_objective import RES, TOKENS, StubText
 
 pytestmark = pytest.mark.mesh
@@ -64,7 +64,7 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     assert grid.shape == (RES, 2 * RES, 3) and grid.dtype == np.uint8
     assert (tmp_path / "export" / "model.safetensors").exists()
     assert (tmp_path / "export" / "config.json").exists()
-    assert any((tmp_path / "checkpoints").iterdir())
+    assert (tmp_path / "checkpoints" / "3").is_dir(), "the last step was not checkpointed"
 
 
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
@@ -76,7 +76,11 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     state = example.main(config, data=fake_dataset(8, classes=5, size=32))
 
     assert int(state.step) == 3
-    assert (tmp_path / "encoder.safetensors").stat().st_size > 0
+    saved = load_params(tmp_path / "encoder.safetensors")
+    averaged = state.averaged["params"]["context_encoder"]
+    assert jax.tree.structure(saved) == jax.tree.structure(averaged), "not the encoder's tree"
+    assert all(np.array_equal(np.asarray(a), b) for a, b in zip(
+        jax.tree.leaves(averaged), jax.tree.leaves(saved), strict=True))
 
 
 def test_train_lm_example_trains_and_generates(tmp_path):

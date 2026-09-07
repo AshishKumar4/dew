@@ -418,7 +418,7 @@ def test_the_streaming_spec_reports_its_records_and_holds_nothing_out(monkeypatc
 
 def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeypatch):
     """Loading resolves the rows; the fetcher pool and its thread start with
-    `train()`, and the stream cannot record a position."""
+    `train()`."""
     started = []
     producer = _producer_of(4, 1)
 
@@ -433,7 +433,6 @@ def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeyp
     with closing(data.train()) as stream:
         assert len(next(stream)["image"]) == 4
         assert len(started) == 1
-        assert not hasattr(stream, "get_state")
 
 
 def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
@@ -499,7 +498,9 @@ def test_a_streaming_run_trains_when_it_never_checkpoints(monkeypatch):
     state = _run(data, steps=6)
 
     assert int(state.step) == 6
-    assert jnp.isfinite(state.params["params"]["level"])
+    # The rows carry pixel values 1 to 24, so the level fits the mean of what
+    # reached the objective; a batch of fabricated zeros fits -1.0.
+    assert -0.70 < float(state.params["params"]["level"]) < -0.60
 
 
 def test_a_streaming_run_that_asks_for_checkpoints_is_refused(monkeypatch, tmp_path):

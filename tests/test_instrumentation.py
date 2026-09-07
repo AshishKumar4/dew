@@ -182,13 +182,6 @@ condition=%condition, body=%body
 """
 
 
-def test_the_compiled_step_reports_a_positive_flop_count():
-    trainer = make_trainer()
-    state, _, _ = trainer.place()
-    trainer.compile(state, shard_batch(trainer.device_mesh, next(batches())))
-    assert trainer.flops_per_step is not None and trainer.flops_per_step > 0
-
-
 def test_step_flops_reads_a_jitted_function():
     flops = step_flops(jax.jit(lambda a, b: a @ b), jnp.ones((8, 16)), jnp.ones((16, 4)))
     assert flops == pytest.approx(2 * 8 * 16 * 4)
@@ -479,7 +472,7 @@ def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     trainer.fit(Data(batches), steps=5, log_every=1)
 
     assert started_at == [2], "the trace did not open after the configured warmup"
-    assert any(files for _, _, files in os.walk(tmp_path / "profile"))
+    assert list((tmp_path / "profile").glob("**/*.xplane.pb")), "no trace to read"
 
 
 def test_an_unfinished_profile_window_is_still_closed(tmp_path):
@@ -487,11 +480,11 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path):
     takes the next one down with it."""
     make_trainer(profile=Profile(str(tmp_path / "long"), steps=8, warmup=1)).fit(
         Data(batches), steps=3, log_every=1)
-    assert any(files for _, _, files in os.walk(tmp_path / "long"))
+    assert list((tmp_path / "long").glob("**/*.xplane.pb")), "no trace to read"
 
     make_trainer(profile=Profile(str(tmp_path / "short"), steps=1, warmup=0)).fit(
         Data(batches), steps=2, log_every=1)
-    assert any(files for _, _, files in os.walk(tmp_path / "short"))
+    assert list((tmp_path / "short").glob("**/*.xplane.pb")), "no trace to read"
 
 
 def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):

@@ -8,7 +8,6 @@ import dataclasses
 import json
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -17,7 +16,7 @@ import pytest
 from dew import models  # noqa: F401  registers the models
 from dew.config import OptimConfig, _rebuild
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.optim import build_optimizer
@@ -117,11 +116,13 @@ def test_a_pattern_that_matches_nothing_quantizes_nothing():
         qmodel.apply(variables, ids) - model.apply(variables, ids)))) == 0.0
 
 
-def test_an_int8_trunk_trains_with_finite_loss():
-    """Five adamw steps through the int8 trunk: every loss finite and the
-    parameters moved. Observed on CPU: 5.17 down to 4.07."""
+def test_an_int8_trunk_trains_down():
+    """Five adamw steps through the int8 trunk: each loss below the one
+    before, which quantized gradients pointing the wrong way or drowned in
+    rounding noise would not manage. Observed on CPU: 5.17 down to 4.07 in
+    steps of about 0.25, against 1e-7 of int8 rounding."""
     pytest.importorskip("qwix")
-    model, qmodel, variables, _ = quantized_forward(Quantization())
+    _, qmodel, variables, _ = quantized_forward(Quantization())
     objective = LMObjective(qmodel, SEQ_LEN)
     batch = token_batch()
     solver = build_optimizer(OptimConfig(learning_rate=1e-3), 5)
@@ -142,8 +143,7 @@ def test_an_int8_trunk_trains_with_finite_loss():
         key, subkey = jax.random.split(key)
         params, opt_state, loss = train(params, opt_state, subkey)
         losses.append(float(loss))
-    assert all(np.isfinite(losses)), losses
-    assert losses[0] != losses[-1]
+    assert all(later < earlier for earlier, later in zip(losses, losses[1:])), losses
 
 
 def test_a_scanned_quantized_stack_scores_as_the_plain_one():
@@ -206,18 +206,29 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():
-    """The rounding option runs when the apply hands Qwix its stream, with
-    finite gradients. Observed on CPU: finite."""
+    """The gradient moves with the stream's key and repeats under the same
+    one: an option that never reached the backward pass would round the same
+    way whatever key the apply handed it. Observed on CPU: 8.4e-08 between
+    keys, on gradients of order 0.16, and bitwise equal under one key."""
     pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(
+    _, qmodel, variables, ids = quantized_forward(
         Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform"))
-    rngs = {"stochastic_rounding": jax.random.key(0)}
 
-    def loss(params):
-        hidden = qmodel.apply({**variables, "params": params}, ids, rngs=rngs,
+    def loss(params, key):
+        hidden = qmodel.apply({**variables, "params": params}, ids,
+                              rngs={"stochastic_rounding": key},
                               method=type(qmodel).hidden_states)
         return jnp.mean(hidden ** 2)
 
-    value, grads = jax.jit(jax.value_and_grad(loss))(variables["params"])
+    def distance(left, right):
+        return max(float(jnp.max(jnp.abs(a - b)))
+                   for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+
+    differentiate = jax.jit(jax.value_and_grad(loss))
+    value, grads = differentiate(variables["params"], jax.random.key(0))
+    _, again = differentiate(variables["params"], jax.random.key(0))
+    _, other = differentiate(variables["params"], jax.random.key(1))
     assert bool(jnp.isfinite(value))
     assert all(bool(jnp.all(jnp.isfinite(g))) for g in jax.tree.leaves(grads))
+    assert distance(grads, again) == 0.0
+    assert distance(grads, other) > 0.0

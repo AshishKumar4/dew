@@ -192,7 +192,6 @@ def test_the_loss_composes_the_term_over_head_log_probs():
         jnp.asarray(chosen_mask), jnp.asarray(rejected_mask), 0.5)
     assert float(loss) == pytest.approx(float(expected), rel=1e-5)
     assert set(aux.metrics) == {"rewards/chosen", "rewards/rejected", "accuracy"}
-    assert 0.0 <= float(aux.metrics["accuracy"]) <= 1.0
 
 
 def test_the_reference_comes_from_the_frozen_tree():

@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 import tyro
 
-from dew.config import ModelConfig, RunConfig
-from dew.data import Dataset, OxfordFlowers, PackedTokens, TokenWindows
+from dew.config import RunConfig
+from dew.data import Dataset, OxfordFlowers, PackedTokens
 from dew.data.dataset import tokenized
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
@@ -68,7 +68,7 @@ def test_another_dataset_is_its_subcommand():
         recipe.LmRunConfig(data=OxfordFlowers())
 
 
-def test_a_spec_field_the_dataset_lacks_is_a_command_line_error(capsys):
+def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
     with pytest.raises(SystemExit):
         parse(RunConfig, ["--data.seq-len", "8"])
 
