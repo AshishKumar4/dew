@@ -36,45 +36,68 @@ def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str
         image_token="<image_soft_token>", padding_side="left", **token_attributes)
     tokenizer.add_tokens([AddedToken(word, single_word=True, normalized=False)
                           for word in vocab if word.startswith("token")])
+    tokenizer.add_tokens([AddedToken(word, special=True, normalized=False)
+                          for word in special if word not in tokenizer.all_special_tokens])
     return tokenizer
 
 
 
 def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str]) -> None:
-    """Actual wrapper forward, cached continuation, pixel gradient and SGD output."""
-    encoded = processor(text=prompts, images=[[images[0]], [images[1], images[2]]],
-                        padding=True, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(**encoded, use_cache=False).logits
-        generated = model.generate(**encoded, max_new_tokens=3, do_sample=False,
-                                   eos_token_id=None, use_cache=True, return_dict_in_generate=False)
-        continuation = generated[:, encoded["input_ids"].shape[1]:]
-    train_pixels = encoded["pixel_values"].clone().requires_grad_(True)
-    training = {**encoded, "pixel_values": train_pixels}
-    predictions = model(**training, use_cache=False).logits[:, :-1]
-    labels = encoded["input_ids"][:, 1:]
-    valid = encoded["attention_mask"][:, :-1].bool() & encoded["attention_mask"][:, 1:].bool()
-    losses = torch.nn.functional.cross_entropy(predictions.reshape(-1, predictions.shape[-1]),
-                                                labels.reshape(-1), reduction="none").reshape(labels.shape)
-    loss = (losses * valid).sum() / valid.sum()
+    """Actual wrapper forward, cached continuation, pixel gradient and SGD output.
+
+    Every reference quantity comes from one unpadded row at a time, so the
+    numbers do not depend on how the reference batches padded rows (Llama 4
+    scales attention by the padded slot index rather than the token position).
+    The padded batch encoding is what Dew consumes, and each row's tokens and
+    pixels are checked against it.
+    """
+    rows = [[images[0]], [images[1], images[2]]]
+    encoded = processor(text=prompts, images=rows, padding=True, return_tensors="pt")
+    # The fp32 reference widens bfloat16 processor pixels exactly.
+    encoded["pixel_values"] = encoded["pixel_values"].float()
+    valid = encoded["attention_mask"].bool()
+    vocab_size = model.config.get_text_config().vocab_size
+    logits = torch.zeros((*encoded["input_ids"].shape, vocab_size))
+    updated = torch.zeros_like(logits)
+    targets = int((valid[:, :-1] & valid[:, 1:]).sum())
+    loss = torch.zeros(())
+    continuation, pixel_inputs, singles = [], [], []
+    for row, (prompt, row_images) in enumerate(zip(prompts, rows)):
+        single = processor(text=[prompt], images=[row_images], return_tensors="pt")
+        single["pixel_values"] = single["pixel_values"].float()
+        assert torch.equal(single["input_ids"][0], encoded["input_ids"][row][valid[row]])
+        singles.append(single)
+        with torch.no_grad():
+            logits[row, valid[row]] = model(**single, use_cache=False).logits[0]
+            generated = model.generate(**single, max_new_tokens=3, do_sample=False,
+                                       eos_token_id=None, use_cache=True, return_dict_in_generate=False)
+            continuation.append(generated[0, single["input_ids"].shape[1]:])
+        pixels = single["pixel_values"].clone().requires_grad_(True)
+        pixel_inputs.append(pixels)
+        predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
+        loss = loss + torch.nn.functional.cross_entropy(
+            predictions, single["input_ids"][0, 1:], reduction="sum") / targets
+    assert torch.equal(torch.cat([single["pixel_values"] for single in singles]), encoded["pixel_values"])
     loss.backward()
-    np.save(destination / "pixel_gradient.npy", train_pixels.grad.numpy())
+    np.save(destination / "pixel_gradient.npy", torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
     with torch.no_grad():
         for parameter in model.parameters():
             if parameter.grad is not None:
                 parameter.add_(parameter.grad, alpha=-1e-4)
-        updated = model(**encoded, use_cache=False).logits
+        for row, single in enumerate(singles):
+            updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
     np.save(destination / "updated_logits.npy", updated.numpy())
     (destination / "training.json").write_text(json.dumps({"loss": float(loss.detach()), "learning_rate": 1e-4}) + "\n")
 
     np.save(destination / "raw_images.npy", images)
     np.save(destination / "logits.npy", logits.numpy())
-    np.save(destination / "continuation.npy", continuation.numpy())
+    np.save(destination / "continuation.npy", torch.stack(continuation).numpy())
     (destination / "prompts.json").write_text(json.dumps(prompts) + "\n")
     for key, value in encoded.items():
         np.save(destination / f"{key}.npy", value.numpy())
     print(destination, "bytes", sum(p.stat().st_size for p in destination.iterdir()),
           "tokens", tuple(encoded["input_ids"].shape), "pixel_values", tuple(encoded["pixel_values"].shape))
+
 
 
 def write_gemma3_native() -> None:
@@ -148,6 +171,37 @@ def write_gemma4_native() -> None:
     images = np.random.default_rng(1304).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <image_soft_token> token9",
                "token5 <image_soft_token> token8 <image_soft_token> token6"]
+    _write_forward_backward(model, processor, destination, images, prompts)
+
+
+
+def write_llama4_native() -> None:
+    """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
+    from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
+    from transformers.models.llama4.image_processing_llama4 import Llama4ImageProcessor
+
+    source = ROOT / "llama4-tiny-mm"
+    destination = ROOT / "llama4-native-tiny"
+    destination.mkdir(parents=True, exist_ok=True)
+    config = json.loads((source / "config.json").read_text())
+    hf_config = Llama4Config.from_dict(config)
+    hf_config._attn_implementation = "eager"
+    model = Llama4ForConditionalGeneration(hf_config).float().eval()
+    tensors = load_file(str(source / "model.safetensors"))
+    model.load_state_dict(tensors, strict=True)
+    save_file(tensors, str(destination / "model.safetensors"))
+    hf_config.save_pretrained(destination)
+    special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
+               "<|image_start|>": 90, "<|image_end|>": 91, "<|patch|>": 92, "<|image|>": 93,
+               "<|tile_x_separator|>": 94, "<|tile_y_separator|>": 95}
+    tokenizer = _tokenizer(config["text_config"]["vocab_size"], special)
+    processor = Llama4Processor(
+        Llama4ImageProcessor(size={"height": 28, "width": 28}, max_patches=4, resize_to_max_canvas=False),
+        tokenizer, patch_size=14, pixel_shuffle_ratio=0.5)
+    processor.save_pretrained(destination)
+    processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
+    images = np.random.default_rng(1707).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
+    prompts = ["token7 <|image|> token9", "token5 <|image|> token8 <|image|> token6"]
     _write_forward_backward(model, processor, destination, images, prompts)
 
 
