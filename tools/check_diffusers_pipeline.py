@@ -15,13 +15,13 @@ import optax
 import transformers
 from PIL import Image
 
-from dew.inference import TextToImage
+from dew.interop.diffusers import load_diffusers_pipeline
 from dew.objectives.base import Step
 
 
 def check(directory, train=True):
     reference = np.load(Path(directory) / "reference.npz")
-    pipe = TextToImage.from_diffusers(directory, local_files_only=True)
+    pipe = load_diffusers_pipeline(directory, local_files_only=True)
     errors = {}
 
     def compare(name, actual, expected, atol=3e-5):
@@ -61,10 +61,12 @@ def check(directory, train=True):
     images = pipe(["cat"], negative_prompts=["dog"], key=key, steps=2, guidance=3.0, latents=noise, **kwargs)
     compare("trajectory_images", (images + 1) / 2, reference["images"])
     training = None
-    if train and pipe.task != "inpainting":
+    if train:
         objective = pipe.objective(unconditional_prob=0.0, ema_decay=None, steps=2)
         variables = objective.init(key)
         batch = {"image": reference["pixels"][None], **pipe.inputs.tokenize(["cat"])}
+        if pipe.task == "inpainting":
+            batch["mask"] = reference["mask"][None, ..., None].astype(np.float32) / 255
         step = Step(step=jnp.asarray(0), key=key, ema=None)
         def loss(params):
             value, _ = objective.loss({**variables, "params": params}, batch, step)
@@ -81,7 +83,7 @@ def check(directory, train=True):
         jax.clear_caches()
     with tempfile.TemporaryDirectory(prefix="dew-diffusers-reload-") as saved:
         pipe.save_pretrained(saved)
-        loaded = TextToImage.from_diffusers(saved, local_files_only=True)
+        loaded = load_diffusers_pipeline(saved, local_files_only=True)
         before = pipe(["cat"], negative_prompts=["dog"], key=key, steps=2, guidance=3.0, latents=noise, **kwargs)
         after = loaded(["cat"], negative_prompts=["dog"], key=key, steps=2, guidance=3.0, latents=noise, **kwargs)
         compare("reload", after, before, atol=0)

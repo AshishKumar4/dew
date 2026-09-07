@@ -221,7 +221,14 @@ images = bound(["a flower"], steps=2, key=jax.random.key(1))
 bound.save_pretrained("./pipeline-copy")
 ```
 
-The source adapter initializes the objective with the loaded variables. Use `pipe.inputs.tokenize(captions)` with uint8 NHWC image batches. `bind(updated_variables).save_pretrained(directory)` retains the source layout for reload. The committed SD/SDXL tests compare preprocessing, hidden states, denoising, decoding, full trajectories and trained save/reload against locally generated reference pipelines. SDXL omitted negative prompts use zeros; explicit empty negative prompts are encoded. Image-to-image and inpainting sampling are covered. The initial adapter refuses safety-checker-bearing sources and inpainting training until those native contracts are available; it does not disable a checker or substitute another training objective.
+Use uint8 NHWC image batches with `pipe.inputs.tokenize(captions)`. For inpainting training, add `batch["mask"]`: a binary array shaped `[B, H, W, 1]`, with white pixels marking the region to repaint. The objective keeps the VAE, text towers and checker frozen; caption dropout preserves the mask and masked-image latent conditions. `TextToImage.from_objective(objective, updated_variables)` retains the checkpoint's inference task. Save bound variables with `save_pretrained`; reload preserves the configured resolution and checker state.
+
+The adapter supports SD and SDXL text-to-image, image-to-image and inpainting, plus the SDXL refiner's single projected text tower and aesthetic conditioning. Supply PIL images and masks to image tasks. Image-to-image also accepts NHWC image latents. For a base/refiner handoff, request `output_type="latent", denoising_end=0.8` from the base, then pass those latents as the refiner's `image` with `denoising_start=0.8`. Use matching step counts and image geometry. Nine-channel inpainting conditions the network on the mask; it does not promise exact copying of unmasked source pixels.
+
+SDXL uses both prompt towers when present. `prompt_2`, `negative_prompt_2`, resolution/crop coordinates and aesthetic scores follow the selected model's conditioning contract. Omitted negatives use zeros when the checkpoint enables `force_zeros_for_empty_prompt`; otherwise the adapter encodes empty prompts. Explicit empty negative prompts always use their encoded values. `prepare(prompts, key=key, negative_prompts=...)` supplies the same noise and conditions as a raw text-to-image call.
+
+Flax msgpack directories are the default input. With `from_pt=True`, the adapter reads UNet/VAE safetensors or legacy `.bin` weights and CLIP/checker safetensors. It uses official Flax model modules and Dew's native CLIP primitives on the current Transformers stack. For LMS, the official scheduler prepares the small sigma/timestep table once; Dew's existing JAX LMS solver executes the trajectory without per-step Torch latent transfers. PNDM consumes its complete expanded timetable. The reference tools pin Diffusers 0.34.0 and isolate Transformers 4.49.0; the runtime tests use Transformers 5.16.1.
+
 
 ### External engine clients
 
