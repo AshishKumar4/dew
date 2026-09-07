@@ -1,0 +1,9 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "t2",
+  "eos_token": "t1",
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "t0",
+  "tokenizer_class": "TokenizersBackend",
+  "unk_token": "t3"
+}
