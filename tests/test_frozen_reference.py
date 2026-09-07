@@ -15,7 +15,7 @@ import dataclasses
 import json
 
 from flax import linen as nn
-from flax.training import dynamic_scale as dynamic_scale_lib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -126,12 +126,8 @@ def test_unit_decay_returns_the_average_untouched():
 
 
 def poison(state):
-    """The state's parameters with an infinite kernel, ema untouched.
-
-    Every leaf is a fresh buffer: `select` aliases the ema leaves with the
-    params leaves, and the compiled step donates the state, so shared
-    buffers would be donated twice."""
-    params = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), state.params)
+    """Replace a live kernel without changing the aliased frozen reference."""
+    params = dict(state.params)
     collection = dict(params["params"])
     layer = dict(collection["Dense_0"])
     layer["kernel"] = jnp.full_like(layer["kernel"], jnp.inf)
@@ -149,10 +145,10 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     state = poison(trainer.initial_state())
     before = frozen_bytes(state)
     batch = next(Counting())
-    scale = dynamic_scale_lib.DynamicScale() if dynamic_scale else None
-    step = trainer.compile(state, batch, scale)
+    
+    step = trainer.compile(state, batch)
 
-    new_state, _, loss, _, finite = step(state, scale, batch)
+    new_state, loss, _, finite, _ = step(state, batch)
 
     assert not bool(finite), "the step should have seen the poison"
     assert not bool(jnp.isfinite(loss)), "the loss should have seen the poison"

@@ -24,7 +24,7 @@ import optax
 from dew.artifacts import TextSamples, agree_process_phase, collective_host
 from dew.diffusion.discrete import DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Objective, Step
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.sampling.sample import sample
@@ -36,7 +36,7 @@ TEXT_KEY = "text"
 
 
 @objectives("masked_diffusion")
-class MaskedDiffusionObjective(Objective):
+class MaskedDiffusionObjective(Objective[Mean]):
     """The MDLM negative ELBO over `[B, seq_len]` rows of `batch["text"]`."""
 
     artifact = TextSamples
@@ -48,7 +48,7 @@ class MaskedDiffusionObjective(Objective):
         seq_len: int,
         *,
         head_chunks: int = 4,
-        ema_decay: float = 0.999,
+        ema_decay: float | None = 0.999,
         sampler: Unmask = Unmask(),
         steps: int = 64,
         samples: int = 4,
@@ -70,7 +70,7 @@ class MaskedDiffusionObjective(Objective):
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def init(self, key):
@@ -94,7 +94,7 @@ class MaskedDiffusionObjective(Objective):
 
         counted = is_masked.astype(losses.dtype)
         weights = counted * self.process.weight(t)[:, None]
-        nelbo = jnp.sum(losses * weights) / tokens.size
+        nelbo = Mean(jnp.sum(losses * weights), jnp.asarray(tokens.size))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
             "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),

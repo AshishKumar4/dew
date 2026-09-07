@@ -106,10 +106,10 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
     return jnp.clip(sequence, max=SEQUENCE_RATIO_CLAMP)
 
 
-def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
-                      epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                      dual_clip: float = 3.0) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-    """PPO's clipped policy loss, token-mean, with the dual clip.
+def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
+                            epsilon_low: float = 0.2, epsilon_high: float = 0.2,
+                            dual_clip: float = 3.0) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    """PPO policy terms before normalization, with the dual clip.
 
     `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))` per token, and for a
     negative advantage the dual clip caps the term at `-A * dual_clip`
@@ -149,7 +149,16 @@ def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Arr
             keep),
         "ppo_kl": masked_mean(-log_ratio, keep),
     }
-    return token_mean(per_token, keep), aux
+    return per_token, aux
+
+
+def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
+                      epsilon_low: float = 0.2, epsilon_high: float = 0.2,
+                      dual_clip: float = 3.0) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    """Token-mean reduction of the dual-clipped policy terms."""
+    terms, aux = clipped_surrogate_terms(
+        log_ratio, advantages, mask, epsilon_low, epsilon_high, dual_clip)
+    return token_mean(terms, mask), aux
 
 
 def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
@@ -170,18 +179,30 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     return jnp.clip(jnp.exp(diff) - diff - 1, -KL_CLAMP, KL_CLAMP)
 
 
-def preference_logsigmoid(policy_chosen: jax.Array, policy_rejected: jax.Array,
-                          ref_chosen: jax.Array, ref_rejected: jax.Array,
-                          mask_chosen: jax.Array, mask_rejected: jax.Array,
-                          beta: float) -> jax.Array:
-    """DPO's loss over one pair batch (arXiv:2305.18290, eq. 7): the mean of
-    `-logsigmoid(beta * delta)`, where `delta` is the chosen log-ratio minus
-    the rejected one and each sequence score sums the per-token
-    log-probabilities under its mask. TRL's `dpo_loss` with the `sigmoid`
-    type reads the same terms (`trl/trainer/dpo_trainer.py`); the masks here
-    arrive already shifted, one per scored token."""
+def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.Array,
+                                ref_chosen: jax.Array, ref_rejected: jax.Array,
+                                mask_chosen: jax.Array, mask_rejected: jax.Array,
+                                beta: float) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    """Per-pair DPO sigmoid terms and chosen/rejected reference-relative rewards.
+
+    Equation 7 of arXiv:2305.18290 uses the difference of masked sequence
+    policy/reference log-ratios. Rewards use beta times each log-ratio.
+    Masks arrive shifted, one value per scored token.
+    """
     chosen = (jnp.sum(policy_chosen * mask_chosen, axis=-1)
               - jnp.sum(ref_chosen * mask_chosen, axis=-1))
     rejected = (jnp.sum(policy_rejected * mask_rejected, axis=-1)
                 - jnp.sum(ref_rejected * mask_rejected, axis=-1))
-    return -jnp.mean(jax.nn.log_sigmoid(beta * (chosen - rejected)))
+    terms = -jax.nn.log_sigmoid(beta * (chosen - rejected))
+    return terms, (beta * chosen, beta * rejected)
+
+
+def preference_logsigmoid(policy_chosen: jax.Array, policy_rejected: jax.Array,
+                          ref_chosen: jax.Array, ref_rejected: jax.Array,
+                          mask_chosen: jax.Array, mask_rejected: jax.Array,
+                          beta: float) -> jax.Array:
+    """Pair-mean reduction of the DPO sigmoid loss."""
+    terms, _ = preference_logsigmoid_terms(
+        policy_chosen, policy_rejected, ref_chosen, ref_rejected,
+        mask_chosen, mask_rejected, beta)
+    return jnp.mean(terms)

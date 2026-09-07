@@ -120,11 +120,11 @@ def run(config: Comparison) -> Curve:
 
     with DevicePrefetchIterator(data.train(), trainer.device_mesh) as source:
         train_step = trainer.compile(state, next(source))
-        scale = None
+        
         losses: list[float] = []
         start = time.perf_counter()
         for step in range(config.steps):
-            state, scale, loss, _, is_finite = train_step(state, scale, next(source))
+            state, loss, _, is_finite, _ = train_step(state, next(source))
             losses.append(float(loss))
             if not bool(is_finite):
                 raise RuntimeError(f"loss went non-finite at step {step}")

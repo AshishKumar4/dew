@@ -15,14 +15,17 @@ from __future__ import annotations
 
 import dataclasses
 
+import jax
 import jax.numpy as jnp
+from dew.objectives.base import Variables
 
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
-from dew.objectives.base import Aux
+from dew.objectives.base import Aux, Mean, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
-from dew.rl import clipped_surrogate, k3_kl, token_log_ratio, token_mean
+from dew.rl import k3_kl, token_log_ratio
+from dew.rl.surrogate import clipped_surrogate_terms
 
 from ..lm import LMObjective
 from .rollout import ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
@@ -36,7 +39,7 @@ class GRPOObjective(LMObjective):
     (`verl/trainer/ppo/core_algos.py`, `compute_policy_loss_vanilla` with
     `token-mean` and `kl_penalty_forward` with `k3`).
 
-    `beta` is the KL strength, 0.0 leaving the reference unread;
+    `beta` is the KL strength; 0.0 allocates no frozen reference.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points;
     `model` and `seq_len` are the LMObjective's, with `seq_len` one below the
     prompt width plus the response width. An `ema_decay` argument is refused,
@@ -56,7 +59,7 @@ class GRPOObjective(LMObjective):
             raise ValueError(
                 "the response mask already says which targets count, "
                 "so loss_role is refused on a GRPO objective")
-        kwargs["ema_decay"] = 1.0
+        kwargs["ema_decay"] = 1.0 if beta > 0 else None
         super().__init__(model, seq_len, **kwargs)
         self.beta = beta
         self.epsilon_low = epsilon_low
@@ -107,10 +110,13 @@ class GRPOObjective(LMObjective):
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         policy = self.per_token_log_probs(params, ids)[:, start:start + width]
         ratio = token_log_ratio(policy, jnp.asarray(batch[OLD_LOG_PROBS_KEY]))
-        pg_loss, aux = clipped_surrogate(
+        terms, aux = clipped_surrogate_terms(
             ratio, jnp.asarray(batch[ADVANTAGES_KEY]), mask,
             epsilon_low=self.epsilon_low, epsilon_high=self.epsilon_high,
             dual_clip=self.dual_clip)
+        mass = jax.lax.stop_gradient(jnp.sum(mask))
+        pg = Mean(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), mass)
+        pg_loss, _ = mean_loss(pg)
         metrics = {"pg": pg_loss, **{f"actor/{k}": v for k, v in aux.items()}}
         if self.beta > 0:
             if step.ema is None:
@@ -118,10 +124,11 @@ class GRPOObjective(LMObjective):
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
             ref = self.per_token_log_probs(step.ema, ids)[:, start:start + width]
-            kl = token_mean(k3_kl(policy, ref), mask)
-            metrics["kl"] = kl
-            return pg_loss + self.beta * kl, Aux(metrics)
-        return pg_loss, Aux(metrics)
+            kl_terms = k3_kl(policy, ref)
+            kl = Mean(jnp.sum(jnp.where(mask != 0, kl_terms, 0) * mask), mass)
+            metrics["kl"], _ = mean_loss(kl)
+            return Mean(pg.total + self.beta * kl.total, mass), Aux[Variables](metrics)
+        return pg, Aux[Variables](metrics)
 
     def preview(self, params, batch, step, *, scored=None):
         """Draw policy text; this objective's EMA holds the frozen reference."""

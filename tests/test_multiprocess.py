@@ -364,7 +364,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     compiled = trainer.compile(state, batch)
     losses = []
     for _ in range(steps):
-        state, _, loss, _, _ = compiled(state, None, batch)
+        state, loss, _, _, _ = compiled(state, batch)
         losses.append(float(loss))
 
     assert len(pool[0]["losses"]) == steps
@@ -919,3 +919,20 @@ def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failur
         assert reports[0][f"{kind}-healthy"]["drawn"] == 1
         assert reports[1][f"{kind}-healthy"]["drawn"] == 0
         assert reports[0][f"{kind}-healthy"]["scores"] == reports[1][f"{kind}-healthy"]["scores"]
+
+
+@pytest.mark.distributed
+def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path):
+    pool = run_pool("training_contract", tmp_path / "pool", 2, devices=1,
+                    run_dir=str(tmp_path / "pool-state"))
+    single = run_worker("training_contract", tmp_path / "single.json", devices=2,
+                        run_dir=str(tmp_path / "single-state"))
+    for report in [*pool, single]:
+        assert report["flags"] == [[True, True], [True, False], [True, True], [True, True]]
+        assert report["clocks"] == [4, 3, 1]
+        assert report["resumed_equal"]
+        assert report["scale"] == 65536.
+    for report in pool:
+        for want, got in zip(single["state"], report["state"], strict=True):
+            np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+

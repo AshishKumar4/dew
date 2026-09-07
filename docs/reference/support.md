@@ -43,6 +43,8 @@ Qwix int8/fp8 training is optional and experimental. FP8 did not improve the mea
 
 ## Training and evaluation issues under review
 
-Overflow/resume clocks and unequal-mask gradient accumulation remain open numerical/state contracts. Do not rely on exact overflow continuation or token-weighted accumulation equivalence until those repairs land. Evaluation separates complete-batch scoring from once-per-event previews and pools metric sufficient statistics over the consumed coordinated prefix. Uneven validation shards can leave an unscored tail; a small FID population does not establish FID-50k. See the [evaluation contract and limits](../guides/evaluation.md).
+Training state separates attempted batches, accepted microbatches and optimizer commits, and persists scaler history and partial accumulation records. CPU regressions compare unequal-role-mask CE/MTP, row/global router auxiliary and QK updates with a combined-batch reference, and compare resumed state after finite-forward/nonfinite-gradient rejection. Cross-host GPU/TPU recovery and production replay memory remain separate qualification work.
+
+Evaluation separates complete-batch scoring from once-per-event previews and pools metric sufficient statistics over the consumed coordinated prefix. Uneven validation shards can leave an unscored tail; a small FID population does not establish FID-50k. See the [evaluation contract and limits](../guides/evaluation.md).
 
 Passing a metric to `fit` does not enable evaluation by itself: set `eval_every` and provide validation data. `Checkpoints` saves training state and available iterator position; it does not create a `run.json` configuration. See [evaluation](../guides/evaluation.md) and [resuming training](../guides/checkpoints.md).
