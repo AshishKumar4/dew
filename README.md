@@ -101,7 +101,7 @@ The supplied DPO and GRPO objectives use the same trainer as pretraining. PPO-re
 | Qwen 2, Qwen 3, Qwen3-MoE | Attention/projection conventions, Q/K normalization, and routed experts |
 | Qwen 3.5 | Gated delta-net/attention hybrid text decoder and vision components |
 | Gemma 1, 2, 3 | Embedding scaling, norm/softcap conventions, local/global attention; Gemma 3 vision |
-| Gemma 3n | AltUp, LAuReL, per-layer inputs, sparse activations, and shared KV layers |
+| Gemma 3n | AltUp, LAuReL, per-layer inputs, sparse activations, shared KV layers, and MobileNet-v5 image encoder |
 | Gemma 4 | Text configurations including routed experts; vision tower and projector |
 | OLMo 3 | Decoder normalization and attention conventions |
 | DeepSeek V2, V2-Lite, V3, V3.2 | MLA, routing/shared experts, balancing, and V3.2 sparse-indexer components |
@@ -155,7 +155,7 @@ import optax
 
 from dew import Dataset, Trainer, metrics, models
 from dew.objectives.lm import LMObjective
-from dew.sampling import generate
+from dew.sampling import Sampling, generate
 
 row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
 batch = {"text": np.tile(row, (8, 1))}
@@ -168,8 +168,9 @@ objective = LMObjective(model, seq_len=16)
 lm_state = Trainer(objective, optax.adam(0.01), key=jax.random.key(0)).fit(
     data, steps=40, log_every=10, eval_every=20, metrics=(metrics.perplexity(),))
 continuation = generate(model, lm_state.params, jnp.array([[1, 2]], jnp.int32),
-                        max_new_tokens=8, key=jax.random.key(1), temperature=0.0)
-print(np.asarray(continuation))
+                        max_new_tokens=8, key=jax.random.key(1),
+                        sampling=Sampling(temperature=0.0))
+print(np.asarray(continuation.tokens))
 ```
 
 The continuation includes the prompt and follows the learned pattern: `[[1, 2, 3, 4, 1, 2, 3, 4, 1, 2]]`. `temperature=0` selects the highest-probability token. Validation uses EMA weights, which can lag the live parameters during a short run.
@@ -196,6 +197,8 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 ```
 
 `DPOObjective` keeps the starting policy as a frozen reference and optimizes the relative likelihood of the chosen response. `PreferencePairs.seq_len` is the full ID-row width; the objective scores one fewer position because of the next-token shift.
+
+`FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples image groups, evaluates rewards, and records the transition densities used by the clipped policy objective. See [FlowGRPO](docs/concepts/post_training.md) for a complete image-reward example.
 
 For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function. `GRPOObjective` trains on their advantages, old log probabilities, and response masks. [`recipes/chain.py`](recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
@@ -273,6 +276,8 @@ The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parall
 
 Models use configurable compute dtypes and hardware-dependent attention kernels: cuDNN on compatible NVIDIA GPU shapes, a Pallas TPU path, and XLA implementations for other configurations. Qwix supplies optional int8/fp8 computation, and MuonClip adds per-head QK clipping to Muon. Quantized weight loading is separate from quantized training.
 
+Set `remat=True` on a decoder to recompute block activations during the backward pass. This reduces retained activation memory at the cost of additional computation; it composes with layer scanning.
+
 Start with [distributed training](docs/concepts/distributed.md) and the [TPU guide](docs/tpu.md). [Benchmarks](docs/benchmarks.md) and [performance notes](docs/performance.md) record workload sizes, hardware, memory, and timing. Physical multi-host GPU/TPU qualification is still limited.
 
 ## Data and configuration
@@ -296,10 +301,12 @@ The [recipe guide](docs/recipes.md) includes a complete text-corpus preparation 
 
 Install from the repository with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
+Python 3.14 is recommended; Python 3.12 remains supported. TFDS training reads prepared ArrayRecords without TensorFlow. Builders that need TensorFlow run in a separate preparation environment, described in the installation guide.
+
 ```bash
 git clone https://github.com/AshishKumar4/dew.git
 cd dew
-uv venv --python 3.12
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install -e .
 ```
