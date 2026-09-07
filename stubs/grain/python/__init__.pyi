@@ -14,7 +14,7 @@ Extend as use grows; a use outside this surface fails here, naming it.
 
 import abc
 import builtins
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from os import PathLike
 from typing import Any, Generic, Protocol, TypeAlias, TypeVar, overload
 
@@ -40,19 +40,9 @@ class RandomMapTransform(abc.ABC):
         """Maps a single element: any record in, any record out."""
 
 
-class Batch:
-    """Form batches of `batch_size` records, whole ones only when asked."""
-
-    def __init__(
-        self,
-        batch_size: int,
-        drop_remainder: bool = ...,
-        batch_fn: Callable[[Sequence[Any]], Any] | None = ...,
-    ) -> None: ...
-
-
-Transformation: TypeAlias = Batch | RandomMapTransform
-"""What a data pipeline step is, of the kinds dew runs: a random map or a batch."""
+Transformation: TypeAlias = RandomMapTransform
+"""What a data pipeline step is, of the kinds dew runs: a random map. Batching
+and sharding are the iterator's, not a transformation's."""
 
 
 class MapDataset(Generic[T]):
@@ -88,10 +78,20 @@ class MapDataset(Generic[T]):
     ) -> IterDataset[T]: ...
 
 
+class DatasetIterator(Generic[T]):
+    """One pass over an `IterDataset` that can report and restore its place."""
+
+    def __iter__(self) -> DatasetIterator[T]: ...
+    def __next__(self) -> T: ...
+    def get_state(self) -> dict[str, Any]: ...
+    def set_state(self, state: dict[str, Any]) -> None: ...
+    def close(self) -> None: ...
+
+
 class IterDataset(Generic[T]):
     """Records read once, in order, with the worker machinery behind them."""
 
-    def __iter__(self) -> Iterator[T]: ...
+    def __iter__(self) -> DatasetIterator[T]: ...
     def mp_prefetch(
         self,
         options: MultiprocessingOptions | None = ...,
@@ -108,30 +108,13 @@ class IterDataset(Generic[T]):
 
 
 class ShardOptions:
-    """How a sampler or source splits records over processes."""
+    """How an iterator splits records over processes."""
 
 
 class ShardByJaxProcess(ShardOptions):
     """Shard index and count from the JAX process layout."""
 
     def __init__(self, drop_remainder: bool = ...) -> None: ...
-
-
-class Sampler:
-    """An index stream over records."""
-
-
-class IndexSampler(Sampler):
-    """Shuffled or ordered record indices, reshuffled every epoch."""
-
-    def __init__(
-        self,
-        num_records: int,
-        shard_options: ShardOptions = ...,
-        shuffle: bool = ...,
-        num_epochs: int | None = ...,
-        seed: int | None = ...,
-    ) -> None: ...
 
 
 class ReadOptions:
@@ -149,24 +132,6 @@ class MultiprocessingOptions:
         per_worker_buffer_size: int = ...,
         enable_profiling: bool = ...,
     ) -> None: ...
-
-
-class DataLoader:
-    """A source, a sampler and operations as an iterable of batches."""
-
-    def __init__(
-        self,
-        *,
-        data_source: RandomAccessDataSource[Any],
-        sampler: Sampler,
-        operations: Sequence[Transformation] = ...,
-        worker_count: int | None = ...,
-        worker_buffer_size: int = ...,
-        shard_options: ShardOptions | None = ...,
-        read_options: ReadOptions | None = ...,
-        enable_profiling: bool = ...,
-    ) -> None: ...
-    def __iter__(self) -> Iterator[Any]: ...
 
 
 class ArrayRecordDataSource(RandomAccessDataSource[bytes]):

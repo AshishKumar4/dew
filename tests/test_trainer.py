@@ -19,6 +19,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 
+from dew import position
 from dew.artifacts import Representations
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState
@@ -470,20 +471,53 @@ def test_a_checkpoint_that_does_not_land_fails_the_run(tmp_path):
         trainer.fit(Data(), steps=1, log_every=1)
 
 
+def _rewrite_position(trainer, step, rows):
+    """Save `step` again with `rows` as the checkpoint's position table."""
+    restored, _ = trainer.checkpoints.restore()
+    written = [np.frombuffer(row, np.uint8) for row in rows]
+    table = {"rows": np.stack(written),
+             "lengths": np.array([len(row) for row in written], np.int64)}
+    manager = trainer.checkpoints._open()
+    manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
+    manager.wait_until_finished()
+
+
 def test_a_position_written_by_another_process_count_is_refused(tmp_path):
-    """Each position is where one process's shard stopped; a table with two
-    rows has no row this single process can take over, and says so."""
+    """`Counting` reports where its own stream stopped; a table with two rows
+    has no row this single process can take over, and says so."""
     trainer = make_trainer(tmp_path)
     trainer.fit(Data(), steps=1, log_every=1)
-    restored, position = trainer.checkpoints.restore()
-    row = np.frombuffer(position, np.uint8)
-    doubled = {"rows": np.stack([row, row]), "lengths": np.array([len(row)] * 2, np.int64)}
-    manager = trainer.checkpoints._open()
-    manager.save(2, args=ocp.args.PyTreeSave({**restored, "position": doubled}), force=True)
-    manager.wait_until_finished()
+    _, saved = trainer.checkpoints.restore()
+    _rewrite_position(trainer, 2, [saved, saved])
 
     with pytest.raises(ValueError, match="position for each of 2 processes and this run has 1 process"):
         make_trainer(tmp_path).fit(Data(), steps=3)
+
+
+def test_a_global_position_is_read_by_any_process_count(tmp_path):
+    """A global position is a record count over an order every process count
+    reads the same way, so the table two processes wrote is this one
+    process's position as well. Only a shard offset ties a resume to the
+    count that wrote it."""
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=1, log_every=1)
+    global_position = position.encode(position.Global(records=16, order="Counting"))
+    _rewrite_position(trainer, 2, [global_position, global_position])
+
+    assert Checkpoints(str(tmp_path / "run")).restore(step=2)[1] == global_position
+
+
+def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
+    """Every process reports the same global position, so two that differ are
+    two orders, and no one of them is this run's place in its own."""
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=1, log_every=1)
+    _rewrite_position(trainer, 2, [
+        position.encode(position.Global(records=records, order="Counting"))
+        for records in (16, 32)])
+
+    with pytest.raises(ValueError, match="global data position that differs between the 2 processes"):
+        Checkpoints(str(tmp_path / "run")).restore(step=2)
 
 
 # --------------------------------------------------------------------------
