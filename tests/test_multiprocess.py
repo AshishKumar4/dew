@@ -528,6 +528,54 @@ def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_chec
     assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
+@pytest.fixture(scope="module")
+def elastic_checkpoint(tmp_path_factory):
+    """A three-step fit on two processes over `train_stream`, saved."""
+    directory = tmp_path_factory.mktemp("elastic-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, name="elastic", elastic=True,
+                       run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
+                       records=RECORDS)
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different global positions"
+    saved = json.loads(positions.pop())[worker.ENVELOPE]
+    assert saved["records"] == POOL_STEPS * worker.BATCH
+    return {"run_dir": directory / "run", "reports": reports}
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_checkpoint,
+                                                          processes):
+    """Two processes save where the run's data stopped, and one process or
+    four take it over.
+
+    Real processes, because a pool is where the position is gathered onto
+    every host, written by orbax from process zero and read back by
+    `read_position` against a process count that is not the one that wrote
+    it. The resumed pool has to land on the parameters of a pool of its own
+    size that nobody stopped: the global batches after the resume are the
+    global batches that run trained on, and the loss is a mean over the
+    step's rows, so which process holds which row cannot change them.
+    """
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(elastic_checkpoint["run_dir"], directory)
+    flags = {"name": "elastic", "elastic": True, "fsdp_size": 1,
+             "steps": 2 * POOL_STEPS, "records": RECORDS}
+
+    resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
+    whole = run_pool("fit", tmp_path / "whole", processes,
+                     run_dir=tmp_path / "whole-run", **flags)
+
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert json.loads(report["restored_dataset_state"])[worker.ENVELOPE]["records"] == (
+            POOL_STEPS * worker.BATCH)
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 # --------------------------------------------------------------------------
 # Preemption
 # --------------------------------------------------------------------------

@@ -7,6 +7,13 @@ the segment ids and positions the backbone's mask needs. Train shuffles from
 `seed`, reshuffled per epoch, and runs forever; val reads `val.bin` once, in
 file order, in whole batches, so every validation pass scores the same
 windows. Both shard by JAX process.
+
+They resume differently, and the difference is where the sharding sits.
+`TokenWindows` reads windows the loader shards after they are ordered, so a
+step is the same windows at any process count and its saved position is a
+global record count. `PackedTokens` packs its windows out of the documents
+one process was given, so a window depends on that slice and the position it
+saves is its own shard's; a resume needs the process count that wrote it.
 """
 
 from __future__ import annotations
@@ -88,7 +95,9 @@ class TokenWindows(DatasetSpec):
     """Fixed windows of `seq_len + 1` ids, each starting `seq_len` after the
     last, so record i's last token is record i + 1's first and the model sees
     every transition once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
-    `val_batches` bounds a validation pass; None scores all of val.bin."""
+    `val_batches` bounds a validation pass; None scores all of val.bin. The
+    training stream's saved position is a global window count, so a run
+    resumes on any process count the global batch divides over."""
 
     path: str | None = None
     seq_len: int = 256
@@ -176,7 +185,9 @@ class PackedTokens(DatasetSpec):
     can stop attention and the loss at document boundaries. This uses grain's
     `Dataset` API, which supports packing. Documents are sliced per process
     before packing. Sharding after it would have every process pack the same
-    ones.
+    ones, and slicing before it is what ties a saved position to the process
+    count that wrote it: which chunks share a window is a fact about one
+    process's documents, so there is no global record count to resume from.
 
     `records` counts window-sized chunks, the upper bound on the windows a
     pass over the split yields and the count a run has before it packs

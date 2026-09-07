@@ -56,7 +56,24 @@ Padding and packing affect the number of valid targets, even when array shapes m
 
 ## Resume from a data position
 
-A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires compatible data ordering, tokenizer, transforms, and process topology as well as the model checkpoint.
+A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires the same data ordering, tokenizer, and transforms as the model checkpoint.
+
+A position is one of two kinds, and the kind decides whether the process count is part of the resume contract.
+
+| Kind | Written by | Resumes on |
+|---|---|---|
+| Global record count | Every record dataset built on `train_stream`: token windows, images, video, prompts, preference pairs | Any process count that divides the global batch |
+| Shard offset | `PackedTokens` and `ChatMessages`, whose windows are packed out of one process's own documents, and custom iterators reporting their own state | The process count that wrote it |
+
+A global position is the number of records the whole run has consumed. Every process reports the same number, because the stream owns both the sharding and the batching: step *k* is records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*th record of that step. A checkpoint saved by two processes therefore restores on one or on four, and the steps after the resume are the steps an uninterrupted run would have taken. Restoring is a slice bound, not a replay: the resumed stream reads nothing it has already read.
+
+The position also records the order it counts into: the source's description, its record count, and the shuffle seed. A resume against a different record count or a different seed is refused. Two corpora of the same length and seed are told apart only when the source describes itself; a source without its own `__repr__` is named by type, so give a source you resume across runs a description that names its data.
+
+Which process holds which row of a step still depends on the process count. Record *q* of step *k* is read by process *q % n*, and the mesh lays each process's rows out together, so the same step arrives in a different row order at a different process count. Row-keyed randomness such as diffusion noise or sampled timesteps therefore lands on different records, and two process counts agree on a loss only because it is a mean over the step's rows.
+
+A record's own randomness does not depend on the count: the per-record RNG is keyed by the record's place in the endless shuffled stream. That key changed with the global position, so at a given seed the augmentations, captions, and clip starts of a run differ from those of a run recorded before the change, even where the record order is identical.
+
+A shard offset has no equivalent on another process count, and `Checkpoints.restore` refuses one whose table was written by a different number of processes, naming both counts. Resume such a run on the count that wrote it; there is no conversion to a global position.
 
 [Resuming training](../guides/checkpoints.md) shows the complete save/restore path. A model-only checkpoint cannot recover records consumed by an arbitrary generator.
 
