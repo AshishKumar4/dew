@@ -7,7 +7,7 @@
 <h1>Dew</h1>
 
 <a href="https://github.com/AshishKumar4/dew/actions/workflows/ci.yml"><img src="https://github.com/AshishKumar4/dew/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-<a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB" alt="Python 3.11+"></a>
+<a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12%2B-3776AB" alt="Python 3.12+"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2aa7a1" alt="MIT license"></a>
 
 <p><a href="docs/index.md">User guide</a> · <a href="docs/installation.md">Installation</a> · <a href="docs/reference/core-api.md">Core API</a> · <a href="docs/reference/support.md">Capabilities and limits</a></p>
@@ -28,7 +28,7 @@ With [uv](https://docs.astral.sh/uv/getting-started/installation/) installed, th
 ```bash
 git clone https://github.com/AshishKumar4/dew.git
 cd dew
-uv venv --python 3.12
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install -e .
 JAX_PLATFORMS=cpu python examples/readme_demo.py --out runs/readme-demo
@@ -397,12 +397,15 @@ During conditional training, the objective can drop conditions on some examples 
 
 This is a dataset-backed starting configuration for unconditional Oxford Flowers generation, beyond the 8×8 mechanics demo. It needs a CUDA-capable GPU, a compatible CUDA JAX installation, disk space for the prepared dataset/checkpoints, and the `tfds` extra. **The preparation and GPU training below were not executed for this guide.** No throughput, memory-fit, convergence, or image-quality result is claimed for this configuration.
 
-From the installed checkout, prepare Oxford Flowers once. These commands install optional packages and can download the dataset; inspect its access conditions first. Use a new TFDS directory if you already have a TFRecord preparation: Dew's random-access loader needs ArrayRecord rather than that format. The label file is created explicitly because `OxfordFlowers` reads label names when processing records, even in an unconditional run.
+Prepare Oxford Flowers in a **separate environment from Dew/JAX training**. Reading already prepared ArrayRecords does not require TensorFlow, but preparation can depend on TensorFlow and a builder's other dependencies. Do not infer that every TFDS builder can prepare without it. The commands below deliberately install TensorFlow only in a dedicated preparation environment; they can download packages and the dataset, so inspect the dataset's access conditions first.
+
+Preparation writes under `TFDS_DATA_DIR`; training receives the **exact prepared version directory**, not just that parent directory. Use a new preparation directory if the existing files are TFRecords rather than ArrayRecords. Python 3.13 below is the separately checked TensorFlow preparation interpreter; Dew/JAX training uses the recommended Python 3.14 environment instead.
 
 ```bash
-uv pip install -e ".[tfds]"
+uv venv --python 3.13 .venv-tfds-prepare
+uv pip install --python .venv-tfds-prepare/bin/python tensorflow-datasets==4.9.10 tensorflow==2.21.0 scipy
 export TFDS_DATA_DIR="$HOME/dew-data/tfds-arrayrecord"
-python - <<'PY'
+.venv-tfds-prepare/bin/python - <<'PY'
 import os
 from pathlib import Path
 import tensorflow_datasets as tfds
@@ -410,12 +413,18 @@ import tensorflow_datasets as tfds
 data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
 builder = tfds.builder("oxford_flowers102", data_dir=str(data_dir))
 builder.download_and_prepare(file_format="array_record")
-labels = data_dir / "flowers102-labels.txt"
-labels.write_text("\n".join(builder.info.features["label"].names) + "\n")
-print("Prepared", builder.info.full_name, "and", labels)
+print("Prepared version directory:", builder.data_dir)
 PY
 ```
 
+The preparation interpreter is invoked by path, so it does not replace your active Dew/JAX environment. Set `DEW_FLOWERS_PATH` to the printed `builder.data_dir`. For Oxford Flowers version 2.1.1 prepared above, use the path below; if the builder printed a different version directory, use that exact directory instead. Then install the reader extra into the separate training environment:
+
+```bash
+export DEW_FLOWERS_PATH="$TFDS_DATA_DIR/oxford_flowers102/2.1.1"
+uv pip install --python .venv/bin/python -e ".[tfds]"
+```
+
+This runtime command requires the TensorFlow-free `tfds` extra and explicit prepared-directory reader introduced in [commit de7793e](https://github.com/AshishKumar4/dew/commit/de7793e); older revisions also installed TensorFlow through that extra. Use the matching [installation guide](docs/installation.md), and do not activate the preparation environment for training merely because it contains TFDS. The prepared directory contains ArrayRecords, `dataset_info.json`, and the label vocabulary; those files cross the environment boundary, while the builder's TensorFlow preparation stack does not. With `labels=None`, `OxfordFlowers` derives `label.labels.txt` from `path`; `labels` remains an optional file override. In a recipe CLI, the equivalent source setting is `--data.path "$DEW_FLOWERS_PATH"`.
 Save this complete script as `train_flowers64.py`. It trains in pixels, without a CLIP/T5 tower or VAE, so the training script requires no pretrained model weights. `DiffusionRunConfig` records the actual model, process, data, optimizer, and trainer choices in `run.json`.
 
 ```python
@@ -434,7 +443,7 @@ from dew.training.runtime import prepare_process
 
 
 def main():
-    data_dir = Path(os.environ["TFDS_DATA_DIR"]).expanduser()
+    prepared_dir = Path(os.environ["DEW_FLOWERS_PATH"]).expanduser()
     config = DiffusionRunConfig(
         model=ModelConfig(
             "simple_dit",
@@ -443,8 +452,8 @@ def main():
             dtype="bfloat16", attention_impl="auto",
         ),
         data=OxfordFlowers(
+            path=str(prepared_dir), labels=None,
             image_size=64, augmentation="none", val_batches=4,
-            labels=str(data_dir / "flowers102-labels.txt"),
             loading=Loading(workers=4, threads=4, read_buffer=16, worker_buffer=2),
         ),
         preset=EDM(), sampler=Heun(), sampling_steps=32,
@@ -477,7 +486,7 @@ if __name__ == "__main__":
     main()
 ```
 
-With your CUDA JAX environment activated and `TFDS_DATA_DIR` still set, launch it with:
+With your CUDA JAX environment activated and `DEW_FLOWERS_PATH` set to the prepared version directory, launch it with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python train_flowers64.py
@@ -891,12 +900,12 @@ This maps responsibilities, **not interchangeable defaults**. Match alpha/sigma 
 
 ## Installation options and learning paths
 
-The distribution name is `dew-ml`; imports use `dew`. The project currently declares Python 3.11 or newer, and the demonstrated programs used the project's Python 3.12 environment. That declared compatibility floor is not a claim that 3.11 is the newest or optimal baseline; the supported baseline is under review. Use a virtual environment and record resolved dependency versions for work you need to reproduce.
+The distribution name is `dew-ml`; imports use `dew`. Dew requires **Python 3.12 or newer**. **Python 3.14 is the recommended runtime and primary CI target**; the installation commands in this guide select it. The program results recorded above were obtained with Python 3.12 and retain that provenance rather than being relabeled as Python 3.14 measurements. TensorFlow-dependent dataset preparation stays in its separate Python 3.13 environment. Use virtual environments and record resolved dependency versions for work you need to reproduce.
 
 For package-only use rather than editing a checkout:
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
 ```
