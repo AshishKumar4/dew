@@ -117,7 +117,7 @@ class GRPOObjective(LMObjective):
             ratio, jnp.asarray(batch[ADVANTAGES_KEY]), mask,
             epsilon_low=self.epsilon_low, epsilon_high=self.epsilon_high,
             dual_clip=self.dual_clip)
-        mass = jax.lax.stop_gradient(jnp.sum(mask))
+        mass = jax.lax.stop_gradient(jnp.sum(mask, dtype=jnp.promote_types(mask.dtype, jnp.float32)))
         pg = Mean(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), mass)
         pg_loss, _ = mean_loss(pg)
         metrics = {"pg": pg_loss, **{f"actor/{k}": v for k, v in aux.items()}}

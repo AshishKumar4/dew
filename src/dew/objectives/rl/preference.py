@@ -96,7 +96,7 @@ class DPOObjective(LMObjective):
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
         accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
-        return Mean(jnp.sum(terms), jnp.asarray(terms.size)), Aux[Variables]({
+        return Mean(jnp.sum(terms), jnp.asarray(terms.size, terms.dtype)), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
