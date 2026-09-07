@@ -240,6 +240,38 @@ The continuation includes the prompt and follows the learned pattern: `[[1, 2, 3
 
 For corpus training, `TokenWindows` reads tokenized binary files and `PackedTokens` packs documents with segment IDs and positions. `ChatMessages` renders chat templates and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
+### Supervised fine-tuning
+
+Fine-tune the trained decoder above by marking which targets belong to the assistant. Here the first four tokens provide the prompt; the remaining tokens are the response. `ChatMessages` produces this role column from chat templates when reading conversation data.
+
+```python
+from dew.data.chat import Role
+
+roles = np.full(batch["text"].shape, Role.USER, dtype=np.int8)
+roles[:, 4:] = Role.ASSISTANT
+sft_batch = {**batch, "text_roles": roles}
+sft_data = Dataset(
+    train=lambda: itertools.repeat(sft_batch),
+    val=None,
+    records=8,
+    batch=8,
+)
+sft_objective = LMObjective(
+    model,
+    seq_len=16,
+    pretrained=lm_state.params,
+    loss_role=Role.ASSISTANT,
+    ema_decay=None,
+)
+sft_state = Trainer(
+    sft_objective,
+    optax.adamw(1e-3),
+    key=jax.random.key(2),
+).fit(sft_data, steps=20, log_every=10)
+```
+
+The loss counts assistant targets after the next-token shift. Prompt tokens still provide context. For conversation files, `ChatMessages` also preserves tool calls, tool responses, and tool schemas.
+
 ### Preference optimization
 
 Continue from `model` and `lm_state` above with a chosen and rejected response. Both start with the prompt `[1, 2]`; the masks restrict the loss to the two response tokens.
@@ -264,6 +296,211 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples image groups, evaluates rewards, and records the transition densities used by the clipped policy objective. See [FlowGRPO](docs/concepts/post_training.md) for a complete image-reward example.
 
 For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function. `GRPOObjective` trains on their advantages, old log probabilities, and response masks. [`recipes/chain.py`](recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+
+### Reinforcement learning with a reward function
+
+This example continues the same decoder with a reward for choosing the expected next token. A task verifier can replace the reward function. The prompt batch uses the same numeric layout as `Prompts`, including UTF-8 reward metadata.
+
+```python
+from dew.objectives.rl import GRPOObjective, SampledRollout
+
+prompt_batch = {
+    "prompt": np.tile(np.array([1, 2], dtype=np.int32), (8, 1)),
+    "prompt_length": np.full(8, 2, dtype=np.int32),
+    "data_source": np.tile(
+        np.frombuffer(b"pattern", dtype=np.uint8).astype(np.int32),
+        (8, 1),
+    ),
+    "ground_truth": np.full((8, 1), ord("3"), dtype=np.int32),
+    "extra_info": np.zeros((8, 0), dtype=np.int32),
+}
+
+
+def reward(data_source, completion, ground_truth, extra_info):
+    return float(completion.split()[:1] == [ground_truth])
+
+
+rl_data = Dataset(
+    train=lambda: itertools.repeat(prompt_batch),
+    val=None,
+    records=8,
+    batch=8,
+)
+rl_objective = GRPOObjective(
+    model,
+    seq_len=5,
+    beta=0.01,
+    pretrained=lm_state.params,
+)
+rollout = SampledRollout(
+    rl_objective,
+    reward=reward,
+    groups=4,
+    max_new_tokens=4,
+    sampling=Sampling(temperature=2.0, top_k=4),
+)
+rl_state = Trainer(
+    rl_objective,
+    optax.adamw(1e-4),
+    key=jax.random.key(3),
+    rollout=rollout,
+).fit(rl_data, steps=20, log_every=10)
+```
+
+Each prompt produces four responses. Their relative rewards determine the advantages. GRPO uses a clipped policy objective and an optional reference KL term; `beta` sets its coefficient. For language tasks, supply a tokenizer's decoding function through `SampledRollout.decode`.
+
+### Diffusion language models
+
+Masked diffusion trains a bidirectional decoder to recover corrupted tokens. Unlike autoregressive training, each input row contains exactly `seq_len` tokens; there is no next-token shift. Reserve a vocabulary ID for the mask.
+
+```python
+from dew.diffusion.discrete import MDLM
+from dew.objectives import Step
+from dew.objectives.diffusion import MaskedDiffusionObjective
+
+masked_batch = {"text": batch["text"][:, :16]}
+masked_data = Dataset(
+    train=lambda: itertools.repeat(masked_batch),
+    val=None,
+    records=8,
+    batch=8,
+)
+masked_model = models.build(
+    "causal_transformer",
+    vocab_size=8,
+    emb_features=32,
+    num_layers=1,
+    num_heads=2,
+    mlp_features=64,
+    max_seq_len=16,
+    causal=False,
+)
+masked_objective = MaskedDiffusionObjective(
+    masked_model,
+    MDLM(mask_id=7)(),
+    seq_len=16,
+    ema_decay=0.9,
+    samples=4,
+    steps=16,
+)
+masked_state = Trainer(
+    masked_objective,
+    optax.adamw(3e-3),
+    key=jax.random.key(4),
+).fit(masked_data, steps=100, log_every=50)
+generated = masked_objective.preview(
+    masked_state.params,
+    masked_batch,
+    Step(
+        step=masked_state.microstep,
+        key=jax.random.key(5),
+        ema=masked_state.averaged,
+    ),
+)
+print(np.asarray(generated.tokens))
+```
+
+LLaDA and Dream use this masked-token path. Diffusion Gemma uses a different canvas/self-conditioning process.
+
+### JEPA representation learning
+
+Train an image encoder by predicting masked patch representations. This uses the Flowers data prepared in the quickstart, with 8×8 patches and a smaller predictor.
+
+```python
+from pathlib import Path
+
+import jax
+import optax
+
+from dew import Field, Trainer, metrics, models
+from dew.data import Loading, OxfordFlowers
+from dew.objectives.jepa import JepaObjective, multi_block_mask
+
+
+def train_jepa():
+    data = OxfordFlowers(
+        path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"),
+        split="train",
+        image_size=64,
+        val_batches=2,
+        loading=Loading(workers=0, threads=1, read_buffer=2),
+    ).load(batch=16)
+    encoder = models.build(
+        "jepa_encoder",
+        patch_size=8,
+        emb_features=64,
+        num_layers=2,
+        num_heads=4,
+    )
+    predictor = models.build(
+        "jepa_predictor",
+        grid=(8, 8),
+        emb_features=64,
+        predictor_features=32,
+        num_layers=1,
+        num_heads=4,
+    )
+    objective = JepaObjective(
+        encoder,
+        predictor,
+        mask=multi_block_mask((8, 8), num_targets=1, scale=(0.25, 0.25)),
+        sample=Field("image", (64, 64, 3)),
+        momentum_steps=20,
+    )
+    return Trainer(
+        objective,
+        optax.adamw(1e-3),
+        key=jax.random.key(0),
+    ).fit(
+        data,
+        steps=20,
+        log_every=10,
+        eval_every=20,
+        metrics=(metrics.knn_probe(102),),
+    )
+
+
+if __name__ == "__main__":
+    jepa_state = train_jepa()
+```
+
+The target encoder follows an EMA of the context encoder. The loss compares predicted and target representations, rather than reconstructing pixels. The kNN metric is a half-batch diagnostic; use a larger labeled evaluation for representation quality. `jepa_video_encoder` extends the same objective to video clips.
+
+### Loading pretrained weights
+
+Load a supported checkpoint from a Hub repository or local directory. This example downloads Qwen3-0.6B and its tokenizer on first use; the released-weight download has not been run for this README.
+
+```python
+import jax
+import jax.numpy as jnp
+from transformers import AutoTokenizer
+
+from dew.interop import load_pretrained_decoder
+from dew.sampling import Sampling, generate
+
+checkpoint = "Qwen/Qwen3-0.6B"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+pretrained_model, variables, config = load_pretrained_decoder(
+    checkpoint,
+    dtype="bfloat16",
+    max_seq_len=512,
+)
+prompt = jnp.asarray(
+    [tokenizer.encode("Explain gradient accumulation in one paragraph.")],
+    dtype=jnp.int32,
+)
+result = generate(
+    pretrained_model,
+    variables,
+    prompt,
+    max_new_tokens=128,
+    key=jax.random.key(0),
+    sampling=Sampling(temperature=0.8, top_k=40, eos_id=tokenizer.eos_token_id),
+)
+print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
+```
+
+Pass `pretrained=variables` to `LMObjective` or a post-training objective to continue from those weights. Tokenize training data with the checkpoint's own tokenizer. For pretrained diffusion runs, `TextToImage.from_run` reads the saved recipe and checkpoint; CLIP/T5 conditioning and a configured VAE are restored with the run.
 
 ### Custom Flax models
 
@@ -342,6 +579,90 @@ Models use configurable compute dtypes and hardware-dependent attention kernels:
 Set `remat=True` on a decoder to recompute block activations during the backward pass. This reduces retained activation memory at the cost of additional computation; it composes with layer scanning.
 
 Start with [distributed training](docs/concepts/distributed.md) and the [TPU guide](docs/tpu.md). [Benchmarks](docs/benchmarks.md) and [performance notes](docs/performance.md) record workload sizes, hardware, memory, and timing. Physical multi-host GPU/TPU qualification is still limited.
+
+### Multiple hosts
+
+Use the same script on each host. The example below uses two hosts with two visible GPUs each and shards model state over all four devices. Both hosts must read the same token files and checkpoint directory.
+
+Prepare byte-token data from your corpus and place it on shared storage:
+
+```bash
+python tools/tokenize_text.py \
+    --input corpus.txt \
+    --out /shared/tokens \
+    --tokenizer byte \
+    --val-fraction 0.01
+```
+
+Save as `train_multihost.py`. Initialize the process group before constructing device arrays.
+
+```python
+import os
+
+import jax
+import optax
+
+
+def main():
+    jax.distributed.initialize(
+        coordinator_address=os.environ["DEW_COORDINATOR"],
+        num_processes=int(os.environ["DEW_WORLD_SIZE"]),
+        process_id=int(os.environ["DEW_RANK"]),
+    )
+    try:
+        from dew import Checkpoints, MeshSpec, Trainer, models
+        from dew.data import Loading, TokenWindows
+        from dew.objectives.lm import LMObjective
+
+        data = TokenWindows(
+            path=os.environ["DEW_TOKEN_DIR"],
+            seq_len=128,
+            loading=Loading(workers=0, threads=1, read_buffer=2),
+        ).load(batch=16)
+        model = models.build(
+            "causal_transformer",
+            vocab_size=256,
+            emb_features=128,
+            num_layers=2,
+            num_heads=4,
+            mlp_features=256,
+            max_seq_len=128,
+            dtype="bfloat16",
+        )
+        trainer = Trainer(
+            LMObjective(model, seq_len=128),
+            optax.adamw(3e-4),
+            key=jax.random.key(0),
+            mesh=MeshSpec(fsdp=4),
+            checkpoints=Checkpoints(os.environ["DEW_CHECKPOINT_DIR"]),
+        )
+        state = trainer.fit(
+            data,
+            steps=int(os.environ.get("DEW_STEPS", "1000")),
+            log_every=20,
+            checkpoint_every=200,
+        )
+        print(f"Process {jax.process_index()}: {int(state.updates)} updates")
+    finally:
+        jax.distributed.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Set these variables on both hosts, changing `DEW_RANK` to `1` on the second host and using the first host's reachable address for the coordinator:
+
+```bash
+export DEW_COORDINATOR="10.0.0.1:43217"
+export DEW_WORLD_SIZE=2
+export DEW_RANK=0
+export DEW_TOKEN_DIR=/shared/tokens
+export DEW_CHECKPOINT_DIR=/shared/runs/lm
+CUDA_VISIBLE_DEVICES=0,1 JAX_PLATFORMS=cuda python train_multihost.py
+```
+
+`batch=16` is global, so each process reads eight rows. The program completed with two local JAX processes and four simulated CPU devices; the two-host GPU launch has not been exercised.
 
 ## Data and configuration
 
