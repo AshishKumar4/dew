@@ -17,7 +17,9 @@ from flax.core import freeze
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inputs import RowPlan, local_rows, mesh_of, request_key
+from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.artifacts import agree_process_phase
+from jax.experimental import multihost_utils
 from dew.objectives.base import Variables
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
@@ -43,6 +45,7 @@ class DenoisingInputs:
     conditions: Mapping[str, object] = struct.field(default_factory=dict)
     unconditional: Mapping[str, object] = struct.field(default_factory=dict)
     rows: int = struct.field(pytree_node=False, default=0)
+    grid_steps: int | None = struct.field(pytree_node=False, default=None)
 
 
 @struct.dataclass
@@ -113,7 +116,7 @@ class TextToImage:
 
         `ema` reads the averaged weights when the run kept them. With `mesh`
         the weights restore straight onto that mesh under `layout`, the way
-        the trainer places them; without one they land on the default device.
+        the trainer places them; without one the default mesh uses the current pool.
         """
         from dew.objectives.diffusion import DiffusionRunConfig
 
@@ -133,6 +136,8 @@ class TextToImage:
     def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
         """The process and explicit time grid a `steps` call walks; the grid
         is concrete, so the compiled trajectory has its length and values."""
+        if type(steps) is not int or steps < 1:
+            raise ValueError("steps must be a positive integer")
         if self.grid is None:
             return self.process, None
         process, times = self.grid(steps)
@@ -156,9 +161,7 @@ class TextToImage:
     def _conditions(self) -> tuple[tuple[str, object], ...]:
         return tuple((keyword, condition.encoder) for keyword, condition in self.inputs.conditions.items())
 
-    def _unconditional(self) -> dict:
-        tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
-                  for keyword, condition in self.inputs.conditions.items()}
+    def _unconditional(self, tokens) -> dict:
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
     def prepare(self, prompts: str | Sequence[str], *, key: jax.Array | None = None,
@@ -168,18 +171,46 @@ class TextToImage:
         `steps` is the trajectory length the noise is drawn for when a `grid`
         ties the prior to the step count; a call over prepared inputs should
         ask for the same count."""
-        rows = [prompts] if isinstance(prompts, str) else list(prompts)
-        if not rows or not all(isinstance(prompt, str) for prompt in rows):
-            raise ValueError("prompts must be a non-empty string sequence")
-        request = request_key(key, seed)
-        process, _ = self.prepared_process(self.steps if steps is None else steps)
-        plan = RowPlan.over(mesh_of(self.params), len(rows))
-        tokens = {keyword: condition.encoder.tokenize(rows)
-                  for keyword, condition in self.inputs.conditions.items()}
+        mesh = mesh_of(self.params)
+        prepared = None
+        error = None
+        try:
+            rows = [prompts] if isinstance(prompts, str) else list(prompts)
+            if not rows or not all(isinstance(prompt, str) for prompt in rows):
+                raise ValueError("prompts must be a non-empty string sequence")
+            request = request_key(key, seed)
+            count = self.steps if steps is None else steps
+            process, times = self.prepared_process(count)
+            plan = RowPlan.over(mesh, len(rows))
+            tokens = {keyword: condition.encoder.tokenize(rows)
+                      for keyword, condition in self.inputs.conditions.items()}
+            null_tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
+                           for keyword, condition in self.inputs.conditions.items()}
+            for leaf in jax.tree.leaves(tokens):
+                if leaf.ndim < 1 or leaf.shape[0] != len(rows):
+                    raise ValueError("tokenized conditions must have one row per prompt")
+            for leaf in jax.tree.leaves(null_tokens):
+                if leaf.ndim < 1 or leaf.shape[0] != 1:
+                    raise ValueError("unconditional tokens must have one row")
+            shape = self.latent_shape
+            controls = (plan.rows, count, times, shape, tuple(np.asarray(jax.random.key_data(request))))
+            signature = generation_signature((tokens, null_tokens), controls)
+            prepared = plan, process, request, tokens, null_tokens, shape, count, signature
+        except Exception as failure:
+            error = failure
+        if mesh is not None:
+            agree_process_phase(error, phase="image input preparation")
+        elif error is not None:
+            raise error
+        assert prepared is not None
+        plan, process, request, tokens, null_tokens, shape, count, signature = prepared
+        if plan.processes > 1:
+            multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
         placed = plan.place(plan.pad(tokens))
         given = _encode(plan.sharding)(self._conditions, self.params, placed)
-        noise = _noise(plan.sharding)(process, plan.keys(request), self.latent_shape)
-        return DenoisingInputs(noise, given, self._unconditional(), rows=plan.rows)
+        noise = _noise(plan.sharding)(process, plan.keys(request), shape)
+        return DenoisingInputs(noise, given, self._unconditional(null_tokens), rows=plan.rows,
+                               grid_steps=count if self.grid is not None else None)
 
     def __call__(self, prompts: str | Sequence[str] | DenoisingInputs, *, steps: int | None = None,
                  guidance: CFG | float | None | object = _UNSET, sampler: Solver[object] | None = None,
@@ -187,38 +218,69 @@ class TextToImage:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
-        chosen = self.guidance if guidance is _UNSET else guidance
-        if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
-            chosen = CFG(float(chosen))
-        if chosen is not None and not isinstance(chosen, CFG):
-            raise ValueError("guidance must be a scale, a CFG value or None")
-        request = request_key(key, seed)
-        count = self.steps if steps is None else steps
-        process, times = self.prepared_process(count)
-        prepared = (prompts if isinstance(prompts, DenoisingInputs)
-                    else self.prepare(prompts, key=request, steps=count))
-        if prepared.noise.ndim != len(self.latent_shape) + 1 or prepared.noise.shape[1:] != self.latent_shape:
-            raise ValueError(f"initial noise must have shape [batch, {self.latent_shape}]")
-        plan = RowPlan.over(mesh_of(self.params), prepared.rows)
-        if prepared.noise.shape[0] != plan.global_rows:
-            raise ValueError("the prepared inputs were placed for a different mesh")
+        mesh = mesh_of(self.params)
+        settings = None
+        error = None
+        try:
+            chosen = self.guidance if guidance is _UNSET else guidance
+            if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
+                chosen = CFG(float(chosen))
+            if chosen is not None and not isinstance(chosen, CFG):
+                raise ValueError("guidance must be a scale, a CFG value or None")
+            request = request_key(key, seed)
+            count = self.steps if steps is None else steps
+            process, times = self.prepared_process(count)
+            solver = self.sampler if sampler is None else sampler
+            prepared = prompts if isinstance(prompts, DenoisingInputs) else None
+            if prepared is not None:
+                if prepared.grid_steps is not None and count != prepared.grid_steps:
+                    raise ValueError("prepared noise belongs to a different source grid; prepare it for these steps")
+                shape = self.latent_shape
+                if prepared.noise.ndim != len(shape) + 1 or prepared.noise.shape[1:] != shape:
+                    raise ValueError(f"initial noise must have shape [batch, {shape}]")
+                if type(prepared.rows) is not int or prepared.rows < 1:
+                    raise ValueError("prepared inputs must declare a positive number of local rows")
+                plan = RowPlan.over(mesh, prepared.rows)
+                if prepared.noise.shape[0] != plan.global_rows or mesh_of(prepared.noise) != mesh:
+                    raise ValueError("the prepared inputs were placed for a different mesh")
+                for leaf in jax.tree.leaves(prepared.conditions):
+                    if leaf.ndim < 1 or leaf.shape[0] != plan.global_rows:
+                        raise ValueError("prepared conditions must match the noise batch")
+            controls = (count, times, solver, chosen, self.final_denoise,
+                        tuple(np.asarray(jax.random.key_data(request))), prepared is not None)
+            signature = generation_signature(prepared, controls)
+            settings = prepared, request, count, process, times, solver, chosen, signature
+        except Exception as failure:
+            error = failure
+        if mesh is not None:
+            agree_process_phase(error, phase="image sampling setup")
+        elif error is not None:
+            raise error
+        assert settings is not None
+        prepared, request, count, process, times, solver, chosen, signature = settings
+        if mesh is not None and jax.process_count() > 1:
+            multihost_utils.assert_equal(signature, "image execution controls must agree across processes")
+        if prepared is None:
+            assert not isinstance(prompts, DenoisingInputs)
+            prepared = self.prepare(prompts, key=request, steps=count)
+        plan = RowPlan.over(mesh, prepared.rows)
         images = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                     self.sampler if sampler is None else sampler, chosen, self.final_denoise,
-                                     times, self.params, prepared.conditions, prepared.unconditional,
+                                     solver, chosen, self.final_denoise, times, self.params,
+                                     prepared.conditions, prepared.unconditional,
                                      prepared.noise, jax.random.fold_in(request, 1))
         return Images(images, rows=plan.rows)
 
 
 def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: MeshSpec | None,
                       layout: Layout | None, dtype: str | None) -> Variables:
-    """A run's published variables, restored onto a mesh under a layout or onto the default device.
+    """A run's published variables, restored onto the current mesh under a layout.
 
     The checkpoint is its own template. `ema` merges the averaged copy over
     the live weights when the run kept one; `dtype` casts the floating leaves.
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
-    from dew.training.distributed import Layout as DefaultLayout, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
 
     checkpoints = Checkpoints(directory)
     stored = checkpoints.stored(step)
@@ -226,12 +288,13 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     averaged = ema and stored["ema"] is not None
     if averaged:
         template["ema"] = stored["ema"]
-    if mesh is not None:
-        device_mesh = build_mesh(mesh)
-        placement = (DefaultLayout() if layout is None else layout).shardings(device_mesh, template)
-        template = jax.tree.map(
-            lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-            template, placement)
+    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    chosen_layout = DefaultLayout() if layout is None else layout
+    placement = chosen_layout.shardings(device_mesh, template)
+    chosen_layout.check(template["params"], placement["params"], device_mesh)
+    template = jax.tree.map(
+        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+        template, placement)
     values, _ = checkpoints.restore(template, step=step)
     params = values["params"]
     if averaged:

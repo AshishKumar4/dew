@@ -19,7 +19,7 @@ print(task("The capital of France is", 32, seed=0).text[0])
 
 ## Placement
 
-Weights are placed once, when the task is built. Without `mesh` they land on the default device. With `mesh=MeshSpec(...)` the front door builds that mesh and shards the weights under `layout` with the same rules the trainer uses for a train state (`Layout.shardings`); a run's checkpoint restores straight onto the mesh, without a host copy.
+Weights are placed once, when the task is built. Without `mesh`, the default `MeshSpec()` uses the current process pool's devices in data parallelism. With `mesh=MeshSpec(...)` the front door builds that mesh and shards the weights under `layout` with the same rules the trainer uses for a train state (`Layout.shardings`); a run's checkpoint restores straight onto the mesh, without a host copy.
 
 Every call splits its rows over the mesh's batch axes. Each process hands in its own rows, the way `SampledRollout` does, and every process must hand in the same number of rows at the same padded width; rows pad up to the device count with repeats that produce nothing. Results keep that placement: the arrays in a `Generation`, `CanvasGeneration` or `Images` are global arrays sharded by row, so a result can feed the next device computation without a gather. `result.host()` returns the same record over host arrays holding this process's real rows, in order. Each row's random draw folds in its global row index, so a pool draws exactly what a single process draws for the same prompts; the canvas sampler is the exception, since it draws one key per refinement for the whole batch.
 
@@ -37,7 +37,7 @@ grid = result.host().images                       # this process's rows, as NumP
 
 `Generation.text` decodes each row's valid continuation through the bound processor on first access; `task.decode(result)` is the same text. A task built without a processor takes token rows and returns token rows.
 
-`Sampling` carries the text policy: temperature, top-k, nucleus top-p, relative min-p, the EOS ids and the padding id. `TextToImage` carries `steps`, `guidance` and `sampler` defaults; a call may override any of them, and `guidance=None` is the plain conditional prediction. `TextToImage.prepare(prompts, seed=...)` encodes prompts and draws their noise once, so several solvers can run on the same `DenoisingInputs`.
+`Sampling` carries the text policy: temperature, top-k, nucleus top-p, relative min-p, the EOS ids and the padding id. `TextToImage` carries `steps`, `guidance` and `sampler` defaults; a call may override any of them, and `guidance=None` is the plain conditional prediction. `TextToImage.prepare(prompts, seed=..., steps=...)` encodes prompts and draws their noise once, so several solvers can run on the same `DenoisingInputs`. Source-grid noise records its step count; changing that count requires preparing it again. Invalid image prompts, controls, prepared shapes and missing text budgets are coordinated before device work, so a bad request on one rank is rejected on the others too.
 
 ## Workflows
 

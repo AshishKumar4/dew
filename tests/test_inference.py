@@ -447,3 +447,5 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     prepared = start.prepare(["a"], key=key, steps=4)
     np.testing.assert_array_equal(start(prepared, steps=4, sampler=Heun(), key=key).images,
                                   np.clip(np.asarray(prepared.noise), -1.0, 1.0))
+    with pytest.raises(ValueError, match="different source grid"):
+        start(prepared, steps=3, seed=3)

@@ -74,10 +74,12 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
 
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: object | None,
-                 collective: bool) -> ModelInputs:
+                 collective: bool, max_new_tokens: int | None, default_tokens: int | None) -> tuple[ModelInputs, int]:
     inputs = None
+    budget = None
     error = None
     try:
+        budget = _budget(max_new_tokens, default_tokens)
         inputs = _prepared(processor, request, images=images)
     except Exception as failure:
         error = failure
@@ -85,8 +87,8 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: objec
         agree_process_phase(error, phase="inference task input preparation")
     elif error is not None:
         raise error
-    assert inputs is not None
-    return inputs
+    assert inputs is not None and budget is not None
+    return inputs, budget
 
 
 def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
@@ -133,9 +135,10 @@ class TextGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None,
                  sampling: Sampling | None = None, images: object | None = None) -> Generation:
-        inputs = _task_inputs(self.processor, request, images=images,
-                              collective=mesh_of(self.variables) is not None)
-        result = generate(self.model, self.variables, inputs, _budget(max_new_tokens, self.max_new_tokens),
+        inputs, budget = _task_inputs(self.processor, request, images=images,
+                                      collective=mesh_of(self.variables) is not None,
+                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens)
+        result = generate(self.model, self.variables, inputs, budget,
                           key=key, seed=seed, sampling=self.sampling if sampling is None else sampling)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
         return replace(result, decoder=decoder)
@@ -174,9 +177,10 @@ class BlockGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None,
                  process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
-        inputs = _task_inputs(self.processor, request, images=images, collective=True)
+        inputs, budget = _task_inputs(self.processor, request, images=images, collective=True,
+                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens)
         result = (self.process if process is None else process).generate(
-            self.model, self.variables, inputs, _budget(max_new_tokens, self.max_new_tokens),
+            self.model, self.variables, inputs, budget,
             key=key, seed=seed, eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
         return replace(result, decoder=decoder)

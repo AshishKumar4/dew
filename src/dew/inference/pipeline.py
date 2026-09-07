@@ -5,8 +5,8 @@ A run directory holds `run.json` and checkpoints; a diffusion run becomes a
 (a Hub repository or a directory in its layout) loads through
 `dew.interop.load_pretrained` and becomes a `TextGeneration`, or a
 `BlockGeneration` for a DiffusionGemma. Weights are placed once: on a mesh
-under a layout, the way the trainer places a train state, or on the
-default device. A just-trained state needs no reload; its objective's
+under a layout, the way the trainer places a train state. The default mesh
+uses the current pool's devices. A just-trained state needs no reload; its objective's
 `pipeline(state)` binds it in place.
 """
 
@@ -39,8 +39,8 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
 
     `source` is a run directory, or a source checkpoint directory or Hub
     repository. `mesh` places the weights on that mesh under `layout` (the
-    trainer's default when None); without a mesh they land on the default
-    device. `dtype` casts a run's floating weights, or is the source loader's
+    trainer's default when None). Without `mesh`, data parallelism uses the
+    current pool's devices. `dtype` casts a run's floating weights, or is the source loader's
     compute dtype. `ema` reads a run's averaged weights when it kept them;
     `step` selects a run's checkpoint; `revision` pins a Hub source.
     """
@@ -81,18 +81,18 @@ def _from_source(source: str, *, mesh, layout, dtype, revision):
     options = {} if dtype is None else {"dtype": dtype}
     loaded = load_pretrained(source, revision=revision, **options)
     task = loaded.block_generation() if isinstance(loaded.model, DiffusionGemma) else loaded.text_generation()
-    if mesh is None:
-        return task
     return task.bind(place(loaded.variables, mesh, layout))
 
 
-def place(variables, mesh: MeshSpec, layout: Layout | None):
+def place(variables, mesh: MeshSpec | None, layout: Layout | None):
     """`variables` on the mesh `mesh` describes, sharded the way the trainer
     shards a train state's parameters under `layout`."""
-    from dew.training.distributed import Layout as DefaultLayout, build_mesh
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
 
-    device_mesh = build_mesh(mesh)
-    shardings = (DefaultLayout() if layout is None else layout).shardings(device_mesh, variables)
+    device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
+    chosen_layout = DefaultLayout() if layout is None else layout
+    shardings = chosen_layout.shardings(device_mesh, variables)
+    chosen_layout.check(variables, shardings, device_mesh)
     return jax.device_put(variables, shardings)
 
 

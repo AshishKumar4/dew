@@ -125,7 +125,7 @@ class AttentionMetadata:
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
 
-def generation_signature(inputs: ModelInputs, controls: object) -> np.ndarray:
+def generation_signature(inputs: object, controls: object) -> np.ndarray:
     """Digest execution shapes and stable host controls without reading payloads.
 
     Algorithms agree this fixed-width signature after local validation and
