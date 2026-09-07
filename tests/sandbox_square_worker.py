@@ -38,6 +38,9 @@ def main():
             identity = request["episode"]
             if mode == "hang":
                 time.sleep(3600)
+            if mode == "cpu":
+                while True:
+                    pass
             if mode == "allocate":
                 block = bytearray(4 * 1024 ** 3)
                 block[-1] = 1

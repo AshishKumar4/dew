@@ -136,3 +136,22 @@ def test_episodes_collect_through_subprocess_workers():
     batch = rollout.project(episodes)
     assert batch["input_ids"].shape[1] == PROMPT + rollout.max_new_tokens
     assert np.isfinite(batch["advantages"]).all()
+
+
+def test_cpu_limit_kills_a_busy_worker():
+    with environment("cpu", cpu_seconds=1, wall_seconds=10.)(IDENTITY) as session:
+        with pytest.raises(ChildProcessError, match="code -9"):
+            session.reset()
+
+
+def test_cancellation_releases_the_real_worker():
+    from concurrent.futures import CancelledError
+
+    pids: list[int] = []
+    cancellation = CancelledError("owner cancelled the tool episode")
+    with pytest.raises(CancelledError) as caught:
+        with environment()(IDENTITY) as session:
+            pids = json.loads(session.reset().detail)
+            raise cancellation
+    assert caught.value is cancellation
+    assert wait_gone(pids) == []

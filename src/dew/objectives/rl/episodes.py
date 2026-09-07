@@ -512,6 +512,15 @@ class EpisodeRollout:
         return _phase(lambda: self.project(episodes), "episode projection")
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
+        """GRPO action rows with one group-relative advantage per episode."""
+        batch = self.tensors(episodes)
+        rewards = jnp.asarray([episode.reward for episode in episodes], jnp.float32)
+        advantages = np.asarray(group_advantage(rewards, self.groups))
+        batch[ADVANTAGES_KEY] = np.broadcast_to(np.repeat(advantages, self.max_turns)[:, None],
+                                               batch[RESPONSE_MASK_KEY].shape)
+        return batch
+
+    def tensors(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
         """Project action tokens from one collection; padded turns have zero support.
 
         Every episode and action must retain that collection's private binding
@@ -544,7 +553,6 @@ class EpisodeRollout:
             if episode.identity.task != group_start.identity.task:
                 raise ValueError("an advantage group must contain the same task")
             rewards.append(episode.reward)
-        advantages = np.asarray(group_advantage(jnp.asarray(rewards, jnp.float32), self.groups))
         rows = len(episodes) * self.max_turns
         prompt, response = self.max_prompt_tokens, self.max_new_tokens
         ids = np.full((rows, prompt + response), self.sampling.pad_id, np.int32)
@@ -573,7 +581,6 @@ class EpisodeRollout:
             BEHAVIOR_LOG_PROBS_KEY: behavior, RESPONSE_LENGTH_KEY: lengths,
             LENGTH_KEY: prompt_lengths, TERMINATED_KEY: terminated,
             REWARDS_KEY: np.repeat(np.asarray(rewards, np.float32), self.max_turns),
-            ADVANTAGES_KEY: np.broadcast_to(np.repeat(advantages, self.max_turns)[:, None], mask.shape),
             "episode_status": np.repeat(np.asarray([episode.status for episode in episodes], np.int32), self.max_turns),
             "task_id": np.repeat(np.asarray([episode.identity.task for episode in episodes], np.int32), self.max_turns),
             "policy_step": np.full(rows, policy_step, np.int32),
