@@ -34,7 +34,8 @@ import os
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple, Union
+from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Protocol,
+                    Tuple, Union)
 
 import ml_dtypes
 import numpy as np
@@ -2114,8 +2115,62 @@ def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
         allow_patterns=["*.safetensors", "*.json"]))
 
 
+class ExportTokenizer(Protocol):
+    """What an export needs of a tokenizer: its own writer.
+
+    HF tokenizers, HF processors, Dew's `Processor` and Dew's `HFTokenizer`
+    all satisfy it. Dew's byte vocabulary does not, and cannot: no HF file
+    describes it, so a byte export is named rather than written.
+    """
+
+    def save_pretrained(self, directory: str, /) -> object: ...
+
+
+def save_export_assets(directory, *, tokenizer: Union[str, ExportTokenizer, None] = None,
+                       generation_config: Optional[Mapping[str, Any]] = None) -> None:
+    """The non-weight half of an HF export: the tokenizer's files and generation_config.json.
+
+    Weights beside a config.json are not a checkpoint anything can read a
+    prompt with. transformers looks for tokenizer_config.json, and so do
+    llama.cpp's converter and every runtime built on it, so the tokenizer
+    writes its own assets here rather than the export naming one it does not
+    ship.
+
+    `tokenizer` is whatever the caller knows the run's vocabulary by: an HF
+    tokenizer or processor object, Dew's own `HFTokenizer`, or the name a
+    training run was given, resolved through `tokenizer_for` from local files
+    only. The name is recorded under `tokenizer_name` as well, because the
+    path a checkpoint sits at says nothing about which vocabulary its ids came
+    from, and because Dew's byte vocabulary is not an HF tokenizer and has no
+    assets to write at all.
+    """
+    values: Dict[str, Any] = ({'do_sample': True, 'use_cache': True}
+                              if generation_config is None else dict(generation_config))
+    name: Optional[str] = None
+    writer: Optional[ExportTokenizer] = None
+    if isinstance(tokenizer, str):
+        from dew.data.text import ByteTokenizer, tokenizer_for
+        name = tokenizer
+        resolved = tokenizer_for(tokenizer, local_files_only=True)
+        # Dew's byte vocabulary is no HF tokenizer and no HF file describes
+        # it, so the name it was exported with is the whole record of it.
+        writer = None if isinstance(resolved, ByteTokenizer) else resolved
+    elif tokenizer is not None:
+        writer = tokenizer
+        recorded = getattr(tokenizer, 'name', None)
+        name = recorded if isinstance(recorded, str) else None
+    os.makedirs(directory, exist_ok=True)
+    if writer is not None:
+        writer.save_pretrained(str(directory))
+    if name is not None:
+        values.setdefault('tokenizer_name', name)
+    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
+        json.dump(values, handle, indent=2)
+
+
 def save_pretrained_decoder(model, variables, directory, *,
-                            tokenizer_name: Optional[str] = None) -> None:
+                            tokenizer: Union[str, ExportTokenizer, None] = None,
+                            generation_config: Optional[Mapping[str, Any]] = None) -> None:
     """Write a decoder back out in the HF layout: config.json, model.safetensors.
 
     The inverse of load_pretrained, the same field map run backwards.
@@ -2124,6 +2179,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     predicate matches the model names the model_type: a model with the
     sandwich norms writes gemma3_text, one with q/k norms qwen3, one with
     biased q/k/v over a bias-free o_proj qwen2, and a plain stack llama.
+
+    `tokenizer` is the vocabulary the weights were trained against, by object
+    or by name; `save_export_assets` writes its files beside them, so one call
+    leaves a directory `load_pretrained` reads back with its processor. This is
+    the writer `Pretrained.save` delegates a decoder to, so the two agree on
+    what a complete export contains.
     """
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -2165,13 +2226,8 @@ def save_pretrained_decoder(model, variables, directory, *,
         hf_tensors[hf_name] = np.ascontiguousarray(
             leaf.T if name.endswith('.kernel') else leaf)
 
-    os.makedirs(directory, exist_ok=True)
     save_hf_layout(hf_tensors, config, directory)
-    generation_config: Dict[str, Any] = {'do_sample': True, 'use_cache': True}
-    if tokenizer_name is not None:
-        generation_config['tokenizer_name'] = tokenizer_name
-    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
-        json.dump(generation_config, handle, indent=2)
+    save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
 
 
 def _flatten(tree: Mapping[str, Any], prefix: str = '') -> Dict[str, Any]:

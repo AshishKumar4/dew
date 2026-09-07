@@ -18,6 +18,8 @@ pytestmark = pytest.mark.mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEQ = 32
+# The committed byte-level BPE a run can train with offline.
+TOKENIZER = REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
 
 
 def load_recipe():
@@ -152,8 +154,9 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
     """A local HF-layout decoder, the way a --pretrained run is pointed at one.
 
     Exported through save_pretrained_decoder, so the directory has the shape
-    a hub repo has: config.json, model.safetensors and the generation_config
-    that records which tokenizer its ids come from.
+    a hub repo has: config.json, model.safetensors, the generation_config
+    that records which tokenizer its ids come from, and that tokenizer's own
+    files whenever it is one that has any.
     """
     from dew.interop.hf_decoders import save_pretrained_decoder
     from dew.registry import models
@@ -162,7 +165,7 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
                          num_layers=1, num_heads=2, num_kv_heads=1, mlp_features=32,
                          max_seq_len=SEQ, tie_embeddings=False)
     variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
-    save_pretrained_decoder(model, variables, str(directory), tokenizer_name=tokenizer)
+    save_pretrained_decoder(model, variables, str(directory), tokenizer=tokenizer)
     return directory
 
 
@@ -239,9 +242,55 @@ def test_a_pretrained_run_refuses_overrides_and_a_foreign_tokenizer(tmp_path):
             recipe, tokens, checkpoint, "--trainer.steps", "1",
             model_config='{"emb_features": 32}'))
 
-    foreign = export_tiny_decoder(tmp_path / "foreign", tokenizer="gpt2")
-    with pytest.raises(ValueError, match="expects gpt2"):
+    # A name an export can resolve offline, since it now writes the assets of
+    # the tokenizer it names rather than only recording the name.
+    foreign = export_tiny_decoder(tmp_path / "foreign", tokenizer=str(TOKENIZER),
+                                  vocab_size=384)
+    with pytest.raises(ValueError, match="expects .*tiny-tools"):
         recipe.main(pretrained_config(recipe, tokens, foreign, "--trainer.steps", "1"))
+
+
+def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
+    """The artifact a --pretrained run leaves behind, taken all the way back.
+
+    The checkpoint is exported with the tokenizer its ids came from, the
+    recipe continues it for a step, `Pretrained.save` writes the trained
+    weights back out, and the second directory is loaded again: it carries
+    the same tokenizer files, so the load hands back a processor and a text
+    prompt generates text without the caller naming a tokenizer anywhere.
+    An export that only recorded a `tokenizer_name` lands here as a
+    `processor` of None, which is also what leaves a directory that
+    `ollama create` and llama.cpp's converter refuse.
+    """
+    from dew.data import tokenizer_for
+    from dew.interop import load_pretrained
+
+    recipe = load_recipe()
+    tokenizer = tokenizer_for(str(TOKENIZER), local_files_only=True)
+    ids = np.asarray(tokenizer.encode((REPO_ROOT / "CONTRIBUTING.md").read_text()), np.uint16)
+    tokens = tmp_path / "tokens"
+    tokens.mkdir(parents=True)
+    (tokens / "train.bin").write_bytes(ids[:40 * SEQ].tobytes())
+    (tokens / "val.bin").write_bytes(ids[40 * SEQ:48 * SEQ].tobytes())
+    (tokens / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(TOKENIZER), "vocab_size": tokenizer.vocab_size,
+         "dtype": "uint16", "eos_id": None}))
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint", tokenizer=str(TOKENIZER),
+                                     vocab_size=tokenizer.vocab_size)
+
+    state = recipe.main(pretrained_config(
+        recipe, tokens, checkpoint, "--trainer.steps", "1", "--sample-tokens", "0",
+        "--tokenizer", str(TOKENIZER), "--trainer.name", "exported"))
+
+    trained = tmp_path / "trained"
+    load_pretrained(str(checkpoint), dtype="float32", attention_impl="reference").save(
+        trained, variables=state.params)
+    again = load_pretrained(str(trained), dtype="float32", attention_impl="reference")
+
+    assert again.processor is not None, "the saved export carries no tokenizer"
+    generated = again.text_generation()("The trainer", 4, key=jax.random.key(0))
+    assert int(generated.lengths[0]) == 4
+    assert again.processor.decode(generated.tokens)[0].startswith("The trainer")
 
 
 def test_a_pretrained_run_refuses_a_checkpoint_too_narrow_for_the_ids(tmp_path):

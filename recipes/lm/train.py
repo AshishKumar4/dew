@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Optional
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, RunConfig
-from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
+from dew.data import PackedTokens, TokenWindows, tokenizer_for
 from dew.objectives.lm import IndexerTraining, LMObjective, Samples
 from dew.sampling import Sampling
 from dew.registry import datasets, metrics, models
@@ -190,16 +190,11 @@ def checkpoint_tokenizer(pretrained: str) -> str:
     return pretrained
 
 
-def build_tokenizer(name: str):
-    """The tokenizer that decodes generated ids back into text."""
-    return ByteTokenizer() if name == "byte" else HFTokenizer(name)
-
-
 def build_samples(config: LmRunConfig) -> Optional[Samples]:
     """What the objective generates and decodes at every validation."""
     if config.sample_tokens <= 0:
         return None
-    tokenizer = build_tokenizer(config.tokenizer)
+    tokenizer = tokenizer_for(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
         max_new_tokens=config.sample_tokens, sampling=Sampling(temperature=0.8, top_k=40),
@@ -235,7 +230,7 @@ def build_masked_objective(config: LmRunConfig, model, fields):
             "masked_diffusion trains a model with a mask token id: continue a "
             "--pretrained diffusion checkpoint, which carries one, or name "
             "mask_token_id in --model.config beside causal=False")
-    decode = None if config.sample_tokens <= 0 else build_tokenizer(config.tokenizer).decode
+    decode = None if config.sample_tokens <= 0 else tokenizer_for(config.tokenizer).decode
     return MaskedDiffusionObjective(
         model, MDLM(mask_id=int(mask))(), config.data.seq_len,
         ema_decay=config.ema_decay, decode=decode)

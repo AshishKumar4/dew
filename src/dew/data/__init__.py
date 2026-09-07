@@ -23,7 +23,7 @@ from .prompts import Prompts
 from .sources.hf import HFDatasetSource
 from .sources.text import TokenDocumentSource, TokenFileSource
 from .streaming import CombinedOnline, OnlineImages
-from .text import ByteTokenizer, HFTokenizer
+from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
@@ -33,5 +33,6 @@ __all__ = [
     "IDS_KEY", "ImageDataset", "Laion12mCoco", "Laion2bAesthetic", "LaionaCoco", "LaionaCocoCoyo",
     "Loading", "LocalVideos", "MASK_KEY", "OnlineImages", "OxfordFlowers",
     "PackedTokens", "PreferencePairs", "Prompts", "Role",
-    "TokenDocumentSource", "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "local_batch",
+    "TokenDocumentSource", "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2",
+    "local_batch", "tokenizer_for",
 ]
