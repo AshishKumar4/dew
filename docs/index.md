@@ -30,7 +30,7 @@ The first example teaches the full sequence: create batches, initialize a Flax m
 
 [Objectives and state](concepts/objectives.md) explains what the loss receives and returns. [Data](concepts/data.md) explains how dataset specifications produce iterators. [Distributed training](concepts/distributed.md) explains meshes and parameter placement after you have run a single-device example.
 
-Use the [core API reference](reference/core-api.md) for signatures and defaults and the [module index](api.md) to locate other interfaces. Consult [capabilities and limitations](reference/support.md) before choosing a model, precision mode, or deployment setup. A translated model configuration, a small numerical parity fixture, and a full checkpoint run are different levels of validation.
+Use the [core API reference](reference/core-api.md) for the signatures and defaults of the documented interfaces. Consult [capabilities and limitations](reference/support.md) before choosing a model, precision mode, or deployment setup. A translated model configuration, a small numerical parity fixture, and a full checkpoint run are different levels of validation.
 
 ## Project status
 

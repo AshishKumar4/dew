@@ -46,7 +46,6 @@ nav:
       - Capabilities and limitations: reference/support.md
       - Decoder and vision families: reference/model-families.md
       - Core API: reference/core-api.md
-      - Module index: api.md
       - Performance measurements: performance.md
       - Benchmark results: benchmarks.md
       - Papers and dependencies: references.md
