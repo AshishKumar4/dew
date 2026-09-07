@@ -2072,6 +2072,13 @@ def _gemma3n_vision_record(
         raise ValueError(f"vision_config fields {sorted(unknown)} have no counterpart")
     if vision.get("architecture", "mobilenetv5_300m_enc") != "mobilenetv5_300m_enc":
         raise ValueError(f"architecture {vision.get('architecture')!r} is not the MobileNet-v5 encoder")
+    for name, default in (("hidden_size", 2048), ("vocab_size", 128), ("vocab_offset", 262144)):
+        value = vision.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"vision_config.{name} must be an integer")
+    epsilon = vision.get("rms_norm_eps", 1e-6)
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise ValueError("vision_config.rms_norm_eps must be a number")
     if int(vision.get("hidden_size", 2048)) != 2048:
         raise ValueError("hidden_size must be 2048; timm's MobileNet-v5 encoder fixes its adapter width")
     if vision.get("do_pooling", False):

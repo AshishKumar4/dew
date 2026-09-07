@@ -136,6 +136,7 @@ if TYPE_CHECKING:
 class PartialSpec:
     kernel: "Kind"
     extra: "Unavailable | None" = None
+    Kind: int = 0
 
     def frequency(self):
         return self.kernel.rope_theta / self.kernel.window

@@ -900,6 +900,12 @@ def mode_builtin_preview_failures(args) -> dict:
                     if phase == "preflight" and rank == source:
                         result = jax.device_put(result, jax.local_devices()[0])
                         result.delete()
+                    if kind == "lm":
+                        return text_sampling.Generation(
+                            tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
+                            terminated=jax.numpy.zeros((1,), bool),
+                            behavior_log_probs=jax.numpy.zeros((1, 1)),
+                            raw_log_probs=jax.numpy.zeros((1, 1)))
                     return result
 
                 if phase == "setup":

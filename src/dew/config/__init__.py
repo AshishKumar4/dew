@@ -37,7 +37,7 @@ from dew.data import Dataset, DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.registry import REGISTRIES, datasets, models, with_precision
+from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
@@ -222,7 +222,6 @@ def _to_json(value) -> Any:
 
 
 def _fields(cls, values):
-    hints = typing.get_type_hints(cls)
     declared = [f.name for f in dataclasses.fields(cls) if f.init]
     unknown = sorted(set(values) - set(declared))
     missing = [name for name in declared if name not in values]
@@ -230,7 +229,7 @@ def _fields(cls, values):
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {name: _rebuild(hints[name], values[name]) for name in declared}
+    return {name: _rebuild(_declared_type(cls, name), values[name]) for name in declared}
 
 
 def _rebuild(annotation, value) -> Any:

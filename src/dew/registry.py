@@ -149,8 +149,8 @@ def _declared_type(member: type, field: str) -> object:
         selected = types.SimpleNamespace(__annotations__={field: annotations[field]})
         try:
             return typing.get_type_hints(
-                selected, globalns=vars(sys.modules[owner.__module__]),
-                localns=dict(vars(owner)))[field]
+                selected, globalns=dict(vars(owner)),
+                localns=vars(sys.modules[owner.__module__]))[field]
         except NameError:
             # Only this field's unavailable dependency leaves its value opaque.
             return None
