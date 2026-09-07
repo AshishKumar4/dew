@@ -47,4 +47,4 @@ More experts increase parameter storage even when `top_k` is fixed. Routing, com
 
 For a reference model, compare router selections and weights, the sparse layer output, the loss, and parameter updates. For distributed training, verify that the balancing statistics represent the global batch and that replicated state remains identical across shards.
 
-The current documentation does not claim a completed large-scale sparse-model training run. Consult [family translation coverage](../reference/model-families.md) and [capabilities and limitations](../reference/support.md) for the implemented and measured scope.
+The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which sparse checkpoints load and which lack an export writer.
