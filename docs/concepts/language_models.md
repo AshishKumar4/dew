@@ -107,7 +107,32 @@ Use the returned model configuration when continuing training. A translated conf
 
 LLaDA and Dream use bidirectional masked-token prediction. They require a mask token ID and a masked-diffusion objective; replacing an autoregressive loss without changing the attention and corruption process is not sufficient.
 
-Diffusion Gemma denoises blocks with a causal prompt encoder, a bidirectional canvas, and self-conditioning. Dew provides its block process, cache prefill, and denoiser functions. This is a different process from masked diffusion.
+DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas, and self-conditioning. Load the complete model through the same `load_pretrained` interface as other published models. Its `BlockProcess` generation policy refines full canvases, commits clean tokens to the shared text cache, and returns `CanvasGeneration`: response lengths including EOS, termination flags and per-row refinement counts, without autoregressive likelihood fields.
+
+From a repository checkout, this CPU example loads the complete tiny reference checkpoint, tokenizes, generates, decodes, saves and reloads it. Its 64-token synthetic vocabulary tests the workflow, not language quality. The released model ID is `google/diffusiongemma-26B-A4B-it`; loading that ID downloads large weights and requires sufficient host/device memory.
+
+```python
+from tempfile import TemporaryDirectory
+
+import jax
+import numpy as np
+from dew.interop import load_pretrained
+
+source = "tests/fixtures/hf/diffusion-gemma-workflow"
+bundle = load_pretrained(source, dtype="float32", attention_impl="xla", max_seq_len=32)
+assert bundle.processor is not None
+inputs = bundle.processor(["<bos> t5 t7 t9 t11"])
+generated = bundle.generate(inputs, 7, key=jax.random.key(11))
+response = generated.tokens[:, inputs.tokens.shape[1]:]
+print(bundle.processor.decode(response))
+with TemporaryDirectory() as checkpoint:
+    bundle.save(checkpoint)
+    restored = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+    replay = restored.generate(inputs, 7, key=jax.random.key(11))
+    np.testing.assert_array_equal(replay.tokens, generated.tokens)
+```
+
+The final canvas is refined at its full width, then the returned response is clipped to `max_new_tokens`. The prefix plus rounded-up canvas capacity must fit `max_seq_len`. Generation defaults come from `generation_config.json`; pass a `BlockProcess` as `generation=` to override them. Media are prepared through the checkpoint processor and run only during prompt prefill, not once per refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the available official fine-tuning recipe from the still-undisclosed original sampler-distillation/RL objective.
 
 Multimodal wrapper translation separates decoder, vision tower, and projector variables. The projector produces soft image tokens, which enter the decoder at image positions. Supported paths and remaining restrictions are listed in the [capability reference](../reference/support.md). Ordinary `generate` is not a general multimodal preprocessing pipeline.
 
