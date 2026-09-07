@@ -56,7 +56,8 @@ class Processor:
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
-        known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids"}
+        known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
+                 "image_position_ids"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -70,42 +71,85 @@ class Processor:
         token_fields = {"attention_mask": jnp.asarray(valid), "positions": jnp.asarray(positions)}
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values:
-            count = self.record.get("tokens_per_image")
-            if type(count) is not int or count < 1:
-                raise ValueError("this processor layout requires a fixed positive tokens_per_image")
-            image_id = self.record.get("image_token_id")
-            if type(image_id) is not int:
-                raise ValueError("image_token_id must be an integer")
-            mask = tokens == image_id
-            lengths = mask.sum(axis=1)
-            if np.any(lengths % count):
-                raise ValueError("image placeholder counts do not match the projector's feature count")
-            image_counts = lengths // count
-            pixels = np.asarray(values["pixel_values"])
-            if pixels.ndim != 4 or pixels.shape[0] != int(image_counts.sum()):
-                raise ValueError("pixel_values and image placeholder counts disagree")
-            if not np.issubdtype(pixels.dtype, np.floating):
-                raise ValueError("pixel_values must be floating processor output")
-            width = int(image_counts.max())
-            if width < 1:
-                raise ValueError("pixels require image placeholders")
-            padded = np.zeros((tokens.shape[0], width, *pixels.shape[1:]), pixels.dtype)
-            indices = np.full(tokens.shape, -1, np.int32)
-            groups = np.full(tokens.shape, -1, np.int32)
-            offset = 0
-            for row, images in enumerate(image_counts):
-                n = int(images)
-                padded[row, :n] = pixels[offset:offset + n]
-                slots = np.flatnonzero(mask[row])
-                indices[row, slots] = np.arange(n * count)
-                groups[row, slots] = np.arange(n * count) // count
-                offset += n
-            token_fields.update(image_indices=jnp.asarray(indices), image_groups=jnp.asarray(groups))
-            conditioning = {"pixel_values": jnp.asarray(padded),
-                            "image_lengths": jnp.asarray(image_counts, jnp.int32)}
+            image_fields, conditioning = self._images(values, tokens)
+            token_fields.update(image_fields)
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
         return result
+
+    def _images(self, values: Mapping[str, object], tokens: np.ndarray
+                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
+        if type(image_id) is not int:
+            raise ValueError("image_token_id must be an integer")
+        pixels = np.asarray(values["pixel_values"])
+        if not np.issubdtype(pixels.dtype, np.floating):
+            raise ValueError("pixel_values must be floating processor output")
+        runs = []
+        for row in tokens:
+            locations = np.flatnonzero(row == image_id)
+            runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
+        image_counts = np.array([len(row) for row in runs], np.int32)
+        if pixels.shape[0] != int(image_counts.sum()):
+            raise ValueError("pixel_values and image placeholder counts disagree")
+        patch_positions = None
+        if "image_position_ids" in values:
+            vision = self.config.get("vision_config")
+            if not isinstance(vision, Mapping):
+                raise ValueError("image_position_ids require a vision config")
+            kernel = vision.get("pooling_kernel_size")
+            if type(kernel) is not int or kernel < 1:
+                raise ValueError("pooling_kernel_size must be a positive integer")
+            patch_positions = np.asarray(values["image_position_ids"])
+            if (pixels.ndim != 3 or patch_positions.shape != pixels.shape[:2] + (2,)
+                    or not np.issubdtype(patch_positions.dtype, np.integer)):
+                raise ValueError("patch pixels require aligned integer image_position_ids")
+            valid_patches = (patch_positions >= 0).all(axis=-1)
+            padding = (patch_positions == -1).all(axis=-1)
+            if not np.all(valid_patches | padding):
+                raise ValueError("image_position_ids use nonnegative coordinates or paired (-1, -1) padding")
+            table_size = vision.get("position_embedding_size")
+            if type(table_size) is not int or np.any(patch_positions >= table_size):
+                raise ValueError("image_position_ids exceed position_embedding_size")
+            counts = valid_patches.sum(axis=1)
+            if pixels.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
+                raise ValueError("patch counts must divide into complete pooling blocks")
+            lengths = counts // kernel ** 2
+            capacity = pixels.shape[1] // kernel ** 2
+        else:
+            count = self.record.get("tokens_per_image")
+            if type(count) is not int or count < 1 or pixels.ndim != 4:
+                raise ValueError("fixed-resolution pixel_values require a positive tokens_per_image")
+            lengths = np.full(pixels.shape[0], count, np.int32)
+            capacity = count
+        width = int(image_counts.max())
+        if width < 1:
+            raise ValueError("pixels require image placeholders")
+        padded = np.zeros((tokens.shape[0], width, *pixels.shape[1:]), pixels.dtype)
+        padded_positions = (None if patch_positions is None else np.full(
+            (tokens.shape[0], width, *patch_positions.shape[1:]), -1, np.int32))
+        indices = np.full(tokens.shape, -1, np.int32)
+        groups = np.full(tokens.shape, -1, np.int32)
+        token_lengths = np.zeros((tokens.shape[0], width), np.int32)
+        offset = 0
+        for row, blocks in enumerate(runs):
+            for image, slots in enumerate(blocks):
+                length = int(lengths[offset])
+                if len(slots) != length:
+                    raise ValueError("image placeholder counts do not match the projector's feature count")
+                padded[row, image] = pixels[offset]
+                if padded_positions is not None and patch_positions is not None:
+                    padded_positions[row, image] = patch_positions[offset]
+                token_lengths[row, image] = length
+                indices[row, slots] = image * capacity + np.arange(length)
+                groups[row, slots] = image
+                offset += 1
+        conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
+                        "image_token_lengths": jnp.asarray(token_lengths)}
+        if padded_positions is not None:
+            conditioning["image_position_ids"] = jnp.asarray(padded_positions)
+        return {"image_indices": jnp.asarray(indices), "image_groups": jnp.asarray(groups)}, conditioning
+
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         """Decode token rows with the tokenizer retained by the source processor."""
@@ -129,9 +173,13 @@ class WeightLayout:
     transpose: tuple[int, ...] | None = None
     concatenate: int | None = None
 
-    def export(self, variables: Mapping[str, object]) -> np.ndarray:
+    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
         for path in self.paths:
+            if path[-1] == "layer_scalar":
+                if scalar_mode not in ("frozen", "trainable"):
+                    raise ValueError("layer_scalar export requires an explicit model mode")
+                path = (("constants" if scalar_mode == "frozen" else "params"), *path[1:])
             node: object = variables
             for part in path:
                 if not isinstance(node, Mapping):
@@ -142,6 +190,43 @@ class WeightLayout:
         if self.transpose is not None:
             value = value.transpose(self.transpose)
         return np.ascontiguousarray(value).reshape(self.shape)
+
+
+def _language_layout(name: str, text_name: str, tensor: np.ndarray,
+                     config, model_type: str, component: str | None = None) -> WeightLayout | None:
+    """The text family's existing leaf map plus its inverse storage operations."""
+    family = decoders._FAMILIES[model_type]
+
+    def nested(path: tuple[str, ...]) -> tuple[str, ...]:
+        return path if component is None else (path[0], component, *path[1:])
+
+    transpose = None
+    concatenate = None
+    if text_name == "lm_head.weight" and config["tie_embeddings"]:
+        paths = (nested(("params", "embed_tokens", "embedding")),)
+    elif text_name.endswith(".experts.gate_up_proj"):
+        names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
+        paths_list = []
+        for key in names:
+            path = family.weight_path(key, config)
+            if path is None:
+                raise ValueError(f"fused expert tensor {name!r} has no parameter path")
+            paths_list.append(nested(path))
+        paths = tuple(paths_list)
+        concatenate = -1
+        if model_type == "gemma4_text":
+            transpose = (0, 2, 1)
+    else:
+        path = family.weight_path(text_name, config)
+        if path is None:
+            return None
+        paths = (nested(path),)
+        if path[-1] == "kernel" and tensor.ndim == 2:
+            transpose = (1, 0)
+        elif text_name.endswith(".experts.down_proj") and model_type == "gemma4_text":
+            transpose = (0, 2, 1)
+    return WeightLayout(name, paths, tensor.shape, transpose, concatenate)
+
 
 
 def _wrapper_layouts(tensors, record):
@@ -155,7 +240,6 @@ def _wrapper_layouts(tensors, record):
                   "gemma3n": vision.gemma3n_vision_path}[tower_kind]
     tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
-    family = decoders._FAMILIES[record["text_model_type"]]
     bindings = []
     retained = {}
     for name, tensor in tensors.items():
@@ -180,29 +264,13 @@ def _wrapper_layouts(tensors, record):
         elif bare.startswith("language_model.") or bare == "lm_head.weight":
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
-            if text_name == "lm_head.weight" and record["text"]["tie_embeddings"]:
-                paths = (("params", "language_model", "embed_tokens", "embedding"),)
-            elif text_name.endswith(".experts.gate_up_proj"):
-                names = [text_name.removesuffix("gate_up_proj") + projection
-                         for projection in ("gate_proj", "up_proj")]
-                mapped = [family.weight_path(key, record["text"]) for key in names]
-                resolved: list[tuple[str, ...]] = []
-                for path in mapped:
-                    if path is None:
-                        raise ValueError(f"fused expert tensor {name!r} has no parameter path")
-                    resolved.append((path[0], "language_model", *path[1:]))
-                paths = tuple(resolved)
-                concatenate = -1
-                if record["text_model_type"] == "gemma4_text":
-                    transpose = (0, 2, 1)
+            layout = _language_layout(name, text_name, tensor, record["text"],
+                                      record["text_model_type"], "language_model")
+            if layout is None:
+                retained[name] = tensor
             else:
-                path = family.weight_path(text_name, record["text"])
-                if path is not None:
-                    paths = ((path[0], "language_model", *path[1:]),)
-                    if path[-1] == "kernel" and tensor.ndim == 2:
-                        transpose = (1, 0)
-                    elif text_name.endswith(".experts.down_proj") and record["text_model_type"] == "gemma4_text":
-                        transpose = (0, 2, 1)
+                bindings.append(layout)
+            continue
         else:
             raise ValueError(f"unknown source tensor {name!r}")
         if paths:
@@ -228,7 +296,7 @@ class Pretrained:
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
     generation_adapter: Callable[[Pretrained, ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], int, jax.Array, Sampling | BlockProcess | None], Generation | CanvasGeneration] | None = field(default=None, repr=False)
-    export_adapter: Callable[[Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
+    export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
 
     @property
     def model_config(self) -> dict[str, object]:
@@ -249,10 +317,12 @@ class Pretrained:
         values = self.variables if variables is None else variables
         destination = Path(directory)
         if self.export_adapter is not None:
-            tensors = self.export_adapter(values, self.config)
+            tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
+            text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
+            scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             tensors = {**self.retained_tensors,
-                       **{layout.name: layout.export(values) for layout in self.weight_layouts}}
+                       **{layout.name: layout.export(values, scalar_mode) for layout in self.weight_layouts}}
         elif isinstance(self.model, CausalTransformer):
             decoders.save_pretrained_decoder(self.model, values, destination)
             tensors = None
@@ -318,7 +388,7 @@ def _generate_autoregressive(bundle: Pretrained, inputs, max_new_tokens: int,
                 raise ValueError("top_k must be an integer")
             generation = Sampling(
                 temperature=float(temperature) if _generation_value(bundle, "do_sample", False) else 0.0,
-                top_k=top_k if top_k else None, eos_id=_eos_ids(bundle), pad_id=_pad_id(bundle))
+                top_k=top_k if top_k else None, eos_id=(_eos_ids(bundle) or None), pad_id=_pad_id(bundle))
         if not isinstance(generation, Sampling):
             raise ValueError("autoregressive generation requires Sampling")
     except BaseException as failure:
@@ -389,6 +459,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             # causal-LM class's optional final tanh cap.
             text_fields["final_logit_softcap"] = None
             text_fields["mixer"] = AttentionMixer(bidirectional_images=True)
+        if family == "gemma4" and config["text_config"].get("use_bidirectional_attention") == "vision":
+            kinds = dict(text_fields["kinds"])
+            sliding = dict(kinds.get("sliding_attention", {}))
+            sliding["mixer"] = AttentionMixer(bidirectional_images=True)
+            kinds["sliding_attention"] = sliding
+            text_fields["kinds"] = kinds
         language_model = models.build("causal_transformer", **with_precision(
             "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl))
         if not isinstance(language_model, CausalTransformer):
@@ -397,6 +473,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             language_model, tower_from_record(record["tower"]),
             projector_from_record(record["projector"]), family,
             record["image_token_id"], dtype=resolve_dtype(dtype),
+            pad_token_id=config["text_config"].get("pad_token_id", 0),
+            extra_placeholder_ids=(tuple(config.get(name, default) for name, default in
+                (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
             attention_impl=None if attention_impl == "reference" else attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record))
         layouts, retained = _wrapper_layouts(tensors, record)
@@ -408,10 +487,20 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             "causal_transformer", record, dtype=dtype, attention_impl=attention_impl))
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
+        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text"):
+            bindings = []
+            for name, tensor in tensors.items():
+                layout = _language_layout(name, name, tensor, record, family)
+                if layout is None:
+                    retained[name] = tensor
+                else:
+                    bindings.append(layout)
+            layouts = tuple(bindings)
     processor = None
     if (directory / "processor_config.json").exists():
         from transformers import AutoProcessor
-        reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True)
+        options = {"backend": "pil"} if family == "gemma3" else {}
+        reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
         processor = Processor(reference, config, record)
     elif (directory / "tokenizer_config.json").exists():
         from transformers import AutoTokenizer
