@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +45,7 @@ class ModelInputs:
 
     def take_rows(self, indices: jax.Array) -> ModelInputs:
         """Select the same rows from tokens, sequence fields and media."""
-        return self.replace(
+        return replace(self,
             tokens=self.tokens[indices],
             token_fields={name: value[indices] for name, value in self.token_fields.items()},
             conditioning={name: value[indices] for name, value in self.conditioning.items()})
@@ -52,7 +53,7 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice token slots; media features retain their original indices."""
         selection = slice(start, stop)
-        return self.replace(
+        return replace(self,
             tokens=self.tokens[:, selection],
             token_fields={name: value[:, selection] for name, value in self.token_fields.items()})
 
@@ -70,7 +71,7 @@ class ModelInputs:
             indices = slots.reshape(slots.shape + (1,) * (value.ndim - 2))
             return jnp.take_along_axis(value, indices, axis=1)
 
-        return self.replace(tokens=shift(self.tokens),
+        return replace(self, tokens=shift(self.tokens),
                             token_fields={name: shift(value) for name, value in self.token_fields.items()})
 
     def kwargs(self) -> dict[str, object]:
@@ -79,3 +80,12 @@ class ModelInputs:
         if self.conditioning:
             result["conditioning"] = self.conditioning
         return result
+
+
+@struct.dataclass
+class AttentionMetadata:
+    """Per-token attention data independent of physical cache-slot addresses."""
+
+    valid: jax.Array | None = None
+    image_groups: jax.Array | None = None
+    rotary_positions: jax.Array | None = None
