@@ -77,22 +77,20 @@ Generation prepares inputs on the host and runs prefill and decode in one compil
 
 On a mesh, rows split over the batch axes and parameters retain their placement. The decode executes a fixed number of steps. EOS disables cache writes and output recording for the finished row without skipping collectives. In a multi-process run, each process passes and receives its own rows. Processes validate inputs together and require matching input shapes and sampling settings. Invalid input on one rank raises on all ranks before device execution; this does not recover a failed device collective.
 
-### Serve concurrent requests
+### Generate through a task
 
-`generate` is the fast path for one fixed batch. `Engine` from `dew.sampling` runs many requests over one model: it validates and admits each request, copies and versions weights, reuses deterministic prefill states, streams events and cancels. Requests with equal `Sampling` share one decode state; a `DiffusionGemma` request keeps its own. Each request pins the weight version current at submission; `publish` installs a copied newer version without disturbing them, which is the rollout boundary online RL needs.
+`TextGeneration` from `dew.inference` binds a decoder, one variables tree and the source's processor, so a call takes text or prepared inputs and returns the same `Generation` as `generate`. `bind` returns the task over other weights; a rollout binds a policy snapshot once and draws from it for the whole collection, with the actual and raw-policy likelihood of every action in the result.
 
 ```python
-from dew.sampling import Engine, Sampling
+from dew.inference import TextGeneration
+from dew.sampling import Sampling
 
-with Engine(model, variables, max_batch_size=8, prefix_cache_bytes=256 << 20) as engine:
-    jobs = [engine.submit(prompt, 64, key=jax.random.key(seed), generation=Sampling(temperature=0.8))
-            for seed, prompt in enumerate(prompts)]
-    for event in jobs[0].stream():
-        print(event.row, event.position, event.token, event.raw_log_prob)
-    results = [job.result() for job in jobs]
+policy = TextGeneration(model, variables, sampling=Sampling(temperature=0.8, top_k=40))
+drawn = policy([[1, 2, 3], [4, 5, 6]], 32, key=jax.random.key(0))
+later = policy.bind(state.params)
 ```
 
-`dew.serve.serve(engine, processor=bundle.processor)` puts the engine behind `POST /generate` with JSON bodies and newline-delimited JSON streams. Each engine advance is one device call followed by host bookkeeping, so a small model on CPU generates far fewer tokens per second than the fused batch scan; the per-step model computation of a large model is what amortizes that loop. The engine schedules a single process.
+Serving stays outside Dew: export a checkpoint with `Pretrained.save` and serve it with vLLM or Ollama.
 
 Checkpoint loading needs the `interop` extra and may download substantial files. The following complete checkpoint-to-text example is not part of the offline quickstart and has not been run during this documentation validation:
 
@@ -139,17 +137,17 @@ source = "tests/fixtures/hf/diffusion-gemma-workflow"
 bundle = load_pretrained(source, dtype="float32", attention_impl="xla", max_seq_len=32)
 assert bundle.processor is not None
 inputs = bundle.processor(["<bos> t5 t7 t9 t11"])
-generated = bundle.generate(inputs, 7, key=jax.random.key(11))
-response = generated.tokens[:, inputs.tokens.shape[1]:]
-print(bundle.processor.decode(response))
+task = bundle.block_generation()
+generated = task(inputs, 7, key=jax.random.key(11))
+print(task.decode(generated, inputs.tokens.shape[1]))
 with TemporaryDirectory() as checkpoint:
     bundle.save(checkpoint)
     restored = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
-    replay = restored.generate(inputs, 7, key=jax.random.key(11))
+    replay = restored.block_generation()(inputs, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(replay.tokens, generated.tokens)
 ```
 
-The final canvas is refined at its full width, then the returned response is clipped to `max_new_tokens`. The prefix plus rounded-up canvas capacity must fit `max_seq_len`. Generation defaults come from `generation_config.json`; pass a `BlockProcess` as `generation=` to override them. Media are prepared through the checkpoint processor and run only during prompt prefill, not once per refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the available official fine-tuning recipe from the still-undisclosed original sampler-distillation/RL objective.
+The final canvas is refined at its full width, then the returned response is clipped to `max_new_tokens`. The prefix plus rounded-up canvas capacity must fit `max_seq_len`. Generation defaults come from `generation_config.json`; pass a `BlockProcess` as `process=` to override them. Media are prepared through the checkpoint processor and run only during prompt prefill, not once per refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the available official fine-tuning recipe from the still-undisclosed original sampler-distillation/RL objective.
 
 ### Fine-tune with the official block loss
 

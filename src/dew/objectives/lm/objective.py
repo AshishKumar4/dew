@@ -47,6 +47,7 @@ from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
                                  mean_loss, merge, select)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
+from dew.inference import TextGeneration
 from dew.sampling.text import Sampling
 
 TEXT_KEY = "text"
@@ -453,6 +454,15 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         variables = {name: value for name, value in params.items() if name != FROZEN}
         return {**variables, "params": merge(params[FROZEN], params["params"])}
 
+    def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
+        """The model over this training tree as a generation task.
+
+        A rollout binds one snapshot of the policy and draws every completion
+        from it; the result records the actual and raw-policy likelihoods
+        the objective's ratio needs.
+        """
+        return TextGeneration(self.model, self._model_variables(params), sampling=sampling)
+
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
@@ -758,24 +768,20 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero."""
         error = None
-        settings = prepared = generate_text = prompt = generated = None
+        settings = prepared = prompt = generated = None
         try:
             settings = self.samples
             if settings is not None:
-                from dew.sampling.text import generate as generate_text
-
-                params = self._model_variables(params if step.ema is None else step.ema)
-                prepared = (self.model, self._prompt, settings.max_new_tokens, settings.sampling)
+                prepared = (self.policy(params if step.ema is None else step.ema, settings.sampling),
+                            self._prompt, settings.max_new_tokens)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview setup")
         error = None
         try:
             if prepared is not None:
-                model, prompt, max_new_tokens, sampling = prepared
-                assert generate_text is not None
-                generated = generate_text(model, params, prompt, max_new_tokens,
-                                          key=step.key, sampling=sampling).tokens
+                policy, prompt, max_new_tokens = prepared
+                generated = policy(prompt, max_new_tokens, key=step.key).tokens
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview generation")

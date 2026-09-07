@@ -14,7 +14,7 @@ from dew.artifacts import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.nn.inputs import ModelInputs
 from dew.rl import group_advantage, rloo_advantage
-from dew.sampling.text import Sampling, _mesh, generate
+from dew.sampling.text import Sampling, _mesh
 from dew.training.distributed import local_rows
 
 from ..lm import LMObjective
@@ -99,9 +99,9 @@ class SampledRollout:
         assert prepared is not None
         prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
-        generated = [generate(
-            self.objective.model, state.params, inputs, self.max_new_tokens,
-            key=jax.random.fold_in(key, group), sampling=self.sampling) for group in range(self.groups)]
+        policy = self.objective.policy(state.params, self.sampling)
+        generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group))
+                     for group in range(self.groups)]
         sampled = np.stack([np.asarray(result.tokens)[:, width:] for result in generated], axis=1)
         lengths = np.stack([np.asarray(result.lengths) for result in generated], axis=1)
         terminated = np.stack([np.asarray(result.terminated) for result in generated], axis=1)
