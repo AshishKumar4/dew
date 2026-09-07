@@ -470,12 +470,12 @@ class Pretrained:
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
     export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
 
-    def text_generation(self) -> TextGeneration:
-        """The decoder as a generation task, defaulting to the source's sampling policy."""
+    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
+        """Use the source policy, or an explicit supported policy supplied by the caller."""
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
-        return TextGeneration(self.model, self.variables, self.processor,
-                              _source_sampling(self.config, self.generation_config))
+        return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
+                              else _source_sampling(self.config, self.generation_config))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -550,18 +550,59 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
     return value
 
 
+def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
+                         name: str, default: float) -> float:
+    value = _generation_value(config, generation_config, name, default)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        raise ValueError(f"{name} must be numeric")
+    return float(value)
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
-    """The source's published sampling policy, from its generation config."""
+    """Construct only policies whose active controls the native sampler implements."""
+    from transformers import GenerationConfig
+
+    defaults = GenerationConfig().to_dict()
+    do_sample = _generation_value(config, generation_config, "do_sample", False)
+    if type(do_sample) is not bool:
+        raise ValueError("do_sample must be a boolean")
+    supported = {"do_sample", "temperature", "top_k", "top_p", "min_p", "eos_token_id", "pad_token_id"}
+    # Prompt creation, requested output size and output representation belong
+    # to the task. These source fields do not transform its token distribution.
+    task_owned = {"bos_token_id", "max_length", "max_new_tokens", "use_cache",
+                  "cache_implementation", "cache_config", "return_legacy_cache", "compile_config",
+                  "disable_compile", "output_attentions", "output_hidden_states", "output_scores",
+                  "output_logits", "return_dict_in_generate", "transformers_version",
+                  "_from_model_config", "_commit_hash", "tokenizer_name"}
+    sampled_only = {"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"}
+    unsupported = []
+    for name in set(defaults) | set(generation_config):
+        if name in supported or name in task_owned:
+            continue
+        if not do_sample and name in sampled_only:
+            continue
+        default = defaults.get(name)
+        value = _generation_value(config, generation_config, name, default)
+        if value != default:
+            unsupported.append(name)
+    if unsupported:
+        raise ValueError(f"native sampling cannot honor active source controls {sorted(unsupported)}; "
+                         "pass an explicit sampling=Sampling(...) policy to text_generation")
     temperature = _generation_value(config, generation_config, "temperature", 1.0)
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
-    top_k = _generation_value(config, generation_config, "top_k")
+    top_k = _generation_value(config, generation_config, "top_k", defaults["top_k"])
     if top_k is not None and type(top_k) is not int:
         raise ValueError("top_k must be an integer")
     return Sampling(
-        temperature=float(temperature) if _generation_value(config, generation_config, "do_sample", False) else 0.0,
+        temperature=float(temperature) if do_sample else 0.0,
         top_k=top_k if top_k else None, eos_id=(_eos_ids(config, generation_config) or None),
-        pad_id=_pad_id(config, generation_config))
+        pad_id=_pad_id(config, generation_config),
+        top_p=_probability_control(config, generation_config, "top_p", 1.0),
+        min_p=_probability_control(config, generation_config, "min_p", 0.0))
+
 
 
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
@@ -663,15 +704,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     error = None
     try:
-        # The generation policy is read once so a malformed source fails on
-        # every rank at load, not inside a later generation on one of them.
-        if isinstance(model, DiffusionGemma):
-            from dew.interop import diffusion_gemma
-            diffusion_gemma.generation_process(config, generation_config)
-        else:
-            _source_sampling(config, generation_config)
-        _eos_ids(config, generation_config)
-        _pad_id(config, generation_config)
+        # Loading for training/export does not opt into the source sampler.
+        # Active policy support is checked when the caller creates its task.
+        if not isinstance(generation_config, dict):
+            raise ValueError("generation_config.json must contain an object")
     except BaseException as failure:
         error = failure
     agree_process_phase(error, phase="pretrained generation policy")
