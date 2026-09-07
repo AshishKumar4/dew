@@ -81,8 +81,16 @@ def gaussian_topk(x, sparsity: float):
 
 def rescale_to(x, target):
     """`x` scaled to `target`'s RMS magnitude per token, the magnitude of `x`
-    floored at MAGNITUDE_EPSILON (the reference's `new_magnitude`)."""
-    target_magnitude = jnp.sqrt(jnp.mean(jnp.square(target), axis=-1, keepdims=True))
+    floored at MAGNITUDE_EPSILON (the reference's `new_magnitude`).
+
+    A zero target (a zero pad embedding at a padded slot) has magnitude zero
+    with a zero gradient; sqrt's infinite derivative there would turn the
+    masked slot's zero upstream gradient into NaN for every parameter it
+    touches.
+    """
+    target_mean = jnp.mean(jnp.square(target), axis=-1, keepdims=True)
+    positive = target_mean > 0
+    target_magnitude = jnp.where(positive, jnp.sqrt(jnp.where(positive, target_mean, 1.0)), 0.0)
     magnitude = jnp.sqrt(jnp.maximum(jnp.mean(jnp.square(x), axis=-1, keepdims=True),
                                      MAGNITUDE_EPSILON))
     return x * target_magnitude / magnitude

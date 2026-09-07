@@ -1957,21 +1957,24 @@ class Gemma3nProjectorModule(nn.Module):
         upper = self.vocab_offset + self.vocab_size
         checkify.check(jnp.all((ids >= self.vocab_offset) & (ids < upper)),
                        f"vision token IDs must be in [{self.vocab_offset}, {upper})")
-        return self._hard_embeddings(ids)
+        return self.embed_hard(ids)
 
-    def _hard_embeddings(self, ids):
-        """Numerical lookup after the public token-domain check."""
+    def embed_hard(self, ids):
+        """Numerical lookup after the caller's token-domain check."""
         embedded = self.embedding(ids - self.vocab_offset)
         if self.is_initializing():
             self.soft_embedding_norm(jnp.zeros_like(embedded))
         return self.embedding_post_projection_norm(
             self.embedding_projection(self.hard_embedding_norm(embedded)))
 
-    def _merge_hard_embeddings(self, token_embeddings, ids):
-        """Fuse admitted text/vision IDs using the reference's dummy vision ID."""
+    def merge_hard_embeddings(self, token_embeddings, ids):
+        """Fuse admitted text/vision IDs using the reference's dummy vision ID.
+
+        Pure: the caller has validated ids against the text vocabulary.
+        """
         mask = (ids >= self.vocab_offset) & (ids < self.vocab_offset + self.vocab_size)
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
-        hard = self._hard_embeddings(chosen).astype(token_embeddings.dtype)
+        hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
 
     def model_inputs(self, token_embeddings, input_ids, soft_tokens=None,
@@ -2000,7 +2003,7 @@ class Gemma3nProjectorModule(nn.Module):
             raise ValueError("per_layer_input_vocab must be positive")
         if (soft_tokens is None) != (image_positions is None):
             raise ValueError("soft_tokens and image_positions arrive together")
-        merged = self._merge_hard_embeddings(embeddings, ids)
+        merged = self.merge_hard_embeddings(embeddings, ids)
         if soft_tokens is not None:
             soft, positions = jnp.asarray(soft_tokens), jnp.asarray(image_positions)
             if (soft.ndim != 3 or soft.shape[0] != ids.shape[0]

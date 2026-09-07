@@ -2,10 +2,12 @@
 
 The reference is the actual Transformers 5.16.1 processor and conditional
 model per family, written by tools/multimodal_reference.py without downloads
-from unpadded rows. Gemma3 carries the Trainer and mutation coverage; Gemma4,
-Qwen3.5 and Llama4 run the same processor, forward, backward, export and
-cached generation path. Unequal image counts and left padding exercise
-per-row conditioning and cache addressing.
+one row of the batch encoding at a time. Gemma3 carries the Trainer and
+mutation coverage; Gemma4, Qwen3.5, Llama4 and Gemma3n (images and audio)
+run the same processor, forward, backward, export and cached generation
+path, and the two audio-only fixtures pin waveform conditioning. Unequal
+image counts and left padding exercise per-row conditioning and cache
+addressing.
 """
 
 import dataclasses
@@ -183,10 +185,13 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
 
 
 FAMILIES = {
-    # family: (fixture, forward error, pixel-gradient error, post-SGD error)
-    "gemma4": ("gemma4-native-tiny", 1.34e-5, 2.04e-6, 1.43e-5),
-    "qwen35": ("qwen35-native-tiny", 3.46e-5, 2.69e-6, 5.28e-5),
-    "llama4": ("llama4-native-tiny", 6.76e-6, 5.4e-8, 1.22e-5),
+    # family: (references, checkpoint, forward error, pixel-gradient error, post-SGD error)
+    "gemma4": ("gemma4-native-tiny", "gemma4-native-tiny", 1.34e-5, 2.04e-6, 1.43e-5),
+    "qwen35": ("qwen35-native-tiny", "qwen35-native-tiny", 3.46e-5, 2.69e-6, 5.28e-5),
+    "llama4": ("llama4-native-tiny", "llama4-native-tiny", 6.76e-6, 5.4e-8, 1.22e-5),
+    # Images and audio through the same prompt; the checkpoint and its
+    # processor are the audio fixture's, the references sit beside them.
+    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny", 1.95e-6, 2.39e-7, 6.41e-5),
 }
 
 
@@ -200,10 +205,16 @@ def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
         # Text-only rotary coordinates instead of the interleaved spatial ones.
         return dataclasses.replace(inputs, token_fields={
             name: value for name, value in inputs.token_fields.items() if name != "rotary_positions"})
+    if family == "gemma3n":
+        # The reference hands its audio encoder the inverted mask; getting
+        # the polarity wrong keeps every shape.
+        mask = inputs.conditioning["input_features_mask"]
+        return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "input_features_mask": ~mask})
     # Llama 4 orders local tiles before the global tile; reversing them keeps
     # every shape and count.
     pixels = inputs.conditioning["pixel_values"]
     return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels[:, ::-1]})
+
 
 
 def _real_pixels(inputs: ModelInputs, gradient: jax.Array) -> jax.Array:
@@ -219,20 +230,77 @@ def _real_pixels(inputs: ModelInputs, gradient: jax.Array) -> jax.Array:
 @pytest.fixture(scope="module", params=sorted(FAMILIES))
 def family_source(request):
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
-    fixture, *_ = FAMILIES[request.param]
-    directory = FIXTURE.parent / fixture
-    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    references, checkpoint, *_ = FAMILIES[request.param]
+    directory = FIXTURE.parent / references
+    source = FIXTURE.parent / checkpoint
+    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
     images = np.load(directory / "raw_images.npy")
+    waveforms = sorted(source.glob("waveform_*.npy"))
     assert loaded.processor is not None
     inputs = loaded.processor(json.loads((directory / "prompts.json").read_text()),
-                              images=[[images[0]], [images[1], images[2]]])
+                              images=[[images[0]], [images[1], images[2]]],
+                              audio=[np.load(path) for path in waveforms] if waveforms else None)
     return request.param, loaded, inputs, directory
+
+
+@pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
+def audio_source(request):
+    directory = FIXTURE.parent / request.param
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    meta = json.loads((directory / "meta.json").read_text())
+    assert loaded.processor is not None
+    inputs = loaded.processor(meta["prompts"], audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    return loaded, inputs, np.load(directory / "reference.npz")
+
+
+def test_audio_only_processor_forward_and_greedy_continuation_match_reference(audio_source):
+    """Waveforms through the actual Gemma processors and native audio towers.
+
+    Valid-logit errors 3.2e-7 (Gemma 3n, fixed slots and padding embeddings)
+    and 2.3e-7 (Gemma 4, one slot per encoded frame) at tolerance 1e-4;
+    greedy continuation matches, including Gemma 3n's hard-range samples.
+    """
+    loaded, inputs, reference = audio_source
+    np.testing.assert_array_equal(inputs.tokens, reference["input_ids"])
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
+    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
+
+
+def test_gemma3n_left_padded_batch_has_finite_gradients():
+    """A zero pad embedding at a padded slot must not poison the gradient.
+
+    The AltUp magnitude is a square root of that slot's zero RMS; without a
+    finite derivative there the masked slot's zero upstream gradient became
+    NaN in the embedding table (observed on the pad row alone).
+    """
+    loaded = load_pretrained(FIXTURE.parent / "gemma-3n-audio-tiny", dtype="float32", attention_impl="reference")
+    model = loaded.model.language_model
+    params = {"params": loaded.variables["params"]["language_model"]}
+    tokens = jnp.asarray([[0, 0, 0, 5, 4, 7, 9, 3], [8, 4, 9, 7, 3, 2, 5, 6]], jnp.int32)
+    valid = tokens != 0
+    inputs = ModelInputs(tokens, {"attention_mask": valid,
+                                  "positions": jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0).astype(jnp.int32)}, {})
+
+    def loss(variables):
+        logits = model.apply(variables, inputs.tokens, **inputs.kwargs())
+        log_probs = jax.nn.log_softmax(logits[:, :-1])
+        picked = jnp.take_along_axis(log_probs, tokens[:, 1:, None], -1)[..., 0]
+        return -(picked * valid[:, 1:]).sum() / valid[:, 1:].sum()
+
+    gradient = jax.grad(loss)(params)
+    assert all(bool(jnp.isfinite(leaf).all()) for leaf in jax.tree.leaves(gradient))
+
 
 
 def test_source_processor_forward_and_cached_generation_match_reference(family_source):
     """Actual processors to native models: Gemma4's padded patches with active
     clipping and its video placeholder decode rule, Qwen3.5's packed
-    channel-time patches with spatial M-RoPE, Llama4's local and global tiles.
+    channel-time patches with spatial M-RoPE, Llama4's local and global tiles,
+    Gemma3n's MobileNet features, hard vocabulary ranges, fixed audio slots
+    and per-layer input masking beside its conformer audio.
 
     FP32 valid-logit errors are recorded in FAMILIES at tolerance 1e-4; each
     family's characteristic slip must fail the same assertion.
