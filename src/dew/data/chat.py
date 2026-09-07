@@ -510,7 +510,7 @@ class RenderConversation:
         where = f"{self.tokenizer} row {index}"
         ids, roles = render_conversation(
             load_tokenizer(self.tokenizer),
-            Conversation.parse(record["messages"], record.get("tools"), where), where)
+            Conversation.parse(record["messages"], record["tools"], where), where)
         return {"text": ids, ROLES_KEY: roles}
 
 
@@ -525,7 +525,7 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
     lengths = []
     for index, record in enumerate(source):
         where = f"{source.path} row {index}"
-        conversation = Conversation.parse(record["messages"], record.get("tools"), where)
+        conversation = Conversation.parse(record["messages"], record["tools"], where)
         lengths.append(len(render_conversation(load, conversation, where)[0]))
     return lengths
 

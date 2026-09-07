@@ -1,10 +1,11 @@
 """Where a run's numbers and artifacts go.
 
 A `Tracker` is the one capability the trainer logs through. `WandbTracker`
-renders each artifact type with a `functools.singledispatch` function.
-Objectives return typed values and the tracker draws them through that
-function. A new artifact type registers a renderer. wandb is imported when
-the first value is logged.
+sends each artifact to a W&B run and `LocalTracker` writes journals, preview
+files and optional plots in a directory; both render artifact types with a
+`functools.singledispatch` function, so a new artifact type registers a
+renderer. `Trackers` fans one report out to several sinks. wandb is imported
+when the first value is logged.
 """
 
 from __future__ import annotations
@@ -13,9 +14,8 @@ import functools
 import json
 import time
 from pathlib import Path
-from typing import TextIO
 from collections.abc import Mapping
-from typing import Protocol, TypeAlias
+from typing import Protocol, TextIO, TypeAlias
 
 import jax
 import numpy as np
@@ -56,14 +56,12 @@ Payload: TypeAlias = dict[str, object]
 
 
 @functools.singledispatch
-def render(value: object) -> Payload | None:
+def render(value: object) -> Payload:
     """The W&B payload for an explicitly reported artifact."""
-    if isinstance(value, RECORD_TYPES):
-        return {"reporting/type": type(value).__name__, "reporting/record": json_value(value)}
     raise TypeError(f"WandbTracker has no renderer for {type(value).__name__}")
 
 @render.register
-def _(value: ImageGrid) -> Payload | None:
+def _(value: ImageGrid) -> Payload:
     import wandb
 
     captions = list(value.captions) + [None] * (len(value.images) - len(value.captions))
@@ -72,7 +70,7 @@ def _(value: ImageGrid) -> Payload | None:
 
 
 @render.register
-def _(value: VideoGrid) -> Payload | None:
+def _(value: VideoGrid) -> Payload:
     import wandb
 
     # wandb reads clips as [N, T, C, H, W].
@@ -81,7 +79,7 @@ def _(value: VideoGrid) -> Payload | None:
 
 
 @render.register
-def _(value: TextSamples) -> Payload | None:
+def _(value: TextSamples) -> Payload:
     import wandb
 
     texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
@@ -93,7 +91,7 @@ def _(value: TextSamples) -> Payload | None:
 
 
 @render.register
-def _(value: Representations) -> Payload | None:
+def _(value: Representations) -> Payload:
     import wandb
 
     # The per-dimension spread across the batch, the collapse view of a
@@ -169,9 +167,7 @@ class WandbTracker(_OwnedTracker):
             if isinstance(value, FitEnded):
                 self._exit_code = int(value.status != "completed")
             return
-        payload = self.render(value)
-        if payload is not None:
-            self.run.log({**payload, "train/step": step})
+        self.run.log({**self.render(value), "train/step": step})
 
     def close(self) -> None:
         if self._closed:
@@ -188,11 +184,12 @@ class WandbTracker(_OwnedTracker):
 
 
 class LocalTracker(_OwnedTracker):
-    """Synchronous hosted reports in a tracking directory, never recipe run.json.
+    """Synchronous reports in a tracking directory: JSONL journals, preview files
+    and optional plots.
 
-    JSONL nonfinite metrics use strings NaN, +Inf, -Inf. No array is moved at
-    train-step cadence by this sink. Plotting is explicitly selected and runs
-    only on plot() or close; it reads the journal rather than retaining history.
+    Nonfinite metrics are journaled as the strings NaN, +Inf and -Inf. Plotting
+    runs only on plot() or close and reads the journal rather than retaining
+    history.
     """
 
     def __init__(self, directory: str | Path, *, plots: bool = False):
@@ -220,7 +217,7 @@ class LocalTracker(_OwnedTracker):
 
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self._write('scalars.jsonl', {'step': step, 'time': time.time(),
-                                    'scalars': dict(scalars)})
+                                    'scalars': {name: float(value) for name, value in scalars.items()}})
 
     def artifact(self, value: object, step: int) -> None:
         self._check()
@@ -233,7 +230,7 @@ class LocalTracker(_OwnedTracker):
         prefix = self.directory / f'preview-{step}-{time.time_ns()}-{self._sequence}'
         files = _write_preview(value, prefix)
         self._write('records.jsonl', {'type': type(value).__name__, 'step': step,
-                                    'files': [path.name for path in files]})
+                                    'time': time.time(), 'files': [path.name for path in files]})
 
     def plot(self) -> list[Path]:
         """Render journal metrics with matplotlib Agg; never changes the journal."""
@@ -352,13 +349,13 @@ class Trackers(_OwnedTracker):
         self.trackers = trackers
         self._closed = False
 
-    def _each(self, operation, *args) -> None:
+    def _each(self, operation) -> None:
         if self._closed:
             raise RuntimeError('Trackers is closed')
         error = None
         for tracker in self.trackers:
             try:
-                operation(tracker, *args)
+                operation(tracker)
             except BaseException as failure:
                 if error is None:
                     error = failure
@@ -381,6 +378,8 @@ class Trackers(_OwnedTracker):
                 self._closed = True
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # Not _each: a later owned sink must see an earlier sink's close
+        # failure so it records the run as failed.
         if self._closed:
             return
         error = exc

@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from dew.artifacts import Artifact, agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.artifacts import Artifact, Artifacts, agree_process_phase, broadcast_from_process_zero, collective_host
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 from .distributed import build_mesh, shard_batch
 
@@ -38,7 +38,7 @@ class Evaluation:
 
     @property
     def scalars(self) -> dict[str, float]:
-        """Metric values and the existing evaluation count keys for reporting."""
+        """Metric values plus the evaluation/* count keys when a batch was scored."""
         if not self.coordinated_batches:
             return dict(self.scores)
         return {**self.scores,
@@ -54,6 +54,10 @@ def _pick(artifacts: tuple[Artifact, ...], reads: type):
             f"a metric reads {reads.__name__}, and the objective's evaluation produced "
             f"{[type(a).__name__ for a in artifacts]}")
     return matching[0]
+
+
+def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
+    return () if value is None else value if isinstance(value, tuple) else (value,)
 
 
 def evaluate(objective: Objective[Loss, Effects], variables: Variables,
@@ -174,8 +178,7 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                         error = failure
                     agree_process_phase(error, phase=f"scoring batch {scored}")
                     produced, home = collective_host((produced, batch), phase=f"scoring batch {scored}")
-                    artifacts = (() if produced is None else produced
-                                 if isinstance(produced, tuple) else (produced,))
+                    artifacts = _artifacts(produced)
                     for metric in metrics:
                         error = None
                         if root:
@@ -200,8 +203,7 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                     agree_process_phase(error, phase="preview generation/decoding")
                     produced_preview = collective_host(produced_preview, phase="preview artifacts")
                     if root:
-                        previews = (() if produced_preview is None else produced_preview
-                                    if isinstance(produced_preview, tuple) else (produced_preview,))
+                        previews = _artifacts(produced_preview)
                     produced_preview = None
                 produced = batch = None
                 scored += 1
