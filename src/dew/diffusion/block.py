@@ -1,38 +1,67 @@
-"""Block diffusion over a token canvas, the DiffusionGemma sampler side.
+"""Entropy-bounded block generation for a shared-weight diffusion language model.
 
-The released design pairs a causal encoder over the prompt, filling a KV
-cache, with a bidirectional decoder over a fixed-length canvas that also
-attends to that cache (TF diffusion_gemma modeling_diffusion_gemma.py:281,
-:383, :1326-1440). There is no mask token and no timestep embedding: the
-canvas starts as uniform random ids, a temperature annealed by the remaining
-step count sharpens the logits
-(generation_diffusion_gemma.py:276-316, cur_step counts down), and positions
-whose categorical entropy fits an independence bound are accepted while the
-rest are renoised (:343-469). The previous step's tempered logits condition
-the next one through the self-conditioning MLP in dew.nn.diffusion_gemma.
-
-What lives here besides the schedule is the denoiser wiring: `prefill_cache`
-runs the causal encoder over the prompt into a KV cache, and `denoise_logits`
-runs the bidirectional canvas against that cache with self-conditioning
-folded in through the decoder's input-embeddings hook. `sample_canvas` takes
-a denoiser callable so the loop stays testable on its own.
+DiffusionGemma Technical Report (2608.00146), Algorithm 1: initialize a uniform
+canvas, refine it with tempered self-conditioning, stop stable/confident rows,
+and commit the final argmax canvas through the causal encoder. The compiled
+loops keep fixed bounds and mask finished rows, including their step counts.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from typing import Optional, Sequence
+from dataclasses import dataclass
+from collections.abc import Sequence
+from functools import partial
 
+from flax import struct
 import jax
 import jax.numpy as jnp
 
-from dew.nn.diffusion_gemma import soft_embeddings
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.inputs import ModelInputs
+from dew.objectives.base import Variables
+
+
+@struct.dataclass
+class CanvasGeneration:
+    """Prompt plus padded response, with no autoregressive likelihood claim.
+
+    ``lengths`` counts response tokens including the first EOS, not prompt
+    tokens. ``decoder_steps`` counts useful refinements per row across canvases.
+    ``terminated`` distinguishes EOS from the requested token limit.
+    """
+
+    tokens: jax.Array
+    lengths: jax.Array
+    terminated: jax.Array
+    decoder_steps: jax.Array
+
+
+@struct.dataclass
+class CanvasState:
+    """The refinement state; previous logits reset between canvases."""
+
+    canvas: jax.Array
+    logits: jax.Array
+    argmax: jax.Array
+    stable_steps: jax.Array
+    finished: jax.Array
+    decoder_steps: jax.Array
+
+
+def _entropy(logits: jax.Array) -> jax.Array:
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+    return -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
 
 
 @dataclass(frozen=True)
 class BlockProcess:
-    """A canvas of `canvas_length` ids over `vocab_size` tokens."""
+    """Uniform-vocabulary diffusion with the published entropy-bound sampler.
+
+    The temperature uses steps remaining, N through 1, rather than a second
+    independently configured time grid. Stability counts previous identical
+    argmax canvases; threshold one needs two matching predictions.
+    """
 
     canvas_length: int
     vocab_size: int
@@ -40,131 +69,163 @@ class BlockProcess:
     t_min: float = 0.4
     entropy_bound: float = 0.1
     max_steps: int = 48
+    stability_threshold: int = 1
+    confidence_threshold: float = 0.005
 
     def __post_init__(self):
-        if self.canvas_length < 1:
-            raise ValueError(
-                f"canvas_length is {self.canvas_length}, a canvas holds ids")
-        if self.vocab_size < 1:
-            raise ValueError(
-                f"vocab_size is {self.vocab_size}, ids come from somewhere")
-        if not 0 < self.t_min <= self.t_max:
-            raise ValueError(
-                f"temperatures t_min/t_max read ({self.t_min}, {self.t_max}), "
-                "the schedule cools from t_max to t_min")
-        if self.entropy_bound <= 0:
-            raise ValueError(
-                f"entropy_bound is {self.entropy_bound}, the reference refuses "
-                "anything but a positive float")
-        if self.max_steps < 1:
-            raise ValueError(f"max_steps is {self.max_steps}, steps denoise")
+        for name in ("canvas_length", "vocab_size", "max_steps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if (isinstance(self.stability_threshold, bool)
+                or not isinstance(self.stability_threshold, int) or self.stability_threshold < 0):
+            raise ValueError("stability_threshold must be a nonnegative integer")
+        if not (math.isfinite(self.t_min) and math.isfinite(self.t_max)
+                and 0 < self.t_min <= self.t_max):
+            raise ValueError("temperatures t_min/t_max must be finite with 0 < t_min <= t_max")
+        for name in ("entropy_bound", "confidence_threshold"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
 
-    def temperature(self, cur_step: int) -> float:
-        """The temperature with cur_step steps remaining, t_max down to t_min."""
-        return self.t_min + (self.t_max - self.t_min) * (cur_step / self.max_steps)
+    def temperature(self, cur_step: jax.typing.ArrayLike) -> jax.Array:
+        return self.t_min + (self.t_max - self.t_min) * jnp.asarray(cur_step) / self.max_steps
 
     def noise(self, key: jax.Array, shape: Sequence[int]) -> jax.Array:
-        """A uniform random canvas, the sampler's starting point."""
         return jax.random.randint(key, shape, 0, self.vocab_size, jnp.int32)
 
-    def temper(self, logits: jax.typing.ArrayLike, cur_step: int) -> jax.Array:
-        """Raw decoder logits divided by the step's temperature."""
+    def temper(self, logits: jax.typing.ArrayLike, cur_step: jax.typing.ArrayLike) -> jax.Array:
         return jnp.asarray(logits, jnp.float32) / self.temperature(cur_step)
 
     def accept(self, current: jax.typing.ArrayLike, denoised: jax.typing.ArrayLike,
                logits: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
-        """The accepted canvas and its mask under the entropy bound.
-
-        Positions sort by ascending entropy; the first k stay where their
-        cumulative entropy minus the running maximum fits the bound, which caps
-        the joint mutual information of what is accepted at once. `logits` are
-        the tempered ones the denoiser canvas was drawn from.
-        """
-        log_probs = jax.nn.log_softmax(jnp.asarray(logits, jnp.float32), axis=-1)
-        entropy = -(jnp.exp(log_probs) * log_probs).sum(axis=-1)
-        order = jnp.argsort(entropy, axis=-1)
+        """Accept the lowest-entropy prefix whose cumulative excess fits the bound."""
+        entropy = _entropy(jnp.asarray(logits))
+        order = jnp.argsort(entropy, axis=-1, stable=True)
         ranked = jnp.take_along_axis(entropy, order, axis=-1)
-        cumulative = jnp.cumsum(ranked, axis=-1)
-        running_max = jnp.maximum.accumulate(ranked, axis=-1)
-        chosen = cumulative - running_max <= self.entropy_bound
-        mask = jnp.take_along_axis(chosen, jnp.argsort(order, axis=-1), axis=-1)
+        chosen = jnp.cumsum(ranked, axis=-1) - ranked <= self.entropy_bound
+        inverse = jnp.argsort(order, axis=-1)
+        mask = jnp.take_along_axis(chosen, inverse, axis=-1)
         return jnp.where(mask, denoised, current), mask
 
     def renoise(self, key: jax.Array, accepted: jax.typing.ArrayLike,
                 mask: jax.typing.ArrayLike) -> jax.Array:
-        """Accepted positions kept, the rest drawn uniform again."""
-        fresh = self.noise(key, jnp.shape(accepted))
-        return jnp.where(jnp.asarray(mask, bool), accepted, fresh)
+        return jnp.where(mask, accepted, self.noise(key, jnp.shape(accepted)))
+
+    @partial(jax.jit, static_argnames=("self", "model", "batch"))
+    def refine(self, model: DiffusionGemma, variables: Variables, cache: Variables,
+               key: jax.Array, batch: int, finished: jax.Array) -> CanvasState:
+        """Refine one canvas without updating its prefix cache."""
+        shape = (batch, self.canvas_length)
+        initial = CanvasState(
+            canvas=self.noise(jax.random.fold_in(key, 0), shape),
+            logits=jnp.zeros((*shape, self.vocab_size), jnp.float32),
+            argmax=jnp.full(shape, -1, jnp.int32),
+            stable_steps=jnp.zeros((batch,), jnp.int32),
+            finished=finished,
+            decoder_steps=jnp.zeros((batch,), jnp.int32))
+
+        def step(index, state: CanvasState) -> CanvasState:
+            raw = model.apply(
+                {**variables, "cache": cache}, state.canvas,
+                self_conditioning_logits=state.logits,
+                self_conditioning_mask=jnp.full((batch,), index != 0))
+            if not isinstance(raw, jax.Array):
+                raise TypeError("a canvas forward must return a logits array")
+            logits = self.temper(raw, self.max_steps - index)
+            draw_key, noise_key = jax.random.split(jax.random.fold_in(key, index + 1))
+            drawn = jax.random.categorical(draw_key, logits, axis=-1).astype(jnp.int32)
+            accepted, mask = self.accept(state.canvas, drawn, logits)
+            canvas = self.renoise(noise_key, accepted, mask)
+            argmax = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            stable_steps = jnp.where(jnp.all(argmax == state.argmax, axis=-1),
+                                     state.stable_steps + 1, 0)
+            confident = _entropy(logits).mean(axis=-1) < self.confidence_threshold
+            stop = (stable_steps >= self.stability_threshold) & confident
+            active = ~state.finished
+            return CanvasState(
+                canvas=jnp.where(active[:, None], canvas, state.canvas),
+                logits=jnp.where(active[:, None, None], logits, state.logits),
+                argmax=jnp.where(active[:, None], argmax, state.argmax),
+                stable_steps=jnp.where(active, stable_steps, state.stable_steps),
+                finished=state.finished | stop,
+                decoder_steps=state.decoder_steps + active.astype(jnp.int32))
+
+        return jax.lax.fori_loop(0, self.max_steps, step, initial)
+
+    def generate(self, model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+                 max_new_tokens: int, *, key: jax.Array, eos_token_ids: tuple[int, ...] = (),
+                 pad_token_id: int = 0) -> CanvasGeneration:
+        """Run prefill, refinement and clean-token commits as one device computation.
+
+        The last canvas is fully refined even when only part is requested;
+        output is cropped to the token limit. Finished rows are padded after
+        their first EOS. No host-side decisions depend on generated tokens.
+        """
+        inputs.validate()
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a nonnegative integer")
+        if self.vocab_size != model.vocab_size or self.canvas_length != model.canvas_length:
+            raise ValueError("BlockProcess geometry must match the loaded model")
+        if not 0 <= pad_token_id < self.vocab_size:
+            raise ValueError("pad_token_id is outside the vocabulary")
+        if any(not 0 <= token < self.vocab_size for token in eos_token_ids):
+            raise ValueError("eos_token_ids contain an id outside the vocabulary")
+        batch, prompt_length = inputs.tokens.shape
+        if prompt_length == 0:
+            raise ValueError("a block-diffusion prompt must contain at least one token")
+        blocks = (max_new_tokens + self.canvas_length - 1) // self.canvas_length
+        if prompt_length + blocks * self.canvas_length > model.max_seq_len:
+            raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
+        return _generate(model, variables, inputs, max_new_tokens, key, self,
+                         eos_token_ids, pad_token_id)
 
 
-def prefill_cache(encoder, variables, prompt) -> dict:
-    """The encoder's KV cache after reading the prompt, the prefix the canvas
-    attends to.
+@jax.jit(static_argnames=("model", "max_new_tokens", "process", "eos_token_ids", "pad_token_id"))
+def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+              max_new_tokens: int, key: jax.Array, process: BlockProcess,
+              eos_token_ids: tuple[int, ...], pad_token_id: int) -> CanvasGeneration:
+    batch, prompt_length = inputs.tokens.shape
+    length = process.canvas_length
+    blocks = (max_new_tokens + length - 1) // length
+    output = jnp.full((batch, prompt_length + blocks * length), pad_token_id, jnp.int32)
+    output = output.at[:, :prompt_length].set(inputs.tokens)
+    initial = CanvasGeneration(
+        tokens=output, lengths=jnp.zeros((batch,), jnp.int32),
+        terminated=jnp.zeros((batch,), bool), decoder_steps=jnp.zeros((batch,), jnp.int32))
+    if max_new_tokens == 0:
+        return initial
+    cache = model.apply(variables, batch, method=model.init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply(
+        {**variables, "cache": cache}, inputs,
+        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+        mutable=["cache"])[1]["cache"]
 
-    `encoder` is the causal model sharing the denoiser's weights; `variables`
-    its `{'params': ...}` tree. The prompt goes through once in decode mode
-    with a mutable cache, exactly like the sampler's prefill, and what comes
-    back is the cache collection alone.
-    """
-    prompt = jnp.asarray(prompt, jnp.int32)
-    cache = encoder.apply(variables, prompt.shape[0],
-                          method=type(encoder).init_cache,
-                          mutable=["cache"])[1]["cache"]
-    return encoder.apply({**variables, "cache": cache}, prompt, decode=True,
-                         mutable=["cache"])[1]["cache"]
+    def canvas_step(index, carry):
+        cache, result = carry
+        canvas_key = jax.random.fold_in(key, index)
+        state = process.refine(model, variables, cache, canvas_key, batch, result.terminated)
+        available = jnp.minimum(length, max_new_tokens - index * length)
+        is_eos = jnp.isin(state.argmax, jnp.asarray(eos_token_ids, jnp.int32))
+        valid = jnp.arange(length)[None, :] < available
+        is_eos = is_eos & valid
+        first_eos = jnp.min(jnp.where(is_eos, jnp.arange(length)[None, :], length), axis=-1)
+        emitted = jnp.where(result.terminated, 0, jnp.minimum(first_eos + 1, available))
+        keep = jnp.arange(length)[None, :] < emitted[:, None]
+        clean = jnp.where(keep, state.argmax, pad_token_id)
+        tokens = jax.lax.dynamic_update_slice(result.tokens, clean, (0, prompt_length + index * length))
+        result = CanvasGeneration(
+            tokens=tokens, lengths=result.lengths + emitted,
+            terminated=result.terminated | jnp.any(is_eos, axis=-1),
+            decoder_steps=result.decoder_steps + state.decoder_steps)
+        # Only preceding canvases enter the cache. Both branch choices are
+        # scalar loop counters shared by every device, never rank-local EOS.
+        cache = jax.lax.cond(
+            index + 1 < blocks,
+            lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
+                                    mutable=["cache"])[1]["cache"],
+            lambda old: old, cache)
+        return cache, result
 
-
-def denoise_logits(decoder, sc, variables, sc_variables, cache, canvas,
-                   prev_logits=None):
-    """One canvas step's raw logits: self-conditioning folded in, prefix
-    cached, bidirectional over the canvas.
-
-    `decoder` is the same weights as the encoder with `causal=False`;
-    `variables` carries its params without the cache. The previous step's
-    tempered logits become soft embeddings through the embedding table, or
-    zeros on the first step, and the self-conditioning module folds them into
-    the scaled canvas embeddings the input-embeddings hook carries. The canvas
-    positions continue past the prefix as decoder_position_ids.
-    """
-    canvas = jnp.asarray(canvas, jnp.int32)
-    table = variables["params"]["embed_tokens"]["embedding"]
-    width = table.shape[-1]
-    scaled = (table[canvas].astype(jnp.float32)
-              * jnp.asarray(math.sqrt(width), jnp.float32))
-    if prev_logits is None:
-        soft = jnp.zeros_like(scaled)
-    else:
-        soft = soft_embeddings(prev_logits, table,
-                               math.sqrt(width)).astype(scaled.dtype)
-    conditioned = sc.apply(sc_variables, scaled, soft.astype(scaled.dtype))
-    length = canvas.shape[1]
-    positions = jnp.broadcast_to(jnp.arange(length), canvas.shape)
-    full = {**variables, "cache": cache}
-    out, _ = decoder.apply(full, canvas, decode=True,
-                           input_embeddings=conditioned,
-                           embedding_positions=positions, mutable=["cache"])
-    return out
-
-
-def sample_canvas(key: jax.Array, denoise, shape: Sequence[int], *,
-                  steps: int) -> jax.Array:
-    """A canvas denoised by `denoise(canvas, prev_logits) -> raw logits`.
-
-    The first step conditions on nothing; every later step conditions on the
-    previous step's tempered logits. `steps` counts down like the reference
-    loop. The argmax of the last step's tempered logits is the denoised canvas.
-    """
-    process = denoise.process
-    key, canvas_key = jax.random.split(key)
-    canvas = process.noise(canvas_key, shape)
-    prev: Optional[jax.Array] = None
-    for remaining in range(steps, 0, -1):
-        key, step_key, draw_key, renoise_key = jax.random.split(key, 4)
-        raw = denoise(canvas, prev)
-        tempered = process.temper(raw, remaining)
-        drawn = jax.random.categorical(draw_key, tempered, axis=-1).astype(jnp.int32)
-        accepted, mask = process.accept(canvas, drawn, tempered)
-        canvas = process.renoise(renoise_key, accepted, mask)
-        prev = tempered
-    final = process.temper(denoise(canvas, prev), 1)
-    return jnp.argmax(final, axis=-1).astype(jnp.int32)
+    _, result = jax.lax.fori_loop(0, blocks, canvas_step, (cache, initial))
+    return result.replace(tokens=result.tokens[:, :prompt_length + max_new_tokens])

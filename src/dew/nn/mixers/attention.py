@@ -255,14 +255,14 @@ class CausalSelfAttention(nn.Module):
             positions = canvas_pos
             valid = jnp.concatenate(
                 [jnp.arange(alloc) < prefix_index, jnp.ones(S, bool)])
-            slot = jnp.concatenate([jnp.arange(alloc), canvas_pos])
-            query_pos = canvas_pos[:, None]
-            key_pos = slot[None, :]
-            canvas_key = jnp.arange(alloc + S)[None, :] >= alloc
-            keep = valid[None, :] & ((key_pos <= query_pos) | canvas_key)
+            # A sliding encoder retains window-1 history keys. Every canvas
+            # query sees that same suffix and every canvas key; diffusion does
+            # not slide a query-relative window inside the canvas.
             if self.sliding_window is not None:
-                keep = keep & (key_pos > query_pos - self.sliding_window)
-            mask = jnp.broadcast_to(keep[None, None], (B, 1, S, alloc + S))
+                valid = valid & jnp.concatenate([
+                    jnp.arange(alloc) > prefix_index - self.sliding_window,
+                    jnp.ones(S, bool)])
+            mask = jnp.broadcast_to(valid[None, None, None], (B, 1, S, alloc + S))
             key = jnp.concatenate([cached_key, key], axis=-3)
             value = jnp.concatenate([cached_value, value], axis=-3)
             causal, window = False, None
