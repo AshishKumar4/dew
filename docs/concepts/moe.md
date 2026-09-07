@@ -37,6 +37,8 @@ For auxiliary-loss-free balancing, a per-expert bias affects selection. The rout
 
 Dew gathers tokens into expert order and uses grouped matrix multiplication through `jax.lax.ragged_dot`. An optional tokamax implementation provides another kernel path. Kernel availability and speed depend on the installed package and device; an optional path is not automatically faster.
 
+tokamax is not a Dew dependency, and its current release does not install cleanly next to one. tokamax 0.0.13 pins `typeguard==2.13.3`; tyro 1.0.16, which parses every recipe's command line, requires `typeguard>=4.0.0`. Installing tokamax into a Dew environment downgrades typeguard, `uv pip check` reports the conflict, and each recipe fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Use the tokamax kernel path from a separate environment that drives Dew through Python rather than a recipe command line, as `tools/benchmark_attention.py` documents in [performance](../performance.md), until a tokamax release relaxes the pin. The dependency conflict is between two packages' declared requirements, and Dew neither pins around it nor falls back at runtime.
+
 The `expert` mesh axis partitions the expert dimension. Dense parameter dimensions can use FSDP or tensor placement independently. See [distributed training](distributed.md) for the global batch and layout requirements.
 
 More experts increase parameter storage even when `top_k` is fixed. Routing, communication, shared experts, and load imbalance still contribute to runtime. Estimate optimizer and EMA storage as well as the parameters, and measure a representative forward/backward step on the intended topology.
