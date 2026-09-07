@@ -13,10 +13,11 @@ Dew's greedy draw token for token. That is what catches a conversion which
 moved the computation rather than repacking it; a transposed kernel or the
 other rope convention answers with different tokens from the first step.
 
-Asking for the model's own argmax means naming `repeat_penalty`. The daemon
-applies 1.1 over the last tokens by default, and the client passes backend
-options through untouched, so the raw policy is reachable but never the
-default. One test pins the difference between the two.
+Asking for the model's own argmax means handing the client a `Sampling`
+value; it turns one into backend options and neutralises the daemon's
+repetition penalty and truncations on the way. Through the lower-level
+`options` mapping those defaults still stand, and on this checkpoint that
+changes the answer. One test pins the difference between the two.
 
 The daemon exposes no tokenize endpoint, so what a test here can compare is
 `prompt_eval_count` against the HF tokenizer's length, not the ids. Length
@@ -72,6 +73,9 @@ FIELDS = {"emb_features": 128, "num_layers": 4, "num_heads": 4, "num_kv_heads": 
           "tie_embeddings": False}
 PROMPTS = ("The trainer", "Dew trains", "The model", "This recipe")
 DRAWN = 8
+GREEDY = Sampling(temperature=0.0)
+"""Argmax over the checkpoint's own policy. Handing this to the client is
+what neutralises the daemon's repetition penalty and truncations."""
 
 
 def daemon_url() -> str:
@@ -90,24 +94,23 @@ def ask(path: str, payload: dict | None = None, timeout: float = 300.0) -> dict:
 
 
 def draw(client: OllamaCompletion, prompt: str, count: int,
-         options: dict[str, object] | None = None, **fields: object) -> Completion:
-    """One greedy raw completion through the client under test.
+         **fields: object) -> Completion:
+    """One raw completion through the client under test.
 
-    The two namespaces stay apart on purpose. `options` carries backend
-    sampler options, where the client adds `num_predict` and `seed` and
-    refuses a caller's own; `fields` carries SDK request fields such as `raw`
-    and `logprobs`. A request field misplaced into `options` is dropped in
-    silence, since the SDK's Options model ignores what it does not declare.
+    `sampling` is how a caller asks for the checkpoint's own policy: the
+    client turns a `Sampling` value into backend options and neutralises the
+    daemon's penalties and truncations on the way. `fields` also carries SDK
+    request fields such as `raw` and `logprobs`; `options` is the lower-level
+    escape hatch, and mixing a request field into it raises.
     """
-    return client(prompt, count, seed=0, raw=True,
-                  options={"temperature": 0, **(options or {})}, **fields)
+    return client(prompt, count, seed=0, raw=True, **fields)
 
 
 def prompt_tokens(client: OllamaCompletion, prompt: str) -> int | None:
     """How many tokens the daemon charged the prompt, off the retained SDK
     response. The count is all it reports; the daemon exposes no tokenize
     endpoint, so the ids it used stay hidden."""
-    return draw(client, prompt, 1).responses[0].prompt_eval_count
+    return draw(client, prompt, 1, sampling=GREEDY).responses[0].prompt_eval_count
 
 
 def write_token_files(directory: Path, tokenizer: HFTokenizer) -> dict:
@@ -286,7 +289,7 @@ def test_the_client_completes_prompts_against_the_daemon(client):
     prompt order, the token budget spent, the backend's own finish reason,
     and the SDK responses retained. Ollama reports no aggregate usage."""
     answer = client(list(PROMPTS), DRAWN, seed=1234,
-                    options={"temperature": 0.8, "top_k": 40})
+                    sampling=Sampling(temperature=0.8, top_k=40))
 
     assert len(answer.texts) == len(PROMPTS)
     assert all(text for text in answer.texts)
@@ -309,12 +312,13 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
     """The conversion repacked the computation, it did not change it.
 
     The export is read back through `load_pretrained`, drawn from at
-    temperature zero, and compared with the daemon asked for the same thing:
-    argmax over the model's own policy, so `repeat_penalty` is set to 1. The
-    two agree token for token. Ollama serves F16 tensors through llama.cpp's
-    kernels and Dew scores fp32 through XLA, and that difference is far too
-    small to move an argmax here; a transposed kernel or the other rope
-    convention answers with a different token immediately.
+    temperature zero, and compared with the daemon handed the same policy as
+    a `Sampling` value, which is what stops its penalties from standing
+    between the checkpoint and the answer. The two agree token for token.
+    Ollama serves F16 tensors through llama.cpp's kernels and Dew scores
+    fp32 through XLA, and that difference is far too small to move an argmax
+    here; a transposed kernel or the other rope convention answers with a
+    different token immediately.
     """
     _, export, _ = imported
     from transformers import AutoTokenizer
@@ -328,7 +332,7 @@ def test_the_daemon_draws_dews_own_greedy_continuation(imported, client):
                          ModelInputs(tokens=jnp.asarray([head], jnp.int32)), DRAWN,
                          key=jax.random.key(0), sampling=Sampling(temperature=0.0))
         ours = [int(token) for token in np.asarray(drawn.tokens)[0, len(head):]]
-        answer = draw(client, prompt, DRAWN, {"repeat_penalty": 1.0})
+        answer = draw(client, prompt, DRAWN, sampling=GREEDY)
         theirs = tokenizer.encode(answer.texts[0], add_special_tokens=False)
 
         assert theirs == ours, (f"{prompt!r}: daemon {theirs} "
@@ -356,7 +360,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     worst = 0.0
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
-        answer = draw(client, prompt, DRAWN, {"repeat_penalty": 1.0}, logprobs=True)
+        answer = draw(client, prompt, DRAWN, sampling=GREEDY, logprobs=True)
         reported = answer.responses[0].logprobs
         assert reported, f"the daemon reported no logprobs for {prompt!r}"
         theirs = tokenizer.encode(answer.texts[0], add_special_tokens=False)
@@ -372,20 +376,21 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     assert worst < 0.05, f"max |dew - daemon| logprob {worst:.5f}"
 
 
-def test_the_daemons_default_penalty_is_not_the_models_policy(client):
-    """What a caller who names no penalty gets, and why the test above names
-    one.
+def test_backend_options_alone_are_not_the_models_policy(client):
+    """Why the tests above hand over a `Sampling` value rather than options.
 
-    Temperature zero is argmax over a distribution the daemon has already
-    penalised: `repeat_penalty` defaults to 1.1 over the last tokens. The
-    client passes backend options through, so the raw policy is reachable,
-    but only by asking; on this checkpoint the two answers differ.
+    Temperature zero through the lower-level `options` escape hatch is argmax
+    over a distribution the daemon has already penalised: `repeat_penalty`
+    defaults to 1.1 over the last tokens, and nothing in a bare options
+    mapping turns that off. A `Sampling` value does, and on this checkpoint
+    the two answers differ.
     """
-    penalised = draw(client, PROMPTS[0], DRAWN).texts
-    raw = draw(client, PROMPTS[0], DRAWN, {"repeat_penalty": 1.0}).texts
+    bare = draw(client, PROMPTS[0], DRAWN, options={"temperature": 0}).texts
+    policy = draw(client, PROMPTS[0], DRAWN, sampling=GREEDY).texts
 
-    assert penalised != raw
-    assert draw(client, PROMPTS[0], DRAWN, {"repeat_penalty": 1.1}).texts == penalised
+    assert bare != policy
+    assert draw(client, PROMPTS[0], DRAWN,
+                options={"temperature": 0, "repeat_penalty": 1.1}).texts == bare
 
 
 def test_ollama_refuses_an_export_without_tokenizer_files(imported, tmp_path):
