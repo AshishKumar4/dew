@@ -56,12 +56,18 @@ class HFDatasetSource:
     once and reopened from there, the way TokenFileSource reopens its memmap.
     """
 
-    def __init__(self, name: Optional[str] = None, split: str = "train", dataset=None):
+    def __init__(self, name: Optional[str] = None, split: str = "train", dataset=None,
+                 options: Optional[Mapping[str, Any]] = None):
         if name is None and dataset is None:
             raise ValueError(
                 "HFDatasetSource needs a hub dataset name or a loaded dataset")
         self.name = name
         self.split = split
+        # Whatever `load_dataset` takes beside the name and the split: the
+        # config name, data_files, a revision. It travels in the pickle so a
+        # worker reloads the same table, and it is in the repr so a resume
+        # compares two descriptions of the same rows.
+        self.options = dict(options or {})
         self._dataset = dataset
         # Set when a dataset that arrived in memory is written out for the
         # workers; from then on it is what reloads the table.
@@ -73,7 +79,7 @@ class HFDatasetSource:
         # refuses a state whose repr differs, so this names the dataset, not
         # an address, and without touching the table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
-                f"cache={self._cache_path!r})")
+                f"options={sorted(self.options.items())!r}, cache={self._cache_path!r})")
 
     def _table(self):
         """The dataset, loaded once on first access.
@@ -97,7 +103,13 @@ class HFDatasetSource:
                             "an HF source needs a dataset name or a cache path")
                     else:
                         self._dataset = datasets.load_dataset(
-                            self.name, split=self.split)
+                            self.name, split=self.split, **self.options)
+                        if not isinstance(self._dataset, datasets.Dataset):
+                            raise TypeError(
+                                f"{self.name!r} split {self.split!r} loaded as "
+                                f"{type(self._dataset).__name__}; a random-access "
+                                f"source is one Arrow-backed split, so name one "
+                                f"split, or read it with streaming=True")
         return self._dataset
 
     def __len__(self) -> int:
