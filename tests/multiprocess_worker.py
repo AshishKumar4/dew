@@ -1016,9 +1016,9 @@ def mode_rollout(args) -> dict:
     """One sampled rollout and one GRPO update across the pool.
 
     Each process generates its own rows over parameters sharded across both
-    processes' devices. The bucket plan and decode trip count come from every
-    process's prompt lengths, so ranks with different lengths and different
-    EOS steps still issue identical collectives. A bounded rendezvous after
+    processes' devices. One padded shape and a fixed decode trip count keep
+    collectives aligned despite different row lengths and EOS outcomes.
+    Both ranks also reject an invalid input from one peer. A rendezvous after
     sampling proves both ranks returned before the update runs.
     """
     import jax
@@ -1039,8 +1039,7 @@ def mode_rollout(args) -> dict:
     batch = rollout_prompts()
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
-    # Every row decodes the same first token greedily, so that token is an
-    # EOS the ranks reach at different response positions.
+    # Select a real first token as EOS; other rows reach it at different steps.
     from dew.nn.inputs import ModelInputs
 
     def inputs_for(records):
@@ -1071,15 +1070,16 @@ def mode_rollout(args) -> dict:
                      sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12))
     invalid_errors = {}
     if processes > 1:
-        for fault in ("token", "length"):
+        for fault in ("token", "length", "key"):
             broken = {name: np.array(value, copy=True) for name, value in local.items()}
             if rank == 1:
                 if fault == "token":
                     broken["prompt"][0, -1] = 13
-                else:
+                elif fault == "length":
                     broken["prompt_length"][0] = 0
+            key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
             try:
-                rollout(state, broken, jax.random.key(23))
+                rollout(state, broken, key)
             except (ValueError, RuntimeError) as error:
                 invalid_errors[fault] = str(error)
             else:
