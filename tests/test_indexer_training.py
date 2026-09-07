@@ -276,14 +276,16 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     assert split_norms(plain_grads)[0] == 0
     seen = {}
     for weight in (0.5, 2.0):
-        aux, grads = gradient(LMObjective(
-            deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=weight)))
+        objective = LMObjective(
+            deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=weight))
+        aux, grads = gradient(objective)
         seen[weight] = split_norms(grads)[0]
-        main = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(grads)
-                if not is_indexer(path)]
-        reference = dict(jax.tree_util.tree_leaves_with_path(plain_grads))
-        for path, leaf in main:
-            assert bool(jnp.all(leaf == reference[path])), jax.tree_util.keystr(path)
+        assert seen[weight] > 0
+        kl_grads = jax.jit(jax.grad(
+            lambda p: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]))(params)["params"]
+        for path, leaf in jax.tree_util.tree_leaves_with_path(kl_grads):
+            if not is_indexer(path):
+                assert bool(jnp.all(leaf == 0)), jax.tree_util.keystr(path)
         assert float(aux.metrics["indexer_kl"]) > 0
     assert seen[2.0] == pytest.approx(4 * seen[0.5], rel=1e-5)
 
