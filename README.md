@@ -146,7 +146,7 @@ The supplied DPO and GRPO objectives use the same trainer as pretraining. PPO-re
 
 ### Supported text models
 
-These model configurations have checkpoint loading, training, and text generation paths in Dew. Text checkpoints are listed separately from multimodal models.
+These model configurations have checkpoint loading, training, and text generation paths in Dew.
 
 | Model or family | Supported |
 |---|---|
@@ -160,17 +160,26 @@ These model configurations have checkpoint loading, training, and text generatio
 | GLM checkpoints using `glm4_moe` | Yes |
 | gpt-oss | Yes |
 | LLaDA, Dream | Yes, with masked-diffusion training and sampling |
+| Diffusion Gemma | Yes: canvas generation and the published Google SFT recipe; the original distillation/RL stage is not published |
+
+### Supported multimodal models
+
+`load_pretrained` returns the model, its processor, and weights. The processor turns raw images and text into `ModelInputs`; the same `LMObjective`, `Trainer`, and cached generation then apply. Each path was checked against the Transformers 5.16.1 forward, pixel gradients, an optimizer update, export, and reload on tiny reference checkpoints.
+
+| Model or family | Inputs |
+|---|---|
+| Gemma 3 | Text and images |
+| Gemma 4 | Text and images |
+| Qwen 3.5 | Text and images with M-RoPE positions |
+| Llama 4 | Text and tiled images |
 
 ### Not yet supported as complete models
 
 | Model or family | Supported | Missing work |
 |---|---|---|
-| Gemma 3 multimodal | No | Complete processor, loading, training, and image-conditioned generation workflow |
-| Gemma 3n, Gemma 4 multimodal | No | Complete image/audio model workflows |
-| Llama 4 multimodal | No | Complete image-conditioned training and generation workflow |
-| Qwen 3.5 full model | No | Multimodal workflows and complete MTP handling |
-| DeepSeek V3 and V3.2 full training | No | Complete MTP handling and V3.2 indexer-training objective |
-| Diffusion Gemma | No | Complete pretrained canvas-generation and training workflows |
+| Gemma 3n | No | Complete image and audio workflows |
+| Gemma 4 audio, Qwen 3.5 audio and video | No | Native audio encoder workflows; video grids |
+| Qwen 3.5 MTP, DeepSeek V3 and V3.2 full training | No | Complete MTP handling and the V3.2 indexer-training objective |
 | DeepSeek V4, Qwen 3.8, GLM 5.3, Kimi K3, Muse Spark | No | Native model integrations |
 | Complete SDXL, SD3, Flux, and other Diffusers pretrained pipelines | No | Pipeline-specific model loading and task workflows |
 
