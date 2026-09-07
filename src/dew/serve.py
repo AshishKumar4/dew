@@ -111,6 +111,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -132,6 +134,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Content-Length must be an integer"})
             return
         if length > MAX_BODY_BYTES:
+            # The body is not read, so the connection cannot carry another request.
+            self.close_connection = True
             self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
             return
         try:
