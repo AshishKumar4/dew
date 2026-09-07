@@ -130,12 +130,16 @@ class TextToImage:
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout, dtype=dtype)
 
-    def prepared_process(self, steps: int) -> tuple[Process, jax.Array | None]:
-        """The process and explicit time grid a `steps`-point trajectory uses."""
+    def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
+        """The process and explicit time grid a `steps` call walks; the grid
+        is concrete, so the compiled trajectory has its length and values."""
         if self.grid is None:
             return self.process, None
         process, times = self.grid(steps)
-        return process, times
+        grid = np.asarray(times, np.float32)
+        if grid.ndim != 1 or grid.shape[0] < 1:
+            raise ValueError("grid must answer a one-dimensional time grid of at least one point")
+        return process, tuple(float(time) for time in grid)
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
@@ -200,8 +204,8 @@ class TextToImage:
             raise ValueError("the prepared inputs were placed for a different mesh")
         images = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
                                      self.sampler if sampler is None else sampler, chosen, self.final_denoise,
-                                     self.params, prepared.conditions, prepared.unconditional, prepared.noise,
-                                     jax.random.fold_in(request, 1), times)
+                                     times, self.params, prepared.conditions, prepared.unconditional,
+                                     prepared.noise, jax.random.fold_in(request, 1))
         return Images(images, rows=plan.rows)
 
 
@@ -262,15 +266,16 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 @functools.lru_cache(maxsize=None)
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity.
-    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise,
-            params, given, null, x_T, key, times):
+    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times,
+            params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-        samples = sample(denoise, x_T, steps, solver=sampler, guidance=guidance, key=key,
-                         times=times, final_denoise=final_denoise)
+        samples = sample(denoise, x_T, None if times is not None else steps, solver=sampler, guidance=guidance,
+                         key=key, times=None if times is None else jnp.asarray(times, jnp.float32),
+                         final_denoise=final_denoise)
         if autoencoder is not None:
             samples = autoencoder.decode(params["autoencoder"], samples)
         samples = jnp.clip(samples, -1.0, 1.0)
         return samples if finish is None else finish(params, samples)
-    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7),
-                   in_shardings=(None, rows, None, rows, None, None), out_shardings=rows)
+    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+                   in_shardings=(None, rows, None, rows, None), out_shardings=rows)
