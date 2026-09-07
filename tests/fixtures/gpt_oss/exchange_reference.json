@@ -1,0 +1,11 @@
+{
+  "transformers": "5.16.1",
+  "torch": "2.14.0+cpu",
+  "seed": 141,
+  "dtype": "float32",
+  "loss": "mean(sin(output))",
+  "hidden_size": 8,
+  "intermediate_size": 12,
+  "experts": 4,
+  "top_k": 2
+}
