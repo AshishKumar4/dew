@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
     RMSNorm, RopeScaling, apply_rotary, causal_attention_mask,
@@ -199,7 +200,9 @@ class CausalSelfAttention(nn.Module):
                  attention_metadata: AttentionMetadata | None = None):
         B, S, _ = x.shape
         logical_positions = positions
-        projected = self.q_proj(x)
+        # The projections and the kernel's output carry the names a remat
+        # policy saves or offloads (causal_transformer.RESIDUALS).
+        projected = checkpoint_name(self.q_proj(x), 'q_proj')
         # OLMo 3 norms the whole projection, one scale of heads * head_dim,
         # before the head split (modeling_olmo3.py:162-163, :178-179); Qwen3
         # and the Gemmas norm each head after it, which the reference marks
@@ -227,10 +230,10 @@ class CausalSelfAttention(nn.Module):
                     "its layer stack")
             key, value, positions = kv_store[self.kv_store_key]
         else:
-            key = self.k_proj(x)
+            key = checkpoint_name(self.k_proj(x), 'k_proj')
             # attention_k_eq_v reads the values off the key projection before
             # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
-            value = (key if self.k_eq_v else self.v_proj(x)).reshape(
+            value = (key if self.k_eq_v else checkpoint_name(self.v_proj(x), 'v_proj')).reshape(
                 B, S, self.num_kv_heads, self.head_dim)
             if whole:
                 key = self.k_norm(key)
@@ -394,19 +397,20 @@ class CausalSelfAttention(nn.Module):
         if not self.is_initializing() and self.is_mutable_collection("qk"):
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window, mask=mask))
-        attention = scaled_dot_product_attention(
+        attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
             sliding_window=window, mask=mask,
             sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
                    if self.attention_sinks else None),
-            softcap=self.attn_logit_softcap)
+            softcap=self.attn_logit_softcap), 'context')
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
-        return self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim))
+        return checkpoint_name(
+            self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim)), 'o_proj')
 
 
 @mixers("attention")

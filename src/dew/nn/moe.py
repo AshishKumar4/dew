@@ -32,6 +32,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn, struct
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
@@ -419,8 +420,10 @@ class ExpertMLP(nn.Module):
         if self.scale_inputs:
             grouped = grouped * weights.reshape(-1)[order][:, None].astype(grouped.dtype)
 
-        gate = self.gate_proj(grouped, group_sizes)
-        up = self.up_proj(grouped, group_sizes)
+        # The same residual names as the dense MLP's, so one remat policy
+        # covers both (causal_transformer.RESIDUALS).
+        gate = checkpoint_name(self.gate_proj(grouped, group_sizes), 'gate_proj')
+        up = checkpoint_name(self.up_proj(grouped, group_sizes), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
@@ -428,7 +431,7 @@ class ExpertMLP(nn.Module):
             gate = nn.silu(gate)
         else:
             gate = nn.gelu(gate, approximate=self.activation == 'geglu')
-        expert_out = self.down_proj(gate * up, group_sizes)
+        expert_out = checkpoint_name(self.down_proj(gate * up, group_sizes), 'down_proj')
 
         per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
         if self.scale_inputs:

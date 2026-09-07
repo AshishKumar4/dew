@@ -32,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
@@ -291,11 +292,12 @@ class GatedMLP(nn.Module):
         self.down_proj = dense(self.out_features, name='down_proj')
 
     def __call__(self, x):
-        gate = self.gate_proj(x)
+        gate = checkpoint_name(self.gate_proj(x), 'gate_proj')
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         gate = _gated_activation(self.activation, gate)
-        return self.down_proj(gate * self.up_proj(x))
+        up = checkpoint_name(self.up_proj(x), 'up_proj')
+        return checkpoint_name(self.down_proj(gate * up), 'down_proj')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,6 +323,102 @@ class BlockWiring:
     def __post_init__(self):
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
+
+
+QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
+ATTENTION_RESIDUALS = QKV_RESIDUALS + ('o_proj',)
+MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
+RESIDUALS = ATTENTION_RESIDUALS + ('context',) + MLP_RESIDUALS
+"""The values a block names as it runs, each after the projection that
+produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
+the attention kernel's output before `o_proj`, and the MLP names cover the
+dense MLP and the routed experts alike. A remat policy picks from these; a
+name off the list is a typo that would otherwise recompute silently."""
+
+
+@dataclasses.dataclass(frozen=True)
+class RematPolicy:
+    """What a recomputed block keeps for its backward pass, and where.
+
+    A block under remat saves its inputs and recomputes its forward when the
+    backward pass asks. `save` names the residuals (`RESIDUALS`) it keeps in
+    device memory instead, `offload` the ones it moves to pinned host memory
+    after the forward pass and fetches back for the backward; everything
+    else is recomputed. Both empty is MaxText's `full`, which recomputes the
+    whole block. `REMAT_POLICIES` holds MaxText's named recipes under this
+    decoder's names: MaxText's `query_proj`/`key_proj`/`value_proj`/
+    `out_proj` are `q_proj`/`k_proj`/`v_proj`/`o_proj` and its `mlpwi_0`/
+    `mlpwi_1`/`mlpwo` are `gate_proj`/`up_proj`/`down_proj`. Its fused
+    `qkv_proj`/`mlpwi` name projections this decoder does not fuse, and its
+    `quantization` names AQT intermediates Qwix does not produce. A config
+    gives a policy by name or as a record of the two lists.
+    """
+    save: Tuple[str, ...] = ()
+    offload: Tuple[str, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, 'save', tuple(self.save))
+        object.__setattr__(self, 'offload', tuple(self.offload))
+        unknown = sorted(set(self.save + self.offload) - set(RESIDUALS))
+        if unknown:
+            raise ValueError(
+                f"a remat policy names residuals from {list(RESIDUALS)}, got {unknown}")
+        both = sorted(set(self.save) & set(self.offload))
+        if both:
+            raise ValueError(
+                f"a residual is saved on device or offloaded to the host, not both: {both}")
+
+    def checkpoint_policy(self):
+        """The policy `nn.remat` runs the block under; None recomputes everything."""
+        if self.offload:
+            return jax.checkpoint_policies.save_and_offload_only_these_names(
+                names_which_can_be_saved=self.save,
+                names_which_can_be_offloaded=self.offload,
+                offload_src='device', offload_dst='pinned_host')
+        if self.save:
+            return jax.checkpoint_policies.save_only_these_names(*self.save)
+        return None
+
+
+REMAT_POLICIES: Mapping[str, RematPolicy] = {
+    'full': RematPolicy(),
+    'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
+    'minimal_with_context': RematPolicy(save=ATTENTION_RESIDUALS + ('context',) + MLP_RESIDUALS),
+    'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
+    'save_dot_with_context_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS + ('context',)),
+    'save_dot_except_mlpwi': RematPolicy(save=ATTENTION_RESIDUALS + ('down_proj',)),
+    'save_qkv_proj': RematPolicy(save=QKV_RESIDUALS),
+    'save_out_proj': RematPolicy(save=('o_proj',)),
+    'minimal_offloaded': RematPolicy(offload=ATTENTION_RESIDUALS + MLP_RESIDUALS),
+    'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
+}
+"""MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
+largest first. `full` keeps nothing but the block's inputs."""
+
+
+def remat_policy(
+        value: Union[RematPolicy, str, Mapping[str, Sequence[str]], None]) -> Optional[RematPolicy]:
+    """`value` as the policy it names: a `RematPolicy`, a name in
+    `REMAT_POLICIES`, a record of `save`/`offload` names, or None for no
+    recomputation at all. A config's record arrives here untyped, so a
+    value of another kind is refused rather than passed on."""
+    if value is None or isinstance(value, RematPolicy):
+        return value
+    if isinstance(value, str):
+        if value not in REMAT_POLICIES:
+            raise ValueError(
+                f"remat names one of {sorted(REMAT_POLICIES)} or is a record of "
+                f"save/offload residual names, got {value!r}")
+        return REMAT_POLICIES[value]
+    if isinstance(value, Mapping):
+        unknown = sorted(set(value) - {'save', 'offload'})
+        if unknown:
+            raise ValueError(
+                f"a remat record holds 'save' and 'offload' residual names, got {unknown}")
+        return RematPolicy(save=tuple(value.get('save', ())),
+                           offload=tuple(value.get('offload', ())))
+    raise ValueError(
+        f"remat is a RematPolicy, its name, its record, or None, not {value!r}")
 
 
 @logical_axes({
@@ -372,7 +470,7 @@ class DecoderBlock(nn.Module):
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     dropout_rate: float = 0.0
-    remat: bool = False
+    remat: Optional[RematPolicy] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -426,7 +524,7 @@ class DecoderBlock(nn.Module):
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  per_layer_input=None, attention_metadata=None):
-        if not self.remat or self.is_initializing() or decode:
+        if self.remat is None or self.is_initializing() or decode:
             return self._forward(x, train, decode, positions, segment_ids,
                                  kv_store, per_layer_input, attention_metadata)
 
@@ -442,9 +540,10 @@ class DecoderBlock(nn.Module):
                 if value is not kv_store.get(name)}
             return out, changed
         # Unlike DiT remat_block, this boundary returns the sharing store.
-        # Full-block remat saves no internal dots; train stays a static
-        # closure value and Linen lifts variables and RNGs with the call.
-        out, store = nn.remat(run)(
+        # The policy decides which named residuals the backward pass reads
+        # back instead of recomputing; train stays a static closure value and
+        # Linen lifts variables and RNGs with the call.
+        out, store = nn.remat(run, policy=self.remat.checkpoint_policy())(
             self, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata)
         if kv_store is not None:
             kv_store.update(store)
@@ -528,7 +627,7 @@ class MTPBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     dropout_rate: float = 0.0
-    remat: bool = False
+    remat: Optional[RematPolicy] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -917,10 +1016,12 @@ class CausalTransformer(nn.Module):
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
-    remat: bool = False
-    """Recompute block intermediates in the backward pass, retaining block
-    inputs and any K/V supplied to later layers. Init and cached decode
-    follow the direct block path; stored parameters have the same layout."""
+    remat: Optional[RematPolicy] = None
+    """Recompute each block in the backward pass, keeping its inputs, any K/V
+    supplied to later layers and the residuals the policy names. A name from
+    `REMAT_POLICIES` or a record of save/offload residual names arrives from
+    a config; None recomputes nothing. Init and cached decode follow the
+    direct block path; stored parameters have the same layout."""
 
     def __post_init__(self):
         if self.layer_scalar not in (None, "frozen", "trainable"):
@@ -959,6 +1060,7 @@ class CausalTransformer(nn.Module):
         elif self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
+        object.__setattr__(self, "remat", remat_policy(self.remat))
         super().__post_init__()
 
 

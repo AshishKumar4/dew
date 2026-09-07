@@ -39,6 +39,12 @@ The `min_shard` threshold keeps small parameters replicated. `Layout.check` dete
 
 Optimizer moments and EMA variables inherit placement from the corresponding parameter paths. Persistent checkpoints use a restore template for the requested layout. A model's shape and parameter naming still need to match the saved state.
 
+`Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy in pinned host memory between steps. The compiled step fetches them to the device, runs the same update, and writes them back, so the values are identical to a device-only layout and only the device memory they occupy between steps changes; checkpoints save and restore the placement. Parameters stay on the device. The transfer costs time on every step, so measure a run's step time with and without it.
+
+## Recompute block activations
+
+`CausalTransformer(remat=...)` recomputes each decoder block in the backward pass instead of keeping its activations. The value is a policy: `"full"` keeps only the block inputs, and the other names in `dew.nn.backbones.causal_transformer.REMAT_POLICIES` (`minimal`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded`, `qkv_proj_offloaded`) keep or offload to host memory the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`), trading recompute time for memory as MaxText's recipes of the same names do. A record such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}` names its own lists. `None`, the default, recomputes nothing. Every policy trains the same model; `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
+
 ## Feed global batches
 
 `Dataset.batch` describes the global batch. Each process supplies its local records, and Dew assembles global arrays. For custom data, validate that process slices are disjoint and deterministic. Repeating the full dataset independently on each process changes the effective training distribution.

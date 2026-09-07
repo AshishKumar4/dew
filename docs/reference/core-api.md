@@ -44,13 +44,13 @@ Import these from `dew.training`:
 
 ```text
 MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, microbatches=None)
-Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02)
+Layout(rules=DEFAULT_RULES, min_shard=65536, tolerance=0.02, host=())
 build_mesh(spec, devices=None)
 ```
 
 `build_mesh` uses the supplied devices or JAX's visible devices; the specified factors must divide their count, and data parallelism fills the remaining factor. Explicit pipeline microbatches require `stage > 1` and a positive multiple of the stage count.
 
-`Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
+`Layout.rules` accepts an ordered logical-axis rule sequence or a mapping of overrides. Mapping entries update the default table. When dimensions compete for one mesh axis, rule order determines precedence; a non-divisible dimension cannot use that axis. Valid parameter mesh axes are `fsdp`, `expert`, and `tensor`. `min_shard` counts elements, not bytes. `tolerance` is the permitted fraction of shardable parameter elements left replicated. `host` names train-state fields, `opt_state` and `ema`, kept in pinned host memory between steps and fetched to the device inside each step. `shardings(mesh, tree)` returns a matching tree of placements; `check(params, shardings, mesh)` validates excessive replication. See [distributed training](../concepts/distributed.md).
 
 ## Trainer
 
