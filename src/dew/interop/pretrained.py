@@ -54,11 +54,14 @@ class Processor:
             "padding": True, "return_tensors": "pt"}
         if images is not None:
             arguments["images"] = images
-        values = self.reference(**arguments)
-        # Llama 4 normalizes pixels in bfloat16 as its original implementation
-        # does; widening to float32 is exact.
-        return self.from_hf({name: (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-                             for name, value in values.items()})
+        arrays: dict[str, np.ndarray] = {}
+        for name, value in self.reference(**arguments).items():
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"processor field {name!r} is not a tensor")
+            # Llama 4 normalizes pixels in bfloat16 as its original
+            # implementation does; widening to float32 is exact.
+            arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+        return self.from_hf(arrays)
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
