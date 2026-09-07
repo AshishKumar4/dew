@@ -19,7 +19,7 @@ from safetensors.numpy import load_file
 from dew.data.audio import AudioProcessor
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
-from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
+from dew.nn.audio import AudioEncoding, Gemma3nAudio, audio_config, audio_weights
 from dew.registry import models, with_precision
 
 
@@ -69,29 +69,30 @@ class _Wrapper:
     def logits(self, params, tokens, valid, features, feature_mask):
         """Reference order: hard vocabularies, then soft audio, then the decoder."""
         encoded = self.encoder.apply({**self.encoder_variables, "params": params["encoder"]}, features, feature_mask)
+        assert isinstance(encoded, AudioEncoding)
         projector_variables = {"params": params["projector"]}
         audio_id = self.config["audio_token_id"]
         rows = jnp.arange(tokens.shape[0])[:, None]
         if isinstance(self.audio, Gemma3nAudio):
-            soft = self.projector.apply(projector_variables, encoded.features, method=self.projector.soft_embeddings)
-            padding = self.projector.apply(projector_variables,
-                                           jnp.array([[self.config["text_config"]["vocab_size"] - 1]], jnp.int32),
-                                           method=self.projector.hard_embeddings)
+            soft = jnp.asarray(self.projector.apply(projector_variables, encoded.features, method=self.projector.soft_embeddings))
+            padding = jnp.asarray(self.projector.apply(
+                projector_variables, jnp.array([[self.config["text_config"]["vocab_size"] - 1]], jnp.int32),
+                method=self.projector.embed_hard))
             count = self.config["audio_soft_tokens_per_image"]
             soft = jnp.where(encoded.mask[..., None], soft, padding)
             soft = jnp.concatenate([soft, jnp.broadcast_to(padding, (soft.shape[0], count - soft.shape[1], soft.shape[2]))], 1)
             safe = jnp.where((tokens >= 0) & (tokens < self.decoder.per_layer_input_vocab), tokens, 0)
-            embeddings = self.decoder.apply(self.text_variables, tokens, method=lambda m, t: m.embed_tokens(t))
+            embeddings = jnp.asarray(self.decoder.apply(self.text_variables, tokens, method=lambda m, t: m.embed_tokens(t)))
             embeddings = embeddings * jnp.sqrt(jnp.float32(self.decoder.emb_features))
-            embeddings = self.vision.apply(self.vision_variables, embeddings, tokens, method=self.vision._merge_hard_embeddings)
-            embeddings = self.projector.apply(projector_variables, embeddings, tokens, method=self.projector._merge_hard_embeddings)
+            embeddings = jnp.asarray(self.vision.apply(self.vision_variables, embeddings, tokens, method=self.vision.merge_hard_embeddings))
+            embeddings = jnp.asarray(self.projector.apply(projector_variables, embeddings, tokens, method=self.projector.merge_hard_embeddings))
             slots = jnp.argsort(jnp.where(tokens == audio_id, jnp.arange(tokens.shape[1]), tokens.shape[1]), axis=1)[:, :count]
             embeddings = embeddings.at[rows, slots].set(soft)
         else:
-            soft = self.projector.apply(projector_variables, encoded.features)
+            soft = jnp.asarray(self.projector.apply(projector_variables, encoded.features))
             placeholders = (tokens == audio_id) | (tokens == self.config["image_token_id"]) | (tokens == self.config["video_token_id"])
             safe = jnp.where(placeholders, self.config["text_config"]["pad_token_id"], tokens)
-            embeddings = self.decoder.apply(self.text_variables, safe, method=lambda m, t: m.embed_tokens(t))
+            embeddings = jnp.asarray(self.decoder.apply(self.text_variables, safe, method=lambda m, t: m.embed_tokens(t)))
             embeddings = embeddings * jnp.sqrt(jnp.float32(self.decoder.emb_features))
             # Valid frames form a prefix; each row's slots take its own features in order.
             order = jnp.cumsum(tokens == audio_id, axis=1) - 1
