@@ -927,10 +927,15 @@ class PNDM:
         e0, e1, e2, e3 = outputs[-1], outputs[-2], outputs[-3], outputs[-4]
 
         def runge_kutta(_):
-            t_mid = 0.5 * (t + t_next)
-            rates_mid = broadcast_rates(schedule, t_mid, x)
-            k2 = denoise(_pndm_step(x, eps, rates_t, rates_mid), t_mid)[1]
-            k3 = denoise(_pndm_step(x, k2, rates_t, rates_mid), t_mid)[1]
+            # Stage points: the k2 sample transfers to t - half and the k2/k3
+            # evaluations sit at t_next + half; both are the midpoint unless the
+            # schedule rounds its interval (Diffusers' integer stride // 2).
+            half = schedule.half_interval(t, t_next)
+            t_low, t_eval = t - half, t_next + half
+            rates_low = broadcast_rates(schedule, t_low, x)
+            rates_eval = broadcast_rates(schedule, t_eval, x)
+            k2 = denoise(_pndm_step(x, eps, rates_t, rates_low), t_eval)[1]
+            k3 = denoise(_pndm_step(x, k2, rates_t, rates_eval), t_eval)[1]
             k4 = denoise(_pndm_step(x, k3, rates_t, rates_s), t_next)[1]
             return _pndm_step(x, eps / 6 + k2 / 3 + k3 / 3 + k4 / 6, rates_t, rates_s)
 

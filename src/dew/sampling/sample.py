@@ -29,12 +29,15 @@ def sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, 
         if times is None:
             times = process.times(steps)
         else:
-            times = jnp.asarray(times, jnp.float32)
+            times = jnp.asarray(times)
             if times.ndim != 1 or times.shape[0] < 1:
                 raise ValueError(f"times must be a descending grid of at least one point, got {times.shape}")
     batch = x_T.shape[0]
     if times.shape[0] == 1:
         return denoise(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
+
+    with jax.ensure_compile_time_eval():
+        initial = solver.init(x_T, times, process)
 
     def body(carry, inputs):
         x, state = carry
@@ -47,7 +50,7 @@ def sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, 
         return (x, state), None
 
     (x, _), _ = lax.scan(
-        body, (x_T, solver.init(x_T, times, process)),
+        body, (x_T, initial),
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     if not final_denoise:
         return x

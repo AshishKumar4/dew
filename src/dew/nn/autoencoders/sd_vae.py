@@ -1,107 +1,44 @@
-"""The Stable Diffusion AutoencoderKL behind the `AutoEncoder` seam. The
-modules are the vendored diffusers ones in vae.py; the weights are the
-checkpoint's."""
-
-from functools import partial
-
+"""Pretrained variational image autoencoders behind the AutoEncoder seam."""
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 
 from .api import AutoEncoder
-from .vae import FlaxEncoder, FlaxDecoder, load_pretrained_vae
+from .kl import AutoencoderKL
+from .vae import load_pretrained_vae
 
 
 class StableDiffusionVAE(AutoEncoder):
-    """A pretrained AutoencoderKL behind the `AutoEncoder` seam.
-
-    `modelname` is a Hub repo or a local directory. The config decides the
-    latent space, so the same class carries SD1's four channels and the
-    sixteen of SD3.5 and Flux; those newer configs also set `use_quant_conv`
-    and `use_post_quant_conv` false, and then there are no such layers to
-    apply. `params` overrides the loaded weights.
-    """
+    """Frozen native AutoencoderKL variables and their latent normalization."""
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
-                 dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None):
-
-        pretrained = load_pretrained_vae(modelname, revision=revision)
-        config = pretrained["config"]
-        params = pretrained["params"] if params is None else params
-
+                 dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
+                 model: AutoencoderKL | None = None):
         self.modelname = modelname
         self.revision = revision
         self.dtype = dtype
+        if model is None:
+            pretrained = load_pretrained_vae(modelname, revision=revision)
+            config = pretrained["config"]
+            params = pretrained["params"] if params is None else params
+            model = AutoencoderKL(
+                channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
+                image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
+                norm_groups=config["norm_num_groups"], quantize=config.get("use_quant_conv", True),
+                post_quantize=config.get("use_post_quant_conv", True), dtype=dtype)
+            latent_shift = (config.get("shift_factor") or 0.0) if latent_shift is None else latent_shift
+            latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
+        if params is None:
+            raise ValueError("A native autoencoder requires explicit parameters")
+        self.model = model
         self.params = params
-
-        enc = FlaxEncoder(
-            in_channels=config["in_channels"],
-            out_channels=config["latent_channels"],
-            down_block_types=config["down_block_types"],
-            block_out_channels=config["block_out_channels"],
-            layers_per_block=config["layers_per_block"],
-            act_fn=config["act_fn"],
-            norm_num_groups=config["norm_num_groups"],
-            double_z=True,
-            dtype=dtype,
-        )
-
-        dec = FlaxDecoder(
-            in_channels=config["latent_channels"],
-            out_channels=config["out_channels"],
-            up_block_types=config["up_block_types"],
-            block_out_channels=config["block_out_channels"],
-            layers_per_block=config["layers_per_block"],
-            norm_num_groups=config["norm_num_groups"],
-            act_fn=config["act_fn"],
-            dtype=dtype,
-        )
-
-        # SD3.5 and Flux fold the quantisation convolutions away, and their
-        # configs say so; SD1-era configs predate the keys and carry both.
-        use_quant_conv = config.get("use_quant_conv", True)
-        use_post_quant_conv = config.get("use_post_quant_conv", True)
-        one_by_one = partial(nn.Conv, kernel_size=(1, 1), strides=(1, 1),
-                             padding="VALID", dtype=dtype)
-        quant_conv = one_by_one(2 * config["latent_channels"]) if use_quant_conv else None
-        post_quant_conv = one_by_one(config["latent_channels"]) if use_post_quant_conv else None
-
-        # The VAE's own latent normalization rides on the AutoEncoder seam, so a
-        # caller can override it with per-dataset statistics without a second
-        # scaling path. Older configs predate these keys; 0.0 and 0.18215 are
-        # the SD defaults.
-        self.latent_shift = config.get("shift_factor", 0.0) if latent_shift is None else latent_shift
-        self.latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
-
-        def encode_single_frame(params, x, rngkey=None):
-            latents = enc.apply({"params": params['encoder']}, x, deterministic=True)
-            if quant_conv is not None:
-                latents = quant_conv.apply({"params": params['quant_conv']}, latents)
-            # apply returns the output alone unless mutable collections were
-            # asked for, and none were.
-            assert not isinstance(latents, tuple)
-            if rngkey is not None:
-                mean, log_std = jnp.split(latents, 2, axis=-1)
-                log_std = jnp.clip(log_std, -30, 20)
-                std = jnp.exp(0.5 * log_std)
-                latents = mean + std * jax.random.normal(rngkey, mean.shape, dtype=mean.dtype)
-            else:
-                latents, _ = jnp.split(latents, 2, axis=-1)
-            return latents
-
-        def decode_single_frame(params, z):
-            if post_quant_conv is not None:
-                z = post_quant_conv.apply({"params": params['post_quant_conv']}, z)
-            return dec.apply({"params": params['decoder']}, z)
-
-        self.encode_single_frame = jax.jit(encode_single_frame)
-        self.decode_single_frame = jax.jit(decode_single_frame)
-
-        # The latent geometry, from the shape one frame takes through the
-        # encoder. It is the weights' own shape, read once here from the trace
-        # alone, so nothing runs at construction.
-        frame = jax.ShapeDtypeStruct((1, 128, 128, config["in_channels"]), dtype)
-        latent = jax.eval_shape(encode_single_frame, params, frame)
+        self.latent_shift = 0.0 if latent_shift is None else latent_shift
+        self.latent_scale = 0.18215 if latent_scale is None else latent_scale
+        self.encode_single_frame = jax.jit(lambda params, image, key=None: self.model.apply(
+            {"params": params}, image, key, method=self.model.encode))
+        self.decode_single_frame = jax.jit(lambda params, latent: self.model.apply(
+            {"params": params}, latent, method=self.model.decode))
+        frame = jax.ShapeDtypeStruct((1, 128, 128, model.image_channels), dtype)
+        latent = jax.eval_shape(self.encode_single_frame, self.params, frame)
         self._downscale_factor = frame.shape[1] // latent.shape[1]
         self._latent_channels = latent.shape[-1]
 
@@ -118,4 +55,3 @@ class StableDiffusionVAE(AutoEncoder):
     @property
     def latent_channels(self) -> int:
         return self._latent_channels
-

@@ -251,7 +251,7 @@ Live CPU verification imported a locally trained Dew model through `Pretrained.s
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
                    unconditional_prob=0.12, ema_decay=0.999, sampler=DDIM(),
-                   guidance=CFG(3.0), steps=200)
+                   guidance=CFG(3.0), steps=200, pretrained=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label")
 ```
@@ -259,6 +259,28 @@ JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
 Import `DiffusionObjective` from `dew.objectives.diffusion`. Its model accepts noisy arrays shaped `(B, *latent_shape)`, model noise levels shaped `(B,)`, and conditioning keywords from `InputSpec`. It returns a prediction with the sample's channel/spatial geometry. The `Process` determines the training target and prediction conversion. The objective passes `train=True` and a dropout RNG during training. An autoencoder changes sample geometry and must expose compatible encode/decode operations. `ema_decay=None` keeps no averaged copy, so previews and evaluation read the live variables. `steps`, `sampler`, and `guidance` configure preview sampling; they do not set the number of optimization steps.
 
 Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normalized images/video and optional token indices plus `train` and RNG settings. It returns token features with the feature dimension last. The predictor consumes context features and context/target position indices and returns target features of the encoder width. Mask grid, patch geometry, and predictor dimensions must agree. `momentum` specifies the EMA schedule endpoints over `momentum_steps` optimizer updates; `label_key` identifies labels for representation evaluation. See the [JEPA example](../guides/representation-learning.md).
+
+### Pretrained latent diffusion
+
+The same `dew.interop.load_pretrained` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. The returned `Pretrained` holds a native `UNet2DCondition`, an `AutoencoderKL` behind the existing autoencoder seam, native CLIP conditioning, a `Process` and the native solver policy. Model and scheduler implementations from other libraries run only in the reference tools.
+
+`source.text_to_image()` builds the native image task. `source.save(directory, variables=updated)` writes the updated component weights back to their published layouts, retaining tokenizer files, image geometry and any safety-head parameters.
+
+```python
+from dew.interop import load_pretrained
+from dew.objectives.diffusion import DiffusionObjective
+
+source = load_pretrained("./image-checkpoint", dtype="float32")
+images = source.text_to_image()(["a flower"], steps=20, seed=0).host().images
+objective = DiffusionObjective(
+    source.model, source.process, source.inputs,
+    autoencoder=source.autoencoder, pretrained=source.variables,
+)
+```
+
+Training batches carry uint8 NHWC images and `source.inputs.tokenize(captions)`. A nine-channel inpainting source also specifies `inputs.mask`: binary NHWC masks with one channel, where white marks the region to repaint. Caption dropout preserves the mask and masked-image latents. This is neural conditioning, not a guarantee that decoded unmasked pixels equal the original image.
+
+Prepared `DenoisingInputs` can supply encoded native conditions and initial latents. Explicit grids pass to `sample(times=..., final_denoise=False)` when the last latent is the result; without an explicit grid, the existing `steps` and final clean-prediction convention remain unchanged. Published tabulated PRK grids own their integer half-interval rule; ordinary native grids retain exact half-intervals.
 
 ## Configuration and registries
 

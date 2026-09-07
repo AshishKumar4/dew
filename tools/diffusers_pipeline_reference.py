@@ -128,9 +128,14 @@ def bundle(root, destination):
     "tests/fixtures/tiny_diffusers.tar.xz"). No model downloads.
     """
     import tarfile
+    from tools.native_diffusion_reference_files import convert
+    def native_files(info):
+        return None if info.name.endswith((".msgpack", ".bin")) else info
     with tarfile.open(destination, "w:xz") as archive:
         for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"):
-            archive.add((Path(root) / task).resolve(), arcname=task)
+            directory = (Path(root) / task).resolve()
+            convert(directory)
+            archive.add(directory, arcname=task, filter=native_files)
 
 
 if __name__ == "__main__":

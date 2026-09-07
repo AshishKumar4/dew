@@ -83,6 +83,7 @@ class ResidualBlock(nn.Module):
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
+    dropout: float = 0.0
 
     def setup(self):
         if self.norm_groups > 0:
@@ -93,7 +94,7 @@ class ResidualBlock(nn.Module):
         self.norm2 = norm()
 
     @nn.compact
-    def __call__(self, x: jax.Array, temb: jax.Array):
+    def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
         conv = partial(nn.Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.activation(self.norm1(x)))
@@ -102,7 +103,10 @@ class ResidualBlock(nn.Module):
                                dtype=self.dtype, precision=self.precision)(temb)
         out = out + temb[:, None, None, :]
 
-        out = conv(name="conv2")(self.activation(self.norm2(out)))
+        out = self.activation(self.norm2(out))
+        if self.dropout:
+            out = nn.Dropout(self.dropout)(out, deterministic=not train)
+        out = conv(name="conv2")(out)
 
         residual = x
         if residual.shape != out.shape:

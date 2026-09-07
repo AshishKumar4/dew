@@ -26,6 +26,10 @@ from dew.diffusion.schedules import NoiseScheduler, expand
 
 class PredictionTransform:
     """The identity parameterization: the model outputs x_0's target space."""
+    normalize_input: bool = False
+
+    def __init__(self, *, normalize_input: bool = False):
+        self.normalize_input = normalize_input
 
     def pred_transform(self, x_t, preds, rates, t) -> jax.Array:
         """The model's raw output at `(x_t, t)` as a prediction in target space."""
@@ -47,6 +51,9 @@ class PredictionTransform:
         return x_0
 
     def get_input_scale(self, rates) -> ArrayLike:
+        if self.normalize_input:
+            signal, noise = rates
+            return jax.lax.rsqrt(signal ** 2 + noise ** 2)
         return 1
 
     def target_error_scale(self, snr) -> ArrayLike:

@@ -25,7 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
@@ -67,6 +67,7 @@ class DiffusionObjective(Objective[Mean]):
         sampler: Solver[Any] = DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
         steps: int = 200,
+        pretrained: Variables | None = None,
     ):
         """`sampler`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction."""
@@ -74,6 +75,9 @@ class DiffusionObjective(Objective[Mean]):
         self.process = process
         self.inputs = inputs
         self.autoencoder = autoencoder
+        self.pretrained = pretrained
+        if inputs.mask is not None and autoencoder is None:
+            raise ValueError("Masked-image conditioning requires an autoencoder")
         self.unconditional_prob = unconditional_prob
         self.sampler = sampler
         self.guidance = guidance
@@ -109,6 +113,8 @@ class DiffusionObjective(Objective[Mean]):
         return (*lead, height // factor, width // factor, self.autoencoder.latent_channels)
 
     def encoder_params(self) -> dict:
+        if self.pretrained is not None:
+            return dict(self.pretrained["encoders"])
         return {keyword: condition.encoder.params
                 for keyword, condition in self.inputs.conditions.items()}
 
@@ -118,15 +124,16 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
-    def text_to_image(self, variables):
-        """The inference task paired with this objective and variables snapshot."""
-        from dew.sampling.pipelines import TextToImage
-        return TextToImage(self.model, self.process, self.inputs, variables, self.autoencoder)
-
     def init(self, key):
+        if self.pretrained is not None:
+            return self.pretrained
         encoders = self.encoder_params()
+        conditions = self.unconditional
+        if self.inputs.mask is not None:
+            conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
+                          "masked_image": jnp.zeros((1, *self.latent_shape))}
         variables = self.model.init(
-            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **self.unconditional)
+            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
         state = {**variables, "encoders": encoders}
         if self.autoencoder is not None:
             # The frozen weights are state, like the encoders'. They ride in
@@ -151,11 +158,18 @@ class DiffusionObjective(Objective[Mean]):
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
                 given, self.unconditional)
+        if self.inputs.mask is not None:
+            from dew.inputs.diffusion import latent_image_conditions
+            spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],
+                unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key], jax.random.fold_in(key, 1))
+            return {**given, **spatial}, {**self.unconditional, **spatial}
         return given, self.unconditional
 
     def _sampling_batch(self, batch):
-        return {name: batch[name] for name in (self.inputs.sample.key,
-                *(condition.field for condition in self.inputs.conditions.values()))}
+        fields = [self.inputs.sample.key, *(condition.field for condition in self.inputs.conditions.values())]
+        if self.inputs.mask is not None:
+            fields.append(self.inputs.mask.key)
+        return {name: batch[name] for name in fields}
 
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.inputs.sample.key])

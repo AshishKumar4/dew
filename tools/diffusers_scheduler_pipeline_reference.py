@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import transformers
-from diffusers import FlaxStableDiffusionPipeline, PNDMScheduler, LMSDiscreteScheduler, EulerDiscreteScheduler
+from diffusers import FlaxStableDiffusionPipeline, PNDMScheduler, LMSDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler
 
 
 def build(base, destination):
@@ -45,6 +45,7 @@ def build(base, destination):
         ("lms-v", LMSDiscreteScheduler, {"prediction_type": "v_prediction"}),
         ("lms-karras", LMSDiscreteScheduler, {"use_karras_sigmas": True}),
         ("euler", EulerDiscreteScheduler, {}),
+        ("dpm", DPMSolverMultistepScheduler, {}),
     ):
         scheduler = cls.from_config(dict(pipe.scheduler.config), **options)
         scheduler.set_timesteps(4)
