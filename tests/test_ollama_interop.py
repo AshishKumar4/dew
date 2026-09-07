@@ -26,12 +26,12 @@ the GGUF records the pre-tokenizer as `default`, whose regex cuts digit runs
 into groups of three, where the exported ByteLevel tokenizer keeps a run
 whole. One test pins that too, so nobody reads the length check as identity.
 
-`save_pretrained_decoder` is the low-level writer and writes no tokenizer
-assets; it records the name under `tokenizer_name` in generation_config.json
-and nothing else. `Pretrained.save` is the path that also writes the
-attached processor (`pretrained.py:428-429`), so an export routed through it
-needs no copying. This file exercises the low-level writer, hence the copy,
-and pins the bare directory being refused.
+`save_pretrained_decoder` writes the tokenizer's own files beside the
+weights: handed the tokenizer the run trained with, it asks that tokenizer
+to save itself, so the directory it leaves is already complete and this file
+copies nothing into it. `Pretrained.save` delegates a decoder to the same
+writer, so both export paths leave the same files. One test converts a
+directory holding only what the writer produced, which is that claim.
 
 The model is created under a name generated for the run and removed when
 the module finishes; no other model the daemon holds is touched.
@@ -132,7 +132,7 @@ def write_token_files(directory: Path, tokenizer: HFTokenizer) -> dict:
 
 def train_and_export(root: Path) -> Path:
     """A short real run on those tokens, written back out in the HF layout
-    with the tokenizer that produced the ids copied beside it."""
+    with the tokenizer that produced the ids, which writes its own files."""
     import tyro
 
     recipe = load_recipe()
@@ -157,10 +157,7 @@ def train_and_export(root: Path) -> Path:
         config.model.architecture, {**FIELDS, "vocab_size": meta["vocab_size"]},
         dtype="float32", attention_impl="xla"))
     export = root / "export"
-    save_pretrained_decoder(model, state.params, str(export),
-                            tokenizer_name=str(TOKENIZER))
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copy2(TOKENIZER / name, export / name)
+    save_pretrained_decoder(model, state.params, str(export), tokenizer=tokenizer)
     return export
 
 
@@ -242,7 +239,7 @@ def test_the_converted_model_carries_the_exported_config(imported):
 
 
 def test_the_tokenizer_reaches_the_gguf(imported, client):
-    """The tokenizer copied beside the export is the one the daemon loads:
+    """The tokenizer the export wrote is the one the daemon loads:
     its end and unknown ids are in the GGUF, and a prompt costs the daemon
     the number of tokens the HF tokenizer encodes it into.
 
@@ -393,19 +390,23 @@ def test_backend_options_alone_are_not_the_models_policy(client):
                 options={"temperature": 0, "repeat_penalty": 1.1}).texts == bare
 
 
-def test_ollama_refuses_an_export_without_tokenizer_files(imported, tmp_path):
-    """The gap `save_pretrained_decoder` leaves.
+def test_what_the_export_writes_is_enough_to_import(imported, tmp_path):
+    """The gap `save_pretrained_decoder` used to leave, closed.
 
-    It writes config.json, model.safetensors and a generation_config that
-    names a tokenizer it does not copy. That directory alone does not
-    convert: the tokenizer has to be put there by whoever exports.
+    It wrote config.json, model.safetensors and a generation_config naming a
+    tokenizer it did not copy, and that directory did not convert: the
+    tokenizer had to be put there by whoever exported. Handed the tokenizer,
+    it now writes that tokenizer's own files, so the five files it produces
+    are by themselves a directory `ollama create` accepts. Copying exactly
+    those five is what makes this a claim about the writer rather than about
+    whatever else the export directory happens to hold.
     """
     _, export, _ = imported
     bare = tmp_path / "bare"
     bare.mkdir()
-    for name in ("config.json", "model.safetensors", "generation_config.json"):
+    for name in ("config.json", "model.safetensors", "generation_config.json",
+                 "tokenizer.json", "tokenizer_config.json"):
         shutil.copy2(export / name, bare / name)
-    assert not (bare / "tokenizer.json").exists()
 
     probe = f"dew-interop-bare-{uuid.uuid4().hex[:8]}"
     try:
@@ -413,5 +414,5 @@ def test_ollama_refuses_an_export_without_tokenizer_files(imported, tmp_path):
     finally:
         remove(probe)
 
-    assert done.returncode != 0
-    assert "tokenizer" in (done.stderr + done.stdout).lower()
+    assert done.returncode == 0, (
+        f"ollama refused what the export writes:\n{done.stderr}")

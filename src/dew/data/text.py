@@ -43,8 +43,9 @@ class HFTokenizer:
     paying for `transformers` and any hub lookup a caller never asked for.
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, *, local_files_only: bool = False):
         self.name = name
+        self.local_files_only = local_files_only
         self._tokenizer = None
 
     @property
@@ -52,7 +53,8 @@ class HFTokenizer:
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self.name)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.name, local_files_only=self.local_files_only)
         return self._tokenizer
 
     @property
@@ -73,5 +75,28 @@ class HFTokenizer:
             ids = ids.tolist()
         return self.tokenizer.decode(ids)
 
+    def save_pretrained(self, directory) -> None:
+        """Write this tokenizer's own files into an export directory.
+
+        What makes an exported checkpoint loadable by anything that reads the
+        HF layout: the tokenizer writes tokenizer.json, tokenizer_config.json
+        and its vocabulary itself, so the export copies no bytes by hand.
+        """
+        self.tokenizer.save_pretrained(str(directory))
+
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.name!r})"
+
+
+def tokenizer_for(name: str, *, local_files_only: bool = False):
+    """The tokenizer a name asks for: `byte` for Dew's own utf-8 vocabulary,
+    any other name for the HF tokenizer of that repo or local directory.
+
+    The one place a tokenizer name is resolved, so a training run and an
+    export of what it trained read the same name the same way. An export
+    passes local_files_only, since writing a checkpoint out is no reason to
+    reach the hub for a tokenizer the host does not already have.
+    """
+    if name == "byte":
+        return ByteTokenizer()
+    return HFTokenizer(name, local_files_only=local_files_only)

@@ -100,11 +100,17 @@ class Processor:
             audio_fields, audio_conditioning = self._audio(values, tokens)
             token_fields.update(audio_fields)
             conditioning = {**conditioning, **audio_conditioning}
-        text = self.record["text"]
-        if not isinstance(text, Mapping) or type(text.get("vocab_size")) is not int:
-            raise ValueError("the text record must carry its integer vocab_size")
-        if np.any(tokens < 0) or np.any(tokens >= text["vocab_size"]):
-            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
+        # Where a record keeps its text half: a translated multimodal wrapper
+        # under 'text', a DiffusionGemma source, whose record is its own HF
+        # config, under 'text_config', and a decoder-only record is the text
+        # record. A processor a caller built with no record at all names no
+        # vocabulary, so there is nothing to hold its ids to.
+        text = self.record.get("text") or self.record.get("text_config") or self.record
+        if text:
+            if not isinstance(text, Mapping) or type(text.get("vocab_size")) is not int:
+                raise ValueError("the text record must carry its integer vocab_size")
+            if np.any(tokens < 0) or np.any(tokens >= text["vocab_size"]):
+                raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
         return result
@@ -499,10 +505,11 @@ class Pretrained:
                                _pad_id(self.config, self.generation_config))
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
-        """Write trained variables back to the source layout with processor artifacts."""
+        """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
+        generation_config = dict(self.generation_config)
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
@@ -511,16 +518,20 @@ class Pretrained:
             tensors = {**self.retained_tensors,
                        **{layout.name: layout.export(values, scalar_mode) for layout in self.weight_layouts}}
         elif isinstance(self.model, CausalTransformer):
-            decoders.save_pretrained_decoder(self.model, values, destination)
-            tensors = None
+            # A source with no layout to run backwards is written by the
+            # decoder export, which writes the whole directory: weights, the
+            # config it derives, this processor's files and this generation
+            # config. One export path, so a decoder saved here and one saved
+            # directly leave the same files behind.
+            decoders.save_pretrained_decoder(self.model, values, destination,
+                                             tokenizer=self.processor,
+                                             generation_config=generation_config)
+            return
         else:
             raise ValueError("this source has no reversible weight layout")
-        if tensors is not None:
-            save_hf_layout(tensors, dict(self.config), destination)
-        if self.processor is not None:
-            self.processor.save_pretrained(destination)
-        with open(destination / "generation_config.json", "w") as handle:
-            json.dump(dict(self.generation_config), handle, indent=2)
+        save_hf_layout(tensors, dict(self.config), destination)
+        decoders.save_export_assets(destination, tokenizer=self.processor,
+                                    generation_config=generation_config)
 
 
 
