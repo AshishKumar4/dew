@@ -372,6 +372,22 @@ class CausalSelfAttention(nn.Module):
             causal, window = False, None
             if implementation in ("auto", "cudnn"):
                 implementation = "xla"
+        if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
+            pairwise = jnp.asarray(attention_metadata.pairwise_mask)
+            if pairwise.shape != (B, S, key.shape[-3]) or pairwise.dtype != jnp.bool_:
+                raise ValueError("attention_pairwise_mask must be boolean [B, queries, keys]")
+            mask = pairwise[:, None]
+            key_positions = attention_metadata.key_positions
+            if key_positions is not None:
+                if key_positions.shape != (B, key.shape[-3]):
+                    raise ValueError("attention_key_positions must be [B, keys]")
+                if self.sliding_window is not None:
+                    query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
+                    distance = query_positions[:, :, None] - key_positions[:, None, :]
+                    mask = mask & (jnp.abs(distance) < self.sliding_window)[:, None]
+            causal, window = False, None
+            if implementation in ("auto", "cudnn"):
+                implementation = "xla"
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
