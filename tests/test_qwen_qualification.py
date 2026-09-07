@@ -314,3 +314,12 @@ def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source
     repeated = task(inputs, 1, key=jax.random.key(91))
     np.testing.assert_array_equal(actual.tokens, repeated.tokens)
 
+
+
+
+@pytest.mark.parametrize("field,value", [("mtp_num_hidden_layers", 2), ("mtp_use_dedicated_embeddings", True)])
+def test_prediction_layouts_outside_the_released_contract_are_refused(field, value):
+    config = json.loads((ROOT / "qwen38-source/moe/config.json").read_text())
+    with pytest.raises(ValueError, match=field):
+        translate_config({**config, field: value})
+
