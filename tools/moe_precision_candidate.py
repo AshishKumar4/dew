@@ -3,11 +3,11 @@
 
 Proposed shared contract: grouped projections use the configured operand
 dtype, accumulate the complete forward contraction at least in fp32, then
-round once to activation dtype. Kernel cotangents accumulate in the original
-master dtype; input cotangents accumulate at least in fp32 before returning
-to their declared input dtype. Higher supplied precision is retained. Exact
-GELU uses at least fp32 for its expression and derivative, then returns to
-activation dtype. These rules do not depend on placement.
+round once to activation dtype. Derivative contractions use a common work
+dtype covering the configured operands and both original input/master
+dtypes, with an fp32 floor; cotangents return to their original dtype only
+after complete reductions. Exact GELU evaluates at least in fp32 before
+returning to activation dtype. These rules do not depend on placement.
 The tangent law is delta_x @ Q(kernel) + Q(x) @ delta_kernel, where Q keeps
 the configured rounded operand values but carries straight-through tangents
 in the original input/master dtype. Its automatic transpose follows the
@@ -107,16 +107,15 @@ def projection_jvp(dtype: Dtype | None, implementation: str, precision: Precisio
     dx, dk, _ = tangents
     dx, dk = jax.lax.optimization_barrier((dx, dk))
     output = jnp.asarray(projection(x, kernel, sizes, dtype, implementation, precision))
-    input_work = jnp.promote_types(x.dtype, jnp.float32)
-    kernel_work = jnp.promote_types(kernel.dtype, jnp.float32)
+    work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
     inputs = jnp.asarray(rounded_operand(x, output.dtype))
     matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-    input_term = grouped_matmul(dx.astype(input_work), matrix.astype(input_work), sizes,
+    input_term = grouped_matmul(dx.astype(work), matrix.astype(work), sizes,
                                 implementation=implementation, precision=precision,
-                                preferred_element_type=input_work)
-    kernel_term = grouped_matmul(inputs.astype(kernel_work), dk.astype(kernel_work), sizes,
+                                preferred_element_type=work)
+    kernel_term = grouped_matmul(inputs.astype(work), dk.astype(work), sizes,
                                  implementation=implementation, precision=precision,
-                                 preferred_element_type=kernel_work)
+                                 preferred_element_type=work)
     tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
     return output, tangent
 
@@ -232,6 +231,61 @@ def check_projection() -> None:
                                 'forward_oracle_error': float(np.max(abs(actual[0] - expected[0]))),
                                 'kernel_oracle_error': float(np.max(abs(actual[1] - expected[1]))),
                                 'input_oracle_error': float(np.max(abs(actual[2] - expected[2])))}), flush=True)
+
+
+def check_mixed_precision_cancellation() -> None:
+    epsilon = 2.0**-30
+    x = jnp.asarray([[1 + epsilon], [-1]], jnp.float64)
+    kernel = jnp.ones((1, 1, 1), jnp.float32)
+    sizes = jnp.asarray([2], jnp.int32)
+
+    def inferred(x, kernel):
+        return jnp.asarray(projection(x, kernel, sizes, None, 'xla', None))
+
+    y, tangent = jax.jit(lambda x, kernel: jax.jvp(
+        inferred, (x, kernel), (jnp.zeros_like(x), jnp.ones_like(kernel))))(x, kernel)
+    dk = jax.jit(jax.grad(lambda kernel: inferred(x, kernel).sum()))(kernel)
+    np.testing.assert_array_equal(y, np.asarray(x))
+    np.testing.assert_array_equal(tangent, np.asarray(x))
+    np.testing.assert_array_equal(dk, np.full(kernel.shape, epsilon, np.float32))
+
+    x = jnp.ones((1, 1), jnp.float32)
+    kernel = jnp.asarray([[[1 + epsilon, -1]]], jnp.float64)
+    sizes = jnp.asarray([1], jnp.int32)
+
+    def explicit(x, kernel):
+        return jnp.asarray(projection(x, kernel, sizes, jnp.float64, 'xla', None))
+
+    y, tangent = jax.jit(lambda x, kernel: jax.jvp(
+        explicit, (x, kernel), (jnp.ones_like(x), jnp.zeros_like(kernel))))(x, kernel)
+    dx = jax.jit(jax.grad(lambda x: explicit(x, kernel).sum()))(x)
+    np.testing.assert_array_equal(y, np.asarray(kernel[0]))
+    np.testing.assert_array_equal(tangent, np.asarray(kernel[0]))
+    np.testing.assert_array_equal(dx, np.full(x.shape, epsilon, np.float32))
+
+    kernel = jnp.asarray([[[1., -1.]]], jnp.float64)
+    direction = jnp.asarray([[[1 + epsilon, -1]]], jnp.float64)
+
+    def scalar(x, kernel):
+        return jnp.asarray(projection(x, kernel, sizes, jnp.bfloat16, 'xla', None)).astype(jnp.float64).sum()
+
+    def mixed(x, kernel, direction):
+        _, forward_reverse = jax.jvp(jax.grad(scalar, (0, 1)), (x, kernel),
+                                     (jnp.zeros_like(x), direction))
+
+        def directional(x, kernel):
+            return jax.jvp(scalar, (x, kernel), (jnp.zeros_like(x), direction))[1]
+
+        return forward_reverse, jax.grad(directional, (0, 1))(x, kernel)
+
+    for dx, dk in jax.jit(mixed)(x, kernel, direction):
+        # The residue is exactly representable; a generic fp32 atol would
+        # admit the old zero result and miss this mixed-order regression.
+        np.testing.assert_array_equal(dx, np.full(x.shape, epsilon, np.float32))
+        np.testing.assert_array_equal(dk, np.zeros(kernel.shape, np.float64))
+    print(json.dumps({'mixed_precision_cancellation': 'all three exact-residue regressions passed',
+                      'residue': epsilon}), flush=True)
+
 
 
 def check_projection_higher_order() -> None:
@@ -496,6 +550,7 @@ if __name__ == '__main__':
         with jax.enable_x64():
             check_projection()
             check_projection_higher_order()
+            check_mixed_precision_cancellation()
             check_activation_higher_order()
     try:
         check_transport_forward_mode()
