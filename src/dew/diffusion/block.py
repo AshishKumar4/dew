@@ -12,13 +12,11 @@ import math
 from dataclasses import dataclass, replace
 from collections.abc import Sequence
 from functools import partial
-from typing import ClassVar
 
-from flax import linen as nn, struct
+from flax import struct
 import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils
-import numpy as np
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
@@ -188,19 +186,6 @@ class BlockProcess:
 
 
 @dataclass(frozen=True)
-class CanvasGeometry:
-    """What the deterministic prefill state depends on besides the inputs."""
-
-    canvas_length: int
-    max_new_tokens: int
-    pad_token_id: int
-
-    @property
-    def blocks(self) -> int:
-        return (self.max_new_tokens + self.canvas_length - 1) // self.canvas_length
-
-
-@dataclass(frozen=True)
 class CanvasPlan:
     """Static controls of one canvas request; every field enters the compiled step."""
 
@@ -210,16 +195,9 @@ class CanvasPlan:
     max_new_tokens: int
 
     @property
-    def controls(self) -> CanvasPlan:
-        return self
-
-    @property
-    def geometry(self) -> CanvasGeometry:
-        return CanvasGeometry(self.process.canvas_length, self.max_new_tokens, self.pad_token_id)
-
-    @property
-    def steps(self) -> int:
-        return self.geometry.blocks
+    def blocks(self) -> int:
+        length = self.process.canvas_length
+        return (self.max_new_tokens + length - 1) // length
 
 
 @struct.dataclass
@@ -237,7 +215,7 @@ class CanvasDecodeState:
 
 def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
                eos_token_ids: tuple[int, ...], pad_token_id: int) -> None:
-    """Host checks shared by batch generation and the engine."""
+    """Host checks before the compiled loop."""
     if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
     if process.vocab_size != model.vocab_size or process.canvas_length != model.canvas_length:
@@ -255,16 +233,17 @@ def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs
 
 
 def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
-           geometry: CanvasGeometry) -> CanvasDecodeState:
+           plan: CanvasPlan) -> CanvasDecodeState:
+    """The deterministic prefill state: the encoded prompt and an empty result."""
     batch, prompt_length = inputs.tokens.shape
-    output = jnp.full((batch, prompt_length + geometry.blocks * geometry.canvas_length),
-                      geometry.pad_token_id, jnp.int32)
+    output = jnp.full((batch, prompt_length + plan.blocks * plan.process.canvas_length),
+                      plan.pad_token_id, jnp.int32)
     output = output.at[:, :prompt_length].set(inputs.tokens)
     result = CanvasGeneration(
         tokens=output, lengths=jnp.zeros((batch,), jnp.int32),
         terminated=jnp.zeros((batch,), bool), decoder_steps=jnp.zeros((batch,), jnp.int32))
     cache = {}
-    if geometry.blocks > 0:
+    if plan.blocks > 0:
         cache = model.apply(variables, batch, method=model.init_cache, mutable=["cache"])[1]["cache"]
         cache = model.apply(
             {**variables, "cache": cache}, inputs,
@@ -277,7 +256,7 @@ def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeSta
              key: jax.Array, plan: CanvasPlan) -> CanvasDecodeState:
     cache, result, index = state.cache, state.result, state.index
     process, length = plan.process, plan.process.canvas_length
-    blocks = plan.steps
+    blocks = plan.blocks
     batch, width = result.tokens.shape
     prompt_length = width - blocks * length
     canvas_key = jax.random.fold_in(key, index)
@@ -312,136 +291,12 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 @jax.jit(static_argnames=("model", "plan"))
 def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan) -> CanvasGeneration:
-    initial = _begin(model, variables, inputs, plan.geometry)
-    if plan.steps == 0:
+    initial = _begin(model, variables, inputs, plan)
+    if plan.blocks == 0:
         return _materialize(initial, inputs.tokens.shape[1], plan.max_new_tokens)
 
     def step(_, state):
         return _advance(model, variables, state, key, plan)
 
-    final = jax.lax.fori_loop(0, plan.steps, step, initial)
+    final = jax.lax.fori_loop(0, plan.blocks, step, initial)
     return _materialize(final, inputs.tokens.shape[1], plan.max_new_tokens)
-
-
-@dataclass(frozen=True)
-class SpanEvent:
-    """Tokens one row committed from one refined canvas."""
-
-    row: int
-    start: int
-    tokens: tuple[int, ...]
-    terminated: bool
-    decoder_steps: int
-
-
-class CanvasProgress:
-    """Host view of committed canvases; the result stays in the device state."""
-
-    def __init__(self, inputs: ModelInputs, plan: CanvasPlan) -> None:
-        self.plan = plan
-        self.prompt = np.asarray(inputs.tokens)
-        self.batch, self.prompt_length = self.prompt.shape
-        self.lengths = np.zeros(self.batch, np.int32)
-        self.decoder_steps = np.zeros(self.batch, np.int32)
-        self.terminated = np.zeros(self.batch, bool)
-        self.remaining = plan.steps
-        self.spans: list[SpanEvent] = []
-
-    @property
-    def bytes(self) -> int:
-        return 0
-
-    @property
-    def done(self) -> bool:
-        return self.remaining == 0 or bool(self.terminated.all())
-
-    def record(self, outputs: CanvasGeneration) -> None:
-        """Consume [steps, ...] committed results, one per refined canvas."""
-        tokens, lengths = np.asarray(outputs.tokens), np.asarray(outputs.lengths)
-        terminated, steps = np.asarray(outputs.terminated), np.asarray(outputs.decoder_steps)
-        for step in range(tokens.shape[0]):
-            for row in range(self.batch):
-                start, stop = int(self.lengths[row]), int(lengths[step, row])
-                if stop == start and not (terminated[step, row] and not self.terminated[row]):
-                    continue
-                self.spans.append(SpanEvent(
-                    row, start, tuple(int(token) for token in
-                                      tokens[step, row, self.prompt_length + start:self.prompt_length + stop]),
-                    bool(terminated[step, row]), int(steps[step, row] - self.decoder_steps[row])))
-            self.lengths, self.terminated, self.decoder_steps = lengths[step], terminated[step], steps[step]
-            self.remaining -= 1
-
-    @property
-    def count(self) -> int:
-        return len(self.spans)
-
-    def events(self, start: int) -> list[SpanEvent]:
-        return self.spans[start:]
-
-    def result(self, state: CanvasDecodeState | None) -> CanvasGeneration:
-        if state is None:
-            if self.plan.steps:
-                raise ValueError("a canvas result is read from its device state")
-            return CanvasGeneration(jnp.asarray(self.prompt), jnp.asarray(self.lengths),
-                                    jnp.asarray(self.terminated), jnp.asarray(self.decoder_steps))
-        return _materialize(state, self.prompt_length, self.plan.max_new_tokens)
-
-
-def _canvas_model(model: nn.Module) -> DiffusionGemma:
-    if not isinstance(model, DiffusionGemma):
-        raise TypeError("canvas generation requires a DiffusionGemma model")
-    return model
-
-
-@dataclass(frozen=True)
-class CanvasFamily:
-    """Block-diffusion generation over the shared prefill and canvas kernels.
-
-    A refinement draws noise for its whole batch, so one request's rows form
-    an indivisible state; an engine never merges rows of different requests.
-    ``process`` is the policy used when a request passes no generation value.
-    """
-
-    process: BlockProcess
-    eos_token_ids: tuple[int, ...] = ()
-    pad_token_id: int = 0
-    shared_rows: ClassVar[bool] = False
-
-    def prepare(self, model: nn.Module, inputs: ModelInputs, max_new_tokens: int,
-                generation: object | None) -> tuple[ModelInputs, CanvasPlan]:
-        process = self.process if generation is None else generation
-        if not isinstance(process, BlockProcess):
-            raise TypeError("DiffusionGemma generation takes a BlockProcess value")
-        _validated(_canvas_model(model), process, inputs, max_new_tokens, self.eos_token_ids, self.pad_token_id)
-        return inputs, CanvasPlan(process, self.eos_token_ids, self.pad_token_id, max_new_tokens)
-
-    def begin(self, model: nn.Module, variables: Variables, inputs: ModelInputs,
-              geometry: CanvasGeometry) -> CanvasDecodeState:
-        return _begin(_canvas_model(model), variables, inputs, geometry)
-
-    def advance(self, model: nn.Module, variables: Variables, state: CanvasDecodeState,
-                keys: jax.Array, controls: CanvasPlan, steps: int
-                ) -> tuple[CanvasDecodeState, CanvasGeneration]:
-        canvas_model = _canvas_model(model)
-
-        def step(carry, _):
-            following = _advance(canvas_model, variables, carry, keys, controls)
-            return following, following.result
-
-        return jax.lax.scan(step, state, None, length=steps)
-
-    def keys(self, key: jax.Array, rows: int) -> jax.Array:
-        return key
-
-    def progress(self, inputs: ModelInputs, plan: CanvasPlan) -> CanvasProgress:
-        return CanvasProgress(inputs, plan)
-
-    def generate(self, model: nn.Module, variables: Variables,
-                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array,
-                 generation: object | None = None) -> CanvasGeneration:
-        process = self.process if generation is None else generation
-        if not isinstance(process, BlockProcess):
-            raise TypeError("DiffusionGemma generation takes a BlockProcess value")
-        return process.generate(_canvas_model(model), variables, inputs, max_new_tokens, key=key,
-                                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)

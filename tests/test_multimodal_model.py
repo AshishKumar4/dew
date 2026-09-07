@@ -135,12 +135,14 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
 def test_public_cached_generation_preserves_image_conditioning(source):
     """Greedy continuation matches HF; changing pixels changes raw likelihoods."""
     loaded, inputs = source
-    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    task = loaded.text_generation()
+    generated = task(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(FIXTURE / "continuation.npy"))
     np.testing.assert_array_equal(generated.lengths, [3, 3])
+    assert task.decode(generated) == tuple(loaded.processor.decode(generated.tokens[:, -3:]))
     blank = dataclasses.replace(inputs, conditioning={
         **inputs.conditioning, "pixel_values": jnp.zeros_like(inputs.conditioning["pixel_values"])})
-    altered = loaded.generate(blank, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    altered = task(blank, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     # The observed maximum change is 0.0840, even though greedy tokens agree.
     assert np.max(np.abs(generated.raw_log_probs - altered.raw_log_probs)) > 1e-2
 
@@ -249,7 +251,7 @@ def test_source_processor_forward_and_cached_generation_match_reference(family_s
     wrong = loaded.model.apply(loaded.variables, wrong_inputs.tokens, **wrong_inputs.kwargs())
     with pytest.raises(AssertionError):
         np.testing.assert_allclose(np.asarray(wrong)[valid], expected[valid], atol=1e-4, rtol=0)
-    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
 
 
