@@ -5,6 +5,7 @@ Run in the isolated reference environment. Existing oracle arrays stay intact.
 The runtime loader consumes only checkpoint/config/tokenizer files afterward.
 """
 import argparse
+import json
 from pathlib import Path
 import re
 
@@ -16,10 +17,18 @@ from safetensors.numpy import save_file
 
 def convert(directory):
     directory = Path(directory)
+    from dew.interop.diffusion import write_flax_component
+    from safetensors.numpy import load_file
+    index = json.loads((directory / "model_index.json").read_text())
     for component in ("unet", "vae", "text_encoder", "text_encoder_2", "safety_checker"):
         folder = directory / component
         flax_file = folder / ("diffusion_flax_model.msgpack" if component in ("unet", "vae") else "flax_model.msgpack")
+        declared = index.get(component, [None, None])
+        if not declared[1] or not declared[1].startswith("Flax"):
+            continue
+        filename = "diffusion_pytorch_model.safetensors" if component in ("unet", "vae") else "model.safetensors"
         if not flax_file.is_file():
+            write_flax_component(directory, component, load_file(folder / filename))
             continue
         tensors = {}
         for path, value in flatten_dict(serialization.msgpack_restore(flax_file.read_bytes())).items():

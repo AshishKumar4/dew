@@ -79,6 +79,7 @@ class _Transformer(nn.Module):
     dtype: Dtype
     precision: PrecisionLike = None
     attention_impl: str | None = None
+    approximate_gelu: bool = True
 
     @nn.compact
     def __call__(self, x, context, *, train=False):
@@ -90,7 +91,8 @@ class _Transformer(nn.Module):
         x = x + attention("self_attention")(norm("self_norm")(x), context if self.stage.cross_only else None, train=train)
         x = x + attention("cross_attention")(norm("cross_norm")(x), context, train=train)
         x = x + FlaxFeedForward(self.stage.features, dtype=self.dtype, precision=self.precision,
-                               dropout=self.dropout, name="feed_forward")(norm("ff_norm")(x), train=train)
+                               dropout=self.dropout, approximate_gelu=self.approximate_gelu,
+                               name="feed_forward")(norm("ff_norm")(x), train=train)
         return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
 
 
@@ -101,11 +103,14 @@ class _SpatialAttention(nn.Module):
     dtype: Dtype
     precision: PrecisionLike = None
     attention_impl: str | None = None
+    norm_groups: int = 32
+    norm_epsilon: float = 1e-5
+    approximate_gelu: bool = True
 
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
-        x = nn.GroupNorm(32, epsilon=1e-5, name="norm")(x)
+        x = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, name="norm")(x)
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
@@ -115,7 +120,8 @@ class _SpatialAttention(nn.Module):
                         precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
         for index in range(self.stage.depth):
             x = _Transformer(self.stage, self.dropout, self.dtype, self.precision,
-                             self.attention_impl, name=f"layer_{index}")(x, context, train=train)
+                             self.attention_impl, approximate_gelu=self.approximate_gelu,
+                             name=f"layer_{index}")(x, context, train=train)
         if self.linear_projection:
             x = nn.Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
             x = x.reshape(batch, height, width, channels)
@@ -136,23 +142,34 @@ class _Level(nn.Module):
     dtype: Dtype
     precision: PrecisionLike = None
     attention_impl: str | None = None
+    norm_groups: int = 32
+    norm_epsilon: float = 1e-5
+    attention_norm_epsilon: float = 1e-5
+    approximate_gelu: bool = True
 
     @nn.compact
-    def __call__(self, x, time, context, skips=(), *, train=False):
+    def __call__(self, x, time, context, skips=(), *, upsample_shape=None, train=False):
         outputs = []
         for index in range(self.blocks):
             if self.direction == "up":
                 x = jnp.concatenate([x, skips[-(index + 1)]], axis=-1)
-            x = ResidualBlock(self.stage.features, norm_groups=32, norm_epsilon=1e-5,
+            x = ResidualBlock(self.stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
                               dropout=self.dropout, dtype=self.dtype, precision=self.precision,
                               name=f"residual_{index}")(x, nn.silu(time), train=train)
             if self.stage.cross_attention:
                 x = _SpatialAttention(self.stage, self.linear_projection, self.dropout, self.dtype,
-                                      self.precision, self.attention_impl, name=f"attention_{index}")(x, context, train=train)
+                                      self.precision, self.attention_impl, norm_groups=self.norm_groups,
+                                      norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
+                                      name=f"attention_{index}")(x, context, train=train)
             outputs.append(x)
         if self.resize:
             if self.direction == "up":
-                x = jax.image.resize(x, (x.shape[0], x.shape[1] * 2, x.shape[2] * 2, x.shape[3]), "nearest")
+                if upsample_shape is None:
+                    raise ValueError("Upsampling requires the next skip spatial shape")
+                height, width = upsample_shape
+                rows = jnp.arange(height) * x.shape[1] // height
+                columns = jnp.arange(width) * x.shape[2] // width
+                x = jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
             stride = (2, 2) if self.direction == "down" else (1, 1)
             x = nn.Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
                         dtype=self.dtype, precision=self.precision, name="resize")(x)
@@ -181,6 +198,10 @@ class UNet2DCondition(nn.Module):
     dtype: Dtype = jnp.float32
     precision: PrecisionLike = None
     attention_impl: str | None = None
+    norm_groups: int = 32
+    norm_epsilon: float = 1e-5
+    attention_norm_epsilon: float = 1e-5
+    approximate_gelu: bool = True
 
     @nn.compact
     def __call__(self, x, time, *, conditioning: DenoisingCondition, mask=None, masked_image=None, train=False):
@@ -205,21 +226,29 @@ class UNet2DCondition(nn.Module):
         for index, stage in enumerate(self.stages):
             x, outputs = _Level(stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
                 self.linear_projection, self.dropout, self.dtype, self.precision, self.attention_impl,
+                norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
+                attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
                 name=f"down_{index}")(x, time, conditioning.context, train=train)
             skips.extend(outputs)
         if self.middle_attention:
-            stage = self.stages[-1]
-            x = ResidualBlock(stage.features, norm_groups=32, norm_epsilon=1e-5, dropout=self.dropout,
+            last = self.stages[-1]
+            stage = UNetStage(last.features, last.heads, last.depth)
+            x = ResidualBlock(stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon, dropout=self.dropout,
                               dtype=self.dtype, precision=self.precision, name="middle_in")(x, nn.silu(time), train=train)
             x = _SpatialAttention(stage, self.linear_projection, self.dropout, self.dtype, self.precision,
-                                  self.attention_impl, name="middle_attention")(x, conditioning.context, train=train)
-            x = ResidualBlock(stage.features, norm_groups=32, norm_epsilon=1e-5, dropout=self.dropout,
+                                  self.attention_impl, norm_groups=self.norm_groups,
+                                  norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
+                                  name="middle_attention")(x, conditioning.context, train=train)
+            x = ResidualBlock(stage.features, norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon, dropout=self.dropout,
                               dtype=self.dtype, precision=self.precision, name="middle_out")(x, nn.silu(time), train=train)
         for index, stage in enumerate(reversed(self.stages)):
             count = self.blocks_per_level + 1
             inputs, skips = tuple(skips[-count:]), skips[:-count]
+            target = skips[-1].shape[1:3] if skips else None
             x, _ = _Level(stage, count, "up", index + 1 < len(self.stages), self.linear_projection,
                           self.dropout, self.dtype, self.precision, self.attention_impl,
-                          name=f"up_{index}")(x, time, conditioning.context, inputs, train=train)
-        x = nn.silu(nn.GroupNorm(32, epsilon=1e-5, name="output_norm")(x))
+                          norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
+                          attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
+                          name=f"up_{index}")(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
+        x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, name="output_norm")(x))
         return nn.Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)
