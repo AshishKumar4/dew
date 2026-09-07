@@ -10,17 +10,21 @@ from __future__ import annotations
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
+import hashlib
 import math
-from typing import Protocol
+from typing import ParamSpec, Protocol, TypeVar
 from uuid import uuid4
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 
+from dew.artifacts import agree_process_phase
+from dew.nn.inputs import ModelInputs
 from dew.data.prompts import LENGTH_KEY
 from dew.rl import group_advantage
 from dew.objectives.base import Variables
@@ -142,7 +146,7 @@ class EpisodeInference(Protocol):
 
     def bind(self, variables: Variables, /) -> EpisodeInference: ...
 
-    def __call__(self, inputs: Sequence[Sequence[int]], max_new_tokens: int, /,
+    def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation: ...
 
 
@@ -158,6 +162,68 @@ class EpisodeCancelled(CancelledError):
     def __init__(self, episode: Episode):
         self.episode = episode
         super().__init__(f"episode {episode.identity} cancelled: {episode.detail}")
+
+
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
+
+
+class _PeerFailure(RuntimeError):
+    """Another rank failed before the next collective generation call."""
+
+
+class _StatusStop(RuntimeError):
+    """An environment returned an explicit error or cancellation outcome."""
+
+
+def _phase(operation: Callable[[], _T], name: str) -> _T:
+    result: tuple[_T] | None = None
+    error = None
+    try:
+        result = (operation(),)
+    except BaseException as failure:
+        error = failure
+    try:
+        agree_process_phase(error, phase=name)
+    except BaseException as failure:
+        if error is None:
+            raise _PeerFailure(str(failure)) from failure
+        raise
+    assert result is not None
+    return result[0]
+
+
+@dataclass
+class _Session:
+    identity: EpisodeId
+    environment: Environment | None = None
+    initial: Observation | None = None
+    observation: Observation | None = None
+    transitions: list[Transition] = field(default_factory=list)
+    pending: Action | None = None
+    status: EpisodeStatus = EpisodeStatus.RUNNING
+    detail: str = ""
+    reward: float | None = None
+    error: BaseException | None = None
+
+    def invoke(self, operation: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        try:
+            return operation(*args, **kwargs)
+        except BaseException as error:
+            self.error = error
+            raise
+
+    def observe(self, observation: Observation) -> None:
+        if not isinstance(observation, Observation):
+            raise TypeError("environment methods must return an Observation")
+        self.observation = observation
+        self.status, self.detail = observation.status, observation.detail
+        if self.status in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
+            raise _StatusStop(self.detail)
+
+    def episode(self, policy_step: int, binding_id: str) -> Episode:
+        return Episode(self.identity, policy_step, self.initial, tuple(self.transitions),
+                       self.status, self.detail, self.reward, _binding_id=binding_id)
 
 
 @dataclass(frozen=True)
@@ -202,128 +268,193 @@ class EpisodeRollout:
         if self.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
-    def _episode(self, identity: EpisodeId, policy: EpisodeInference,
-                 policy_step: int, key: jax.Array, binding_id: str) -> Episode:
-        initial = None
-        transitions: list[Transition] = []
-        status = EpisodeStatus.RUNNING
-        detail = ""
-        pending: Action | None = None
-        episode: Episode | None = None
-        try:
-            with self.environment(identity) as environment:
-                observation = environment.reset()
-                initial = observation
-                status, detail = observation.status, observation.detail
-                while status == EpisodeStatus.RUNNING:
-                    if len(transitions) == self.max_turns:
-                        status, detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
-                        break
-                    if len(observation.context) > self.max_prompt_tokens:
-                        status, detail = EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens"
-                        break
-                    result = policy(
-                        [observation.context], self.max_new_tokens,
-                        key=jax.random.fold_in(key, len(transitions)), sampling=self.sampling)
-                    if not isinstance(result, Generation):
-                        raise TypeError("tool episodes require autoregressive Generation likelihoods")
-                    pending = self._action(result, observation.context, policy_step, binding_id)
-                    if not pending.terminated:
-                        observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
-                    else:
-                        observation = environment.step(pending)
-                    transitions.append(Transition(pending, observation))
-                    pending = None
-                    status, detail = observation.status, observation.detail
-                episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail,
-                                  _binding_id=binding_id)
-                if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
-                    # A verifier may inspect files or services owned by the
-                    # environment. Score before its context releases them.
-                    reward = float(self.verifier(episode))
-                    if not math.isfinite(reward):
-                        raise ValueError("episode verifier returned a non-finite reward")
-                    episode = replace(episode, reward=reward)
-            if episode is None or (status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED)
-                                   and episode.reward is None):
-                raise RuntimeError("environment exited before episode verification completed")
-        except BaseException as error:
-            status = (EpisodeStatus.CANCELLED if isinstance(
-                error, (AsyncCancelledError, CancelledError, KeyboardInterrupt)) else EpisodeStatus.ERROR)
-            detail = f"{type(error).__name__}: {error}"
-            if pending is not None:
-                transitions.append(Transition(pending, Observation((), status, detail)))
-            episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail,
-                              _binding_id=binding_id)
-            if self.record is not None:
-                self.record(episode)
-            if status == EpisodeStatus.CANCELLED:
-                raise EpisodeCancelled(episode) from error
-            raise EpisodeFailure(episode) from error
-        if self.record is not None:
-            self.record(episode)
-        if episode.status == EpisodeStatus.CANCELLED:
-            raise EpisodeCancelled(episode)
-        if episode.status == EpisodeStatus.ERROR:
-            raise EpisodeFailure(episode)
-        return episode
+    def _open(self, slots: list[_Session], stack: ExitStack) -> None:
+        for slot in slots:
+            slot.environment = slot.invoke(lambda: stack.enter_context(self.environment(slot.identity)))
+            observation = slot.invoke(slot.environment.reset)
+            slot.initial = observation
+            slot.invoke(slot.observe, observation)
 
-    def _action(self, result: Generation, context: tuple[int, ...], policy_step: int,
+    def _inputs(self, slots: list[_Session]) -> ModelInputs:
+        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad_id, np.int32)
+        valid = np.zeros_like(tokens, bool)
+        for row, slot in enumerate(slots):
+            if slot.status == EpisodeStatus.RUNNING:
+                observation = slot.observation
+                assert observation is not None
+                length = len(observation.context)
+                if length > self.max_prompt_tokens:
+                    slot.status, slot.detail = EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens"
+                else:
+                    tokens[row, -length:] = observation.context
+                    valid[row, -length:] = True
+            if not valid[row].any():
+                # Keep global row indices and collective shapes stable. The
+                # draw for a finished slot is discarded, never executed or trained.
+                valid[row, -1] = True
+        return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
+
+    def _advance(self, slots: list[_Session], result: Generation,
+                 policy_step: int, binding_id: str) -> None:
+        if not isinstance(result, Generation) or result.tokens.shape[0] != len(slots):
+            raise TypeError("tool episodes require one autoregressive Generation row per slot")
+        # Record every actual draw before invoking any tool. A tool failure
+        # must not erase the other requests already sampled in this cohort.
+        for row, slot in enumerate(slots):
+            if slot.status == EpisodeStatus.RUNNING:
+                observation = slot.observation
+                assert observation is not None
+                slot.pending = slot.invoke(self._action, result, row, observation.context, policy_step, binding_id)
+        for slot in slots:
+            action = slot.pending
+            if action is None:
+                continue
+            environment = slot.environment
+            assert environment is not None
+            if action.terminated:
+                observation = slot.invoke(environment.step, action)
+            else:
+                observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
+            if not isinstance(observation, Observation):
+                slot.invoke(slot.observe, observation)
+            slot.transitions.append(Transition(action, observation))
+            slot.pending = None
+            slot.invoke(slot.observe, observation)
+
+    def _verify(self, slots: list[_Session], policy_step: int, binding_id: str) -> None:
+        for slot in slots:
+            if slot.status == EpisodeStatus.RUNNING:
+                slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
+            def score() -> float:
+                reward = float(self.verifier(slot.episode(policy_step, binding_id)))
+                if not math.isfinite(reward):
+                    raise ValueError("episode verifier returned a non-finite reward")
+                return reward
+            slot.reward = slot.invoke(score)
+
+    def _failed(self, slots: list[_Session], error: BaseException,
+                policy_step: int, binding_id: str) -> None:
+        started = [slot for slot in slots if slot.environment is not None or slot.error is not None]
+        if not started:
+            raise error
+        primary = next((slot for slot in started if slot.error is not None), started[0])
+        cancelled = isinstance(error, (AsyncCancelledError, CancelledError, KeyboardInterrupt, _PeerFailure))
+        explicit = isinstance(error, _StatusStop)
+        if explicit:
+            cancelled = primary.status == EpisodeStatus.CANCELLED
+        for slot in started:
+            slot.status = (EpisodeStatus.ERROR if slot is primary and not cancelled else EpisodeStatus.CANCELLED)
+            slot.detail = str(error) if explicit else f"{type(error).__name__}: {error}"
+            slot.reward = None
+            if slot.pending is not None:
+                slot.transitions.append(Transition(slot.pending, Observation((), slot.status, slot.detail)))
+                slot.pending = None
+        records = tuple(slot.episode(policy_step, binding_id) for slot in started)
+        def record() -> None:
+            if self.record is not None:
+                for episode in records:
+                    self.record(episode)
+        _phase(record, "episode abort recording")
+        episode = records[started.index(primary)]
+        failure = EpisodeCancelled(episode) if cancelled else EpisodeFailure(episode)
+        if explicit:
+            raise failure from None
+        raise failure from error
+
+    def _action(self, result: Generation, row: int, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
-        """Validate recorded tokens and likelihoods before an environment acts."""
-        tokens = np.asarray(result.tokens)
+        """Validate a cohort row's provenance before an environment acts."""
+        tokens = np.asarray(result.tokens)[row]
         lengths, ended = np.asarray(result.lengths), np.asarray(result.terminated)
-        raw, behavior = np.asarray(result.raw_log_probs), np.asarray(result.behavior_log_probs)
-        width = len(context)
-        if (tokens.shape != (1, width + self.max_new_tokens)
+        raw, behavior = np.asarray(result.raw_log_probs)[row], np.asarray(result.behavior_log_probs)[row]
+        width = self.max_prompt_tokens
+        expected = np.full(width, self.sampling.pad_id, np.int32)
+        expected[-len(context):] = context
+        if (tokens.shape != (width + self.max_new_tokens,)
                 or not np.issubdtype(tokens.dtype, np.integer) or np.any(tokens < 0)
-                or not np.array_equal(tokens[0, :width], context)):
+                or not np.array_equal(tokens[:width], expected)):
             raise ValueError("inference must retain the exact requested context in integer tokens")
-        if (lengths.shape != (1,) or not np.issubdtype(lengths.dtype, np.integer)
-                or not 0 < lengths[0] <= self.max_new_tokens):
+        if (lengths.ndim != 1 or not np.issubdtype(lengths.dtype, np.integer)
+                or not 0 < lengths[row] <= self.max_new_tokens):
             raise ValueError("inference must return a valid sampled action length")
-        if raw.shape != (1, self.max_new_tokens) or behavior.shape != raw.shape:
+        if raw.shape != (self.max_new_tokens,) or behavior.shape != raw.shape:
             raise ValueError("inference must record raw and behavior likelihoods for every output slot")
-        if ended.shape != (1,) or ended.dtype != np.bool_:
+        if ended.shape != lengths.shape or ended.dtype != np.bool_:
             raise ValueError("inference must record a boolean EOS termination flag")
-        count = int(lengths[0])
-        actions = tuple(int(value) for value in tokens[0, width:width + count])
+        count = int(lengths[row])
+        actions = tuple(int(value) for value in tokens[width:width + count])
         stops = self.sampling.eos_id
         assert stops is not None
-        if bool(ended[0]) != bool(np.isin(actions[-1], stops)):
+        if bool(ended[row]) != bool(np.isin(actions[-1], stops)):
             raise ValueError("inference termination disagrees with the sampled EOS token")
-        return Action(context, actions, tuple(float(value) for value in raw[0, :count]),
-                      tuple(float(value) for value in behavior[0, :count]),
-                      bool(ended[0]), policy_step, self.sampling, _binding_id=binding_id)
+        return Action(context, actions, tuple(float(value) for value in raw[:count]),
+                      tuple(float(value) for value in behavior[:count]),
+                      bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
 
     def collect(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> tuple[Episode, ...]:
-        """Collect task-major groups without optimizer effects."""
-        if jax.process_count() != 1:
-            raise NotImplementedError(
-                "variable-turn episode collection needs a distributed environment coordinator")
-        tasks = local_rows(batch["task_id"])
-        if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
-            raise ValueError("task_id must be a nonempty vector of integer task identities")
+        """Collect fixed cohorts, agreeing host phases before every generation."""
+        def prepare():
+            tasks = local_rows(batch["task_id"])
+            if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
+                raise ValueError("task_id must be a nonempty vector of integer task identities")
+            if key.shape != ():
+                raise ValueError("episode key must be one PRNG key")
+            policy = self.policy.bind(state.params)
+            signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
+                         self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
+                         tuple(np.asarray(jax.random.key_data(key)).tolist()))
+            return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
+        tasks, policy, signature = _phase(prepare, "episode preparation")
+        processes, rank = jax.process_count(), jax.process_index()
+        if processes > 1:
+            multihost_utils.assert_equal(signature, "episode task counts, budgets, sampling and clocks must agree")
+        origin = np.frombuffer(uuid4().bytes, np.uint8) if rank == 0 else np.zeros(16, np.uint8)
+        if processes > 1:
+            origin = multihost_utils.broadcast_one_to_all(origin)
+        binding_id = origin.tobytes().hex()
         policy_step = int(state.updates)
-        # Copy only the containers; JAX buffers are immutable and remain live
-        # until collection returns. Replacing a caller's mapping cannot move
-        # the policy halfway through an episode.
-        variables = jax.tree.map(lambda leaf: leaf, state.params)
-        policy = self.policy.bind(variables)
-        binding_id = uuid4().hex
-        episodes = []
+        slots = []
         for index, task in enumerate(tasks):
             for group in range(self.groups):
-                sample = index * self.groups + group
+                sample = (rank * tasks.size + index) * self.groups + group
                 draw = jax.random.fold_in(key, sample)
-                identity = EpisodeId(int(task), int(state.step), sample,
-                                     tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))
-                episodes.append(self._episode(identity, policy, policy_step, draw, binding_id))
-        return tuple(episodes)
+                slots.append(_Session(EpisodeId(int(task), int(state.step), int(sample),
+                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
+        error = None
+        try:
+            with ExitStack() as stack:
+                try:
+                    _phase(lambda: self._open(slots, stack), "episode reset")
+                    for turn in range(self.max_turns):
+                        inputs = _phase(lambda: self._inputs(slots), "episode context preparation")
+                        active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
+                        if not agree_process_phase(None, phase="episode availability", available=active):
+                            break
+                        result = _phase(lambda: policy(inputs, self.max_new_tokens,
+                            key=jax.random.fold_in(key, turn), sampling=self.sampling), "episode generation")
+                        _phase(lambda: self._advance(slots, result, policy_step, binding_id), "episode tool step")
+                    _phase(lambda: self._verify(slots, policy_step, binding_id), "episode verification")
+                except BaseException as failure:
+                    error = failure
+                    raise
+        except BaseException as failure:
+            error = failure
+        try:
+            agree_process_phase(error, phase="episode resource release")
+        except BaseException as failure:
+            self._failed(slots, failure, policy_step, binding_id)
+        records = tuple(slot.episode(policy_step, binding_id) for slot in slots)
+        def record() -> None:
+            if self.record is not None:
+                for episode in records:
+                    self.record(episode)
+        _phase(record, "episode recording")
+        return records
+
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
         episodes = self.collect(state, batch, key)
-        return self.project(episodes)
+        return _phase(lambda: self.project(episodes), "episode projection")
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
         """Project action tokens from one collection; padded turns have zero support.

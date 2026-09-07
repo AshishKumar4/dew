@@ -1,6 +1,7 @@
 """Real sampled tool actions, verifier rewards and action-only GRPO updates."""
 
 import asyncio
+from collections import Counter
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
@@ -152,7 +153,7 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
     episodes = collect(rollout, state)
     batch = rollout.project(episodes)
 
-    assert harness.opened == harness.closed
+    assert Counter(harness.opened) == Counter(harness.closed)
     assert len(harness.calls) == GROUPS
     assert {episode.reward for episode in episodes} == {0., 1.}
     table = transition_logits()
@@ -244,8 +245,10 @@ def test_environment_failures_abort_collection_and_release_sessions(failure, sta
     expected = EpisodeCancelled if status == EpisodeStatus.CANCELLED else EpisodeFailure
     with pytest.raises(expected) as caught:
         collect(rollout, before)
-    assert harness.opened == harness.closed
-    assert len(harness.closed) == len(records) == 1
+    assert Counter(harness.opened) == Counter(harness.closed)
+    assert len(harness.closed) == len(records) == (1 if failure == "reset" else GROUPS)
+    assert all(episode.status == EpisodeStatus.CANCELLED and episode.reward is None
+               for episode in records[1:])
     assert caught.value.episode is records[0]
     assert records[0].status == status and records[0].reward is None
     if failure != "reset":
@@ -266,7 +269,7 @@ def test_verifier_failure_is_not_a_zero_reward(mode):
     assert caught.value.episode.reward is None
     assert caught.value.episode.status == EpisodeStatus.ERROR
     assert len(caught.value.episode.transitions) == 2
-    assert harness.opened == harness.closed
+    assert Counter(harness.opened) == Counter(harness.closed)
 
 
 @pytest.mark.parametrize("limits,turns,tool_calls", [
@@ -279,7 +282,7 @@ def test_truncation_preserves_actions_but_does_not_execute_partial_calls(limits,
     trainer, rollout = build(harness, **limits)
     episodes = collect(rollout, trainer.initial_state())
     assert len(harness.calls) == tool_calls
-    assert harness.opened == harness.closed
+    assert Counter(harness.opened) == Counter(harness.closed)
     assert all(episode.status == EpisodeStatus.TRUNCATED and episode.reward == -1. for episode in episodes)
     assert all(len(episode.transitions) == turns for episode in episodes)
     if limits.get("max_new_tokens") == 1:
@@ -392,8 +395,8 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     restored, _, _ = trainer.place()
     assert int(restored.step) == int(restored.updates) == 1
     np.testing.assert_array_equal(restored.params["params"]["table"], expected)
-    assert len(records) == 1 and records[0].identity.attempt == 1
-    assert records[0].reward is None
+    assert len(records) == jax.device_count() * GROUPS
+    assert all(episode.identity.attempt == 1 and episode.reward is None for episode in records)
 
 
 @pytest.mark.parametrize("corruption", ["context", "termination"])
@@ -410,12 +413,12 @@ def test_inference_provenance_is_checked_before_tool_execution(corruption):
         def __call__(self, inputs, max_new_tokens, *, key, sampling):
             result = self.inner(inputs, max_new_tokens, key=key, sampling=sampling)
             if corruption == "context":
-                return replace(result, tokens=result.tokens.at[0, 0].set(PAD))
+                return replace(result, tokens=result.tokens.at[0, PROMPT - 1].set(PAD))
             return replace(result, terminated=~result.terminated)
 
     with pytest.raises(EpisodeFailure, match="inference") as caught:
         collect(replace(rollout, policy=CorruptPolicy(rollout.policy)), trainer.initial_state())
-    assert harness.calls == [] and harness.opened == harness.closed
+    assert harness.calls == [] and Counter(harness.opened) == Counter(harness.closed)
     assert caught.value.episode.reward is None
 
 
@@ -440,7 +443,7 @@ def test_verifier_runs_before_environment_resources_are_released():
     trainer, rollout = build(harness, verifier=live_verifier)
     episodes = collect(rollout, trainer.initial_state())
     assert {episode.reward for episode in episodes} == {0., 1.}
-    assert harness.opened == harness.closed
+    assert Counter(harness.opened) == Counter(harness.closed)
 
 
 def test_projection_rejects_distinct_weight_bindings_with_identical_clocks():
@@ -504,9 +507,10 @@ def test_async_cancellation_keeps_its_cause_and_partial_episode(phase, retained_
         collect(rollout, trainer.initial_state())
 
     assert caught.value.__cause__ is cancelled
-    assert exiting_errors == [cancelled]
-    assert harness.opened == harness.closed
-    assert len(records) == 1 and records[0] is caught.value.episode
+    count = 1 if phase == "reset" else GROUPS
+    assert len(exiting_errors) == count and all(error is cancelled for error in exiting_errors)
+    assert Counter(harness.opened) == Counter(harness.closed)
+    assert len(records) == count and records[0] is caught.value.episode
     assert records[0].status == EpisodeStatus.CANCELLED and records[0].reward is None
     assert len(records[0].transitions) == retained_turns
     if retained_turns:
