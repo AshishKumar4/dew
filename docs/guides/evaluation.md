@@ -52,7 +52,19 @@ The trainer calls `Objective.preview` once per evaluation event when process zer
 
 ## Use a tracker
 
-Without a tracker, the trainer prints losses, validation results, and timing summaries to the terminal. Recipes can configure WandB tracking through their run configuration. Set the project and account information explicitly before using a remote service; the offline quickstart does not contact one.
+Import `LocalTracker`, `WandbTracker`, and `Trackers` from `dew.training`.
+
+`Tracker` has three methods: `log(scalars, step)`, `artifact(value, step)`, and `close()`. A tracker is borrowed by `Trainer.fit`; its constructing owner closes it. Context managers preserve the active exception if closing also fails.
+
+`LocalTracker("runs/example/tracking")` writes synchronous scalar and typed-record JSONL journals plus preview files. It never overwrites the recipe's `run.json`. Recipes create this local sink under their checkpoint directory; URI-backed checkpoint runs print their local tracking path. Optional W&B reporting uses the same interface. Explicitly use `offline=True` to prevent a W&B online session.
+
+Use `with Trackers(LocalTracker(path), WandbTracker(project, offline=True)) as tracker:` to own both sinks. Every sink receives each report even if another fails; the first failure propagates. There is no asynchronous reporting queue or silent drop policy: synchronous I/O has a cost at the log cadence.
+
+Local JSON encodes nonfinite metric values as strings `"NaN"`, `"+Inf"`, and `"-Inf"`. Perfect PSNR remains positive infinity, not null or a fabricated finite score. Use `float(value)` when reading these fields.
+
+Plotting is explicit: install `dew-ml[plots]`, then call `tracker.plot()` or construct `LocalTracker(path, plots=True)` to render at close. Matplotlib uses Agg, never a display backend. No plots render on training log ticks. Nonfinite points are annotated and omitted from curve segments; their exact values remain in the journal.
+
+Run records in `dew.telemetry.records` are `RunRecord` (resolved model/data/optimizer configuration and package versions), `FitStarted`, `CheckpointRequested`, `ProfileWindow`, and `FitEnded`. Checkpoint requests record asynchronous submission, not durability; existing checkpoint waits are unchanged. Profile records link explicit JAX trace windows, without per-step layer tensor copies. Data contents and source revisions are not automatically hashed: include their identities in the run summary when needed.
 
 Training metrics use names under `train/`; reduced validation metrics use `val/`. The logging cadence controls when the tracker receives values. Save the configuration separately from checkpoints when you need a record of the optimizer, data source, and evaluation settings.
 

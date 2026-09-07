@@ -291,6 +291,9 @@ def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monk
     stopped, waited = threading.Event(), threading.Event()
 
     class Tracker:
+        def artifact(self, value, step):
+            assert value is not None
+
         def log(self, scalars, step):
             raise primary
 

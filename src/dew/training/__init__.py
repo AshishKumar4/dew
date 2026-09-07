@@ -11,13 +11,13 @@ from .optim import build_optimizer
 from .quantization import Quantization, apply_quantization
 from .runtime import prepare_process, run_timestamp
 from .state import TrainState
-from .tracker import Tracker, WandbTracker
+from .tracker import Tracker, WandbTracker, LocalTracker, Trackers
 from .trainer import Profile, Rollout, Trainer, ema_update, write_back
 
 __all__ = [
     "Aux", "Checkpoints", "DEFAULT_RULES", "EMASpec", "Layout", "MeshSpec", "Metric",
     "Objective", "Profile", "Quantization", "Rollout", "Step", "Tracker",
-    "TrainState", "Trainer", "WandbTracker", "apply_quantization",
+    "TrainState", "Trainer", "LocalTracker", "Trackers", "WandbTracker", "apply_quantization",
     "build_mesh", "build_optimizer", "ema_update", "everything", "prepare_process",
     "run_timestamp", "under", "write_back",
 ]

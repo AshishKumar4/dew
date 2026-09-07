@@ -850,7 +850,7 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     assert seen == [((BATCH, 3), (BATCH, RES, RES, 3))] * 4
     scores = [s["val/sample_range"] for _, s in tracker.scalars if "val/sample_range" in s]
     assert len(scores) == 2 and all(np.isfinite(score) and score > 0 for score in scores)
-    assert [step for step, _ in tracker.artifacts] == [1, 2]
+    assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [1, 2]
     assert Checkpoints(str(tmp_path)).latest == 2
 
 
