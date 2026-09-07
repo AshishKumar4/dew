@@ -174,4 +174,3 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
         np.testing.assert_array_equal(after[key], before[key])
     trained = "model.vision_tower.patch_embedder.input_proj.weight"
     assert np.max(np.abs(after[trained] - before[trained])) > 1e-4
-

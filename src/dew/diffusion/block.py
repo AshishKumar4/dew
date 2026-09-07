@@ -16,10 +16,11 @@ from functools import partial
 from flax import struct
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, generation_signature
 from dew.objectives.base import Variables
 
 
@@ -188,6 +189,11 @@ class BlockProcess:
             error = failure
         agree_process_phase(error, phase="canvas generation setup")
         assert prepared is not None
+        if jax.process_count() > 1:
+            controls = (max_new_tokens, self, eos_token_ids, pad_token_id, model)
+            multihost_utils.assert_equal(
+                generation_signature(prepared, controls),
+                "canvas input schemas, model geometry and generation policy must agree")
         return _generate(model, variables, prepared, max_new_tokens, key, self,
                          eos_token_ids, pad_token_id)
 
