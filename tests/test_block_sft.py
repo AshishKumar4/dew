@@ -2,7 +2,7 @@
 
 Both canvases are evaluated. Row zero selects its second, two-token canvas;
 row one selects its first, three-token canvas. Encoder target supports also
- differ. The self-conditioning draw enables row zero and disables row one.
+differ. The self-conditioning draw enables row zero and disables row one.
 """
 
 from pathlib import Path

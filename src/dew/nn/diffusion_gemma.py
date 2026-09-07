@@ -1,12 +1,11 @@
-"""DiffusionGemma's self-conditioning MLP, in the reference layout.
+"""DiffusionGemma's shared native encoder/decoder and self-conditioning MLP.
 
-The decoder folds the previous step's logits back into its input embeddings
-through this gated MLP with a scaled pre-norm and a scale-free post-norm
-(TF/models/diffusion_gemma/modeling_diffusion_gemma.py:790-823, the norms at
-:147-165). The previous logits become soft embeddings through
-`soft_embeddings` (softmax in fp32 against the embedding table times its
-scale, :1271-1280), zeroed wherever training disables conditioning for the
-row. Weights load under the module's own tensor names.
+The MLP follows Transformers modeling_diffusion_gemma.py:790-823: a scaled
+pre-norm, gated feed-forward, and scale-free post-norm. Previous logits become
+soft embeddings through an fp32 softmax against the scaled embedding table.
+An explicit self-conditioning mask zeros embeddings for the first inference
+step. The official SFT objective instead supplies zero logits for its dropout
+branch; those are uniform soft embeddings, not a zero signal.
 """
 
 from __future__ import annotations
