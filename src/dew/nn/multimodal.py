@@ -109,10 +109,23 @@ class MultimodalTransformer(nn.Module):
     def causal(self) -> bool:
         return self.language_model.causal
 
+    @nn.compact
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None):
+        if decode:
+            allocated = self.has_variable("cache", "next_position")
+            next_position = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
+            valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+            logical = rotary_positions if rotary_positions is not None else positions
+            if logical is None:
+                logical = next_position.value[:, None] + jnp.cumsum(valid, axis=1) - 1
+                positions = logical
+            mask = valid if logical.ndim == 2 else valid[..., None]
+            maximum = jnp.max(jnp.where(mask, logical, -1), axis=tuple(range(1, logical.ndim)))
+            if allocated:
+                next_position.value = jnp.where(valid.any(axis=1), maximum + 1, next_position.value)
         if conditioning is None:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
@@ -146,6 +159,8 @@ class MultimodalTransformer(nn.Module):
         """The decoder's shared fp32 head matrix for chunked objective scoring."""
         return self.language_model.head_weight(params["language_model"])
 
+    @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the nested language cache without evaluating media."""
+        self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
