@@ -74,6 +74,9 @@ class SampledRollout:
         prepared = None
         error = None
         try:
+            key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
+            if key.shape != ():
+                raise ValueError("key must be a single JAX PRNG key")
             prompts = local_rows(batch[PROMPT_KEY])
             prompt_lengths = local_rows(batch[LENGTH_KEY])
             sources, truths, infos = (_texts(local_rows(batch[name]))
