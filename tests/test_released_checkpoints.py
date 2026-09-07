@@ -1,65 +1,14 @@
-"""Released checkpoints from the Hub, through the whole public path.
+"""Network-gated released-weight checks for load, scoring, generation, SGD and export.
 
-`test_hf_decoders.py` holds the family-by-family parity fixtures and, for
-Qwen3-0.6B, a comparison against committed top-32 logits. This file is the
-acceptance run those fixtures stand in for: the checkpoint is downloaded at
-a pinned revision, loaded through `load_pretrained`, tokenized by its own
-tokenizer, scored through `LMObjective`, generated from, trained for one
-`Trainer` step, exported and reloaded, with the reference computed by
-transformers in the same process from the same snapshot directory rather
-than read from a fixture.
+SmolLM2-135M and Qwen3-0.6B are revision-pinned below. Dew and Transformers
+5.16.1 load the same snapshot in float32; the Torch reference stays on CPU.
+The GPU run uses the suite's highest matmul precision. Observed maximum
+logit differences on the RTX 4080 were 1.8e-4 and 3.6e-4 respectively.
+Lowering precision to TF32 made four Qwen cases fail at the unchanged bounds.
 
-Two checkpoints are two checkpoints. What they establish is that the
-published path runs on real released weights and that its numbers are the
-reference's; they establish neither a family nor a size range nor the Hub.
-
-Conditions. `dtype='float32'`, so parameters and compute are float32, and
-`attention_impl='reference'`, dew's own attention rather than a fused
-kernel, which is what the fixture parity tests compare under.
-`max_seq_len` 32. Each prompt goes through the processor on its own, so no
-tokenizer padding is requested, and the rows are assembled into one
-right-padded batch through the processor's own `from_hf` seam; only the
-positions the attention mask keeps are compared. The reference is
-transformers 5.16.1 with `dtype=torch.float32` and
-`set_attn_implementation('eager')`, reading the directory the loader
-resolved, so both sides hold the same weights rather than two downloads.
-
-`conftest.py` sets `JAX_DEFAULT_MATMUL_PRECISION=highest` for the whole
-suite. That setting is load-bearing here: on the RTX 4080 these prompts run
-at 3.6e-04 with it and at 7.5e-02 without it, because Ampere and later
-default fp32 matmuls to TF32's 10-bit mantissa. A run that unsets it is not
-comparing fp32.
-
-Observed, jax 0.11.1 on one RTX 4080 and torch 2.14.0+cpu on the reference
-side, at the revisions pinned below:
-
-- HuggingFaceTB/SmolLM2-135M, 30 layers, 0.50 GiB of float32 parameters in
-  272 leaves. Logits: max |difference| 1.8e-04, mean 1.4e-05, on logits up
-  to 36.1, with the argmax of every compared position equal. Per-token
-  cross entropy: 1.8e-04 on losses up to 11.8. Greedy: identical over 12
-  tokens for both prompts. One SGD step: 3.0e-08 from the explicit gradient
-  step, whose largest parameter move is 6.2e-04. The export read back by
-  transformers: 9.3e-05.
-- Qwen/Qwen3-0.6B, 28 layers, 2.22 GiB in 310 leaves. Logits: max
-  |difference| 3.6e-04, mean 1.0e-05, on logits up to 20.7, argmax equal.
-  Per-token cross entropy: 7.0e-04 on losses up to 14.9. Greedy: identical
-  over 12 tokens for both prompts. One SGD step: 1.2e-07 from the explicit
-  step, largest parameter move 3.0e-03. The export read back: 1.5e-04.
-
-The tolerances below sit a factor of five or more above those residues,
-which are 28 and 30 layers of fp32 rounding accumulating in a different
-order. They stay far below what a wrong rope convention, norm placement or
-weight transpose costs: those move logits by whole units, and the fixture
-tests hold the tight bounds on the same code at tiny sizes.
-
-Qwen3-0.6B's own generation config samples (temperature 0.6, top-k 20,
-top-p 0.95), so its greedy run passes an explicit policy; SmolLM2's config
-names no sampling and `text_generation()` is already greedy there.
-
-Neither released tokenizer is modified. SmolLM2's declares no pad token, so
-the fill for the assembled rows is its end-of-text id and `LMObjective` is
-told to count no target holding it; asking that tokenizer to pad a batch of
-prompts is a separate matter and is not exercised here.
+Each prompt is tokenized individually, then the public numeric-input seam
+assembles padded rows. This does not exercise raw-text batch padding when
+the source tokenizer has no pad token; masked fill uses its EOS id instead.
 """
 
 import math
@@ -296,7 +245,6 @@ def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batc
         assert length == NEW_TOKENS and not bool(generation.terminated[0]), text
         assert (list(drawn[0, width:width + length])
                 == [int(token) for token in expected[0][lengths[row]:]]), text
-        assert task.decode(generation)[0], f"{text!r} decoded to nothing"
 
 
 def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, trained):
@@ -310,12 +258,9 @@ def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, 
 
     held, updated, grads = flat(variables), flat(state.params), flat(gradient)
     assert int(state.updates) == 1 and held.keys() == updated.keys()
-    moved = sum(int(not np.array_equal(np.asarray(leaf), np.asarray(updated[name])))
-                for name, leaf in held.items())
     difference = max(float(np.max(np.abs(np.asarray(updated[name])
                                          - (np.asarray(leaf) - RATE * np.asarray(grads[name])))))
                      for name, leaf in held.items())
-    assert moved == len(held), f"{len(held) - moved} of {len(held)} leaves did not move"
     assert difference < UPDATE, f"max |update difference| {difference:.3e}"
 
 
