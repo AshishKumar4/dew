@@ -13,6 +13,13 @@ trainer logs as train/mfu. Each case is timed twice over the same number of
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
+Two registry architectures are composites: `multimodal_transformer` wraps a
+decoder in an image tower and projector, and `diffusion_gemma` reads one
+decoder both ways for the official block-diffusion loss. A case builds those
+from its trunk `config` plus the `media` or `canvas` record the wrapper
+needs, so their rows measure the tower and the canvas passes, not the plain
+decoder step.
+
 Usage:
     python tools/benchmark_step.py --preset cpu-smoke
     python tools/benchmark_step.py --preset small --json-out /tmp/bench.json
@@ -26,6 +33,8 @@ Usage:
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
         "num_heads": 8}, "batch_size": 32, "image_size": 32, "fsdp_size": 2}]'
+    python tools/benchmark_step.py --preset small \\
+        --architectures multimodal_transformer diffusion_gemma
 """
 
 import contextlib
@@ -47,11 +56,15 @@ import tyro
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
-from dew.objectives.diffusion import DiffusionObjective
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.inputs import ModelInputs
+from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
+from dew.nn.vision import ProjectorBase, TowerBase, projector_from_record, tower_from_record
+from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
-from dew.registry import with_precision
+from dew.registry import resolve_dtype, with_precision
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer
@@ -63,7 +76,7 @@ from dew.training.distributed import DevicePrefetchIterator
 TEXT_TOKENS = 77
 TEXT_FEATURES = 768
 
-Batch = dict[str, np.ndarray | Mapping[str, np.ndarray]]
+Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 Row = dict[str, object]
 
 
@@ -89,6 +102,17 @@ class Case:
     """Video models take (frames, H, W, C) samples; 0 means images."""
     predictor: dict[str, object] | None = None
     """Set for JEPA: the architecture is an encoder and this builds its predictor."""
+    canvas: dict[str, object] | None = None
+    """Set for a block-diffusion decoder: `prompt_length` and `canvas_size`.
+    The architecture is the shared encoder/decoder trunk `config` builds, and
+    the row of `seq_len + 1` tokens splits into a clean prompt and whole
+    canvases the way recipes/lm/train.py's block objective splits it."""
+    media: dict[str, object] | None = None
+    """Set for a vision-conditioned decoder: the `tower` and `projector`
+    records, the `family` and `image_token_id` the wrapper carries, `images`
+    per row and the `pixels` shape the checkpoint's processor emits. The
+    architecture is the decoder `config` builds and the images ride the batch
+    beside the tokens, as they do on the loaded multimodal path."""
     seq_len: int = 0
     """Set for language models: batches are token windows of this length, not images."""
     packed_documents: int = 0
@@ -109,6 +133,13 @@ class Case:
         return self.seq_len > 0
 
     @property
+    def packs_documents(self) -> bool:
+        """Whether --packed-documents means anything for this case: a plain
+        token window packs, a canvas row is the objective's own fixed
+        geometry, and a media row is what a processor emitted."""
+        return self.is_lm and self.canvas is None and self.media is None
+
+    @property
     def sample_shape(self) -> tuple[int, ...]:
         square = (self.image_size, self.image_size, 3)
         return square if self.frames == 0 else (self.frames, *square)
@@ -117,8 +148,83 @@ class Case:
     def label(self) -> str:
         mixture = self.config.get("mixture")
         experts = f" x{mixture['experts']}experts" if isinstance(mixture, dict) else ""
-        return (f"{self.architecture}{experts} b{self.batch_size} fsdp{self.fsdp_size} "
-                f"expert{self.expert_size}")
+        canvases = f" x{canvas_split(self)[2]}canvas" if self.canvas else ""
+        images = f" x{images_per_row(self)}img" if self.media else ""
+        return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size} "
+                f"fsdp{self.fsdp_size} expert{self.expert_size}")
+
+
+def _count(record: Mapping[str, object], key: str, owner: str) -> int:
+    value = record.get(key)
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{owner} needs a positive integer {key}, got {value!r}")
+    return value
+
+
+def canvas_split(case: Case) -> tuple[int, int, int]:
+    """A block-diffusion row as (prompt_length, canvas_size, num_canvases).
+
+    The row holds `seq_len + 1` tokens, the width the token-windows loader
+    emits, and splits the way recipes/lm/train.py splits it for the official
+    fine-tuning objective: a clean prompt, then whole canvases.
+    """
+    canvas = case.canvas or {}
+    prompt = _count(canvas, "prompt_length", "a canvas case")
+    width = _count(canvas, "canvas_size", "a canvas case")
+    response = case.seq_len + 1 - prompt
+    if response < width or response % width:
+        raise ValueError(
+            f"{case.architecture}'s row of {case.seq_len + 1} tokens is not "
+            f"{prompt} prompt tokens followed by whole canvases of {width}")
+    return prompt, width, response // width
+
+
+def images_per_row(case: Case) -> int:
+    return _count(case.media or {}, "images", "a media case")
+
+
+def media_pixels(case: Case) -> tuple[int, ...]:
+    """One processed image's (channels, height, width), as a processor emits it."""
+    shape = (case.media or {}).get("pixels")
+    if (not isinstance(shape, (list, tuple)) or len(shape) != 3
+            or any(type(size) is not int or size < 1 for size in shape)):
+        raise ValueError(
+            f"a media case's pixels is [channels, height, width], got {shape!r}")
+    return tuple(shape)
+
+
+def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
+    """The wrapper's media fields as built values: the checkpoint family, the
+    tower and projector its records name, and the placeholder token id."""
+    media = case.media or {}
+    family = media.get("family")
+    if not isinstance(family, str) or not family:
+        raise ValueError(f"a media case names its checkpoint family, got {family!r}")
+    for name in ("tower", "projector"):
+        if not isinstance(media.get(name), Mapping):
+            raise ValueError(f"a media case's {name} is a record, got {media.get(name)!r}")
+    token = media.get("image_token_id")
+    if type(token) is not int or token < 0:
+        raise ValueError(f"a media case's image_token_id is an id, got {token!r}")
+    return (family, tower_from_record(media["tower"]),
+            projector_from_record(media["projector"]), token)
+
+
+def image_tokens(case: Case) -> int:
+    """Text slots one image fills: the soft tokens this case's own projector
+    emits for it.
+
+    Read off the tower and projector instead of declared beside them, so a
+    row cannot mark a width the modules do not produce. The trace is
+    abstract: no parameter is allocated and no kernel compiles.
+    """
+    family, tower, projector, _ = media_values(case)
+    conditioner = VisionConditioner(family, tower, projector)
+    features = jax.eval_shape(
+        lambda pixels: conditioner.init_with_output(
+            jax.random.key(0), {"pixel_values": pixels})[0],
+        jax.ShapeDtypeStruct((1, 1, *media_pixels(case)), np.float32))
+    return features.shape[1]
 
 
 def cases_from_json(text: str) -> list[Case]:
@@ -153,7 +259,15 @@ JsonCases = Annotated[
 
 
 def cpu_smoke_cases() -> list[Case]:
-    """Tiny enough to run anywhere, real enough to compile the same step."""
+    """Tiny enough to run anywhere, real enough to compile the same step.
+
+    The last two are the composites at a size a CPU compiles in seconds: the
+    same wrappers, the same objectives and the same media and canvas work as
+    --preset small, on a two-layer decoder.
+    """
+    tiny_decoder: dict[str, object] = {"vocab_size": 256, "emb_features": 32,
+                                       "num_layers": 2, "num_heads": 2,
+                                       "mlp_features": 64, "max_seq_len": 16}
     return [
         Case("simple_dit", {"patch_size": 4, "emb_features": 64, "num_layers": 2,
                             "num_heads": 2, "mlp_ratio": 2},
@@ -163,9 +277,20 @@ def cpu_smoke_cases() -> list[Case]:
              predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
                         "num_layers": 1, "num_heads": 2, "mlp_ratio": 2},
              batch_size=8, image_size=16, fsdp_min_param_size=256),
-        Case("causal_transformer", {"vocab_size": 256, "emb_features": 32, "num_layers": 2,
-                                    "num_heads": 2, "mlp_features": 64, "max_seq_len": 16},
+        Case("causal_transformer", tiny_decoder,
              batch_size=8, seq_len=16, fsdp_min_param_size=256),
+        Case("multimodal_transformer", tiny_decoder,
+             media={"family": "gemma3", "image_token_id": 255, "images": 1,
+                    "pixels": [3, 16, 16],
+                    "tower": {"kind": "siglip", "hidden_size": 32, "intermediate_size": 64,
+                              "num_layers": 1, "num_heads": 2, "image_size": 16,
+                              "patch_size": 8},
+                    "projector": {"kind": "gemma", "vision_width": 32, "text_width": 32,
+                                  "patches_per_side": 2, "tokens_per_side": 2}},
+             batch_size=8, seq_len=15, fsdp_min_param_size=256),
+        Case("diffusion_gemma", {**tiny_decoder, "layer_scalar": "frozen"},
+             canvas={"prompt_length": 8, "canvas_size": 4},
+             batch_size=8, seq_len=15, fsdp_min_param_size=256),
     ]
 
 
@@ -185,6 +310,11 @@ def small_cases(dtype: str) -> list[Case]:
     predictor: dict[str, object] = {"grid": (16, 16), "emb_features": 384,
                                     "predictor_features": 192, "num_layers": 3,
                                     "num_heads": 6, "mlp_ratio": 4}
+    # GPT-2 small's width and heads at a quarter of its depth, on 512-token
+    # rows. The two composites wrap this same decoder, so their rows are the
+    # plain decoder's rows plus the work their wrapper adds.
+    decoder: dict[str, object] = {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
+                                  "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512}
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
@@ -205,24 +335,45 @@ def small_cases(dtype: str) -> list[Case]:
         Case("jepa_video_encoder", {**encoder, "num_layers": 4},
              predictor={**predictor, "num_layers": 2, "factorized": True},
              batch_size=4, image_size=64, frames=8),
-        # GPT-2 small's width and heads at a quarter of its depth, 512-token windows
-        Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                                    "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512},
-             batch_size=16, seq_len=512),
+        Case("causal_transformer", decoder, batch_size=16, seq_len=512),
         # The same decoder with an 8-expert, top-2 feed-forward on every second
         # layer, which is the sparse shape the 4.7 acceptance run trains
-        Case("causal_transformer", {"vocab_size": 50304, "emb_features": 768, "num_layers": 3,
-                                    "num_heads": 12, "mlp_features": 3072, "max_seq_len": 512,
-                                    "mixture": {"experts": 8, "top_k": 2, "every": 2}},
+        Case("causal_transformer",
+             {**decoder, "mixture": {"experts": 8, "top_k": 2, "every": 2}},
              batch_size=16, seq_len=512),
+        # The same decoder as a vision-conditioned one: SigLIP-so400m's widths
+        # at four layers over a 448px crop, pooled to the 256 soft tokens
+        # Gemma 3 gives an image, so half of every 512-token row is media. One
+        # image a row keeps the tower's cost the per-row cost a caption batch
+        # pays, and the batch is halved because each row carries one. The trunk
+        # is the plain decoder, so the row is the tower, the projector, the
+        # fusion and a causal decoder; Gemma 3's bidirectional-over-image mask
+        # is a per-family attention setting this case does not turn on.
+        Case("multimodal_transformer", decoder,
+             media={"family": "gemma3", "image_token_id": 50303, "images": 1,
+                    "pixels": [3, 448, 448],
+                    "tower": {"kind": "siglip", "hidden_size": 1152,
+                              "intermediate_size": 4304, "num_layers": 4,
+                              "num_heads": 16, "image_size": 448, "patch_size": 14},
+                    "projector": {"kind": "gemma", "vision_width": 1152, "text_width": 768,
+                                  "patches_per_side": 32, "tokens_per_side": 16}},
+             batch_size=8, seq_len=512),
+        # The same decoder read both ways by the official DiffusionGemma
+        # fine-tuning loss: one encoder pass over the whole row into the
+        # cache, then two decoder passes over the response for the
+        # self-conditioning branch. `frozen` is the published scalar policy
+        # the objective migrates to a trained one. The published vocabulary is
+        # 262144 and this loss holds whole `[B, S, vocab]` logit tensors, so
+        # the case keeps the other rows' vocabulary and a quarter of their
+        # batch.
+        Case("diffusion_gemma", {**decoder, "layer_scalar": "frozen"},
+             canvas={"prompt_length": 256, "canvas_size": 128},
+             batch_size=4, seq_len=511),
     ]
     cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
     # jepa_predictor has no step of its own: it is built through the registry
-    # inside the two JEPA cases above. The two composites wrap a built
-    # causal_transformer plus checkpoint-defined towers, so they have no flat
-    # field set to sweep; their decoder step is the causal_transformer rows.
-    covered = {case.architecture for case in cases} | {
-        "jepa_predictor", "diffusion_gemma", "multimodal_transformer"}
+    # inside the two JEPA cases above.
+    covered = {case.architecture for case in cases} | {"jepa_predictor"}
     missing = set(models) - covered
     if missing:
         raise ValueError(
@@ -297,14 +448,22 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 
     def apply(case: Case) -> Case:
         # An image model handed a (T, H, W, C) sample is a rank error, so
-        # --frames only resizes the video cases, and packing is a language
-        # model's batch.
+        # --frames only resizes the video cases, and packing is a plain token
+        # window's batch.
         frames = {} if config.frames is None or case.frames == 0 else {'frames': config.frames}
         packed = ({'packed_documents': config.packed_documents}
-                  if config.packed_documents is not None and case.is_lm else {})
+                  if config.packed_documents is not None and case.packs_documents else {})
         return dataclasses.replace(case, **overrides, **frames, **packed)
 
     return [apply(case) for case in cases]
+
+
+def lm_objective(case: Case, model) -> LMObjective:
+    """Next-token cross entropy over the case's rows, with its own head
+    chunking where it names one."""
+    if case.head_chunks is None:
+        return LMObjective(model, case.seq_len)
+    return LMObjective(model, case.seq_len, head_chunks=case.head_chunks)
 
 
 def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
@@ -314,18 +473,35 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
     The model goes through the same precision function the recipes use, so the
     dtype and the attention kernel land in the nested unet attention configs
     too, and a row of this table is a row a real run would produce.
+
+    A composite takes built values rather than a flat record, so its trunk
+    goes through the policy and the wrapper takes it, the way the pretrained
+    loader assembles the same two models (dew.interop.pretrained and
+    dew.interop.diffusion_gemma.build).
     """
     def built(architecture: str, config: Mapping[str, object]):
         return models.build(architecture, **with_precision(
             architecture, config, dtype=case.dtype, attention_impl=attention_impl))
 
-    model = built(case.architecture, case.config)
     sample_key = "video" if case.frames else "image"
 
-    if case.is_lm:
-        objective = (LMObjective(model, case.seq_len) if case.head_chunks is None
-                     else LMObjective(model, case.seq_len, head_chunks=case.head_chunks))
+    if case.canvas is not None:
+        prompt, width, count = canvas_split(case)
+        model = DiffusionGemma(text=built("causal_transformer", case.config),
+                               canvas_length=width)
+        objective = BlockDiffusionObjective(
+            model, prompt_length=prompt, canvas_size=width, num_canvases=count)
+    elif case.media is not None:
+        family, tower, projector, token = media_values(case)
+        model = MultimodalTransformer(
+            built("causal_transformer", case.config), tower, projector, family, token,
+            dtype=resolve_dtype(case.dtype),
+            attention_impl=None if attention_impl == 'reference' else attention_impl)
+        objective = lm_objective(case, model)
+    elif case.is_lm:
+        objective = lm_objective(case, built(case.architecture, case.config))
     elif case.predictor is not None:
+        model = built(case.architecture, case.config)
         patch = case.config.get("patch_size", 16)
         if not isinstance(patch, int):
             raise ValueError(f"{case.architecture}'s patch_size is {patch!r}, not an int")
@@ -335,6 +511,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
             multi_block_mask(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
+        model = built(case.architecture, case.config)
         inputs = InputSpec(Field(sample_key, case.sample_shape),
                            {"textcontext": text_condition()})
         objective = DiffusionObjective(model, presets.EDM()(), inputs)
@@ -346,6 +523,37 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
         checkpoints=None, tracker=None)
 
 
+def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> ModelInputs:
+    """One media batch in the numeric form a processor hands the model: the
+    placeholder run the images fill, the feature each of those slots reads,
+    and the pixels themselves.
+
+    Every row marks `image_tokens` slots for each of its images, so every
+    feature the tower computes is read by a slot. A shorter run would pay for
+    features the decoder never sees, and a longer one would read a feature
+    twice.
+    """
+    _, _, _, token = media_values(case)
+    images = images_per_row(case)
+    vocab = case.config.get("vocab_size")
+    if not isinstance(vocab, int) or token >= vocab:
+        raise ValueError(
+            f"a media row marks its slots with token {token}, which is not in "
+            f"{case.architecture}'s vocabulary of {vocab!r}")
+    slots = images * image_tokens(case)
+    if slots > tokens.shape[1]:
+        raise ValueError(
+            f"{images} images fill {slots} slots of {case.architecture}'s "
+            f"{tokens.shape[1]}-token row, which has no room for them")
+    tokens = tokens.copy()
+    tokens[:, :slots] = token
+    indices = np.full(tokens.shape, -1, np.int32)
+    indices[:, :slots] = np.arange(slots)
+    pixels = rng.normal(size=(case.batch_size, images, *media_pixels(case)))
+    return ModelInputs(tokens, {"image_indices": indices},
+                       {"pixel_values": pixels.astype(np.float32)})
+
+
 def batches(case: Case) -> Iterator[Batch]:
     """One host batch, reused: the loader is benchmarked by benchmark_data.py."""
     rng = np.random.default_rng(0)
@@ -355,7 +563,12 @@ def batches(case: Case) -> Iterator[Batch]:
         if not isinstance(vocab, int):
             raise ValueError(f"{case.architecture}'s vocab_size is {vocab!r}, not an int")
         width = case.seq_len + 1
-        batch["text"] = rng.integers(0, vocab, size=(case.batch_size, width)).astype(np.int32)
+        # A canvas row's target masks are read off the pad id, so a drawn zero
+        # would move the objective's own target support with the seed. Every
+        # other row takes it as an ordinary token.
+        lowest = 1 if case.canvas is not None else 0
+        tokens = rng.integers(lowest, vocab, size=(case.batch_size, width)).astype(np.int32)
+        batch["text"] = tokens if case.media is None else media_row(case, tokens, rng)
         if case.packed_documents:
             # Equal documents tiling the row. A packed row from the loader is
             # ragged and can end in padding; what the mask and the kernel cost
@@ -554,6 +767,12 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "expert_size": case.expert_size,
             "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
             "packed_documents": case.packed_documents,
+            # A row's own extra work, so a number is readable without its
+            # case: the images each row carries and their processed shape,
+            # and the canvases the block loss splits the response into.
+            "images_per_row": 0 if case.media is None else images_per_row(case),
+            "image_pixels": None if case.media is None else list(media_pixels(case)),
+            "canvases_per_row": 0 if case.canvas is None else canvas_split(case)[2],
             "dtype": case.dtype,
             "attention_impl": config.attention_impl,
             "xla_flags": config.xla_flags,
@@ -580,7 +799,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
 
 
 TABLE_COLUMNS = (
-    ("architecture", "architecture", 20, "{}"),
+    # Wide enough for the longest registry name, multimodal_transformer.
+    ("architecture", "architecture", 22, "{}"),
     ("batch_size", "batch", 6, "{}"),
     ("fsdp_size", "fsdp", 5, "{}"),
     ("expert_size", "expert", 7, "{}"),
