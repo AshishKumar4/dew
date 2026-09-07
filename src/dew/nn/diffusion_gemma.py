@@ -103,13 +103,15 @@ class DiffusionGemma(nn.Module):
         self.text.init_cache(batch_size)
 
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
+               attention_mask=None, image_groups=None, rotary_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False):
         """Append a clean prompt or committed canvas, evaluating media only when supplied."""
         if not conditioning:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
             return self.text(tokens, decode=True, train=train, positions=positions,
-                             segment_ids=segment_ids)
+                             segment_ids=segment_ids, attention_mask=attention_mask,
+                             image_groups=image_groups, rotary_positions=rotary_positions)
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
@@ -120,7 +122,8 @@ class DiffusionGemma(nn.Module):
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.text(fused.tokens, decode=True, train=train, positions=positions,
                          segment_ids=segment_ids, input_embeddings=fused.embeddings,
-                         embedding_positions=slots)
+                         embedding_positions=slots, attention_mask=attention_mask,
+                         image_groups=image_groups, rotary_positions=rotary_positions)
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False):

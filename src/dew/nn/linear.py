@@ -48,6 +48,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .inputs import AttentionMetadata
 from .sharding import logical_axes
 
 CHUNK_SIZE = 64
@@ -90,6 +91,24 @@ def causal_conv1d(x, kernel, activation: bool = True):
     if activation:
         windows = nn.silu(windows)
     return windows
+
+
+def _masked_conv1d(x, kernel, valid, state=None):
+    """Convolve real tokens without advancing a paused row's history."""
+    batch, channels, _ = x.shape
+    width = kernel.shape[1] - 1
+    if state is None:
+        state = jnp.zeros((batch, channels, width), x.dtype)
+
+    def step(history, inputs):
+        token, active = inputs
+        window = jnp.concatenate([history, token[:, :, None]], axis=-1)
+        output = nn.silu(jnp.sum(window * kernel[None, :, :], axis=-1))
+        history = jnp.where(active[:, None, None], window[:, :, 1:], history)
+        return history, jnp.where(active[:, None], output, 0.0)
+
+    state, output = jax.lax.scan(step, state, (jnp.moveaxis(x, 2, 0), valid.T))
+    return jnp.moveaxis(output, 0, 2), state
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
@@ -338,9 +357,13 @@ class GatedDeltaNet(nn.Module):
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         del positions, segment_ids, kv_store
         B, S, _ = x.shape
+        valid = None if attention_metadata is None else attention_metadata.valid
+        if valid is not None and valid.shape != (B, S):
+            raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
         projected = self.in_proj_qkv(x)
         key_dim, value_dim = self.key_features, self.value_features
         query, key, value = jnp.split(projected, [key_dim, 2 * key_dim], axis=-1)
@@ -372,13 +395,15 @@ class GatedDeltaNet(nn.Module):
                 mixed = causal_conv1d(conv_input, self._conv_taps())
                 out = jnp.zeros((B, S, self.value_features), self.dtype)
                 return self.out_proj(out)
-            history = jnp.concatenate([conv_state.value, conv_input], axis=2)
-            # The next step sees the last K-1 columns of this one.
-            conv_state.value = history[:, :, -(self.conv_kernel - 1):]
-            # The whole history goes through the same conv, so a multi-token
-            # prefill against a live cache and a single-token step land in
-            # one code path; only the new columns' outputs are kept.
-            mixed = causal_conv1d(history, self._conv_taps())[..., -S:]
+            if valid is not None:
+                mixed, history = _masked_conv1d(conv_input, self._conv_taps(), valid, conv_state.value)
+                conv_state.value = history
+            else:
+                history = jnp.concatenate([conv_state.value, conv_input], axis=2)
+                conv_state.value = history[:, :, -(self.conv_kernel - 1):]
+                mixed = causal_conv1d(history, self._conv_taps())[..., -S:]
+        elif valid is not None:
+            mixed, _ = _masked_conv1d(conv_input, self._conv_taps(), valid)
         else:
             mixed = causal_conv1d(conv_input, self._conv_taps())
         mixed = jnp.moveaxis(mixed, 2, 1)  # back to [B, S, D]
@@ -394,6 +419,10 @@ class GatedDeltaNet(nn.Module):
 
         query = l2norm(query)
         key = l2norm(key)
+        if valid is not None:
+            # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
+            beta = jnp.where(valid[:, :, None], beta, 0.0)
+            g = jnp.where(valid[:, :, None], g, 0.0)
 
         out, final = (recurrent_gated_delta_rule(
                           query, key, value, g, beta,

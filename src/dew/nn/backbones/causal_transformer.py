@@ -35,6 +35,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
+from ..inputs import AttentionMetadata
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
@@ -410,18 +411,18 @@ class DecoderBlock(nn.Module):
 
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
-                 per_layer_input=None):
+                 per_layer_input=None, attention_metadata=None):
         if not self.remat or self.is_initializing() or decode:
             return self._forward(x, train, decode, positions, segment_ids,
-                                 kv_store, per_layer_input)
+                                 kv_store, per_layer_input, attention_metadata)
 
-        def run(module, x, positions, segment_ids, kv_store, per_layer_input):
+        def run(module, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
             # Return writes explicitly, keeping consumer values out of the
             # scan result so its tracers cannot replace the outer store.
             store = None if kv_store is None else dict(kv_store)
             out = module._forward(x, train, False, positions, segment_ids,
-                                  store, per_layer_input)
+                                  store, per_layer_input, attention_metadata)
             changed = {} if store is None else {
                 name: value for name, value in store.items()
                 if value is not kv_store.get(name)}
@@ -430,13 +431,13 @@ class DecoderBlock(nn.Module):
         # Full-block remat saves no internal dots; train stays a static
         # closure value and Linen lifts variables and RNGs with the call.
         out, store = nn.remat(run)(
-            self, x, positions, segment_ids, kv_store, per_layer_input)
+            self, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata)
         if kv_store is not None:
             kv_store.update(store)
         return out
 
     def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input):
+                 kv_store, per_layer_input, attention_metadata):
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -444,7 +445,8 @@ class DecoderBlock(nn.Module):
         normed = self.input_layernorm(x) if self.wiring.pre_norms else x
         mixed = self.self_attn(normed,
                                decode=decode, positions=positions, segment_ids=segment_ids,
-                               **({} if kv_store is None else {"kv_store": kv_store}))
+                               **({} if kv_store is None else {"kv_store": kv_store}),
+                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}))
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
@@ -552,7 +554,7 @@ build their layers from, so one factory describes every view of them."""
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[Tuple[int, int]], x, *, train: bool, decode: bool,
-              positions, segment_ids, kv_store, per_layer_input):
+              positions, segment_ids, kv_store, per_layer_input, attention_metadata=None):
     """The layers over `x`, one run at a time as `groups` says.
 
     A run of one layer is `layers[first]`, called as the plain loop calls it.
@@ -573,14 +575,15 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if count == 1:
             x = layers[first](x, train=train, decode=decode, positions=positions,
                               segment_ids=segment_ids, kv_store=kv_store,
-                              per_layer_input=None if inputs is None else inputs[:, :, 0, :])
+                              per_layer_input=None if inputs is None else inputs[:, :, 0, :],
+                              attention_metadata=attention_metadata)
             continue
         store = kv_store if specs[first].kv_shared else None
 
         def step(layer, carry, per_layer_input):
             return layer(carry, train=train, decode=decode, positions=positions,
                          segment_ids=segment_ids, kv_store=store,
-                         per_layer_input=per_layer_input), None
+                         per_layer_input=per_layer_input, attention_metadata=attention_metadata), None
 
         scanned = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
                           in_axes=2, length=count)
@@ -607,11 +610,11 @@ class PipelineStage(nn.Module):
 
     @nn.compact
     def __call__(self, x, train: bool = False, positions=None, segment_ids=None,
-                 per_layer_input=None):
+                 per_layer_input=None, attention_metadata=None):
         return run_stack(self.layers, self.block, self.specs, self.groups, x,
                          train=train, decode=False, positions=positions,
                          segment_ids=segment_ids, kv_store=None,
-                         per_layer_input=per_layer_input)
+                         per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
 
 def _stack_leaves(*trees):
@@ -1338,11 +1341,13 @@ class CausalTransformer(nn.Module):
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
-                 input_embeddings=None, embedding_positions=None):
+                 input_embeddings=None, embedding_positions=None,
+                 attention_mask=None, image_groups=None, rotary_positions=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
                                positions=positions, segment_ids=segment_ids,
                                input_embeddings=input_embeddings,
-                               embedding_positions=embedding_positions)
+                               embedding_positions=embedding_positions, attention_mask=attention_mask,
+                               image_groups=image_groups, rotary_positions=rotary_positions)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -1408,7 +1413,8 @@ class CausalTransformer(nn.Module):
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None,
-                      input_embeddings=None, embedding_positions=None):
+                      input_embeddings=None, embedding_positions=None,
+                      attention_mask=None, image_groups=None, rotary_positions=None):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
@@ -1421,6 +1427,9 @@ class CausalTransformer(nn.Module):
         `embedding_positions`: both or neither, and the values replace the
         scaled token embeddings before the layers read them.
         """
+        attention_metadata = (None if attention_mask is None and image_groups is None
+                              and rotary_positions is None else AttentionMetadata(
+                                  attention_mask, image_groups, rotary_positions))
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             # Gemma casts embed_scale to the embedding weight dtype
@@ -1439,7 +1448,7 @@ class CausalTransformer(nn.Module):
             # copy: [num_inputs, B, S, D].
             x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
         x = self.stack(x, train=train, decode=decode, positions=positions,
-                       segment_ids=segment_ids, per_layer_input=ple)
+                       segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
         if self.altup is not None:
             # The copies past the first come back through their own
             # projections, rescaled to the first's magnitude, and the mean of
@@ -1450,7 +1459,7 @@ class CausalTransformer(nn.Module):
         return self.norm(x)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
-              per_layer_input):
+              per_layer_input, attention_metadata=None):
         """The layer stack over `x`: the plain loop, the scanned runs, or the
         pipeline over the mesh's stages.
 
@@ -1469,7 +1478,7 @@ class CausalTransformer(nn.Module):
                 tuple((index, 1) for index in range(self.num_layers)), x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 kv_store={} if self.num_kv_shared_layers else None,
-                per_layer_input=per_layer_input)
+                per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         if stages == 1:
             view = StackView(self.groups)
         else:
@@ -1494,13 +1503,13 @@ class CausalTransformer(nn.Module):
                 broadcast=tuple(name for name, tree in self.variables.items() if tree))
         x = x.astype(self.residual_dtype(
             x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            per_layer_input=per_layer_input))
+            per_layer_input=per_layer_input, attention_metadata=attention_metadata))
         run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        return run(self, view, x, train, decode, positions, segment_ids, per_layer_input)
+        return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
-                       per_layer_input) -> jnp.dtype:
+                       per_layer_input, attention_metadata=None) -> jnp.dtype:
         """The dtype the residual stream settles in: `x`'s promoted with what
         the first layer returns for it.
 
@@ -1520,7 +1529,8 @@ class CausalTransformer(nn.Module):
             layer.variables, x, mutable=True, rngs=rngs,
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             kv_store={} if self.num_kv_shared_layers else None,
-            per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :])[0])
+            per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :],
+            attention_metadata=attention_metadata)[0])
         return jnp.result_type(x.dtype, output.dtype)
 
     def stage_layers(self, stages: int) -> int:
@@ -1554,19 +1564,19 @@ class CausalTransformer(nn.Module):
 
     @nn.compact
     def _stacked(self, view: StackView, x, train: bool, decode: bool, positions,
-                 segment_ids, per_layer_input):
+                 segment_ids, per_layer_input, attention_metadata=None):
         """The stack inside `view`: scanned runs, or the pipeline over stages."""
         if view.stages == 1:
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 kv_store={} if self.num_kv_shared_layers else None,
-                per_layer_input=per_layer_input)
+                per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         return self._pipeline(view, x, train=train, positions=positions,
-                              segment_ids=segment_ids, per_layer_input=per_layer_input)
+                              segment_ids=segment_ids, per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
     def _pipeline(self, view: StackView, x, *, train: bool, positions, segment_ids,
-                  per_layer_input):
+                  per_layer_input, attention_metadata=None):
         """GPipe over the stage axis, as MaxText's `layers/pipeline.py` runs it.
 
         The batch splits into `view.microbatches` microbatches. Iteration t
@@ -1595,6 +1605,7 @@ class CausalTransformer(nn.Module):
         per_row = [None if value is None else micro(jnp.asarray(value), 0)
                    for value in (positions, segment_ids)]
         inputs = None if per_layer_input is None else micro(per_layer_input, 0)
+        metadata = jax.tree.map(lambda value: micro(value, 0), attention_metadata)
         slots = count // stages
         state_io = _on_stage_axis(x.reshape((stages, slots) + x.shape[1:]))
         shift = _on_stage_axis(jnp.zeros((stages,) + x.shape[1:], x.dtype))
@@ -1622,9 +1633,9 @@ class CausalTransformer(nn.Module):
             return _on_stage_axis(jax.vmap(
                 lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
 
-        def call_stage(stage, x, positions, segment_ids, per_layer_input):
+        def call_stage(stage, x, positions, segment_ids, per_layer_input, attention_metadata):
             return stage(x, train=train, positions=positions, segment_ids=segment_ids,
-                         per_layer_input=per_layer_input)
+                         per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
         def iteration(module, carry, step):
             state_io, shift = carry
@@ -1642,7 +1653,8 @@ class CausalTransformer(nn.Module):
             run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
                           in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
             out = _on_stage_axis(run(stage, stages_in, gather(per_row[0], ids),
-                                     gather(per_row[1], ids), stage_inputs))
+                                     gather(per_row[1], ids), stage_inputs,
+                                     jax.tree.map(lambda value: gather(value, ids), metadata)))
             state_io = jax.lax.dynamic_update_index_in_dim(
                 state_io, rotate_up(stream, out), slot, 1)
             return (state_io, shift_down(out)), None
