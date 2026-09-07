@@ -35,15 +35,18 @@ from dew.sampling.solvers import DDIM, Solver
 VALIDATION_SAMPLES = 4
 
 
-def check_solver(process, sampler) -> None:
-    """One abstract solver step, run when the objective is built. A solver
-    that refuses the process's schedule fails there, before the first
-    validation pass an epoch in."""
+def check_solver(process, sampler, steps: int) -> None:
+    """Trace a solver step on the objective's actual sampling grid."""
     x = jnp.zeros((1, 1), jnp.float32)
-    t = jnp.ones((1,), jnp.float32)
+    with jax.ensure_compile_time_eval():
+        times = process.times(steps)
+    state = sampler.init(x, times, process)
+    if times.shape[0] < 2:
+        return
+    t, t_next = times[:1], times[1:2]
     key = jax.ShapeDtypeStruct((2,), jnp.uint32)
     jax.eval_shape(
-        lambda x, key: sampler.step(x, t, t * 0.5, x, x, sampler.init(x), key, process,
+        lambda x, key: sampler.step(x, t, t_next, x, x, state, key, process,
                                     lambda x_t, t_: (x_t, x_t)),
         x, key)
 
@@ -78,7 +81,7 @@ class DiffusionObjective(Objective[Mean]):
         self.ema = (None if ema_decay is None else
                     EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
-        check_solver(process, sampler)
+        check_solver(process, sampler, steps)
         # The unconditional datum's value: the encoders are frozen, so one
         # pass here serves every step and every sample.
         self.unconditional = self.encode(self.encoder_params(), {
@@ -152,7 +155,7 @@ class DiffusionObjective(Objective[Mean]):
         preds = self.model.apply(
             variables, noisy * c_in, schedule.model_time(t), **conditions,
             train=True, rngs={"dropout": dropout_key})
-        preds = self.process.prediction.pred_transform(noisy, preds, rates)
+        preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
         return Mean(jnp.sum(losses * weights),

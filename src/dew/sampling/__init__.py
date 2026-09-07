@@ -1,7 +1,8 @@
 """The reverse process for diffusion, and decoding for language models."""
 
 from .solvers import (
-    Solver, DDPM, DDIM, Euler, EulerAncestral, Heun, RK4, MultiStepDPM, DPMSolverPP,
+    Solver, DDPM, DDIM, Euler, EulerAncestral, Heun, RK4, KDPM2, MultiStepDPM,
+    DPMSolverMultistep, DPMSolverSinglestep, DEIS, UniPC, PNDM, LMS, Consistency, TCD,
 )
 from .guidance import CFG
 from .sample import sample
@@ -17,8 +18,16 @@ __all__ = [
     "EulerAncestral",
     "Heun",
     "RK4",
+    "KDPM2",
     "MultiStepDPM",
-    "DPMSolverPP",
+    "DPMSolverMultistep",
+    "DPMSolverSinglestep",
+    "DEIS",
+    "UniPC",
+    "PNDM",
+    "LMS",
+    "Consistency",
+    "TCD",
     "CFG",
     "sample",
     "generate",
