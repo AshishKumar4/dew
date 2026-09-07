@@ -43,11 +43,15 @@ class VisionConditioner(nn.Module):
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
-        if pixels.ndim != 5:
-            raise ValueError("pixel_values must be [B, images, C, H, W]")
+        positions = conditioning.get("image_position_ids")
+        if pixels.ndim != (4 if positions is not None else 5):
+            raise ValueError("pixel_values must be row-aligned NCHW images or positioned patch pixels")
         batch, images = pixels.shape[:2]
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
-        features = self.tower(flat)
+        if positions is None:
+            features = self.tower(flat)
+        else:
+            features = self.tower(flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]))
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
 
@@ -95,6 +99,8 @@ class MultimodalTransformer(nn.Module):
     projection: ProjectorBase
     family: str
     image_token_id: int
+    pad_token_id: int = 0
+    extra_placeholder_ids: tuple[int, ...] = ()
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str | None = None
@@ -130,6 +136,11 @@ class MultimodalTransformer(nn.Module):
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None):
+        if self.family == "gemma4":
+            placeholder = tokens == self.image_token_id
+            for token_id in self.extra_placeholder_ids:
+                placeholder = placeholder | (tokens == token_id)
+            tokens = jnp.where(placeholder, self.pad_token_id, tokens)
         if decode:
             allocated = self.has_variable("cache", "next_position")
             next_position = self.variable("cache", "next_position", jnp.zeros, (tokens.shape[0],), jnp.int32)
