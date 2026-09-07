@@ -218,8 +218,11 @@ def small_cases(dtype: str) -> list[Case]:
     ]
     cases = [dataclasses.replace(case, dtype=dtype) for case in cases]
     # jepa_predictor has no step of its own: it is built through the registry
-    # inside the two JEPA cases above.
-    covered = {case.architecture for case in cases} | {"jepa_predictor"}
+    # inside the two JEPA cases above. The two composites wrap a built
+    # causal_transformer plus checkpoint-defined towers, so they have no flat
+    # field set to sweep; their decoder step is the causal_transformer rows.
+    covered = {case.architecture for case in cases} | {
+        "jepa_predictor", "diffusion_gemma", "multimodal_transformer"}
     missing = set(models) - covered
     if missing:
         raise ValueError(
