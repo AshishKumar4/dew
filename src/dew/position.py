@@ -63,6 +63,10 @@ def decode(position: bytes) -> Global | None:
     envelope = stored.get(ENVELOPE) if isinstance(stored, dict) else None
     if not isinstance(envelope, dict):
         return None
+    if not {"records", "order"} <= set(envelope):
+        raise ValueError(
+            f"a saved global data position is missing {sorted({'records', 'order'} - set(envelope))}; "
+            f"the checkpoint's position was written by dew and is damaged")
     return Global(records=int(envelope["records"]), order=str(envelope["order"]))
 
 

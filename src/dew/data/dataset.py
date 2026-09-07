@@ -21,7 +21,6 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime
 import grain.python as pygrain
 import jax
 from absl import flags
-from grain.experimental import ElasticIterator
 
 from dew import position
 
@@ -43,8 +42,8 @@ class Loading:
     seed is not one of them; it decides the order records arrive in and keys
     the per-record rng that augments and captions them.
 
-    `read_buffer` counts records held ahead of the read and `worker_buffer`
-    counts batches held ahead of the step, per worker.
+    All four count records: a worker reads records and hands records back,
+    and the batch is stacked behind it, in the process that trains.
     """
 
     workers: int = 32
@@ -280,36 +279,38 @@ def hold_out(source: Any, records: int, held_out: int, name: str):
             SourceSlice(source, 0, held_out))
 
 
-GLOBAL_INDEX = "global_next_index"
-"""The field grain's elastic iterator keeps its global record offset in
-(grain/_src/python/dataset/elastic_iterator.py:25,84-91). Its own name for
-the key is private, the persisted shape is not, and reading it wrong fails
-loudly in `tests/test_data.py`."""
-
-
 def describe(source: object) -> str:
     """`source`'s own description, or its type when it has none.
 
-    Grain compared repr(source) between a saved DataLoader state and the run
-    restoring it, which is why dew's sources describe themselves without an
-    address (`dew/data/sources/text.py`). A source that does not is named by
-    its type: the default repr is this process's address for the object, and
-    a resume would compare two addresses and refuse every time.
+    A saved position names the order it counts into, and the order is named
+    by the source, so a resumed run compares two descriptions and needs one
+    that survives the process that wrote it (`dew/data/sources/text.py`
+    writes such a repr). A source without its own is named by type: the
+    default repr is this process's address for the object, and two addresses
+    would refuse every resume.
     """
     described = type(source).__repr__ is not object.__repr__
     return repr(source) if described else type(source).__name__
 
 
+
+
 class GlobalStream:
     """A training stream whose saved position is one global record count.
 
-    Grain's `ElasticIterator` owns the sharding and the batching together, so
-    global batch k is records [k * batch, (k + 1) * batch) of one order and
-    process p of n takes every nth of them starting at p
-    (grain/_src/python/dataset/elastic_iterator.py:63-77). Its state is that
-    offset in records: one number, the same on every process, naming no
-    shard, so the position two processes wrote is where one process or four
+    The stream is a shuffled order over the whole corpus, endlessly, and the
+    step is cut out of it here: global batch k is records
+    [k * batch, (k + 1) * batch) of that order, and process p of n reads
+    every nth of them starting at p. The position is then how many records
+    the run has consumed -- one number, the same on every process, naming no
+    shard -- so the position two processes wrote is where one process or four
     resume, on the same records in the same steps.
+
+    `open(offset)` starts the per-process read at a record offset, which is
+    what a restore does instead of replaying: an offset is a slice bound, so
+    a resume reads nothing it has already read. It is called on the first
+    batch and again after `set_state`, so a stream that is restored before it
+    is read starts no worker twice.
 
     The offset alone would resume that many records into whatever order the
     run now has, so `order` rides with it and a restore that disagrees is
@@ -317,38 +318,51 @@ class GlobalStream:
     read.
     """
 
-    def __init__(self, iterator: pygrain.DatasetIterator[Batch], order: str):
-        self._iterator = iterator
+    def __init__(self, open: Callable[[int], pygrain.DatasetIterator[Batch]],
+                 batch: int, order: str):
+        self._open = open
+        self._batch = batch
         self._order = order
+        self._records = 0
+        self._reads: pygrain.DatasetIterator[Batch] | None = None
 
     def __iter__(self) -> Iterator[Batch]:
         return self
 
     def __next__(self) -> Batch:
-        return next(self._iterator)
+        if self._reads is None:
+            self._reads = self._open(self._records)
+        batch = next(self._reads)
+        # Counted after the batch: a step the stream did not deliver is not
+        # a step a resume may skip.
+        self._records += self._batch
+        return batch
 
     def get_state(self) -> bytes:
-        return position.encode(position.Global(
-            records=int(self._iterator.get_state()[GLOBAL_INDEX]), order=self._order))
+        return position.encode(position.Global(records=self._records, order=self._order))
 
     def set_state(self, state: bytes) -> None:
         saved = position.decode(state)
         if saved is None:
             raise ValueError(
                 "this training stream resumes from a global record count, and the "
-                "saved position is one process's own offset into its shard; a run "
-                "that wrote one cannot resume a stream that reads the records "
-                "globally")
+                "saved position is one process's own offset into its shard: either "
+                "a packed dataset's position or one written before dew stored a "
+                "global count. There is no conversion; resume the run that wrote "
+                "it with the dataset that wrote it")
         if saved.order != self._order:
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
                 f"{saved.order}, and this run reads {self._order}; a record count "
                 f"is a place in one order and another place in another, so resume "
                 f"the corpus, record count and seed the checkpoint was written with")
-        self._iterator.set_state({GLOBAL_INDEX: saved.records})
+        self.close()
+        self._records = saved.records
 
     def close(self) -> None:
-        self._iterator.close()
+        reads, self._reads = self._reads, None
+        if reads is not None:
+            reads.close()
 
 
 def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
@@ -357,36 +371,42 @@ def train_stream(source: Any, operations: Sequence[pygrain.Transformation], *,
     """An endless shuffled stream over `source`, batched per process.
 
     `batch` is this process's share of a step, so the global batch behind it
-    is that share times the process count. Grain's elastic iterator takes the
-    global batch and cuts it up itself, which is what makes global batch k the
-    same records at every process count: process p of n reads every nth record
-    of the window the whole run is on. A `GlobalStream` position is therefore
-    a record count and not a shard offset.
+    is that share times the process count. The order is the corpus reshuffled
+    from `seed` every epoch, endlessly, and the slice off it is
+    `offset + process_index :: process_count`, so global batch k is the same
+    records at every process count and a `GlobalStream` position is a record
+    count rather than a shard offset.
 
-    The order is the corpus reshuffled from `seed` every epoch, endlessly.
-    `operations` run behind that order and ahead of the per-process slice, so
-    they run inside grain's workers, a record's rng is keyed by its place in
-    the endless stream, and what a record becomes depends on neither the
-    process count nor the worker count.
+    Reads are records, not batches: the threads behind `to_iter_dataset` each
+    fetch one record, the workers hand records back in order, and the batch
+    is stacked here, behind them, so it depends on neither the worker count
+    nor the process count. Grain's `ElasticIterator` would own the slice and
+    the batch together in twenty fewer lines, but it batches ahead of its
+    read, so every read is one whole batch fetched serially: on a
+    2 ms/record source at batch 256 that took 2.18 s where this takes
+    0.15 s, and 7.28 s against 2.14 s at 20 ms a record over 32 workers.
 
-    The elastic iterator batches ahead of its read, so a read thread hands
-    back a whole batch and `read_buffer` records held ahead is
-    `read_buffer // batch` of them. Left in elements, the default would hold
-    128 batches of images per worker instead of 128 records.
+    `operations` run behind the order and ahead of the slice, so they run
+    inside the workers, a record's rng is keyed by its place in the endless
+    stream, and what a record becomes depends on neither count either.
     """
     order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}"
-    reads = pygrain.ReadOptions(loading.threads, max(1, loading.read_buffer // batch))
+    reads = pygrain.ReadOptions(loading.threads, loading.read_buffer)
     workers = pygrain.MultiprocessingOptions(
         num_workers=loading.workers,
         per_worker_buffer_size=loading.worker_buffer) if loading.workers else None
 
-    def stream() -> GlobalStream:
+    def open(offset: int) -> pygrain.DatasetIterator[Batch]:
         records = pygrain.MapDataset.source(source).seed(seed)
         records = records.shuffle(seed).repeat(None).apply(list(operations))
-        return GlobalStream(iter(ElasticIterator(
-            records, batch * jax.process_count(), pygrain.ShardByJaxProcess(),
-            read_options=reads,
-            multiprocessing_options=workers)), order)
+        mine = records[offset + jax.process_index()::jax.process_count()]
+        stream = mine.to_iter_dataset(reads)
+        if workers is not None:
+            stream = stream.mp_prefetch(workers)
+        return iter(stream.batch(batch, drop_remainder=True))
+
+    def stream() -> GlobalStream:
+        return GlobalStream(open, batch * jax.process_count(), order)
 
     return stream
 
