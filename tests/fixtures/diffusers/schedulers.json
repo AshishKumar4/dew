@@ -28,12 +28,28 @@
     "thresholding": false,
     "algorithm_type": "dpmsolver++",
     "solver_order": 2,
-    "solver_type": "midpoint"
+    "solver_type": "midpoint",
+    "lower_order_final": false
    },
    "convention": "vp",
    "step_kwargs": {},
    "intervals": 20,
    "latent_scale": 3.14520001411438
+  },
+  "dpm_multistep.pp_2m_short_no_taper": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "thresholding": false,
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2,
+    "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 10,
+   "latent_scale": 3.1449522972106934
   },
   "dpm_multistep.pp_2h": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -219,6 +235,33 @@
     "algorithm_type": "dpmsolver++",
     "solver_order": 2,
     "lower_order_final": false
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 20,
+   "latent_scale": 3.14520001411438
+  },
+  "dpm_singlestep.pp_2_uneven": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 2
+   },
+   "convention": "vp",
+   "step_kwargs": {},
+   "intervals": 19,
+   "latent_scale": 3.145190477371216
+  },
+  "dpm_singlestep.pp_3_uneven": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "config": {
+    "prediction_type": "epsilon",
+    "final_sigmas_type": "sigma_min",
+    "algorithm_type": "dpmsolver++",
+    "solver_order": 3,
+    "solver_type": "heun"
    },
    "convention": "vp",
    "step_kwargs": {},

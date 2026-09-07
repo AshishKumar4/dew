@@ -16,8 +16,11 @@ def sample(denoise, x_T, steps: int, *, solver, guidance=None, key):
     process = denoise.process
     if guidance is not None:
         denoise = guidance(denoise)
-    times = process.times(steps)
+    with jax.ensure_compile_time_eval():
+        times = process.times(steps)
     batch = x_T.shape[0]
+    if times.shape[0] == 1:
+        return denoise(x_T, jnp.full((batch,), times[0]))[0]
 
     def body(carry, inputs):
         x, state = carry
@@ -30,6 +33,6 @@ def sample(denoise, x_T, steps: int, *, solver, guidance=None, key):
         return (x, state), None
 
     (x, _), _ = lax.scan(
-        body, (x_T, solver.init(x_T, times)),
+        body, (x_T, solver.init(x_T, times, process)),
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     return denoise(x, jnp.full((batch,), times[-1]))[0]

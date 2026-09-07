@@ -29,10 +29,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import patch
 
 # The per-step noise is the test suite's draw, which conftest.py makes on
 # the CPU; a GPU draw of the same key differs in the last float32 bit and
@@ -105,11 +106,8 @@ def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[None]:
     if original is None:
         yield
         return
-    module.randn_tensor = draw
-    try:
+    with patch.object(module, "randn_tensor", draw):
         yield
-    finally:
-        module.randn_tensor = original
 
 
 def vp_epsilon(x: torch.Tensor, index: int) -> torch.Tensor:
@@ -145,7 +143,7 @@ class Case:
     Dew's process follow."""
 
     scheduler: str
-    config: dict[str, object]
+    config: Mapping[str, object]
     grid: np.ndarray
     convention: str = "vp"
     step_kwargs: dict[str, object] = field(default_factory=dict)
@@ -325,7 +323,10 @@ VE_GRID = np.linspace(1.0, 0.0, VE_POINTS, dtype=np.float32)
 CASES: dict[str, Case] = {
     # DPM-Solver multistep: the four algorithms, the three orders, both
     # second-order forms, the short-run taper and the Euler final step.
-    "dpm_multistep.pp_2m": multistep(algorithm_type="dpmsolver++", solver_order=2, solver_type="midpoint"),
+    "dpm_multistep.pp_2m": multistep(algorithm_type="dpmsolver++", solver_order=2, solver_type="midpoint",
+                                    lower_order_final=False),
+    "dpm_multistep.pp_2m_short_no_taper": multistep(algorithm_type="dpmsolver++", solver_order=2,
+                                                   lower_order_final=False, steps=11),
     "dpm_multistep.pp_2h": multistep(algorithm_type="dpmsolver++", solver_order=2, solver_type="heun"),
     "dpm_multistep.pp_3": multistep(algorithm_type="dpmsolver++", solver_order=3),
     "dpm_multistep.dpm_2m": multistep(algorithm_type="dpmsolver", solver_order=2, solver_type="midpoint"),
@@ -342,6 +343,8 @@ CASES: dict[str, Case] = {
     # lowering, the midpoint third order that keeps one difference, the
     # noise-prediction algorithm and the stochastic one.
     "dpm_singlestep.pp_2": singlestep(algorithm_type="dpmsolver++", solver_order=2, lower_order_final=False),
+    "dpm_singlestep.pp_2_uneven": singlestep(algorithm_type="dpmsolver++", solver_order=2, steps=20),
+    "dpm_singlestep.pp_3_uneven": singlestep(algorithm_type="dpmsolver++", solver_order=3, solver_type="heun"),
     "dpm_singlestep.pp_3h_final": singlestep(algorithm_type="dpmsolver++", solver_order=3, solver_type="heun",
                                              lower_order_final=True),
     "dpm_singlestep.pp_3m": singlestep(algorithm_type="dpmsolver++", solver_order=3, solver_type="midpoint",
@@ -421,24 +424,28 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
+    version = __import__("diffusers").__version__
+    if version != "0.34.0":
+        raise RuntimeError("Requires diffusers==0.34.0")
     FIXTURES.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
+    cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {
         "diffusers": __import__("diffusers").__version__,
         "train_steps": TRAIN_STEPS, "data_std": DATA_STD, "shape": list(SHAPE),
-        "karras": karras_config(), "edm": EDM, "cases": {},
+        "karras": karras_config(), "edm": EDM, "cases": cases,
     }
     for name, case in CASES.items():
         result = run(name, case)
         for key, value in result.items():
             arrays[f"{name}.{key}"] = value
-        record["cases"][name] = {
+        cases[name] = {
             "scheduler": case.scheduler, "config": case.config, "convention": case.convention,
             "step_kwargs": case.step_kwargs, "intervals": len(case.grid) - 1,
             "latent_scale": float(np.abs(result["latents"]).max()),
         }
-        print(f"{name}: {len(case.grid) - 1} intervals, |latent| <= {record['cases'][name]['latent_scale']:.3g}")
-    np.savez(FIXTURES / "schedulers.npz", **arrays)
+        print(f"{name}: {len(case.grid) - 1} intervals, |latent| <= {float(np.abs(result['latents']).max()):.3g}")
+    np.savez(FIXTURES / "schedulers.npz", allow_pickle=False, **arrays)
     (FIXTURES / "schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in FIXTURES.iterdir())
     print(f"{FIXTURES}: {size / 1e3:.0f} kB, {sorted(p.name for p in FIXTURES.iterdir())}")
