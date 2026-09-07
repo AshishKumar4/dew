@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +16,9 @@ from flax import linen as nn
 from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
 from dew.interop.quantized import dequantize_checkpoint, fp8_block
-from dew.diffusion.block import BlockProcess, CanvasGeneration
-from dew.sampling.engine import GenerationFamily
-from dew.sampling.text import Sampling, Generation
+from dew.inference import BlockGeneration, TextGeneration
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.sampling.text import Sampling
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
@@ -387,16 +387,24 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    generation_adapter: GenerationFamily[Any, Any, Any, Any, Any] | None = field(default=None, repr=False)
     export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
 
-    def generate(self, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], max_new_tokens: int, *,
-                 key: jax.Array, generation: Sampling | BlockProcess | None = None) -> Generation | CanvasGeneration:
-        """Generate through the model family's shared native sampling algorithm."""
-        if self.generation_adapter is None:
-            raise ValueError("this source has no native generation algorithm")
-        return self.generation_adapter.generate(self.model, self.variables, inputs, max_new_tokens,
-                                                key=key, generation=generation)
+    def text_generation(self) -> TextGeneration:
+        """The decoder as a generation task, defaulting to the source's sampling policy."""
+        if isinstance(self.model, DiffusionGemma):
+            raise TypeError("a DiffusionGemma source generates through block_generation")
+        return TextGeneration(self.model, self.variables, self.processor,
+                              _source_sampling(self.config, self.generation_config))
+
+    def block_generation(self) -> BlockGeneration:
+        """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
+        from dew.interop import diffusion_gemma
+        if not isinstance(self.model, DiffusionGemma):
+            raise TypeError("block generation needs a DiffusionGemma source")
+        return BlockGeneration(self.model, self.variables,
+                               diffusion_gemma.generation_process(self.config, self.generation_config),
+                               self.processor, _eos_ids(self.config, self.generation_config),
+                               _pad_id(self.config, self.generation_config))
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with processor artifacts."""
@@ -461,27 +469,18 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
     return value
 
 
-def _source_family(model: nn.Module, config: Mapping[str, object],
-                   generation_config: Mapping[str, object]) -> GenerationFamily[Any, Any, Any, Any, Any]:
-    """The native generation family with the source's published policy as its default."""
-    from dew.nn.diffusion_gemma import DiffusionGemma
-    if isinstance(model, DiffusionGemma):
-        from dew.diffusion.block import CanvasFamily
-        from dew.interop import diffusion_gemma
-        return CanvasFamily(diffusion_gemma.generation_process(config, generation_config),
-                            _eos_ids(config, generation_config), _pad_id(config, generation_config))
-    from dew.sampling.text import AutoregressiveFamily
+def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
+    """The source's published sampling policy, from its generation config."""
     temperature = _generation_value(config, generation_config, "temperature", 1.0)
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
     top_k = _generation_value(config, generation_config, "top_k")
     if top_k is not None and type(top_k) is not int:
         raise ValueError("top_k must be an integer")
-    sampling = Sampling(
+    return Sampling(
         temperature=float(temperature) if _generation_value(config, generation_config, "do_sample", False) else 0.0,
         top_k=top_k if top_k else None, eos_id=(_eos_ids(config, generation_config) or None),
         pad_id=_pad_id(config, generation_config))
-    return AutoregressiveFamily(sampling)
 
 
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
@@ -582,11 +581,18 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     error = None
-    generation_adapter = None
     try:
-        generation_adapter = _source_family(model, config, generation_config)
+        # The generation policy is read once so a malformed source fails on
+        # every rank at load, not inside a later generation on one of them.
+        if isinstance(model, DiffusionGemma):
+            from dew.interop import diffusion_gemma
+            diffusion_gemma.generation_process(config, generation_config)
+        else:
+            _source_sampling(config, generation_config)
+        _eos_ids(config, generation_config)
+        _pad_id(config, generation_config)
     except BaseException as failure:
         error = failure
     agree_process_phase(error, phase="pretrained generation policy")
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
-                      layouts, retained, generation_adapter, export_adapter)
+                      layouts, retained, export_adapter)

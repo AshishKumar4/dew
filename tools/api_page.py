@@ -30,7 +30,7 @@ SECTIONS = {
                    "dew.objectives.lm", "dew.objectives.rl"],
     "Diffusion": ["dew.diffusion", "dew.diffusion.presets", "dew.diffusion.schedules",
                   "dew.diffusion.transforms", "dew.diffusion.discrete"],
-    "Sampling": ["dew.sampling", "dew.sampling.solvers", "dew.sampling.text"],
+    "Sampling": ["dew.sampling", "dew.sampling.solvers", "dew.sampling.text", "dew.inference"],
     "Models": ["dew.nn", "dew.nn.backbones", "dew.nn.autoencoders", "dew.nn.moe",
                "dew.nn.text_encoders", "dew.nn.sharding"],
     "Inputs and data": ["dew.inputs", "dew.data"],

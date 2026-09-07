@@ -51,9 +51,10 @@ module has no importable names.
 
 | Module | Exports |
 | --- | --- |
-| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `AutoregressiveFamily`, `TokenEvent`, `CapacityError`, `Engine`, `EngineStats`, `GenerationJob`, `WeightVersion`, `generation_family`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
+| `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
 | `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
-| `dew.sampling.text` | `AutoregressiveFamily`, `DecoderState`, `Generation`, `Sampling`, `TextPlan`, `TextProgress`, `TokenEvent`, `TokenSample`, `generate` |
+| `dew.sampling.text` | `DecoderState`, `Generation`, `Sampling`, `TokenSample`, `generate` |
+| `dew.inference` | `BlockGeneration`, `Completion`, `OllamaCompletion`, `OpenAICompletion`, `Processor`, `TextGeneration` |
 
 ## Models
 
