@@ -90,7 +90,7 @@ drawn = policy([[1, 2, 3], [4, 5, 6]], 32, key=jax.random.key(0))
 later = policy.bind(state.params)
 ```
 
-Serving stays outside Dew: export a checkpoint with `Pretrained.save` and serve it with vLLM or Ollama.
+`LMObjective.policy(params)` returns the same task already bound to a training tree, which is what `SampledRollout` draws with. To hand the weights to another runtime, export them and point Ollama or vLLM at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) walks that through to the client call.
 
 This example runs offline on the tiny Gemma 3 fixture that the wrapper tests use. A Hub name such as `"Qwen/Qwen3-0.6B"` works the same way with the `interop` extra and a download; a real checkpoint needs enough host and device memory for its weights and cache.
 
@@ -135,7 +135,7 @@ state = trainer.fit(data, steps=1, log_every=1)
 bundle.save("gemma3-tiny-step1", variables=state.params)
 ```
 
-The base fixture is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
+The base fixture is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which decoder families load, train, generate and export.
 
 ## Diffusion language models and media inputs
 
@@ -211,12 +211,12 @@ python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-w
     --sample-tokens 0 --ema-decay None --optim.learning-rate 0.00015
 ```
 
-Those token files must use the checkpoint tokenizer and arrange the intended clean prompt prefix and response canvases. The large-checkpoint command is not part of the CPU example and was not run here. Trainer checkpoints preserve optimizer and iterator state; `Pretrained.save` instead writes a complete source-format inference checkpoint.
+Those token files must use the checkpoint tokenizer and arrange the intended clean prompt prefix and response canvases. Trainer checkpoints preserve optimizer and iterator state; `Pretrained.save` instead writes a complete source-format inference checkpoint.
 
 A multimodal checkpoint loads as a `MultimodalTransformer`: the text decoder, the vision tower and projector, and for Gemma 3n and Gemma 4 the audio tower and its embedder, under the variable names `language_model`, `tower`, `projector`, `audio_tower` and `audio_projector`. The checkpoint's processor owns resizing, normalization, patching and placeholder expansion; Dew's `Processor` runs it and lays its outputs out row by row. `ModelInputs.tokens` is `[B, S]`; `token_fields` holds `attention_mask`, `positions`, `image_indices` and `image_groups` (the soft feature and the image behind each slot, -1 for text), `audio_indices` for audio slots and, for Qwen 3.5, the three-axis `rotary_positions`; `conditioning` holds the media, padded to the row with the most images or clips: `pixel_values` as `[B, images, ...]` in the processor's own layout, `image_position_ids` (Gemma 4) or `image_grid_thw` (Qwen 3.5) beside it, and `input_features` with `input_features_mask` as `[B, clips, frames, mel]`. The processor checks token ids, placeholder counts and media shapes on the host; the compiled model is pure. The same `ModelInputs` feeds `model.apply`, the objective and `generate`; media are evaluated at prefill and decode steps read the cache.
 
 Per family, the processor emits what the reference expects. Gemma 3 gives one fixed-resolution image per placeholder block. Llama 4 tiles each image into local tiles and a global tile with separator tokens, normalizing pixels in bfloat16 as its original implementation does; the loader widens them to float32 exactly. Gemma 4 emits padded patch streams with 2D patch positions and expands video placeholders that the decoder maps to the pad embedding. Qwen 3.5 packs channel-then-time patches with a per-image grid, and the loader derives the spatial rotary coordinates the reference's `get_rope_index` computes. Gemma 3n uses the MobileNet-v5 encoder, embeds its hard vision and audio vocabulary ranges through the multimodal embedders, and keeps placeholder ids for its per-layer inputs while masking the hard ranges, on training and decode steps alike. Audio clips carry a mask that is True for valid frames; Gemma 4 inserts one placeholder per encoded frame, Gemma 3n a fixed `audio_soft_tokens_per_image` per clip with the embedder's padding token in the remaining slots.
 
-`bundle.save` writes trained variables under the source tensor names, including Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bitwise through training. The [family reference](../reference/model-families.md) lists each wrapper's fixture and processor inputs.
+`bundle.save` writes trained variables under the source tensor names, including Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bitwise through training. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names each wrapper's media.
 
 Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields; `audio_weights` converts the tower's own tensors, keeping Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)` with the mask subsampled to the encoder's frame rate. `dew.data.audio.AudioProcessor` builds the checkpoint's feature extractor from its `preprocessor_config.json` record and converts 16 kHz mono waveforms into those two arrays without resampling. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the vision-only scaling; Gemma 4 reuses `Gemma4ProjectorModule` with its input width taken from `output_proj_dims`.

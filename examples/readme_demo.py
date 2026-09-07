@@ -122,6 +122,8 @@ def flow_images(out: Path):
         state.params, batch,
         Step(step=state.step, key=jax.random.key(4), ema=state.averaged),
     )
+    if preview is None:
+        raise RuntimeError("the diffusion objective draws a preview on every event")
     generated = np.asarray(preview.images)
     np.save(out / "flow-preview.npy", generated)
     pixels = np.round((generated + 1) * 127.5).clip(0, 255).astype(np.uint8)

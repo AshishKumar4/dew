@@ -70,4 +70,4 @@ For text conditioning, `InputSpec.conditions` maps model keyword arguments to co
 
 A configured autoencoder changes training from pixels to latent tensors. Match the denoising model's channel count and spatial shape to the encoder output and retain the correct scaling convention. Loading a VAE does not by itself load an external diffusion transformer's weights.
 
-Use [training recipes](../recipes.md) for dataset-backed runs, and consult [capability limits](../reference/support.md) before selecting external checkpoints or a distributed deployment.
+Use [training recipes](../recipes.md) for dataset-backed runs. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the checkpoints that load.
