@@ -161,8 +161,8 @@ def wrapper_pixels(directory, record):
     grid = int(count ** 0.5)
     patch = int(record["tower"]["patch_size"])
     side = grid * patch
-    return pixels.reshape(batch, grid, grid, 3, patch, patch).transpose(
-        0, 3, 1, 4, 2, 5).reshape(batch, 3, side, side)
+    return pixels.reshape(batch, grid, grid, patch, patch, 3).transpose(
+        0, 5, 1, 3, 2, 4).reshape(batch, 3, side, side)
 
 
 def test_wrapper_tower_and_projector_match_the_reference():
