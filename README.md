@@ -72,12 +72,14 @@ An abridged [`examples/train_flowers.py`](examples/train_flowers.py); the file a
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import optax
 
-from dew import Checkpoints, Field, InputSpec, Trainer, models
+from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.data import Loading, OxfordFlowers
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
+from dew.nn.backbones import SimpleDiT
 
 
 def train():
@@ -90,13 +92,12 @@ def train():
         loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2),
     ).load(batch=16)
 
-    model = models.build(
-        "simple_dit",
+    model = SimpleDiT(
         patch_size=4,
         emb_features=128,
         num_layers=4,
         num_heads=4,
-        dtype="bfloat16",
+        dtype=jnp.bfloat16,
         attention_impl="auto",
     )
     objective = DiffusionObjective(
@@ -175,7 +176,7 @@ images = sample(
 
 Set `ema_decay=None` to train without an averaged copy, then sample with `state.params`.
 
-Choose the Flowers model's computation precision with the `dtype` argument to `models.build`: `"bfloat16"` for bf16 or `"float32"` for fp32. Its master weights and optimizer state stay fp32.
+Choose the Flowers model's computation precision with `SimpleDiT(dtype=jnp.bfloat16)` or `dtype=jnp.float32`. Its master weights and optimizer state stay fp32.
 
 For int8 quantization-aware training, install Qwix with `uv pip install qwix` and wrap the model **before** constructing the objective:
 
@@ -186,6 +187,8 @@ model = apply_quantization(model, Quantization(dtype="int8"))
 ```
 
 Qwix quantizes the trunk matmuls while retaining fp32 master weights. This changes the training arithmetic; it is a separate choice from bf16 computation.
+
+Import model classes directly when writing Python: `from dew.nn.backbones import SimpleDiT, CausalTransformer`. The examples below also use `models.build(name, **fields)` for models selected by configuration; both construct the same Flax classes.
 
 ## Features
 

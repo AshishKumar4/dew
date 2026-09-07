@@ -7,15 +7,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
 from PIL import Image
 
-from dew import Checkpoints, Field, InputSpec, Trainer, models, sample
+from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.data import Loading, OxfordFlowers
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
+from dew.nn.backbones import SimpleDiT
 from dew.sampling import Heun
 
 
@@ -35,13 +37,12 @@ def main(config: Config):
         val_batches=0,
         loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2),
     ).load(batch=config.batch)
-    model = models.build(
-        "simple_dit",
+    model = SimpleDiT(
         patch_size=4,
         emb_features=128,
         num_layers=4,
         num_heads=4,
-        dtype="bfloat16",
+        dtype=jnp.bfloat16,
         attention_impl="auto",
     )
     process = EDM()()
