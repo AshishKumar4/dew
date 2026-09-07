@@ -879,7 +879,7 @@ class Gemma4VisionTransformer(nn.Module):
         valid = (pixel_position_ids >= 0).all(axis=-1)
         safe = jnp.maximum(pixel_position_ids, 0)
         hidden_states = self.patch_embed(2 * (pixels - 0.5))
-        table = self.position_table.astype(hidden_states.dtype)
+        table = jnp.asarray(self.position_table, hidden_states.dtype)
         positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
         hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
         cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta)
