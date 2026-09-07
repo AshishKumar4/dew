@@ -1,0 +1,16 @@
+{
+  "maxtext": "0.2.4",
+  "commit": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+  "source": {
+    "calculate_indexer_loss": "src/maxtext/layers/attention_mla.py:1117-1229",
+    "generate_mask": "src/maxtext/layers/attention_mla.py:228-268",
+    "indexer_call_masking": "src/maxtext/layers/attention_mla.py:428-452",
+    "query_scale": "src/maxtext/layers/attention_mla.py:955"
+  },
+  "batch": 2,
+  "length": 7,
+  "heads": 3,
+  "head_dim": 8,
+  "top_k": 3,
+  "seed": 23
+}
