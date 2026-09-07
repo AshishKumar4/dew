@@ -45,20 +45,10 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
     encoded = processor(text=prompts, images=[[images[0]], [images[1], images[2]]],
                         padding=True, return_tensors="pt")
     with torch.no_grad():
-        output = model(**encoded, use_cache=True)
-        logits = output.logits
-        cache = output.past_key_values
-        attention_mask = encoded["attention_mask"]
-        next_logits = logits[:, -1]
-        continuation = []
-        for _ in range(3):
-            token = next_logits.argmax(-1)
-            continuation.append(token)
-            attention_mask = torch.cat([attention_mask, torch.ones_like(token[:, None])], dim=1)
-            output = model(input_ids=token[:, None], attention_mask=attention_mask,
-                           past_key_values=cache, use_cache=True)
-            cache = output.past_key_values
-            next_logits = output.logits[:, -1]
+        logits = model(**encoded, use_cache=False).logits
+        generated = model.generate(**encoded, max_new_tokens=3, do_sample=False,
+                                   eos_token_id=None, use_cache=True, return_dict_in_generate=False)
+        continuation = generated[:, encoded["input_ids"].shape[1]:]
     train_pixels = encoded["pixel_values"].clone().requires_grad_(True)
     training = {**encoded, "pixel_values": train_pixels}
     predictions = model(**training, use_cache=False).logits[:, :-1]
@@ -79,7 +69,7 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
 
     np.save(destination / "raw_images.npy", images)
     np.save(destination / "logits.npy", logits.numpy())
-    np.save(destination / "continuation.npy", torch.stack(continuation, dim=1).numpy())
+    np.save(destination / "continuation.npy", continuation.numpy())
     (destination / "prompts.json").write_text(json.dumps(prompts) + "\n")
     for key, value in encoded.items():
         np.save(destination / f"{key}.npy", value.numpy())
@@ -158,6 +148,39 @@ def write_gemma4_native() -> None:
     images = np.random.default_rng(1304).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <image_soft_token> token9",
                "token5 <image_soft_token> token8 <image_soft_token> token6"]
+    _write_forward_backward(model, processor, destination, images, prompts)
+
+
+
+def write_qwen35_native() -> None:
+    """The actual Qwen3VLProcessor and hybrid model, including spatial M-RoPE."""
+    from transformers import Qwen3VLProcessor, Qwen3VLVideoProcessor, Qwen3_5Config, Qwen3_5ForConditionalGeneration
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    source = ROOT / "qwen35-tiny-mm"
+    destination = ROOT / "qwen35-native-tiny"
+    destination.mkdir(parents=True, exist_ok=True)
+    config = json.loads((source / "config.json").read_text())
+    hf_config = Qwen3_5Config.from_dict(config)
+    hf_config._attn_implementation = "eager"
+    model = Qwen3_5ForConditionalGeneration(hf_config).float().eval()
+    tensors = load_file(str(source / "model.safetensors"))
+    model.load_state_dict(tensors, strict=True)
+    save_file(tensors, str(destination / "model.safetensors"))
+    hf_config.save_pretrained(destination)
+    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
+               "<image_soft_token>": 200, "<video>": 201,
+               "<start_of_image>": 202, "<end_of_image>": 203}
+    tokenizer = _tokenizer(256, special, video_token="<video>",
+                           vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
+    processor = Qwen3VLProcessor(
+        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
+        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
+    processor.save_pretrained(destination)
+    processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
+    images = np.random.default_rng(2305).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
+    prompts = ["token7 <start_of_image><image_soft_token><end_of_image> token9",
+               "token5 <start_of_image><image_soft_token><end_of_image> token8 <start_of_image><image_soft_token><end_of_image> token6"]
     _write_forward_backward(model, processor, destination, images, prompts)
 
 

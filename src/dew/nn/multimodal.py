@@ -44,11 +44,16 @@ class VisionConditioner(nn.Module):
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
         positions = conditioning.get("image_position_ids")
-        if pixels.ndim != (4 if positions is not None else 5):
+        grid = conditioning.get("image_grid_thw")
+        if positions is not None and grid is not None:
+            raise ValueError("image positions and grid_thw belong to different tower inputs")
+        if pixels.ndim != (4 if positions is not None or grid is not None else 5):
             raise ValueError("pixel_values must be row-aligned NCHW images or positioned patch pixels")
         batch, images = pixels.shape[:2]
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
-        if positions is None:
+        if grid is not None:
+            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
+        elif positions is None:
             features = self.tower(flat)
         else:
             features = self.tower(flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]))

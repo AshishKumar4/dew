@@ -187,7 +187,7 @@ def test_wrapper_language_halves_build_and_score():
     """The language halves are complete decoder trees: they build and score a
     row of ids. The tied Gemma halves keep one leaf for head and embedding."""
     for name, tied in (("gemma3-tiny-mm", True), ("llama4-tiny-mm", False),
-                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", True)):
+                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", False)):
         _, record, variables = load_wrapper(name)
         model = models.build("causal_transformer", **with_precision(
             "causal_transformer", record["text"], dtype="float32",
