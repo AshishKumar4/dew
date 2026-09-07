@@ -9,7 +9,7 @@ import optax
 import pytest
 
 from dew import Dataset, Trainer, evaluate
-from dew.artifacts import TokenScores
+from dew.artifacts import TextSamples, TokenScores
 from dew.objectives.base import Aux, Objective
 from dew.objectives.lm import LMObjective, Samples, perplexity
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -19,13 +19,13 @@ from dew.sampling import Sampling
 class Recording:
     def __init__(self):
         self.scalars = []
-        self.previews = []
+        self.artifacts = []
 
     def log(self, scalars, step):
         self.scalars.append(dict(scalars))
 
     def artifact(self, artifact, step):
-        self.previews.append(artifact)
+        self.artifacts.append(artifact)
 
 
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
@@ -36,13 +36,15 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     data = Dataset(lambda: iter([batch] * 2), lambda: iter([batch]), records=8, batch=8)
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
-    state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(perplexity(),))
+    state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(perplexity(),), preview=True)
     result = evaluate(objective, state.params, data.val, key=state.key, step=state.step,
                       schedule_step=state.microstep, averaged=state.averaged,
                       metrics=(perplexity(),), preview=True, mesh=trainer.device_mesh)
     logged = next(item for item in tracker.scalars if "val/perplexity" in item)
     assert result.scalars == logged
-    np.testing.assert_array_equal(result.previews[0].tokens, tracker.previews[0].tokens)
+    previews = [artifact for artifact in tracker.artifacts if isinstance(artifact, TextSamples)]
+    assert len(previews) == 1
+    np.testing.assert_array_equal(result.previews[0].tokens, previews[0].tokens)
     assert isinstance(result.previews[0].tokens, np.ndarray)
     assert result.records == 8 and result.coordinated_batches == 1
     restored = pickle.loads(pickle.dumps(result))
