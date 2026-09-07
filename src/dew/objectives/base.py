@@ -20,6 +20,7 @@ from typing_extensions import TypeVar
 
 from flax import struct
 import jax
+from jax.tree_util import Partial
 import jax.numpy as jnp
 import optax
 
@@ -38,6 +39,12 @@ PathFilter: TypeAlias = Callable[[Path], bool]
 """Selects leaves of a variables tree by the tuple of dict keys above them.
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
+Initializer: TypeAlias = Partial
+"""An objective's `init` as one value a JIT can take: a
+`jax.tree_util.Partial`, whose bound arguments are pytree children rather
+than closure cells, so a JIT that builds the initial state receives the held
+variables as arguments instead of compiling them in as constants. A plain
+function is not one of these; `jax.jit` cannot take it as an argument."""
 
 @struct.dataclass
 class Mean:
@@ -151,10 +158,43 @@ class Objective(ABC, Generic[Loss, Effects]):
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
 
+    def held_variables(self) -> Variables | None:
+        """The arrays this objective starts from, or None when it draws them.
+
+        A continued-pretraining objective returns its checkpoint here; one
+        that keeps a frozen tower beside the model it trains returns that.
+        The trainer reads this once and hands the result back to `init`, so
+        an objective never has to read its own held arrays inside a trace.
+        """
+        return None
+
+    @property
+    def initializer(self) -> Initializer:
+        """`init` as one value a JIT can take, with held arrays as arguments.
+
+        The trainer builds the initial state inside one JIT. A nullary
+        function forces every concrete array its body reads to be captured
+        as a compiled constant, which for a loaded checkpoint means the whole
+        parameter tree is embedded in the executable: 2.2 GiB for a 0.6B
+        model, a module too large for the compilation cache to store.
+
+        This is the one boundary where held variables cross into that JIT as
+        data. `Partial` is a pytree whose bound arguments are children, so
+        they arrive as JIT arguments however deeply `init` nests its own
+        compilation, and the call always dispatches through public `init`.
+        """
+        held = self.held_variables()
+        return Partial(self.init) if held is None else Partial(self.init, variables=held)
+
     @abstractmethod
-    def init(self, key: jax.Array) -> Variables:
+    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
         """The whole variables tree, every collection, from one key. Pure, so
-        the trainer traces it once for shapes and once for values."""
+        the trainer traces it once for shapes and once for values.
+
+        `variables` is the held tree the caller supplies, which is how the
+        trainer passes it as data; None means take it from this objective's
+        own `held_variables`. An objective that holds nothing ignores it.
+        """
 
     @abstractmethod
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:

@@ -59,7 +59,7 @@ class DeterministicObjective(Objective):
                                num_heads=2, mlp_ratio=1)
         self.ema = EMASpec(decay=decay)
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
     def loss(self, params, batch, step):
@@ -343,7 +343,7 @@ class IndivisibleModel(nn.Module):
 class Indivisible(Objective):
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return IndivisibleModel().init(key, jnp.ones((1, 15)))
 
     def loss(self, params, batch, step):

@@ -24,7 +24,7 @@ import optax
 from dew.artifacts import TextSamples, agree_process_phase, collective_host
 from dew.diffusion.discrete import DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.sampling.sample import sample
@@ -73,7 +73,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def init(self, key):
+    def init(self, key, variables: Variables | None = None):
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, params, batch, step: Step):

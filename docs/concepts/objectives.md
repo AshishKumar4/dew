@@ -10,6 +10,36 @@ The trainer traces initialization to determine shapes and then initializes varia
 
 The [regression tutorial](../getting-started.md#define-initialization-and-loss) includes a complete custom objective. Register an objective when a configuration needs to look it up through a registry. Passing an instance directly to `Trainer` requires no decorator.
 
+### Objectives that start from held weights
+
+An objective that continues from a checkpoint, or that keeps a frozen tower beside the model it trains, holds real arrays. Those arrays cross into the trainer's compiled state construction at one boundary, and the objective describes them through two public methods: `held_variables()` reports what it starts from, and `init(key, variables=None)` initializes from what the caller supplies.
+
+`Objective.initializer` builds those into the one value a JIT can take: `Partial(self.init)` when `held_variables()` is None, and `Partial(self.init, variables=held)` otherwise. `jax.tree_util.Partial` is a pytree whose bound arguments are children, so the held tree arrives as a JIT argument. An objective that draws its whole tree from the key implements neither method beyond `init` and inherits the rest:
+
+```python
+class Continued(Objective):
+    def __init__(self, model, pretrained=None):
+        self.model, self.pretrained = model, pretrained
+
+    def held_variables(self):
+        return self.pretrained
+
+    def init(self, key, variables=None):
+        pretrained = self.pretrained if variables is None else variables
+        if pretrained is not None:
+            return pretrained
+        return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
+```
+
+`variables=None` means resolve the configured input, which is what a plain `init(key)` call does, so every existing caller is unaffected. When the trainer calls through the initializer it always supplies the tree, so nothing is read off the objective inside the trace.
+
+Two properties make this a contract rather than a convention. The call dispatches through public `init`, so a subclass that overrides `init` decides what the state holds whether it is called directly or compiled by the trainer. And because the tree is an argument, it stays one however deeply `init` nests its own `jax.jit`, and an objective that composes another one passes the held tree to that objective's `init`. A subclass of an objective that holds arrays must accept the second parameter; it will raise rather than be quietly bypassed if it does not.
+
+What it buys is the difference between a parameter tree that arrives on the device as an argument and one that is compiled into the state executable as a constant. For a 0.6B checkpoint the second is 2.2 GiB inside the module, past the 2 GiB limit on a compilation cache entry, so the cache silently stops working for the run that most needs it.
+
+`Trainer.initial_state(initializer=None, key=None)` is the single state implementation and resolves each None from the run. `place` resolves both inputs once and then calls that same method for the shapes and for the values, so a `Trainer` subclass that overrides `initial_state` is honoured on every path, and `trainer.initial_state()` with no arguments still returns the state a run starts from.
+
+
 ## Loss and auxiliary values
 
 `loss(variables, batch, step)` returns `(statistics, aux)`. Return `Mean(total, mass)` for additive terms sharing one nonnegative, parameter-independent denominator. The default reducer divides the summed numerator by the summed mass and treats zero support as inactive. A plain scalar explicitly denotes one unit-mass term. Dew does not infer token or row weights from a scalar.
@@ -60,7 +90,7 @@ class StatefulRegression(Objective):
     def __init__(self):
         self.model = NormalizedRegressor()
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32), train=True)
 
     def loss(self, variables, batch, step):

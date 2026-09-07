@@ -629,7 +629,7 @@ class Regression(Objective):
     model = nn.Dense(1)
     inputs = InputSpec(Field("x", (1,)))
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.ones((1, 1)))
 
     def loss(self, variables, batch, step):

@@ -7,6 +7,7 @@ count, what lands on disk and when, what a resume restores, what reaches the
 tracker, and what a failure does to the run.
 """
 
+import dataclasses
 import json
 import os
 
@@ -43,7 +44,7 @@ class Regression(Objective):
         self.model = Affine()
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, params, batch, step):
@@ -269,6 +270,96 @@ def test_a_run_past_its_target_is_refused(tmp_path):
     make_trainer(tmp_path).fit(Data(), steps=3, log_every=1)
     with pytest.raises(ValueError, match="past"):
         make_trainer(tmp_path).fit(Data(), steps=2)
+
+
+def held_lm_trainer(**settings):
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                              mlp_features=16, max_seq_len=8)
+    weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
+    objective = LMObjective(model, seq_len=4, pretrained=weights)
+    return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                   layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
+
+
+def raw_leaf(leaf):
+    return jax.random.key_data(leaf) if jnp.issubdtype(
+        leaf.dtype, jax.dtypes.prng_key) else leaf
+
+
+def test_the_state_is_built_from_the_initializer_and_the_key_alone():
+    """What `place` compiles takes the objective's held variables and the run
+    key as arguments, so a loaded checkpoint reaches the device as data.
+
+    Resolved from the objective instead, the same construction captures the
+    whole tree as a constant: 2.2 GiB inside the executable for a 0.6B
+    checkpoint, which is past the compilation cache's 2 GiB entry limit. Both
+    calls build the same state, so this is where the arrays travel, not what
+    they are.
+    """
+    trainer, objective, weights = held_lm_trainer()
+    shardings = trainer.shardings(jax.eval_shape(trainer.initial_state))
+
+    passed = jax.make_jaxpr(trainer.initial_state)(objective.initializer, trainer.key).consts
+    resolved = jax.make_jaxpr(trainer.initial_state)().consts
+    explicit = jax.jit(trainer.initial_state, out_shardings=shardings)(
+        objective.initializer, trainer.key)
+    default = jax.jit(trainer.initial_state, out_shardings=shardings)()
+
+    assert passed == [], "the state JIT still captures arrays it was handed as data"
+    assert sum(int(np.asarray(raw_leaf(value)).nbytes) for value in resolved) >= sum(
+        int(np.asarray(leaf).nbytes) for leaf in jax.tree.leaves(weights)), (
+            "resolving the input no longer captures the tree, so this proves nothing")
+    for before, after in zip(jax.tree.leaves(default), jax.tree.leaves(explicit), strict=True):
+        np.testing.assert_array_equal(np.asarray(raw_leaf(before)), np.asarray(raw_leaf(after)))
+
+
+def test_place_builds_the_state_through_the_overridable_method():
+    """`place` compiles the same method a subclass overrides, so a trainer
+    that adjusts the state it starts from still decides what a run begins
+    with. Compiling a private construction instead skipped the override."""
+    class Marked(Trainer):
+        def initial_state(self, initializer=None, key=None):
+            state = super().initial_state(initializer, key)
+            return dataclasses.replace(state, updates=jnp.asarray(7, jnp.int32))
+
+    _, objective, _ = held_lm_trainer()
+    trainer = Marked(objective, optax.adam(1e-3), key=jax.random.key(0),
+                     layout=Layout(min_shard=1, tolerance=1.0))
+
+    state, _, position = trainer.place()
+
+    assert int(state.updates) == 7, "place bypassed the overridden state construction"
+    assert int(trainer.initial_state().updates) == 7 and position is None
+
+
+def test_place_asks_the_objective_for_its_held_variables_once():
+    """Shapes and values come from one resolution of the same inputs, so an
+    objective is not asked to produce its held tree twice per placement."""
+    asked = []
+
+    class Counted(Objective):
+        ema = None
+
+        def held_variables(self):
+            asked.append(1)
+            return {"params": {"w": jnp.ones((2,))}}
+
+        def init(self, key, variables=None):
+            return self.held_variables() if variables is None else variables
+
+        def loss(self, variables, batch, step):
+            return jnp.sum(variables["params"]["w"]), Aux({})
+
+    trainer = Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    asked.clear()
+
+    trainer.place()
+
+    assert len(asked) == 1, f"held_variables was evaluated {len(asked)} times in one place()"
 
 
 def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
@@ -765,7 +856,7 @@ class ScaledObjective(Objective):
     def __init__(self):
         self.ema = EMASpec(decay=lambda step: 0.5)
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}}
 
     def loss(self, params, batch, step):
@@ -820,7 +911,7 @@ class Counted(Objective):
 
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": jnp.zeros(())}}
 
     def loss(self, params, batch, step):
@@ -865,7 +956,7 @@ class TwoTrees(Objective):
     def __init__(self, ema):
         self.ema = ema
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"tracked": {"w": jnp.ones((2,))},
                            "untracked": {"w": jnp.ones((2,))}}}
 
@@ -912,7 +1003,7 @@ class TwoPlayers(Objective):
 
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"gen": {"g": jnp.zeros(())}, "disc": {"d": jnp.zeros(())}}}
 
     def loss(self, params, batch, step):

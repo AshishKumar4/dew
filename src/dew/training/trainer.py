@@ -29,7 +29,8 @@ from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Aux, Batch, Effects, Loss, Mean, Metric, Objective, Step, Variables, merge, select, mean_loss
+from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
+                                 Step, Variables, merge, select, mean_loss)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
@@ -247,11 +248,23 @@ class Trainer(Generic[Loss, Effects]):
     # The state
     # ------------------------------------------------------------------
 
-    def initial_state(self) -> TrainState:
+    def initial_state(self, initializer: Initializer | None = None,
+                      key: jax.Array | None = None) -> TrainState:
         """The state a fresh run starts from. Pure, so `fit` traces it once
-        for its shapes and once, sharded, for its values."""
-        init_key, run_key = jax.random.split(self.key)
-        params = nn.unbox(self.objective.init(init_key))
+        for its shapes and once, sharded, for its values.
+
+        Both inputs are the run's own by default, and `place` passes them
+        explicitly so what it compiles takes them as arguments: a held
+        checkpoint then reaches the device as an argument instead of as a
+        constant embedded in the executable. Passing None means resolve the
+        configured input, which is what a no-argument call does. This is the
+        one state implementation, so a subclass overrides it here and every
+        path sees the override.
+        """
+        initializer = self.objective.initializer if initializer is None else initializer
+        key = self.key if key is None else key
+        init_key, run_key = jax.random.split(key)
+        params = nn.unbox(initializer(init_key))
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -312,13 +325,17 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement, bytes | None]:
         """The state itself, fresh or restored, on the mesh, with its shardings
         and the data position a resume continues from."""
-        abstract = jax.eval_shape(self.initial_state)
+        # Resolved once: the shapes and the values are then the same inputs
+        # through the same overridable method, and the objective is asked for
+        # what it holds exactly once.
+        initializer, key = self.objective.initializer, self.key
+        abstract = jax.eval_shape(self.initial_state, initializer, key)
         shardings = self.shardings(abstract)
         self.layout.check(abstract.params, shardings.params, self.device_mesh)
         checkpoints = self.checkpoints
         resume = None if checkpoints is None else checkpoints.latest
         if checkpoints is None or resume is None:
-            state = jax.jit(self.initial_state, out_shardings=shardings)()
+            state = jax.jit(self.initial_state, out_shardings=shardings)(initializer, key)
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)

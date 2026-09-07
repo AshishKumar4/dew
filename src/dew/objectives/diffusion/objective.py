@@ -25,7 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
@@ -110,15 +110,28 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
-    def init(self, key):
-        encoders = self.encoder_params()
-        variables = self.model.init(
-            key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **self.unconditional)
-        state = {**variables, "encoders": encoders}
+    def held_variables(self) -> Variables:
+        """Every array `init` starts from rather than draws: the frozen towers.
+
+        A text tower and a VAE are released weights: hundreds of megabytes
+        that a nullary trace would compile into the state executable as
+        constants. One mapping, so an objective that starts from more than
+        the towers extends this and `init` together.
+        """
+        held: dict[str, Any] = {"encoders": self.encoder_params()}
         if self.autoencoder is not None:
+            held["autoencoder"] = self.autoencoder.params
+        return held
+
+    def init(self, key, variables: Variables | None = None) -> Variables:
+        held = self.held_variables() if variables is None else variables
+        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
+                                **self.unconditional)
+        state: dict[str, Any] = {**drawn, "encoders": held["encoders"]}
+        if "autoencoder" in held:
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
-            state["autoencoder"] = self.autoencoder.params
+            state["autoencoder"] = held["autoencoder"]
         return state
 
     def trainable(self, params) -> dict:
