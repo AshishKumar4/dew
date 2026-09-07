@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -13,7 +13,7 @@ import numpy as np
 from jax.sharding import Mesh
 
 from dew.artifacts import Artifact, agree_process_phase, broadcast_from_process_zero, collective_host
-from dew.objectives.base import Batch, Metric, Objective, Step, Variables
+from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 from .distributed import build_mesh, shard_batch
 
 
@@ -56,7 +56,7 @@ def _pick(artifacts: tuple[Artifact, ...], reads: type):
     return matching[0]
 
 
-def evaluate(objective: Objective, variables: Variables,
+def evaluate(objective: Objective[Loss, Effects], variables: Variables,
              batches: Callable[[], Iterator[Batch]] | None, *,
              key: jax.Array, metrics: Sequence[Metric] = (),
              step: int | jax.Array = 0, averaged: Variables | None = None,
@@ -168,7 +168,7 @@ def evaluate(objective: Objective, variables: Variables,
                 if metrics:
                     error = None
                     try:
-                        info = context.replace(key=jax.random.fold_in(score_key, scored))
+                        info = replace(context, key=jax.random.fold_in(score_key, scored))
                         produced = objective.evaluate(variables, batch, info)
                     except BaseException as failure:
                         error = failure
@@ -193,7 +193,7 @@ def evaluate(objective: Objective, variables: Variables,
                     error = None
                     produced_preview = None
                     try:
-                        info = context.replace(key=preview_key)
+                        info = replace(context, key=preview_key)
                         produced_preview = objective.preview(variables, batch, info, scored=produced)
                     except BaseException as failure:
                         error = failure
