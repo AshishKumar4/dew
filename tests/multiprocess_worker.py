@@ -1083,6 +1083,16 @@ def mode_rollout(args) -> dict:
     # row index, so the pool draws what one process draws for the same rows.
     drawn = generate(model, state.params, inputs_for(local), 4, key=jax.random.key(21),
                      sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12))
+    # A resident global array reaches the task as it is: a process cannot
+    # fetch the rows the other process's devices hold, so a host round trip
+    # would fail here before any model ran.
+    from dew.inference import TextGeneration
+    from dew.training.distributed import shard_batch
+
+    resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
+    controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
+    through_task = TextGeneration(model, state.params)(resident, 4, key=jax.random.key(27), sampling=controls)
+    direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls)
     invalid_errors = {}
     if processes > 1:
         for fault in ("token", "length", "key"):
@@ -1128,6 +1138,11 @@ def mode_rollout(args) -> dict:
         "drawn_lengths": np.asarray(drawn.lengths).tolist(),
         "drawn_behavior": np.asarray(drawn.behavior_log_probs).tolist(),
         "drawn_raw": np.asarray(drawn.raw_log_probs).tolist(),
+        "resident_addressable": bool(resident.is_fully_addressable),
+        "resident_tokens": np.asarray(through_task.tokens).tolist(),
+        "resident_behavior": np.asarray(through_task.behavior_log_probs).tolist(),
+        "direct_tokens": np.asarray(direct.tokens).tolist(),
+        "direct_behavior": np.asarray(direct.behavior_log_probs).tolist(),
         "single": None if single is None else {
             name: np.asarray(value).tolist() for name, value in single.items()},
     }

@@ -874,6 +874,14 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         np.testing.assert_allclose(reports[0][name] + reports[1][name], single[name],
                                    rtol=1e-5, atol=1e-6)
     assert any(value < 0 for row in single["drawn_behavior"] for value in row)
+    # A task takes a resident global array without fetching it to the host;
+    # each rank generates from its own rows exactly as the direct call does.
+    for report in reports:
+        assert report["resident_addressable"] is False
+        assert report["resident_tokens"] == report["direct_tokens"]
+        np.testing.assert_allclose(report["resident_behavior"], report["direct_behavior"],
+                                   rtol=1e-5, atol=1e-6)
+    assert reports[0]["resident_tokens"] + reports[1]["resident_tokens"] == single["resident_tokens"]
     assert_same_parameters(dumped_params(tmp_path / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
 

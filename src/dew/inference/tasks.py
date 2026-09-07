@@ -67,7 +67,9 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
                 if any(isinstance(token, (bool, np.bool_)) or not isinstance(token, (int, np.integer))
                        for token in row):
                     raise ValueError("token rows must contain integers, not coerced token IDs")
-    return ModelInputs.from_value(np.asarray(request))
+        return ModelInputs.from_value(np.asarray(request))
+    # A resident array stays where it is; a global one cannot be fetched.
+    return ModelInputs.from_value(request)
 
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: object | None,
