@@ -36,7 +36,7 @@ from dew.nn.attention import (
     RMSNorm, _cache_positions, _write_cache, apply_rotary, causal_attention_mask,
     max_attention_logits, rotary_freqs, scaled_dot_product_attention,
 )
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.sharding import logical_axes
 
 
@@ -482,10 +482,15 @@ class MultiHeadLatentAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         causal, mask = self.causal, None
         implementation = self.attention_impl
         batch, length, _ = x.shape
+        valid = None if attention_metadata is None else attention_metadata.valid
+        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
+            raise ValueError("MLA does not implement multi-axis rotary positions")
+        logical_positions = positions
         queries, q_resid = self._queries(x)
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
@@ -493,10 +498,8 @@ class MultiHeadLatentAttention(nn.Module):
             queries, [self.qk_nope_head_dim], axis=-1)
         latent, rot = self._latents(x)
         if decode:
-            if positions is not None or segment_ids is not None:
-                raise ValueError(
-                    "decode positions come from the cache index, so an "
-                    "explicit positions or segment_ids has no meaning there")
+            if segment_ids is not None:
+                raise ValueError("decode accepts row validity, not packed segment_ids")
             # The cache hands out the slots first, because the rope heads
             # rotate at absolute positions: the queries at this step's slots
             # and the appended latents at theirs, while the cached ones keep
@@ -509,10 +512,10 @@ class MultiHeadLatentAttention(nn.Module):
                 index_keys = self.indexer.keys(x)
                 positions, append = open_expanded_cache(
                     self, shape_key, shape_value, index_keys,
-                    self.max_seq_len)
+                    self.max_seq_len, valid=valid)
                 freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions, self.qk_rope_head_dim, self.rope_theta,
-                    self.yarn)
+                    positions if logical_positions is None else logical_positions,
+                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
                 q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
                 rot = self._rotate(
                     rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
@@ -522,23 +525,26 @@ class MultiHeadLatentAttention(nn.Module):
                     *self._expand(latent, rot), index_keys)
                 mask = self._index_mask(
                     x, q_resid, positions, key.shape[1], index_full,
-                    freqs_cos, freqs_sin)
+                    freqs_cos, freqs_sin, base=causal_attention_mask(
+                        positions, key.shape[1], key_valid=self.get_variable("cache", "cache_valid")))
             else:
                 positions, append = open_latent_cache(
-                    self, latent, rot, None, self.max_seq_len)
+                    self, latent, rot, None, self.max_seq_len, valid=valid)
                 freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions, self.qk_rope_head_dim, self.rope_theta,
-                    self.yarn)
+                    positions if logical_positions is None else logical_positions,
+                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
                 q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
                 rot = self._rotate(
                     rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
                 latent, rot, _ = append(latent, rot, None)
                 key, value = self._expand(latent, rot)
-                mask = causal_attention_mask(positions, key.shape[-3])
+                mask = causal_attention_mask(
+                    positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
             causal = False
         else:
             if positions is None:
-                positions = jnp.arange(length)
+                positions = (jnp.arange(length) if valid is None else
+                             jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
             else:
                 positions = jnp.asarray(positions)
             freqs_cos, freqs_sin = mla_rope_freqs(
@@ -566,6 +572,11 @@ class MultiHeadLatentAttention(nn.Module):
                 mask = self._index_mask(
                     x, q_resid, positions, length, index_keys,
                     freqs_cos, freqs_sin, base=mask)
+        if valid is not None:
+            queries_valid = jnp.asarray(valid, bool)[:, None, :, None]
+            mask = queries_valid if mask is None else mask & queries_valid
+            if not decode:
+                mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         scale = self.query_scale
         query = jnp.concatenate([q_pass, q_rot], axis=-1)
         if scale != 1.0:
@@ -606,6 +617,9 @@ class MultiHeadLatentAttention(nn.Module):
             jnp.arange(batch)[:, None, None],
             queries[None, :, None], chosen].set(True)
         return jnp.logical_and(keep, selected[:, None])
+
+
+from dew.nn.mixers import MixerBase, MixerContext, mixers
 
 
 @mixers("mla")
