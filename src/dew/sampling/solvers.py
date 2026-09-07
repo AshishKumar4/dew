@@ -130,12 +130,17 @@ class DDIM:
     1 DDPM-like."""
 
     eta: float = 0.0
+    clip: float | None = None
 
     def init(self, x, times, process):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
+        schedule = process.sampler_schedule
+        target = t - schedule.step_interval(t, t_next)
+        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, target, x)
+        if self.clip is not None:
+            denoised = jnp.clip(denoised, -self.clip, self.clip)
         if self.eta > 0:
             # DDIM paper eq. 16: eta=0 is deterministic DDIM, eta=1.0 approaches DDPM.
             # The direction term must shrink to keep the marginal variance right.
@@ -907,9 +912,9 @@ class PNDM:
     each step's first eps; under `skip_prk_steps`, the PLMS form Stable
     Diffusion runs, the first step is a predictor-corrector pair (an Euler
     step, eps re-read at its end, the step retaken with the mean) and the
-    orders grow from there. Diffusers takes each step's stride from its
-    grid; here the stride is `t_next - t`, so any grid works. The transfer
-    divides by alpha_t, so the walk cannot start where alpha is 0.
+    orders grow from there. The schedule owns the transfer stride: ordinary
+    native grids use their adjacent interval, while published integer grids
+    retain their fixed training stride. Transfers cannot start at alpha = 0.
     """
 
     skip_prk_steps: bool = False
@@ -922,6 +927,8 @@ class PNDM:
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
         rates_t, rates_s = _rates(process, t, t_next, x)
+        interval = schedule.step_interval(t, t_next)
+        rates_step = broadcast_rates(schedule, t - interval, x)
         outputs, count = state
         outputs = _push(outputs, eps)
         e0, e1, e2, e3 = outputs[-1], outputs[-2], outputs[-3], outputs[-4]
@@ -940,8 +947,9 @@ class PNDM:
             return _pndm_step(x, eps / 6 + k2 / 3 + k3 / 3 + k4 / 6, rates_t, rates_s)
 
         def predictor_corrector(_):
-            eps_next = denoise(_pndm_step(x, eps, rates_t, rates_s), t_next)[1]
-            return _pndm_step(x, (eps_next + eps) / 2, rates_t, rates_s)
+            eps_next = denoise(_pndm_step(x, eps, rates_t, rates_step), t_next)[1]
+            correction_source = broadcast_rates(schedule, t_next + interval, x)
+            return _pndm_step(x, (eps_next + eps) / 2, correction_source, rates_s)
 
         def adams(k: int):
             if k == 2:
@@ -950,7 +958,7 @@ class PNDM:
                 combined = (23 * e0 - 16 * e1 + 5 * e2) / 12
             else:
                 combined = (1 / 24) * (55 * e0 - 59 * e1 + 37 * e2 - 9 * e3)
-            return _pndm_step(x, combined, rates_t, rates_s)
+            return _pndm_step(x, combined, rates_t, rates_step)
 
         if self.skip_prk_steps:
             branches = [predictor_corrector] + [(lambda k: lambda _: adams(k))(k) for k in (2, 3, 4)]

@@ -45,6 +45,10 @@ class NoiseScheduler(ABC):
         alpha, sigma = self.rates(jnp.asarray(self.T))
         return jnp.sqrt(alpha ** 2 + sigma ** 2)
 
+    def step_interval(self, t, t_next) -> jax.Array:
+        """The transfer interval; ordinary grids advance to their next point."""
+        return jnp.asarray(t, jnp.float32) - jnp.asarray(t_next, jnp.float32)
+
     def half_interval(self, t, t_next) -> jax.Array:
         """Half a grid interval, as a Runge-Kutta stage places its intermediate points."""
         return (jnp.asarray(t, jnp.float32) - jnp.asarray(t_next, jnp.float32)) / 2

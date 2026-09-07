@@ -264,7 +264,11 @@ Import `JepaObjective` from `dew.objectives.jepa`. The encoder receives normaliz
 
 The same `dew.interop.load_pretrained` entry reads a diffusion checkpoint directory with `model_index.json`, component configurations, safetensors and tokenizer files. The returned `Pretrained` holds a native `UNet2DCondition`, an `AutoencoderKL` behind the existing autoencoder seam, native CLIP conditioning, a `Process` and the native solver policy. Model and scheduler implementations from other libraries run only in the reference tools.
 
-`source.text_to_image()` builds the native image task. `source.save(directory, variables=updated)` writes the updated component weights back to their published layouts, retaining tokenizer files, image geometry and any safety-head parameters.
+`source.text_to_image()` builds the native image task. `source.save(directory, variables=updated)` writes the updated component weights back to their published layouts, retaining tokenizer files, image geometry and any safety-head parameters. Flax-declared components retain their source class and receive Flax msgpack files alongside the safetensors used by Dew; export does not relabel them as PyTorch models.
+
+Source UNet configuration selects normalization groups and epsilon, and the declared implementation selects GEGLU semantics: exact GELU for PyTorch sources, approximate GELU for Flax sources. Spatial upsampling targets the actual next skip shape, including odd intermediate dimensions.
+
+The source scheduler policy retains rounded DDIM/PNDM model times and fixed transfer strides, DDIM clipping, zero-terminal-SNR beta rescaling, and DPM Karras grids. Unsupported active controls fail at load rather than being ignored, including dynamic thresholding and published PNDM velocity-domain history. Native PNDM itself integrates epsilon history.
 
 ```python
 from dew.interop import load_pretrained
