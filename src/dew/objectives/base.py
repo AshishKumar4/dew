@@ -20,6 +20,7 @@ from typing_extensions import TypeVar
 
 from flax import struct
 import jax
+from jax.tree_util import Partial
 import jax.numpy as jnp
 import optax
 
@@ -38,6 +39,11 @@ PathFilter: TypeAlias = Callable[[Path], bool]
 """Selects leaves of a variables tree by the tuple of dict keys above them.
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
+Initializer: TypeAlias = Callable[[jax.Array], Variables]
+"""An objective's `init` as a value, built with `jax.tree_util.Partial` so
+that the held variables it is bound to are pytree children rather than
+closure cells: a JIT that builds the initial state then receives them as
+arguments instead of compiling them in as constants."""
 
 @struct.dataclass
 class Mean:
@@ -150,6 +156,25 @@ class Objective(ABC, Generic[Loss, Effects]):
     ema: EMASpec | None = None
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
+
+    @property
+    def initializer(self) -> Initializer:
+        """`init` as one callable value whose held arrays are its arguments.
+
+        The trainer builds the initial state inside one JIT. A nullary
+        function forces every concrete array its body reads to be captured as
+        a compiled constant, which for a loaded checkpoint means the whole
+        parameter tree is embedded in the executable: 2.2 GiB for a 0.6B
+        model, a module too large for the compilation cache to store.
+
+        This is the one boundary where held variables cross into that JIT as
+        data. An objective that initialises from a key alone holds nothing,
+        so the default binds no arguments. An objective that holds arrays
+        overrides this with `Partial(self._initialize, held)` and delegates
+        `init` to the same `_initialize`, so there is one initialization
+        implementation and one copy of the arrays.
+        """
+        return Partial(self.init)
 
     @abstractmethod
     def init(self, key: jax.Array) -> Variables:

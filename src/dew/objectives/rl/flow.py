@@ -101,12 +101,18 @@ class FlowGRPOObjective(DiffusionObjective):
         self.adv_clip_max = adv_clip_max
         self.pretrained = pretrained
 
-    def init(self, key: jax.Array) -> dict[str, object]:
-        if self.pretrained is None:
-            return super().init(key)
-        variables = {**self.pretrained, "encoders": self.encoder_params()}
-        if self.autoencoder is not None:
-            variables["autoencoder"] = self.autoencoder.params
+    def _held_variables(self) -> dict:
+        held = super()._held_variables()
+        if self.pretrained is not None:
+            held["pretrained"] = self.pretrained
+        return held
+
+    def _initialize(self, held, key: jax.Array) -> dict[str, object]:
+        if "pretrained" not in held:
+            return super()._initialize(held, key)
+        variables = {**held["pretrained"], "encoders": held["encoders"]}
+        if "autoencoder" in held:
+            variables["autoencoder"] = held["autoencoder"]
         return variables
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:

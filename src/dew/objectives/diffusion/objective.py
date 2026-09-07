@@ -12,10 +12,12 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
+from jax.tree_util import Partial
 import optax
 from flax import linen as nn
 
@@ -25,7 +27,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Initializer, Mean, Objective, Step, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
@@ -110,15 +112,40 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
+    def _held_variables(self) -> dict:
+        """Every array `init` starts from rather than draws: the frozen towers.
+
+        One mapping, so the initializer binds all of it as a single argument
+        and an objective that starts from more than the towers extends this
+        and `_initialize` together.
+        """
+        held = {"encoders": self.encoder_params()}
+        if self.autoencoder is not None:
+            held["autoencoder"] = self.autoencoder.params
+        return held
+
+    @property
+    def initializer(self) -> Initializer:
+        """The frozen towers as the initializer's argument, not its closure.
+
+        A text tower and a VAE are released weights: hundreds of megabytes
+        that a nullary trace would compile into the state executable as
+        constants.
+        """
+        return Partial(self._initialize, self._held_variables())
+
     def init(self, key):
-        encoders = self.encoder_params()
+        return self._initialize(self._held_variables(), key)
+
+    def _initialize(self, held: Mapping[str, object], key) -> dict:
+        """The one initialization implementation `init` and `initializer` share."""
         variables = self.model.init(
             key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **self.unconditional)
-        state = {**variables, "encoders": encoders}
-        if self.autoencoder is not None:
+        state = {**variables, "encoders": held["encoders"]}
+        if "autoencoder" in held:
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
-            state["autoencoder"] = self.autoencoder.params
+            state["autoencoder"] = held["autoencoder"]
         return state
 
     def trainable(self, params) -> dict:
