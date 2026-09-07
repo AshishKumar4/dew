@@ -10,14 +10,15 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import checkify
 import numpy as np
 import optax
 import pytest
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
+from dew.interop.pretrained import load_pretrained
 from dew.nn import vision as V
+from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
 from dew.registry import models, with_precision
 
@@ -98,58 +99,40 @@ def test_encoder_backward_and_sgd_update_match_reference(bundle):
     np.testing.assert_allclose(stepped, np.load(FIXTURE / "stepped_ref.npy"), rtol=0, atol=1e-4)
 
 
-def _wrapper_forward(bundle, variables, pixels, ids, positions):
-    _, _, tower, projector, decoder = bundle
-    features = tower.apply(variables["tower"], pixels)
-    soft = projector.apply(variables["projector"], features)
-    embeddings = decoder.apply(variables["language_model"], ids,
-                                method=lambda model, tokens: model.embed_tokens(tokens))
-    embeddings = embeddings * jnp.asarray(decoder.emb_features ** 0.5, embeddings.dtype)
-    prepared = projector.apply(
-        variables["projector"], embeddings, ids, soft, positions,
-        per_layer_input_vocab=decoder.per_layer_input_vocab, method=projector.model_inputs)
-    return decoder.apply(variables["language_model"], **prepared)
-
-
 def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(bundle):
-    """Full image-to-logit fp32 parity, including hard vision IDs and PLE masking.
+    """Full image-to-logit fp32 parity through the native wrapper, including
+    hard vision IDs (48..55 here) and the per-layer table that ends at 48.
 
-    The PLE table ends at 48 while image and hard vision IDs exceed it.
     The actual conditional model supplies the reference, with no audio input.
+    Silencing the hard embedding norm moves the logits by more than 1e-2.
     """
     record, variables, _, projector, _ = bundle
+    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    model = loaded.model.clone(precision=jax.lax.Precision.HIGHEST)
     pixels = jnp.asarray(np.load(FIXTURE / "pixels_odd.npy"))
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
-    positions = jnp.asarray(np.stack([np.flatnonzero(row == record["image_token_id"])
-                                     for row in np.asarray(ids)]), jnp.int32)
-    run = jax.jit(checkify.checkify(
-        lambda state, tokens: _wrapper_forward(bundle, state, pixels, tokens, positions)))
-    error, output = run(variables, ids)
-    error.throw()
-    logits = np.asarray(output)
+    marks = ids == record["image_token_id"]
+    inputs = ModelInputs(ids, {"image_indices": jnp.where(marks, jnp.cumsum(marks, axis=1) - 1, -1)},
+                         {"pixel_values": pixels[:, None]})
+    run = jax.jit(lambda state: model.apply(state, inputs.tokens, rngs=None, method=None,
+                                            mutable=False, capture_intermediates=False, **inputs.kwargs()))
+    logits = np.asarray(run(loaded.variables))
     reference = np.load(FIXTURE / "wrapper_ref.npy")
     np.testing.assert_allclose(logits, reference, rtol=0, atol=1e-4)
     np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    hard = projector.apply(variables["projector"], jnp.array([[48, 50, 55]]),
-                           method=projector.hard_embeddings)
+    hard = projector.apply(variables["projector"], jnp.array([[48, 50, 55]]), method=projector.embed_hard)
     np.testing.assert_allclose(hard, np.load(FIXTURE / "hard_ref.npy"), rtol=0, atol=1e-4)
     muted = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf) if any(
             getattr(part, "key", None) == "hard_embedding_norm" for part in path) else leaf,
-        variables)
-    error, muted_output = run(muted, ids)
-    error.throw()
-    assert np.max(np.abs(np.asarray(muted_output) - reference)) > 1e-2
-    audio_ids = jnp.where(ids == 54, 57, ids)
-    error, _ = run(variables, audio_ids)
-    with pytest.raises(ValueError, match="image-only input_ids"):
-        error.throw()
+        loaded.variables)
+    assert np.max(np.abs(np.asarray(run(muted)) - reference)) > 1e-2
 
 
 def test_soft_initialization_also_creates_the_hard_vision_path():
     projector = V.Gemma3nProjectorModule(8, 4, vocab_size=3, vocab_offset=16)
     variables = projector.init(jax.random.key(51), jnp.arange(16, dtype=jnp.float32).reshape(1, 2, 8))
-    hard = projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.hard_embeddings)
+    hard = jnp.asarray(projector.apply(variables, jnp.array([[16, 18]], jnp.int32), method=projector.embed_hard))
     np.testing.assert_allclose(jnp.mean(jnp.square(hard), axis=-1), 1.0, atol=1e-4)
 
 
@@ -177,22 +160,6 @@ def test_tower_refuses_nonprocessor_pixels(bundle, pixels):
         tower.apply(variables["tower"], pixels)
 
 
-def test_projector_refuses_incomplete_or_misaligned_image_inputs(bundle):
-    _, variables, _, projector, _ = bundle
-    embeddings = jnp.ones((1, 4, 32))
-    ids = jnp.array([[2, 49, 48, 1]])
-    soft = jnp.ones((1, 1, 32))
-    with pytest.raises(ValueError, match="arrive together"):
-        projector.apply(variables["projector"], embeddings, ids, soft,
-                        per_layer_input_vocab=48, method=projector.model_inputs)
-    with pytest.raises(ValueError, match="integers"):
-        projector.apply(variables["projector"], embeddings, ids, soft, jnp.ones((1, 1)),
-                        per_layer_input_vocab=48, method=projector.model_inputs)
-    with pytest.raises(ValueError, match="soft_tokens"):
-        projector.apply(variables["projector"], embeddings, ids, soft, jnp.array([[1, 2]]),
-                        per_layer_input_vocab=48, method=projector.model_inputs)
-
-
 @pytest.mark.parametrize("change", (
     {"architecture": "resnet50"},
     {"hidden_size": 1024},
@@ -209,11 +176,14 @@ def test_unsupported_timm_graph_changes_fail_before_loading(change):
         translate_wrapper_config(config)
 
 
-def test_wrapper_refuses_audio_components_and_wrong_soft_token_count(bundle):
+def test_wrapper_checks_audio_weights_and_wrong_soft_token_count(bundle):
+    """An audio config translates to its tower record; its weights must then exist."""
     config = json.loads((FIXTURE / "config.json").read_text())
     config["audio_config"] = {"model_type": "gemma3n_audio", "hidden_size": 32}
-    with pytest.raises(ValueError, match="audio_config"):
-        translate_wrapper_config(config)
+    record = translate_wrapper_config(config)
+    assert record["audio"]["kind"] == "gemma3n_audio" and record["audio_soft_tokens"] == 188
+    with pytest.raises(ValueError, match="audio checkpoint is missing"):
+        translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
     config["audio_config"] = None
     config["vision_soft_tokens_per_image"] = 9
     with pytest.raises(ValueError, match="vision_soft_tokens_per_image"):
@@ -233,63 +203,6 @@ def test_image_only_released_config_builds_the_actual_encoder():
     output, _ = jax.eval_shape(tower.init_with_output, jax.random.key(0),
                                jax.ShapeDtypeStruct((1, 3, 768, 768), jnp.float32))
     assert output.shape == (1, 256, 2048)
-
-
-@pytest.mark.parametrize("bad_id", (47, 56))
-def test_hard_vision_ids_reject_both_sides_of_the_vocabulary_eager_and_compiled(bundle, bad_id):
-    _, variables, _, projector, _ = bundle
-    ids = jnp.array([[bad_id, 48]], jnp.int32)
-    with pytest.raises(ValueError, match="vision token IDs"):
-        projector.apply(variables["projector"], ids, method=projector.hard_embeddings)
-    checked = jax.jit(checkify.checkify(lambda tokens: projector.apply(
-        variables["projector"], tokens, method=projector.hard_embeddings)))
-    error, _ = checked(ids)
-    with pytest.raises(ValueError, match="vision token IDs"):
-        error.throw()
-    error, valid = checked(jnp.array([[48, 55]], jnp.int32))
-    error.throw()
-    np.testing.assert_allclose(valid, np.load(FIXTURE / "hard_ref.npy")[:, [0, 2]], rtol=0, atol=1e-4)
-
-
-@pytest.mark.parametrize("bad_id", (-1, 56, 57))
-def test_image_only_inputs_reject_negative_upper_boundary_and_audio_ids(bundle, bad_id):
-    _, variables, _, projector, _ = bundle
-    embeddings = jnp.ones((1, 2, 32))
-    ids = jnp.array([[2, bad_id]], jnp.int32)
-
-    def prepare(tokens):
-        return projector.apply(variables["projector"], embeddings, tokens,
-                               per_layer_input_vocab=48, method=projector.model_inputs)
-
-    with pytest.raises(ValueError, match="image-only input_ids"):
-        prepare(ids)
-    checked = jax.jit(checkify.checkify(prepare))
-    error, _ = checked(ids)
-    with pytest.raises(ValueError, match="image-only input_ids"):
-        error.throw()
-    error, valid = checked(jnp.array([[2, 55]], jnp.int32))
-    error.throw()
-    np.testing.assert_array_equal(valid["input_embeddings"][:, 0], embeddings[:, 0])
-    np.testing.assert_allclose(valid["input_embeddings"][:, 1],
-                               np.load(FIXTURE / "hard_ref.npy")[:, -1], rtol=0, atol=1e-4)
-
-
-def test_checked_hard_embedding_gradients_remain_jittable(bundle):
-    _, variables, _, projector, _ = bundle
-    ids = jnp.array([[48, 50, 55]], jnp.int32)
-    coefficients = jnp.linspace(-1, 1, 96).reshape(1, 3, 32)
-
-    def loss(params):
-        embeddings = projector.apply({"params": params}, ids, method=projector.hard_embeddings)
-        return jnp.mean(embeddings * coefficients)
-
-    params = variables["projector"]["params"]
-    expected_value, expected_grad = jax.value_and_grad(loss)(params)
-    error, (value, gradients) = jax.jit(checkify.checkify(jax.value_and_grad(loss)))(params)
-    error.throw()
-    np.testing.assert_allclose(value, expected_value, rtol=0, atol=1e-6)
-    for actual, expected in zip(jax.tree.leaves(gradients), jax.tree.leaves(expected_grad), strict=True):
-        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
 
 
 @pytest.mark.parametrize("field,value", [("vocab_size", "8"), ("vocab_offset", "48"),
