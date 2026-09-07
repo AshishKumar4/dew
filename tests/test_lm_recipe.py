@@ -346,3 +346,35 @@ def test_masked_diffusion_on_a_causal_model_is_refused():
             recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
                                objective="masked_diffusion"),
             model, {"mask_token_id": 5})
+
+
+def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
+    from dew.interop import load_pretrained
+
+    recipe = load_recipe()
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    directory = tmp_path / "tokens"
+    directory.mkdir()
+    for split, count in (("train", 160), ("val", 32)):
+        ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
+        (directory / f"{split}.bin").write_bytes(ids.tobytes())
+    (directory / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
+    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+        "--pretrained", str(checkpoint), "--objective", "block_diffusion",
+        "--tokenizer", str(checkpoint), "--data.path", str(directory), "--data.seq-len", "11",
+        "--block-prompt-tokens", "4", "--data.loading.workers", "0",
+        "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+    state = recipe.main(config)
+    assert int(state.updates) == 1
+    original = load_pretrained(checkpoint, dtype="float32", attention_impl="xla")
+    difference = max(float(jnp.max(jnp.abs(a - b)))
+                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(original.variables)))
+    assert difference > 1e-5
+    restored = recipe.main(config)
+    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params)):
+        np.testing.assert_array_equal(actual, wanted)

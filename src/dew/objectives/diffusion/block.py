@@ -68,7 +68,7 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
 
 def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
     mass = mask.sum(axis=-1)
-    row_losses = jnp.sum(jnp.where(mask, losses, 0), axis=-1) / jnp.maximum(mass, 1)
+    row_losses = jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1)
     return Mean(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
 
 
@@ -134,9 +134,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, params: Variables, batch: Batch, step: Step):
-        tokens = jnp.asarray(batch["text"], jnp.int32)
-        if tokens.ndim != 2 or tokens.shape[1] != self.sequence_length:
-            raise ValueError(f"block SFT expects [B, {self.sequence_length}] token rows")
+        tokens = jnp.asarray(batch["text"])
+        if tokens.ndim != 2 or tokens.shape[1] != self.sequence_length or not jnp.issubdtype(tokens.dtype, jnp.integer):
+            raise ValueError(f"block SFT expects integer [B, {self.sequence_length}] token rows")
+        tokens = tokens.astype(jnp.int32)
         response = tokens[:, self.prompt_length:]
         canvas_mask = jnp.asarray(batch.get("canvas_mask", response != self.pad_token_id), bool)
         if canvas_mask.shape != response.shape:
@@ -181,7 +182,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), response)
         shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
         adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
-        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), bool)
+        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")
         encoder_losses = optax.softmax_cross_entropy_with_integer_labels(encoder_logits.astype(jnp.float32), shifted)

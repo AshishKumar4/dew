@@ -91,15 +91,19 @@ def translate_weights(tensors: Mapping[str, np.ndarray], config: Mapping[str, ob
     mapped = translate_denoiser_weights(text, fields)
     params = {"text": mapped["text"]["params"],
               "self_conditioning": mapped["self_conditioning"]["params"]}
+    variables = {"params": params}
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
+        tower_variables = translate_gemma4_vision_weights(vision)
         params["conditioner"] = {
-            "tower": translate_gemma4_vision_weights(vision),
+            "tower": tower_variables["params"],
             "projector": translate_gemma4_projector_weights(projection)}
+        if "constants" in tower_variables:
+            variables["constants"] = {"conditioner": {"tower": tower_variables["constants"]}}
     elif vision or projection:
         raise ValueError("vision weights require vision_config")
-    return {"params": params}
+    return variables
 
 
 def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
@@ -169,21 +173,24 @@ def export_weights(variables: Variables, config: Mapping[str, object]) -> dict[s
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
-        for name, raw in _flatten(params["conditioner"]["tower"]).items():
-            parts = name.split(".")
-            if tuple(parts) in inverse:
-                target = inverse[tuple(parts)]
-            elif parts[0].startswith("layers_"):
-                index = parts[0].removeprefix("layers_")
-                tail = parts[1:-1]
-                if parts[-1] == "kernel":
-                    tail = [*tail, "linear"]
-                target = f"encoder.layers.{index}." + ".".join([*tail, "weight"])
-            else:
-                raise ValueError(f"unknown vision parameter {name!r}")
-            leaf = np.asarray(raw)
-            result["model.encoder.vision_tower." + target] = np.ascontiguousarray(
-                leaf.T if parts[-1] == "kernel" else leaf)
+        for collection in ("params", "constants"):
+            tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
+            for name, raw in _flatten(tower).items():
+                parts = name.split(".")
+                if tuple(parts) in inverse:
+                    target = inverse[tuple(parts)]
+                elif parts[0].startswith("layers_"):
+                    index = parts[0].removeprefix("layers_")
+                    tail = parts[1:-1]
+                    if parts[-1] == "kernel":
+                        tail = [*tail, "linear"]
+                    ending = parts[-1] if collection == "constants" else "weight"
+                    target = f"encoder.layers.{index}." + ".".join([*tail, ending])
+                else:
+                    raise ValueError(f"unknown vision parameter {name!r}")
+                leaf = np.asarray(raw)
+                result["model.encoder.vision_tower." + target] = np.ascontiguousarray(
+                    leaf.T if parts[-1] == "kernel" else leaf)
         result["model.encoder.embed_vision.embedding_projection.weight"] = np.ascontiguousarray(
             np.asarray(params["conditioner"]["projector"]["projection"]["kernel"]).T)
     return result

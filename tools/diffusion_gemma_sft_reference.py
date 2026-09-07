@@ -126,7 +126,8 @@ def main():
                   canvas_id=jnp.broadcast_to(jnp.repeat(jnp.arange(2), 4), (2, 8)),
                   encoder_target=targets, encoder_target_mask=target_mask)
     model = reference_model()
-    variables = model.init({"params": jax.random.key(701), "sampling": jax.random.key(SEED)}, **kwargs)
+    variables = model.init({"params": jax.random.key(701), "sampling": jax.random.key(SEED)},
+                           kwargs, method=lambda module, data: module(**data))
     paths, structure = jax.tree.flatten_with_path(variables)
     scattered = []
     for index, (path, value) in enumerate(paths):
@@ -138,7 +139,10 @@ def main():
     ar_loss = sft_model.EncoderARLoss()
 
     def objective(values, source_model=model):
-        out = source_model.apply(values, **kwargs, rngs={"sampling": jax.random.key(SEED)})
+        out = source_model.apply(values, kwargs, method=lambda module, data: module(**data),
+                                 rngs={"sampling": jax.random.key(SEED)})
+        if not isinstance(out, dict):
+            raise TypeError("official SFTDiffusion must return its prediction dictionary")
         canvas = loss_fn(out["output"], out["target"], out["noise_info"]["time"])
         encoder = ar_loss.get_values(out["encoder_logits"], targets, target_mask)
         return canvas.mean() + encoder.mean(), (canvas, encoder, out)
