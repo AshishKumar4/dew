@@ -524,6 +524,21 @@ def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
     return from_record(cls, {key: value for key, value in record.items() if key in fields})
 
 
+def encoded_frame_stride(config: Gemma3nAudio | Gemma4Audio) -> int:
+    """Input frames per encoded frame: the subsampling strides and any reduction.
+
+    The encoders keep every stride-th frame of the input mask, so a host can
+    count a clip's encoded frames as mask[::stride] without running them.
+    """
+    if isinstance(config, Gemma3nAudio):
+        stride = config.conf_reduction_factor
+        for time_stride, _ in config.sscp_conv_stride_size:
+            stride *= time_stride
+        return stride
+    return 4
+
+
+
 @functools.cache
 def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     features = config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]

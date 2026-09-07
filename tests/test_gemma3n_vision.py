@@ -209,11 +209,14 @@ def test_unsupported_timm_graph_changes_fail_before_loading(change):
         translate_wrapper_config(config)
 
 
-def test_wrapper_refuses_audio_components_and_wrong_soft_token_count(bundle):
+def test_wrapper_checks_audio_weights_and_wrong_soft_token_count(bundle):
+    """An audio config translates to its tower record; its weights must then exist."""
     config = json.loads((FIXTURE / "config.json").read_text())
     config["audio_config"] = {"model_type": "gemma3n_audio", "hidden_size": 32}
-    with pytest.raises(ValueError, match="audio_config"):
-        translate_wrapper_config(config)
+    record = translate_wrapper_config(config)
+    assert record["audio"]["kind"] == "gemma3n_audio" and record["audio_soft_tokens"] == 188
+    with pytest.raises(ValueError, match="audio checkpoint is missing"):
+        translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
     config["audio_config"] = None
     config["vision_soft_tokens_per_image"] = 9
     with pytest.raises(ValueError, match="vision_soft_tokens_per_image"):
