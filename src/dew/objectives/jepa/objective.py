@@ -33,7 +33,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from .masking import MultiBlockMask
 
@@ -108,7 +108,7 @@ class JepaObjective(Objective[Mean]):
             select=under("params", CONTEXT_ENCODER),
         )
 
-    def init(self, key):
+    def init(self, key, variables: Variables | None = None):
         encoder_key, predictor_key = jax.random.split(key)
         sample = jnp.ones((1, *self.sample.shape))
         context_idx = jnp.arange(self.mask.num_context, dtype=jnp.int32)[None]
