@@ -67,3 +67,38 @@ def test_import_rejects_lost_provenance_and_partial_episodes(corruption):
         rows[0]["reward_score"] += 1
     with pytest.raises(ValueError):
         from_verl(rows)
+
+
+@pytest.mark.parametrize("corruption", ["negative_response", "negative_context", "empty_context",
+                                      "missing_eos", "unmarked_eos", "early_eos", "no_eos_configured"])
+def test_import_refuses_invalid_action_ids_and_termination(corruption):
+    """Malformed sampled actions fail at import, before they can enter PPO."""
+    rows = [output["wire"] for output in json.loads(FIXTURE.read_text())["outputs"]]
+    row = rows[0]
+    action = row["extra_fields"]["dew"]["action"]
+    eos = action["sampling"]["eos_id"][0]
+    if corruption == "negative_response":
+        row["response_ids"][0] = -1
+    elif corruption == "negative_context":
+        row["prompt_ids"][0] = -1
+    elif corruption == "empty_context":
+        row["prompt_ids"] = []
+    elif corruption == "missing_eos":
+        row["response_ids"][-1] = 1
+    elif corruption == "unmarked_eos":
+        action["terminated"] = False
+    elif corruption == "early_eos":
+        row["response_ids"][0] = eos
+    else:
+        action["sampling"]["eos_id"] = None
+    with pytest.raises(ValueError):
+        from_verl(rows)
+
+
+@pytest.mark.parametrize("field", ["context", "tokens"])
+def test_action_construction_rejects_boolean_token_ids(field):
+    rows = [output["wire"] for output in json.loads(FIXTURE.read_text())["outputs"]]
+    action = from_verl(rows)[0].transitions[0].action
+    ids = action.context if field == "context" else action.tokens
+    with pytest.raises(ValueError, match="integer"):
+        replace(action, **{field: (True, *ids[1:])})
