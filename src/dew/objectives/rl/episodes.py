@@ -130,10 +130,12 @@ EpisodeRecorder = Callable[[Episode], None]
 
 
 class EpisodeInference(Protocol):
-    """A model-bound inference callable using the supplied variables."""
+    """A bindable autoregressive policy returning actual sampling likelihoods."""
 
-    def __call__(self, variables: Variables, inputs: Sequence[Sequence[int]],
-                 max_new_tokens: int, /, *, key: jax.Array, sampling: Sampling) -> Generation: ...
+    def bind(self, variables: Variables, /) -> EpisodeInference: ...
+
+    def __call__(self, inputs: Sequence[Sequence[int]], max_new_tokens: int, /,
+                 *, key: jax.Array, sampling: Sampling) -> Generation: ...
 
 
 class EpisodeFailure(RuntimeError):
@@ -166,14 +168,14 @@ class EpisodeRollout:
     is inferred. Host records and numeric rows carry the trainer's committed
     update clock. Raw and behavior likelihoods come from actual draws.
 
-    Inference receives the same immutable variables tree for every turn of
-    a collection. It must use those supplied weights, not a mutable serving
-    default. The Trainer cannot update or donate the tree until this call
-    returns. Checkpoints resume at Trainer boundaries, not halfway through
-    an external tool call.
+    The policy binds one immutable variables snapshot for the whole
+    collection. It must use that binding, not a mutable serving default.
+    The Trainer cannot update or donate the tree until this call returns.
+    Checkpoints resume at Trainer boundaries, not halfway through an
+    external tool call.
     """
 
-    inference: EpisodeInference
+    policy: EpisodeInference
     environment: EnvironmentFactory
     verifier: Verifier
     max_prompt_tokens: int
@@ -192,13 +194,14 @@ class EpisodeRollout:
         if self.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
-    def _episode(self, identity: EpisodeId, variables: Variables,
+    def _episode(self, identity: EpisodeId, policy: EpisodeInference,
                  policy_step: int, key: jax.Array) -> Episode:
         initial = None
         transitions: list[Transition] = []
         status = EpisodeStatus.RUNNING
         detail = ""
         pending: Action | None = None
+        episode: Episode | None = None
         try:
             with self.environment(identity) as environment:
                 observation = environment.reset()
@@ -211,9 +214,11 @@ class EpisodeRollout:
                     if len(observation.context) > self.max_prompt_tokens:
                         status, detail = EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens"
                         break
-                    result = self.inference(
-                        variables, [observation.context], self.max_new_tokens,
+                    result = policy(
+                        [observation.context], self.max_new_tokens,
                         key=jax.random.fold_in(key, len(transitions)), sampling=self.sampling)
+                    if not isinstance(result, Generation):
+                        raise TypeError("tool episodes require autoregressive Generation likelihoods")
                     pending = self._action(result, observation.context, policy_step)
                     if not pending.terminated:
                         observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
@@ -222,14 +227,17 @@ class EpisodeRollout:
                     transitions.append(Transition(pending, observation))
                     pending = None
                     status, detail = observation.status, observation.detail
-            if status == EpisodeStatus.RUNNING:
-                raise RuntimeError("environment exited before a terminal observation")
-            episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail)
-            if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
-                reward = float(self.verifier(episode))
-                if not math.isfinite(reward):
-                    raise ValueError("episode verifier returned a non-finite reward")
-                episode = replace(episode, reward=reward)
+                episode = Episode(identity, policy_step, initial, tuple(transitions), status, detail)
+                if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
+                    # A verifier may inspect files or services owned by the
+                    # environment. Score before its context releases them.
+                    reward = float(self.verifier(episode))
+                    if not math.isfinite(reward):
+                        raise ValueError("episode verifier returned a non-finite reward")
+                    episode = replace(episode, reward=reward)
+            if episode is None or (status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED)
+                                   and episode.reward is None):
+                raise RuntimeError("environment exited before episode verification completed")
         except BaseException as error:
             status = (EpisodeStatus.CANCELLED if isinstance(error, (CancelledError, KeyboardInterrupt))
                       else EpisodeStatus.ERROR)
@@ -290,6 +298,7 @@ class EpisodeRollout:
         # until collection returns. Replacing a caller's mapping cannot move
         # the policy halfway through an episode.
         variables = jax.tree.map(lambda leaf: leaf, state.params)
+        policy = self.policy.bind(variables)
         episodes = []
         for index, task in enumerate(tasks):
             for group in range(self.groups):
@@ -297,7 +306,7 @@ class EpisodeRollout:
                 draw = jax.random.fold_in(key, sample)
                 identity = EpisodeId(int(task), int(state.step), sample,
                                      tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))
-                episodes.append(self._episode(identity, variables, policy_step, draw))
+                episodes.append(self._episode(identity, policy, policy_step, draw))
         return tuple(episodes)
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
