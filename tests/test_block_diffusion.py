@@ -103,10 +103,10 @@ def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
     expected = process.generate(model, variables, inputs, budget, key=jax.random.key(11),
                                 eos_token_ids=eos_ids, pad_token_id=0)
     plan = CanvasPlan(process, eos_ids, 0, budget)
-    begin = jax.jit(lambda weights, data: _begin(model, weights, data, plan.geometry))
+    begin = jax.jit(lambda weights, data: _begin(model, weights, data, plan))
     advance = jax.jit(lambda weights, state: _advance(model, weights, state, jax.random.key(11), plan))
     state = begin(variables, inputs)
-    for _ in range(plan.steps):
+    for _ in range(plan.blocks):
         state = advance(variables, jax.device_get(state))
     result = _materialize(state, inputs.tokens.shape[1], budget)
     np.testing.assert_array_equal(result.tokens, expected.tokens)
