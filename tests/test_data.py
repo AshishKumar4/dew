@@ -27,6 +27,7 @@ from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
+from dew.position import ENVELOPE
 from dew.registry import datasets
 
 WORKERS = dict(loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
@@ -298,6 +299,94 @@ def test_each_process_reads_its_own_slice_of_the_validation_split(monkeypatch):
     assert _indices(data.val(), 3) == [[1, 3, 5, 7], [9, 11, 13, 15]]
 
 
+def _steps(monkeypatch, processes, count, *, position=None, length=32, seed=0, batch=8):
+    """`(global batches, saved positions)` for `processes` simulated processes.
+
+    A global batch is the step every process contributes its rows to, so the
+    records are collected across the processes; which process holds which row
+    is the mesh's business and which records a step trains on is the
+    dataset's. Each process is opened in turn, resumed from `position` when
+    one is given, and asked where it stopped.
+    """
+    monkeypatch.setattr(jax, "process_count", lambda: processes)
+    read, saved = [], []
+    for index in range(processes):
+        monkeypatch.setattr(jax, "process_index", lambda index=index: index)
+        stream = Indexed(length=length, seed=seed).load(batch=batch).train
+        iterator = stream()
+        if position is not None:
+            iterator.set_state(position)
+        read.append(_indices(iterator, count))
+        saved.append(iterator.get_state())
+        iterator.close()
+    return [sorted(index for rows in read for index in rows[step])
+            for step in range(count)], saved
+
+
+@pytest.mark.parametrize("processes", [1, 2, 4])
+def test_a_training_step_reads_the_same_records_at_every_process_count(
+        monkeypatch, processes):
+    """Step k is records [k * batch, (k + 1) * batch) of one order whatever
+    the process count is, because the iterator owns the sharding and the
+    batching together. Shuffling the corpus per shard first, as an index
+    sampler does, gave each count a different order, which no encoding of a
+    position could have translated."""
+    alone, _ = _steps(monkeypatch, 1, 4)
+    together, _ = _steps(monkeypatch, processes, 4)
+
+    assert together == alone
+    assert sorted(index for step in alone for index in step) == list(range(32)), (
+        "four steps of eight is one pass over the corpus, each record once")
+
+
+def test_every_process_saves_the_same_global_position(monkeypatch):
+    """A position is a record count over the whole run's order, so every
+    process reports the same bytes; that is what lets a checkpoint written by
+    two processes be handed to one or to four."""
+    _, saved = _steps(monkeypatch, 4, 3)
+
+    assert len(set(saved)) == 1
+    assert json.loads(saved[0])[ENVELOPE]["records"] == 3 * 8
+
+
+@pytest.mark.parametrize("processes", [1, 4])
+def test_a_position_saved_by_two_processes_resumes_on_another_count(
+        monkeypatch, processes):
+    """The steps after a resume are the steps the run that was never stopped
+    would have trained on, whether the resume has half the processes or twice
+    them."""
+    whole, _ = _steps(monkeypatch, 2, 6)
+    _, saved = _steps(monkeypatch, 2, 3)
+
+    resumed, _ = _steps(monkeypatch, processes, 3, position=saved[0])
+
+    assert resumed == whole[3:]
+
+
+def test_a_position_over_another_order_is_refused(monkeypatch):
+    """A record count is a place in one order and another place in another, so
+    a corpus, record count or seed the position was not written over is
+    refused instead of resumed at the same offset into different data."""
+    _, saved = _steps(monkeypatch, 2, 3)
+
+    for other in (dict(length=64), dict(seed=1)):
+        stream = Indexed(**other).load(batch=8).train()
+        with pytest.raises(ValueError, match="records into"):
+            stream.set_state(saved[0])
+        stream.close()
+
+
+def test_a_shard_offset_cannot_resume_a_global_stream():
+    """A stream whose windows come out of one shard reports where that shard
+    stopped. Handing such a position to a stream that reads its records
+    globally would resume it somewhere else, so it is refused by name."""
+    stream = Indexed().load(batch=8).train()
+
+    with pytest.raises(ValueError, match="one process's own offset into its shard"):
+        stream.set_state(json.dumps({"last_seen_indices": {"0": 15}}).encode())
+    stream.close()
+
+
 # ---------------------------------------------------------------------------------
 # Clip sampling uses a local RNG
 # ---------------------------------------------------------------------------------
@@ -530,11 +619,12 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     restored run owes the epoch its unseen records, no more and no fewer.
 
     The loader is built again from a source object of its own, as a resumed
-    process has: grain validates a saved position against `repr(source)` and
-    will not restore one it cannot match.
+    process has: the position is a record count into a named order, and a
+    source described by its address names a different order in every process.
 
-    Eight training records over two workers is two whole batches, since each
-    worker batches its own slice and drops what is left over.
+    Eight training records at a batch of four is two whole batches, and the
+    iterator batches ahead of the worker slice so that holds at every worker
+    count.
     """
     def loader():
         return Augmenting(image_size=8, seed=3, val_batches=2,
@@ -551,7 +641,7 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     restored.set_state(state)
     resumed = [row for batch in itertools.islice(restored, 3) for row in _rows(batch)]
 
-    assert "object at 0x" not in json.loads(state)["data_source"], (
+    assert "object at 0x" not in json.loads(state)[ENVELOPE]["order"], (
         "a source described by its address can only be restored in the process "
         "that saved it")
     assert resumed == rest, "a resumed epoch owes the same records, augmented alike"

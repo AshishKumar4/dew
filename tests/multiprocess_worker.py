@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from dew.telemetry.records import RECORD_TYPES
 from dew.data import Loading
+from dew.position import ENVELOPE
 from dew.training.evaluation import evaluate
 
 RES = 8
@@ -202,6 +203,34 @@ def indexed_loader(records: int, batch: int = BATCH):
         operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
         worker_count=0,
     )
+
+
+def elastic_loader(records: int, workers: int):
+    """`train_stream` over the same records, whose position is a global count.
+
+    The loader above is grain's own `DataLoader`, whose position is one
+    process's offset into its shard. This one is the path every dataset spec
+    takes, so what a pool reading it exercises is a position every process
+    reports alike and a pool of another size reads back.
+    """
+    from dew.data.dataset import Loading as ReadLoading
+    from dew.data.dataset import local_batch, train_stream
+
+    class Indexed:
+        """Records that say which they are, in the field the objective reads."""
+
+        def __repr__(self):
+            return f"Indexed(records={records})"
+
+        def __len__(self):
+            return records
+
+        def __getitem__(self, index):
+            return {"image": np.full((RES, RES, 3), index, np.uint8)}
+
+    return train_stream(Indexed(), [], batch=local_batch(BATCH), seed=0,
+                        loading=ReadLoading(workers=workers, threads=2, read_buffer=8,
+                                            worker_buffer=2))
 
 
 def batch_records(batch) -> list[int]:
@@ -438,9 +467,13 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    loader = indexed_loader(args.records, rows)
-    if args.block_after:
-        loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+    if args.elastic:
+        open_train = elastic_loader(args.records, args.workers)
+    else:
+        loader = indexed_loader(args.records, rows)
+        if args.block_after:
+            loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+        open_train = lambda: iter(loader)
     val, available = None, None
     scored = []
     evaluate = trainer.objective.evaluate
@@ -455,7 +488,7 @@ def mode_fit(args) -> dict:
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
         available = sum(1 for _ in data.val())
-    state = trainer.fit(Data(lambda: iter(loader), val=val, records=args.records),
+    state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
                         checkpoint_every=args.save_every, metrics=(Batches(),))
@@ -1185,6 +1218,9 @@ def parse_args(argv=None):
     parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--elastic", action="store_true",
+                        help="read the training records through train_stream, whose "
+                             "saved position is a global record count")
     return parser.parse_args(argv)
 
 

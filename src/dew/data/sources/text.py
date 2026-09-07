@@ -58,9 +58,9 @@ class TokenFileSource:
             )
 
     def __repr__(self) -> str:
-        # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses a state whose repr differs, so a resumed run needs this to
-        # describe the file, not an address in this process.
+        # A saved data position names the order it counts into by naming its
+        # source, and a resume refuses a description it cannot match, so this
+        # describes the file, not an address in this process.
         return f"TokenFileSource(path={self.path!r}, seq_len={self.seq_len})"
 
     def __len__(self) -> int:
