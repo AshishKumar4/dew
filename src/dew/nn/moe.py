@@ -37,7 +37,9 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from .sharding import logical_axes
+from jax.sharding import PartitionSpec as P
+
+from .sharding import EXPERT_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -47,6 +49,7 @@ from .sharding import logical_axes
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
 GROUPED_MATMULS = ('xla', 'tokamax')
+EXPERT_DISPATCHES = ('global', 'exchange')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
 # whose sigmoid scores are all zero stays finite
@@ -306,6 +309,10 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
       kernels (`maxtext layers/moe.py:1633`); tokamax picks its Mosaic or
       Triton kernel where one exists and lowers to XLA elsewhere.
+
+    This is the raw kernel call and JAX's own differentiation rules.
+    `expert_projection` adds the precision contract routed experts train
+    under.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
@@ -323,9 +330,99 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         preferred_element_type=preferred_element_type)
 
 
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
+    # The value an operand takes in the compute dtype, held in its own dtype
+    # so the straight-through tangent below never rounds a second time.
+    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
+
+
+@_rounded_operand.defjvp
+def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
+                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
+    return jnp.asarray(_rounded_operand(primals[0], dtype)), tangents[0]
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
+def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+                      dtype: Optional[Dtype], implementation: str,
+                      precision: PrecisionLike) -> jax.Array:
+    """`grouped_matmul` under one precision contract for both dispatches.
+
+    The operands are cast to `dtype` (flax's promotion when None), every
+    contraction accumulates in at least fp32 and rounds once to the compute
+    dtype, so a width split over a mesh axis rounds no partial sum. The
+    tangent is `dx @ Q(kernel) + Q(x) @ dkernel` with `Q` the rounded operand
+    values and the tangents in their own dtypes: a kernel gradient keeps the
+    master dtype, an input gradient its input's, and both accumulate over
+    the widest of the compute, input and kernel dtypes. The contract holds
+    in both differentiation directions and does not depend on placement.
+
+    The tangent contractions are `jax.lax.ragged_dot`, whose transposes JAX
+    defines, so both directions differentiate under either kernel; tokamax's
+    own rules stop at reverse mode. Measured against NumPy float64 sums of
+    the rounded operands and three Adam steps of the global path on every
+    expert/fsdp layout in tests/test_moe_precision.py; with fp32 operands
+    the forward pass is the call it wraps.
+    """
+    x, kernel = promote_dtype(x, kernel, dtype=dtype)
+    accumulated = grouped_matmul(
+        x, kernel, group_sizes, implementation=implementation, precision=precision,
+        preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+    return accumulated.astype(x.dtype)
+
+
+@expert_projection.defjvp
+def _expert_projection_jvp(dtype: Optional[Dtype], implementation: str,
+                           precision: PrecisionLike,
+                           primals: tuple[jax.Array, jax.Array, jax.Array],
+                           tangents: tuple[jax.Array, jax.Array, jax.Array]
+                           ) -> tuple[jax.Array, jax.Array]:
+    x, kernel, group_sizes = primals
+    dx, dkernel, _ = tangents
+    # The tangents keep their dtypes to this point whatever produced them, so
+    # an activation's bf16 cotangent is not fused into a wider expression.
+    dx, dkernel = jax.lax.optimization_barrier((dx, dkernel))
+    output = jnp.asarray(expert_projection(x, kernel, group_sizes, dtype, implementation, precision))
+    work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
+    inputs = jnp.asarray(_rounded_operand(x, output.dtype))
+    matrix = jnp.asarray(_rounded_operand(kernel, output.dtype))
+    input_term = jax.lax.ragged_dot(
+        dx.astype(work), matrix.astype(work), group_sizes, precision=precision,
+        preferred_element_type=work)
+    kernel_term = jax.lax.ragged_dot(
+        inputs.astype(work), dkernel.astype(work), group_sizes, precision=precision,
+        preferred_element_type=work)
+    tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
+    return output, tangent
+
+
+@jax.custom_jvp
+def exact_gelu(x: jax.Array) -> jax.Array:
+    """The erf gelu in at least fp32, returned in `x`'s dtype, in both
+    differentiation directions: a bf16 gate's activation rounds once, wherever
+    the compiler places it."""
+    x = jax.lax.optimization_barrier(x)
+    work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    return nn.gelu(work, approximate=False).astype(x.dtype)
+
+
+@exact_gelu.defjvp
+def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
+                    ) -> tuple[jax.Array, jax.Array]:
+    x, = primals
+    dx, = tangents
+    output = exact_gelu(x)
+    work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    _, derivative = jax.jvp(lambda value: nn.gelu(value, approximate=False),
+                            (work,), (jnp.ones_like(work),))
+    tangent = derivative * jax.lax.optimization_barrier(dx).astype(work.dtype)
+    return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
+
+
 class ExpertLinear(nn.Module):
     """One matrix per expert, `[exp, in_features, features]`, over tokens
-    already sorted by expert, through `grouped_matmul` on `implementation`."""
+    already sorted by expert, through `expert_projection` on `implementation`."""
     num_experts: int
     in_features: int
     features: int
@@ -344,10 +441,8 @@ class ExpertLinear(nn.Module):
             (self.num_experts, self.in_features, self.features), jnp.float32)
 
     def __call__(self, tokens, group_sizes):
-        tokens, kernel = promote_dtype(tokens, self.kernel, dtype=self.dtype)
-        return grouped_matmul(
-            tokens, kernel, group_sizes, implementation=self.implementation,
-            precision=self.precision, preferred_element_type=tokens.dtype)
+        return jnp.asarray(expert_projection(
+            tokens, self.kernel, group_sizes, self.dtype, self.implementation, self.precision))
 
 
 class ExpertMLP(nn.Module):
@@ -359,6 +454,15 @@ class ExpertMLP(nn.Module):
     summed with their router weights (`maxtext layers/moe.py:940` `permute` and
     `:1101` `unpermute`). The gather reads token rows directly, without a
     `top_k`-fold copy of them, which is MaxText's `moe_use_direct_token_gather`.
+
+    `dispatch='global'` retains that path. `'exchange'` opts into all-to-all
+    rounds on an expert mesh axis that divides the expert count. Each round
+    uses a local-slot-sized message buffer and later rounds keep excess
+    assignments. No expert capacity drops tokens. Initialisation creates the
+    same parameters without requiring a mesh. The projections run through
+    `expert_projection`, whose precision contract is the same under both
+    dispatches, so a routed layer computes the same forward, gradients and
+    tangents whichever moves the tokens.
 
     The sum over a token's experts runs in fp32, because that is the dtype the
     router weights are computed in, and the result rejoins the residual stream
@@ -380,12 +484,15 @@ class ExpertMLP(nn.Module):
     out_features: int
     activation: str = 'swiglu'
     implementation: str = 'xla'
+    dispatch: str = 'global'
     swiglu_limit: Optional[float] = None
     scale_inputs: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
     def setup(self):
+        if self.dispatch not in EXPERT_DISPATCHES:
+            raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
         if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
             raise ValueError(
                 f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
@@ -404,42 +511,134 @@ class ExpertMLP(nn.Module):
         self.down_proj = expert(in_features=self.hidden_features,
                                 features=self.out_features, name='down_proj')
 
-    def __call__(self, x, weights, indices):
-        """`x` is `[..., embed]` and `weights` and `indices` are `[..., k]`."""
-        if weights.shape != indices.shape or indices.shape[:-1] != x.shape[:-1]:
-            raise ValueError(
-                f"routing {indices.shape} does not describe tokens {x.shape}")
-        top_k = indices.shape[-1]
-        tokens = x.reshape(-1, x.shape[-1])
-        experts = indices.reshape(-1)
-        # Slot j of the flattened routing belongs to token j // top_k, so one
-        # gather puts the token rows in expert order.
-        order = jnp.argsort(experts)
-        group_sizes = jnp.bincount(experts, length=self.num_experts)
-        grouped = tokens[order // top_k]
-        if self.scale_inputs:
-            grouped = grouped * weights.reshape(-1)[order][:, None].astype(grouped.dtype)
+    def _project(self, tokens: jax.Array, sizes: jax.Array,
+                 kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+        def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
+            return jnp.asarray(expert_projection(
+                x, kernel, sizes, self.dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (causal_transformer.RESIDUALS).
-        gate = checkpoint_name(self.gate_proj(grouped, group_sizes), 'gate_proj')
-        up = checkpoint_name(self.up_proj(grouped, group_sizes), 'up_proj')
+        gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
+        up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation == 'swiglu':
             gate = nn.silu(gate)
+        elif self.activation == 'geglu':
+            gate = nn.gelu(gate, approximate=True)
         else:
-            gate = nn.gelu(gate, approximate=self.activation == 'geglu')
-        expert_out = checkpoint_name(self.down_proj(gate * up, group_sizes), 'down_proj')
+            gate = exact_gelu(gate)
+        return checkpoint_name(linear(gate * up, kernels[2]), 'down_proj')
 
-        per_slot = expert_out[jnp.argsort(order)].reshape(*indices.shape, -1)
+    def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         if self.scale_inputs:
-            return jnp.sum(per_slot.astype(jnp.float32), axis=-2).astype(expert_out.dtype)
-        combined = jnp.einsum(
-            '...ke,...k->...e', per_slot.astype(jnp.float32),
-            weights.astype(jnp.float32), precision=self.precision)
-        return combined.astype(expert_out.dtype)
+            return jnp.sum(slots.astype(jnp.float32), axis=-2).astype(slots.dtype)
+        return jnp.einsum('...ke,...k->...e', slots.astype(jnp.float32),
+                          weights.astype(jnp.float32), precision=self.precision).astype(slots.dtype)
+
+    def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
+        """`x` is `[..., embed]` and `weights` and `indices` are `[..., k]`."""
+        if weights.shape != indices.shape or indices.shape[:-1] != x.shape[:-1]:
+            raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
+        kernels = (self.gate_proj.kernel, self.up_proj.kernel, self.down_proj.kernel)
+        tokens = x.reshape(-1, x.shape[-1])
+        mesh = jax.sharding.get_abstract_mesh()
+        shards = mesh.shape.get(EXPERT_AXIS, 1)
+        if self.dispatch == 'exchange' and not self.is_initializing() and (
+                shards <= 1 or self.num_experts % shards):
+            raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
+                             "that divides num_experts")
+        if self.dispatch == 'exchange' and not self.is_initializing() and tokens.shape[0]:
+            # Padding is only for a token axis the mesh cannot divide. The
+            # sentinel expert is excluded from send counts, never dispatched.
+            padding = -tokens.shape[0] % shards
+            result = self._exchange(
+                jnp.pad(tokens, ((0, padding), (0, 0))),
+                jnp.pad(weights.reshape(-1, indices.shape[-1]), ((0, padding), (0, 0))),
+                jnp.pad(indices.reshape(-1, indices.shape[-1]), ((0, padding), (0, 0)),
+                        constant_values=self.num_experts), kernels)
+            return result[:tokens.shape[0]].reshape(x.shape)
+
+        experts = indices.ravel()
+        order = jnp.argsort(experts)
+        sizes = jnp.bincount(experts, length=self.num_experts)
+        grouped = tokens[order // indices.shape[-1]]
+        if self.scale_inputs:
+            grouped = grouped * weights.ravel()[order][:, None].astype(grouped.dtype)
+        projected = self._project(grouped, sizes, kernels)
+        return self._combine(projected[jnp.argsort(order)].reshape(
+            *indices.shape, self.out_features), weights)
+
+    def _exchange(self, tokens: jax.Array, weights: jax.Array, indices: jax.Array,
+                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+        """Stream destination buckets through fixed-size all-to-alls.
+
+        With S expert shards and L local routing slots, a round carries
+        S * ceil(L/S) rows. At most S rounds drain even a bucket holding all
+        L slots. Bucket sizes determine the actual round count collectively;
+        capacity bounds each message, never the number of accepted tokens.
+        The return exchange restores slots before the original top-k sum.
+        """
+        mesh = jax.sharding.get_abstract_mesh()
+        shards = mesh.shape[EXPERT_AXIS]
+
+        @functools.partial(jax.shard_map, mesh=mesh, axis_names={EXPERT_AXIS},
+                           in_specs=(P(EXPERT_AXIS), P(EXPERT_AXIS), P(EXPERT_AXIS),
+                                     (P(EXPERT_AXIS),) * 3), out_specs=P(EXPERT_AXIS))
+        def local(tokens: jax.Array, weights: jax.Array, indices: jax.Array,
+                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+            slots, per_shard = indices.size, kernels[0].shape[0]
+            order = jnp.argsort(indices.ravel())
+            experts = indices.ravel()[order]
+            grouped = tokens[order // indices.shape[-1]]
+            if self.scale_inputs:
+                grouped = grouped * weights.ravel()[order][:, None].astype(grouped.dtype)
+            sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
+            starts = jnp.cumsum(sizes) - sizes
+            capacity = (slots + shards - 1) // shards
+            rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
+            lanes = jnp.arange(capacity)
+            dtype = jnp.dtype(self.dtype) if self.dtype is not None else jnp.result_type(tokens, *kernels)
+
+            @jax.checkpoint
+            def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
+                offsets = iteration * capacity + lanes
+                valid = offsets[None, :] < sizes[:, None]
+                addresses = starts[:, None] + offsets
+                send = grouped[jnp.minimum(addresses, slots - 1)]
+                send = jnp.where(valid[..., None], send, 0)
+                ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
+                                per_shard)
+                received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
+                    -1, tokens.shape[-1])
+                received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
+                permutation = jnp.argsort(received_ids)
+                groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
+                computed = self._project(received[permutation], groups, kernels)[
+                    jnp.argsort(permutation)]
+                computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
+                returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
+                                             EXPERT_AXIS, 0, 0, tiled=True)
+                # Only padding gets an out-of-bounds scatter address. All
+                # real slots have one unique writer across the rounds.
+                return returned, jnp.where(valid, addresses, slots)
+
+            def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
+                def active(out: jax.Array) -> jax.Array:
+                    returned, addresses = exchange_round(iteration)
+                    return out.at[addresses].set(returned, mode='drop')
+
+                return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
+
+            initial = jax.lax.pcast(jnp.zeros((slots, self.out_features), dtype),
+                                    EXPERT_AXIS, to='varying')
+            result, _ = jax.lax.scan(step, initial, jnp.arange(shards))
+            return self._combine(result[jnp.argsort(order)].reshape(
+                *indices.shape, self.out_features), weights)
+
+        return local(tokens, weights, indices, kernels)
 
 
 @logical_axes({
@@ -473,6 +672,7 @@ class SparseMLP(nn.Module):
     out_features: int
     activation: str = 'swiglu'
     implementation: str = 'xla'
+    dispatch: str = 'global'
     score_function: str = 'softmax'
     normalize_weights: bool = True
     routed_scaling_factor: float = 1.0
@@ -500,7 +700,8 @@ class SparseMLP(nn.Module):
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,
-            implementation=self.implementation, swiglu_limit=self.swiglu_limit,
+            implementation=self.implementation, dispatch=self.dispatch,
+            swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.shared is not None:
