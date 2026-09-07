@@ -12,10 +12,11 @@ FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 
 
 def test_biased_interleaved_experts_match_reference():
-    """fp32 atol 1.6e-4: twice the fixture's own 7.8e-5 deviation from the float64
-    equation, the most two fp32 evaluations of it can disagree. Observed 3.4e-5
-    locally and 6.1e-5 on the CI runner, with gates above the clamp and both
-    expert biases in play. Dropping the down bias moves the output by 2.57."""
+    """The fp32 budget covers measured fixture and implementation roundoff.
+    The fixture differs from the float64 equation by up to 7.8e-5; measured
+    cross-implementation differences are 3.4e-5 locally and 6.1e-5 on CI.
+    Dropping the down bias moves the output by 2.57.
+    """
     with np.load(FIXTURES / "moe.npz") as fixture:
         arrays = {name: jnp.asarray(value) for name, value in fixture.items()}
     params = {

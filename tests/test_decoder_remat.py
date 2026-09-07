@@ -12,8 +12,9 @@ identical.
 
 The named policies recompute the same block from more or fewer saved
 residuals: against `full`, on the dense shape with MTP and dropout, the
-loss is bitwise identical and the gradients differ by at most 8.4e-7 over
-the eighteen policy/scan cases (CPU, JAX 0.11.1), from the saved values
+loss is bitwise identical on CPU and differs by one float32 ulp (4.8e-7)
+on an RTX 4080, and the gradients differ by at most 8.4e-7 over the
+eighteen policy/scan cases (CPU, JAX 0.11.1), from the saved values
 entering fusions the recomputed ones do not. The offloaded policies run on
 the CPU backend, whose lowering of a host transfer is the identity, so
 their residuals are typed in host memory space and compile to the same
@@ -249,9 +250,15 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
     (loss, aux), grads = gradient_step(full, variables, key)
     (other_loss, other_aux), other_grads = gradient_step(
         full.clone(remat=policy), variables, key)
-    assert float(loss) == float(other_loss)
+    assert abs(float(loss - other_loss)) < 2e-6
     assert difference(grads, other_grads) < 2e-6
-    assert difference(aux.metrics, other_aux.metrics) < 1e-5
+    for name, value in aux.metrics.items():
+        other = other_aux.metrics[name]
+        if name == "perplexity":
+            # Compare in cross-entropy units; exp magnifies the same rounding.
+            np.testing.assert_allclose(np.log(value), np.log(other), atol=2e-6, rtol=0)
+        else:
+            np.testing.assert_allclose(value, other, atol=1e-5, rtol=0)
 
 
 def residuals(model, variables, capsys):
