@@ -841,7 +841,7 @@ def test_fit_end_to_end_with_validation_and_metrics(tmp_path, fsdp_size):
     tracker = RecordingTracker()
     trainer = make_trainer(tmp_path, fsdp=fsdp_size, tracker=tracker)
     state = trainer.fit(Data(batches, val=val_stream), steps=2, log_every=1, eval_every=1,
-                        metrics=(PeakToPeak(seen),))
+                        metrics=(PeakToPeak(seen),), preview=True)
 
     assert int(state.step) == 2
     sharded = [x for x in jax.tree.leaves(state.ema) if 'fsdp' in str(x.sharding.spec)]
