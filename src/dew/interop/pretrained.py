@@ -47,12 +47,18 @@ class Processor:
     record: Mapping[str, object]
 
     def __call__(self, text: str | Sequence[str], *, images: object | None = None) -> ModelInputs:
+        import torch
+
         arguments: dict[str, object] = {
             "text": text if isinstance(text, str) else list(text),
-            "padding": True, "return_tensors": "np"}
+            "padding": True, "return_tensors": "pt"}
         if images is not None:
             arguments["images"] = images
-        return self.from_hf(self.reference(**arguments))
+        values = self.reference(**arguments)
+        # Llama 4 normalizes pixels in bfloat16 as its original implementation
+        # does; widening to float32 is exact.
+        return self.from_hf({name: (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+                             for name, value in values.items()})
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
