@@ -8,7 +8,7 @@ The fixtures it writes are what CI compares against.
 Set up the venv and run it:
 
     uv venv /tmp/hfref --python 3.12
-    uv pip install --python /tmp/hfref/bin/python torch \
+    uv pip install --python /tmp/hfref/bin/python torch torchvision \
         --index-url https://download.pytorch.org/whl/cpu
     uv pip install --python /tmp/hfref/bin/python transformers safetensors \
         sentencepiece numpy
@@ -878,15 +878,11 @@ def qwen35_patchify(images: np.ndarray, patch_size: int, merge_size: int,
     """Still images into flat tokens the way the Qwen processor lays them:
     spatial patches in merge-block order, each frame repeated along time
     (image_processing_qwen2_vl.py, patchify)."""
-    batch, channels, height, width = images.shape
-    grid = height // patch_size
-    blocks = grid // merge_size
-    patches = images.reshape(batch, channels, blocks, merge_size, patch_size,
-                             blocks, merge_size, patch_size)
-    patches = patches.transpose(0, 2, 5, 3, 6, 1, 4, 7)
-    flat = patches.reshape(batch, grid * grid, channels * patch_size * patch_size)
-    return np.tile(flat[:, :, None, :], (1, 1, temporal_patch_size, 1)).reshape(
-        batch * grid * grid, channels * temporal_patch_size * patch_size * patch_size)
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    processor = Qwen2VLImageProcessor()
+    patches, _, _ = processor.patchify(torch.from_numpy(images), patch_size, merge_size, temporal_patch_size)
+    return patches.reshape(-1, patches.shape[-1]).numpy()
 
 
 def qwen35_vision_tiny_system(seed: int = 1234):
