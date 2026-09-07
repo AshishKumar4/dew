@@ -14,7 +14,7 @@ unlike the released trainer's earlier float32 score conversion.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeAlias
 
@@ -101,19 +101,20 @@ class FlowGRPOObjective(DiffusionObjective):
         self.adv_clip_max = adv_clip_max
         self.pretrained = pretrained
 
-    def _held_variables(self) -> dict:
-        held = super()._held_variables()
+    def held_variables(self) -> dict:
+        held = super().held_variables()
         if self.pretrained is not None:
             held["pretrained"] = self.pretrained
         return held
 
-    def _initialize(self, held, key: jax.Array) -> dict[str, object]:
+    def init(self, key: jax.Array, variables: Mapping[str, object] | None = None) -> dict[str, object]:
+        held = self.held_variables() if variables is None else variables
         if "pretrained" not in held:
-            return super()._initialize(held, key)
-        variables = {**held["pretrained"], "encoders": held["encoders"]}
+            return super().init(key, held)
+        state = {**held["pretrained"], "encoders": held["encoders"]}
         if "autoencoder" in held:
-            variables["autoencoder"] = held["autoencoder"]
-        return variables
+            state["autoencoder"] = held["autoencoder"]
+        return state
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:
         tokens = {keyword: batch[condition.field]

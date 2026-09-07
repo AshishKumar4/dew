@@ -153,8 +153,9 @@ def test_a_held_tree_stays_data_through_an_objectives_own_jit():
     from dew.objectives.lm import LMObjective
 
     class Nested(LMObjective):
-        def _initialize(self, pretrained, key):
-            return jax.jit(lambda held: LMObjective._initialize(self, held, key))(pretrained)
+        def init(self, key, variables=None):
+            return jax.jit(lambda held: LMObjective.init(self, key, held))(
+                self.pretrained if variables is None else variables)
 
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
@@ -162,6 +163,29 @@ def test_a_held_tree_stays_data_through_an_objectives_own_jit():
 
     assert captured_bytes(lambda initializer, key: initializer(key),
                           objective.initializer, jax.random.key(0)) == 0
+
+
+def test_the_initializer_dispatches_through_the_public_init():
+    """The trainer reaches an objective's initialization the way any caller
+    does. An override of `init` decides what the state holds, whether it is
+    called directly or through the initializer the trainer compiles."""
+    from dew.objectives.lm import LMObjective
+
+    class Zeroed(LMObjective):
+        def init(self, key, variables=None):
+            return jax.tree.map(jnp.zeros_like, LMObjective.init(self, key, variables))
+
+    tiny = lm_objective()
+    weights = jax.jit(tiny.init)(jax.random.key(0))
+    objective = Zeroed(tiny.model, seq_len=4, pretrained=weights)
+    key = jax.random.key(0)
+
+    for tree in (objective.init(key), objective.initializer(key),
+                 jax.jit(objective.initializer)(key),
+                 jax.jit(lambda i, k: i(k))(objective.initializer, key)):
+        nonzero = sum(int(np.count_nonzero(np.asarray(leaf)))
+                      for leaf in jax.tree.leaves(tree))
+        assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
 
 
 def test_the_initializer_and_init_return_the_same_tree():
@@ -175,3 +199,15 @@ def test_the_initializer_and_init_return_the_same_tree():
         assert jax.tree.structure(direct) == jax.tree.structure(through)
         for left, right in zip(jax.tree.leaves(direct), jax.tree.leaves(through)):
             np.testing.assert_array_equal(left, right)
+
+
+def test_the_held_variables_hook_is_what_the_initializer_binds():
+    """`held_variables` is the public hook the boundary reads, so an
+    objective that reports nothing binds nothing and one that reports a tree
+    binds exactly that tree."""
+    tiny = lm_objective()
+    weights = jax.jit(tiny.init)(jax.random.key(0))
+
+    assert tiny.held_variables() is None
+    holding = lm_objective(pretrained=weights)
+    assert held_bytes(holding.initializer) == held_bytes(holding.held_variables())
