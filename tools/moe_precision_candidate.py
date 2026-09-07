@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Opt-in precision-bugfix investigation; production defaults are unchanged.
 
-Proposed shared contract: grouped projections use the configured activation
-dtype, accumulate master-kernel cotangents in the original parameter dtype,
-and return activation cotangents at their declared input dtype. Exact GELU
-uses at least fp32 for its transcendental expression and derivative, then
-returns to the activation dtype. Neither contract depends on placement.
+Proposed shared contract: grouped projections use the configured operand
+dtype, accumulate the complete forward contraction at least in fp32, then
+round once to activation dtype. Kernel cotangents accumulate in the original
+master dtype; input cotangents accumulate at least in fp32 before returning
+to their declared input dtype. Higher supplied precision is retained. Exact
+GELU uses at least fp32 for its expression and derivative, then returns to
+activation dtype. These rules do not depend on placement.
 
 Reference environment: JAX/jaxlib 0.11.1, NumPy 2.5.2, ml_dtypes 0.6.0,
 SciPy 1.18.1.
@@ -74,8 +76,10 @@ exact_gelu.defvjp(exact_gelu_forward, exact_gelu_backward)
 def projection(x: jax.Array, kernel: jax.Array, sizes: jax.Array,
                dtype: Dtype | None, implementation: str, precision: PrecisionLike) -> jax.Array:
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
-    return grouped_matmul(x, kernel, sizes, implementation=implementation,
-                          precision=precision, preferred_element_type=x.dtype)
+    accumulated = grouped_matmul(x, kernel, sizes, implementation=implementation,
+                                  precision=precision,
+                                  preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+    return accumulated.astype(x.dtype)
 
 
 def projection_forward(x: jax.Array, kernel: jax.Array, sizes: jax.Array,
@@ -91,7 +95,8 @@ def projection_backward(dtype: Dtype | None, implementation: str, precision: Pre
     x, kernel, sizes = residual
     inputs, matrix = promote_dtype(x, kernel, dtype=dtype)
     dx = grouped_matmul(dy, matrix.swapaxes(1, 2), sizes, implementation=implementation,
-                        precision=precision, preferred_element_type=inputs.dtype).astype(x.dtype)
+                        precision=precision,
+                        preferred_element_type=jnp.promote_types(x.dtype, jnp.float32)).astype(x.dtype)
     dk = jax.lax.ragged_dot_general(
         inputs, dy, sizes,
         jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ()),
@@ -151,37 +156,68 @@ def check_activation() -> None:
 
 def check_projection() -> None:
     rng = np.random.default_rng(271)
-    x = rng.normal(size=(24, 8)).astype(np.float32)
-    kernel = rng.normal(size=(8, 8, 16)).astype(np.float32)
-    dy = rng.normal(size=(24, 16)).astype(np.float32)
+    random_case = ('random', rng.normal(size=(24, 16)).astype(np.float32),
+                   rng.normal(size=(8, 16, 16)).astype(np.float32),
+                   rng.normal(size=(24, 16)).astype(np.float32))
+    forward_kernel = np.zeros((8, 16, 8), np.float32)
+    forward_kernel[:, 0, :] = 1
+    forward_kernel[:, (1, 8), :] = 2**-8
+    input_kernel = np.zeros((8, 8, 16), np.float32)
+    input_kernel[:, :, 0] = 1
+    input_kernel[:, :, (1, 8)] = 2**-8
+    cases = (random_case,
+             ('forward-round-once', np.ones((24, 16), np.float32), forward_kernel,
+              np.ones((24, 8), np.float32)),
+             ('input-gradient-round-once', np.ones((24, 8), np.float32), input_kernel,
+              np.ones((24, 16), np.float32)))
     sizes = np.full(8, 3, np.int32)
-    dk_oracle = np.stack([bf16(x)[3*e:3*(e+1)].T @ bf16(dy)[3*e:3*(e+1)] for e in range(8)])
-    dx_oracle = bf16(np.concatenate([bf16(dy)[3*e:3*(e+1)] @ bf16(kernel)[e].T
-                                    for e in range(8)])).astype(np.float32)
 
     def loss(kernel, x, dy, sizes):
         projected = jnp.asarray(projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
-        return jnp.sum(projected.astype(jnp.float32) * dy)
+        return jnp.sum(projected.astype(jnp.float32) * dy), projected
 
-    for master in (jnp.float32, jnp.float64):
-        arrays = (jnp.asarray(kernel, master), jnp.asarray(x, jnp.bfloat16),
-                  jnp.asarray(dy), jnp.asarray(sizes))
-        for expert, fsdp in ((2, 4), (4, 2), (8, 1)):
-            mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
-            kernels = NamedSharding(mesh, P('expert', None, 'fsdp'))
-            tokens = NamedSharding(mesh, P(('expert', 'fsdp')))
-            replicated = NamedSharding(mesh, P())
-            arguments = tuple(jax.device_put(value, spec) for value, spec in zip(
-                arrays, (kernels, tokens, tokens, replicated), strict=True))
-            with jax.set_mesh(mesh):
-                for spec, placement in ((kernels, 'placed'), (replicated, 'replicated-output')):
-                    dk, dx = jax.jit(jax.grad(loss, (0, 1)), out_shardings=(spec, tokens))(*arguments)
-                    assert dk.dtype == master and dx.dtype == jnp.bfloat16
-                    np.testing.assert_allclose(dk, dk_oracle, atol=3e-5, rtol=3e-5)
-                    np.testing.assert_allclose(dx.astype(jnp.float32), dx_oracle, atol=3e-5, rtol=3e-5)
-                    print(json.dumps({'projection': f'{jnp.dtype(master).name}/expert{expert}/fsdp{fsdp}/{placement}',
-                                      'kernel_oracle_error': float(np.max(abs(np.asarray(dk) - dk_oracle))),
-                                      'input_oracle_error': float(np.max(abs(np.asarray(dx.astype(jnp.float32)) - dx_oracle)))}), flush=True)
+    for case, x, kernel, dy in cases:
+        forward_oracle = bf16(np.concatenate([
+            bf16(x)[3*e:3*(e+1)] @ bf16(kernel)[e] for e in range(8)]))
+        dk_oracle = np.stack([bf16(x)[3*e:3*(e+1)].T @ bf16(dy)[3*e:3*(e+1)]
+                              for e in range(8)])
+        dx_sum = np.concatenate([bf16(dy)[3*e:3*(e+1)] @ bf16(kernel)[e].T for e in range(8)])
+        dtype_cases = ((jnp.float32, jnp.bfloat16),)
+        if case == 'random':
+            dtype_cases += ((jnp.float64, jnp.bfloat16), (jnp.float32, jnp.float32),
+                            (jnp.float64, jnp.float64))
+        for master, input_dtype in dtype_cases:
+            dx_oracle = dx_sum.astype(input_dtype).astype(np.float64)
+            arrays = (jnp.asarray(kernel, master), jnp.asarray(x, input_dtype),
+                      jnp.asarray(dy), jnp.asarray(sizes))
+            for expert, fsdp in ((2, 4), (4, 2), (8, 1)):
+                mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
+                replicated = NamedSharding(mesh, P())
+                for orientation in ('rows', 'columns'):
+                    rows = orientation == 'rows'
+                    kernels = NamedSharding(mesh, P('expert', 'fsdp', None) if rows
+                                            else P('expert', None, 'fsdp'))
+                    inputs = NamedSharding(mesh, P('expert', 'fsdp') if rows else P('expert'))
+                    outputs = NamedSharding(mesh, P('expert') if rows else P('expert', 'fsdp'))
+                    arguments = tuple(jax.device_put(value, spec) for value, spec in zip(
+                        arrays, (kernels, inputs, outputs, replicated), strict=True))
+                    with jax.set_mesh(mesh):
+                        for spec, placement in ((kernels, 'placed'), (replicated, 'replicated-gradient')):
+                            (_, y), (dk, dx) = jax.jit(
+                                jax.value_and_grad(loss, (0, 1), has_aux=True),
+                                out_shardings=((replicated, outputs), (spec, inputs)))(*arguments)
+                            assert dk.dtype == master and dx.dtype == input_dtype
+                            actual = (np.asarray(y).astype(np.float64), np.asarray(dk),
+                                      np.asarray(dx).astype(np.float64))
+                            expected = (forward_oracle, dk_oracle, dx_oracle)
+                            for a, b in zip(actual, expected, strict=True):
+                                np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-5)
+                            print(json.dumps({
+                                'projection': f'{case}/{jnp.dtype(master).name}/{jnp.dtype(input_dtype).name}'
+                                              f'/expert{expert}/fsdp{fsdp}/{orientation}/{placement}',
+                                'forward_oracle_error': float(np.max(abs(actual[0] - expected[0]))),
+                                'kernel_oracle_error': float(np.max(abs(actual[1] - expected[1]))),
+                                'input_oracle_error': float(np.max(abs(actual[2] - expected[2])))}), flush=True)
 
 
 def place(value: jax.Array, sharding: NamedSharding) -> jax.Array:
