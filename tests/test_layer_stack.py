@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.interop.hf_decoders import load_pretrained_decoder, translate_config
+from dew.interop import load_pretrained
+from dew.interop.hf_decoders import translate_config
 
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
@@ -39,10 +40,11 @@ FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 def fixture_pair(name, **overrides):
     """The fixture's model and its scanned twin, with the fixture's weights."""
     directory = FIXTURES / name
-    model, variables, built = load_pretrained_decoder(
+    pretrained = load_pretrained(
         str(directory), dtype="float32", attention_impl="reference", **overrides)
-    scanned = models.build("causal_transformer", **{**built, "scan_layers": True})
-    return model, scanned, variables, directory
+    scanned = models.build("causal_transformer",
+                           **{**pretrained.model_config, "scan_layers": True})
+    return pretrained.model, scanned, pretrained.variables, directory
 
 
 def paths(tree):

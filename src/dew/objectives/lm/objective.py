@@ -207,7 +207,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         vocabulary, and one is the full pass.
 
         `pretrained` is a variables dict to start from instead of a fresh
-        init, as dew.interop.hf_decoders.load_pretrained_decoder returns for a
+        init, as `dew.interop.load_pretrained(...).variables` is for a
         Hugging Face checkpoint. The trainer takes its whole initial state
         from `init`, so continued pretraining starts here.
 
@@ -275,7 +275,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             if "params" not in self.pretrained:
                 raise ValueError(
                     "pretrained is the variables dict ({'params': ...}) that "
-                    "load_pretrained_decoder and model.init return")
+                    "load_pretrained and model.init return")
             return self.pretrained
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
