@@ -1,0 +1,13 @@
+{
+  "torch": "2.14.0+cpu",
+  "transformers": "5.16.1",
+  "seed": 2718,
+  "prompts": [
+    "listen <audio> ok",
+    "say <audio> again ok"
+  ],
+  "sampling_rate": 16000,
+  "backend": "cpu",
+  "dtype": "float32",
+  "parameters": 2287364
+}

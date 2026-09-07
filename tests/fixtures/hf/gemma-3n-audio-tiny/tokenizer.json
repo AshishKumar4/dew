@@ -1,0 +1,205 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": {
+    "strategy": "BatchLongest",
+    "direction": "Left",
+    "pad_to_multiple_of": null,
+    "pad_id": 0,
+    "pad_type_id": 0,
+    "pad_token": "<pad>"
+  },
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<pad>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "</s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "<s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<boi>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "<boa>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 6,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 48,
+      "content": "<eoi>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 49,
+      "content": "<image>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 56,
+      "content": "<eoa>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 57,
+      "content": "<audio>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "WhitespaceSplit"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "</s>": 1,
+      "<s>": 2,
+      "<boi>": 3,
+      "<boa>": 4,
+      "listen": 5,
+      "<unk>": 6,
+      "ok": 7,
+      "say": 8,
+      "again": 9,
+      "tok10": 10,
+      "tok11": 11,
+      "tok12": 12,
+      "tok13": 13,
+      "tok14": 14,
+      "tok15": 15,
+      "tok16": 16,
+      "tok17": 17,
+      "tok18": 18,
+      "tok19": 19,
+      "tok20": 20,
+      "tok21": 21,
+      "tok22": 22,
+      "tok23": 23,
+      "tok24": 24,
+      "tok25": 25,
+      "tok26": 26,
+      "tok27": 27,
+      "tok28": 28,
+      "tok29": 29,
+      "tok30": 30,
+      "tok31": 31,
+      "tok32": 32,
+      "tok33": 33,
+      "tok34": 34,
+      "tok35": 35,
+      "tok36": 36,
+      "tok37": 37,
+      "tok38": 38,
+      "tok39": 39,
+      "tok40": 40,
+      "tok41": 41,
+      "tok42": 42,
+      "tok43": 43,
+      "tok44": 44,
+      "tok45": 45,
+      "tok46": 46,
+      "tok47": 47,
+      "<eoi>": 48,
+      "<image>": 49,
+      "<|video|>": 50,
+      "tok51": 51,
+      "tok52": 52,
+      "tok53": 53,
+      "tok54": 54,
+      "tok55": 55,
+      "<eoa>": 56,
+      "<audio>": 57,
+      "tok58": 58,
+      "tok59": 59,
+      "tok60": 60,
+      "tok61": 61,
+      "tok62": 62,
+      "tok63": 63
+    },
+    "unk_token": "<unk>"
+  }
+}
