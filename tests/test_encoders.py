@@ -98,3 +98,16 @@ def test_two_conditions_cannot_share_one_batch_field():
     }
     with pytest.raises(ValueError, match="field"):
         InputSpec(sample=Field("image", (8, 8, 3)), conditions=conditions)
+
+
+def test_condition_roundtrip_preserves_nondefault_character_embeddings():
+    from dew.inputs import CharTable
+
+    condition = Condition(CharTable.from_pretrained(
+        seed=7, dtype="bfloat16", tokens=4, features=2, vocab=8))
+    restored = Condition.from_json(condition.to_json())
+    contexts = [value.encoder.encode(value.encoder.params, value.encoder.tokenize(["ab", ""]))
+                for value in (condition, restored)]
+    np.testing.assert_array_equal(contexts[0].hidden, contexts[1].hidden)
+    np.testing.assert_array_equal(contexts[0].mask, contexts[1].mask)
+    assert contexts[1].hidden.dtype == jnp.bfloat16

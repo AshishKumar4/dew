@@ -2,7 +2,7 @@
 
 import json
 import os
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 import dataclasses
 
 import jax.numpy as jnp
@@ -127,6 +127,46 @@ def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
 # --------------------------------------------------------------------------
 # A record builds a value
 # --------------------------------------------------------------------------
+if TYPE_CHECKING:
+    class Unavailable:
+        pass
+
+
+@dataclasses.dataclass(frozen=True)
+class PartialSpec:
+    kernel: "Kind"
+    extra: "Unavailable | None" = None
+
+    def frequency(self):
+        return self.kernel.rope_theta / self.kernel.window
+
+
+def test_an_unresolved_dependency_type_does_not_hide_a_buildable_field():
+    registry = Registry("partial")
+    registry("partial")(PartialSpec)
+    built = registry.build("partial", kernel={"window": 4, "rope_theta": 20.0})
+    assert built.frequency() == 5.0
+
+
+@dataclasses.dataclass(frozen=True)
+class MixedSpec:
+    kernel: "Kind | dict[str, object]"
+
+    def frequency(self):
+        if isinstance(self.kernel, dict):
+            if self.kernel["dtype"] != "vendor_float":
+                raise ValueError("the opaque kernel's dtype changed")
+            return 2 * self.kernel["gain"]
+        return self.kernel.rope_theta / self.kernel.window
+
+
+def test_a_multi_union_leaves_the_selected_opaque_record_for_its_consumer():
+    registry = Registry("mixed")
+    registry("mixed")(MixedSpec)
+    built = registry.build("mixed", kernel={"gain": 7, "dtype": "vendor_float"})
+    assert built.frequency() == 14
+
+
 
 @dataclasses.dataclass(frozen=True)
 class Kind:
@@ -264,3 +304,97 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
                     ("write", "gs://dew-runs/flowers/run.json")]
     assert RunConfig.load("gs://dew-runs/flowers") == config
     assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")
+
+
+def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
+    import jax
+    from dew.nn.backbones.causal_transformer import LayerKind
+    from dew.nn.mixers import AttentionMixer
+    from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+
+    mixer = GatedDeltaNetMixer(
+        linear_num_key_heads=1, linear_num_value_heads=1,
+        linear_key_head_dim=4, linear_value_head_dim=4, linear_conv_kernel_dim=2)
+    run = RunConfig(model=ModelConfig("causal_transformer", {
+        "vocab_size": 8, "emb_features": 4, "num_layers": 1, "num_heads": 1,
+        "max_seq_len": 8, "mlp_features": 8, "mixer": AttentionMixer(),
+        "kinds": {"full_attention": LayerKind(mixer=mixer)},
+    }, dtype="float32"))
+    model = run.model.build()
+    tokens = jnp.asarray([[0, 1, 2, 3]], jnp.int32)
+    variables = model.init(jax.random.key(1), tokens)
+    expected = model.apply(variables, tokens)
+    run.save(str(tmp_path))
+    restored = RunConfig.load(str(tmp_path)).model.build()
+    assert jnp.array_equal(restored.apply(variables, tokens), expected)
+
+
+def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
+    import jax
+    from dew.nn.vision import GemmaProjector, SiglipVision, projector_from_record, tower_from_record
+
+    @dataclasses.dataclass(frozen=True)
+    class VisionRun(RunConfig):
+        vision: dict[str, object] = dataclasses.field(default_factory=lambda: {
+            "tower": SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1,
+                                   num_heads=1, image_size=2, patch_size=1),
+            "projector": GemmaProjector(vision_width=4, text_width=2,
+                                         patches_per_side=2, tokens_per_side=1),
+        })
+
+    run = VisionRun()
+    tower, projector = run.vision["tower"].build(), run.vision["projector"].build()
+    pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 3, 2, 2)
+    tower_params = tower.init(jax.random.key(2), pixels)
+    encoded = tower.apply(tower_params, pixels)
+    projector_params = projector.init(jax.random.key(3), encoded)
+    expected = projector.apply(projector_params, encoded)
+    run.save(str(tmp_path))
+    restored = VisionRun.load(str(tmp_path))
+    actual = projector_from_record(restored.vision["projector"]).build().apply(
+        projector_params, tower_from_record(restored.vision["tower"]).build().apply(
+            tower_params, pixels))
+    assert jnp.array_equal(actual, expected)
+
+
+def test_a_bare_tuple_record_builds_a_jitted_residual_block():
+    import jax
+    from dew.nn.blocks import ResidualBlock
+
+    registry = Registry("block")
+    registry("residual")(ResidualBlock)
+    model = registry.build("residual", features=2, norm_groups=0, kernel_size=[1, 3])
+    pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 2, 3, 2)
+    time = jnp.ones((1, 2))
+    variables = model.init(jax.random.key(4), pixels, time)
+    expected = ResidualBlock(features=2, norm_groups=0, kernel_size=(1, 3)).apply(
+        variables, pixels, time)
+    actual = jax.jit(lambda module, x: module.apply(variables, x, time), static_argnums=0)(
+        model, pixels)
+    assert jnp.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_deferred_annotations_keep_inherited_buildable_fields(monkeypatch):
+    import sys
+    import types
+
+    module = types.ModuleType("dew_optional_annotation_case")
+    module.__dict__.update(dataclasses=dataclasses, Kind=Kind)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    future = "from __future__ import annotations\n" if sys.version_info < (3, 14) else ""
+    exec(future + """
+@dataclasses.dataclass(frozen=True)
+class Base:
+    kernel: Kind
+
+@dataclasses.dataclass(frozen=True)
+class Spec(Base):
+    extra: Unavailable | None = None
+
+    def frequency(self):
+        return self.kernel.rope_theta / self.kernel.window
+""", module.__dict__)
+    registry = Registry("deferred")
+    registry("spec")(module.Spec)
+    built = registry.build("spec", kernel={"window": 4, "rope_theta": 20.0})
+    assert built.frequency() == 5.0

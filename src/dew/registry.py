@@ -1,7 +1,7 @@
 """Names for the things a run is made of.
 
-One `Registry` per kind: `models`, `presets`, `samplers`, `datasets`,
-`encoders`, `metrics`, `objectives`. A registry is a decorator, a mapping and
+One Registry per kind, including model components such as mixers, towers and
+projectors. A registry is a decorator, a mapping and
 an attribute view over the same table, so `models["simple_dit"]`,
 `models.SimpleDiT` and the class are one object. A name or a field the table
 does not know raises.
@@ -14,18 +14,22 @@ imports none of them.
 from __future__ import annotations
 
 import dataclasses
+import sys
 import types
 import typing
 from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
 
 import jax.numpy as jnp
+from typing_extensions import Format, get_annotations
 
 if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.data.dataset import DatasetSpec
     from dew.diffusion.presets import Preset
+    from dew.nn.mixers import MixerBase
+    from dew.nn.vision import ProjectorBase, TowerBase
     from dew.inputs.encoders import ConditionEncoder
     from dew.objectives.base import Metric, Objective
     from dew.sampling.solvers import Solver
@@ -37,8 +41,9 @@ M = TypeVar("M", bound=Callable[..., Any])
 class Registry(Mapping[str, T], Generic[T]):
     """Names for one kind of thing: a decorator, a mapping and an attribute view."""
 
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
+        self.record = record
         # A decorator has no base class to test the member against, and it
         # hands back the class it decorated so a caller's checker keeps the
         # concrete type (`DiffusionObjective`, not `Objective`). The table is
@@ -89,7 +94,7 @@ class Registry(Mapping[str, T], Generic[T]):
     def __repr__(self) -> str:
         return f"Registry({self.kind!r}, {sorted(self._members)})"
 
-    def name_of(self, member: T) -> str:
+    def name_of(self, member: object) -> str:
         """The name a member was registered under."""
         for name, held in self._members.items():
             if held is member:
@@ -135,40 +140,31 @@ def _describe(member: Any) -> str:
     return getattr(member, "__name__", repr(member))
 
 
-def _declared_type(member: Any, field: str) -> Any:
-    """The annotation of `member`'s `field`, or None when it cannot be read."""
-    try:
-        hints = typing.get_type_hints(member)
-    except NameError:
-        # An annotation naming something imported only under TYPE_CHECKING
-        # cannot be resolved here; such a field takes its value as given.
-        return None
-    return hints.get(field)
+def _declared_type(member: type, field: str) -> object:
+    """Resolve one field without evaluating unrelated dependency annotations."""
+    for owner in member.__mro__:
+        annotations = get_annotations(owner, format=Format.FORWARDREF)
+        if field not in annotations:
+            continue
+        selected = types.SimpleNamespace(__annotations__={field: annotations[field]})
+        try:
+            return typing.get_type_hints(
+                selected, globalns=vars(sys.modules[owner.__module__]),
+                localns=dict(vars(owner)))[field]
+        except NameError:
+            # Only this field's unavailable dependency leaves its value opaque.
+            return None
+    return None
 
 
-def _value_type(annotation: Any) -> Any:
-    """The value class `annotation` asks for, looking through Optional only.
-
-    A container of values is not itself a value, so `Mapping[str, LayerKind]`
-    answers None and its entries are walked instead. A union of several
-    values names no single one either (a mixer's `{"kind": ...}` record
-    stays a record for the owner to dispatch on its kind), so only a union
-    with one value answers it, as `Optional[Mixture]` does. This is
-    the same opaque treatment `entry_types` and `dew.config`'s record rebuild
-    give a multi-member union.
-    """
-    if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
-        return annotation
-    if typing.get_origin(annotation) not in (Union, types.UnionType):
-        return None
-    members = [argument for argument in typing.get_args(annotation)
-               if argument is not type(None)
-               and dataclasses.is_dataclass(argument)
-               and isinstance(argument, type)]
-    return members[0] if len(members) == 1 else None
+def _value_type(annotation: object) -> type | None:
+    """A dataclass type behind an Optional, but not a multi-member union."""
+    annotation = _unwrapped(annotation)
+    return (annotation if isinstance(annotation, type) and dataclasses.is_dataclass(annotation)
+            else None)
 
 
-def _unwrapped(annotation: Any) -> Any:
+def _unwrapped(annotation: object) -> object:
     """`annotation` with an Optional looked through; a union of several
     members says nothing about its entries and answers None."""
     if typing.get_origin(annotation) not in (Union, types.UnionType):
@@ -192,11 +188,12 @@ def entry_types(annotation: Any, count: int) -> list[Any]:
     return [element] * count
 
 
-def wants_tuple(annotation: Any) -> bool:
+def wants_tuple(annotation: object) -> bool:
     """Whether a container annotation declares a tuple, which a record's
     list becomes; JSON has no tuple, and a frozen value with a list in a
     tuple field is unhashable and unequal to the one that was written."""
-    return typing.get_origin(_unwrapped(annotation)) is tuple
+    annotation = _unwrapped(annotation)
+    return annotation is tuple or typing.get_origin(annotation) is tuple
 
 
 def from_record(annotation: Any, value: Any) -> Any:
@@ -207,6 +204,8 @@ def from_record(annotation: Any, value: Any) -> Any:
     build their values too, and a model config is a dict from the command
     line all the way to the module.
     """
+    if typing.get_origin(annotation) in (Union, types.UnionType) and _unwrapped(annotation) is None:
+        return value
     if isinstance(value, Mapping):
         held = _value_type(annotation)
         if held is None:
@@ -302,8 +301,17 @@ datasets: Registry[type[DatasetSpec]] = Registry("dataset")
 encoders: Registry[type[ConditionEncoder[Any]]] = Registry("encoder")
 metrics: Registry[Callable[..., Metric]] = Registry("metric")
 objectives: Registry[type[Objective]] = Registry("objective")
+mixers: Registry[type[MixerBase]] = Registry("mixer", record="kind")
+towers: Registry[type[TowerBase]] = Registry("tower", record="kind")
+projectors: Registry[type[ProjectorBase]] = Registry("projector", record="kind")
+
+# Core records nest their fields under a name; model component records inline
+# their fields beside a kind discriminator read by the component's constructor.
+REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
+              mixers, towers, projectors)
 
 __all__ = [
     "Registry", "models", "presets", "samplers", "datasets", "encoders", "metrics", "objectives",
+    "mixers", "towers", "projectors", "REGISTRIES",
     "resolve_dtype", "dtype_name", "with_precision",
 ]
