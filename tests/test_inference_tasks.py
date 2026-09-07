@@ -90,3 +90,57 @@ def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims()
 
     rebound = task.bind(jax.tree.map(lambda leaf: leaf * 0.5, loaded.variables))
     assert not np.array_equal(rebound(prompts, 7, key=jax.random.key(11)).tokens, result.tokens)
+
+
+def test_seed_is_the_key_and_equal_shapes_reuse_one_executable():
+    """`seed=n` draws what `key=jax.random.key(n)` draws; a second request of
+    the same shape and controls, and the same task over other weights,
+    reuse the compiled decode rather than tracing it again."""
+    from dew.sampling import text
+
+    model = decoder("attention")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    task = TextGeneration(model, params, sampling=SAMPLING)
+    prompt = [[1, 2, 4], [5, 6, 7]]
+    compiled = text._compiled(None)
+    before = compiled._cache_size()
+    seeded = task(prompt, 3, seed=11)
+    keyed = task(prompt, 3, key=jax.random.key(11))
+    assert_same_generation(seeded, keyed)
+    assert compiled._cache_size() == before + 1
+    task.bind(jax.tree.map(lambda leaf: leaf * 0.5, params))(prompt, 3, seed=11)
+    task([[9, 8, 7], [1, 1, 1]], 3, seed=0)
+    assert compiled._cache_size() == before + 1
+    task(prompt, 2, seed=11)
+    assert compiled._cache_size() == before + 2
+    with pytest.raises(ValueError, match="exactly one of key and seed"):
+        task(prompt, 3)
+
+
+def test_text_decodes_lazily_through_the_bound_processor():
+    """`Generation.text` is the processor's decoding of each row's valid
+    continuation; without a processor there is nothing to decode with."""
+    from dew.inference import RunProcessor
+
+    class Digits:
+        vocab_size = 13
+        eos_id = 12
+
+        def encode(self, text):
+            return [int(character) for character in text]
+
+        def decode(self, ids):
+            return "".join(str(int(token)) for token in ids)
+
+    model = decoder("attention")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bare = TextGeneration(model, params, sampling=Sampling(temperature=0))
+    with pytest.raises(ValueError, match="no processor"):
+        bare([[1, 2]], 3, seed=0).text
+    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0), max_new_tokens=3)
+    result = task(["12", "5"], seed=0)
+    rows = result.host()
+    assert rows.tokens.shape == (2, 2 + 3) and rows.tokens[1, 0] == 0
+    assert result.text == task.decode(result)
+    assert result.text == tuple("".join(str(token) for token in row[2:2 + length])
+                                for row, length in zip(rows.tokens, rows.lengths))

@@ -484,7 +484,8 @@ class Pretrained:
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
         return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
-                              else _source_sampling(self.config, self.generation_config))
+                              else _source_sampling(self.config, self.generation_config),
+                              max_new_tokens=_budget(self.config, self.generation_config))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -494,7 +495,8 @@ class Pretrained:
         return BlockGeneration(self.model, self.variables,
                                diffusion_gemma.generation_process(self.config, self.generation_config),
                                self.processor, _eos_ids(self.config, self.generation_config),
-                               _pad_id(self.config, self.generation_config))
+                               _pad_id(self.config, self.generation_config),
+                               max_new_tokens=_budget(self.config, self.generation_config))
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with its tokenizer assets."""
@@ -561,6 +563,16 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
         value = 0
     if type(value) is not int or value < 0:
         raise ValueError("pad_token_id must be a nonnegative integer")
+    return value
+
+
+def _budget(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int | None:
+    """The source's own generation budget, when it ships one."""
+    value = _generation_value(config, generation_config, "max_new_tokens")
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError("max_new_tokens must be a nonnegative integer")
     return value
 
 

@@ -43,7 +43,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
+from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables, published,
                                  mean_loss, merge, select)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
@@ -54,6 +54,14 @@ TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
 
 FROZEN = "frozen"
+
+
+def model_variables(params: Variables) -> Variables:
+    """The tree the model applies: a pretrained run's frozen split merged back."""
+    if FROZEN not in params:
+        return params
+    variables = {name: value for name, value in params.items() if name != FROZEN}
+    return {**variables, "params": merge(params[FROZEN], params["params"])}
 """The collection the dense warm-up keeps the main model's weights under.
 The optimizer moves the `params` collection and nothing else, so what the
 warm-up leaves there is the indexer alone; the rest of the tree rides
@@ -448,11 +456,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return merge(variables, pretrained)
 
     def _model_variables(self, params: Variables) -> Variables:
-        """The tree the model applies: the frozen split merged back."""
-        if FROZEN not in params:
-            return params
-        variables = {name: value for name, value in params.items() if name != FROZEN}
-        return {**variables, "params": merge(params[FROZEN], params["params"])}
+        return model_variables(params)
 
     def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
         """The model over this training tree as a generation task.
@@ -462,6 +466,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         the objective's ratio needs.
         """
         return TextGeneration(self.model, self._model_variables(params), sampling=sampling)
+
+    def pipeline(self, state, *, ema: bool = True, processor=None) -> TextGeneration:
+        """The decoder over the state's published weights, sampling and
+        budgeted the way this objective's previews are; `processor` decodes."""
+        samples = self.samples
+        return TextGeneration(self.model, self._model_variables(published(state, ema)), processor,
+                              sampling=Sampling() if samples is None else samples.sampling,
+                              max_new_tokens=None if samples is None else samples.max_new_tokens)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -781,7 +793,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         try:
             if prepared is not None:
                 policy, prompt, max_new_tokens = prepared
-                generated = policy(prompt, max_new_tokens, key=step.key).tokens
+                generated = policy(prompt, max_new_tokens, key=step.key).host().tokens
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview generation")

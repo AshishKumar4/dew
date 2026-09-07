@@ -19,7 +19,7 @@ from dew.interop import save_hf_layout
 from dew.objectives.diffusion import DiffusionObjective
 import dew.nn.backbones  # registers the models
 from dew.registry import models
-from dew.sampling import CFG, Heun, TextToImage
+from dew.sampling import CFG, Heun
 from dew.training import Checkpoints, MeshSpec, Trainer
 
 
@@ -62,9 +62,11 @@ def main(config: Config, data=None, inputs=None):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    pipe = TextToImage(model=model, process=process, inputs=inputs, params=state.averaged)
-    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), key=jax.random.key(1))
-    pixels = np.clip(np.round((np.asarray(images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    # The trained objective is the pipeline: the averaged weights stay on
+    # the trainer's mesh, prompts split over it, and host() reads the rows back.
+    pipe = objective.pipeline(state)
+    images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), seed=1).host().images
+    pixels = np.clip(np.round((images + 1.0) * 127.5), 0, 255).astype(np.uint8)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")

@@ -12,6 +12,7 @@ not mutate, donate or delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -25,9 +26,9 @@ from jax.typing import ArrayLike
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, mesh_of
 from dew.objectives.base import Variables
-from dew.sampling.text import Generation, Sampling, _mesh, generate
+from dew.sampling.text import Generation, Sampling, generate
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -96,6 +97,14 @@ def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike,
                  for row in range(rows.shape[0]))
 
 
+def _budget(requested: int | None, default: int | None) -> int:
+    if requested is not None:
+        return requested
+    if default is None:
+        raise ValueError("max_new_tokens is required; the source declares no default budget")
+    return default
+
+
 @dataclass(frozen=True)
 class TextGeneration:
     """Next-token generation bound to a decoder, its weights and its processor.
@@ -103,13 +112,16 @@ class TextGeneration:
     A call runs the shared cached prefill and decode; the result is the
     `Generation` a training rollout consumes, with the actual and raw-policy
     likelihood of every drawn action. `sampling` is the policy a call uses
-    when it passes none; a loaded source fills it from its generation config.
+    when it passes none, and `max_new_tokens` the budget; a loaded source
+    fills both from its generation config. Weights keep their placement: on
+    a mesh, rows split over its batch axes and results keep that sharding.
     """
 
     model: nn.Module
     variables: Variables
     processor: Processor | None = None
     sampling: Sampling = Sampling()
+    max_new_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -118,17 +130,20 @@ class TextGeneration:
         """The same task over other weights, such as a training policy snapshot."""
         return replace(self, variables=variables)
 
-    def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array | None = None, seed: int | None = None,
                  sampling: Sampling | None = None, images: object | None = None) -> Generation:
         inputs = _task_inputs(self.processor, request, images=images,
-                              collective=_mesh(self.variables) is not None)
-        return generate(self.model, self.variables, inputs, max_new_tokens, key=key,
-                        sampling=self.sampling if sampling is None else sampling)
+                              collective=mesh_of(self.variables) is not None)
+        result = generate(self.model, self.variables, inputs, _budget(max_new_tokens, self.max_new_tokens),
+                          key=key, seed=seed, sampling=self.sampling if sampling is None else sampling)
+        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        return replace(result, decoder=decoder)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        width = generation.tokens.shape[1] - generation.behavior_log_probs.shape[1]
-        return _decoded(self.processor, generation.tokens, generation.lengths, width)
+        rows = generation.host()
+        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -138,7 +153,7 @@ class BlockGeneration:
     A call runs prefill, refinement and clean-token commits as one device
     computation; the `CanvasGeneration` result carries no autoregressive
     likelihoods. `process` is the published sampler configuration used when
-    a call passes none.
+    a call passes none, and `max_new_tokens` the budget a call omits.
     """
 
     model: DiffusionGemma
@@ -147,6 +162,7 @@ class BlockGeneration:
     processor: Processor | None = None
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
+    max_new_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -155,13 +171,17 @@ class BlockGeneration:
         """The same task over other weights."""
         return replace(self, variables=variables)
 
-    def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array | None = None, seed: int | None = None,
                  process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
         inputs = _task_inputs(self.processor, request, images=images, collective=True)
-        return (self.process if process is None else process).generate(
-            self.model, self.variables, inputs, max_new_tokens, key=key,
-            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+        result = (self.process if process is None else process).generate(
+            self.model, self.variables, inputs, _budget(max_new_tokens, self.max_new_tokens),
+            key=key, seed=seed, eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        return replace(result, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration, prompt_width: int) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        return _decoded(self.processor, generation.tokens, generation.lengths, prompt_width)
+        rows = generation.host()
+        return _decoded(self.processor, rows.tokens, rows.lengths, prompt_width)

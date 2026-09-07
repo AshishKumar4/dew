@@ -166,44 +166,56 @@ The model must implement Linen `hidden_states(tokens, train=..., positions=..., 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
-generate(model, params, inputs, max_new_tokens, *, key,
+generate(model, params, inputs, max_new_tokens, *, key=None, seed=None,
          sampling=Sampling()) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
 ```
 
-`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Scalar `positions` supplied in token fields continue from the last valid position.
+`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Exactly one of `key` and `seed` is given; `seed=n` is `jax.random.key(n)`.
 
-The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over batch axes; each process receives its own rows. All participating processes validate inputs and agree on input shapes and sampling controls before device execution. Host input rejection propagates to peers; blocked device collectives cannot be recovered by this protocol. Changing padded shapes or static controls can still compile a new executable. Streaming and request scheduling are not part of this batch function.
+The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over the batch axes and the result keeps that sharding; each process hands in its own rows, at the same count and padded width on every process, and reads them back with `Generation.host()`. Keys fold in the global row index, so a pool draws what one process draws for the same rows. Invalid input on one rank raises on all ranks before device execution.
 
 `Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering.
 
-`Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)`. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)` and zero invalid tails. Only slots below `lengths` are likelihoods. Behavior probabilities include temperature/top-k/top-p/min-p; raw probabilities describe the unmodified model. Greedy behavior has probability one for its selected action.
+`Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)` with `B` the placed rows. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. `rows` counts this process's real rows; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound.
 
-`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. GRPO compares current and old raw-policy likelihoods; it does not silently substitute the behavior distribution. Reward text excludes EOS and the invalid tail. Models explicitly declaring `causal=False` are refused by the next-token objective.
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`.
 
 ### Inference tasks
 
-Import `TextGeneration`, `BlockGeneration`, `TextToImage` and `DenoisingInputs` from `dew.inference`.
+Import `pipeline`, `TextGeneration`, `BlockGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`; `dew.pipeline` is the same front door. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
 ```text
-TextGeneration(model, variables, processor=None, sampling=Sampling())
-task(request, max_new_tokens, *, key, sampling=None, images=None) -> Generation
+pipeline(source, *, mesh=None, layout=None, dtype=None, ema=True, step=None, revision=None)
+    -> TextGeneration | BlockGeneration | TextToImage
+Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
+LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
+TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None)
+task(request, max_new_tokens=None, *, key=None, seed=None, sampling=None, images=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
-BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0)
-task(request, max_new_tokens, *, key, process=None, images=None) -> CanvasGeneration
+BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
+                max_new_tokens=None)
+task(request, max_new_tokens=None, *, key=None, seed=None, process=None, images=None) -> CanvasGeneration
 Pretrained.text_generation(sampling=None) -> TextGeneration
 Pretrained.block_generation() -> BlockGeneration
+TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
+            sampler=DDIM(), finish=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
+TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None)
+TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None)
 image_task.bind(variables) -> TextToImage
-image_task.prepare(prompts, *, key) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=50, sampler=DDIM(), guidance=None, key) -> jax.Array
+image_task.prepare(prompts, *, key=None, seed=None) -> DenoisingInputs
+image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, seed=None) -> Images
+RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 ```
 
-A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text/numeric batches, floats, strings inside token rows and booleans are rejected without filtering rows or coercing IDs. `ModelInputs` carries prepared images and other numeric conditioning; raw images go through the bound processor in both text and canvas tasks.
+A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
 
-Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` to choose an explicit supported policy. This override is a deliberate change of policy, not inferred equivalence with the source default.
+`max_new_tokens` defaults to the budget the source declares (a checkpoint's `max_new_tokens`, an LM run's `sample_tokens`, an objective's `Samples`); without one the call must pass it. Equal shapes and controls reuse the compiled executable, across calls and across `bind`.
 
-`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods. Text and canvas tasks retain different result types. `TextToImage.prepare` returns initial noise and encoded conditional/unconditional values. Passing those arrays back to the image task reuses preparation while varying a solver or guidance value. Rebinding the image task preserves its model and encoders.
+Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
+
+`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()` and `text`. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
 
 ### External engine clients
 

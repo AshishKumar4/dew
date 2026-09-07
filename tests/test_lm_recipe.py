@@ -1,10 +1,12 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import importlib.util
+import dataclasses
 import json
 import sys
 from pathlib import Path
 
+import dew
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +14,8 @@ import pytest
 import tyro
 
 from dew.data import PackedTokens, TokenWindows
+from dew.inference import TextGeneration
+from dew.sampling import Sampling
 from dew.objectives.lm import Samples
 
 pytestmark = pytest.mark.mesh
@@ -103,8 +107,21 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
     data = config.data.load(batch=8)
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "run")) == config
-    assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()
+    run = tmp_path / "runs" / "run"
+    assert (run / str(int(state.step))).is_dir()
+    # run.json is the resolved spec: the model as built, vocabulary and
+    # context included, so the front door rebuilds it without the recipe.
+    recorded = recipe.LmRunConfig.load(str(run))
+    assert recorded.model.config["vocab_size"] == 256 and recorded.model.config["max_seq_len"] == SEQ
+    assert dataclasses.replace(recorded, model=config.model) == config
+    task = dew.pipeline(str(run))
+    assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
+    drawn = task("the ", seed=1, sampling=Sampling(temperature=0))
+    assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
+    np.testing.assert_array_equal(
+        drawn.host().tokens,
+        TextGeneration(task.model, state.averaged)([list(b"the ")], 4, seed=1,
+                                                   sampling=Sampling(temperature=0)).host().tokens)
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
@@ -147,7 +164,9 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
     assert int(state.step) > 0
     assert all(bool(jnp.all(jnp.isfinite(leaf)))
                for leaf in jax.tree.leaves(state.params["params"]))
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant")) == config
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant"))
+    assert recorded.model.config["vocab_size"] == 256
+    assert dataclasses.replace(recorded, model=config.model) == config
 
 
 def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
@@ -201,7 +220,9 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     state = recipe.main(config)
 
     assert int(state.step) == 1
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued")) == config
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued"))
+    assert recorded.model.config["vocab_size"] == 256
+    assert dataclasses.replace(recorded, model=config.model) == config
     kernel = state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)
     assert np.all(np.isfinite(np.asarray(kernel)))
