@@ -51,6 +51,22 @@ class VisionConditioner(nn.Module):
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
 
+    def initialize_parameters(self) -> None:
+        """Create the media leaves during an ordinary token-only model init.
+
+        Fixed-resolution towers use their configured image size. Other towers
+        need only one pooling/merge block to create resolution-independent
+        parameters; real batches supply their processed geometry later.
+        """
+        side = getattr(self.vision, "image_size", None)
+        if side is None:
+            patch = getattr(self.vision, "patch_size", 16)
+            block = getattr(self.vision, "pooling_kernel_size", getattr(self.vision, "spatial_merge_size", 2))
+            side = patch * block
+        channels = getattr(self.vision, "num_channels", getattr(self.vision, "in_channels", getattr(self.vision, "in_chans", 3)))
+        self({"pixel_values": jnp.zeros((1, 1, channels, side, side), self.dtype or jnp.float32)})
+
+
     def fuse(self, tokens: jax.Array, embeddings: jax.Array,
              image_indices: jax.Array, conditioning: Mapping[str, jax.Array],
              train: bool = False) -> Fusion:
@@ -127,6 +143,8 @@ class MultimodalTransformer(nn.Module):
             if allocated:
                 next_position.value = jnp.where(valid.any(axis=1), maximum + 1, next_position.value)
         if conditioning is None:
+            if self.is_initializing():
+                self.conditioner.initialize_parameters()
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
             return self.language_model.hidden_states(
