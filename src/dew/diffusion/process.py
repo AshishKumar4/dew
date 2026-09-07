@@ -47,10 +47,12 @@ class Process:
         return jnp.linspace(schedule.T, 0.0, steps, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
-        """x_T for `shape`: N(0, alpha_T^2 + sigma_T^2), the marginal at t = T
-        of unit-variance data."""
-        alpha, sigma = self.sampler_schedule.rates(jnp.asarray(self.sampler_schedule.T))
-        return jax.random.normal(key, shape) * jnp.sqrt(alpha ** 2 + sigma ** 2)
+        """Draw the sampling schedule's Gaussian prior for the requested shape.
+
+        Its default scale is the unit-data marginal at T; a schedule may
+        declare a different prior normalization.
+        """
+        return jax.random.normal(key, shape) * self.sampler_schedule.prior_scale()
 
     def denoiser(self, model, params, conditions: Mapping[str, Any],
                  unconditional: Mapping[str, Any] | None = None) -> Denoiser:
