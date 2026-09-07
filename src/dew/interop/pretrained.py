@@ -507,7 +507,6 @@ def _generate_canvas(bundle: Pretrained, inputs, max_new_tokens: int,
 
 
 
-
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
                     revision: str | None = None) -> Pretrained:

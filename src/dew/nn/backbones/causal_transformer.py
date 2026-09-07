@@ -1361,12 +1361,15 @@ class CausalTransformer(nn.Module):
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
                  input_embeddings=None, embedding_positions=None,
-                 attention_mask=None, image_groups=None, rotary_positions=None):
+                 attention_mask=None, image_groups=None, rotary_positions=None,
+                 attention_pairwise_mask=None, attention_key_positions=None):
         x = self.hidden_states(tokens, train=train, decode=decode,
                                positions=positions, segment_ids=segment_ids,
                                input_embeddings=input_embeddings,
                                embedding_positions=embedding_positions, attention_mask=attention_mask,
-                               image_groups=image_groups, rotary_positions=rotary_positions)
+                               image_groups=image_groups, rotary_positions=rotary_positions,
+                               attention_pairwise_mask=attention_pairwise_mask,
+                               attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -1433,22 +1436,38 @@ class CausalTransformer(nn.Module):
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None,
                       input_embeddings=None, embedding_positions=None,
-                      attention_mask=None, image_groups=None, rotary_positions=None):
+                      attention_mask=None, image_groups=None, rotary_positions=None,
+                      attention_pairwise_mask=None, attention_key_positions=None):
         """The final normalised states, `[B, S, D]`: everything the forward
         pass does before the head projection.
 
-        holding the full `[B, S, vocab]` logits tensor. A packed batch passes
-        its per-document `positions` and `segment_ids` through to the layers,
-        where RoPE and the mask read them.
+        A packed batch passes per-document `positions` and `segment_ids`
+        through to the layers, where RoPE and the mask read them.
 
         A caller that fuses another encoder's outputs passes them as
         `input_embeddings` with their token positions in
         `embedding_positions`: both or neither, and the values replace the
         scaled token embeddings before the layers read them.
+
+        `attention_pairwise_mask` is an explicit boolean [B, queries, keys]
+        visibility mask for ordinary attention mixers. Optional
+        `attention_key_positions` supplies logical [B, keys] coordinates;
+        local layers apply their configured window to those coordinates.
+        These are call-local cached-read metadata, not sliceable token fields.
         """
+        if attention_key_positions is not None and attention_pairwise_mask is None:
+            raise ValueError("attention_key_positions requires attention_pairwise_mask")
+        if attention_pairwise_mask is not None:
+            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
+            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
+                raise ValueError("explicit pairwise masks require ordinary attention mixers")
         attention_metadata = (None if attention_mask is None and image_groups is None
-                              and rotary_positions is None else AttentionMetadata(
-                                  attention_mask, image_groups, rotary_positions))
+                              and rotary_positions is None and attention_pairwise_mask is None
+                              and attention_key_positions is None else AttentionMetadata(
+                                  valid=attention_mask, image_groups=image_groups,
+                                  rotary_positions=rotary_positions,
+                                  pairwise_mask=attention_pairwise_mask,
+                                  key_positions=attention_key_positions))
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             # Gemma casts embed_scale to the embedding weight dtype

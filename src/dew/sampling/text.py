@@ -15,7 +15,7 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, generation_signature
 from dew.objectives.base import Variables
 
 
@@ -252,11 +252,7 @@ def generate(model: nn.Module, params: Variables,
         # Compare fixed-size hashes before creating distributed input arrays.
         # The schema covers all conditioning and token fields, not token length
         # alone; different traced shapes would issue mismatched collectives.
-        import hashlib
-        schema = (str(jax.tree.structure(prepared)),
-                  [(leaf.shape, str(leaf.dtype)) for leaf in jax.tree.leaves(prepared)],
-                  max_new_tokens, sampling)
-        digest = np.frombuffer(hashlib.sha256(repr(schema).encode()).digest(), np.uint8)
+        digest = generation_signature(prepared, (max_new_tokens, sampling))
         multihost_utils.assert_equal(digest, "generation input shapes and sampling must agree across processes")
     rows_sharding = None
     if mesh is not None:

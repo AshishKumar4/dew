@@ -9,16 +9,18 @@ loops keep fixed bounds and mask finished rows, including their step counts.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Sequence
 from functools import partial
 
 from flax import struct
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 
+from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, generation_signature
 from dew.objectives.base import Variables
 
 
@@ -153,7 +155,8 @@ class BlockProcess:
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
-    def generate(self, model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
                  max_new_tokens: int, *, key: jax.Array, eos_token_ids: tuple[int, ...] = (),
                  pad_token_id: int = 0) -> CanvasGeneration:
         """Run prefill, refinement and clean-token commits as one device computation.
@@ -162,70 +165,119 @@ class BlockProcess:
         output is cropped to the token limit. Finished rows are padded after
         their first EOS. No host-side decisions depend on generated tokens.
         """
-        inputs.validate()
-        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
-            raise ValueError("max_new_tokens must be a nonnegative integer")
-        if self.vocab_size != model.vocab_size or self.canvas_length != model.canvas_length:
-            raise ValueError("BlockProcess geometry must match the loaded model")
-        if not 0 <= pad_token_id < self.vocab_size:
-            raise ValueError("pad_token_id is outside the vocabulary")
-        if any(not 0 <= token < self.vocab_size for token in eos_token_ids):
-            raise ValueError("eos_token_ids contain an id outside the vocabulary")
-        batch, prompt_length = inputs.tokens.shape
-        if prompt_length == 0:
-            raise ValueError("a block-diffusion prompt must contain at least one token")
-        blocks = (max_new_tokens + self.canvas_length - 1) // self.canvas_length
-        if prompt_length + blocks * self.canvas_length > model.max_seq_len:
-            raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
-        return _generate(model, variables, inputs, max_new_tokens, key, self,
+        prepared = None
+        error = None
+        try:
+            prepared = ModelInputs.from_value(inputs)
+            if jax.random.key_data(key).ndim != 1:
+                raise ValueError("key must be one PRNG key, not a batch of keys")
+            if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+                raise ValueError("max_new_tokens must be a nonnegative integer")
+            if self.vocab_size != model.vocab_size or self.canvas_length != model.canvas_length:
+                raise ValueError("BlockProcess geometry must match the loaded model")
+            if not 0 <= pad_token_id < self.vocab_size:
+                raise ValueError("pad_token_id is outside the vocabulary")
+            if any(not 0 <= token < self.vocab_size for token in eos_token_ids):
+                raise ValueError("eos_token_ids contain an id outside the vocabulary")
+            _, prompt_length = prepared.tokens.shape
+            if prompt_length == 0:
+                raise ValueError("a block-diffusion prompt must contain at least one token")
+            blocks = (max_new_tokens + self.canvas_length - 1) // self.canvas_length
+            if prompt_length + blocks * self.canvas_length > model.max_seq_len:
+                raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
+        except BaseException as failure:
+            error = failure
+        agree_process_phase(error, phase="canvas generation setup")
+        assert prepared is not None
+        if jax.process_count() > 1:
+            controls = (max_new_tokens, self, eos_token_ids, pad_token_id, model)
+            multihost_utils.assert_equal(
+                generation_signature(prepared, controls),
+                "canvas input schemas, model geometry and generation policy must agree")
+        return _generate(model, variables, prepared, max_new_tokens, key, self,
                          eos_token_ids, pad_token_id)
+
+
+@struct.dataclass
+class CanvasDecodeState:
+    """Committed output and prefix cache between complete canvas refinements.
+
+    index counts refined canvases even after individual rows finish. It is
+    the random-key fold and commit position, independent of emitted lengths.
+    """
+
+    cache: Variables
+    result: CanvasGeneration
+    index: jax.Array
+
+
+def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+           max_new_tokens: int, process: BlockProcess, pad_token_id: int) -> CanvasDecodeState:
+    batch, prompt_length = inputs.tokens.shape
+    blocks = (max_new_tokens + process.canvas_length - 1) // process.canvas_length
+    output = jnp.full((batch, prompt_length + blocks * process.canvas_length), pad_token_id, jnp.int32)
+    output = output.at[:, :prompt_length].set(inputs.tokens)
+    result = CanvasGeneration(
+        tokens=output, lengths=jnp.zeros((batch,), jnp.int32),
+        terminated=jnp.zeros((batch,), bool), decoder_steps=jnp.zeros((batch,), jnp.int32))
+    cache = {}
+    if max_new_tokens > 0:
+        cache = model.apply(variables, batch, method=model.init_cache, mutable=["cache"])[1]["cache"]
+        cache = model.apply(
+            {**variables, "cache": cache}, inputs,
+            method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
+            mutable=["cache"])[1]["cache"]
+    return CanvasDecodeState(cache, result, jnp.asarray(0, jnp.int32))
+
+
+def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeState,
+             max_new_tokens: int, key: jax.Array, process: BlockProcess,
+             eos_token_ids: tuple[int, ...], pad_token_id: int) -> CanvasDecodeState:
+    cache, result, index = state.cache, state.result, state.index
+    length = process.canvas_length
+    blocks = (max_new_tokens + length - 1) // length
+    batch, width = result.tokens.shape
+    prompt_length = width - blocks * length
+    canvas_key = jax.random.fold_in(key, index)
+    refined = process.refine(model, variables, cache, canvas_key, batch, result.terminated)
+    available = jnp.minimum(length, max_new_tokens - index * length)
+    is_eos = jnp.isin(refined.argmax, jnp.asarray(eos_token_ids, jnp.int32))
+    valid = jnp.arange(length)[None, :] < available
+    is_eos = is_eos & valid
+    first_eos = jnp.min(jnp.where(is_eos, jnp.arange(length)[None, :], length), axis=-1)
+    emitted = jnp.where(result.terminated, 0, jnp.minimum(first_eos + 1, available))
+    keep = jnp.arange(length)[None, :] < emitted[:, None]
+    clean = jnp.where(keep, refined.argmax, pad_token_id)
+    tokens = jax.lax.dynamic_update_slice(result.tokens, clean, (0, prompt_length + index * length))
+    result = CanvasGeneration(
+        tokens=tokens, lengths=result.lengths + emitted,
+        terminated=result.terminated | jnp.any(is_eos, axis=-1),
+        decoder_steps=result.decoder_steps + refined.decoder_steps)
+    # This branch depends only on the request's canvas counter, never on a
+    # rank-local sampled token or termination outcome.
+    cache = jax.lax.cond(
+        index + 1 < blocks,
+        lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
+                                mutable=["cache"])[1]["cache"],
+        lambda old: old, cache)
+    return CanvasDecodeState(cache, result, index + 1)
+
+
+def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: int) -> CanvasGeneration:
+    return replace(state.result, tokens=state.result.tokens[:, :prompt_length + max_new_tokens])
 
 
 @jax.jit(static_argnames=("model", "max_new_tokens", "process", "eos_token_ids", "pad_token_id"))
 def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
               max_new_tokens: int, key: jax.Array, process: BlockProcess,
               eos_token_ids: tuple[int, ...], pad_token_id: int) -> CanvasGeneration:
-    batch, prompt_length = inputs.tokens.shape
-    length = process.canvas_length
-    blocks = (max_new_tokens + length - 1) // length
-    output = jnp.full((batch, prompt_length + blocks * length), pad_token_id, jnp.int32)
-    output = output.at[:, :prompt_length].set(inputs.tokens)
-    initial = CanvasGeneration(
-        tokens=output, lengths=jnp.zeros((batch,), jnp.int32),
-        terminated=jnp.zeros((batch,), bool), decoder_steps=jnp.zeros((batch,), jnp.int32))
-    if max_new_tokens == 0:
-        return initial
-    cache = model.apply(variables, batch, method=model.init_cache, mutable=["cache"])[1]["cache"]
-    cache = model.apply(
-        {**variables, "cache": cache}, inputs,
-        method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
-        mutable=["cache"])[1]["cache"]
+    initial = _begin(model, variables, inputs, max_new_tokens, process, pad_token_id)
+    blocks = (max_new_tokens + process.canvas_length - 1) // process.canvas_length
+    if blocks == 0:
+        return _materialize(initial, inputs.tokens.shape[1], max_new_tokens)
 
-    def canvas_step(index, carry):
-        cache, result = carry
-        canvas_key = jax.random.fold_in(key, index)
-        state = process.refine(model, variables, cache, canvas_key, batch, result.terminated)
-        available = jnp.minimum(length, max_new_tokens - index * length)
-        is_eos = jnp.isin(state.argmax, jnp.asarray(eos_token_ids, jnp.int32))
-        valid = jnp.arange(length)[None, :] < available
-        is_eos = is_eos & valid
-        first_eos = jnp.min(jnp.where(is_eos, jnp.arange(length)[None, :], length), axis=-1)
-        emitted = jnp.where(result.terminated, 0, jnp.minimum(first_eos + 1, available))
-        keep = jnp.arange(length)[None, :] < emitted[:, None]
-        clean = jnp.where(keep, state.argmax, pad_token_id)
-        tokens = jax.lax.dynamic_update_slice(result.tokens, clean, (0, prompt_length + index * length))
-        result = CanvasGeneration(
-            tokens=tokens, lengths=result.lengths + emitted,
-            terminated=result.terminated | jnp.any(is_eos, axis=-1),
-            decoder_steps=result.decoder_steps + state.decoder_steps)
-        # Only preceding canvases enter the cache. Both branch choices are
-        # scalar loop counters shared by every device, never rank-local EOS.
-        cache = jax.lax.cond(
-            index + 1 < blocks,
-            lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
-                                    mutable=["cache"])[1]["cache"],
-            lambda old: old, cache)
-        return cache, result
+    def step(_, state):
+        return _advance(model, variables, state, max_new_tokens, key, process, eos_token_ids, pad_token_id)
 
-    _, result = jax.lax.fori_loop(0, blocks, canvas_step, (cache, initial))
-    return result.replace(tokens=result.tokens[:, :prompt_length + max_new_tokens])
+    final = jax.lax.fori_loop(0, blocks, step, initial)
+    return _materialize(final, inputs.tokens.shape[1], max_new_tokens)

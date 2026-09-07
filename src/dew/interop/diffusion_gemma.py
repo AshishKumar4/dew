@@ -191,21 +191,24 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
-        for name, raw in _flatten(params["conditioner"]["tower"]).items():
-            parts = name.split(".")
-            if tuple(parts) in inverse:
-                target = inverse[tuple(parts)]
-            elif parts[0].startswith("layers_"):
-                index = parts[0].removeprefix("layers_")
-                tail = parts[1:-1]
-                if parts[-1] == "kernel":
-                    tail = [*tail, "linear"]
-                target = f"encoder.layers.{index}." + ".".join([*tail, "weight"])
-            else:
-                raise ValueError(f"unknown vision parameter {name!r}")
-            leaf = np.asarray(raw)
-            result["model.encoder.vision_tower." + target] = np.ascontiguousarray(
-                leaf.T if parts[-1] == "kernel" else leaf)
+        for collection in ("params", "constants"):
+            tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
+            for name, raw in _flatten(tower).items():
+                parts = name.split(".")
+                if tuple(parts) in inverse:
+                    target = inverse[tuple(parts)]
+                elif parts[0].startswith("layers_"):
+                    index = parts[0].removeprefix("layers_")
+                    tail = parts[1:-1]
+                    if parts[-1] == "kernel":
+                        tail = [*tail, "linear"]
+                    ending = parts[-1] if collection == "constants" else "weight"
+                    target = f"encoder.layers.{index}." + ".".join([*tail, ending])
+                else:
+                    raise ValueError(f"unknown vision parameter {name!r}")
+                leaf = np.asarray(raw)
+                result["model.encoder.vision_tower." + target] = np.ascontiguousarray(
+                    leaf.T if parts[-1] == "kernel" else leaf)
         result["model.encoder.embed_vision.embedding_projection.weight"] = np.ascontiguousarray(
             np.asarray(params["conditioner"]["projector"]["projection"]["kernel"]).T)
     return result
