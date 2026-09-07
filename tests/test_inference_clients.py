@@ -114,10 +114,12 @@ def test_ollama_retains_sdk_metadata_and_full_options(clients):
 
 @pytest.mark.parametrize("answer", [
     {}, {"response": None}, {"response": {}}, {"response": "", "eval_count": -1},
-    {"response": "", "eval_count": True}, {"response": "", "eval_count": 1.5},
-    {"response": "", "eval_count": "3"},
+    {"response": "", "eval_count": 1.5},
 ])
-def test_ollama_rejects_bad_wire_fields_before_sdk_coercion(clients, answer):
+def test_ollama_malformed_or_negative_wire_values_fail(clients, answer):
+    """The public SDK methods parse the wire; unparsable text and counts fail
+    there, and a negative count fails in the adapter. Bool and numeric-string
+    counts are the SDK's own lax coercion and are not visible to the adapter."""
     task, _ = clients("ollama", lambda http, request, body: http.Response(200, json=answer))
     with pytest.raises(ValueError):
         task("a", 3)
