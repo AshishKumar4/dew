@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import IntEnum
 import hashlib
 import math
-from typing import ParamSpec, Protocol, TypeVar
+from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
 import jax
@@ -36,6 +36,9 @@ from .rollout import (
     ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY,
     RESPONSE_LENGTH_KEY, RESPONSE_MASK_KEY, REWARDS_KEY, TERMINATED_KEY,
 )
+
+if TYPE_CHECKING:
+    from .journal import EpisodeJournal, JournalRun
 
 
 class EpisodeStatus(IntEnum):
@@ -134,6 +137,15 @@ class Environment(Protocol):
     def reset(self) -> Observation: ...
 
     def step(self, action: Action) -> Observation: ...
+
+
+@runtime_checkable
+class RecoverableEnvironment(Environment, Protocol):
+    """Opaque snapshots restore tool state without replaying completed calls."""
+
+    def get_state(self) -> bytes: ...
+
+    def set_state(self, state: bytes) -> None: ...
 
 
 EnvironmentFactory = Callable[[EpisodeId], AbstractContextManager[Environment]]
@@ -245,8 +257,9 @@ class EpisodeRollout:
     The policy binds one immutable variables snapshot for the whole
     collection. It must use that binding, not a mutable serving default.
     The Trainer cannot update or donate the tree until this call returns.
-    Checkpoints resume at Trainer boundaries, not halfway through an
-    external tool call.
+    EpisodeJournal adds durable turn boundaries for environments exposing
+    get_state/set_state. Pending external effects require environment-owned
+    idempotency; Trainer checkpoints remain the optimizer's recovery boundary.
     """
 
     policy: EpisodeInference
@@ -258,6 +271,7 @@ class EpisodeRollout:
     sampling: Sampling
     groups: int = 2
     record: EpisodeRecorder | None = None
+    journal: EpisodeJournal | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -268,18 +282,41 @@ class EpisodeRollout:
         if self.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
-    def _open(self, slots: list[_Session], stack: ExitStack) -> None:
+    def _persist(self, slot: _Session, run: JournalRun | None, policy_step: int, binding: str) -> None:
+        if run is not None:
+            environment = slot.environment
+            if not isinstance(environment, RecoverableEnvironment):
+                raise TypeError("EpisodeJournal requires get_state/set_state on the environment")
+            snapshot = slot.invoke(environment.get_state)
+            if not isinstance(snapshot, bytes):
+                raise TypeError("environment get_state must return bytes")
+            slot.invoke(run.save, slot.episode(policy_step, binding), slot.pending, snapshot)
+
+    def _open(self, slots: list[_Session], stack: ExitStack, run: JournalRun | None,
+              policy_step: int, binding: str) -> None:
         for slot in slots:
             slot.environment = slot.invoke(lambda: stack.enter_context(self.environment(slot.identity)))
-            observation = slot.invoke(slot.environment.reset)
-            slot.initial = observation
-            slot.invoke(slot.observe, observation)
+            saved = None if run is None else slot.invoke(run.load, slot.identity)
+            if saved is None:
+                observation = slot.invoke(slot.environment.reset)
+                slot.initial = observation
+                slot.invoke(slot.observe, observation)
+                self._persist(slot, run, policy_step, binding)
+            else:
+                if not isinstance(slot.environment, RecoverableEnvironment):
+                    raise TypeError("EpisodeJournal requires get_state/set_state on the environment")
+                slot.invoke(slot.environment.set_state, saved.snapshot)
+                episode = saved.episode
+                slot.initial, slot.transitions = episode.initial, list(episode.transitions)
+                slot.pending, slot.reward = saved.pending, episode.reward
+                slot.observation = episode.transitions[-1].observation if episode.transitions else episode.initial
+                slot.status, slot.detail = episode.status, episode.detail
 
-    def _inputs(self, slots: list[_Session]) -> ModelInputs:
+    def _inputs(self, slots: list[_Session], turn: int) -> ModelInputs:
         tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad_id, np.int32)
         valid = np.zeros_like(tokens, bool)
         for row, slot in enumerate(slots):
-            if slot.status == EpisodeStatus.RUNNING:
+            if slot.status == EpisodeStatus.RUNNING and len(slot.transitions) == turn and slot.pending is None:
                 observation = slot.observation
                 assert observation is not None
                 length = len(observation.context)
@@ -294,20 +331,21 @@ class EpisodeRollout:
                 valid[row, -1] = True
         return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
 
-    def _advance(self, slots: list[_Session], result: Generation,
-                 policy_step: int, binding_id: str) -> None:
+    def _advance(self, slots: list[_Session], result: Generation, policy_step: int,
+                 binding_id: str, turn: int, run: JournalRun | None) -> None:
         if not isinstance(result, Generation) or result.tokens.shape[0] != len(slots):
             raise TypeError("tool episodes require one autoregressive Generation row per slot")
         # Record every actual draw before invoking any tool. A tool failure
         # must not erase the other requests already sampled in this cohort.
         for row, slot in enumerate(slots):
-            if slot.status == EpisodeStatus.RUNNING:
+            if slot.status == EpisodeStatus.RUNNING and len(slot.transitions) == turn and slot.pending is None:
                 observation = slot.observation
                 assert observation is not None
                 slot.pending = slot.invoke(self._action, result, row, observation.context, policy_step, binding_id)
+                self._persist(slot, run, policy_step, binding_id)
         for slot in slots:
             action = slot.pending
-            if action is None:
+            if action is None or len(slot.transitions) != turn:
                 continue
             environment = slot.environment
             assert environment is not None
@@ -320,9 +358,12 @@ class EpisodeRollout:
             slot.transitions.append(Transition(action, observation))
             slot.pending = None
             slot.invoke(slot.observe, observation)
+            self._persist(slot, run, policy_step, binding_id)
 
-    def _verify(self, slots: list[_Session], policy_step: int, binding_id: str) -> None:
+    def _verify(self, slots: list[_Session], policy_step: int, binding_id: str, run: JournalRun | None) -> None:
         for slot in slots:
+            if slot.reward is not None:
+                continue
             if slot.status == EpisodeStatus.RUNNING:
                 slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
             def score() -> float:
@@ -331,6 +372,7 @@ class EpisodeRollout:
                     raise ValueError("episode verifier returned a non-finite reward")
                 return reward
             slot.reward = slot.invoke(score)
+            self._persist(slot, run, policy_step, binding_id)
 
     def _failed(self, slots: list[_Session], error: BaseException,
                 policy_step: int, binding_id: str) -> None:
@@ -402,7 +444,7 @@ class EpisodeRollout:
             policy = self.policy.bind(state.params)
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
-                         tuple(np.asarray(jax.random.key_data(key)).tolist()))
+                         tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
             return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
         tasks, policy, signature = _phase(prepare, "episode preparation")
         processes, rank = jax.process_count(), jax.process_index()
@@ -422,21 +464,34 @@ class EpisodeRollout:
                     tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
         error = None
         try:
-            with ExitStack() as stack:
-                try:
-                    _phase(lambda: self._open(slots, stack), "episode reset")
+            with ExitStack() as journal_stack:
+                run = None
+                if self.journal is not None:
+                    journal = self.journal
+                    def open_journal():
+                        from .journal import policy_digest
+
+                        cohort = repr((int(state.step), tuple(np.asarray(jax.random.key_data(key)).tolist())))
+                        fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
+                                            policy_digest(state.params)))
+                        return journal_stack.enter_context(journal.open(cohort, fingerprint, binding_id))
+                    run = _phase(open_journal, "episode journal open")
+                    origin = np.frombuffer(bytes.fromhex(run.binding), np.uint8)
+                    if processes > 1:
+                        origin = multihost_utils.broadcast_one_to_all(origin)
+                    binding_id = origin.tobytes().hex()
+                    _phase(lambda: run.align(binding_id), "episode journal binding")
+                with ExitStack() as stack:
+                    _phase(lambda: self._open(slots, stack, run, policy_step, binding_id), "episode reset")
                     for turn in range(self.max_turns):
-                        inputs = _phase(lambda: self._inputs(slots), "episode context preparation")
+                        inputs = _phase(lambda: self._inputs(slots, turn), "episode context preparation")
                         active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
                         if not agree_process_phase(None, phase="episode availability", available=active):
                             break
                         result = _phase(lambda: policy(inputs, self.max_new_tokens,
                             key=jax.random.fold_in(key, turn), sampling=self.sampling), "episode generation")
-                        _phase(lambda: self._advance(slots, result, policy_step, binding_id), "episode tool step")
-                    _phase(lambda: self._verify(slots, policy_step, binding_id), "episode verification")
-                except BaseException as failure:
-                    error = failure
-                    raise
+                        _phase(lambda: self._advance(slots, result, policy_step, binding_id, turn, run), "episode tool step")
+                    _phase(lambda: self._verify(slots, policy_step, binding_id, run), "episode verification")
         except BaseException as failure:
             error = failure
         try:
