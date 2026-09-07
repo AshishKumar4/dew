@@ -170,7 +170,7 @@ class JepaObjective(Objective[Mean]):
         predictions = predictions.reshape(targets.shape)
 
         squared = (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2
-        loss = Mean(jnp.sum(squared), jnp.asarray(squared.size))
+        loss = Mean(jnp.sum(squared), jnp.asarray(squared.size, squared.dtype))
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
         return loss, Aux(representation_health(pooled))
 

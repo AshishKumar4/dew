@@ -94,7 +94,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
 
         counted = is_masked.astype(losses.dtype)
         weights = counted * self.process.weight(t)[:, None]
-        nelbo = Mean(jnp.sum(losses * weights), jnp.asarray(tokens.size))
+        nelbo = Mean(jnp.sum(losses * weights), jnp.asarray(tokens.size, jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
             "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),
