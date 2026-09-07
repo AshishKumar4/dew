@@ -73,6 +73,48 @@ def scatter(model: torch.nn.Module) -> None:
                 parameter.normal_(0, 0.08, generator=generator)
 
 
+def write_video_reference(model, processor, destination: Path) -> None:
+    """Interleave images and timestamped videos with odd frame counts and unequal grids."""
+    rng = np.random.default_rng(3883)
+    videos = [rng.integers(0, 256, shape, dtype=np.uint8)
+              for shape in ((5, 64, 96, 3), (3, 96, 64, 3))]
+    metadata = [{"fps": fps, "total_num_frames": len(video), "frames_indices": list(range(len(video)))}
+                for video, fps in zip(videos, (5.0, 3.0))]
+    images = np.load(destination / "images.npy")
+    image = "<|vision_start|><|image_pad|><|vision_end|>"
+    video = "<|vision_start|><|video_pad|><|vision_end|>"
+    prompts = [f"a {image} b {video} c", f"d {video} e {image} f"]
+    encoded = processor(text=prompts, images=[[images[0]], [images[1]]], videos=videos,
+                        video_metadata=metadata, padding=True, return_tensors="pt")
+    for index, frames in enumerate(videos):
+        np.save(destination / f"video_{index}.npy", frames)
+    (destination / "video_inputs.json").write_text(json.dumps({"prompts": prompts, "metadata": metadata}, indent=2) + "\n")
+    with torch.no_grad():
+        generated = model.generate(**encoded, max_new_tokens=3, do_sample=False,
+                                   eos_token_id=None, pad_token_id=processor.tokenizer.pad_token_id)
+    logits, hidden, embeddings, positions = prediction_inputs(model, encoded)
+    valid = encoded["attention_mask"].bool()
+    admitted = valid[:, :-1] & valid[:, 1:]
+    mtp_logits = model.lm_head(model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted))
+    main_ce = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
+                                                encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
+    depth_ce = torch.nn.functional.cross_entropy(mtp_logits[:, :-1].reshape(-1, logits.shape[-1]),
+                                                 encoded["input_ids"][:, 2:].reshape(-1), reduction="none")
+    depth_valid = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
+    loss = ((main_ce.reshape(admitted.shape) * admitted).sum()
+            + .2 * (depth_ce.reshape(depth_valid.shape) * depth_valid).sum()) / admitted.sum()
+    loss.backward()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.add_(parameter.grad, alpha=-1e-4)
+        updated = model(**encoded, use_cache=False).logits
+    np.savez(destination / "video_reference.npz", **{key: value.numpy() for key, value in encoded.items()},
+             logits=logits.detach().numpy(), mtp_logits=mtp_logits.detach().numpy(),
+             loss=loss.detach().numpy(), updated_logits=updated.numpy(), generated=generated.numpy())
+
+
+
 def write_reference(kind: str) -> None:
     source = SOURCES / kind
     destination = ROOT / f"qwen38-{kind}-tiny"
@@ -81,6 +123,7 @@ def write_reference(kind: str) -> None:
     config = tiny_config(source, tok)
     (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     torch.manual_seed(3180)
+    processor = None
     if kind == "dense":
         hf_config = Qwen3_5Config.from_dict(copy.deepcopy(config))
         hf_config._attn_implementation = "eager"
@@ -90,7 +133,9 @@ def write_reference(kind: str) -> None:
         # Retain the actual split processor-file layout from the source.
         tok.save_pretrained(destination)
         (destination / "preprocessor_config.json").write_text(json.dumps(image_config, indent=2) + "\n")
-        (destination / "video_preprocessor_config.json").write_text((source / "video_preprocessor_config.json").read_text())
+        video_config = json.loads((source / "video_preprocessor_config.json").read_text())
+        video_config.update(size={"shortest_edge": 4096, "longest_edge": 24576}, do_sample_frames=False)
+        (destination / "video_preprocessor_config.json").write_text(json.dumps(video_config, indent=2) + "\n")
         images = np.random.default_rng(3182).integers(0, 256, (2, 64, 64, 3), dtype=np.uint8)
         prompts = ["a <|vision_start|><|image_pad|><|vision_end|> b",
                    "xy <|vision_start|><|image_pad|><|vision_end|> z"]
@@ -164,6 +209,10 @@ def write_reference(kind: str) -> None:
              positions=positions.detach().numpy(), valid=admitted.numpy(),
              loss=total.detach().numpy(), updated_logits=main_after.numpy(),
              updated_mtp_logits=mtp_after.numpy())
+    if processor is not None:
+        model.load_state_dict(initial_state, strict=True)
+        model.zero_grad(set_to_none=True)
+        write_video_reference(model, processor, destination)
 
 
 
