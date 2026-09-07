@@ -25,7 +25,7 @@ class Regression(Objective):
     def __init__(self):
         self.model = nn.Dense(features=1)
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, 1), jnp.float32))
 
     def loss(self, variables, batch, step):

@@ -92,10 +92,19 @@ class PPOObjective(Objective[Mean, Variables]):
         self.ema = None if reference is None else EMASpec(reference.decay,
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
 
-    def init(self, key: jax.Array) -> Variables:
-        policy = self.actor.init(key)
-        critic = self.critic.init(jax.random.fold_in(key, 1), jnp.zeros((1, self.seq_len), jnp.int32))
-        return _join(policy, critic)
+    def held_variables(self) -> Variables | None:
+        """Whatever the actor starts from: a loaded policy checkpoint.
+
+        The critic is drawn from the key, so the actor's tree is the only
+        held data here, and it reaches the trainer's state JIT as the
+        initializer's argument rather than as a captured constant.
+        """
+        return self.actor.held_variables()
+
+    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        critic = self.critic.init(jax.random.fold_in(key, 1),
+                                  jnp.zeros((1, self.seq_len), jnp.int32))
+        return _join(self.actor.init(key, variables), critic)
 
     def policy(self, variables: Variables) -> EpisodeInference:
         """Bind the policy subtree when an episode collector supplies the full tree."""

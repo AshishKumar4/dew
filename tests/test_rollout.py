@@ -46,7 +46,7 @@ class Regression(Objective):
         self.model = Affine()
         self.ema = EMASpec(decay=optax.constant_schedule(1.0))
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, params, batch, step):

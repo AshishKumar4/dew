@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -101,13 +101,20 @@ class FlowGRPOObjective(DiffusionObjective):
         self.adv_clip_max = adv_clip_max
         self.pretrained = pretrained
 
-    def init(self, key: jax.Array) -> dict[str, object]:
-        if self.pretrained is None:
-            return super().init(key)
-        variables = {**self.pretrained, "encoders": self.encoder_params()}
-        if self.autoencoder is not None:
-            variables["autoencoder"] = self.autoencoder.params
-        return variables
+    def held_variables(self) -> Variables:
+        held: dict[str, Any] = dict(super().held_variables())
+        if self.pretrained is not None:
+            held["pretrained"] = self.pretrained
+        return held
+
+    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        held = self.held_variables() if variables is None else variables
+        if "pretrained" not in held:
+            return super().init(key, held)
+        state: dict[str, Any] = {**held["pretrained"], "encoders": held["encoders"]}
+        if "autoencoder" in held:
+            state["autoencoder"] = held["autoencoder"]
+        return state
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:
         tokens = {keyword: batch[condition.field]

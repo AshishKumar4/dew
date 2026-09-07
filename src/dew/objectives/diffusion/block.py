@@ -18,7 +18,8 @@ import optax
 
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.objectives.base import Aux, Batch, EMASpec, Mean, Objective, Step, Variables, mean_loss
+from dew.objectives.base import (Aux, Batch, EMASpec, Mean, Objective, Step,
+                                 Variables, mean_loss)
 from dew.registry import objectives
 
 
@@ -127,16 +128,21 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
 
-    def init(self, key: jax.Array) -> Variables:
-        if self.pretrained is not None:
-            if "params" not in self.pretrained:
+    def held_variables(self) -> Variables | None:
+        """The SFT source this objective starts from."""
+        return self.pretrained
+
+    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        pretrained = self.pretrained if variables is None else variables
+        if pretrained is not None:
+            if "params" not in pretrained:
                 raise ValueError("pretrained must contain the params collection")
             if self._initial_scalar_mode == "trainable":
-                return self.pretrained
+                return pretrained
             # Google makes skip_scale a parameter; Transformers declares the
             # same tensor a buffer. Move references once, under an explicit
             # model policy, without copying any parameter arrays.
-            values = dict(self.pretrained)
+            values = dict(pretrained)
             params = dict(values["params"])
             text = dict(params["text"])
             constants = dict(values["constants"])
