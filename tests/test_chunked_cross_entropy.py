@@ -14,7 +14,6 @@ The tie rule has its own two tests; a looser comparison would pass either winner
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import pytest
 

@@ -37,6 +37,17 @@ def image_inputs(rng):
             TextContext(jnp.ones((2, 77, 768), jnp.float32), jnp.ones((2, 77), bool)))
 
 
+def compare_forward_and_backward(plain, remat, params, *inputs):
+    def loss(model, p):
+        return jnp.sum(model.apply(p, *inputs) ** 2)
+
+    assert jnp.allclose(loss(plain, params), loss(remat, params), rtol=1e-5, atol=1e-4)
+    g_plain = jax.grad(lambda p: loss(plain, p))(params)
+    g_remat = jax.grad(lambda p: loss(remat, p))(params)
+    for a, b in zip(jax.tree.leaves(g_plain), jax.tree.leaves(g_remat), strict=True):
+        assert jnp.allclose(a, b, rtol=1e-3, atol=1e-4)
+
+
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
 def test_remat_keeps_parameter_tree_identical(rng, arch):
     x, temb, ctx = image_inputs(rng)
@@ -53,20 +64,12 @@ def test_remat_keeps_parameter_tree_identical(rng, arch):
 def test_remat_preserves_outputs_and_gradients(rng, arch):
     x, temb, ctx = image_inputs(rng)
     plain, remat = BUILDERS[arch](False), BUILDERS[arch](True)
-    params = plain.init(rng, x, temb, ctx)
-
-    def loss(model, p):
-        return jnp.sum(model.apply(p, x, temb, ctx) ** 2)
-
-    assert jnp.allclose(loss(plain, params), loss(remat, params), rtol=1e-5, atol=1e-4)
-
-    g_plain = jax.grad(lambda p: loss(plain, p))(params)
-    g_remat = jax.grad(lambda p: loss(remat, p))(params)
-    for a, b in zip(jax.tree.leaves(g_plain), jax.tree.leaves(g_remat)):
-        assert jnp.allclose(a, b, rtol=1e-3, atol=1e-4)
+    compare_forward_and_backward(plain, remat, plain.init(rng, x, temb, ctx), x, temb, ctx)
 
 
 def test_video_dit_remat_matches():
+    """Remat only rewrites the backward pass, so the gradients are where a
+    dropped residual or a mismatched body would show, not the forward."""
     rng = jax.random.PRNGKey(0)
     x = jax.random.normal(rng, (1, 3, 16, 16, 3))
     temb = jnp.ones((1,))
@@ -74,6 +77,4 @@ def test_video_dit_remat_matches():
     plain = VideoDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
     remat = VideoDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1,
                      remat=True)
-    params = plain.init(rng, x, temb, ctx)
-    assert jnp.allclose(plain.apply(params, x, temb, ctx),
-                        remat.apply(params, x, temb, ctx), rtol=1e-5, atol=1e-4)
+    compare_forward_and_backward(plain, remat, plain.init(rng, x, temb, ctx), x, temb, ctx)

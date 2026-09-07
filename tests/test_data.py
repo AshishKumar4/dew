@@ -11,17 +11,15 @@ import itertools
 import json
 import os
 import sys
-from pathlib import Path
 
 import cv2
-import grain.python as pygrain
 import jax
 import numpy as np
 import pytest
 
 import dew.data
-from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset, LocalVideos,
-                      OxfordFlowers, VoxCeleb2, local_batch)
+from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset,
+                      LocalVideos, VoxCeleb2, local_batch)
 from dew.data import Loading, images, video
 from dew.data.dataset import hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
@@ -752,7 +750,7 @@ def test_a_batch_carries_captions_and_each_encoder_tokenizes_them_its_own_way():
 
     spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
     captions = next(spec.load(batch=4, tokenize=keep_captions).train())["caption"]
-    assert [str(caption) for caption in captions] and captions.shape == (4,)
+    assert captions.shape == (4,)
 
     def tokens(encoder):
         inputs = InputSpec(Field("image", (8, 8, 3)),

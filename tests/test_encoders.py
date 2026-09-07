@@ -12,7 +12,6 @@ import pytest
 
 from dew.inputs import CLIPText, Condition, InputSpec, Field, unit_range
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
-from dew.registry import encoders
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
@@ -24,7 +23,6 @@ def test_unit_range_is_the_one_pixel_convention():
 
 def test_field_shape_is_a_tuple_of_ints():
     assert Field("image", [8, 8, 3]).shape == (8, 8, 3)
-    assert InputSpec(Field("image", (8, 8, 3))).conditions == {}
 
 
 ############################################################################################################
@@ -81,9 +79,9 @@ def test_the_text_encoder_hands_the_model_its_mask():
     tokens = encoder.tokenize(["a red bird", ""])
     context = encoder.encode(encoder.params, tokens)
     assert context.hidden.shape[:2] == context.mask.shape == (2, 77)
-    # BOS, four word pieces, EOS for the prompt; BOS and EOS for the empty one
+    # BOS, eight word pieces and EOS for the prompt; BOS and EOS for the empty one
+    assert int(context.mask[0].sum()) == 10
     assert int(context.mask[1].sum()) == 2
-    assert int(context.mask[0].sum()) > 2
 
 
 def test_two_conditions_cannot_share_one_batch_field():

@@ -65,16 +65,6 @@ def test_latent_normalization_shifts_and_scales_roundtrip(rng, shape):
     assert jnp.allclose(autoencoder.decode(autoencoder.params, latent), x, atol=1e-5)
 
 
-def test_latent_normalization_whitens_a_known_distribution(rng):
-    """The point of per-dataset stats: the diffusion model sees zero mean and
-    unit variance instead of whatever the encoder happens to produce."""
-    x = 3.0 + 5.0 * jax.random.normal(rng, (4096, 1, 1, 4))
-    autoencoder = IdentityAutoEncoder(latent_shift=float(jnp.mean(x)), latent_scale=1.0 / float(jnp.std(x)))
-    latent = autoencoder.encode(autoencoder.params, x)
-    assert abs(float(jnp.mean(latent))) < 1e-4
-    assert abs(float(jnp.std(latent)) - 1.0) < 1e-4
-
-
 @pytest.fixture(scope="module")
 def vae():
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE

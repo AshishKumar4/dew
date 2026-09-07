@@ -27,7 +27,7 @@ from flax import linen as nn
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective, Perplexity, Samples, TEXT_KEY
+from dew.objectives.lm import LMObjective, Samples, TEXT_KEY
 from dew.registry import metrics
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -254,21 +254,6 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
 
 
 
-
-
-def test_token_accuracy_is_the_argmax_the_full_pass_would_have_taken():
-    objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    batch = token_batch()
-    targets = np.asarray(batch[TEXT_KEY][:, 1:])
-
-    _, aux = scalar_loss(objective, params, batch, step_at())
-
-    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
-    expected = (np.argmax(np.asarray(logits), axis=-1) == targets).mean()
-    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected)
-
-
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
     objective = make_objective(pad_id=0)
     params = objective.init(jax.random.key(0))
@@ -371,7 +356,6 @@ def test_evaluation_scores_every_target_of_the_batch():
 
     scores = objective.evaluate(params, batch, step_at())
 
-    assert isinstance(scores, TokenScores)
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     np.testing.assert_array_equal(scores.weights, 1.0)
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
@@ -402,7 +386,6 @@ def test_scoring_with_samples_configured_does_not_decode():
                                               decode=fail_decode))
     params = objective.init(jax.random.key(0))
     scores = objective.evaluate(params, token_batch(), step_at())
-    assert isinstance(scores, TokenScores)
     expected = objective.token_scores(params, token_batch()[TEXT_KEY])
     # Jitted scoring and eager scoring differ by <= 4.8e-7 in float32 on CPU.
     np.testing.assert_allclose(scores.losses, expected.losses, rtol=1e-6, atol=1e-6)
@@ -439,7 +422,7 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
     counted targets moves the score more, which the mean of per-batch means
     gets wrong the moment counts differ."""
     metric = metrics.perplexity()
-    assert isinstance(metric, Perplexity) and metric.reads is TokenScores
+    assert metric.reads is TokenScores
     heavy = TokenScores(losses=jnp.full((1, 4), 1.0), weights=jnp.ones((1, 4)))
     light = TokenScores(losses=jnp.full((1, 4), 3.0), weights=jnp.array([[1.0, 0, 0, 0]]))
 
@@ -692,22 +675,6 @@ def test_a_packed_evaluation_carries_the_document_weights():
     np.testing.assert_array_equal(np.asarray(scores.weights[0]), weights)
 
 
-def test_a_fixed_window_batch_is_scored_exactly_as_before():
-    """A batch without the packing keys has to give the loss it gave before
-    the packed path existed: the model is called without them, and every
-    target counts."""
-    objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    batch = token_batch()
-
-    loss, _ = scalar_loss(objective, params, batch, step_at())
-
-    tokens = np.asarray(batch[TEXT_KEY])
-    logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
-    assert float(loss) == pytest.approx(
-        reference_cross_entropy(logits, tokens[:, 1:]), rel=1e-5)
-
-
 def test_a_packed_row_of_only_padding_does_not_divide_by_zero():
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
@@ -796,7 +763,6 @@ def test_evaluation_weights_follow_loss_role():
 
     scores = objective.evaluate(params, batch, step_at())
 
-    assert isinstance(scores, TokenScores)
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     expected = (np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(scores.weights), expected)

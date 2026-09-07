@@ -216,8 +216,9 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
                         steps=1000, log_every=500)
     params = state.params
 
-    loss, _ = scalar_loss(objective, params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
+    loss, aux = scalar_loss(objective, params, {"text": ROWS}, Step(state.microstep, jax.random.PRNGKey(1), None))
     assert jnp.isfinite(loss)
+    assert set(aux.metrics) == {"masked_accuracy", "masked_fraction"}
 
     t = jnp.full((len(ROWS),), 0.5)
     masked, is_masked = process.corrupt(jax.random.PRNGKey(5), jnp.asarray(ROWS), t)

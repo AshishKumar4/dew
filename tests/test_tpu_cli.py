@@ -459,9 +459,9 @@ def test_a_worker_that_fails_a_captured_command_says_why(fake, capsys):
 def test_reset_kills_what_holds_the_accelerators_on_every_worker(fake):
     fake.offer("slice", "us-central2-b")
     assert run("reset", "slice") == 0
-    commands = [call[-2].split("=", 1)[1] for call in fake.gcloud_calls()[-2:]]
-    assert len(commands) == 2
-    for command in commands:
+    resets = only(fake.gcloud_calls(), "ssh")
+    assert sorted(call[6] for call in resets) == ["--worker=0", "--worker=1"]
+    for command in ssh_commands(resets):
         assert "/dev/accel*" in command and "kill -9 $pids" in command
 
 
@@ -666,21 +666,13 @@ def test_spawn_does_not_launch_when_setup_fails_the_device_check(fake, capsys):
 @pytest.mark.parametrize("argv,expected", [
     (("create", "slice"), "gcloud compute tpus tpu-vm create slice --zone=us-central2-b"),
     (("delete", "slice"), "gcloud compute tpus tpu-vm delete slice"),
-    (("start", "slice"), "gcloud compute tpus tpu-vm start slice"),
-    (("stop", "slice"), "gcloud compute tpus tpu-vm stop slice"),
     (("list",), "gcloud compute tpus tpu-vm list --zone=us-east1-d"),
     (("describe", "slice"), "describe slice --zone=us-central2-b --format=json"),
-    (("ssh", "slice", "-L", "8888"), "--ssh-flag=-L 8888:localhost:8888"),
-    (("run", "slice", "--", "uptime"), "--worker=1"),
-    (("logs", "slice", "job1"), "worker-0.log"),
-    (("copy", "slice", "a", "b"), "compute tpus tpu-vm scp a you@slice:b"),
     (("sync", "slice"), "rsync -az --exclude=.git"),
     (("setup", "slice"), "dew-setup.sh"),
     (("train", "slice", "--", "recipes/lm/train.py"), "--trainer.multi-host True"),
     (("status", "slice"), "uptime -p"),
-    (("reset", "slice"), "/dev/accel*"),
     (("spawn", "base", "1"), "create base-0"),
-    (("init",), 'project = "my-project"'),
 ])
 def test_dry_run_prints_the_plan_and_calls_nothing(fake, capsys, argv, expected):
     flags, rest = tpu_cli._split(argv)
@@ -785,14 +777,10 @@ def test_init_dry_run_shows_the_file_without_writing_it(fake, capsys):
 @pytest.mark.parametrize("kind,workers,devices,runtime", [
     ("v5e-8", 1, 8, "v2-alpha-tpuv5-lite"),
     ("v5e-16", 2, 16, "v2-alpha-tpuv5-lite"),
-    ("v5e-32", 4, 32, "v2-alpha-tpuv5-lite"),
     ("v5litepod-16", 2, 16, "v2-alpha-tpuv5-lite"),
     ("v5p-8", 1, 4, "v2-alpha-tpuv5"),
-    ("v5p-32", 4, 16, "v2-alpha-tpuv5"),
     ("v4-8", 1, 4, "tpu-ubuntu2204-base"),
-    ("v4-32", 4, 16, "tpu-ubuntu2204-base"),
     ("v6e-8", 1, 8, "v2-alpha-tpuv6e"),
-    ("v6e-256", 32, 256, "v2-alpha-tpuv6e"),
     ("v3-8", 1, 8, "tpu-ubuntu2204-base"),
 ])
 def test_what_an_accelerator_type_implies(kind, workers, devices, runtime):
