@@ -10,6 +10,7 @@ reference uses the inverse mask inside its encoder.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Mapping
 
@@ -19,9 +20,10 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew.registry import from_record, towers
 from .attention import RMSNorm
 from .sharding import logical_axes
-from dew.registry import from_record
+from .vision import TowerBase
 
 
 @struct.dataclass
@@ -31,8 +33,9 @@ class AudioEncoding:
     """True for valid encoded frames, including after temporal subsampling."""
 
 
+@towers("gemma3n_audio")
 @dataclasses.dataclass(frozen=True)
-class Gemma3nAudio:
+class Gemma3nAudio(TowerBase):
     input_feat_size: int = 128
     hidden_size: int = 1536
     rms_norm_eps: float = 1e-6
@@ -56,8 +59,9 @@ class Gemma3nAudio:
         return Gemma3nAudioEncoder(self)
 
 
+@towers("gemma4_audio")
 @dataclasses.dataclass(frozen=True)
-class Gemma4Audio:
+class Gemma4Audio(TowerBase):
     hidden_size: int = 1024
     num_hidden_layers: int = 12
     num_attention_heads: int = 8
@@ -520,33 +524,47 @@ def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
     return from_record(cls, {key: value for key, value in record.items() if key in fields})
 
 
+@functools.cache
+def _audio_template(config: Gemma3nAudio | Gemma4Audio):
+    features = config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
+    template = jax.eval_shape(config.build().init, jax.random.key(0),
+                              jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
+                              jax.ShapeDtypeStruct((1, 16), jnp.bool_))
+    return {tuple(str(k.key) for k in path): value
+            for path, value in jax.tree_util.tree_leaves_with_path(template)}
+
+
+def audio_weight_path(name: str, config: Gemma3nAudio | Gemma4Audio) -> tuple[str, ...]:
+    """One bare HF audio tensor name into its complete native collection path."""
+    parts = name.split(".")
+    if len(parts) > 1 and parts[0] in ("conformer", "layers") and parts[1].isdigit():
+        parts = [f"{parts[0]}_{parts[1]}", *parts[2:]]
+    collection = "constants" if parts[-1] in ("input_min", "input_max", "output_min", "output_max") else "params"
+    if parts[-1] == "weight":
+        norms = {"norm", "pre_attn_norm", "post_norm", "pre_layer_norm", "post_layer_norm",
+                 "norm_pre_attn", "norm_post_attn", "norm_out", "conv_norm"}
+        parts[-1] = "scale" if len(parts) > 1 and parts[-2] in norms else "kernel"
+    path = (collection, *parts)
+    if path not in _audio_template(config):
+        raise ValueError(f"audio tensor {name!r} does not match the encoder")
+    return path
+
+
+
 def audio_weights(tensors: Mapping[str, np.ndarray], config: Gemma3nAudio | Gemma4Audio) -> dict:
     """Translate reference weights into params and frozen clipping constants.
 
     Prefix stripping belongs to the shared wrapper loader. This accepts only
     the encoder's own tensor names and verifies them against its abstract tree.
     """
-    module = config.build()
-    features = config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
-    template = jax.eval_shape(module.init, jax.random.key(0),
-                              jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
-                              jax.ShapeDtypeStruct((1, 16), jnp.bool_))
-    expected = {tuple(str(k.key) for k in path): value for path, value in jax.tree_util.tree_leaves_with_path(template)}
+    expected = _audio_template(config)
     result = {}
     seen = set()
     for name, array in tensors.items():
-        parts = name.split(".")
-        if len(parts) > 1 and parts[0] in ("conformer", "layers") and parts[1].isdigit():
-            parts = [f"{parts[0]}_{parts[1]}", *parts[2:]]
-        collection = "constants" if parts[-1] in ("input_min", "input_max", "output_min", "output_max") else "params"
+        path = audio_weight_path(name, config)
         value = np.asarray(array, np.float32)
-        if parts[-1] == "weight":
-            if value.ndim == 1:
-                parts[-1] = "scale"
-            else:
-                parts[-1] = "kernel"
-                value = np.ascontiguousarray(value.transpose(*range(2, value.ndim), 1, 0))
-        path = (collection, *parts)
+        if path[-1] == "kernel":
+            value = np.ascontiguousarray(value.transpose(*range(2, value.ndim), 1, 0))
         if path not in expected or value.shape != expected[path].shape:
             raise ValueError(f"audio tensor {name!r} with shape {value.shape} does not match the encoder")
         seen.add(path)
