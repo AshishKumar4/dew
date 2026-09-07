@@ -14,7 +14,7 @@ Extend as use grows; a use outside this surface fails here, naming it.
 
 import abc
 import builtins
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from os import PathLike
 from typing import Any, Generic, Protocol, TypeAlias, TypeVar, overload
 
@@ -79,19 +79,33 @@ class MapDataset(Generic[T]):
 
 
 class DatasetIterator(Generic[T]):
-    """One pass over an `IterDataset` that can report and restore its place."""
+    """One pass over an `IterDataset`, able to report and restore its place.
+
+    grain declares `get_state` and `set_state` abstract, so every iterator in
+    a pipeline has them whether or not the source underneath can honour them.
+    """
 
     def __iter__(self) -> DatasetIterator[T]: ...
     def __next__(self) -> T: ...
-    def get_state(self) -> dict[str, Any]: ...
-    def set_state(self, state: dict[str, Any]) -> None: ...
+    def get_state(self) -> dict[str, object]: ...
+    def set_state(self, state: Mapping[str, object]) -> None: ...
     def close(self) -> None: ...
 
 
 class IterDataset(Generic[T]):
     """Records read once, in order, with the worker machinery behind them."""
 
+    def __init__(
+        self, parents: MapDataset[Any] | IterDataset[Any]
+        | Sequence[MapDataset[Any] | IterDataset[Any]] = ()
+    ) -> None: ...
     def __iter__(self) -> DatasetIterator[T]: ...
+    def random_map(
+        self,
+        transform: RandomMapTransform | Callable[[T, np.random.Generator], S],
+        *,
+        seed: int | None = ...,
+    ) -> IterDataset[S]: ...
     def mp_prefetch(
         self,
         options: MultiprocessingOptions | None = ...,
