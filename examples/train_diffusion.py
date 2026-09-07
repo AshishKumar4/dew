@@ -1,7 +1,7 @@
 """Train a text-to-image diffusion model on Oxford Flowers, sample from it, export the weights.
 
-    python examples/train_diffusion.py --epochs 200 --image-size 128
-    python examples/train_diffusion.py --steps 20 --image-size 32   # smoke run
+    python examples/train_diffusion.py --data-path /data/oxford_flowers102/2.1.1 --epochs 200
+    python examples/train_diffusion.py --data-path /data/oxford_flowers102/2.1.1 --steps 20 --image-size 32
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +25,7 @@ from dew.training import Checkpoints, MeshSpec, Trainer
 
 @dataclass
 class Config:
+    data_path: Path | None = None
     image_size: int = 128
     batch_size: int = 32
     epochs: int = 200
@@ -46,8 +47,10 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
 
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or OxfordFlowers(image_size=config.image_size).load(
-        batch=config.batch_size, tokenize=inputs.tokenize)
+    data = data or OxfordFlowers(
+        path=None if config.data_path is None else str(config.data_path.expanduser()),
+        image_size=config.image_size,
+    ).load(batch=config.batch_size, tokenize=inputs.tokenize)
     steps = config.steps or data.epoch_steps(config.epochs)
     fields = dict(config.model, output_channels=3, dtype="bfloat16")
     model = models.build("simple_dit", **fields)

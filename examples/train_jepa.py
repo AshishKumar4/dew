@@ -1,7 +1,7 @@
 """Train an I-JEPA encoder on Oxford Flowers, probe it, save the encoder.
 
-    python examples/train_jepa.py --epochs 300 --image-size 224
-    python examples/train_jepa.py --steps 20 --image-size 32 --patch-size 4   # smoke run
+    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --epochs 300
+    python examples/train_jepa.py --data-path /data/oxford_flowers102/2.1.1 --steps 20 --image-size 32 --patch-size 4
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +21,7 @@ from dew.training import Checkpoints, Trainer
 
 @dataclass
 class Config:
+    data_path: Path | None = None
     classes: int = 102
     image_size: int = 224
     patch_size: int = 16
@@ -34,7 +35,10 @@ class Config:
 
 
 def main(config: Config, data=None):
-    data = data or OxfordFlowers(image_size=config.image_size).load(batch=config.batch_size)
+    data = data or OxfordFlowers(
+        path=None if config.data_path is None else str(config.data_path.expanduser()),
+        image_size=config.image_size,
+    ).load(batch=config.batch_size)
     steps = config.steps or data.epoch_steps(config.epochs)
     side = config.image_size // config.patch_size
     grid = (side, side)
