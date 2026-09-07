@@ -11,6 +11,8 @@ good models
 .env
 .env
 tensorboard
+# the run-output directory above, not the stub package the checker reads
+!stubs/tensorboard/
 wandb
 gcs_mount
 datacache

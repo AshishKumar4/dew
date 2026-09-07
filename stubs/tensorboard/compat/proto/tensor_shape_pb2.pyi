@@ -1,0 +1,6 @@
+from collections.abc import Iterable
+
+class TensorShapeProto:
+    class Dim:
+        def __init__(self, *, size: int = ..., name: str = ...) -> None: ...
+    def __init__(self, *, dim: Iterable[TensorShapeProto.Dim] = ...) -> None: ...
