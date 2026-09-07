@@ -64,6 +64,8 @@ test = [
 av = ["opencv-python", "moviepy"]
 # FID (scipy sqrtm) and Inception weight download
 metrics = ["scipy", "requests"]
+# Explicit LocalTracker.plot()/plots=True rendering.
+plots = ["matplotlib"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.

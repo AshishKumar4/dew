@@ -1,0 +1,193 @@
+"""Reporting persists real results and releases owned sinks on failures."""
+
+import json
+import math
+
+import jax
+import numpy as np
+import optax
+import pytest
+from PIL import Image
+
+from dew.artifacts import ImageGrid, TextSamples, VideoGrid, Representations, TokenScores
+from dew.data import Dataset
+from dew.telemetry.records import RunRecord, FitEnded, json_value
+from dew.training import LocalTracker, Trackers, Trainer, Checkpoints
+from test_instrumentation import Regression, batches
+
+
+def records(path):
+    return [json.loads(line) for line in (path / 'records.jsonl').read_text().splitlines()]
+
+
+def test_nonfinite_metrics_preserve_meaning_without_invalid_json(tmp_path):
+    with LocalTracker(tmp_path) as tracker:
+        tracker.log({'psnr': math.inf, 'diverged': math.nan, 'bound': -math.inf, 'loss': 1.5}, 2)
+    row = json.loads((tmp_path / 'scalars.jsonl').read_text(),
+                     parse_constant=lambda x: pytest.fail(f'invalid JSON: {x}'))
+    assert row['scalars'] == {'psnr': '+Inf', 'diverged': 'NaN', 'bound': '-Inf', 'loss': 1.5}
+    assert float(row['scalars']['psnr']) == math.inf
+    with pytest.raises(RuntimeError, match='closed'):
+        tracker.log({'loss': 1.}, 3)
+
+
+def test_journals_do_not_touch_recipe_config_and_preserve_metadata(tmp_path):
+    config = tmp_path / 'run.json'
+    config.write_text('{"model":"original"}')
+    with LocalTracker(tmp_path) as tracker:
+        tracker.artifact(RunRecord('example', {'model': 'affine'}, {}, 2, {'jax': jax.__version__}), 0)
+    assert config.read_text() == '{"model":"original"}'
+    assert records(tmp_path)[0]['value']['config'] == {'model': 'affine'}
+    with pytest.raises(TypeError):
+        json_value({'device-array': np.ones(2)})
+
+
+def test_all_builtin_previews_have_local_representations(tmp_path):
+    with LocalTracker(tmp_path) as tracker:
+        tracker.artifact(ImageGrid(np.zeros((1, 8, 8, 3)), ('image',)), 1)
+        tracker.artifact(VideoGrid(np.zeros((1, 2, 8, 8, 3)), ('clip',)), 1)
+        tracker.artifact(TextSamples(np.array([[1, 2]]), texts=('text',)), 1)
+        tracker.artifact(Representations(np.ones((2, 3)), np.array([0, 1])), 1)
+        tracker.artifact(TokenScores(np.ones((2, 3)), np.ones((2, 3))), 1)
+    entries = records(tmp_path)
+    assert {e['type'] for e in entries} == {
+        'ImageGrid', 'VideoGrid', 'TextSamples', 'Representations', 'TokenScores'}
+    image = Image.open(next(tmp_path.glob('*.png')))
+    assert image.size == (8, 8) and np.asarray(image)[0, 0].tolist() == [127, 127, 127]
+    payloads = [json.loads(p.read_text()) for p in tmp_path.glob('*.json')]
+    assert {'prompt': '', 'texts': ['text'], 'tokens': [[1, 2]]} in payloads
+
+
+def test_fanout_continues_to_local_sink_and_context_preserves_primary(tmp_path):
+    primary = ValueError('bad objective')
+
+    class Broken:
+        def log(self, scalars, step):
+            raise OSError('sink offline')
+
+        def artifact(self, value, step):
+            raise OSError('sink offline')
+
+        def close(self):
+            raise OSError('close offline')
+
+    local = LocalTracker(tmp_path)
+    with pytest.raises(ValueError) as raised:
+        with Trackers(Broken(), local) as tracker:
+            with pytest.raises(OSError):
+                tracker.log({'loss': 3.}, 1)
+            raise primary
+    assert raised.value is primary
+    assert 'close offline' in '\n'.join(primary.__notes__)
+    assert json.loads((tmp_path / 'scalars.jsonl').read_text())['scalars'] == {'loss': 3.}
+    with pytest.raises(RuntimeError):
+        local.log({}, 2)
+
+
+def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_path):
+    local = LocalTracker(tmp_path / 'tracking')
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=local,
+                      checkpoints=Checkpoints(str(tmp_path / 'checkpoint')))
+    state = trainer.fit(Dataset(batches, None, None, 8), steps=2, log_every=1)
+    local.log({'after_fit': 1.}, 2)
+    local.close()
+    entries = records(tmp_path / 'tracking')
+    assert int(state.step) == 2
+    assert [e['type'] for e in entries] == ['FitStarted', 'CheckpointRequested', 'FitEnded']
+    assert entries[-1]['value']['status'] == 'completed'
+
+
+def test_failure_is_recorded_without_replacing_the_original(tmp_path):
+    error = RuntimeError('rollout broke')
+
+    def rollout(state, batch, key):
+        raise error
+
+    with LocalTracker(tmp_path) as local:
+        trainer = Trainer(Regression(), optax.sgd(.01), key=jax.random.key(0),
+                          tracker=local, rollout=rollout)
+        with pytest.raises(RuntimeError) as raised:
+            trainer.fit(Dataset(batches, None, None, 8), steps=2)
+        assert raised.value is error
+    outcome = records(tmp_path)[-1]['value']
+    assert outcome['status'] == 'failed' and 'rollout broke' in outcome['traceback']
+
+
+def test_plotting_is_explicit_and_infinity_remains_in_journal(tmp_path):
+    pytest.importorskip('matplotlib')
+    with LocalTracker(tmp_path, plots=True) as tracker:
+        tracker.log({'psnr': 10.}, 1)
+        tracker.log({'psnr': math.inf}, 2)
+        assert not list(tmp_path.glob('*.png'))
+    assert Image.open(tmp_path / 'metric-0.png').size[0] > 0
+    assert '+Inf' in (tmp_path / 'scalars.jsonl').read_text()
+
+
+@pytest.mark.parametrize('preview', [False, True])
+def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview):
+    generated = []
+
+    class Display(Regression):
+        def preview(self, params, batch, step, *, scored=None):
+            generated.append(int(step.step))
+            return ImageGrid(np.zeros((1, 8, 8, 3)))
+
+    with LocalTracker(tmp_path) as sink:
+        trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
+        trainer.fit(Dataset(batches, lambda: iter([next(batches())]), None, 8),
+                    steps=2, eval_every=1, preview=preview)
+    assert generated == ([1, 2] if preview else [])
+    assert len(list(tmp_path.glob('*.png'))) == (2 if preview else 0)
+
+
+@pytest.mark.parametrize('body_failure', [False, True])
+def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch, request, body_failure):
+    import functools
+    import wandb
+    from dew.training import WandbTracker
+    from wandb.proto import wandb_internal_pb2
+    from wandb.sdk.internal.datastore import DataStore
+    request.addfinalizer(wandb.teardown)
+    monkeypatch.setenv('WANDB_DIR', str(tmp_path))
+    monkeypatch.setenv('WANDB_MODE', 'offline')
+    monkeypatch.setenv('WANDB_SILENT', 'true')
+    # Explicit SDK directory avoids its process-wide cached environment from
+    # sending this run's transport file to a preceding test's temporary path.
+    monkeypatch.setattr(wandb, 'init', functools.partial(wandb.init, dir=str(tmp_path)))
+    original = ValueError('training failed')
+    cleanup = OSError('local journal flush failed')
+
+    class FailedLocal(LocalTracker):
+        def close(self):
+            super().close()
+            raise cleanup
+
+    local = FailedLocal(tmp_path / 'local')
+    later_local = LocalTracker(tmp_path / 'later-local')
+    with pytest.raises((ValueError, OSError)) as caught:
+        with Trackers(local, WandbTracker('dew-close-proof', offline=True), later_local) as sinks:
+            sinks.log({'train/loss': 1.}, 1)
+            if body_failure:
+                raise original
+    assert caught.value is (original if body_failure else cleanup)
+    if body_failure:
+        assert any('local journal flush failed' in note for note in original.__notes__)
+    with pytest.raises(RuntimeError, match='closed'):
+        later_local.log({}, 2)
+
+    # Read the actual offline transport record a subsequent W&B sync would
+    # upload. This checks the persisted run outcome, not a mock finish echo.
+    journal = next((tmp_path / 'wandb').glob('offline-run-*/*.wandb'))
+    store = DataStore()
+    store.open_for_scan(str(journal))
+    exit_codes = []
+    try:
+        while (payload := store.scan_data()) is not None:
+            record = wandb_internal_pb2.Record()
+            record.ParseFromString(payload)
+            if record.HasField('exit'):
+                exit_codes.append(record.exit.exit_code)
+    finally:
+        store.close()
+    assert exit_codes == [1]
+

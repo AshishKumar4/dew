@@ -73,7 +73,7 @@ The custom `step(objective, optimizer)` factory owns accepted/update clocks, sca
 
 ```text
 fit(data, *, steps, log_every=100, eval_every=None,
-    checkpoint_every=None, metrics=()) -> TrainState
+    checkpoint_every=None, metrics=(), preview=False) -> TrainState
 ```
 
 - `data` is a `Dataset`.
@@ -82,6 +82,7 @@ fit(data, *, steps, log_every=100, eval_every=None,
 - `eval_every=None` disables evaluation. With an interval, evaluation also runs at the end.
 - `checkpoint_every` controls periodic saves when a checkpointer exists. The normal completion path can still save a final checkpoint when a checkpointer is present.
 - `metrics` reduce evaluation artifacts and require evaluation to be enabled.
+- `preview=True` explicitly requests generated/display artifacts during evaluation; adding a scalar tracker alone does not request them.
 
 Checkpointable data must supply the consumed iterator position. A failed scaled transaction advances attempted work and scaler history while preserving the earlier accepted prefix. Completely inactive windows close accepted slots without an optimizer call, weight decay, EMA, or deferred effects. Auxiliary-only windows can still be active.
 

@@ -29,7 +29,8 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.registry import datasets, encoders, metrics, models, presets, samplers
     from dew.sampling import CFG, sample
     from dew.training import (
-        Checkpoints, Evaluation, Layout, MeshSpec, Tracker, Trainer, TrainState, WandbTracker, evaluate,
+        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, Tracker, Trackers,
+        Trainer, TrainState, WandbTracker, evaluate,
     )
 
 __version__ = "0.1.0"
@@ -48,7 +49,8 @@ _EXPORTS = {
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
-    "WandbTracker": "dew.training", "Evaluation": "dew.training", "evaluate": "dew.training",
+    "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
+    "Evaluation": "dew.training", "evaluate": "dew.training",
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
@@ -82,6 +84,6 @@ __all__ = [
     "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Evaluation", "Field",
     "ImageGrid", "InputSpec", "Layout", "MeshSpec", "Objective", "Process",
     "Representations", "Step", "TextSamples", "TokenScores", "Tracker",
-    "TrainState", "Trainer", "VideoGrid", "WandbTracker",
+    "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
     "datasets", "encoders", "evaluate", "metrics", "models", "presets", "sample", "samplers",
 ]
