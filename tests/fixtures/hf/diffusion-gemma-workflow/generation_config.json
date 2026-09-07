@@ -1,0 +1,16 @@
+{
+  "confidence_threshold": 0.005,
+  "eos_token_id": 1,
+  "max_denoising_steps": 4,
+  "max_new_tokens": 7,
+  "pad_token_id": 0,
+  "return_dict_in_generate": true,
+  "sampler_config": {
+    "_cls_name": "EntropyBoundSamplerConfig",
+    "entropy_bound": 0.1
+  },
+  "stability_threshold": 1,
+  "t_max": 0.8,
+  "t_min": 0.4,
+  "transformers_version": "5.16.1"
+}
