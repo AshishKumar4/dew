@@ -36,7 +36,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
-from ..moe import GROUPED_MATMULS, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
@@ -192,6 +192,11 @@ class Mixture:
     `moe.grouped_matmul`'s 'xla' or 'tokamax', the way `attention_impl`
     names the attention kernel; it changes which kernel computes the same
     contraction and nothing about the routing.
+
+    `dispatch='exchange'` sends selected tokens to their expert shard in
+    bounded rounds on the existing expert mesh axis. It requires fp32 and
+    an expert count divisible by that axis. The default `'global'` retains
+    the global sort/gather path, including its low-precision gradients.
     """
 
     experts: int
@@ -210,6 +215,7 @@ class Mixture:
     expert_features: Optional[int] = None
     shared_features: int = 0
     implementation: str = 'xla'
+    dispatch: str = 'global'
 
     def __post_init__(self):
         if self.layers is not None:
@@ -236,6 +242,8 @@ class Mixture:
             raise ValueError(
                 f"implementation is the experts' grouped matmul, one of "
                 f"{list(GROUPED_MATMULS)}, got {self.implementation!r}")
+        if self.dispatch not in EXPERT_DISPATCHES:
+            raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
@@ -1206,6 +1214,7 @@ class CausalTransformer(nn.Module):
             out_features=self.emb_features,
             activation=self.mlp,
             implementation=mixture.implementation,
+            dispatch=mixture.dispatch,
             score_function=mixture.score_function,
             normalize_weights=mixture.norm_topk_prob,
             routed_scaling_factor=mixture.scaling,
@@ -1227,6 +1236,7 @@ class CausalTransformer(nn.Module):
             out_features=self.emb_features,
             activation=self.mlp,
             implementation=mixture.implementation,
+            dispatch=mixture.dispatch,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
@@ -1238,6 +1248,8 @@ class CausalTransformer(nn.Module):
         if self.mlp == 'swigluoai':
             if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
                 raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
+            if mixture.dispatch != 'global':
+                raise ValueError('swigluoai experts do not support exchange dispatch')
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,
