@@ -1,5 +1,6 @@
 """Real sampled tool actions, verifier rewards and action-only GRPO updates."""
 
+import asyncio
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
@@ -440,3 +441,75 @@ def test_verifier_runs_before_environment_resources_are_released():
     episodes = collect(rollout, trainer.initial_state())
     assert {episode.reward for episode in episodes} == {0., 1.}
     assert harness.opened == harness.closed
+
+
+def test_projection_rejects_distinct_weight_bindings_with_identical_clocks():
+    """Update/attempt counters alone do not identify the generating weights."""
+    trainer, rollout = build()
+    first_state = trainer.initial_state()
+    second_state = replace(first_state, params={"params": {
+        "table": first_state.params["params"]["table"].at[START, CALL_THREE].add(.8)}})
+    first = collect(rollout, first_state)
+    second = collect(rollout, second_state)
+    assert first[0].identity == second[0].identity
+    assert first[0].policy_step == second[0].policy_step == 0
+    assert abs(first[0].transitions[0].action.raw_log_probs[0]
+               - second[0].transitions[0].action.raw_log_probs[0]) > .01
+
+    # Distinct sample identities and unchanged clocks cannot catch the splice.
+    with pytest.raises(ValueError, match="binding"):
+        rollout.project((*first[:2], *second[2:]))
+    crossed = replace(first[0], transitions=(
+        replace(first[0].transitions[0], action=second[0].transitions[0].action),
+        *first[0].transitions[1:]))
+    with pytest.raises(ValueError, match="binding"):
+        rollout.project((crossed, *first[1:]))
+
+
+@pytest.mark.parametrize("phase, retained_turns", [("reset", 0), ("tool", 1), ("verifier", 2)])
+def test_async_cancellation_keeps_its_cause_and_partial_episode(phase, retained_turns):
+    cancelled = asyncio.CancelledError("cancelled tool bridge")
+    harness = Harness()
+    records, exiting_errors = [], []
+
+    class Session(SquareSession):
+        def reset(self):
+            observation = super().reset()
+            if phase == "reset":
+                raise cancelled
+            return observation
+
+        def step(self, action):
+            if phase == "tool":
+                raise cancelled
+            return super().step(action)
+
+    @contextmanager
+    def environment(identity):
+        try:
+            yield Session(identity, harness)
+        except BaseException as error:
+            exiting_errors.append(error)
+            raise
+        finally:
+            harness.closed.append(identity)
+
+    def verifier(episode):
+        if phase == "verifier":
+            raise cancelled
+        return verify(episode)
+
+    trainer, rollout = build(environment=environment, verifier=verifier, record=records.append)
+    with pytest.raises(EpisodeCancelled) as caught:
+        collect(rollout, trainer.initial_state())
+
+    assert caught.value.__cause__ is cancelled
+    assert exiting_errors == [cancelled]
+    assert harness.opened == harness.closed
+    assert len(records) == 1 and records[0] is caught.value.episode
+    assert records[0].status == EpisodeStatus.CANCELLED and records[0].reward is None
+    assert len(records[0].transitions) == retained_turns
+    if retained_turns:
+        action = records[0].transitions[0].action
+        assert action.tokens[-1] == EOS
+        assert len(action.tokens) == len(action.raw_log_probs) == len(action.behavior_log_probs)
