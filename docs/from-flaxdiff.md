@@ -16,7 +16,7 @@ If you are new to the project, start with [getting started](getting-started.md).
 | `flaxdiff.metrics` | `dew.eval` | Choose metrics that consume the current objective's evaluation outputs. |
 | `training.py` and `training_jepa.py` | `recipes/diffusion/train.py` and `recipes/jepa/train.py` | Recipes use dataclass configurations and generated CLI flags instead of the old argparse interface. |
 
-Read [objectives](concepts/objectives.md) for the shared training contract, [the diffusion guide](guides/diffusion.md) for the diffusion pieces, and [recipes](recipes.md) for command-line configuration. The [API overview](api.md) lists current modules.
+Read [objectives](concepts/objectives.md) for the shared training contract, [the diffusion guide](guides/diffusion.md) for the diffusion pieces, and [recipes](recipes.md) for command-line configuration. The [core API reference](reference/core-api.md) describes the current interfaces.
 
 ## Start in a new run directory
 
