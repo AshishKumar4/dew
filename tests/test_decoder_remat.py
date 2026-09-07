@@ -1,12 +1,14 @@
 """Block recomputation preserves training, stateful collections and checkpoints.
 
-JAX 0.11.1 CPU: the two-step momentum-SGD comparisons observed maximum
-differences of 4.8e-7 in loss, 2.4e-5 in gradients, 1.2e-7 in updated
-variables and 7.7e-6 in per-head QK maxima, across the eight shape/scan
-cases. Momentum SGD keeps update differences on the gradient scale; Adam
-can amplify roundoff-size gradients near AltUp zero-initialized scales.
-The same tests also run on JAX 0.10.2 and on one RTX 4080 (without the
-four simulated-mesh cases). Cached decoding is bitwise identical.
+JAX 0.11.1 CPU: with both models stepping from the same variables and
+optimizer state, the two momentum-SGD steps observed maximum differences of
+4.8e-7 in loss, 1.4e-5 in gradients and optimizer state, 6.0e-8 in updated
+variables, 3.1e-5 in reported metrics and 7.6e-6 in per-head QK maxima,
+across the eight shape/scan cases. Momentum SGD keeps update differences on
+the gradient scale; Adam can amplify roundoff-size gradients near AltUp
+zero-initialized scales. The same tests also run on JAX 0.10.2 and on one
+RTX 4080 (without the four simulated-mesh cases). Cached decoding is bitwise
+identical.
 """
 
 import jax
@@ -23,6 +25,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.state import TrainState
+from dew.training.trainer import write_back
 
 
 SHAPES = {
@@ -62,6 +65,8 @@ def objective_for(model):
 
 
 def training_step(model):
+    """One committed step as the trainer takes it: the optimizer update, then
+    sequential collection writes and the objective's deferred effects."""
     objective = objective_for(model)
     optimizer = optax.sgd(1e-3, momentum=0.9)
 
@@ -72,11 +77,21 @@ def training_step(model):
                                        tokens, info),
             has_aux=True)(variables["params"])
         updates, state = optimizer.update(grads, state, variables["params"])
-        moved = {**variables, "params": optax.apply_updates(variables["params"], updates),
-                 **(aux.variables or {})}
+        moved = write_back({**variables, "params": optax.apply_updates(variables["params"], updates)},
+                           aux.variables)
+        if aux.effects is not None:
+            moved = write_back(moved, objective.apply_effects(moved, aux.effects))
         return moved, state, loss, grads, aux
 
     return jax.jit(step), optimizer
+
+
+def train_state(step, variables, opt_state, key):
+    """A single-microbatch state after `step` committed updates."""
+    count = jnp.asarray(step, jnp.int32)
+    return TrainState(step=count, microstep=count, updates=count, params=variables,
+                      opt_state=opt_state, ema=None, key=key, scale=None,
+                      window_size=jnp.asarray(1, jnp.int32))
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -84,8 +99,14 @@ def training_step(model):
 def test_recomputed_blocks_train_the_same_model(shape, scan):
     """Dropout, MTP, MoE balancing and shared K/V retain their derivatives.
 
-    Both optimizer steps use their own updated variables and fresh RNG keys;
-    matching only the first step would miss lost mutable collection writes.
+    Each step hands both models the same variables and optimizer state, the
+    plain model's from the previous step, with a fresh key, and compares the
+    committed step including the deferred router-bias effects. Independent
+    chains cannot be compared past one step: recomputation changes rounding
+    in the backward pass (3e-8 in the updated variables here), and one
+    token's second and third router scores in layer 1 of the sparse model
+    were 1.6e-7 apart at the second step, so that step routed the token to
+    a different expert and moved the loss by 6e-4.
     """
     plain = model_for(shape, scan_layers=scan)
     remat = plain.clone(remat=True)
@@ -99,19 +120,26 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
                       jax.jit(remat.apply)(variables, ids)) < 2e-5
     run, solver = training_step(plain)
     rerun, _ = training_step(remat)
-    state, other_state = solver.init(variables["params"]), solver.init(recomputed["params"])
+    state = solver.init(variables["params"])
     original = variables
     for index in range(2):
         key = jax.random.fold_in(jax.random.key(4), index)
-        variables, state, loss, grads, aux = run(variables, state, tokens, key)
+        moved, next_state, loss, grads, aux = run(variables, state, tokens, key)
         recomputed, other_state, other_loss, other_grads, other_aux = rerun(
-            recomputed, other_state, tokens, key)
+            variables, state, tokens, key)
         assert abs(float(loss - other_loss)) < 2e-5
         assert difference(grads, other_grads) < 3e-5
-        assert difference(variables, recomputed) < 2e-5
+        assert difference(moved, recomputed) < 2e-5
+        assert difference(next_state, other_state) < 2e-5
         assert difference(aux.metrics, other_aux.metrics) < 1e-4
         assert difference(aux.qk_stats, other_aux.qk_stats) < 1e-4
+        if shape == "sparse":
+            # Router slot counts are integers; recomputation routes identically.
+            assert difference(aux.effects, other_aux.effects) == 0
+        variables, state = moved, next_state
     assert difference(original["params"], variables["params"]) > 1e-4
+    if shape == "sparse":
+        assert difference(original["moe"], variables["moe"]) > 0
 
 
 @pytest.mark.parametrize("shape", ["dense", "shared", "altup"])
@@ -164,18 +192,19 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     run, optimizer = training_step(model)
     moved, opt_state, _, _, _ = run(
         variables, optimizer.init(variables["params"]), batch(), jax.random.key(3))
-    state = TrainState(jnp.asarray(1), moved, opt_state, None, jax.random.key(4))
+    state = train_state(1, moved, opt_state, jax.random.key(4))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(1, state, None)
     checkpoints.wait()
     resumed_model = model.clone(remat=not saved_remat)
     template_vars = resumed_model.init(jax.random.key(8), batch()["text"][:, :-1])
-    template = TrainState(jnp.asarray(0), template_vars,
-                          optimizer.init(template_vars["params"]), None, jax.random.key(0))
+    template = train_state(0, template_vars, optimizer.init(template_vars["params"]),
+                           jax.random.key(0))
     template = jax.tree.map(lambda value: jax.ShapeDtypeStruct(
         value.shape, value.dtype, sharding=value.sharding), template)
     restored, position = checkpoints.restore(template)
     assert position is None
+    assert int(restored.step) == 1 and int(restored.updates) == 1
     expected = run(state.params, state.opt_state, batch(), state.key)
     resume, _ = training_step(resumed_model)
     actual = resume(restored.params, restored.opt_state, batch(), restored.key)
