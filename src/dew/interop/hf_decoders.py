@@ -1368,10 +1368,12 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         partial_rotary_type='default',
         kinds=kinds,
     )
-    # Read by no forward pass in transformers 5.16.1. mlp_only_layers and
-    # mamba_ssm_dtype are names no qwen3_5 module looks up, and the MTP
-    # fields describe the mtp.* weights the reference drops on load
-    # (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected).
+    depth = hf_config.get('mtp_num_hidden_layers', 0)
+    if type(depth) is not int or depth not in (0, 1):
+        _refuse('mtp_num_hidden_layers', 'Qwen supports the released single shared prediction layer')
+    if hf_config.get('mtp_use_dedicated_embeddings', False):
+        _refuse('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head')
+    config['num_nextn_predict_layers'] = depth
     used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_num_hidden_layers',
                  'mtp_use_dedicated_embeddings'))
 
@@ -1731,6 +1733,8 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             projector_tensors[bare[len(projector_prefix):]] = tensor
         elif bare.startswith(tower_prefix):
             tower_tensors[bare[len(tower_prefix):]] = tensor
+        elif bare.startswith("mtp.") and record["text_model_type"] == _QWEN35:
+            text_tensors[bare] = tensor
         elif bare == "lm_head.weight":
             text_tensors["lm_head.weight"] = tensor
         else:
@@ -1790,13 +1794,9 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
     The first name is the collection: `params` for a weight, `moe` for
     DeepSeek's balancing bias. That bias is router state a training step
     moves, not a parameter, so it lands where `Router` keeps it. None means
-    the tensor has no place in the tree: the tied lm_head a checkpoint
-    carries as a copy of the embedding or the mtp.* weights of a Qwen3.5
-    checkpoint, which the reference itself drops on load
-    (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected). No
-    forward pass of the reference reads them. A name the map cannot explain
-    at all raises ValueError with the tensor name, so an unfamiliar
-    checkpoint fails at load.
+    the tensor is the tied lm_head copy. Prediction layers use their own
+    family path rather than being discarded. An unexplained tensor name
+    raises before any checkpoint is accepted.
     """
     parts = hf_name.split('.')
     if (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
@@ -1821,8 +1821,6 @@ def _param_path(parts: List[str], config: Mapping[str, Any]) -> Optional[Tuple[s
         return ('per_layer_projection_norm', 'scale')
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
-    if parts[0] == 'mtp' and 'linear_attention' in config.get('layer_types', ()):
-        return None
 
     if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         layer, module, leaf = f'layers_{parts[2]}', parts[3], parts[-1]
@@ -2608,7 +2606,39 @@ _GEMMA4_MOE: Dict[Tuple[str, ...], Tuple[str, ...]] = {
 }
 
 
+_QWEN_MTP_FIELDS = {
+    "fc.weight": ("eh_proj", "kernel"),
+    "pre_fc_norm_embedding.weight": ("enorm", "scale"),
+    "pre_fc_norm_hidden.weight": ("hnorm", "scale"),
+    "norm.weight": ("final_norm", "scale"),
+}
+
+
+def _qwen_mtp_path(name: str, config: Mapping[str, object],
+                   block_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]]) -> Tuple[str, ...]:
+    """vLLM qwen3_5_mtp.py's shared-embedding single prediction layer."""
+    if config.get("num_nextn_predict_layers", 0) != 1:
+        raise ValueError("mtp tensors require one configured Qwen prediction layer")
+    tail = name.removeprefix("mtp.")
+    if tail in _QWEN_MTP_FIELDS:
+        return ("params", "mtp_0", *_QWEN_MTP_FIELDS[tail])
+    if tail.startswith("layers.0."):
+        path = block_path("model." + tail, config)
+        if path is not None:
+            return (path[0], "mtp_0", "block", *path[2:])
+    raise ValueError(f"unknown Qwen MTP tensor {name!r}")
+
+
+def _qwen35_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    if name.startswith("mtp."):
+        return _qwen_mtp_path(name, config, _dew_path)
+    return _dew_path(name, config)
+
+
+
 def _qwen35_moe_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    if name.startswith("mtp."):
+        return _qwen_mtp_path(name, config, _qwen35_moe_path)
     parts = name.split(".")
     if len(parts) >= 5 and parts[:2] == ["model", "layers"] and parts[2].isdigit():
         tail = parts[3:]
@@ -2722,7 +2752,7 @@ _FAMILY_ENTRIES = (
     DecoderFamily((_QWEN35,), _qwen35_config,
                   lambda fields: bool(fields['output_gate']
                                       or 'linear_attention' in (fields['layer_types'] or ())),
-                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}),
+                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path),
     DecoderFamily(('olmo3',), _olmo3_config,
                   lambda fields: not fields['pre_norms'],
                   'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),

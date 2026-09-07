@@ -136,6 +136,56 @@ class MultimodalTransformer(nn.Module):
     def causal(self) -> bool:
         return self.language_model.causal
 
+    @property
+    def num_nextn_predict_layers(self) -> int:
+        return self.language_model.num_nextn_predict_layers
+
+    def _conditioned_embeddings(self, tokens, image_indices, conditioning, train=False):
+        if image_indices is None:
+            raise ValueError("conditioned inputs require image_indices")
+        safe_tokens = jnp.where(image_indices >= 0, 0, tokens)
+        embeddings = self.language_model.embed_tokens(safe_tokens)
+        if self.language_model.embedding_scale:
+            embeddings = (embeddings * jnp.asarray(
+                math.sqrt(self.emb_features), self.language_model.embed_tokens.embedding.dtype)).astype(embeddings.dtype)
+        return self.conditioner.fuse(safe_tokens, embeddings, image_indices, conditioning, train=train)
+
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
+                          segment_ids=None, image_indices=None, conditioning=None,
+                          attention_mask=None, image_groups=None, rotary_positions=None):
+        """Prediction layers over the same media embeddings as the main decoder."""
+        embeddings = slots = None
+        if conditioning is not None:
+            fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
+            tokens, embeddings = fused.tokens, fused.embeddings
+            slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
+        elif image_indices is not None:
+            raise ValueError("image_indices require conditioning payloads")
+        return self.language_model.mtp_hidden_states(
+            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
+            input_embeddings=embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            image_groups=image_groups, rotary_positions=rotary_positions)
+
+    def mtp_logits(self, hidden, tokens, **kwargs):
+        """The shared language head over each media-aware prediction depth."""
+        return [self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
+
+    def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
+                 input_embeddings=None, **kwargs):
+        """One candidate prediction step using the decoder's independent MTP cache."""
+        if conditioning is not None:
+            if input_embeddings is not None:
+                raise ValueError("MTP receives either prepared embeddings or media conditioning")
+            fused = self._conditioned_embeddings(tokens, image_indices, conditioning)
+            tokens, input_embeddings = fused.tokens, fused.embeddings
+        elif image_indices is not None:
+            raise ValueError("image_indices require conditioning payloads")
+        return self.language_model.mtp_step(hidden, tokens, input_embeddings=input_embeddings, **kwargs)
+
+    def init_mtp_cache(self, batch_size: int):
+        self.language_model.init_mtp_cache(batch_size)
+
+
     @nn.compact
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
@@ -166,14 +216,7 @@ class MultimodalTransformer(nn.Module):
             return self.language_model.hidden_states(
                 tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)
-        if image_indices is None:
-            raise ValueError("conditioned inputs require image_indices")
-        safe_tokens = jnp.where(image_indices >= 0, 0, tokens)
-        embeddings = self.language_model.embed_tokens(safe_tokens)
-        if self.language_model.embedding_scale:
-            embeddings = (embeddings * jnp.asarray(
-                math.sqrt(self.emb_features), self.language_model.embed_tokens.embedding.dtype)).astype(embeddings.dtype)
-        fused = self.conditioner.fuse(safe_tokens, embeddings, image_indices, conditioning, train=train)
+        fused = self._conditioned_embeddings(tokens, image_indices, conditioning, train=train)
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
@@ -187,6 +230,11 @@ class MultimodalTransformer(nn.Module):
                                     segment_ids=segment_ids, image_indices=image_indices,
                                     conditioning=conditioning, attention_mask=attention_mask,
                                     image_groups=image_groups, rotary_positions=rotary_positions)
+        if self.is_initializing() and self.num_nextn_predict_layers:
+            self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
+                                   segment_ids=segment_ids, image_indices=image_indices,
+                                   conditioning=conditioning, attention_mask=attention_mask,
+                                   image_groups=image_groups, rotary_positions=rotary_positions)
         return self.language_model._logits(hidden)
 
     def head_weight(self, params):

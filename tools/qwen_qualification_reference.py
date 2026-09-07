@@ -16,6 +16,7 @@ from safetensors.torch import save_file
 from tokenizers.pre_tokenizers import ByteLevel
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, Qwen2Tokenizer, Qwen3_5Config
 from transformers import Qwen3_5MoeTextConfig
+from qwen_mtp_reference import QwenMTP, prediction_inputs
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCES = ROOT / "qwen38-source"
@@ -103,9 +104,10 @@ def write_reference(kind: str) -> None:
         tok.save_pretrained(destination)
         prompts = ["abcd ef", "wx yz uv"]
         encoded = tok(prompts, padding=True, return_tensors="pt")
+    model.mtp = QwenMTP(hf_config.get_text_config())
     scatter(model)
-    save_file({name: value.detach().contiguous().clone() for name, value in model.state_dict().items()},
-              str(destination / "model.safetensors"))
+    initial_state = {name: value.detach().contiguous().clone() for name, value in model.state_dict().items()}
+    save_file(initial_state, str(destination / "model.safetensors"))
     (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     (destination / "prompts.json").write_text(json.dumps(prompts) + "\n")
     generation = json.loads((source / "generation_config.json").read_text())
@@ -133,6 +135,36 @@ def write_reference(kind: str) -> None:
              loss=np.float32(loss.detach()), learning_rate=np.float32(1e-4))
     print(kind, "parameters", sum(parameter.numel() for parameter in model.parameters()),
           "tokens", tuple(encoded["input_ids"].shape))
+    # Independently qualify the shipped MTP composition and its trainable loss.
+    model.load_state_dict(initial_state, strict=True)
+    model.zero_grad(set_to_none=True)
+    main, hidden, embeddings, positions = prediction_inputs(model, encoded)
+    admitted = valid[:, :-1] & valid[:, 1:]
+    mtp_hidden = model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted)
+    mtp_logits = model.lm_head(mtp_hidden)
+    mtp_expected = mtp_logits.detach().numpy()
+    main_ce = torch.nn.functional.cross_entropy(main[:, :-1].reshape(-1, main.shape[-1]),
+                                                encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
+    depth_ce = torch.nn.functional.cross_entropy(mtp_logits[:, :-1].reshape(-1, main.shape[-1]),
+                                                 encoded["input_ids"][:, 2:].reshape(-1), reduction="none")
+    depth_valid = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
+    denominator = target_valid.sum()
+    total = ((main_ce.reshape(target_valid.shape) * target_valid).sum()
+             + 0.2 * (depth_ce.reshape(depth_valid.shape) * depth_valid).sum()) / denominator
+    total.backward()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.add_(parameter.grad, alpha=-1e-4)
+        main_after, hidden_after, embed_after, pos_after = prediction_inputs(model, encoded)
+        mtp_after = model.lm_head(model.mtp(hidden_after[:, :-1], embed_after[:, 1:],
+                                           pos_after[..., 1:], admitted))
+    np.savez(destination / "mtp_reference.npz", logits=mtp_expected,
+             hidden=hidden.detach().numpy(), embeddings=embeddings.detach().numpy(),
+             positions=positions.detach().numpy(), valid=admitted.numpy(),
+             loss=total.detach().numpy(), updated_logits=main_after.numpy(),
+             updated_mtp_logits=mtp_after.numpy())
+
 
 
 if __name__ == "__main__":

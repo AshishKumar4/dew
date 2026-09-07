@@ -1485,14 +1485,12 @@ def test_the_qwen35_wrapper_config_is_refused_by_name():
         translate_config(json.loads((QWEN35_REAL / "config.json").read_text()))
 
 
-def test_the_mtp_weights_of_a_qwen35_checkpoint_are_dropped_like_the_reference_drops_them():
-    """The released checkpoints carry mtp.* tensors that the reference lists
-    in _keys_to_ignore_on_load_unexpected (modeling_qwen3_5.py:807), so no
-    reference forward reads them and they map to nothing; any other
-    unfamiliar name still raises."""
+def test_qwen_mtp_weights_require_a_declared_prediction_layer():
+    """An undeclared prediction component must never disappear on load."""
     config = translate_config(fixture_config("qwen35-tiny"))
     tensors = {"mtp.layers.0.self_attn.q_proj.weight": np.zeros((8, 64), np.float32)}
-    assert translate_weights(tensors, config) == {"params": {}}
+    with pytest.raises(ValueError, match="mtp tensors require"):
+        translate_weights(tensors, config)
     with pytest.raises(ValueError, match="unknown tensor name"):
         translate_weights({"model.layers.0.linear_attn.nope.weight": np.zeros((4,), np.float32)},
                           config)
