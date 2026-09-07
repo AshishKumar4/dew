@@ -12,7 +12,6 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 
-
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
@@ -54,9 +53,6 @@ def test_valid_rows_prefill_pause_and_resume_without_reading_padding():
             expected = scaled_dot_product_attention(token, histories[row], histories[row],
                                                      implementation="xla")
             np.testing.assert_allclose(actual[row, 0], expected[0, 0], atol=1e-6, rtol=1e-6)
-
-
-
 
 
 @pytest.mark.parametrize("kind", ["latent", "sparse", "recurrent"])

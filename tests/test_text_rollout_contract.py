@@ -75,7 +75,27 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     assert np.max(np.abs(np.asarray(result.raw_log_probs - result.behavior_log_probs))) > 0.1
 
 
-def test_padding_repro_greedy_and_seeded_bucket_independence():
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_right_padding_and_logical_positions_survive_cached_generation(kind):
+    model = decoder(kind)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    inputs = ModelInputs(jnp.array([[1, 2, 0, 0], [4, 5, 0, 0]]), {
+        "attention_mask": jnp.array([[1, 1, 0, 0], [1, 1, 0, 0]], bool),
+        "positions": jnp.array([[2, 7, 0, 0], [12, 17, 0, 0]])})
+    result = generate(model, params, inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    for row in range(2):
+        context = inputs.tokens[row:row + 1, :2]
+        positions = inputs.token_fields["positions"][row:row + 1, :2]
+        for index, token in enumerate(np.asarray(result.tokens)[row, 4:]):
+            logits = model.apply(params, context, positions=positions)[0, -1]
+            assert token == int(jnp.argmax(logits))
+            np.testing.assert_allclose(result.raw_log_probs[row, index], jax.nn.log_softmax(logits)[token],
+                                       atol=3e-6, rtol=3e-6)
+            context = jnp.concatenate([context, jnp.array([[token]])], axis=1)
+            positions = jnp.concatenate([positions, positions[:, -1:] + 1], axis=1)
+
+
+def test_padding_repro_greedy_and_seeded_reproducibility():
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     key = jax.random.key(1)
@@ -192,6 +212,18 @@ def test_recurrent_causality_and_bidirectional_capability_refusal():
     for objective in (LMObjective, GRPOObjective):
         with pytest.raises(ValueError, match="causal"):
             objective(bidirectional, seq_len=3)
+
+
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_padding_slots_do_not_consume_cache_capacity(kind):
+    model = decoder(kind).clone(max_seq_len=5)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    tokens = jnp.array([[0, 0, 0, 0, 0, 0, 1, 2]])
+    inputs = ModelInputs(tokens, {"attention_mask": jnp.array([[0, 0, 0, 0, 0, 0, 1, 1]], bool)})
+    actual = generate(model, params, inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    expected = generate(model, params, [[1, 2]], 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(actual.tokens[:, 8:], expected.tokens[:, 2:])
+    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
 def test_any_declared_eos_id_stops_the_generation():
