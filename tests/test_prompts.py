@@ -130,8 +130,8 @@ def test_an_empty_prompt_is_refused():
 
 
 def test_a_malformed_message_is_refused():
-    with pytest.raises(ValueError, match="pair of strings"):
-        source({"prompt": [{"role": "user"}]})[0]
+    with pytest.raises(ValueError, match="role as a string"):
+        source({"prompt": [{"content": "hi"}]})[0]
 
 
 def test_a_non_object_row_is_refused():
@@ -144,6 +144,16 @@ def test_a_non_object_row_is_refused():
 def test_a_window_below_one_is_refused():
     with pytest.raises(ValueError, match="max_prompt_len"):
         PromptSource.from_records(records({"prompt": IDS}), TOKENIZER, 0, 0)
+
+
+@pytest.mark.parametrize("prompt", ["hi", IDS])
+def test_tool_schemas_need_a_chat_prompt(prompt):
+    """Plain text and pretokenized ids have no template to render schemas."""
+    spec = Prompts(tokenizer=TOKENIZER,
+                   records=records({"prompt": prompt, "tools": []}),
+                   max_prompt_len=WINDOW, loading=Loading(workers=0))
+    with pytest.raises(ValueError, match="tools require chat messages"):
+        next(spec.load(batch=1).train())
 
 
 def test_parquet_carries_the_verl_columns(tmp_path):
@@ -206,6 +216,7 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
     data = Prompts(tokenizer=TOKENIZER, path=str(train), val_path=str(val),
                    max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
 
+    assert data.val is not None
     batches = list(data.val())
 
     assert len(batches) == 1
