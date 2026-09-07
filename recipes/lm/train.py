@@ -23,7 +23,7 @@ import tyro
 
 from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
-from dew.objectives.lm import LMObjective, Samples
+from dew.objectives.lm import IndexerTraining, LMObjective, Samples
 from dew.sampling import Sampling
 from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
@@ -68,6 +68,12 @@ class LmRunConfig(RunConfig):
     mtp_weight: Optional[float] = None
     """DeepSeek's lambda on the multi-token-prediction term. Needs a model
     with num_nextn_predict_layers above zero; unset leaves the term out."""
+    indexer: Optional[IndexerTraining] = None
+    """DeepSeek-V3.2's lightning-indexer phase: `indexer:indexer-training
+    --indexer.phase warmup` freezes everything but the indexer of a model
+    whose mla mixer names the indexer's heads and no top-k; `sparse`
+    trains the whole model on its top-k with the KL beside the cross
+    entropy. Unset trains no indexer term."""
     objective: str = "lm"
     """Loss convention: lm, masked_diffusion (MDLM), or block_diffusion
     (the official DiffusionGemma fine-tuning objective)."""
@@ -306,6 +312,7 @@ def main(config: LmRunConfig) -> TrainState:
         pretrained=pretrained,
         balance_rate=config.balance_rate,
         mtp_weight=config.mtp_weight,
+        indexer=config.indexer,
         qk_stats=config.optim.optimizer == "muonclip",
     )
     return config.train(objective, data, name=name, metrics=(metrics.perplexity(),), summary=summary)

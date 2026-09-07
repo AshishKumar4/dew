@@ -32,6 +32,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.scipy.special import xlogy
 
 from dew.nn.attention import (
     RMSNorm, _cache_positions, _write_cache, apply_rotary, causal_attention_mask,
@@ -230,6 +231,52 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
     return positions, append
 
 
+INDEXER = 'indexer'
+"""The indexer's name under its attention layer, which the parameter paths
+of the indexer's weights carry and nothing else in the tree does."""
+
+INDEXER_COLLECTION = 'indexer'
+"""The collection an attention layer sows its per-query indexer KL under
+when a caller opens it, as the LM objective does to train the indexer."""
+
+
+def indexer_kl(scores, query, key, keep, scale: float):
+    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
+
+    The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
+    `attention_mla.py` `calculate_indexer_loss`): the target is the main
+    attention's distribution summed over its heads and L1-normalised, the
+    indexer's distribution the softmax of its `[B, S, T]` `scores`, both
+    over the keys `keep` allows, so the dense warm-up passes the causal
+    (and packed) mask and sparse training the top-k selection. `query` and
+    `key` are the main heads, `[B, S, H, D]` and `[B, T, H, D]`, `scale`
+    the logit scale the kernel applies on top of them. The target is a
+    constant of the loss, both projections detached as the reference
+    detaches them, so the gradient reaches the indexer alone. The heads are
+    summed one at a time, which keeps the footprint at `[B, S, T]` rather
+    than the `[B, H, S, T]` logits.
+    """
+    masked = jnp.finfo(jnp.float32).min
+    batch, length, total = scores.shape
+    keep = jnp.broadcast_to(keep, (batch, length, total))
+    query = jax.lax.stop_gradient(query).astype(jnp.float32) * scale
+    key = jax.lax.stop_gradient(key).astype(jnp.float32)
+
+    def head(summed, projections):
+        q, k = projections
+        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
+        return summed + jax.nn.softmax(logits, axis=-1), None
+
+    summed, _ = jax.lax.scan(
+        head, jnp.zeros((batch, length, total), jnp.float32),
+        (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
+    target = summed / jnp.sum(summed, axis=-1, keepdims=True)
+    log_indexer = jax.nn.log_softmax(
+        jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
+    # xlogy keeps a key the target gives no mass at zero rather than nan.
+    return jnp.sum(xlogy(target, target) - target * log_indexer, axis=-1)
+
+
 @logical_axes({
     ("wq_b",): ("qlora", "index"),
     ("wk",): ("embed", "index"),
@@ -239,16 +286,21 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
     ("weights_proj",): ("embed", "index"),
 })
 class SparseIndexer(nn.Module):
-    """DeepSeek sparse attention's top-k token selector, per query.
+    """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
     A lightweight scorer beside the main MLA projections
     (`modeling_deepseek_v32.DeepseekV32Indexer`): `wq_b` reads the query
     residual, `wk` reads the hidden states into keys the cache holds, and
     `weights_proj` weights the heads into one score per key. `select`
-    returns the `int32` top-k key positions, which the mixer folds into the
+    keeps the top-k keys of each query, which the mixer folds into the
     attention mask the way the reference's eager path does. There is no
     fast-kernel index path here, so the mask fold is the only path, on every
     backend.
+
+    The indexer reads its inputs detached. The reference trains it apart
+    from the main model: the top-k is a selection, so the main loss reaches
+    the indexer's weights nowhere, and the indexer's own loss (`indexer_kl`)
+    reaches the main model nowhere.
 
     The indexer rotates with the plain rotate-half convention, unlike the
     main rope head's interleaved pairs; the reference calls the two
@@ -259,7 +311,7 @@ class SparseIndexer(nn.Module):
     n_heads: int
     head_dim: int
     rope_head_dim: int
-    top_k: int
+    top_k: Optional[int] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -280,7 +332,7 @@ class SparseIndexer(nn.Module):
 
     def keys(self, hidden):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
-        return self.k_norm(self.wk(hidden))
+        return self.k_norm(self.wk(jax.lax.stop_gradient(hidden)))
 
     def rotated_keys(self, keys, freqs_cos, freqs_sin):
         """`keys` with their rope slice rotated at their own positions.
@@ -293,18 +345,17 @@ class SparseIndexer(nn.Module):
         k_rot = apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
         return jnp.concatenate([k_rot[:, :, 0, :], k_pass], axis=-1)
 
-    def select(self, hidden, q_resid, keys, freqs_cos, freqs_sin, mask):
-        """Top-k key positions per query: `[B, S, K]`, int32.
+    def scores(self, hidden, q_resid, keys, freqs_cos, freqs_sin):
+        """Index scores of every query against every key: `[B, S, T]`, fp32.
 
         `keys` are the rotated keys of every candidate (the cache on
-        decode), `mask` the `[B, S, T]` additive float bias of what the
-        query may not attend, and the query side is computed on each call.
-        Scores run in fp32: the head weighting multiplies by
-        `n_heads ** -0.5` in fp32 in the reference, and the relu keeps only
-        the positive agreements.
+        decode); the query side is computed on each call. Scores run in
+        fp32: the head weighting multiplies by `n_heads ** -0.5` in fp32 in
+        the reference, and the relu keeps only the positive agreements.
         """
+        hidden = jax.lax.stop_gradient(hidden)
+        q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = hidden.shape
-        total = keys.shape[-2]
         query = self.wq_b(q_resid).reshape(
             batch, length, self.n_heads, self.head_dim)
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
@@ -316,10 +367,33 @@ class SparseIndexer(nn.Module):
         scores = jnp.maximum(scores * (self.head_dim ** -0.5), 0)
         weights = self.weights_proj(hidden).astype(jnp.float32)
         weights = weights * (self.n_heads ** -0.5)
-        index_scores = jnp.matmul(weights[..., None, :], scores).squeeze(-2)
-        index_scores = index_scores + mask
-        return jax.lax.top_k(
-            index_scores, min(self.top_k, total))[1].astype(jnp.int32)
+        return jnp.matmul(weights[..., None, :], scores).squeeze(-2)
+
+    def select(self, scores, keep):
+        """The top-k keys of each query among those `keep` allows: `[B, S, T]`, bool."""
+        if self.top_k is None:
+            raise ValueError("selecting keys needs the indexer's top_k")
+        return top_k_keys(scores, keep, self.top_k)
+
+
+def top_k_keys(scores, keep, top_k: int):
+    """The `top_k` highest-scoring keys of each query among those `keep`
+    allows: `[B, S, T]`, bool.
+
+    Exactly `top_k` keys where at least that many are allowed, ties to the
+    earlier key as `jax.lax.top_k` breaks them (the reference's exact
+    top-k, MaxText `indexer_mask_exact_topk`), and every allowed key where
+    fewer are, so a sequence the top-k covers attends as the dense mixer
+    does. `keep` is the `[B, S, T]` attention mask (a leading axis of one
+    broadcasts).
+    """
+    batch, length, total = scores.shape
+    ranked = jnp.where(keep, scores, jnp.finfo(jnp.float32).min)
+    chosen = jax.lax.top_k(ranked, min(top_k, total))[1]
+    selected = jnp.zeros((batch, length, total), jnp.bool_).at[
+        jnp.arange(batch)[:, None, None],
+        jnp.arange(length)[None, :, None], chosen].set(True)
+    return jnp.logical_and(selected, keep)
 
 
 @logical_axes({
@@ -352,6 +426,15 @@ class MultiHeadLatentAttention(nn.Module):
     norms are the model's RMSNorm under the model's `scale_offset` and
     `scale_after_cast`, since the reference builds them from the same class
     as every other norm of the layer.
+
+    `index_n_heads` and `index_head_dim` together put the indexer beside
+    the attention; `index_topk` makes it select, which is the released
+    V3.2 layer. Without a top-k the attention stays dense and the indexer
+    only scores, the state of V3.2's dense warm-up (arXiv 2512.02556,
+    section 2.1.1), where a fresh indexer learns the dense attention of a
+    frozen model. Whenever the indexer is present and the `indexer`
+    collection is open, a training pass sows the per-query `indexer_kl`
+    under `kl`, over the keys the attention itself used.
     """
 
     emb_features: int
@@ -387,11 +470,14 @@ class MultiHeadLatentAttention(nn.Module):
             raise ValueError(
                 "the nope head dim and the value head dim must be positive, "
                 f"got {self.qk_nope_head_dim} and {self.v_head_dim}")
-        index = (self.index_topk, self.index_n_heads, self.index_head_dim)
-        if index != (None, None, None) and None in index:
+        if (self.index_n_heads is None) != (self.index_head_dim is None):
             raise ValueError(
-                "the indexer needs its top-k, head count and head dim "
-                "together, all set or all unset")
+                "the indexer needs its head count and head dim together, "
+                "both set or both unset")
+        if self.index_topk is not None and self.index_n_heads is None:
+            raise ValueError(
+                "index_topk selects with the indexer, which index_n_heads "
+                "and index_head_dim have to describe")
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
@@ -420,8 +506,7 @@ class MultiHeadLatentAttention(nn.Module):
             use_bias=False, dtype=self.dtype, precision=self.precision,
             name='kv_b_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
-        if (self.index_topk is not None and self.index_n_heads is not None
-                and self.index_head_dim is not None):
+        if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
                     "the indexer reads the query residual, which only exists "
@@ -430,7 +515,12 @@ class MultiHeadLatentAttention(nn.Module):
                 q_lora_rank=self.q_lora_rank, n_heads=self.index_n_heads,
                 head_dim=self.index_head_dim,
                 rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
-                dtype=self.dtype, precision=self.precision, name='indexer')
+                dtype=self.dtype, precision=self.precision, name=INDEXER)
+
+    @property
+    def indexed(self) -> bool:
+        """Whether the V3.2 indexer scores the keys beside the attention."""
+        return self.index_n_heads is not None
 
     @property
     def sparse(self) -> bool:
@@ -489,7 +579,7 @@ class MultiHeadLatentAttention(nn.Module):
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
-        causal, mask = self.causal, None
+        causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
         batch, length, _ = x.shape
         valid = None if attention_metadata is None else attention_metadata.valid
@@ -528,10 +618,13 @@ class MultiHeadLatentAttention(nn.Module):
                     self.indexer.keys(x), freqs_cos, freqs_sin)
                 key, value, index_full = append(
                     *self._expand(latent, rot), index_keys)
-                mask = self._index_mask(
-                    x, q_resid, positions, key.shape[1], index_full,
-                    freqs_cos, freqs_sin, base=causal_attention_mask(
-                        positions, key.shape[1], key_valid=self.get_variable("cache", "cache_valid")))
+                index_scores = self.indexer.scores(
+                    x, q_resid, index_full, freqs_cos, freqs_sin)
+                mask = self.indexer.select(
+                    index_scores,
+                    causal_attention_mask(
+                        positions, key.shape[1],
+                        key_valid=self.get_variable("cache", "cache_valid"))[:, 0])[:, None]
             else:
                 positions, append = open_latent_cache(
                     self, latent, rot, None, self.max_seq_len, valid=valid)
@@ -570,13 +663,32 @@ class MultiHeadLatentAttention(nn.Module):
                 causal = False
                 if implementation in ('auto', 'cudnn'):
                     implementation = 'xla'
-            if self.sparse:
+            if self.indexed:
                 assert q_resid is not None
+                # The keys a query may attend before selection: the rows'
+                # causal order (packed positions restart per document, so
+                # they order nothing here) and the packed base when there
+                # is one. The indexer selects among those, and the KL
+                # measures over whatever the attention then uses.
+                keep = None if mask is None else mask[:, 0]
+                if causal:
+                    rows = causal_attention_mask(jnp.arange(length), length)[:, 0]
+                    keep = rows if keep is None else jnp.logical_and(keep, rows)
+                if keep is None:
+                    keep = jnp.ones((1, length, length), jnp.bool_)
                 index_keys = self.indexer.rotated_keys(
                     self.indexer.keys(x), freqs_cos, freqs_sin)
-                mask = self._index_mask(
-                    x, q_resid, positions, length, index_keys,
-                    freqs_cos, freqs_sin, base=mask)
+                if valid is not None:
+                    # Selection and its objective range over real keys only.
+                    keep = jnp.logical_and(keep, jnp.asarray(valid, bool)[:, None, :])
+                index_scores = self.indexer.scores(
+                    x, q_resid, index_keys, freqs_cos, freqs_sin)
+                if self.sparse:
+                    keep = self.indexer.select(index_scores, keep)
+                    mask, causal = keep[:, None], False
+                if (not self.is_initializing()
+                        and self.is_mutable_collection(INDEXER_COLLECTION)):
+                    objective = (index_scores, keep)
         if valid is not None:
             queries_valid = jnp.asarray(valid, bool)[:, None, :, None]
             mask = queries_valid if mask is None else mask & queries_valid
@@ -586,6 +698,15 @@ class MultiHeadLatentAttention(nn.Module):
         query = jnp.concatenate([q_pass, q_rot], axis=-1)
         if scale != 1.0:
             query = query * scale
+        if objective is not None:
+            # The indexer's objective, per query, over the keys the attention
+            # itself attends: dense attention's causal set in the warm-up,
+            # the selected set under the top-k. The kernel scales the
+            # (yarn-prescaled) query by the head width, so the target does.
+            index_scores, index_keep = objective
+            self.sow(INDEXER_COLLECTION, "kl", indexer_kl(
+                index_scores, query, key, index_keep,
+                1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)))
         # The per-head maxima the QK-Clip reads, with the nope width the
         # clip needs to split the latent projections: computed only when a
         # caller opened the collection. Under the sparse indexer the mask
@@ -600,28 +721,11 @@ class MultiHeadLatentAttention(nn.Module):
         return checkpoint_name(self.o_proj(checkpoint_name(attention, 'context').reshape(
             batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
 
-    def _index_mask(self, x, q_resid, positions, kv_len: int, index_keys,
-                    freqs_cos, freqs_sin, base=None):
-        """The attention bool mask with the indexer's top-k folded in.
 
-        `True` attends: causality (or the packed base) and the selected keys
-        meet, the way the reference's eager path `masked_fill`s the additive
-        mask. Decode positions are cache slots, so causality reads them.
-        """
-        batch, length, _ = x.shape
-        keep = causal_attention_mask(positions, kv_len)
-        if base is not None:
-            keep = jnp.logical_and(base, keep)
-        queries = jnp.arange(length)
-        bias = jnp.where(keep, 0.0, jnp.finfo(jnp.float32).min)
-        if bias.ndim == 4:
-            bias = bias[:, 0]
-        chosen = self.indexer.select(
-            x, q_resid, index_keys, freqs_cos, freqs_sin, bias)
-        selected = jnp.zeros((batch, length, kv_len), jnp.bool_).at[
-            jnp.arange(batch)[:, None, None],
-            queries[None, :, None], chosen].set(True)
-        return jnp.logical_and(keep, selected[:, None])
+# The standard attention mixer reads the YaRN ramp above, so the registry
+# hub imports this module while it imports the hub; the registry side of
+# this module comes after the ramp so either import order resolves.
+from dew.nn.mixers import MixerBase, MixerContext, mixers  # noqa: E402
 
 
 from dew.nn.mixers import MixerBase, MixerContext, mixers
@@ -634,8 +738,11 @@ class MLAMixer(MixerBase):
 
     A config names it as `mixer={"kind": "mla", ...}` with the fields of a
     DeepSeek config.json, so translation renames nothing; `yarn` is the
-    rope-scaling record (or None for plain rope), and the three index fields
-    together turn on the V3.2 sparse indexer (None is dense MLA). The rope
+    rope-scaling record (or None for plain rope). `index_n_heads` and
+    `index_head_dim` put the V3.2 indexer beside the attention and
+    `index_topk` makes it select, the released sparse layer; the heads
+    without a top-k is dense attention with an indexer scoring beside it,
+    the state the dense warm-up trains (all None is dense MLA). The rope
     base is the model's `rope_theta`, transformed by the yarn ramp rather
     than replaced, so scaling is configured once, and the mscale is applied
     in the attention as a query pre-scale.
@@ -658,6 +765,16 @@ class MLAMixer(MixerBase):
     index_topk: Optional[int] = None
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
+
+    @property
+    def indexed(self) -> bool:
+        """Whether the layer carries the indexer, selecting or not."""
+        return self.index_n_heads is not None
+
+    @property
+    def sparse(self) -> bool:
+        """Whether the indexer selects the keys each query attends."""
+        return self.index_topk is not None
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         unsupported = {
