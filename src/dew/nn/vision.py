@@ -1367,6 +1367,37 @@ def translate_llama4_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dic
     return _translate(hf_tensors, llama4_vision_path)
 
 
+_PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
+    "gemma": {
+        "mm_soft_emb_norm.weight": ("mm_soft_emb_norm", "scale"),
+        "mm_input_projection_weight": ("mm_input_projection", "kernel"),
+    },
+    "llama4": {"linear_1.weight": ("linear", "kernel")},
+    "gemma4": {"embedding_projection.weight": ("projection", "kernel")},
+    "qwen3_5": {
+        "norm.weight": ("norm", "scale"), "norm.bias": ("norm", "bias"),
+        "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
+        "linear_fc2.weight": ("fc2", "kernel"), "linear_fc2.bias": ("fc2", "bias"),
+    },
+    "gemma3n": {
+        "embedding.weight": ("embedding", "embedding"),
+        "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
+        "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
+        "embedding_projection.weight": ("embedding_projection", "kernel"),
+    },
+}
+
+
+def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
+    """The projector's canonical tensor path, shared by load and source export."""
+    if kind == "qwen3_5":
+        name = name.removeprefix("merger.")
+    if kind not in _PROJECTOR_PATHS or name not in _PROJECTOR_PATHS[kind]:
+        raise ValueError(f"unknown {kind} projector tensor {name!r}")
+    return _PROJECTOR_PATHS[kind][name]
+
+
+
 def translate_gemma_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     """A Gemma projector's two tensors into its params tree, in fp32.
 
@@ -1374,28 +1405,18 @@ def translate_gemma_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> D
     parameter the reference multiplies as is, so unlike a Linear kernel it
     keeps its layout.
     """
-    known = {"mm_soft_emb_norm.weight", "mm_input_projection_weight"}
+    known = set(_PROJECTOR_PATHS["gemma"])
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    return {
-        "mm_soft_emb_norm": {
-            "scale": np.asarray(hf_tensors["mm_soft_emb_norm.weight"], np.float32)},
-        "mm_input_projection": {
-            "kernel": np.ascontiguousarray(np.asarray(
-                hf_tensors["mm_input_projection_weight"], np.float32))},
-    }
+    return {module: {leaf: np.ascontiguousarray(hf_tensors[name], dtype=np.float32)}
+            for name, (module, leaf) in _PROJECTOR_PATHS["gemma"].items()}
 
 
 def translate_llama4_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     """Llama 4's outer projector map into its params tree, in fp32."""
 
-    def path_of(hf_name: str) -> Optional[Tuple[str, ...]]:
-        if hf_name != "linear_1.weight":
-            raise ValueError(f"unknown tensor name {hf_name!r}")
-        return ("linear", "kernel")
-
-    return _translate(hf_tensors, path_of)
+    return _translate(hf_tensors, lambda name: projector_weight_path("llama4", name))
 
 
 def _image_size(value: object, field: str) -> int:
@@ -1594,13 +1615,9 @@ def translate_gemma4_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> 
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
-    if set(hf_tensors) != {"embedding_projection.weight"}:
+    if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return {
-        "projection": {
-            "kernel": _leaf(("projection", "kernel"),
-                            hf_tensors["embedding_projection.weight"])},
-    }
+    return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name))
 
 
 def _gemma4_rope_theta(vision: Mapping[str, Any]) -> float:
@@ -1750,20 +1767,7 @@ def translate_qwen35_projector_weights(
         hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     """A Qwen 3.5 merger's tensors into its params tree, in fp32."""
 
-    def path_of(hf_name: str) -> Optional[Tuple[str, ...]]:
-        # The plain fixture keeps the reference's merger prefix while the
-        # wrapper routing strips it; both name the same leaves.
-        bare = hf_name[7:] if hf_name.startswith("merger.") else hf_name
-        parts = bare.split(".")
-        if len(parts) == 2 and parts[1] in ("weight", "bias"):
-            leaf = "kernel" if parts[1] == "weight" else "bias"
-            if parts[0] == "norm":
-                return ("norm", "scale" if parts[1] == "weight" else "bias")
-            if parts[0] in ("linear_fc1", "linear_fc2"):
-                return ({"linear_fc1": "fc1", "linear_fc2": "fc2"}[parts[0]], leaf)
-        raise ValueError(f"unknown tensor name {hf_name!r}")
-
-    return _translate(hf_tensors, path_of)
+    return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name))
 
 
 def _qwen35_patch_field(vision: Mapping[str, Any], field: str) -> int:
@@ -2038,12 +2042,7 @@ def translate_gemma3n_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> di
 
 
 def translate_gemma3n_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, object]:
-    paths = {
-        "embedding.weight": ("embedding", "embedding"),
-        "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
-        "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
-        "embedding_projection.weight": ("embedding_projection", "kernel"),
-    }
+    paths = _PROJECTOR_PATHS["gemma3n"]
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
