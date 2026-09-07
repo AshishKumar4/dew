@@ -618,11 +618,9 @@ class MTPBlock(nn.Module):
     hidden states with `hnorm`, projects the pair concatenated in that
     order back to the model width, and runs one decoder block over it. That
     composition is what the released MTP weights were trained for, which
-    the engines that run them state (vLLM deepseek_mtp.py and
-    glm4_moe_mtp.py, SGLang's DeepseekV3ForCausalLMNextN); transformers
-    builds no depth. `block` is a plain forward block: multi-token
-    prediction is a training-time auxiliary, so there is no decode path and
-    no cache.
+    the engines state (vLLM deepseek_mtp.py, glm4_moe_mtp.py and
+    qwen3_5_mtp.py). Training shifts complete sequences through this block;
+    prediction steps may use an independently allocated KV cache.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -657,12 +655,13 @@ class MTPBlock(nn.Module):
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
 
-    def __call__(self, hidden, embeds, train: bool = False,
-                 positions=None, segment_ids=None):
+    def __call__(self, hidden, embeds, train: bool = False, positions=None,
+                 segment_ids=None, attention_metadata=None, decode: bool = False):
         fused = self.eh_proj(jnp.concatenate(
             [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
         return self.final_norm(self.block(
-            fused, train=train, positions=positions, segment_ids=segment_ids))
+            fused, train=train, positions=positions, segment_ids=segment_ids,
+            attention_metadata=attention_metadata, decode=decode))
 
 
 Block = Callable[[int, str], DecoderBlock]
@@ -1421,7 +1420,8 @@ class CausalTransformer(nn.Module):
         # like the last layer's (GLM 4.5 ships its depth with the trunk's
         # experts) and is dense otherwise.
         mtp_type = 'full_attention' if 'full_attention' in types else types[0]
-        mtp_mixer = mixer_spec.build(self.mixer_context(
+        prediction_mixer = kinds[mtp_type].mixer or mixer_spec
+        mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, False))
         mtp_feedforward = (
             routed if routed is not None and self.num_layers - 1 in sparse else
@@ -1484,7 +1484,9 @@ class CausalTransformer(nn.Module):
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
             self.mtp_hidden_states(x, tokens, train=train, positions=positions,
-                                   segment_ids=segment_ids)
+                                   segment_ids=segment_ids, input_embeddings=input_embeddings,
+                                   embedding_positions=embedding_positions, attention_mask=attention_mask,
+                                   image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
     def _logits(self, x):
@@ -1504,42 +1506,71 @@ class CausalTransformer(nn.Module):
         return logits
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False,
-                          positions=None, segment_ids=None):
-        """One `[B, S - d, D]` final-normed state array per prediction depth d.
+                          positions=None, segment_ids=None, input_embeddings=None,
+                          embedding_positions=None, attention_mask=None,
+                          image_groups=None, rotary_positions=None):
+        """One final-normed state array per shifted prediction depth.
 
-        Depth d reads the previous depth's states at positions p and the
-        embeddings of the tokens at p + d, the sequence one shorter per
-        depth, so its state at p is what scores the token after p + d
-        through the shared head (`mtp_logits`, or a chunked loss over
-        `head_weight`). `positions` and `segment_ids` are the main forward's,
-        sliced with the states, so a packed batch keeps its documents apart
-        in the depths too. Empty without prediction depths; a sequence with
-        no position d tokens out raises.
-
-        A plain init of the main forward holds these depths too: `__call__`
-        reaches them while initializing, so the tree does not depend on which
-        method built it.
+        A depth combines the preceding hidden state and the next token's
+        embedding, including any media replacement. Its positions are the
+        next token's positions. Both ends must be valid and belong to the
+        same packed document; padded intermediates cannot become keys.
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
-            raise ValueError(
-                f"{len(self.mtp)} prediction depths need more than "
-                f"{len(self.mtp)} tokens, got {tokens.shape[1]}")
-        embeds = self.embed_tokens(tokens)
+            raise ValueError("prediction depths need a sequence longer than their depth count")
+        embeds = self._scatter_inputs(self.embed_tokens(tokens), tokens,
+                                      input_embeddings, embedding_positions)
+        valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
         states = []
         for depth, block in enumerate(self.mtp, start=1):
-            hidden = block(
-                hidden[:, :-1], embeds[:, depth:], train=train,
-                positions=None if positions is None else positions[:, :-depth],
-                segment_ids=None if segment_ids is None else segment_ids[:, :-depth])
+            valid = valid[:, :-1] & (jnp.ones(tokens[:, depth:].shape, bool)
+                                     if attention_mask is None else attention_mask[:, depth:])
+            if segment_ids is not None:
+                valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
+            metadata = AttentionMetadata(
+                valid=valid,
+                image_groups=None if image_groups is None else image_groups[:, depth:],
+                rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
+            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train,
+                           positions=None if positions is None else positions[:, depth:],
+                           segment_ids=None if segment_ids is None else segment_ids[:, depth:],
+                           attention_metadata=metadata)
             states.append(hidden)
         return states
 
-    def mtp_logits(self, hidden, tokens, train: bool = False,
-                   positions=None, segment_ids=None):
-        """One `[B, S - d, vocab]` fp32 logits array per prediction depth d:
-        the depth states of `mtp_hidden_states` through the shared head."""
+    def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
+                   segment_ids=None, input_embeddings=None, embedding_positions=None,
+                   attention_mask=None, image_groups=None, rotary_positions=None):
+        """The shared language head over each prediction depth's hidden states."""
         return [self._logits(state) for state in self.mtp_hidden_states(
-            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids)]
+            hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
+            input_embeddings=input_embeddings, embedding_positions=embedding_positions,
+            attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)]
+
+    def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
+                 input_embeddings=None, attention_mask=None, rotary_positions=None,
+                 decode: bool = False):
+        """One unshifted prediction step, optionally appending its own KV cache.
+
+        Call init_mtp_cache before cached steps. The hidden input is the
+        target model's preceding state; tokens or input_embeddings supply
+        the candidate next token, as in vLLM's Qwen3_5MultiTokenPredictor.
+        """
+        if depth < 0 or depth >= len(self.mtp):
+            raise ValueError("prediction depth is outside the model's configured depths")
+        embeds = self.embed_tokens(tokens) if input_embeddings is None else input_embeddings
+        state = self.mtp[depth](hidden, embeds, positions=positions, decode=decode,
+                                attention_metadata=AttentionMetadata(valid=attention_mask,
+                                                                    rotary_positions=rotary_positions))
+        return self._logits(state)
+
+    def init_mtp_cache(self, batch_size: int):
+        """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
+        for block in self.mtp:
+            block(jnp.zeros((batch_size, 1, self.emb_features), self.dtype),
+                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True)
+
+
 
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None,

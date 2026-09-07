@@ -347,7 +347,7 @@ def _wrapper_layouts(tensors, record):
                     transpose = (1, 0) if tensor.ndim == 2 else (3, 2, 0, 1)
                     if tensor.ndim == 5:
                         transpose = (1, 0)
-        elif bare.startswith("language_model.") or bare == "lm_head.weight":
+        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight":
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
             layout = _language_layout(name, text_name, tensor, record["text"],
