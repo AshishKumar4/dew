@@ -222,7 +222,7 @@ class HFRows(pygrain.IterDataset):
         self.shuffle_buffer = shuffle_buffer
         self.epochs = epochs
         self._asked = threading.Lock()
-        self._refused: Optional[Optional[str]] = ...  # type: ignore[assignment]
+        self._answer: Optional[tuple[Optional[str]]] = None
 
     def __repr__(self) -> str:
         return (f"HFRows({self.what}, seed={self.seed}, "
@@ -246,11 +246,10 @@ class HFRows(pygrain.IterDataset):
         caller that made the iterator is still holding one.
         """
         with self._asked:
-            if self._refused is ...:
-                self._refused = refusal(self._pass(0),
-                                        shuffled=bool(self.shuffle_buffer),
-                                        given=self.given)
-            return self._refused
+            if self._answer is None:
+                self._answer = (refusal(self._pass(0), shuffled=bool(self.shuffle_buffer),
+                                        given=self.given),)
+            return self._answer[0]
 
     @property
     def resumable(self) -> bool:
