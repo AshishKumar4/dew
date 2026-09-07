@@ -59,6 +59,7 @@ The base package currently installs Transformers, Hugging Face Hub, WandB, and i
 | Extra | Use |
 |---|---|
 | `interop` | Read or write safetensors checkpoints |
+| `vision` | Run the checkpoint's HF image processor using torchvision on the host |
 | `streaming` | Hugging Face datasets and online sources |
 | `av` | Video readers and image resizing |
 | `metrics` | SciPy and download support used by image metrics |
@@ -69,6 +70,16 @@ For example:
 
 ```bash
 uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
+```
+
+For HF vision processors, install matching CPU PyTorch and torchvision wheels first,
+then add Dew's vision extra. This keeps image preprocessing on the host without
+installing CUDA PyTorch packages beside JAX's accelerator runtime. The native
+Gemma4 processor path was checked with torch 2.14.0+cpu and torchvision 0.29.0+cpu.
+
+```bash
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+uv pip install 'dew-ml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
 Qwix quantization and tokamax kernels require their respective external packages; they are not declared as installable Dew extras in the current package metadata. See [capabilities and limitations](reference/support.md) before enabling them.

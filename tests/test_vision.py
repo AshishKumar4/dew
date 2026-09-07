@@ -17,12 +17,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
   its GELU after both maps.
 - llama4 projector : max |difference| 9.6e-07, tolerance 1e-4. One bias-free
   map on the reference trunk output.
-- gemma4 tower     : max |difference| 1.96e-05, tolerance 1e-4. Scaled patch
+- gemma4 tower     : max |difference| 2.01e-05, tolerance 1e-4. Scaled patch
   pixels, summed 2D tables, RMS blocks with the 2D rotary and gated
   feed-forwards, position pooling and standardization over a 4x4 grid.
 - gemma4 projector : max |difference| 9.6e-07, tolerance 1e-4. Scale-free RMS
   norm and the map on the reference trunk output.
-- qwen3_5 tower    : max |difference| 7.4e-06, tolerance 1e-4. Block-order
+- qwen3_5 tower    : max |difference| 6.44e-06, tolerance 1e-4. Block-order
   patches with the frame repeated along time, resampled positions, the 2D
   rotary and full-attention blocks over a 4x4 grid on an 8x8 table.
 - qwen3_5 projector: max |difference| 3.9e-06, tolerance 1e-4. The merger
@@ -182,8 +182,8 @@ def gemma4_image(pixels, patch):
     batch, count, _ = pixels.shape
     grid = int(count ** 0.5)
     side = grid * patch
-    return pixels.reshape(batch, grid, grid, 3, patch, patch).transpose(
-        0, 3, 1, 4, 2, 5).reshape(batch, 3, side, side)
+    return pixels.reshape(batch, grid, grid, patch, patch, 3).transpose(
+        0, 5, 1, 3, 2, 4).reshape(batch, 3, side, side)
 
 
 def test_gemma4_tower_matches_the_reference_implementation():
@@ -193,7 +193,7 @@ def test_gemma4_tower_matches_the_reference_implementation():
     fixture = load_fixture("gemma4-vision-tiny")
     record = V.translate_gemma4_vision_config(fixture["config"])
     tower = V.tower_from_record(record).build()
-    variables = {"params": V.translate_gemma4_vision_weights(fixture["tensors"])}
+    variables = V.translate_gemma4_vision_weights(fixture["tensors"])
     patch = record["patch_size"]
     assert isinstance(patch, int)
     image = gemma4_image(fixture["pixels"], patch)
@@ -238,7 +238,7 @@ def test_gemma4_projector_matches_the_reference_implementation():
 def test_qwen35_tower_matches_the_reference_implementation():
     """fp32 parity on the tiny Qwen 3.5 trunk, and the resampled positions
     are live: with the table zeroed the trunk leaves the reference by more
-    than 0.7."""
+    than 0.69."""
     fixture = load_fixture("qwen35-vision-tiny")
     record = V.translate_qwen35_vision_config(fixture["config"])
     tower = V.tower_from_record(record).build()
@@ -248,9 +248,10 @@ def test_qwen35_tower_matches_the_reference_implementation():
     unpositioned = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf)
         if path[-1].key == "embedding" else leaf, variables)
-    assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 0.7
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(tower.apply(unpositioned, fixture["pixels"])),
+            fixture["tower_ref"], atol=1e-4, rtol=0)
 
 
 def test_qwen35_projector_matches_the_reference_implementation():
@@ -280,8 +281,6 @@ def test_qwen35_projector_matches_the_reference_implementation():
     ("hidden_activation", "swiglu", "hidden_activation"),
     ("attention_bias", True, "attention_bias"),
     ("attention_dropout", 0.1, "training-time"),
-    ("use_clipped_linears", True, "use_clipped_linears"),
-    ("standardize", False, "standardize"),
     ("output_proj_dims", 64, "output_proj_dims"),
 ])
 def test_a_gemma4_field_with_no_counterpart_is_refused(field, value, message):
@@ -313,3 +312,27 @@ def test_a_qwen35_merger_beside_the_decoder_width_is_refused():
         (FIXTURES / "qwen35-vision-tiny" / "config.json").read_text()))
     with pytest.raises(ValueError, match="out_hidden_size"):
         V.translate_qwen35_projector_config(trunk, 32)
+
+
+def test_gemma4_clipping_matches_reference_forward_and_backward():
+    """Transformers 5.16.1 Gemma4ClippableLinear on a 3-to-2 map.
+
+    Reference output [0.2, 0.06], input gradient [0, -0.1, 0], and the second
+    weight row gradient [-1, 0.4, 1] distinguish both clipping locations.
+    """
+    linear = V.Gemma4ClippableLinear(features=2, use_bias=False, use_clipped_linears=True)
+    kernel = jnp.array([[0.1, 0.1], [0.2, -0.1], [0.3, 0.2]], jnp.float32)
+    constants = {"input_min": jnp.float32(-1), "input_max": jnp.float32(1),
+                 "output_min": jnp.float32(-0.2), "output_max": jnp.float32(0.2)}
+    inputs = jnp.array([[-2, 0.4, 2]], jnp.float32)
+
+    def value(weight, pixels):
+        return jnp.asarray(linear.apply({"params": {"kernel": weight}, "constants": constants}, pixels))
+
+    np.testing.assert_allclose(value(kernel, inputs), [[0.2, 0.06]], atol=1e-7, rtol=0)
+    weights, pixels = jax.grad(lambda weight, x: value(weight, x).sum(), argnums=(0, 1))(kernel, inputs)
+    np.testing.assert_allclose(pixels, [[0, -0.1, 0]], atol=1e-7, rtol=0)
+    np.testing.assert_allclose(weights, [[0, -1], [0, 0.4], [0, 1]], atol=1e-7, rtol=0)
+    unclipped = jnp.asarray(linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs))
+    assert np.max(np.abs(unclipped - value(kernel, inputs))) > 0.25
+

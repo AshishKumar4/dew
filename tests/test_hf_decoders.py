@@ -2077,7 +2077,6 @@ def test_gemma4_moe_logits_match_the_reference_implementation():
     assert params["layers_0"]["moe"]["router"]["per_expert_scale"].shape == (4,)
     assert "v_proj" not in params["layers_2"]["self_attn"]
     assert params["layers_2"]["self_attn"]["k_proj"]["kernel"].shape == (32, 16)
-    assert all(params[f"layers_{index}"]["layer_scalar"].shape == (1,) for index in range(3))
 
 
 def test_the_layer_scalars_are_what_the_parity_tests():
@@ -2087,11 +2086,11 @@ def test_the_layer_scalars_are_what_the_parity_tests():
     model, variables, _ = fp32_decoder(GEMMA4_MOE)
     ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
     reference = np.load(GEMMA4_MOE / "logits.npy")
-    params = dict(variables["params"])
+    constants = dict(variables["constants"])
     for index in range(3):
-        params[f"layers_{index}"] = {**params[f"layers_{index}"],
-                                     "layer_scalar": jnp.full((1,), 0.5, jnp.float32)}
-    logits = np.asarray(model.apply({"params": params}, ids))
+        constants[f"layers_{index}"] = {**constants[f"layers_{index}"],
+                                        "layer_scalar": jnp.full((1,), 0.5, jnp.float32)}
+    logits = np.asarray(model.apply({**variables, "constants": constants}, ids))
     assert float(np.max(np.abs(logits - reference))) > 1e-3
 
 
@@ -2430,3 +2429,31 @@ def test_dream_logits_match_the_reference_implementation():
     assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_layer_scalar_rejects_old_boolean_modes(legacy):
+    with pytest.raises(ValueError, match="layer_scalar"):
+        models.build("causal_transformer", vocab_size=8, layer_scalar=legacy)
+
+
+@pytest.mark.parametrize("mode", ["frozen", "trainable"])
+def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
+    """Frozen HF buffers and trainable Google scalars retain each view's math."""
+    from safetensors.numpy import load_file
+    base, _, fields = fp32_decoder(GEMMA4_MOE)
+    fields = {**fields, "layer_scalar": mode}
+    variables = translate_weights(load_file(str(GEMMA4_MOE / "model.safetensors")), fields)
+    plain = base.clone(layer_scalar=mode)
+    scanned = plain.clone(scan_layers=True, remat=True)
+    ids = jnp.asarray(np.load(GEMMA4_MOE / "input_ids.npy"), jnp.int32)
+
+    def loss(model, params):
+        return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
+
+    expected, expected_grad = jax.jit(jax.value_and_grad(lambda params: loss(plain, params)))(variables["params"])
+    value, gradient = jax.jit(jax.value_and_grad(lambda params: loss(scanned, params)))(variables["params"])
+    np.testing.assert_allclose(value, expected, atol=1e-5, rtol=0)
+    for actual, wanted in zip(jax.tree.leaves(gradient), jax.tree.leaves(expected_grad)):
+        np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=1e-5)
+

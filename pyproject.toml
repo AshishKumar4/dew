@@ -73,6 +73,8 @@ streaming = ["datasets"]
 tfds = ["tensorflow-datasets>=4.9.10"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
+# HF image processors use torchvision on the host; model computation stays JAX.
+vision = ["torchvision>=0.29"]
 
 [tool.pyright]
 # The declared boundary: dew's own source, checked against the project venv.

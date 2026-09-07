@@ -10,6 +10,7 @@ import pytest
 
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mla import MLAMixer
 from dew.objectives.base import Step
@@ -41,14 +42,19 @@ def prompts():
             "extra_info": np.zeros((2, 1), np.int32)}
 
 
+def model_inputs(batch):
+    tokens = jnp.asarray(batch["prompt"])
+    mask = jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
+    return ModelInputs(tokens, {"attention_mask": mask})
+
+
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
 def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     model = decoder(kind)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     batch = prompts()
     sampling = Sampling(temperature=0.7, top_k=5)
-    result = generate(model, params, batch["prompt"], 3, key=jax.random.key(1),
-                      prompt_lengths=batch["prompt_length"], sampling=sampling)
+    result = generate(model, params, model_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
     np.testing.assert_array_equal(result.lengths, [3, 3])
     np.testing.assert_array_equal(result.terminated, [False, False])
     for row, length in enumerate(batch["prompt_length"]):
@@ -69,18 +75,37 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     assert np.max(np.abs(np.asarray(result.raw_log_probs - result.behavior_log_probs))) > 0.1
 
 
-def test_padding_repro_greedy_and_seeded_bucket_independence():
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_right_padding_and_logical_positions_survive_cached_generation(kind):
+    model = decoder(kind)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    inputs = ModelInputs(jnp.array([[1, 2, 0, 0], [4, 5, 0, 0]]), {
+        "attention_mask": jnp.array([[1, 1, 0, 0], [1, 1, 0, 0]], bool),
+        "positions": jnp.array([[2, 7, 0, 0], [12, 17, 0, 0]])})
+    result = generate(model, params, inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    for row in range(2):
+        context = inputs.tokens[row:row + 1, :2]
+        positions = inputs.token_fields["positions"][row:row + 1, :2]
+        for index, token in enumerate(np.asarray(result.tokens)[row, 4:]):
+            logits = model.apply(params, context, positions=positions)[0, -1]
+            assert token == int(jnp.argmax(logits))
+            np.testing.assert_allclose(result.raw_log_probs[row, index], jax.nn.log_softmax(logits)[token],
+                                       atol=3e-6, rtol=3e-6)
+            context = jnp.concatenate([context, jnp.array([[token]])], axis=1)
+            positions = jnp.concatenate([positions, positions[:, -1:] + 1], axis=1)
+
+
+def test_padding_repro_greedy_and_seeded_reproducibility():
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     key = jax.random.key(1)
     for sampling in (Sampling(temperature=0), Sampling(temperature=0.8, top_k=4)):
-        padded = generate(model, params, [[0, 0, 1, 2]], 3, key=key,
-                          sampling=sampling, prompt_lengths=[2])
+        inputs = ModelInputs(jnp.array([[0, 0, 1, 2]]), {"attention_mask": jnp.array([[0, 0, 1, 1]], bool)})
+        padded = generate(model, params, inputs, 3, key=key, sampling=sampling)
         plain = generate(model, params, [[1, 2]], 3, key=key, sampling=sampling)
         np.testing.assert_array_equal(padded.tokens[:, 4:], plain.tokens[:, 2:])
         np.testing.assert_allclose(padded.behavior_log_probs, plain.behavior_log_probs, atol=1e-6)
-        repeated = generate(model, params, [[0, 0, 1, 2]], 3, key=key,
-                            sampling=sampling, prompt_lengths=[2])
+        repeated = generate(model, params, inputs, 3, key=key, sampling=sampling)
         for first, second in zip(jax.tree.leaves(padded), jax.tree.leaves(repeated)):
             np.testing.assert_array_equal(first, second)
 
@@ -90,8 +115,8 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     objective = GRPOObjective(model, seq_len=7)
     params = objective.init(jax.random.key(0))
     batch = prompts()
-    plain = generate(model, params, batch["prompt"], 4, key=jax.random.key(1),
-                     prompt_lengths=batch["prompt_length"], sampling=Sampling(temperature=0))
+    plain = generate(model, params, model_inputs(batch), 4, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0))
     eos = int(plain.tokens[0, 4])
     seen = []
 
@@ -189,12 +214,40 @@ def test_recurrent_causality_and_bidirectional_capability_refusal():
             objective(bidirectional, seq_len=3)
 
 
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_padding_slots_do_not_consume_cache_capacity(kind):
+    model = decoder(kind).clone(max_seq_len=5)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    tokens = jnp.array([[0, 0, 0, 0, 0, 0, 1, 2]])
+    inputs = ModelInputs(tokens, {"attention_mask": jnp.array([[0, 0, 0, 0, 0, 0, 1, 1]], bool)})
+    actual = generate(model, params, inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    expected = generate(model, params, [[1, 2]], 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(actual.tokens[:, 8:], expected.tokens[:, 2:])
+    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+
+
+def test_any_declared_eos_id_stops_the_generation():
+    model = decoder()
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    prompt = jnp.array([[1, 2]])
+    baseline = generate(model, params, prompt, 3, key=jax.random.key(1),
+                        sampling=Sampling(temperature=0))
+    first = int(baseline.tokens[0, 2])
+    result = generate(model, params, prompt, 3, key=jax.random.key(1),
+                      sampling=Sampling(temperature=0, eos_id=((first + 1) % 13, first), pad_id=12))
+    np.testing.assert_array_equal(result.tokens[0, 2:], [first, 12, 12])
+    np.testing.assert_array_equal(result.lengths, [1])
+    np.testing.assert_array_equal(result.terminated, [True])
+    np.testing.assert_allclose(result.raw_log_probs[0, 0], baseline.raw_log_probs[0, 0], atol=1e-6)
+
+
 def test_sampling_and_prompt_validity_fail_before_execution():
     for kwargs in ({"temperature": -1}, {"temperature": float("nan")}, {"top_k": 0}):
         with pytest.raises(ValueError):
             Sampling(**kwargs)
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    for lengths in ([0], [3], [[2]], [1.5]):
-        with pytest.raises(ValueError, match="prompt_lengths"):
-            generate(model, params, [[1, 2]], 2, key=jax.random.key(1), prompt_lengths=lengths)
+    for mask in ([[0, 0]], [[1, 2]], [[1]], [[0.5, 1]]):
+        with pytest.raises(ValueError):
+            generate(model, params, ModelInputs(jnp.array([[1, 2]]), {"attention_mask": jnp.asarray(mask)}),
+                     2, key=jax.random.key(1))

@@ -161,8 +161,8 @@ def wrapper_pixels(directory, record):
     grid = int(count ** 0.5)
     patch = int(record["tower"]["patch_size"])
     side = grid * patch
-    return pixels.reshape(batch, grid, grid, 3, patch, patch).transpose(
-        0, 3, 1, 4, 2, 5).reshape(batch, 3, side, side)
+    return pixels.reshape(batch, grid, grid, patch, patch, 3).transpose(
+        0, 5, 1, 3, 2, 4).reshape(batch, 3, side, side)
 
 
 def test_wrapper_tower_and_projector_match_the_reference():
@@ -187,7 +187,7 @@ def test_wrapper_language_halves_build_and_score():
     """The language halves are complete decoder trees: they build and score a
     row of ids. The tied Gemma halves keep one leaf for head and embedding."""
     for name, tied in (("gemma3-tiny-mm", True), ("llama4-tiny-mm", False),
-                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", True)):
+                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", False)):
         _, record, variables = load_wrapper(name)
         model = models.build("causal_transformer", **with_precision(
             "causal_transformer", record["text"], dtype="float32",

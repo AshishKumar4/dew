@@ -33,10 +33,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
-    RMSNorm, apply_rotary, causal_attention_mask, max_attention_logits,
-    rotary_freqs, scaled_dot_product_attention,
+    RMSNorm, _cache_positions, _write_cache, apply_rotary, causal_attention_mask,
+    max_attention_logits, rotary_freqs, scaled_dot_product_attention,
 )
-from dew.nn.mixers import MixerBase, MixerContext, mixers
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.sharding import logical_axes
 
 
@@ -173,114 +173,60 @@ def apply_rotary_interleave(x, freqs_cos, freqs_sin):
     return out.astype(x.dtype)
 
 
-def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len):
-    """Fixed-size latent cache in the `open_kv_cache` style.
-
-    Declares `cached_latent`/`cached_rot` (and `cached_index` when the
-    indexer scores) plus the shared `cache_index`, sized from the step's own
-    arrays at the full decode length, and returns the absolute positions of
-    the appended tokens with the writer that appends them. Positions come
-    out before the write, because the decoupled rope head is rotated before
-    it enters the cache, exactly like the standard mixer's keys.
-    """
+def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *, valid=None):
+    """Compact per-row latent/rotary cache with optional sparse-index keys."""
     if max_seq_len is None:
-        raise ValueError(
-            "decoding needs max_seq_len: the latent cache is allocated once, "
-            "at the full decode length, and never grows.")
-    batch, length = latent.shape[0], latent.shape[1]
-    if length > max_seq_len:
-        raise ValueError(
-            f"{length} tokens do not fit a latent cache of {max_seq_len}.")
-    allocated = module.has_variable('cache', 'cached_latent')
-    cached_latent = module.variable(
-        'cache', 'cached_latent', jnp.zeros,
-        (batch, max_seq_len, latent.shape[-1]), latent.dtype)
-    cached_rot = module.variable(
-        'cache', 'cached_rot', jnp.zeros,
-        (batch, max_seq_len, rot.shape[-1]), rot.dtype)
+        raise ValueError("decoding needs max_seq_len for its fixed-capacity latent cache")
+    batch, length = latent.shape[:2]
+    if valid is None and length > max_seq_len:
+        raise ValueError(f"{length} tokens do not fit a latent cache of {max_seq_len}.")
+    cached_latent = module.variable("cache", "cached_latent", jnp.zeros,
+                                    (batch, max_seq_len, latent.shape[-1]), latent.dtype)
+    cached_rot = module.variable("cache", "cached_rot", jnp.zeros,
+                                 (batch, max_seq_len, rot.shape[-1]), rot.dtype)
     cached_index = None
     if index_keys is not None:
-        cached_index = module.variable(
-            'cache', 'cached_index', jnp.zeros,
-            (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    cache_index = module.variable('cache', 'cache_index',
-                                  lambda: jnp.array(0, jnp.int32))
-    index = cache_index.value
+        cached_index = module.variable("cache", "cached_index", jnp.zeros,
+                                       (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
+    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
 
     def append(new_latent, new_rot, new_index_keys):
-        if not allocated:
-            return new_latent, new_rot, new_index_keys
-        zero = jnp.array(0, index.dtype)
-        cached_latent.value = jax.lax.dynamic_update_slice(
-            cached_latent.value, new_latent.astype(cached_latent.value.dtype),
-            (zero, index, zero))
-        cached_rot.value = jax.lax.dynamic_update_slice(
-            cached_rot.value, new_rot.astype(cached_rot.value.dtype),
-            (zero, index, zero))
-        if cached_index is not None:
-            if new_index_keys is None:
-                raise ValueError(
-                    "the indexer scores, so decode has to append its keys too")
-            cached_index.value = jax.lax.dynamic_update_slice(
-                cached_index.value,
-                new_index_keys.astype(cached_index.value.dtype),
-                (zero, index, zero))
-        cache_index.value = index + length
+        if allocated:
+            cached_latent.value = _write_cache(cached_latent.value, new_latent, positions)
+            cached_rot.value = _write_cache(cached_rot.value, new_rot, positions)
+            if cached_index is not None:
+                if new_index_keys is None:
+                    raise ValueError("the indexer scores, so decode must append its keys")
+                cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
         return cached_latent.value, cached_rot.value, full_index
 
-    return index + jnp.arange(length), append
+    return positions, append
 
 
-def open_expanded_cache(module: nn.Module, key, value, index_keys,
-                        max_seq_len):
-    """Fixed-size expanded K/V cache for the sparse variant.
-
-    The V3.2 reference caches the expanded keys and values, not the latents,
-    so decode reads them back without re-expanding the whole history every
-    step. Same declare/append shape as `open_latent_cache`, with the
-    indexer's keys alongside.
-    """
+def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, *, valid=None):
+    """Per-row expanded K/V and sparse-index cache, as DeepSeek V3.2 stores it."""
     if max_seq_len is None:
-        raise ValueError(
-            "decoding needs max_seq_len: the sparse cache is allocated once, "
-            "at the full decode length, and never grows.")
-    batch, length = key.shape[0], key.shape[1]
-    if length > max_seq_len:
-        raise ValueError(
-            f"{length} tokens do not fit a sparse cache of {max_seq_len}.")
-    allocated = module.has_variable('cache', 'cached_key')
-    cached_key = module.variable(
-        'cache', 'cached_key', jnp.zeros,
-        (batch, max_seq_len) + key.shape[2:], key.dtype)
-    cached_value = module.variable(
-        'cache', 'cached_value', jnp.zeros,
-        (batch, max_seq_len) + value.shape[2:], value.dtype)
-    cached_index = module.variable(
-        'cache', 'cached_index', jnp.zeros,
-        (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    cache_index = module.variable('cache', 'cache_index',
-                                  lambda: jnp.array(0, jnp.int32))
-    index = cache_index.value
+        raise ValueError("decoding needs max_seq_len for its fixed-capacity sparse cache")
+    batch, length = key.shape[:2]
+    if valid is None and length > max_seq_len:
+        raise ValueError(f"{length} tokens do not fit a sparse cache of {max_seq_len}.")
+    cached_key = module.variable("cache", "cached_key", jnp.zeros,
+                                 (batch, max_seq_len) + key.shape[2:], key.dtype)
+    cached_value = module.variable("cache", "cached_value", jnp.zeros,
+                                   (batch, max_seq_len) + value.shape[2:], value.dtype)
+    cached_index = module.variable("cache", "cached_index", jnp.zeros,
+                                   (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
+    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
 
     def append(new_key, new_value, new_index_keys):
-        if not allocated:
-            return new_key, new_value, new_index_keys
-        zero = jnp.array(0, index.dtype)
-        cached_key.value = jax.lax.dynamic_update_slice(
-            cached_key.value, new_key.astype(cached_key.value.dtype),
-            (zero, index) + (zero,) * (new_key.ndim - 2))
-        cached_value.value = jax.lax.dynamic_update_slice(
-            cached_value.value, new_value.astype(cached_value.value.dtype),
-            (zero, index) + (zero,) * (new_value.ndim - 2))
-        cached_index.value = jax.lax.dynamic_update_slice(
-            cached_index.value,
-            new_index_keys.astype(cached_index.value.dtype),
-            (zero, index, zero))
-        cache_index.value = index + length
+        if allocated:
+            cached_key.value = _write_cache(cached_key.value, new_key, positions)
+            cached_value.value = _write_cache(cached_value.value, new_value, positions)
+            cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
         return cached_key.value, cached_value.value, cached_index.value
 
-    return index + jnp.arange(length), append
+    return positions, append
 
 
 @logical_axes({
@@ -536,10 +482,15 @@ class MultiHeadLatentAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None):
+                 positions=None, segment_ids=None, kv_store=None,
+                 attention_metadata: AttentionMetadata | None = None):
         causal, mask = self.causal, None
         implementation = self.attention_impl
         batch, length, _ = x.shape
+        valid = None if attention_metadata is None else attention_metadata.valid
+        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
+            raise ValueError("MLA does not implement multi-axis rotary positions")
+        logical_positions = positions
         queries, q_resid = self._queries(x)
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
@@ -547,10 +498,8 @@ class MultiHeadLatentAttention(nn.Module):
             queries, [self.qk_nope_head_dim], axis=-1)
         latent, rot = self._latents(x)
         if decode:
-            if positions is not None or segment_ids is not None:
-                raise ValueError(
-                    "decode positions come from the cache index, so an "
-                    "explicit positions or segment_ids has no meaning there")
+            if segment_ids is not None:
+                raise ValueError("decode accepts row validity, not packed segment_ids")
             # The cache hands out the slots first, because the rope heads
             # rotate at absolute positions: the queries at this step's slots
             # and the appended latents at theirs, while the cached ones keep
@@ -563,10 +512,10 @@ class MultiHeadLatentAttention(nn.Module):
                 index_keys = self.indexer.keys(x)
                 positions, append = open_expanded_cache(
                     self, shape_key, shape_value, index_keys,
-                    self.max_seq_len)
+                    self.max_seq_len, valid=valid)
                 freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions, self.qk_rope_head_dim, self.rope_theta,
-                    self.yarn)
+                    positions if logical_positions is None else logical_positions,
+                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
                 q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
                 rot = self._rotate(
                     rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
@@ -576,23 +525,26 @@ class MultiHeadLatentAttention(nn.Module):
                     *self._expand(latent, rot), index_keys)
                 mask = self._index_mask(
                     x, q_resid, positions, key.shape[1], index_full,
-                    freqs_cos, freqs_sin)
+                    freqs_cos, freqs_sin, base=causal_attention_mask(
+                        positions, key.shape[1], key_valid=self.get_variable("cache", "cache_valid")))
             else:
                 positions, append = open_latent_cache(
-                    self, latent, rot, None, self.max_seq_len)
+                    self, latent, rot, None, self.max_seq_len, valid=valid)
                 freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions, self.qk_rope_head_dim, self.rope_theta,
-                    self.yarn)
+                    positions if logical_positions is None else logical_positions,
+                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
                 q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
                 rot = self._rotate(
                     rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
                 latent, rot, _ = append(latent, rot, None)
                 key, value = self._expand(latent, rot)
-                mask = causal_attention_mask(positions, key.shape[-3])
+                mask = causal_attention_mask(
+                    positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
             causal = False
         else:
             if positions is None:
-                positions = jnp.arange(length)
+                positions = (jnp.arange(length) if valid is None else
+                             jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
             else:
                 positions = jnp.asarray(positions)
             freqs_cos, freqs_sin = mla_rope_freqs(
@@ -620,6 +572,11 @@ class MultiHeadLatentAttention(nn.Module):
                 mask = self._index_mask(
                     x, q_resid, positions, length, index_keys,
                     freqs_cos, freqs_sin, base=mask)
+        if valid is not None:
+            queries_valid = jnp.asarray(valid, bool)[:, None, :, None]
+            mask = queries_valid if mask is None else mask & queries_valid
+            if not decode:
+                mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         scale = self.query_scale
         query = jnp.concatenate([q_pass, q_rot], axis=-1)
         if scale != 1.0:
@@ -660,6 +617,9 @@ class MultiHeadLatentAttention(nn.Module):
             jnp.arange(batch)[:, None, None],
             queries[None, :, None], chosen].set(True)
         return jnp.logical_and(keep, selected[:, None])
+
+
+from dew.nn.mixers import MixerBase, MixerContext, mixers
 
 
 @mixers("mla")

@@ -1,0 +1,1040 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<pad>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<bos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "<eos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "token4",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 5,
+      "content": "token5",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 6,
+      "content": "token6",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 7,
+      "content": "token7",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 8,
+      "content": "token8",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 9,
+      "content": "token9",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 10,
+      "content": "token10",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 11,
+      "content": "token11",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 12,
+      "content": "token12",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 13,
+      "content": "token13",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 14,
+      "content": "token14",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 15,
+      "content": "token15",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 16,
+      "content": "token16",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 17,
+      "content": "token17",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 18,
+      "content": "token18",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 19,
+      "content": "token19",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 20,
+      "content": "token20",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 21,
+      "content": "token21",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 22,
+      "content": "token22",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 23,
+      "content": "token23",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 24,
+      "content": "token24",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 25,
+      "content": "token25",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 26,
+      "content": "token26",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 27,
+      "content": "token27",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 28,
+      "content": "token28",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 29,
+      "content": "token29",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 30,
+      "content": "token30",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 31,
+      "content": "token31",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32,
+      "content": "token32",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 33,
+      "content": "token33",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 34,
+      "content": "token34",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 35,
+      "content": "token35",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 36,
+      "content": "token36",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 37,
+      "content": "token37",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 38,
+      "content": "token38",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 39,
+      "content": "token39",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 40,
+      "content": "token40",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 41,
+      "content": "token41",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 42,
+      "content": "token42",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 43,
+      "content": "token43",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 44,
+      "content": "token44",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 45,
+      "content": "token45",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 46,
+      "content": "token46",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 47,
+      "content": "token47",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 48,
+      "content": "token48",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 49,
+      "content": "token49",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 50,
+      "content": "token50",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 51,
+      "content": "token51",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 52,
+      "content": "token52",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 53,
+      "content": "token53",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 54,
+      "content": "token54",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 55,
+      "content": "token55",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 56,
+      "content": "token56",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 57,
+      "content": "token57",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 58,
+      "content": "token58",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 59,
+      "content": "token59",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 60,
+      "content": "token60",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 61,
+      "content": "token61",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 62,
+      "content": "token62",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 63,
+      "content": "token63",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 64,
+      "content": "token64",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 65,
+      "content": "token65",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 66,
+      "content": "token66",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 67,
+      "content": "token67",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 68,
+      "content": "token68",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 69,
+      "content": "token69",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 70,
+      "content": "token70",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 71,
+      "content": "token71",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 72,
+      "content": "token72",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 73,
+      "content": "token73",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 74,
+      "content": "token74",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 75,
+      "content": "token75",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 76,
+      "content": "token76",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 77,
+      "content": "token77",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 78,
+      "content": "token78",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 79,
+      "content": "token79",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 80,
+      "content": "token80",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 81,
+      "content": "token81",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 82,
+      "content": "token82",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 83,
+      "content": "token83",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 84,
+      "content": "token84",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 85,
+      "content": "token85",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 86,
+      "content": "token86",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 87,
+      "content": "token87",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 88,
+      "content": "token88",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 89,
+      "content": "token89",
+      "single_word": true,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 90,
+      "content": "<|image_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 91,
+      "content": "<|image_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 92,
+      "content": "<|patch|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 93,
+      "content": "<|image|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 94,
+      "content": "<|tile_x_separator|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 95,
+      "content": "<|tile_y_separator|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 96,
+      "content": "<mask>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 97,
+      "content": "<start_of_image>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 98,
+      "content": "<end_of_image>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 99,
+      "content": "<image_soft_token>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "<bos>": 1,
+      "<eos>": 2,
+      "<unk>": 3,
+      "token4": 4,
+      "token5": 5,
+      "token6": 6,
+      "token7": 7,
+      "token8": 8,
+      "token9": 9,
+      "token10": 10,
+      "token11": 11,
+      "token12": 12,
+      "token13": 13,
+      "token14": 14,
+      "token15": 15,
+      "token16": 16,
+      "token17": 17,
+      "token18": 18,
+      "token19": 19,
+      "token20": 20,
+      "token21": 21,
+      "token22": 22,
+      "token23": 23,
+      "token24": 24,
+      "token25": 25,
+      "token26": 26,
+      "token27": 27,
+      "token28": 28,
+      "token29": 29,
+      "token30": 30,
+      "token31": 31,
+      "token32": 32,
+      "token33": 33,
+      "token34": 34,
+      "token35": 35,
+      "token36": 36,
+      "token37": 37,
+      "token38": 38,
+      "token39": 39,
+      "token40": 40,
+      "token41": 41,
+      "token42": 42,
+      "token43": 43,
+      "token44": 44,
+      "token45": 45,
+      "token46": 46,
+      "token47": 47,
+      "token48": 48,
+      "token49": 49,
+      "token50": 50,
+      "token51": 51,
+      "token52": 52,
+      "token53": 53,
+      "token54": 54,
+      "token55": 55,
+      "token56": 56,
+      "token57": 57,
+      "token58": 58,
+      "token59": 59,
+      "token60": 60,
+      "token61": 61,
+      "token62": 62,
+      "token63": 63,
+      "token64": 64,
+      "token65": 65,
+      "token66": 66,
+      "token67": 67,
+      "token68": 68,
+      "token69": 69,
+      "token70": 70,
+      "token71": 71,
+      "token72": 72,
+      "token73": 73,
+      "token74": 74,
+      "token75": 75,
+      "token76": 76,
+      "token77": 77,
+      "token78": 78,
+      "token79": 79,
+      "token80": 80,
+      "token81": 81,
+      "token82": 82,
+      "token83": 83,
+      "token84": 84,
+      "token85": 85,
+      "token86": 86,
+      "token87": 87,
+      "token88": 88,
+      "token89": 89,
+      "<|image_start|>": 90,
+      "<|image_end|>": 91,
+      "<|patch|>": 92,
+      "<|image|>": 93,
+      "<|tile_x_separator|>": 94,
+      "<|tile_y_separator|>": 95
+    },
+    "unk_token": "<unk>"
+  }
+}

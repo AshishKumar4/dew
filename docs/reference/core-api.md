@@ -162,12 +162,16 @@ The model must implement Linen `hidden_states(tokens, train=..., positions=..., 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
-generate(model, params, prompt, max_new_tokens, *, key,
-         sampling=Sampling(), prompt_lengths=None) -> Generation
+generate(model, params, inputs, max_new_tokens, *, key,
+         sampling=Sampling()) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0)
 ```
 
-`params` is the complete variables tree. `prompt` is an integer `(B, P)` array. Optional `(B,)` `prompt_lengths` counts real tokens at each row's right edge. Each real prompt plus the token budget must fit the cache. The host groups equal lengths and removes padding before the compiled cached decoder; different lengths can produce different JIT shapes. The decode runs a fixed trip count with finished rows masked. On a mesh the group's rows split over the batch axes; in a pool each process passes and receives its own rows, and the group plan is agreed across processes so their collectives match. This API does not provide streaming or continuous request batching.
+`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Scalar `positions` supplied in token fields continue from the last valid position.
+
+The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over batch axes; each process receives its own rows. All participating processes validate inputs and agree on input shapes and sampling controls before device execution. Host input rejection propagates to peers; blocked device collectives cannot be recovered by this protocol. Changing padded shapes or static controls can still compile a new executable. Streaming and request scheduling are not part of this batch function.
+
+`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple.
 
 `Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)`. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)` and zero invalid tails. Only slots below `lengths` are likelihoods. Behavior probabilities include temperature/top-k; raw probabilities describe the unmodified model. Greedy behavior has probability one for its selected action.
 

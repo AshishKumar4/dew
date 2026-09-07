@@ -1,0 +1,21 @@
+{
+  "dither": 0.0,
+  "feature_extractor_type": "Gemma3nAudioFeatureExtractor",
+  "feature_size": 16,
+  "fft_length": 1024,
+  "fft_overdrive": true,
+  "frame_length": 512,
+  "hop_length": 160,
+  "input_scale_factor": 1.0,
+  "max_frequency": 7600.0,
+  "mel_floor": 1e-05,
+  "min_frequency": 125.0,
+  "padding_side": "right",
+  "padding_value": 0.0,
+  "per_bin_mean": null,
+  "per_bin_stddev": null,
+  "preemphasis": 0.97,
+  "preemphasis_htk_flavor": true,
+  "return_attention_mask": true,
+  "sampling_rate": 16000
+}
