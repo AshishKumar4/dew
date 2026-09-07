@@ -1116,7 +1116,7 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
     params = model.init(rng, jnp.ones((1, 4), jnp.int32))
     prompt = jax.random.randint(rng, (1, 3), 0, 64)
 
-    cache = model.apply(params, 1, method=type(model).init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply(params, 1, method="init_cache", mutable=["cache"])[1]["cache"]
     variables = {**params, "cache": cache}
     logits, mutated = model.apply(variables, prompt, decode=True, mutable=["cache"])
     first = jnp.argmax(logits[:, -1], axis=-1)
@@ -1511,9 +1511,9 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     directory = FIXTURES / "qwen35-tiny"
     model, variables = fp32_decoder(directory, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    full = model.apply(variables, ids)
+    full = jnp.asarray(model.apply(variables, ids))
 
-    cache = model.apply(variables, ids.shape[0], method=type(model).init_cache,
+    cache = model.apply(variables, ids.shape[0], method="init_cache",
                         mutable=["cache"])[1]["cache"]
     logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
                                   decode=True, mutable=["cache"])
@@ -2242,7 +2242,7 @@ def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
     steps through the KV cache agree with the whole sequence."""
     model, variables = fp32_decoder(GEMMA3N, max_seq_len=16)
     ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
-    full = model.apply(variables, ids)
+    full = jnp.asarray(model.apply(variables, ids))
     state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
     steps = []
     for position in range(ids.shape[1]):
