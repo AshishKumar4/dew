@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import functools
 import os
-from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import linen as nn, struct
+from flax.core import freeze
 
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
@@ -18,6 +20,19 @@ from dew.objectives.base import Variables
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
+
+
+if TYPE_CHECKING:
+    from dew.objectives.diffusion import DiffusionObjective
+
+
+@struct.dataclass
+class DenoisingInputs:
+    """Initial noise and already encoded conditioning for one denoising call."""
+
+    noise: jax.Array
+    conditions: Mapping[str, object] = struct.field(default_factory=dict)
+    unconditional: Mapping[str, object] = struct.field(default_factory=dict)
 
 
 @dataclass(frozen=True, eq=False)
@@ -33,11 +48,22 @@ class TextToImage:
     process: Process
     inputs: InputSpec
     params: Variables
-    autoencoder: Optional[AutoEncoder] = None
+    autoencoder: AutoEncoder | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "params", freeze(dict(self.params)))
+
+    def bind(self, variables: Variables) -> TextToImage:
+        """Bind another variables snapshot without rebuilding the model or encoders."""
+        return replace(self, params=variables)
+
+    @classmethod
+    def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
+        return cls(objective.model, objective.process, objective.inputs, variables, objective.autoencoder)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool = True,
-                 step: Optional[int] = None) -> "TextToImage":
+                 step: int | None = None) -> "TextToImage":
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`)."""
         from dew.checkpoints import Checkpoints
@@ -62,8 +88,7 @@ class TextToImage:
         params = values["params"]
         if ema:
             params = merge(params, values["ema"])
-        return cls(model=objective.model, process=objective.process, inputs=objective.inputs,
-                   params=params, autoencoder=objective.autoencoder)
+        return cls.from_objective(objective, params)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool = True) -> "TextToImage":
@@ -72,6 +97,7 @@ class TextToImage:
         from dew.interop.hub import pull_from_hub
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema)
+
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
@@ -96,28 +122,38 @@ class TextToImage:
                 encoder_params, condition.encoder.tokenize([condition.unconditional]))
         return given, null
 
-    def __call__(self, prompts: Sequence[str], *, steps: int = 50,
-                 guidance: CFG | float | None = None, sampler: Solver[Any] = DDIM(),
-                 key) -> jax.Array:
+    def prepare(self, prompts: str | Sequence[str], *, key: jax.Array) -> DenoisingInputs:
+        """Encode prompts once; the returned arrays can be reused with other solvers."""
+        rows = [prompts] if isinstance(prompts, str) else list(prompts)
+        if not rows or not all(isinstance(prompt, str) for prompt in rows):
+            raise ValueError("prompts must be a non-empty string sequence")
+        given, null = self.conditions(rows)
+        noise = self.process.noise(key, (len(rows), *self.latent_shape))
+        return DenoisingInputs(noise, given, null)
+
+    def __call__(self, prompts: str | Sequence[str] | DenoisingInputs, *, steps: int = 50,
+                 guidance: CFG | float | None = None, sampler: Solver[object] = DDIM(),
+                 key: jax.Array) -> jax.Array:
         """Images in [-1, 1], `[len(prompts), H, W, C]`. `guidance` is a
         classifier-free guidance scale, or a `CFG` with its interval, or None
         for the plain conditional prediction."""
         if isinstance(guidance, (int, float)):
             guidance = CFG(float(guidance))
-        given, null = self.conditions(prompts)
-        x_T = self.process.noise(key, (len(prompts), *self.latent_shape))
-        return _run(self, self.params, given, null, x_T, jax.random.fold_in(key, 1),
+        prepared = prompts if isinstance(prompts, DenoisingInputs) else self.prepare(prompts, key=key)
+        if prepared.noise.ndim != len(self.latent_shape) + 1 or prepared.noise.shape[1:] != self.latent_shape:
+            raise ValueError(f"initial noise must have shape [batch, {self.latent_shape}]")
+        return _run(self.model, self.process, self.autoencoder, self.params, prepared.conditions,
+                    prepared.unconditional, prepared.noise, jax.random.fold_in(key, 1),
                     steps=steps, sampler=sampler, guidance=guidance)
 
 
-# The pipeline (by identity), the step count, the solver and the guidance
-# are compile-time constants, so a second call with the same settings runs
-# the compiled loop without tracing again.
-@functools.partial(jax.jit, static_argnames=("pipe", "steps", "sampler", "guidance"))
-def _run(pipe: TextToImage, params, given, null, x_T, key, *, steps, sampler, guidance):
-    denoise = pipe.process.denoiser(pipe.model, params, given,
-                                    None if guidance is None else null)
+# Rebinding weights must not change the static compilation identity.
+@functools.partial(jax.jit, static_argnames=("model", "process", "autoencoder", "steps", "sampler", "guidance"))
+def _run(model: nn.Module, process: Process, autoencoder: AutoEncoder | None,
+         params, given, null, x_T, key, *, steps, sampler, guidance):
+    variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
+    denoise = process.denoiser(model, variables, given, None if guidance is None else null)
     samples = sample(denoise, x_T, steps, solver=sampler, guidance=guidance, key=key)
-    if pipe.autoencoder is not None:
-        samples = pipe.autoencoder.decode(params["autoencoder"], samples)
+    if autoencoder is not None:
+        samples = autoencoder.decode(params["autoencoder"], samples)
     return jnp.clip(samples, -1.0, 1.0)
