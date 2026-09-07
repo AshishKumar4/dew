@@ -41,6 +41,10 @@ tokamax is not a Dew dependency, and its current release does not install cleanl
 
 The `expert` mesh axis partitions the expert dimension. Dense parameter dimensions can use FSDP or tensor placement independently. See [distributed training](distributed.md) for the global batch and layout requirements.
 
+The mixture's separate `dispatch` field defaults to `"global"`, retaining global sort/gather. `"exchange"` opts into bounded fp32 token exchange through public JAX `all_to_all` collectives. It needs an `expert` mesh axis larger than one that divides the expert count. Every selected token is retained, including when all traffic goes to one shard: later rounds drain that shard's bucket. Initialisation still works outside a mesh; applying the exchange model requires the mesh. GPT OSS's biased experts do not yet support this dispatch choice.
+
+Exchange currently refuses bf16 rather than changing gradients or silently using global dispatch. The global path's bf16-to-fp32 parameter-gradient rounding varies with XLA placement, and exact GELU has an additional bf16 rounding difference inside a loop. This is an fp32 implementation increment, not completed bf16 expert-parallel training support. `tools/moe_exchange_probe.py` reproduces the working-buffer measurement and the independent float64 gradient-oracle comparison. No multiaccelerator throughput claim follows from the CPU measurements.
+
 More experts increase parameter storage even when `top_k` is fixed. Routing, communication, shared experts, and load imbalance still contribute to runtime. Estimate optimizer and EMA storage as well as the parameters, and measure a representative forward/backward step on the intended topology.
 
 ## Validate a sparse run
