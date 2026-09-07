@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import numpy as np
+from flax import linen as nn
 
 from dew.diffusion.block import BlockProcess
 from dew.interop.hf_decoders import translate_config, translate_denoiser_weights
@@ -91,15 +92,22 @@ def translate_weights(tensors: Mapping[str, np.ndarray], config: Mapping[str, ob
     mapped = translate_denoiser_weights(text, fields)
     params = {"text": mapped["text"]["params"],
               "self_conditioning": mapped["self_conditioning"]["params"]}
+    variables = {"params": params}
+    for collection, tree in mapped["text"].items():
+        if collection != "params":
+            variables[collection] = {"text": tree}
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
+        tower_variables = translate_gemma4_vision_weights(vision)
         params["conditioner"] = {
-            "tower": translate_gemma4_vision_weights(vision),
+            "tower": tower_variables["params"],
             "projector": translate_gemma4_projector_weights(projection)}
+        if "constants" in tower_variables:
+            variables.setdefault("constants", {})["conditioner"] = {"tower": tower_variables["constants"]}
     elif vision or projection:
         raise ValueError("vision weights require vision_config")
-    return {"params": params}
+    return variables
 
 
 def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
@@ -124,13 +132,27 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
         confidence_threshold=_number(generation, "confidence_threshold", 0.005))
 
 
-def export_weights(variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """Write canonical decoder tensors once; HF reconstructs the encoder aliases."""
+def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """Write canonical decoder tensors under the native model's explicit scalar policy."""
     from dew.interop.hf_decoders import _GEMMA4_MOE, _flatten, _hf_name
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 
+    if not isinstance(model, DiffusionGemma):
+        raise TypeError("DiffusionGemma export requires its native model value")
+    mode = model.text.layer_scalar
+    if mode not in ("frozen", "trainable"):
+        raise ValueError("DiffusionGemma export requires an explicit layer_scalar mode")
     params = variables["params"]
     flat = _flatten(params["text"])
+    scalar_collection = "params" if mode == "trainable" else "constants"
+    other_collection = "constants" if mode == "trainable" else "params"
+    for index in range(model.text.num_layers):
+        layer = f"layers_{index}"
+        wrong = variables.get(other_collection, {}).get("text", {}).get(layer, {})
+        if "layer_scalar" in wrong:
+            raise ValueError(f"layer_scalar in {other_collection} disagrees with model mode {mode}")
+        value = variables[scalar_collection]["text"][layer]["layer_scalar"]
+        flat[f"{layer}.layer_scalar"] = value
     inverse_moe = {value: key for key, value in _GEMMA4_MOE.items()}
     hf_text = text_config(config)
     result: dict[str, np.ndarray] = {}
