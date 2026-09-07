@@ -245,6 +245,7 @@ def family_source(request):
 
 @pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
 def audio_source(request):
+    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
     directory = FIXTURE.parent / request.param
     loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
     meta = json.loads((directory / "meta.json").read_text())
