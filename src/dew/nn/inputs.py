@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 
 
@@ -28,6 +29,29 @@ class ModelInputs:
     tokens: jax.Array
     token_fields: Mapping[str, jax.Array] = struct.field(default_factory=dict)
     conditioning: Mapping[str, jax.Array] = struct.field(default_factory=dict)
+
+    @classmethod
+    def from_value(cls, value: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]]) -> ModelInputs:
+        """Normalize host input without lossy ID coercion or moving resident arrays.
+
+        Distributed algorithms call this inside their agreed validation phase;
+        this method itself performs no collectives or model execution.
+        """
+        if isinstance(value, cls):
+            result = value
+        elif isinstance(value, jax.Array):
+            result = cls(value)
+        else:
+            array = np.asarray(value)
+            if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
+                raise ValueError("tokens must be an integer [B, S] array")
+            bounds = np.iinfo(np.int32)
+            if np.any(array < bounds.min) or np.any(array > bounds.max):
+                raise ValueError("token IDs must be representable as int32")
+            result = cls(jnp.asarray(array, jnp.int32))
+        result.validate()
+        return result
+
 
     def validate(self) -> None:
         """Check the numeric layout on the host before dispatching a model."""
