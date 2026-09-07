@@ -25,7 +25,7 @@ from dew.data.prompts import LENGTH_KEY
 from dew.rl import group_advantage
 from dew.objectives.base import Variables
 from dew.sampling.text import Generation, Sampling
-from dew.training.distributed import local_rows
+from dew.nn.inputs import local_rows
 from dew.training.state import TrainState
 
 from .rollout import (
@@ -271,9 +271,10 @@ class EpisodeRollout:
     def _action(self, result: Generation, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
         """Validate recorded tokens and likelihoods before an environment acts."""
-        tokens = np.asarray(result.tokens)
-        lengths, ended = np.asarray(result.lengths), np.asarray(result.terminated)
-        raw, behavior = np.asarray(result.raw_log_probs), np.asarray(result.behavior_log_probs)
+        rows = result.host()
+        tokens = np.asarray(rows.tokens)
+        lengths, ended = np.asarray(rows.lengths), np.asarray(rows.terminated)
+        raw, behavior = np.asarray(rows.raw_log_probs), np.asarray(rows.behavior_log_probs)
         width = len(context)
         if (tokens.shape != (1, width + self.max_new_tokens)
                 or not np.issubdtype(tokens.dtype, np.integer) or np.any(tokens < 0)
