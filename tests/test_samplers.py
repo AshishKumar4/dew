@@ -9,17 +9,22 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import linen as nn
 
 from dew.diffusion import (
     CosineNoiseScheduler, EpsilonPredictionTransform, FlowMatchingScheduler,
-    FlowMatchPredictionTransform, KarrasPredictionTransform, KarrasVENoiseScheduler, Process,
-    broadcast_rates, expand,
+    FlowMatchPredictionTransform, KarrasPredictionTransform, KarrasVENoiseScheduler,
+    LinearNoiseScheduler, Process, broadcast_rates, expand,
 )
-from dew.sampling import CFG, DDIM, DDPM, Euler, EulerAncestral, Heun, MultiStepDPM, RK4, sample
+from dew.sampling import (
+    CFG, DDIM, DDPM, DPMSolverPP, Euler, EulerAncestral, Heun, MultiStepDPM, RK4, sample,
+)
 
 DATA_STD = 0.3
 
@@ -82,14 +87,16 @@ def generate(process, model, solver, steps=100, count=256, shape=(8, 8, 3), seed
     return sample(denoise, x_T, steps, solver=solver, key=jax.random.fold_in(key, 1))
 
 
-@pytest.mark.parametrize("solver", [Euler(), DDIM(), DDPM()], ids=lambda s: type(s).__name__)
+@pytest.mark.parametrize("solver", [Euler(), DDIM(), DDPM(), DPMSolverPP()],
+                         ids=lambda s: type(s).__name__)
 def test_vp_sampler_converges(solver):
     process, model = vp_process()
     assert_gaussian_stats(generate(process, model, solver))
 
 
 @pytest.mark.parametrize(
-    "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), RK4()],
+    "solver", [Euler(), EulerAncestral(), DDIM(), Heun(), MultiStepDPM(), DDPM(), RK4(),
+               DPMSolverPP()],
     ids=lambda s: type(s).__name__)
 def test_karras_sampler_converges(solver):
     process, model = karras_process()
@@ -253,6 +260,121 @@ def test_heun_takes_the_euler_step_where_sigma_reaches_zero():
     euler, _ = Euler().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process, denoise)
     assert jnp.all(jnp.isfinite(heun))
     assert jnp.allclose(heun, euler, atol=1e-6)
+
+
+############################################################################################################
+# DPM-Solver++ (2M) against Diffusers 0.34.0
+############################################################################################################
+
+DPM_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "dpm_solver"
+
+
+class LinearVPOracle(nn.Module):
+    """The epsilon oracle on the linear beta table, the model
+    tools/dpm_solver_reference.py runs under Diffusers."""
+    schedule: LinearNoiseScheduler
+
+    @nn.compact
+    def __call__(self, x, temb):
+        alpha, sigma = broadcast_rates(self.schedule, temb, x)
+        return x * sigma / (alpha**2 * DATA_STD**2 + sigma**2)
+
+
+def dpm_walk(solver, x_T, steps=21):
+    """Every latent after each solver step on the linear VP table, the walk
+    the reference tool records."""
+    schedule = LinearNoiseScheduler(1000)
+    process = Process(schedule, EpsilonPredictionTransform())
+    model = LinearVPOracle(schedule=schedule)
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 3, 4, 4)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    times = process.times(steps)
+
+    def body(carry, inputs):
+        x, state = carry
+        t, t_next = inputs
+        t = jnp.full((x.shape[0],), t)
+        t_next = jnp.full((x.shape[0],), t_next)
+        denoised, eps = denoise(x, t)
+        x, state = solver.step(x, t, t_next, denoised, eps, state,
+                               jax.random.PRNGKey(0), process, denoise)
+        return (x, state), x
+
+    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T)), (times[:-1], times[1:]))
+    return latents
+
+
+def test_dpmpp_2m_matches_diffusers_latents_and_gradient():
+    """Twenty second-order steps on the linear VP table against Diffusers
+    0.34.0's DPMSolverMultistepScheduler (dpmsolver++, order 2, midpoint,
+    sigma_min final) on the same integer grid and the same closed-form
+    epsilon oracle: every latent within 1e-4 (observed max 1.4e-06 at latents
+    up to 3.1), and the vector-Jacobian product of the final latent against
+    the fixture's cotangent through the whole trajectory within 1e-4 (observed
+    1.0e-06 at gradients up to 1.0). Dropping the D1 term, which turns every
+    step first order, misses the latents by more than 1e-2."""
+    fixture = np.load(DPM_FIXTURES / "linear_vp_2m.npz")
+    x_T = jnp.asarray(fixture["x_T"])
+    latents = dpm_walk(DPMSolverPP(), x_T)
+    assert latents.shape == fixture["latents"].shape
+    assert float(jnp.max(jnp.abs(latents - fixture["latents"]))) < 1e-4
+    _, vjp = jax.vjp(lambda x: dpm_walk(DPMSolverPP(), x)[-1], x_T)
+    (grad,) = vjp(jnp.asarray(fixture["cotangent"]))
+    assert float(jnp.max(jnp.abs(grad - fixture["grad"]))) < 1e-4
+
+    class FirstOrderOnly:
+        """The same update with its history discarded every step."""
+        inner = DPMSolverPP()
+
+        def init(self, x):
+            return self.inner.init(x)
+
+        def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+            stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x),
+                                         key, process, denoise)
+            return stepped, state
+
+    first_order = dpm_walk(FirstOrderOnly(), x_T)
+    assert float(jnp.max(jnp.abs(first_order - fixture["latents"]))) > 1e-2
+
+
+def test_dpmpp_2m_lands_on_the_clean_prediction_at_sigma_zero():
+    """The step onto sigma 0 is the h -> infinity limit of the first order
+    update, x_t = x0, with no log of zero in the arithmetic. The flow path
+    reaches sigma 0 at t = 0, so the last interval of any grid hits it; the
+    check holds with and without history."""
+    process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
+    model = ConstantVelocity()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    x = jax.random.normal(jax.random.PRNGKey(0), (3, 4))
+    t = jnp.full((3,), 0.25)
+    zero = jnp.zeros((3,))
+    x_0, eps = denoise(x, t)
+    solver = DPMSolverPP()
+    fresh, state = solver.step(x, t, zero, x_0, eps, solver.init(x), jax.random.PRNGKey(0),
+                               process, denoise)
+    assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(fresh, x_0, atol=1e-6)
+    with_history, _ = solver.step(x, t, zero, x_0, eps, state, jax.random.PRNGKey(0),
+                                  process, denoise)
+    assert jnp.all(jnp.isfinite(with_history)) and jnp.allclose(with_history, x_0, atol=1e-6)
+
+
+def test_dpmpp_2m_is_second_order_on_the_karras_ode():
+    """Twenty rho-spaced steps from sigma 80 down against the closed form,
+    the bracket test_solvers_integrate_the_flow_ode_at_their_order sets:
+    DPM-Solver++ (2M) lands within 8e-2 like Heun and closer than Euler.
+    Observed 5.7e-2 beside Heun's 5.1e-2, against Euler's 1.5e-1."""
+    process, _ = karras_process()
+    x_T = jax.random.normal(jax.random.PRNGKey(0), (64, 4)) * 80.0
+
+    def error(solver):
+        x, sigma = integrate(process, solver, x_T, steps=20)
+        exact = x_T * jnp.sqrt(DATA_STD**2 + sigma**2) / jnp.sqrt(DATA_STD**2 + 80.0**2)
+        return float(jnp.max(jnp.abs(x - exact)) / jnp.max(jnp.abs(exact)))
+
+    dpmpp, euler = error(DPMSolverPP()), error(Euler())
+    assert dpmpp < 8e-2 and dpmpp < euler, (dpmpp, euler)
 
 
 ############################################################################################################

@@ -227,4 +227,65 @@ class MultiStepDPM:
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)
 
 
-__all__ = ["Solver", "DDPM", "DDIM", "Euler", "EulerAncestral", "Heun", "RK4", "MultiStepDPM"]
+def _half_log_snr(alpha, sigma):
+    """lambda = log(alpha) - log(sigma), the variable DPM-Solver integrates in."""
+    return jnp.log(alpha) - jnp.log(sigma)
+
+
+@samplers("dpmpp_2m")
+@dataclass(frozen=True)
+class DPMSolverPP:
+    """DPM-Solver++ (2M): the second order multistep, deterministic, midpoint
+    form of Lu et al. 2022 (arXiv 2211.01095), the update Diffusers 0.34.0
+    takes in `DPMSolverMultistepScheduler` under `algorithm_type="dpmsolver++"`,
+    `solver_order=2`, `solver_type="midpoint"`.
+
+    In lambda = log(alpha) - log(sigma), with h = lambda_t - lambda_s0 over the
+    step and h_0 = lambda_s0 - lambda_s1 over the one before, D0 the clean
+    prediction at s0 and D1 = (D0 - x0(s1)) h / h_0:
+
+        x_t = (sigma_t / sigma_s0) x - alpha_t (e^-h - 1) D0
+                                    - alpha_t (e^-h - 1) D1 / 2
+
+    The first step has no history and takes the first order update (the D0
+    line alone); a step onto sigma 0 is that update's h -> infinity limit,
+    x_t = x0, which Diffusers reaches through its `final_sigmas_type="zero"`
+    rule. Every schedule the process exposes works, since the update reads
+    alpha and sigma and the clean prediction. Not reproduced: Diffusers'
+    `lower_order_final` heuristic, which drops to first order on the last
+    step of a run shorter than 15 timesteps; a grid ending at sigma_min stays
+    second order here.
+    """
+
+    def init(self, x):
+        coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
+        return (jnp.zeros_like(x), coefficient, jnp.zeros((), jnp.int32))
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        (alpha_s0, sigma_s0), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        last_denoised, last_lambda, count = state
+        lambda_s0 = _half_log_snr(alpha_s0, sigma_s0)
+        # sigma_t of 0 is the terminal step: h is infinite there and the
+        # update collapses to the clean prediction, which is written out so
+        # the coefficients never see the log of zero.
+        terminal = sigma_t <= 0
+        safe_sigma_t = jnp.where(terminal, sigma_s0, sigma_t)
+        h = _half_log_snr(alpha_t, safe_sigma_t) - lambda_s0
+        decay = alpha_t * (jnp.exp(-h) - 1.0)
+        ratio = safe_sigma_t / sigma_s0
+
+        def first(_):
+            return ratio * x - decay * denoised
+
+        def second(_):
+            r0 = (lambda_s0 - last_lambda) / h
+            d1 = (denoised - last_denoised) / r0
+            return ratio * x - decay * denoised - 0.5 * decay * d1
+
+        stepped = lax.switch(jnp.minimum(count, 1), [first, second], None)
+        next_x = jnp.where(terminal, alpha_t * denoised, stepped)
+        return next_x, (denoised, lambda_s0, count + 1)
+
+
+__all__ = ["Solver", "DDPM", "DDIM", "Euler", "EulerAncestral", "Heun", "RK4",
+           "MultiStepDPM", "DPMSolverPP"]

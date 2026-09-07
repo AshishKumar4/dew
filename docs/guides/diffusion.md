@@ -54,7 +54,7 @@ The DiT divides each 8×8 image into 4×4 patches, producing four spatial tokens
 
 The objective samples noise and noise levels and computes the flow-matching loss. Its `steps=4` setting controls evaluation sampling, not the number of optimizer updates. `trainer.fit(..., steps=3)` controls the training target.
 
-`Euler()` is the numerical solver used for preview generation. Changing a solver, noise schedule, or prediction transform changes sampling semantics; choose a compatible process and solver. Other supplied solvers include DDPM, DDIM, Heun, RK4, and Euler ancestral variants. The named `MultiStepDPM` implementation should not be assumed equivalent to every Diffusers DPM-Solver schedule.
+`Euler()` is the numerical solver used for preview generation. Changing a solver, noise schedule, or prediction transform changes sampling semantics; choose a compatible process and solver. Other supplied solvers include DDPM, DDIM, Heun, RK4, Euler ancestral, and `DPMSolverPP`, the DPM-Solver++ (2M) update Diffusers runs as `DPMSolverMultistepScheduler(algorithm_type="dpmsolver++", solver_order=2)`. The named `MultiStepDPM` implementation is a finite-difference sigma integrator, not that scheduler.
 
 ## Inspect the preview
 
