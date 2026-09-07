@@ -43,7 +43,7 @@ class Regression(Objective):
     def __init__(self, model):
         self.model = model
 
-    def init(self, key):
+    def init(self, key, variables=None):
         sample = jnp.zeros((1, 1), dtype=jnp.float32)
         return self.model.init(key, sample)
 

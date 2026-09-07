@@ -44,7 +44,7 @@ class Regression(Objective):
         self.model = Affine()
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, params, batch, step):
@@ -856,7 +856,7 @@ class ScaledObjective(Objective):
     def __init__(self):
         self.ema = EMASpec(decay=lambda step: 0.5)
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}}
 
     def loss(self, params, batch, step):
@@ -911,7 +911,7 @@ class Counted(Objective):
 
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": jnp.zeros(())}}
 
     def loss(self, params, batch, step):
@@ -956,7 +956,7 @@ class TwoTrees(Objective):
     def __init__(self, ema):
         self.ema = ema
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"tracked": {"w": jnp.ones((2,))},
                            "untracked": {"w": jnp.ones((2,))}}}
 
@@ -1003,7 +1003,7 @@ class TwoPlayers(Objective):
 
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"gen": {"g": jnp.zeros(())}, "disc": {"d": jnp.zeros(())}}}
 
     def loss(self, params, batch, step):

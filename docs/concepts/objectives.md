@@ -90,7 +90,7 @@ class StatefulRegression(Objective):
     def __init__(self):
         self.model = NormalizedRegressor()
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32), train=True)
 
     def loss(self, variables, batch, step):

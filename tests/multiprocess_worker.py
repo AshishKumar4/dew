@@ -72,7 +72,7 @@ def make_objective():
                                    mlp_ratio=1)
             self.ema = EMASpec(decay=optax.constant_schedule(0.999))
 
-        def init(self, key):
+        def init(self, key, variables=None):
             return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
 
         def loss(self, params, batch, step):
@@ -707,7 +707,7 @@ def mode_evaluation_contract(args) -> dict:
     class Numerical(Objective):
         artifact = Representations
 
-        def init(self, key):
+        def init(self, key, variables=None):
             return {"params": {"offset": jnp.zeros(())}}
 
         def loss(self, params, batch, step):
@@ -837,7 +837,7 @@ def mode_evaluation_replicas(args) -> dict:
     from dew.training import MeshSpec, Trainer
 
     class Rows(Objective):
-        def init(self, key):
+        def init(self, key, variables=None):
             return {"params": {"offset": jnp.zeros(())}}
 
         def loss(self, params, batch, step):

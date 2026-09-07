@@ -57,7 +57,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
 
 
 class ScheduledScores(Objective):
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"offset": jnp.zeros(())}}
 
     def loss(self, params, batch, step):

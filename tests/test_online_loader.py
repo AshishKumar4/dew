@@ -466,7 +466,7 @@ class Mean(Objective):
 
     ema = None
 
-    def init(self, key):
+    def init(self, key, variables=None):
         return {"params": {"level": jnp.zeros(())}}
 
     def loss(self, params, batch, step):

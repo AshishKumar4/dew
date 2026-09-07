@@ -71,7 +71,7 @@ def test_ema_spec_defaults_to_the_whole_tree():
 
 def test_an_objective_needs_init_and_loss():
     class Incomplete(Objective):
-        def init(self, key):
+        def init(self, key, variables=None):
             return {}
 
     with pytest.raises(TypeError):
