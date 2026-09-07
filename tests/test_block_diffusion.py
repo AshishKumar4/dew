@@ -130,7 +130,7 @@ def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
 def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
-    restored = adapter.translate_weights(adapter.export_weights(changed, config), config)
+    restored = adapter.translate_weights(adapter.export_weights(model, changed, config), config)
     for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored)):
         np.testing.assert_array_equal(actual, wanted)
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))

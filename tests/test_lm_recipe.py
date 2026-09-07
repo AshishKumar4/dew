@@ -372,8 +372,9 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     state = recipe.main(config)
     assert int(state.updates) == 1
     original = load_pretrained(checkpoint, dtype="float32", attention_impl="xla")
+    initial = recipe.build_block_objective(config, original.model, original.variables).init(jax.random.key(0))
     difference = max(float(jnp.max(jnp.abs(a - b)))
-                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(original.variables)))
+                     for a, b in zip(jax.tree.leaves(state.params), jax.tree.leaves(initial)))
     assert difference > 1e-5
     restored = recipe.main(config)
     for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params)):
