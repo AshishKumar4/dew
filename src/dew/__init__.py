@@ -29,7 +29,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.registry import datasets, encoders, metrics, models, presets, samplers
     from dew.sampling import CFG, sample
     from dew.training import (
-        Checkpoints, Layout, MeshSpec, Tracker, Trainer, TrainState, WandbTracker,
+        Checkpoints, Evaluation, Layout, MeshSpec, Tracker, Trainer, TrainState, WandbTracker, evaluate,
     )
 
 __version__ = "0.1.0"
@@ -48,7 +48,7 @@ _EXPORTS = {
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
-    "WandbTracker": "dew.training",
+    "WandbTracker": "dew.training", "Evaluation": "dew.training", "evaluate": "dew.training",
     "Objective": "dew.objectives",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
@@ -79,9 +79,9 @@ def __dir__() -> list[str]:
 # lazy lookup above. tests/test_api_surface.py holds the two in agreement.
 __all__ = [
     "__version__",
-    "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Field",
+    "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Evaluation", "Field",
     "ImageGrid", "InputSpec", "Layout", "MeshSpec", "Objective", "Process",
     "Representations", "Step", "TextSamples", "TokenScores", "Tracker",
     "TrainState", "Trainer", "VideoGrid", "WandbTracker",
-    "datasets", "encoders", "metrics", "models", "presets", "sample", "samplers",
+    "datasets", "encoders", "evaluate", "metrics", "models", "presets", "sample", "samplers",
 ]

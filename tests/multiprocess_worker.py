@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 from dew.data import Loading
+from dew.training.evaluation import evaluate
 
 RES = 8
 BATCH = 8
@@ -777,8 +778,11 @@ def mode_evaluation_contract(args) -> dict:
         if failure == "duplicates" and rank == 0:
             scoring = (metric, metric)
         try:
-            result = trainer._evaluate(state, data, scoring, trainer.device_mesh, 0)
-            results[failure] = {"scores": result, "events": list(events)}
+            result = evaluate(objective, state.params, data.val, metrics=scoring, key=state.key,
+                              step=state.step, schedule_step=state.microstep,
+                              preview=trainer.tracker is not None, mesh=trainer.device_mesh)
+            trainer._report_evaluation(result)
+            results[failure] = {"scores": result.scalars, "events": list(events)}
         except (ValueError, RuntimeError, OSError) as error:
             results[failure] = {"error": str(error), "events": list(events)}
     return {"results": results, "closed": closed}
@@ -823,8 +827,10 @@ def mode_evaluation_replicas(args) -> dict:
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
     data = Dataset(train=lambda: iter([batch]), val=lambda: iter([batch]), records=3, batch=3)
-    measured = trainer._evaluate(state, data, (Count(),), trainer.device_mesh, 0)
-    unconsumed = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+    measured = evaluate(trainer.objective, state.params, data.val, metrics=(Count(),),
+                        key=state.key, mesh=trainer.device_mesh).scalars
+    unconsumed = evaluate(trainer.objective, state.params, data.val, key=state.key,
+                          mesh=trainer.device_mesh).scalars
     # Plain host stays usable on root alone for local arrays outside evaluation.
     local = None
     if jax.process_index() == 0:
@@ -916,7 +922,9 @@ def mode_builtin_preview_failures(args) -> dict:
                 else:
                     objective._sample = sample_failure
                 try:
-                    trainer._evaluate(state, data, (), trainer.device_mesh, 0)
+                    result = evaluate(objective, state.params, data.val, key=state.key,
+                                      preview=trainer.tracker is not None, mesh=trainer.device_mesh)
+                    trainer._report_evaluation(result)
                 except (AttributeError, ValueError, RuntimeError) as error:
                     reports[case] = {"type": type(error).__name__, "error": str(error),
                                      "original": error is fault, "closed": case in closed}
@@ -936,8 +944,10 @@ def mode_builtin_preview_failures(args) -> dict:
                         raise RuntimeError(f"{case}: peer never returned from evaluation")
                     time.sleep(.01)
         case = f"{kind}-healthy"
-        scores = trainer._evaluate(state, data, (), trainer.device_mesh, 0)
-        reports[case] = {"scores": scores, "drawn": len(tracker.drawn)}
+        result = evaluate(objective, state.params, data.val, key=state.key,
+                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
+        trainer._report_evaluation(result)
+        reports[case] = {"scores": result.scalars, "drawn": len(tracker.drawn)}
     return reports
 
 
