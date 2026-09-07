@@ -85,7 +85,12 @@ def _sample_token(logits: jax.Array, keys: jax.Array, sampling: Sampling
 
 @struct.dataclass
 class DecoderState:
-    """Functional autoregressive state shared by batch generation and scheduling."""
+    """Functional carry shared by batch generation and scheduling.
+
+    lengths counts emitted actions, not prompt tokens. finished includes EOS
+    and unused rows. Optional positions continues explicitly supplied scalar
+    rotary coordinates; physical cursors live inside the model cache.
+    """
 
     cache: Variables
     logits: jax.Array
@@ -197,14 +202,15 @@ def generate(model: nn.Module, params: Variables,
     process = jax.process_index() if mesh is not None else 0
     error = None
     prepared = None
+    random_key = None
     try:
-        if isinstance(inputs, ModelInputs):
-            inputs.validate()
-            ids = local_rows(inputs.tokens)
-            fields = {name: local_rows(value) for name, value in inputs.token_fields.items()}
-            conditioning = {name: local_rows(value) for name, value in inputs.conditioning.items()}
-        else:
-            ids, fields, conditioning = np.asarray(inputs), {}, {}
+        random_key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
+        if random_key.shape != ():
+            raise ValueError("key must be a single JAX PRNG key")
+        canonical = ModelInputs.from_value(inputs)
+        ids = local_rows(canonical.tokens)
+        fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
+        conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
         if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
             raise ValueError("inputs must contain non-empty [B, P] integer token ids")
         if "params" not in params:
@@ -240,7 +246,7 @@ def generate(model: nn.Module, params: Variables,
         agree_process_phase(error, phase="generation input validation")
     elif error is not None:
         raise error
-    assert prepared is not None
+    assert prepared is not None and random_key is not None
     batch = prepared.tokens.shape[0]
     if processes > 1:
         # Compare fixed-size hashes before creating distributed input arrays.
@@ -269,11 +275,11 @@ def generate(model: nn.Module, params: Variables,
             lambda leaf: jax.make_array_from_process_local_data(rows_sharding, np.asarray(leaf)), prepared)
     else:
         count = batch
-    row_keys = jax.vmap(lambda row: jax.random.fold_in(key, row))(
+    row_keys = jax.vmap(lambda row: jax.random.fold_in(random_key, row))(
         jnp.arange(count) + process * batch)
     if rows_sharding is not None:
         key_data = jax.make_array_from_process_local_data(rows_sharding, np.asarray(jax.random.key_data(row_keys)))
-        row_keys = jax.random.wrap_key_data(key_data, impl=jax.random.key_impl(key))
+        row_keys = jax.random.wrap_key_data(key_data, impl=jax.random.key_impl(random_key))
     output = _compiled(rows_sharding)(model, params, prepared, row_keys, max_new_tokens, sampling)
     if mesh is None:
         return output
