@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
 from functools import partial
+from typing import Generic, overload
 
 from flax import struct
 import jax
@@ -22,12 +23,12 @@ from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables
 
 
 @struct.dataclass
-class CanvasGeneration:
+class CanvasGeneration(Generic[ArrayT]):
     """Prompt plus padded response, with no autoregressive likelihood claim.
 
     ``lengths`` counts response tokens including the first EOS, not prompt
@@ -38,24 +39,26 @@ class CanvasGeneration:
     processor.
     """
 
-    tokens: jax.Array
-    lengths: jax.Array
-    terminated: jax.Array
-    decoder_steps: jax.Array
-    rows: int = struct.field(pytree_node=False, default=0)
-    prompt_width: int = struct.field(pytree_node=False, default=0)
+    tokens: ArrayT
+    lengths: ArrayT
+    terminated: ArrayT
+    decoder_steps: ArrayT
+    rows: int | None = struct.field(pytree_node=False, default=None)
+    prompt_width: int | None = struct.field(pytree_node=False, default=None)
     decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = struct.field(
         pytree_node=False, default=None)
 
-    def host(self) -> CanvasGeneration:
+    def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
-    @property
+    @functools.cached_property
     def text(self) -> tuple[str, ...]:
         """Each real row's response, decoded on first access."""
         if self.decoder is None:
             raise ValueError("this generation carries no processor to decode with")
+        if self.prompt_width is None:
+            raise ValueError("this generation has no prompt width")
         rows = self.host()
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
@@ -175,6 +178,18 @@ class BlockProcess:
                 decoder_steps=state.decoder_steps + active.astype(jnp.int32))
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
+
+    @overload
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+                 max_new_tokens: int, *, key: jax.Array, seed: None = None,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
+
+    @overload
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+                 max_new_tokens: int, *, key: None = None, seed: int,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
 
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],

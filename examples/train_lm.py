@@ -54,7 +54,7 @@ def main(config: Config):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    # The trained objective is the pipeline: no reload, the averaged weights
+    # No reload is needed; the averaged weights
     # stay where the trainer placed them, and the tokenizer decodes the rows.
     task = objective.pipeline(state, processor=RunProcessor(tokenizer))
     text = config.prompt + task(config.prompt, seed=1).text[0]

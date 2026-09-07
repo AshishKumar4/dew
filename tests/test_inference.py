@@ -308,7 +308,7 @@ def test_the_text_condition_pins_a_revision(tmp_path, monkeypatch):
     assert "revision" not in seen and "max_length" not in seen
 
 
-def make_lm_run(directory, *, mesh=None):
+def make_lm_run(directory, *, mesh=None, ema_decay=0.9):
     """Two training steps of a tiny byte-level decoder, its checkpoint and the
     `run.json` the LM recipe writes: the resolved model, tokenizer and budget."""
     import json
@@ -320,7 +320,7 @@ def make_lm_run(directory, *, mesh=None):
     fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                   mlp_features=32, max_seq_len=16)
     model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
-    objective = LMObjective(model_config.build(), 8, ema_decay=0.9,
+    objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)))
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
@@ -350,7 +350,8 @@ def make_lm_run(directory, *, mesh=None):
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
         "objective": "lm", "model": dataclasses.asdict(model_config), "tokenizer": "byte",
-        "sample_tokens": 4, "ema_decay": 0.9, "data": {"seq_len": 8}}))
+        "sample_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
+        "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
 
 
@@ -427,8 +428,6 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
     walk one more interval; `final_denoise=False` skips the closing clean
     prediction, and over a one-point grid hands the noise itself to the
     decode and clip that end every call."""
-    import jax.numpy as jnp
-
     objective, state = make_run(tmp_path)
     plain = TextToImage.from_objective(objective, state.params)
     same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
@@ -449,3 +448,23 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
                                   np.clip(np.asarray(prepared.noise), -1.0, 1.0))
     with pytest.raises(ValueError, match="different source grid"):
         start(prepared, steps=3, seed=3)
+
+
+def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
+    objective, state = make_lm_run(tmp_path, ema_decay=None)
+    with pytest.raises(ValueError, match="no EMA"):
+        objective.pipeline(state)
+    with pytest.raises(ValueError, match="no EMA"):
+        dew.pipeline(str(tmp_path))
+    restored = dew.pipeline(str(tmp_path), ema=False)
+    live = objective.pipeline(state, ema=False, processor=restored.processor)
+    np.testing.assert_array_equal(restored("the ", seed=7).host().tokens,
+                                  live("the ", seed=7).host().tokens)
+
+
+@pytest.mark.parametrize("kind", ["jepa", "masked_diffusion", "unregistered"])
+def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
+    import json
+    (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
+    with pytest.raises(TypeError, match="no saved generation task"):
+        dew.pipeline(str(tmp_path))

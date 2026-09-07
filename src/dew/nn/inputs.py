@@ -6,16 +6,61 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import math
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
+ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
+
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
+
+
+def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
+                   padding_side: Literal["left", "right"] = "left",
+                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
+                   ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Pad ragged token rows and their scalar token fields on the host.
+
+    Filler IDs carry no content; attention_mask alone marks real slots.
+    Tokenizer state is not involved in this numeric layout operation.
+    """
+    if padding_side not in ("left", "right"):
+        raise ValueError("padding_side must be left or right")
+    limits = np.iinfo(np.int32)
+    if type(pad_id) is not int or not 0 <= pad_id <= limits.max:
+        raise ValueError("pad_id must be a nonnegative int32 token id")
+    arrays = [np.asarray(row) for row in rows]
+    if not arrays or any(row.ndim != 1 or row.size == 0 or not np.issubdtype(row.dtype, np.integer) for row in arrays):
+        raise ValueError("each prompt must contain a nonempty integer token row")
+    if any(np.any((row < 0) | (row > limits.max)) for row in arrays):
+        raise ValueError("token IDs must be nonnegative int32 values")
+    width = max(row.size for row in arrays)
+    tokens = np.full((len(arrays), width), pad_id, np.int32)
+    valid = np.zeros(tokens.shape, bool)
+    slots = [slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays]
+    for index, (row, slot) in enumerate(zip(arrays, slots)):
+        tokens[index, slot] = row
+        valid[index, slot] = True
+    padded = {"attention_mask": valid}
+    for name, values in (fields or {}).items():
+        aligned = [np.asarray(row) for row in values]
+        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays)):
+            raise ValueError(f"token field {name!r} must align with the token rows")
+        if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
+            raise ValueError("attention_mask must contain only zero or one")
+        dtype = bool if name == "attention_mask" else np.result_type(*(row.dtype for row in aligned))
+        value = np.zeros(tokens.shape, dtype=dtype)
+        for index, (row, slot) in enumerate(zip(aligned, slots)):
+            value[index, slot] = row
+        padded[name] = value
+    return tokens, padded
 
 
 @struct.dataclass

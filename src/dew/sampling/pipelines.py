@@ -6,18 +6,20 @@ import functools
 import os
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, overload
+from enum import Enum
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.core import freeze
+from jax.typing import ArrayLike
 
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.artifacts import agree_process_phase
 from jax.experimental import multihost_utils
 from dew.objectives.base import Variables
@@ -30,7 +32,8 @@ if TYPE_CHECKING:
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training.distributed import Layout, MeshSpec
 
-_UNSET: object = object()
+class _Default(Enum):
+    GUIDANCE = "guidance"
 
 
 @struct.dataclass
@@ -44,21 +47,24 @@ class DenoisingInputs:
     noise: jax.Array
     conditions: Mapping[str, object] = struct.field(default_factory=dict)
     unconditional: Mapping[str, object] = struct.field(default_factory=dict)
-    rows: int = struct.field(pytree_node=False, default=0)
+    rows: int | None = struct.field(pytree_node=False, default=None)
     grid_steps: int | None = struct.field(pytree_node=False, default=None)
+    process: Process | None = struct.field(pytree_node=False, default=None)
+    times: tuple[float, ...] | None = struct.field(pytree_node=False, default=None)
 
 
 @struct.dataclass
-class Images:
+class Images(Generic[ArrayT]):
     """Decoded samples in [-1, 1], NHWC, keeping the placement the task ran with.
 
     ``host()`` reads this process's ``rows`` real rows back as a host array.
     """
 
-    images: jax.Array
-    rows: int = struct.field(pytree_node=False, default=0)
+    images: ArrayT | None
+    rows: int | None = struct.field(pytree_node=False, default=None)
+    latents: ArrayT | None = None
 
-    def host(self) -> Images:
+    def host(self) -> Images[np.ndarray]:
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
 
@@ -141,10 +147,7 @@ class TextToImage:
         if self.grid is None:
             return self.process, None
         process, times = self.grid(steps)
-        grid = np.asarray(times, np.float32)
-        if grid.ndim != 1 or grid.shape[0] < 1:
-            raise ValueError("grid must answer a one-dimensional time grid of at least one point")
-        return process, tuple(float(time) for time in grid)
+        return process, _time_grid(times)
 
     @property
     def latent_shape(self) -> tuple[int, ...]:
@@ -161,41 +164,102 @@ class TextToImage:
     def _conditions(self) -> tuple[tuple[str, object], ...]:
         return tuple((keyword, condition.encoder) for keyword, condition in self.inputs.conditions.items())
 
-    def _unconditional(self, tokens) -> dict:
+    def _unconditional(self, tokens, plan: RowPlan) -> dict:
+        leaves = jax.tree.leaves(tokens)
+        if leaves and leaves[0].shape[0] != 1:
+            return _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
         return _encode(None)(self._conditions, self.params, jax.tree.map(jnp.asarray, tokens))
 
-    def prepare(self, prompts: str | Sequence[str], *, key: jax.Array | None = None,
-                seed: int | None = None, steps: int | None = None) -> DenoisingInputs:
-        """Encode prompts once and draw their noise; reuse with other solvers.
+    @overload
+    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
+                key: jax.Array, seed: None = None, steps: int | None = None,
+                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
+                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
+                times: ArrayLike | Sequence[float] | None = None,
+                encode_key: jax.Array | None = None) -> DenoisingInputs: ...
 
-        `steps` is the trajectory length the noise is drawn for when a `grid`
-        ties the prior to the step count; a call over prepared inputs should
-        ask for the same count."""
+    @overload
+    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
+                key: None = None, seed: int, steps: int | None = None,
+                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
+                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
+                times: ArrayLike | Sequence[float] | None = None,
+                encode_key: jax.Array | None = None) -> DenoisingInputs: ...
+
+    def prepare(self, prompts: str | Sequence[str | Mapping[str, object]], *,
+                key: jax.Array | None = None, seed: int | None = None, steps: int | None = None,
+                unconditional: str | Sequence[str | Mapping[str, object]] | None = None,
+                image: ArrayLike | None = None, image_latents: ArrayLike | None = None,
+                mask: ArrayLike | None = None, noise: ArrayLike | None = None, initial: ArrayLike | None = None,
+                times: ArrayLike | Sequence[float] | None = None,
+                encode_key: jax.Array | None = None) -> DenoisingInputs:
+        """Encode conditions and construct the initial state on a concrete grid.
+
+        Images are uint8 or normalized floating NHWC pixels at the task's
+        geometry. image_latents skips VAE encoding. A mask adds spatial
+        conditioning to both guidance branches. noise is unit Gaussian noise
+        for noising a clean image; initial is an already-noisy latent state
+        for a continuation or refiner handoff and is never noised again.
+        Explicit times select a partial trajectory in the prepared process.
+        encode_key samples a VAE posterior; None uses its mean.
+        """
         mesh = mesh_of(self.params)
         prepared = None
         error = None
         try:
             rows = [prompts] if isinstance(prompts, str) else list(prompts)
-            if not rows or not all(isinstance(prompt, str) for prompt in rows):
-                raise ValueError("prompts must be a non-empty string sequence")
+            if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
+                raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
             request = request_key(key, seed)
             count = self.steps if steps is None else steps
-            process, times = self.prepared_process(count)
+            process, source_times = self.prepared_process(count)
+            selected = _time_grid(times) if times is not None else source_times
             plan = RowPlan.over(mesh, len(rows))
+            if unconditional is None:
+                negatives = None
+            else:
+                negatives = [unconditional] if isinstance(unconditional, str) else list(unconditional)
+                if len(negatives) not in (1, len(rows)):
+                    raise ValueError("unconditional inputs need one row or one row per prompt")
             tokens = {keyword: condition.encoder.tokenize(rows)
                       for keyword, condition in self.inputs.conditions.items()}
-            null_tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
-                           for keyword, condition in self.inputs.conditions.items()}
+            null_tokens = {keyword: condition.encoder.tokenize(
+                [condition.unconditional] if negatives is None else negatives)
+                for keyword, condition in self.inputs.conditions.items()}
             for leaf in jax.tree.leaves(tokens):
                 if leaf.ndim < 1 or leaf.shape[0] != len(rows):
                     raise ValueError("tokenized conditions must have one row per prompt")
             for leaf in jax.tree.leaves(null_tokens):
-                if leaf.ndim < 1 or leaf.shape[0] != 1:
-                    raise ValueError("unconditional tokens must have one row")
+                if leaf.ndim < 1 or leaf.shape[0] not in (1, len(rows)):
+                    raise ValueError("unconditional tokens must have one row or one per prompt")
             shape = self.latent_shape
-            controls = (plan.rows, count, times, shape, tuple(np.asarray(jax.random.key_data(request))))
-            signature = generation_signature((tokens, null_tokens), controls)
-            prepared = plan, process, request, tokens, null_tokens, shape, count, signature
+            if image is not None and image_latents is not None:
+                raise ValueError("pass image or image_latents, not both")
+            if mask is not None and self.autoencoder is None:
+                raise ValueError("masked-image conditioning requires an autoencoder")
+            if noise is not None and (image is None and image_latents is None or initial is not None):
+                raise ValueError("noise is for noising a clean image; initial is already noisy")
+            if mask is not None and image is None:
+                raise ValueError("a mask requires its image pixels")
+            if encode_key is not None:
+                encode_key = request_key(encode_key, None)
+            data = {}
+            if image is not None:
+                pixels = _image_rows(image, len(rows), self.inputs.sample.shape, "image")
+                data["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
+            for name, value in (("image_latents", image_latents), ("noise", noise), ("initial", initial)):
+                if value is not None:
+                    data[name] = _image_rows(value, len(rows), shape, name)
+            if mask is not None:
+                value = _image_rows(mask, len(rows), (*self.inputs.sample.shape[:-1], 1), "mask")
+                data["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
+            controls = (plan.rows, count, selected, shape,
+                        tuple(np.asarray(jax.random.key_data(request))),
+                        None if encode_key is None else tuple(np.asarray(jax.random.key_data(encode_key))))
+            signature = generation_signature((tokens, null_tokens, data), controls)
+            prepared = plan, process, request, tokens, null_tokens, shape, count, selected, data, signature
         except Exception as failure:
             error = failure
         if mesh is not None:
@@ -203,18 +267,44 @@ class TextToImage:
         elif error is not None:
             raise error
         assert prepared is not None
-        plan, process, request, tokens, null_tokens, shape, count, signature = prepared
+        plan, process, request, tokens, null_tokens, shape, count, selected, data, signature = prepared
         if plan.processes > 1:
             multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
-        placed = plan.place(plan.pad(tokens))
-        given = _encode(plan.sharding)(self._conditions, self.params, placed)
-        noise = _noise(plan.sharding)(process, plan.keys(request), shape)
-        return DenoisingInputs(noise, given, self._unconditional(null_tokens), rows=plan.rows,
-                               grid_steps=count if self.grid is not None else None)
+        given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
+        null = self._unconditional(null_tokens, plan)
+        if data:
+            start = process.times(count)[0] if selected is None else selected[0]
+            initial_state, spatial = _image_start(plan.sharding)(
+                self.autoencoder, process, shape, self.params, plan.place(plan.pad(data)),
+                plan.keys(request), encode_key, start)
+            if spatial:
+                given = {**given, **spatial}
+                null = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (plan.global_rows, *leaf.shape[1:]))
+                                    if leaf.shape[0] == 1 else leaf, null)
+                null = {**null, **spatial}
+        else:
+            initial_state = _noise(plan.sharding)(process, plan.keys(request), shape)
+        owns_grid = self.grid is not None or times is not None
+        return DenoisingInputs(initial_state, given, null, rows=plan.rows,
+                               grid_steps=count if owns_grid else None,
+                               process=process if owns_grid else None, times=selected)
 
-    def __call__(self, prompts: str | Sequence[str] | DenoisingInputs, *, steps: int | None = None,
-                 guidance: CFG | float | None | object = _UNSET, sampler: Solver[object] | None = None,
-                 key: jax.Array | None = None, seed: int | None = None) -> Images:
+    @overload
+    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
+                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 sampler: Solver[object] | None = None, key: jax.Array,
+                 seed: None = None, decode: bool = True) -> Images: ...
+
+    @overload
+    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
+                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 sampler: Solver[object] | None = None, key: None = None,
+                 seed: int, decode: bool = True) -> Images: ...
+
+    def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
+                 steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
+                 sampler: Solver[object] | None = None, key: jax.Array | None = None,
+                 seed: int | None = None, decode: bool = True) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
@@ -222,22 +312,34 @@ class TextToImage:
         settings = None
         error = None
         try:
-            chosen = self.guidance if guidance is _UNSET else guidance
+            chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
             if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
                 chosen = CFG(float(chosen))
             if chosen is not None and not isinstance(chosen, CFG):
                 raise ValueError("guidance must be a scale, a CFG value or None")
             request = request_key(key, seed)
-            count = self.steps if steps is None else steps
-            process, times = self.prepared_process(count)
-            solver = self.sampler if sampler is None else sampler
             prepared = prompts if isinstance(prompts, DenoisingInputs) else None
+            default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
+                             else self.steps)
+            count = default_count if steps is None else steps
+            if prepared is not None and prepared.times is not None:
+                times = _time_grid(prepared.times)
+                process = self.process if prepared.process is None else prepared.process
+            else:
+                process, times = self.prepared_process(count)
+            if type(decode) is not bool:
+                raise ValueError("decode must be a boolean")
+            solver = self.sampler if sampler is None else sampler
             if prepared is not None:
                 if prepared.grid_steps is not None and count != prepared.grid_steps:
                     raise ValueError("prepared noise belongs to a different source grid; prepare it for these steps")
                 shape = self.latent_shape
                 if prepared.noise.ndim != len(shape) + 1 or prepared.noise.shape[1:] != shape:
                     raise ValueError(f"initial noise must have shape [batch, {shape}]")
+                if prepared.rows is None:
+                    if isinstance(prepared.noise, jax.Array) and not prepared.noise.is_fully_addressable:
+                        raise ValueError("global prepared arrays need the number of real local rows")
+                    prepared = replace(prepared, rows=prepared.noise.shape[0])
                 if type(prepared.rows) is not int or prepared.rows < 1:
                     raise ValueError("prepared inputs must declare a positive number of local rows")
                 plan = RowPlan.over(mesh, prepared.rows)
@@ -246,9 +348,10 @@ class TextToImage:
                 for leaf in jax.tree.leaves(prepared.conditions):
                     if leaf.ndim < 1 or leaf.shape[0] != plan.global_rows:
                         raise ValueError("prepared conditions must match the noise batch")
-            controls = (count, times, solver, chosen, self.final_denoise,
+            controls = (count, times, solver, chosen, self.final_denoise, decode,
                         tuple(np.asarray(jax.random.key_data(request))), prepared is not None)
-            signature = generation_signature(prepared, controls)
+            arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
+            signature = generation_signature(arrays, controls)
             settings = prepared, request, count, process, times, solver, chosen, signature
         except Exception as failure:
             error = failure
@@ -263,12 +366,62 @@ class TextToImage:
         if prepared is None:
             assert not isinstance(prompts, DenoisingInputs)
             prepared = self.prepare(prompts, key=request, steps=count)
+        assert prepared.rows is not None
         plan = RowPlan.over(mesh, prepared.rows)
-        images = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                     solver, chosen, self.final_denoise, times, self.params,
+        result = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
+                                     solver, chosen, self.final_denoise, times, decode, self.params,
                                      prepared.conditions, prepared.unconditional,
                                      prepared.noise, jax.random.fold_in(request, 1))
-        return Images(images, rows=plan.rows)
+        return replace(result, rows=plan.rows)
+
+
+def _time_grid(times) -> tuple[float, ...]:
+    values = np.asarray(times, np.float32)
+    if values.ndim != 1 or values.size < 1 or not np.isfinite(values).all() or np.any(np.diff(values) > 0):
+        raise ValueError("times must be a finite descending grid with at least one point")
+    return tuple(float(value) for value in values)
+
+
+def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarray:
+    array = local_rows(value)
+    if array.shape == shape:
+        array = array[None]
+    if array.ndim != len(shape) + 1 or array.shape[1:] != shape or array.shape[0] not in (1, rows):
+        raise ValueError(f"{name} must have shape [{rows}, {shape}] or one broadcast row; got {array.shape}")
+    if not jnp.issubdtype(array.dtype, jnp.number) and array.dtype != np.bool_:
+        raise ValueError(f"{name} must be a numeric array")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must contain finite values")
+    if name == "image" and array.dtype != np.uint8 and np.any((array < -1) | (array > 1)):
+        raise ValueError("floating image pixels must be normalized to [-1, 1]; uint8 pixels are also accepted")
+    return np.broadcast_to(array, (rows, *shape))
+
+
+@functools.lru_cache(maxsize=None)
+def _image_start(rows: jax.sharding.NamedSharding | None):
+    def prepare(autoencoder, process, shape, params, data, keys, encode_key, start):
+        spatial = {}
+        pixels = data.get("image")
+        if "initial" in data:
+            value = data["initial"]
+        else:
+            clean = data.get("image_latents")
+            if clean is None:
+                if autoencoder is None:
+                    clean = pixels
+                else:
+                    clean = autoencoder.encode(params["autoencoder"], pixels, encode_key)
+            noise = data.get("noise")
+            if noise is None:
+                noise = jax.vmap(lambda key: jax.random.normal(key, shape))(keys)
+            alpha, sigma = process.sampler_schedule.rates(start)
+            value = alpha * clean + sigma * noise
+        if "mask" in data:
+            from dew.inputs.diffusion import latent_image_conditions
+            spatial = latent_image_conditions(autoencoder, params["autoencoder"], pixels, data["mask"], encode_key)
+        return value, spatial
+    return jax.jit(prepare, static_argnums=(0, 1, 2),
+                   in_shardings=(None, rows, rows, None, None), out_shardings=rows)
 
 
 def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: MeshSpec | None,
@@ -285,7 +438,9 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     checkpoints = Checkpoints(directory)
     stored = checkpoints.stored(step)
     template = {"params": stored["params"]}
-    averaged = ema and stored["ema"] is not None
+    if ema and stored.get("ema") is None:
+        raise ValueError("the run keeps no EMA; request the live policy with ema=False")
+    averaged = ema
     if averaged:
         template["ema"] = stored["ema"]
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
@@ -329,17 +484,24 @@ def _noise(rows: jax.sharding.NamedSharding | None):
 @functools.lru_cache(maxsize=None)
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity.
-    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times,
+    def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times, decode,
             params, given, null, x_T, key):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
         denoise = process.denoiser(model, variables, given, None if guidance is None else null)
         with jax.ensure_compile_time_eval():
             grid = None if times is None else jnp.asarray(times, jnp.float32)
-        samples = sample(denoise, x_T, None if grid is not None else steps, solver=sampler, guidance=guidance,
-                         key=key, times=grid, final_denoise=final_denoise)
-        if autoencoder is not None:
-            samples = autoencoder.decode(params["autoencoder"], samples)
-        samples = jnp.clip(samples, -1.0, 1.0)
-        return samples if finish is None else finish(params, samples)
-    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        if grid is None:
+            latents = sample(denoise, x_T, steps, solver=sampler, guidance=guidance,
+                             key=key, final_denoise=final_denoise)
+        else:
+            latents = sample(denoise, x_T, solver=sampler, guidance=guidance,
+                             key=key, times=grid, final_denoise=final_denoise)
+        if not decode:
+            return Images(None, latents=latents)
+        images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
+        images = jnp.clip(images, -1.0, 1.0)
+        if finish is not None:
+            images = finish(params, images)
+        return Images(images, latents=latents)
+    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
                    in_shardings=(None, rows, None, rows, None), out_shardings=rows)

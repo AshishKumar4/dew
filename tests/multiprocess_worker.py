@@ -1183,9 +1183,8 @@ def mode_rollout(args) -> dict:
     }
 
 
-def mode_pipeline(args) -> dict:
-    """The front door on a pool: a diffusion run and an LM run placed on the
-    mesh, each rank handing in its own prompts, results read back per rank."""
+def mode_inference_pipeline(args) -> dict:
+    """Load diffusion and LM runs on the mesh with process-local prompts and results."""
     import jax
     import dew
     from dew.sampling import Sampling
@@ -1245,7 +1244,7 @@ def mode_pipeline(args) -> dict:
 
 
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
-         "pipeline": mode_pipeline,
+         "inference_pipeline": mode_inference_pipeline,
          "rollout": mode_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,

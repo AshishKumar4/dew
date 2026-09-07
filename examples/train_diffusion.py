@@ -61,7 +61,7 @@ def main(config: Config, data=None, inputs=None):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    # The trained objective is the pipeline: the averaged weights stay on
+    # The averaged weights stay on
     # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
     images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), seed=1).host().images

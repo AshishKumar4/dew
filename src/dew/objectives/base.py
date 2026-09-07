@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeAlias
 from typing_extensions import TypeVar
 
 from flax import struct
@@ -27,6 +27,7 @@ from dew.artifacts import Artifacts
 
 if TYPE_CHECKING:
     from dew.inputs import InputSpec
+    from dew.training.state import TrainState
     from dew.inference.tasks import BlockGeneration, TextGeneration
     from dew.sampling.pipelines import TextToImage
 
@@ -152,6 +153,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     inputs: InputSpec
     """Per-example shapes and dtypes the parameter tree is initialised from."""
     ema: EMASpec | None = None
+    _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
 
@@ -194,13 +196,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
-    def pipeline(self, state, *, ema: bool = True) -> Task:
+    def _pipeline_weights(self, state: TrainState, ema: bool) -> Variables:
+        if self._ema_is_reference or not ema:
+            return state.params
+        return state.averaged
+
+    def pipeline(self, state: TrainState, *, ema: bool = True) -> Task:
         """The trained model as its inference task over `state`'s weights.
 
-        `state` is the trainer's `TrainState`; the task binds `state.averaged`
-        when the objective keeps an EMA and `ema` asks for it, else
-        `state.params`, and runs on the mesh the state is placed on. No
-        reload, no copy. Objectives that generate nothing raise.
+        Ordinary generative objectives require `state.averaged` when `ema`
+        is True; False selects live parameters. Reference-policy objectives
+        publish the trained policy, never their frozen loss reference. Arrays
+        retain their placement. Objectives without a generation task raise.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -216,10 +223,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
 
-def published(state, ema: bool) -> Variables:
-    """The weights a train state publishes: the EMA copy merged over the live
-    variables when the objective keeps one and `ema` asks for it."""
-    return state.averaged if ema and state.ema is not None else state.params
 
 
 def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
