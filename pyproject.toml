@@ -58,6 +58,13 @@ test = [
     # unbounded so the suite runs the release `pip install dew-ml[streaming]`
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.
     "datasets",
+    # The MLflow, TensorBoard and Optuna adapters are proven against the real
+    # libraries: tests/test_reporting.py reads an MLflow run back with
+    # MlflowClient and an event file back with the official accumulator, and
+    # tests/test_sweep.py asks Optuna for a point. Type checking reads them too.
+    "mlflow",
+    "tensorboard",
+    "optuna",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg, cv2 resizes
 # the frames (lazy imports in dew.data)
@@ -67,6 +74,12 @@ metrics = ["scipy", "requests"]
 # Explicit LocalTracker.plot()/plots=True rendering.
 plots = ["matplotlib"]
 wandb = ["wandb"]
+# MLflowTracker: a run in a tracking store, local file store included.
+mlflow = ["mlflow"]
+# TensorBoardTracker: an event file, written with tensorboard's own writer.
+tensorboard = ["tensorboard"]
+# optuna_search: the sampler behind dew.config.sweep's Optuna backend.
+hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.

@@ -99,5 +99,16 @@ class FitEnded:
                    f'{type(error).__name__}: {error}', ''.join(traceback.format_exception(error)))
 
 
-Record: TypeAlias = RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
+@dataclasses.dataclass(frozen=True)
+class TrialFinished:
+    """One finished sweep trial: the search point it trained, the run name it
+    trained under and the score the sweep recorded for it."""
+    index: int
+    name: str
+    overrides: Mapping[str, JSON]
+    value: float
+
+
+Record: TypeAlias = (RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
+                     | TrialFinished)
 RECORD_TYPES = typing.get_args(Record)
