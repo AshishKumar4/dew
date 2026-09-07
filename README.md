@@ -35,46 +35,101 @@ Dew is under active development. APIs and training checkpoint formats can change
 
 ## Getting started
 
-This example trains a small flow-matching DiT and generates four 64×64 RGB samples. It creates random images so you can run it without a dataset download. Replace `images` with your training data for a real experiment.
+Train a diffusion transformer on Oxford Flowers at 64×64, then generate a sample grid on an NVIDIA GPU. This uses the dataset's training split, bfloat16 computation, AdamW, and EMA sampling.
 
-```python
-import itertools
-
-import jax
-import numpy as np
-import optax
-
-from dew import Checkpoints, Dataset, Field, InputSpec, Trainer, models, presets, sample
-from dew.objectives.diffusion import DiffusionObjective
-from dew.sampling import Euler
-
-images = np.random.default_rng(0).integers(0, 256, (8, 64, 64, 3), dtype=np.uint8)
-data = Dataset(train=lambda: itertools.repeat({"image": images}),
-               val=None, records=8, batch=8)
-model = models.build("simple_dit", emb_features=64, num_layers=2,
-                     num_heads=4, patch_size=8, attention_impl="xla")
-process = presets.Flow()()
-objective = DiffusionObjective(model, process, InputSpec(Field("image", (64, 64, 3))))
-trainer = Trainer(objective, optax.adamw(3e-4), key=jax.random.key(0),
-                  checkpoints=Checkpoints("runs/readme-flow"))
-state = trainer.fit(data, steps=20, log_every=5)
-
-denoise = process.denoiser(model, state.averaged, conditions={})
-noise = process.noise(jax.random.key(1), (4, 64, 64, 3))
-samples = sample(denoise, noise, steps=16, solver=Euler(), key=jax.random.key(2))
-np.save("samples.npy", np.asarray(samples))
-print("Generated:", samples.shape)
-```
-
-The program logs the training loss, writes a checkpoint under `runs/readme-flow`, and saves `samples.npy` with shape `(4, 64, 64, 3)`. It runs on CPU; use a CUDA JAX installation to run it on a GPU. Twenty updates on random images demonstrate the training and sampling APIs, not image generation quality.
-
-`DiffusionObjective` constructs noisy inputs and prediction targets. `Trainer` differentiates the loss and applies the optimizer. `state.averaged` supplies EMA weights for sampling. To train on images from disk, follow the [diffusion guide](docs/guides/diffusion.md) and [dataset recipes](docs/recipes.md).
-
-For a longer example, run [`examples/readme_demo.py`](examples/readme_demo.py). It trains a language model, resumes its checkpoint, applies DPO, and trains a separate flow model. The script creates its own data and saves both checkpoints and image previews:
+Install Dew and CUDA JAX in a virtual environment:
 
 ```bash
-JAX_PLATFORMS=cpu python examples/readme_demo.py --out runs/demo
+git clone https://github.com/AshishKumar4/dew.git
+cd dew
+uv venv --python 3.14
+source .venv/bin/activate
+uv pip install -e ".[tfds]" "jax[cuda12]"
 ```
+
+Prepare the dataset once in a separate environment. TensorFlow is needed for this TFDS builder, but not for reading the prepared data during training.
+
+```bash
+uv venv --python 3.13 .venv-data
+uv pip install --python .venv-data/bin/python \
+    "tensorflow-datasets==4.9.10" "tensorflow==2.21.0" scipy
+CUDA_VISIBLE_DEVICES="" .venv-data/bin/python - <<'PY'
+from pathlib import Path
+import tensorflow_datasets as tfds
+
+builder = tfds.builder(
+    "oxford_flowers102",
+    data_dir=Path.home() / ".cache" / "dew" / "datasets",
+)
+builder.download_and_prepare(file_format="array_record")
+print(builder.data_dir)
+PY
+```
+
+The training program is [`examples/train_flowers.py`](examples/train_flowers.py):
+
+```python
+from pathlib import Path
+
+import jax
+import optax
+
+from dew import Checkpoints, Field, InputSpec, Trainer, models
+from dew.data import Loading, OxfordFlowers
+from dew.diffusion.presets import EDM
+from dew.objectives.diffusion import DiffusionObjective
+
+
+def train():
+    data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
+    data = OxfordFlowers(
+        path=str(data_path),
+        split="train",
+        image_size=64,
+        val_batches=0,
+        loading=Loading(workers=2, threads=2),
+    ).load(batch=16)
+
+    model = models.build(
+        "simple_dit",
+        patch_size=4,
+        emb_features=128,
+        num_layers=4,
+        num_heads=4,
+        dtype="bfloat16",
+        attention_impl="auto",
+    )
+    objective = DiffusionObjective(
+        model,
+        EDM()(),
+        InputSpec(Field("image", (64, 64, 3))),
+    )
+    trainer = Trainer(
+        objective,
+        optax.adamw(2e-4),
+        key=jax.random.key(0),
+        checkpoints=Checkpoints("runs/flowers64/checkpoints"),
+    )
+    return trainer.fit(data, steps=1000, log_every=20, checkpoint_every=200)
+
+
+if __name__ == "__main__":
+    state = train()
+```
+
+The `__main__` guard allows Grain to start its data-loading workers. `Field` describes one image; the dataset supplies batches of 16. The objective adds noise and constructs the denoising targets. The trainer runs optimization and checkpoints; `state.averaged` contains the EMA weights used for sampling.
+
+Run the full script, which also saves `samples.png`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
+    --data "$HOME/.cache/dew/datasets/oxford_flowers102/2.1.1" \
+    --steps 1000
+```
+
+Use `--steps 20` for a short setup check. That path completed on an RTX 4080 with the real Flowers records and wrote a checkpoint and sample grid. Image quality needs a longer training run.
+
+[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning. For an offline run without a dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) demonstrates language modeling, checkpoint continuation, DPO, and flow matching.
 
 ## Features
 
@@ -89,45 +144,53 @@ The supplied DPO and GRPO objectives use the same trainer as pretraining. PPO-re
 
 ## Models
 
-### Language models
+### Supported text models
 
-`CausalTransformer` combines attention, recurrent mixers, feed-forward layers, and family-specific residual/embedding operations. Hugging Face loaders translate supported configurations and tensor layouts into this model.
+These model configurations have checkpoint loading, training, and text generation paths in Dew. Text checkpoints are listed separately from multimodal models.
 
-| Family | Implemented components |
+| Model or family | Supported |
 |---|---|
-| Llama 2, 3, 3.1 | Grouped-query attention and supported RoPE scaling variants |
-| Llama 4 | Text decoder, interleaved attention, routed experts, vision tower and projector |
-| Mistral, Mixtral | Sliding-window attention and Mixtral experts |
-| Qwen 2, Qwen 3, Qwen3-MoE | Attention/projection conventions, Q/K normalization, and routed experts |
-| Qwen 3.5 | Gated delta-net/attention hybrid text decoder and vision components |
-| Gemma 1, 2, 3 | Embedding scaling, norm/softcap conventions, local/global attention; Gemma 3 vision |
-| Gemma 3n | AltUp, LAuReL, per-layer inputs, sparse activations, shared KV layers, and MobileNet-v5 image encoder |
-| Gemma 4 | Text configurations including routed experts; vision tower and projector |
-| OLMo 3 | Decoder normalization and attention conventions |
-| DeepSeek V2, V2-Lite, V3, V3.2 | MLA, routing/shared experts, balancing, and V3.2 sparse-indexer components |
-| Kimi K2 | DeepSeek-derived decoder and checkpoint translation |
-| GLM 4.5/5 configurations using `glm4_moe` | Attention, routing, and supported multi-token prediction depths |
-| gpt-oss | Attention sinks, biased/clamped experts, and MXFP4 weight unpacking |
-| LLaDA, Dream | Bidirectional masked-diffusion decoders |
-| Diffusion Gemma | Text decoder and block-diffusion denoising components |
+| Llama 2, Llama 3, Llama 3.1 | Yes |
+| Mistral, Mixtral | Yes |
+| Qwen 2, Qwen 3, Qwen3-MoE | Yes |
+| Gemma 1, Gemma 2, Gemma 3 text | Yes |
+| OLMo 3 | Yes |
+| DeepSeek V2 and V2-Lite (`deepseek_v2`) | Yes |
+| Kimi K2 text | Yes |
+| GLM checkpoints using `glm4_moe` | Yes |
+| gpt-oss | Yes |
+| LLaDA, Dream | Yes, with masked-diffusion training and sampling |
 
-The [family reference](docs/reference/model-families.md) lists accepted model types, configuration restrictions, and numerical checks. Support for a family does not cover every later model with the same brand name. Released-weight coverage and export support vary by family.
+### Not yet supported as complete models
+
+| Model or family | Supported | Missing work |
+|---|---|---|
+| Gemma 3 multimodal | No | Complete processor, loading, training, and image-conditioned generation workflow |
+| Gemma 3n, Gemma 4 multimodal | No | Complete image/audio model workflows |
+| Llama 4 multimodal | No | Complete image-conditioned training and generation workflow |
+| Qwen 3.5 full model | No | Multimodal workflows and complete MTP handling |
+| DeepSeek V3 and V3.2 full training | No | Complete MTP handling and V3.2 indexer-training objective |
+| Diffusion Gemma | No | Complete pretrained canvas-generation and training workflows |
+| DeepSeek V4, Qwen 3.8, GLM 5.3, Kimi K3, Muse Spark | No | Native model integrations |
+| Complete SDXL, SD3, Flux, and other Diffusers pretrained pipelines | No | Pipeline-specific model loading and task workflows |
+
+The [model reference](docs/reference/model-families.md) records exact checkpoint types and configuration requirements. Work on the unsupported models continues; tested layers alone do not put a model in the supported list.
 
 ### Diffusion and representation models
 
-| Registry name | Architecture |
-|---|---|
-| `unet`, `unet_3d` | Image and video UNets |
-| `uvit`, `simple_udit` | U-shaped transformers |
-| `simple_dit` | Patch-based diffusion transformer |
-| `simple_mmdit` | Dual-stream text/image transformer |
-| `hierarchical_mmdit` | Multi-resolution dual-stream transformer |
-| `hybrid_dit` | Transformer with S5 state-space blocks |
-| `video_dit` | Factorized spatial and temporal attention |
-| `jepa_encoder`, `jepa_video_encoder` | Image and video context encoders |
-| `jepa_predictor` | Masked-representation predictor |
+These Dew architectures can be trained from scratch.
 
-CLIP, T5, SigLIP, and model-specific vision/projector components provide conditioning and multimodal inputs. Autoencoders support latent-space training. These components do not yet cover all pretrained pipelines available in Diffusers.
+| Model | Registry name | Training |
+|---|---|---|
+| Image/video UNet | `unet`, `unet_3d` | Diffusion and flow matching |
+| U-shaped transformers | `uvit`, `simple_udit` | Diffusion and flow matching |
+| DiT | `simple_dit` | Diffusion and flow matching |
+| Dual-stream MMDiT | `simple_mmdit`, `hierarchical_mmdit` | Text-conditioned diffusion |
+| S5/transformer hybrid | `hybrid_dit` | Diffusion |
+| Video DiT | `video_dit` | Video diffusion |
+| I-JEPA / V-JEPA | `jepa_encoder`, `jepa_video_encoder`, `jepa_predictor` | Masked representation prediction |
+
+CLIP and T5 text encoders and VAE interfaces provide conditioning and latent-space training.
 
 ## Training
 
