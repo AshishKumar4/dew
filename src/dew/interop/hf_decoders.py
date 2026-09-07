@@ -1216,7 +1216,7 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         config['kinds'].setdefault('full_attention', {})['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
     # reference initialises to one, so the tree always holds it.
-    config.update(attention_k_eq_v=k_eq_v, layer_scalar=True)
+    config.update(attention_k_eq_v=k_eq_v, layer_scalar="frozen")
     used.update(('moe_intermediate_size', 'expert_intermediate_size',
                  'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
     if hf_config.get('enable_moe_block'):
@@ -2611,6 +2611,12 @@ def _gemma4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str,
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         tail = tuple(parts[3:])
+        if tail == ('layer_scalar',):
+            mode = config.get("layer_scalar")
+            if mode not in ("frozen", "trainable"):
+                _refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
+            collection = "constants" if mode == "frozen" else "params"
+            return (collection, f'layers_{parts[2]}', 'layer_scalar')
         layer = ('params', f'layers_{parts[2]}')
         if tail in _GEMMA4_MOE:
             return (*layer, *_GEMMA4_MOE[tail])
