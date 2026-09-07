@@ -26,7 +26,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
-from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import pipeline_microbatches
@@ -36,6 +36,7 @@ from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
     shard_batch,
 )
+from dew.training.evaluation import Evaluation, evaluate
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 
@@ -168,13 +169,6 @@ def write_back(params: Variables, variables: Variables | None) -> Variables:
     return {**params, **variables}
 
 
-def _pick(artifacts: tuple, reads: type):
-    matching = [artifact for artifact in artifacts if isinstance(artifact, reads)]
-    if len(matching) != 1:
-        raise ValueError(
-            f"a metric reads {reads.__name__}, and the objective's evaluation produced "
-            f"{[type(a).__name__ for a in artifacts]}")
-    return matching[0]
 def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
     """Working gradients use at least fp32, preserving higher caller precision."""
     dtype = jnp.promote_types(gradient.dtype, jnp.float32)
@@ -703,7 +697,11 @@ class Trainer(Generic[Loss, Effects]):
 
                 if eval_every and current % eval_every == 0 and current < steps:
                     paused = time.perf_counter()
-                    self._evaluate(state, data, metrics, mesh, current)
+                    self._report_evaluation(evaluate(
+                        self.objective, state.params, data.val, metrics=metrics, key=state.key,
+                        step=state.step, schedule_step=state.microstep,
+                        averaged=with_ema(state.params, state.ema),
+                        preview=self.tracker is not None, mesh=mesh))
                     other += time.perf_counter() - paused
 
                 # On its own clock, not the logging one: nested inside the log
@@ -740,7 +738,11 @@ class Trainer(Generic[Loss, Effects]):
                 loss.block_until_ready()
             paused = time.perf_counter()
             if eval_every:
-                self._evaluate(state, data, metrics, mesh, current)
+                self._report_evaluation(evaluate(
+                    self.objective, state.params, data.val, metrics=metrics, key=state.key,
+                    step=state.step, schedule_step=state.microstep,
+                    averaged=with_ema(state.params, state.ema),
+                    preview=self.tracker is not None, mesh=mesh))
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -788,179 +790,22 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
-                  mesh, step: int) -> dict[str, float]:
-        """Score the coordinated shard prefix and produce one optional preview.
-
-        Every rank participates in numerical work and global-array gathers.
-        Only process zero owns host metric statistics and tracker effects.
-        Host outcomes are agreed before the next collective; blocked device
-        collectives still require the distributed runtime's failure handling.
-        """
-        process_zero = jax.process_index() == 0
+    def _report_evaluation(self, result: Evaluation) -> None:
         error = None
-        configuration = None
-        try:
-            names = [metric.name for metric in metrics]
-            if len(names) != len(set(names)):
-                raise ValueError("evaluation metric names must be unique")
-            configuration = {
-                "validation": data.val is not None,
-                "metrics": [[metric.name, metric.reads.__module__, metric.reads.__qualname__]
-                            for metric in metrics],
-            }
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="configuration")
-        root_configuration = broadcast_from_process_zero(configuration)
-        error = None if configuration == root_configuration else ValueError(
-            "validation availability and ordered metric names/types must agree across ranks")
-        agree_process_phase(error, phase="configuration agreement")
-        preview_enabled = bool(broadcast_from_process_zero(
-            process_zero and self.tracker is not None))
-        if data.val is None or not (metrics or preview_enabled):
-            return {}
-
-        # Stable integer domains keep display choices out of scoring randomness.
-        event_key = jax.random.fold_in(jax.random.fold_in(state.key, 0x4556414C), state.step)
-        score_key = jax.random.fold_in(event_key, 0x53434F52)
-        preview_key = jax.random.fold_in(event_key, 0x50524556)
-        ema = with_ema(state.params, state.ema)
-        summaries: dict[str, object] = {}
-        source = iterator = None
-        scored = records = 0
-        uneven = False
-        try:
-            error = None
+        if jax.process_index() == 0:
             try:
-                source = data.val()
-                iterator = iter(source)
+                print(f"Evaluation {result.split} at step {result.step}: "
+                      f"{result.coordinated_batches} coordinated batches, {result.records} records, "
+                      f"uneven_shards={result.uneven_shards}, event_key={result.event_key}: {result.scores}")
+                if self.tracker is not None:
+                    for artifact in result.previews:
+                        self.tracker.artifact(artifact, result.step)
+                    scalars = result.scalars
+                    if scalars:
+                        self.tracker.log(scalars, result.step)
             except BaseException as failure:
                 error = failure
-            agree_process_phase(error, phase="iterator construction")
-            assert iterator is not None
-            while True:
-                error = None
-                batch = None
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    pass
-                except BaseException as failure:
-                    error = failure
-                available = agree_process_phase(
-                    error, phase=f"iterator next batch {scored}", available=batch is not None)
-                if available != jax.process_count():
-                    uneven = available > 0
-                    batch = None
-                    break
-                assert batch is not None
-                error = None
-                try:
-                    batch = shard_batch(mesh, batch)
-                    rows = next((leaf.shape[0] for leaf in jax.tree.leaves(batch) if leaf.ndim), None)
-                    if rows is None:
-                        raise ValueError("validation batch has no row-bearing array")
-                    records += int(rows)
-                except BaseException as failure:
-                    error = failure
-                agree_process_phase(error, phase=f"batch placement {scored}")
-                produced = None
-                if metrics:
-                    error = None
-                    try:
-                        info = Step(step=state.microstep, key=jax.random.fold_in(score_key, scored), ema=ema)
-                        produced = self.objective.evaluate(state.params, batch, info)
-                    except BaseException as failure:
-                        error = failure
-                    agree_process_phase(error, phase=f"scoring batch {scored}")
-                    produced, home = collective_host(
-                        (produced, batch), phase=f"scoring batch {scored}")
-                    artifacts = (() if produced is None else produced
-                                 if isinstance(produced, tuple) else (produced,))
-                    for metric in metrics:
-                        error = None
-                        if process_zero:
-                            try:
-                                contribution = metric(_pick(artifacts, metric.reads), home)
-                                summaries[metric.name] = (
-                                    metric.merge(summaries[metric.name], contribution)
-                                    if metric.name in summaries else contribution)
-                                del contribution
-                            except BaseException as failure:
-                                error = failure
-                        agree_process_phase(error, phase=f"metric {metric.name} batch {scored}")
-                    del home, artifacts
-                if scored == 0 and preview_enabled:
-                    error = None
-                    preview = None
-                    try:
-                        info = Step(step=state.microstep, key=preview_key, ema=ema)
-                        preview = self.objective.preview(state.params, batch, info, scored=produced)
-                    except BaseException as failure:
-                        error = failure
-                    agree_process_phase(error, phase="preview generation/decoding")
-                    preview = collective_host(preview, phase="preview artifacts")
-                    error = None
-                    if process_zero and self.tracker is not None:
-                        try:
-                            for artifact in (() if preview is None else preview
-                                             if isinstance(preview, tuple) else (preview,)):
-                                self.tracker.artifact(artifact, step)
-                        except BaseException as failure:
-                            error = failure
-                    agree_process_phase(error, phase="preview rendering")
-                    preview = artifact = None
-                produced = batch = None
-                scored += 1
-                if not metrics:
-                    break
-            event_words = np.asarray(collective_host(
-                jax.random.key_data(event_key), phase="event identity")).tolist()
-            scores: dict[str, float] = {}
-            if scored:
-                for metric in metrics:
-                    error = None
-                    if process_zero:
-                        try:
-                            scores[f"val/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
-                        except BaseException as failure:
-                            error = failure
-                    agree_process_phase(error, phase=f"finalizing metric {metric.name}")
-            error = None
-            if process_zero:
-                try:
-                    if scored:
-                        scores.update({"evaluation/coordinated_batches": float(scored),
-                                       "evaluation/records": float(records),
-                                       "evaluation/uneven_shards": float(uneven)})
-                    print(f"Validation at step {step}: {scored} coordinated batches, {records} records, "
-                          f"uneven_shards={uneven}, event_key={event_words}: {scores}")
-                except BaseException as failure:
-                    error = failure
-            agree_process_phase(error, phase="evaluation summary")
-            error = None
-            if process_zero and self.tracker is not None and scores:
-                try:
-                    self.tracker.log(scores, step)
-                except BaseException as failure:
-                    error = failure
-            agree_process_phase(error, phase="final tracking")
-            return broadcast_from_process_zero(scores)
-        finally:
-            primary = sys.exception()
-            error = None
-            try:
-                close = getattr(iterator if iterator is not None else source, "close", None)
-                if close is not None:
-                    close()
-            except BaseException as failure:
-                if primary is not None:
-                    primary.add_note(f"Validation iterator cleanup failed: {failure!r}")
-                else:
-                    error = failure
-            if primary is None:
-                agree_process_phase(error, phase="iterator cleanup")
+        agree_process_phase(error, phase="evaluation reporting")
 
 
     # ------------------------------------------------------------------
