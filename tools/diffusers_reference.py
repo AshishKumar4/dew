@@ -28,10 +28,16 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
+
+# The per-step noise is the test suite's draw, which conftest.py makes on
+# the CPU; a GPU draw of the same key differs in the last float32 bit and
+# the fixture would then not regenerate byte-identically.
+os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax
 import jax.numpy as jnp
