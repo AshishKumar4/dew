@@ -643,6 +643,30 @@ def _gemma4_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array
     return jnp.concatenate(rotated, axis=-1)
 
 
+class Gemma4ClippableLinear(nn.Dense):
+    """The reference linear map with optional nontrainable activation bounds.
+
+    Subclassing Dense keeps the existing kernel path; HF's extra linear
+    name belongs to checkpoint conversion, not another numerical operation.
+    """
+
+    use_clipped_linears: bool = False
+
+    @nn.compact
+    def __call__(self, inputs):
+        if self.use_clipped_linears:
+            low = self.variable("constants", "input_min", lambda: jnp.array(-jnp.inf, jnp.float32))
+            high = self.variable("constants", "input_max", lambda: jnp.array(jnp.inf, jnp.float32))
+            inputs = jnp.clip(inputs, low.value.astype(inputs.dtype), high.value.astype(inputs.dtype))
+        output = super().__call__(inputs)
+        if self.use_clipped_linears:
+            low = self.variable("constants", "output_min", lambda: jnp.array(-jnp.inf, jnp.float32))
+            high = self.variable("constants", "output_max", lambda: jnp.array(jnp.inf, jnp.float32))
+            output = jnp.clip(output, low.value.astype(output.dtype), high.value.astype(output.dtype))
+        return output
+
+
+
 class Gemma4VisionAttention(nn.Module):
     """Grouped-query attention with scaled q/k/v norms and the 2D rotary.
 
@@ -659,9 +683,11 @@ class Gemma4VisionAttention(nn.Module):
     rms_norm_eps: float = 1e-6
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    use_clipped_linears: bool = False
 
     def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=False,
+        dense = functools.partial(Gemma4ClippableLinear, use_bias=False,
+                                  use_clipped_linears=self.use_clipped_linears,
                                   dtype=self.dtype, precision=self.precision)
         self.q_proj = dense(self.hidden_size, name="q_proj")
         self.k_proj = dense(self.num_key_value_heads * (self.hidden_size // self.num_heads),
@@ -674,7 +700,7 @@ class Gemma4VisionAttention(nn.Module):
         self.v_norm = RMSNorm(epsilon=self.rms_norm_eps, with_scale=False,
                               dtype=self.dtype, name="v_norm")
 
-    def __call__(self, hidden_states, cos, sin) -> jax.Array:
+    def __call__(self, hidden_states, cos, sin, valid=None) -> jax.Array:
         batch, length, _ = hidden_states.shape
         head_dim = self.hidden_size // self.num_heads
         # The norms read the heads (modeling_gemma4.py,
@@ -687,9 +713,11 @@ class Gemma4VisionAttention(nn.Module):
         repeats = self.num_heads // self.num_key_value_heads
         key = jnp.repeat(key, repeats, axis=2)
         value = jnp.repeat(value, repeats, axis=2)
-        scores = jnp.einsum("bqhd,bkhd->bhqk", query, key)
+        scores = jnp.einsum("bqhd,bkhd->bhqk", query, key, precision=self.precision)
+        if valid is not None:
+            scores = jnp.where(valid[:, None, None, :], scores, jnp.finfo(scores.dtype).min)
         probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(query.dtype)
-        attended = jnp.einsum("bhqk,bkhd->bqhd", probs, value)
+        attended = jnp.einsum("bhqk,bkhd->bqhd", probs, value, precision=self.precision)
         return self.o_proj(attended.reshape(batch, length, self.hidden_size))
 
 
@@ -705,9 +733,11 @@ class Gemma4VisionMLP(nn.Module):
     hidden_act: str = "gelu_pytorch_tanh"
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    use_clipped_linears: bool = False
 
     def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=False,
+        dense = functools.partial(Gemma4ClippableLinear, use_bias=False,
+                                  use_clipped_linears=self.use_clipped_linears,
                                   dtype=self.dtype, precision=self.precision)
         self.gate_proj = dense(self.intermediate_size, name="gate_proj")
         self.up_proj = dense(self.intermediate_size, name="up_proj")
@@ -742,6 +772,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
     rope_theta: float = 100.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    use_clipped_linears: bool = False
 
     def setup(self):
         norm = functools.partial(RMSNorm, epsilon=self.rms_norm_eps, dtype=self.dtype)
@@ -749,17 +780,19 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.self_attn = Gemma4VisionAttention(
             self.hidden_size, self.num_heads, self.num_key_value_heads,
             rope_theta=self.rope_theta, rms_norm_eps=self.rms_norm_eps,
-            dtype=self.dtype, precision=self.precision, name="self_attn")
+            dtype=self.dtype, precision=self.precision,
+            use_clipped_linears=self.use_clipped_linears, name="self_attn")
         self.post_attention_layernorm = norm(name="post_attention_layernorm")
         self.pre_feedforward_layernorm = norm(name="pre_feedforward_layernorm")
         self.mlp = Gemma4VisionMLP(
             self.hidden_size, self.intermediate_size, self.hidden_act,
-            dtype=self.dtype, precision=self.precision, name="mlp")
+            dtype=self.dtype, precision=self.precision,
+            use_clipped_linears=self.use_clipped_linears, name="mlp")
         self.post_feedforward_layernorm = norm(name="post_feedforward_layernorm")
 
-    def __call__(self, hidden_states, cos, sin):
+    def __call__(self, hidden_states, cos, sin, valid=None):
         residual = hidden_states
-        hidden_states = self.self_attn(self.input_layernorm(hidden_states), cos, sin)
+        hidden_states = self.self_attn(self.input_layernorm(hidden_states), cos, sin, valid)
         hidden_states = residual + self.post_attention_layernorm(hidden_states)
         residual = hidden_states
         hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
@@ -769,12 +802,10 @@ class Gemma4VisionEncoderLayer(nn.Module):
 class Gemma4VisionTransformer(nn.Module):
     """The Gemma 4 vision trunk, param layout of `Gemma4VisionConfig`.
 
-    `pixel_values` are [B, C, H, W] squares tiling patch_size, one resolution
-    per call: the patches unfold in row-major order, the (x, y) ids come from
-    the patch grid the way the processor's meshgrid lays them, and the pooler
-    averages each pooling_kernel_size block into one soft token. Padding and
-    video frames have no form here; the reference pads ragged batches with
-    (-1, -1) marks, which this trunk refuses by taking images alone.
+    The processor supplies [B, patches, patch_pixels] and (x, y) position IDs
+    with (-1, -1) for padding. Fixed NCHW images are patchified in the same
+    HWC order. Outputs retain padded soft-token slots so their shape remains
+    static under JIT; callers select valid features using processor lengths.
     """
 
     hidden_size: int = 1152
@@ -790,6 +821,8 @@ class Gemma4VisionTransformer(nn.Module):
     rope_theta: float = 100.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    standardize: bool = False
+    use_clipped_linears: bool = False
 
     def setup(self):
         if self.hidden_size % self.num_heads:
@@ -815,48 +848,58 @@ class Gemma4VisionTransformer(nn.Module):
                 self.hidden_size, self.intermediate_size, self.num_heads,
                 self.num_key_value_heads, self.hidden_act,
                 rms_norm_eps=self.rms_norm_eps, rope_theta=self.rope_theta,
-                dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
+                dtype=self.dtype, precision=self.precision,
+                use_clipped_linears=self.use_clipped_linears, name=f"layers_{index}")
             for index in range(self.num_layers)]
-        self.std_bias = self.param("std_bias", nn.initializers.zeros, (self.hidden_size,))
-        self.std_scale = self.param("std_scale", nn.initializers.ones, (self.hidden_size,))
+        if self.standardize:
+            self.std_bias = self.variable("constants", "std_bias", jnp.zeros, (self.hidden_size,), jnp.float32)
+            self.std_scale = self.variable("constants", "std_scale", jnp.ones, (self.hidden_size,), jnp.float32)
 
-    def __call__(self, pixel_values) -> jax.Array:
-        pixel_values = jnp.asarray(pixel_values)
-        batch, channels, height, width = pixel_values.shape
-        if height != width or height % (self.patch_size * self.pooling_kernel_size):
-            raise ValueError(
-                f"pixel_values of {channels}x{height}x{width} are not a square "
-                f"tiled by {self.pooling_kernel_size}x{self.pooling_kernel_size} "
-                f"blocks of {self.patch_size}px patches")
-        grid = height // self.patch_size
-        patches = pixel_values.reshape(
-            batch, channels, grid, self.patch_size, grid, self.patch_size)
-        patches = patches.transpose(0, 2, 4, 1, 3, 5)
-        hidden_states = self.patch_embed(
-            2 * (patches.reshape(batch, grid * grid,
-                                channels * self.patch_size ** 2) - 0.5))
-        rows = jnp.repeat(jnp.arange(grid), grid)
-        cols = jnp.tile(jnp.arange(grid), grid)
+    def __call__(self, pixel_values, pixel_position_ids=None) -> jax.Array:
+        pixels = jnp.asarray(pixel_values)
+        if pixels.ndim == 4:
+            if pixel_position_ids is not None:
+                raise ValueError("position IDs accompany patch pixels, not NCHW images")
+            batch, channels, height, width = pixels.shape
+            stride = self.patch_size * self.pooling_kernel_size
+            if channels != 3 or height % stride or width % stride:
+                raise ValueError(f"Gemma4 images must have three channels and sides divisible by {stride}")
+            rows, columns = height // self.patch_size, width // self.patch_size
+            patches = pixels.reshape(batch, channels, rows, self.patch_size, columns, self.patch_size)
+            pixels = patches.transpose(0, 2, 4, 3, 5, 1).reshape(batch, rows * columns, -1)
+            x = jnp.tile(jnp.arange(columns), rows)
+            y = jnp.repeat(jnp.arange(rows), columns)
+            pixel_position_ids = jnp.broadcast_to(jnp.stack([x, y], axis=-1), (batch, rows * columns, 2))
+        if pixels.ndim != 3 or pixels.shape[-1] != 3 * self.patch_size ** 2:
+            raise ValueError("Gemma4 patch pixels must be [B, patches, 3 * patch_size**2]")
+        if pixel_position_ids is None or pixel_position_ids.shape != pixels.shape[:2] + (2,):
+            raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
+        if not jnp.issubdtype(pixel_position_ids.dtype, jnp.integer):
+            raise ValueError("pixel_position_ids must be integers")
+        valid = (pixel_position_ids >= 0).all(axis=-1)
+        safe = jnp.maximum(pixel_position_ids, 0)
+        hidden_states = self.patch_embed(2 * (pixels - 0.5))
         table = self.position_table.astype(hidden_states.dtype)
-        hidden_states = hidden_states + table[0, cols] + table[1, rows]
-        ids = jnp.stack([cols, rows], axis=-1)
-        head_dim = self.hidden_size // self.num_heads
-        cos, sin = _gemma4_rope_tables(
-            jnp.broadcast_to(ids, (batch,) + ids.shape), head_dim, self.rope_theta)
+        positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
+        hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
+        cos, sin = _gemma4_rope_tables(pixel_position_ids, self.hidden_size // self.num_heads, self.rope_theta)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cos, sin)
-        # The pooler averages each kernel block and scales in fp32, and the
-        # trunk standardizes in fp32 (modeling_gemma4.py, Gemma4VisionPooler
-        # and Gemma4VisionModel.forward).
-        side = grid // self.pooling_kernel_size
-        pooled = hidden_states.reshape(
-            batch, side, self.pooling_kernel_size, side,
-            self.pooling_kernel_size, self.hidden_size).mean(axis=(2, 4))
-        pooled = pooled.reshape(batch, side * side, self.hidden_size)
-        pooled = pooled.astype(jnp.float32) * self.hidden_size ** 0.5
-        standardized = ((pooled - self.std_bias.astype(jnp.float32))
-                        * self.std_scale.astype(jnp.float32))
-        return standardized.astype(hidden_states.dtype)
+            hidden_states = layer(hidden_states, cos, sin, valid)
+        kernel = self.pooling_kernel_size
+        if pixels.shape[1] % kernel ** 2:
+            raise ValueError("patch count must divide into whole pooling blocks")
+        output_length = pixels.shape[1] // kernel ** 2
+        width = safe[..., 0].max(axis=-1, keepdims=True) + 1
+        indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)
+        values = jnp.where(valid[..., None], hidden_states, 0).astype(jnp.float32) / kernel ** 2
+        # Segment sums avoid the reference pooler's [patches, soft_tokens]
+        # one-hot matrix while preserving its position-indexed block average.
+        pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(values, indices)
+        pooled = pooled * self.hidden_size ** 0.5
+        if self.standardize:
+            pooled = (pooled - self.std_bias.value) * self.std_scale.value
+        return pooled.astype(hidden_states.dtype)
+
 
 
 @towers("gemma4")
@@ -875,6 +918,8 @@ class Gemma4Vision(TowerBase):
     hidden_act: str = "gelu_pytorch_tanh"
     rms_norm_eps: float = 1e-6
     rope_theta: float = 100.0
+    standardize: bool = False
+    use_clipped_linears: bool = False
 
     def build(self) -> nn.Module:
         return Gemma4VisionTransformer(
@@ -884,7 +929,8 @@ class Gemma4Vision(TowerBase):
             pooling_kernel_size=self.pooling_kernel_size,
             position_embedding_size=self.position_embedding_size,
             hidden_act=self.hidden_act, rms_norm_eps=self.rms_norm_eps,
-            rope_theta=self.rope_theta)
+            rope_theta=self.rope_theta, standardize=self.standardize,
+            use_clipped_linears=self.use_clipped_linears)
 
 
 class Gemma4ProjectorModule(nn.Module):
@@ -1584,6 +1630,10 @@ def _gemma4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
             return (layer, "self_attn", parts[4], "kernel")
         if parts[3] == "mlp" and parts[4] in _GEMMA4_VISION_MLP:
             return (layer, "mlp", parts[4], "kernel")
+    if len(parts) == 6 and parts[5] in ("input_min", "input_max", "output_min", "output_max"):
+        if ((parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS)
+                or (parts[3] == "mlp" and parts[4] in _GEMMA4_VISION_MLP)):
+            return (layer, parts[3], parts[4], parts[5])
     if len(parts) == 6 and parts[3] == "self_attn" and parts[5] == "weight":
         if parts[4] in ("q_norm", "k_norm"):
             # The value norm carries no scale (modeling_gemma4.py,
@@ -1592,7 +1642,7 @@ def _gemma4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
     return None
 
 def gemma4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
-    """One Gemma 4 vision tensor name into its path in a trunk tree.
+    """One Gemma 4 vision tensor name into its collection and trunk path.
 
     The rotary tables are buffers the checkpoint leaves out, recomputed from
     the grid at call time. Anything else unknown raises ValueError.
@@ -1601,11 +1651,12 @@ def gemma4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
         hf_name.split("."))
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
-    return path
+    collection = "constants" if path[-1] in ("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max") else "params"
+    return (collection, *path)
 
 
 def translate_gemma4_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Gemma 4 vision tensors into a trunk params tree, in fp32."""
+    """Gemma 4 weights and frozen buffers as a complete Flax variables tree."""
     return _translate(hf_tensors, gemma4_vision_path)
 
 
@@ -1640,8 +1691,8 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
 
     Reads the vision_config of a wrapper or a bare vision config. The head
     width derives from the hidden size and the head count; a config carrying
-    any other width refuses. Biases, dropout, clipped linears and an
-    unstandardized trunk refuse, each naming its field.
+    any other width refuses. Standardization and activation clipping retain
+    their reference buffers outside the trainable parameter collection.
     """
     vision = hf_config.get("vision_config", hf_config)
     if not isinstance(vision, Mapping):
@@ -1663,12 +1714,6 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
         raise ValueError("attention_bias=True needs biased maps this trunk lacks")
     if float(vision.get("attention_dropout", 0.0)):
         raise ValueError("attention_dropout is training-time; this trunk runs eval")
-    if vision.get("use_clipped_linears", False):
-        raise ValueError(
-            "use_clipped_linears=True needs clamped maps this trunk lacks")
-    if not vision.get("standardize", False):
-        raise ValueError(
-            "standardize=False skips the bias and scale this trunk applies")
     if "output_proj_dims" in vision:
         raise ValueError(
             f"output_proj_dims ({vision['output_proj_dims']!r}) changes the "
@@ -1686,6 +1731,8 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
         "hidden_act": activation,
         "rms_norm_eps": float(vision.get("rms_norm_eps", 1e-6)),
         "rope_theta": _gemma4_rope_theta(vision),
+        "standardize": bool(vision.get("standardize", False)),
+        "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }
 
 
