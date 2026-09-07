@@ -34,7 +34,6 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import checkify
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -1944,23 +1943,11 @@ class Gemma3nProjectorModule(nn.Module):
         return self.embedding_post_projection_norm(
             self.embedding_projection(self.soft_embedding_norm(features)))
 
-    def hard_embeddings(self, input_ids):
-        """Embed checked vision IDs in [vocab_offset, vocab_offset + vocab_size).
-
-        Eager calls raise on invalid IDs. Compiled callers use checkify.checkify
-        around apply, then call the returned Error.throw() on the host before
-        consuming embeddings. Plain jit does not functionalize these checks.
-        """
-        ids = jnp.asarray(input_ids)
-        if ids.ndim != 2 or not jnp.issubdtype(ids.dtype, jnp.integer):
-            raise ValueError("vision token IDs must be an integer [B, S] array")
-        upper = self.vocab_offset + self.vocab_size
-        checkify.check(jnp.all((ids >= self.vocab_offset) & (ids < upper)),
-                       f"vision token IDs must be in [{self.vocab_offset}, {upper})")
-        return self.embed_hard(ids)
-
     def embed_hard(self, ids):
-        """Numerical lookup after the caller's token-domain check."""
+        """Embed vocabulary ids in [vocab_offset, vocab_offset + vocab_size).
+
+        Pure: the host processor validates ids before device work.
+        """
         embedded = self.embedding(ids - self.vocab_offset)
         if self.is_initializing():
             self.soft_embedding_norm(jnp.zeros_like(embedded))
@@ -1968,55 +1955,13 @@ class Gemma3nProjectorModule(nn.Module):
             self.embedding_projection(self.hard_embedding_norm(embedded)))
 
     def merge_hard_embeddings(self, token_embeddings, ids):
-        """Fuse admitted text/vision IDs using the reference's dummy vision ID.
-
-        Pure: the caller has validated ids against the text vocabulary.
-        """
+        """Replace this vocabulary range's slots with hard embeddings, through the
+        reference's dummy id for every other slot."""
         mask = (ids >= self.vocab_offset) & (ids < self.vocab_offset + self.vocab_size)
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
         hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
 
-    def model_inputs(self, token_embeddings, input_ids, soft_tokens=None,
-                     image_positions=None, *, per_layer_input_vocab: int) -> dict[str, jax.Array]:
-        """CausalTransformer inputs after vision fusion and the PLE vocabulary mask.
-
-        token_embeddings are the decoder's scaled embeddings. Image positions
-        are a precomputed integer [B, N] array, matching the [B, N, D] soft
-        tokens. Eager calls reject IDs outside the text/vision vocabulary.
-        Compile the caller with jit(checkify.checkify(...)); it returns an
-        Error alongside the inputs. Call Error.throw() on the host before
-        using the inputs. The checkified path remains differentiable.
-        """
-        ids = jnp.asarray(input_ids)
-        embeddings = jnp.asarray(token_embeddings)
-        if ids.ndim != 2 or not jnp.issubdtype(ids.dtype, jnp.integer):
-            raise ValueError("input_ids must be an integer [B, S] array")
-        if embeddings.shape != ids.shape + (self.text_width,):
-            raise ValueError("token embeddings must align with input_ids and text_width")
-        upper = self.vocab_offset + self.vocab_size
-        checkify.check(jnp.all((ids >= 0) & (ids < upper)),
-                       f"image-only input_ids must be in [0, {upper}); audio IDs are unsupported")
-        if not jnp.issubdtype(embeddings.dtype, jnp.floating):
-            raise ValueError("token_embeddings must be floating point")
-        if per_layer_input_vocab < 1:
-            raise ValueError("per_layer_input_vocab must be positive")
-        if (soft_tokens is None) != (image_positions is None):
-            raise ValueError("soft_tokens and image_positions arrive together")
-        merged = self.merge_hard_embeddings(embeddings, ids)
-        if soft_tokens is not None:
-            soft, positions = jnp.asarray(soft_tokens), jnp.asarray(image_positions)
-            if (soft.ndim != 3 or soft.shape[0] != ids.shape[0]
-                    or soft.shape[-1] != self.text_width or positions.shape != soft.shape[:2]):
-                raise ValueError("soft_tokens and image_positions must be [B, N, D] and [B, N]")
-            if not jnp.issubdtype(positions.dtype, jnp.integer):
-                raise ValueError("image_positions must be integers")
-            merged = merged.at[jnp.arange(ids.shape[0])[:, None], positions].set(
-                soft.astype(merged.dtype))
-        tokens = jnp.where((ids >= 0) & (ids < per_layer_input_vocab), ids, 0)
-        return {"tokens": tokens, "input_embeddings": merged,
-                "embedding_positions": jnp.broadcast_to(
-                    jnp.arange(ids.shape[1], dtype=jnp.int32), ids.shape)}
 
 @projectors("gemma3n")
 @dataclasses.dataclass(frozen=True)

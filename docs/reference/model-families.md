@@ -34,15 +34,17 @@ The translator validates supported computational fields. A new checkpoint releas
 
 ## Vision wrappers
 
-| Wrapper | Vision computation | Current scope |
-|---|---|---|
-| Gemma 3 | SigLIP tower and projector | Small tower, projector, and wrapper-forward fixtures |
-| Llama 4 | Vision rotary, patch ordering, adapter, and projection | Still-image wrapper fixtures; inspect input resolution and token placement requirements |
-| Gemma 4 | Position tables, vision rotary, pooler, and multimodal embedder | Fixed square still-image path; ragged/padded/video behavior is restricted |
-| Qwen 3.5 | Temporal-patch layout for stills, vision rotary, and merger | Fixed-resolution stills; mixed-resolution packed inputs are restricted |
-| Gemma 3n | MobileNet-v5 encoder and hard/soft vision embeddings | Image-only bundles; audio config and weights are rejected. Tiny forward, gradient, and update comparisons run on CPU |
+`load_pretrained` builds these wrappers as one native model with the checkpoint's own processor. Each row of the table has a tiny fixture written from the actual Transformers 5.16.1 processor and conditional model, covering the processor call, forward logits, the loss and pixel gradient, an all-parameter SGD update exported back to the source layout and reloaded, and cached greedy generation.
 
-Audio towers are not implemented. A vision wrapper's successful forward comparison does not automatically qualify its tokenizer, image processor, generation loop, training gradients, or multi-host placement.
+| Wrapper | Media computation | Processor inputs |
+|---|---|---|
+| Gemma 3 | SigLIP tower and average-pooling projector | Fixed-resolution images, four to 256 soft tokens each |
+| Llama 4 | Vision rotary, local and global tiles, pixel-shuffle adapter | Tiled images; the processor normalizes pixels in bfloat16 and the loader widens them exactly |
+| Gemma 4 | 2D position tables, vision rotary, clippable linears, position pooler, audio conformer | Padded patch streams with positions, video placeholders, waveforms with one placeholder per encoded frame |
+| Qwen 3.5 | Channel-then-time patches, frame-bounded window attention, merger, spatial M-RoPE | Packed patch streams with per-image grids at any resolution the processor emits |
+| Gemma 3n | MobileNet-v5 encoder, hard/soft vision and audio embedders, audio conformer | Fixed-resolution images and waveforms with a fixed slot count per clip |
+
+The fixtures are tiny and run on CPU in float32. A passing fixture does not qualify a released checkpoint's memory use, accelerator precision or multi-host placement.
 
 ## Weight formats and memory
 
