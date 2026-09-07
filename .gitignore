@@ -9,7 +9,6 @@ checkpoints
 good models
 *(old).ipynb
 .env
-.env
 tensorboard
 wandb
 gcs_mount
@@ -21,7 +20,6 @@ gcsfuse.yml
 *.parquet
 *.arrow
 artifacts
-*.parquet
 dataset-prep/datasets
 # local working docs
 PLAN.md

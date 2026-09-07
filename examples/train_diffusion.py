@@ -17,7 +17,6 @@ from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
 from dew.objectives.diffusion import DiffusionObjective
-import dew.nn.backbones  # registers the models
 from dew.registry import models
 from dew.sampling import CFG, Heun, TextToImage
 from dew.training import Checkpoints, MeshSpec, Trainer
