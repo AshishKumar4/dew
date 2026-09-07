@@ -155,7 +155,8 @@ class DiffusionObjective(Objective[Mean]):
         preds = self.process.prediction.pred_transform(noisy, preds, rates)
         losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
-        return Mean(jnp.sum(losses * weights), jnp.asarray(losses.size)), Aux(metrics={})
+        return Mean(jnp.sum(losses * weights),
+                    jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
     def _sample_impl(self, params, tokens, key, *, count: int):
         given = self.encode(params["encoders"], tokens)
