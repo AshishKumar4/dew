@@ -172,5 +172,77 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
     for name in ("std_bias", "std_scale"):
         key = "model.vision_tower." + name
         np.testing.assert_array_equal(after[key], before[key])
+    for name in before:
+        if name.endswith("layer_scalar"):
+            np.testing.assert_array_equal(after[name], before[name])
     trained = "model.vision_tower.patch_embedder.input_proj.weight"
     assert np.max(np.abs(after[trained] - before[trained])) > 1e-4
+
+
+
+
+@pytest.fixture(scope="module")
+def gemma4_source():
+    pytest.importorskip("torchvision", reason="the optional vision extra supplies the actual Gemma4 processor")
+    directory = FIXTURE.parent / "gemma4-native-tiny"
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    images = np.load(directory / "raw_images.npy")
+    assert loaded.processor is not None
+    inputs = loaded.processor(json.loads((directory / "prompts.json").read_text()),
+                              images=[[images[0]], [images[1], images[2]]])
+    return loaded, inputs, directory
+
+
+def test_gemma4_processor_clipping_and_cached_generation_match_reference(gemma4_source):
+    """Actual padded processor patches, active clipping, image masks and decode.
+
+    FP32 valid-logit max error 1.35e-5, tolerance 1e-4. The reference samples
+    video placeholder ID56; its next decode input must use the pad embedding.
+    """
+    loaded, inputs, directory = gemma4_source
+    np.testing.assert_array_equal(inputs.tokens, np.load(directory / "input_ids.npy"))
+    logits = jax.jit(lambda variables: loaded.model.apply(
+        variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    expected = np.load(directory / "logits.npy")
+    np.testing.assert_allclose(np.asarray(logits)[valid], expected[valid], atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), expected[valid].argmax(-1))
+    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
+
+
+def test_gemma4_source_backward_and_trained_export_match_reference(gemma4_source, tmp_path):
+    """Pixel-gradient max error 1.88e-6 against actual Transformer backward."""
+    loaded, inputs, directory = gemma4_source
+    objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1,
+                            pretrained=loaded.variables, ema_decay=None, pad_id=0)
+    step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
+
+    def loss(params, pixels):
+        values = {**loaded.variables, "params": params}
+        data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+        statistics, _ = objective.loss(values, {"text": data}, step)
+        return objective.reduce_loss(statistics)[0]
+
+    value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        loaded.variables["params"], inputs.conditioning["pixel_values"])
+    expected = json.loads((directory / "training.json").read_text())
+    np.testing.assert_allclose(value, expected["loss"], atol=1e-5, rtol=0)
+    real = jnp.stack([pixels[0, 0], pixels[1, 0], pixels[1, 1]])
+    np.testing.assert_allclose(real, np.load(directory / "pixel_gradient.npy"), atol=1e-5, rtol=1e-4)
+    optimizer = optax.sgd(expected["learning_rate"])
+    params = loaded.variables["params"]
+    updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+    updated = {**loaded.variables, "params": optax.apply_updates(params, updates)}
+    loaded.save(tmp_path, variables=updated)
+    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    np.testing.assert_allclose(np.asarray(output)[valid], np.load(directory / "updated_logits.npy")[valid], atol=1e-4, rtol=0)
+    original = load_file(str(directory / "model.safetensors"))
+    saved = load_file(str(tmp_path / "model.safetensors"))
+    for name, tensor in original.items():
+        if name.endswith(("std_bias", "std_scale", "input_min", "input_max", "output_min", "output_max")):
+            np.testing.assert_array_equal(saved[name], tensor)
+
+
