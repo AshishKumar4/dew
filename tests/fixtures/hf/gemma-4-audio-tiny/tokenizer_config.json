@@ -1,0 +1,20 @@
+{
+  "audio_token": "<audio>",
+  "backend": "tokenizers",
+  "boa_token": "<boa>",
+  "boi_token": "<boi>",
+  "bos_token": "<s>",
+  "eoa_token": "<eoa>",
+  "eoi_token": "<eoi>",
+  "eos_token": "</s>",
+  "extra_special_tokens": [
+    "<|video|>"
+  ],
+  "image_token": "<image>",
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<pad>",
+  "padding_side": "left",
+  "processor_class": "Gemma4Processor",
+  "tokenizer_class": "TokenizersBackend",
+  "unk_token": "<unk>"
+}

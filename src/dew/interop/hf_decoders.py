@@ -1216,7 +1216,7 @@ def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         config['kinds'].setdefault('full_attention', {})['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
     # reference initialises to one, so the tree always holds it.
-    config.update(attention_k_eq_v=k_eq_v, layer_scalar=True)
+    config.update(attention_k_eq_v=k_eq_v, layer_scalar="frozen")
     used.update(('moe_intermediate_size', 'expert_intermediate_size',
                  'num_experts', 'top_k_experts', 'chunk_size_feed_forward'))
     if hf_config.get('enable_moe_block'):
@@ -1431,6 +1431,15 @@ def _wrapper_text(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         _refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     used.add("text_config")
+    if hf_config.get("model_type") != "llama4":
+        # These conditional models own their lm_head at wrapper scope; the
+        # nested text model has no head. Llama4 nests a complete causal LM.
+        default_tied = hf_config.get("model_type") != "qwen3_5"
+        tied = hf_config.get("tie_word_embeddings", default_tied)
+        if tied is not None and not isinstance(tied, bool):
+            _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
+        text = {**text, "tie_word_embeddings": bool(tied)}
+        used.add("tie_word_embeddings")
     return translate_config(text)
 
 
@@ -1626,17 +1635,17 @@ def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     return record
 
 
-def _wrapper_tower_weights(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+def _wrapper_tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     if kind == "siglip":
-        return vision_nn.translate_siglip_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_siglip_vision_weights(hf_tensors)}
     if kind == "llama4":
-        return vision_nn.translate_llama4_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_llama4_vision_weights(hf_tensors)}
     if kind == "gemma4":
         return vision_nn.translate_gemma4_vision_weights(hf_tensors)
     if kind == "qwen3_5":
-        return vision_nn.translate_qwen35_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_qwen35_vision_weights(hf_tensors)}
     if kind == "gemma3n":
-        return vision_nn.translate_gemma3n_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_gemma3n_vision_weights(hf_tensors)}
     raise ValueError(f"tower kind {kind!r} has no weight map here")
 
 
@@ -1656,6 +1665,14 @@ def _wrapper_projector_weights(kind: str,
     raise ValueError(f"projector kind {kind!r} has no weight map here")
 
 
+_WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
+                         "gemma4": "vision_tower.", "qwen3_5": "visual.",
+                         "gemma3n": "vision_tower."}
+_WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
+                             "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
+                             "gemma3n": "embed_vision."}
+
+
 def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
                               record: Mapping[str, Any]) -> Dict[str, Any]:
     """Wrapper tensors into language, tower and projector trees, in fp32.
@@ -1670,12 +1687,8 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
-    tower_prefix = {"siglip": "vision_tower.", "llama4": "vision_model.",
-                    "gemma4": "vision_tower.", "qwen3_5": "visual.",
-                    "gemma3n": "vision_tower."}[tower_kind]
-    projector_prefix = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
-                        "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
-                        "gemma3n": "embed_vision."}[projector_kind]
+    tower_prefix = _WRAPPER_TOWER_PREFIX[tower_kind]
+    projector_prefix = _WRAPPER_PROJECTOR_PREFIX[projector_kind]
     text_tensors: Dict[str, np.ndarray] = {}
     tower_tensors: Dict[str, np.ndarray] = {}
     projector_tensors: Dict[str, np.ndarray] = {}
@@ -1698,7 +1711,7 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             raise ValueError(f"unknown tensor name {name!r}")
     return {
         "language_model": translate_weights(text_tensors, record["text"]),
-        "tower": {"params": _wrapper_tower_weights(tower_kind, tower_tensors)},
+        "tower": _wrapper_tower_variables(tower_kind, tower_tensors),
         "projector": {"params": _wrapper_projector_weights(projector_kind,
                                                             projector_tensors)},
     }
@@ -2607,6 +2620,12 @@ def _gemma4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str,
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         tail = tuple(parts[3:])
+        if tail == ('layer_scalar',):
+            mode = config.get("layer_scalar")
+            if mode not in ("frozen", "trainable"):
+                _refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
+            collection = "constants" if mode == "frozen" else "params"
+            return (collection, f'layers_{parts[2]}', 'layer_scalar')
         layer = ('params', f'layers_{parts[2]}')
         if tail in _GEMMA4_MOE:
             return (*layer, *_GEMMA4_MOE[tail])

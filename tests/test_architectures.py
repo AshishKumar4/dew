@@ -236,7 +236,7 @@ CASES = [
         "layer_types": ("sliding_attention", "full_attention"),
         "kinds": {"sliding_attention": {"window": 4},
                   "full_attention": {"head_dim": 16, "num_kv_heads": 1}},
-        "attention_k_eq_v": True, "layer_scalar": True,
+        "attention_k_eq_v": True, "layer_scalar": "frozen",
         "mixture": {"experts": 8, "top_k": 2, "expert_features": 16, "parallel": True},
     }, seq_len=SEQ_LEN, label="gemma4_moe"),
     # Gemma 3n at toy width: three copies of the residual stream under

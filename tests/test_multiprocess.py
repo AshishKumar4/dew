@@ -109,7 +109,7 @@ def run_worker(mode, out: Path, **flags) -> dict:
     return report_of(spawn(mode, out, **flags), out)
 
 
-def run_pool(mode, directory: Path, processes: int, **flags) -> list[dict]:
+def run_pool(mode, directory: Path, processes: int, *, timeout=600, **flags) -> list[dict]:
     """`processes` workers in one pool, and their reports in process order."""
     directory.mkdir(parents=True, exist_ok=True)
     coordinator = f"127.0.0.1:{free_port()}"
@@ -119,7 +119,7 @@ def run_pool(mode, directory: Path, processes: int, **flags) -> list[dict]:
               **flags)
         for index, out in enumerate(outs)]
     try:
-        return [report_of(process, out) for process, out in zip(running, outs)]
+        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -831,16 +831,20 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
 def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     """Two ranks own prompts of different lengths and stop at different steps.
 
-    Bucket plans and the decode trip count are agreed from every rank's
-    prompt lengths over parameters sharded across both ranks, so the ranks
-    issue the same collectives and both reach the rendezvous after sampling.
+    A shared padded shape and fixed decode trip count keep collectives in
+    the same order despite different validity masks. Both ranks reach the
+    rendezvous after sampling and after a peer rejects invalid input.
     The sampled rows, lengths and likelihoods match a single process over
     the same prompts, and the update that follows moves the same parameters.
     """
-    reports = run_pool("rollout", tmp_path, 2, fsdp_size=2)
+    reports = run_pool("rollout", tmp_path, 2, fsdp_size=2, timeout=90)
     single = run_worker("rollout", tmp_path / "single.json", fsdp_size=1)
 
     assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
+    for report in reports:
+        assert "vocabulary" in report["invalid_errors"]["token"]
+        assert "prompt_length" in report["invalid_errors"]["length"]
+        assert "single JAX PRNG key" in report["invalid_errors"]["key"]
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2

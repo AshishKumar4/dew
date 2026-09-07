@@ -1,0 +1,21 @@
+{
+  "audio_token": "<audio>",
+  "backend": "tokenizers",
+  "boa_token": "<start_of_audio>",
+  "boi_token": "<start_of_image>",
+  "bos_token": "<bos>",
+  "eoa_token": "<end_of_audio>",
+  "eoi_token": "<end_of_image>",
+  "eos_token": "<eos>",
+  "extra_special_tokens": [
+    "<|video|>"
+  ],
+  "image_token": "<image_soft_token>",
+  "mask_token": "<mask>",
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<pad>",
+  "padding_side": "left",
+  "processor_class": "Gemma4Processor",
+  "tokenizer_class": "GemmaTokenizer",
+  "unk_token": "<unk>"
+}
