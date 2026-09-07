@@ -7,9 +7,9 @@ import pytest
 from dew.nn.moe import load_balance_update
 
 
-@pytest.mark.parametrize("dtype", [jnp.int32, jnp.int64])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32, jnp.int64, jnp.uint64])
 def test_router_direction_keeps_one_count_differences_when_total_overflows(dtype):
-    with jax.enable_x64(dtype == jnp.int64):
+    with jax.enable_x64(np.dtype(dtype).itemsize == 8):
         maximum = np.iinfo(dtype).max
         cases = [[2**30, 2**30 + 1, 2**30 - 1],
                  [maximum, maximum - 1, maximum - 2],
@@ -20,6 +20,17 @@ def test_router_direction_keeps_one_count_differences_when_total_overflows(dtype
             expected = [.125 * ((total > len(values) * x) - (total < len(values) * x))
                         for x in values]
             np.testing.assert_array_equal(update(jnp.asarray(values, dtype)), expected)
+
+
+@pytest.mark.parametrize("dtype,experts", [(jnp.int8, 129), (jnp.uint8, 256),
+                                         (jnp.int16, 32769), (jnp.uint16, 65536)])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_router_direction_does_not_narrow_the_expert_divisor(dtype, experts, compiled):
+    counts = jnp.ones(experts, dtype).at[0].set(0)
+    update = jax.jit(load_balance_update) if compiled else load_balance_update
+    expected = np.full(experts, -.125)
+    expected[0] = .125
+    np.testing.assert_array_equal(update(counts, .125), expected)
 
 
 @pytest.mark.parametrize("sequence", [False, True])

@@ -130,6 +130,9 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
     Integer counts must individually fit their dtype; their total need not.
     """
     if jnp.issubdtype(counts.dtype, jnp.integer):
+        # Narrow count elements do not imply a narrow expert-count divisor.
+        minimum = jnp.uint32 if jnp.issubdtype(counts.dtype, jnp.unsignedinteger) else jnp.int32
+        counts = counts.astype(jnp.promote_types(counts.dtype, minimum))
         # Partial sums are represented divided by the expert count. Their
         # quotients never exceed the largest count, even when the total does.
         divisor = counts.size
