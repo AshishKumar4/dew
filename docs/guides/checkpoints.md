@@ -88,7 +88,7 @@ A plain Python generator generally has no restorable position. To continue the d
 
 ## Change placement deliberately
 
-Persistent checkpoints can restore into a compatible placement through the trainer's restore template. A checkpoint containing saved iterator position requires the same JAX process count; restore rejects a different count even for persistent storage. Position-free checkpoints can change process count when the tensor layout is compatible. Local emergency checkpoints contain each process's available shards and impose additional placement restrictions.
+Persistent checkpoints can restore into a compatible placement through the trainer's restore template. A saved iterator position can change the process count when it is a global record count, which every record dataset built on `train_stream` reports; a position that is one process's own shard offset, as the packed sources (`PackedTokens`, `ChatMessages`) and custom iterators report, requires the count that wrote it, and restore rejects a different count naming both. Position-free checkpoints can change process count when the tensor layout is compatible. Local emergency checkpoints contain each process's available shards and impose additional placement restrictions. See [resume from a data position](../concepts/data.md#resume-from-a-data-position).
 
 Use [distributed training](../concepts/distributed.md) for topology requirements and [the TPU guide](../tpu.md) for remote setup. A local save/restore test does not prove cross-host recovery or remote storage behavior.
 

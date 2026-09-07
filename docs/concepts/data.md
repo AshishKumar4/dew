@@ -56,7 +56,18 @@ Padding and packing affect the number of valid targets, even when array shapes m
 
 ## Resume from a data position
 
-A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires compatible data ordering, tokenizer, transforms, and process topology as well as the model checkpoint.
+A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires the same data ordering, tokenizer, and transforms as the model checkpoint.
+
+A position is one of two kinds, and the kind decides whether the process count is part of the resume contract.
+
+| Kind | Written by | Resumes on |
+|---|---|---|
+| Global record count | Every record dataset built on `train_stream`: token windows, images, video, prompts, preference pairs | Any process count that divides the global batch |
+| Shard offset | `PackedTokens` and `ChatMessages`, whose windows are packed out of one process's own documents, and custom iterators reporting their own state | The process count that wrote it |
+
+A global position is the number of records the whole run has consumed. Every process reports the same number, because the iterator owns both the sharding and the batching: step *k* is records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*th record of that step. A checkpoint saved by two processes therefore restores on one or on four, and the steps after the resume are the steps an uninterrupted run would have taken. The position also records the order it counts into — the source's description, its record count, and the shuffle seed — so a resume against a different corpus or seed is refused instead of continuing at the same offset into different data.
+
+A shard offset has no equivalent on another process count, and `Checkpoints.restore` refuses one whose table was written by a different number of processes, naming both counts. Resume such a run on the count that wrote it.
 
 [Resuming training](../guides/checkpoints.md) shows the complete save/restore path. A model-only checkpoint cannot recover records consumed by an arbitrary generator.
 
