@@ -121,7 +121,7 @@
    "convention": "vp",
    "step_kwargs": {},
    "intervals": 20,
-   "latent_scale": 3.259972333908081
+   "latent_scale": 3.25997257232666
   },
   "dpm_multistep.sde_pp_2h": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -297,7 +297,7 @@
    "convention": "vp",
    "step_kwargs": {},
    "intervals": 20,
-   "latent_scale": 3.8742470741271973
+   "latent_scale": 3.874246597290039
   },
   "deis.2": {
    "scheduler": "DEISMultistepScheduler",
