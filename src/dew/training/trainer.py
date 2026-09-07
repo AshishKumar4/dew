@@ -697,7 +697,7 @@ class Trainer(Generic[Loss, Effects]):
                             # this is where the loop waits on the device.
                             loss.block_until_ready()
                             now = time.time()
-                            scalars = {"train/step": current, "train/loss": float(loss),
+                            scalars = {"train/loss": float(loss),
                                        **{f"train/{k}": float(v) for k, v in aux.items()},
                                        **self._throughput(now - last_log_time, steps_since_log,
                                                           data.batch)}
