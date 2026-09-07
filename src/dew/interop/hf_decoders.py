@@ -1411,6 +1411,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
+    if model_type == "llama":
+        # SmolLM2 retains these training fields; Transformers 5.16.1 Llama does not read them.
+        used.update(("is_llama_config", "rope_interleaved"))
 
     config = _FAMILIES[model_type].translate_config(hf_config, used)
 

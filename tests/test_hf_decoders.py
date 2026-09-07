@@ -120,6 +120,21 @@ def flat_tree(tree):
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
     return {'.'.join(str(entry.key) for entry in path): leaf for path, leaf in leaves}
 
+def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path):
+    from shutil import copytree
+
+    original = FIXTURES / "llama-tiny"
+    directory = tmp_path / "checkpoint"
+    copytree(original, directory)
+    config = fixture_config("llama-tiny")
+    config.update(is_llama_config=True, rope_interleaved=False)
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    ids = np.load(original / "input_ids.npy")
+    actual = loaded.model.apply(loaded.variables, ids)
+    expected = np.load(original / "logits.npy")
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+
 
 def test_qwen3_config_translates_field_by_field():
     config = translate_config(fixture_config("qwen3-tiny"))
