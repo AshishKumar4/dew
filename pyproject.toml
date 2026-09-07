@@ -33,7 +33,6 @@ dependencies = [
     "jinja2",
     "filelock",
     "huggingface_hub",
-    "wandb",
 ]
 license = "MIT"
 
@@ -46,6 +45,7 @@ test = [
     "pytest-xdist",
     "safetensors",
     "torch",
+    "wandb",
     # The committed VAE fixture was generated with this reference release.
     "diffusers==0.34.0",
     # Every decoder and MoE parity number is calibrated against this exact
@@ -66,6 +66,7 @@ av = ["opencv-python", "moviepy"]
 metrics = ["scipy", "requests"]
 # Explicit LocalTracker.plot()/plots=True rendering.
 plots = ["matplotlib"]
+wandb = ["wandb"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.

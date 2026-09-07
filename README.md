@@ -545,11 +545,85 @@ The [objective guide](docs/concepts/objectives.md) also covers BatchNorm state a
 
 ### Evaluation and checkpoints
 
-Pass `eval_every` and metrics to `fit` to score validation data. A tracker can also receive generated previews. Perplexity reduces token losses over the validation pass; FID accumulates population statistics before computing the final distance. The [evaluation guide](docs/guides/evaluation.md) explains metric selection and distributed behavior.
+Pass `eval_every` and metrics to `fit` to score validation data. Set `preview=True` when you also want generated previews. Perplexity reduces token losses over the validation pass; FID accumulates population statistics before computing the final distance.
 
 `Checkpoints` saves numerical state and data position through Orbax. Rebuild the run with the same checkpoint directory to continue it. `fit(steps=1200)` sets a total target: restoring step 1000 runs toward 1200, not 2200. Recipe configuration is separate; `RunConfig.save` writes `run.json`.
 
 See [checkpointing and resume](docs/guides/checkpoints.md) for restore requirements, local checkpoints, and current recovery limitations.
+
+### Standalone evaluation and local reports
+
+`evaluate` scores trained variables without an optimizer. It returns metric values and optional previews. `LocalTracker` writes scalar history, artifacts, and plots; it needs no W&B account or installation. Install `dew-ml[plots]` for Matplotlib output.
+
+```python
+import itertools
+
+import jax
+import numpy as np
+import optax
+
+from dew import Dataset, LocalTracker, Trainer, evaluate, metrics, models
+from dew.objectives.lm import LMObjective, Samples
+from dew.sampling import Sampling
+
+row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
+batch = {"text": np.tile(row, (8, 1))}
+data = Dataset(
+    train=lambda: itertools.repeat(batch),
+    val=lambda: iter([batch]),
+    records=8,
+    batch=8,
+)
+model = models.build(
+    "causal_transformer",
+    vocab_size=8,
+    emb_features=32,
+    num_layers=1,
+    num_heads=2,
+    mlp_features=64,
+    max_seq_len=32,
+)
+objective = LMObjective(
+    model,
+    seq_len=16,
+    samples=Samples([1, 2], 8, sampling=Sampling(temperature=0)),
+)
+with LocalTracker("runs/lm-report", plots=True) as tracker:
+    state = Trainer(
+        objective,
+        optax.adam(0.01),
+        key=jax.random.key(0),
+        tracker=tracker,
+    ).fit(data, steps=40, log_every=10)
+    result = evaluate(
+        objective,
+        state.params,
+        data.val,
+        metrics=(metrics.perplexity(),),
+        key=jax.random.key(1),
+        step=int(state.step),
+        preview=True,
+    )
+    tracker.log(result.scalars, step=result.step)
+    for preview in result.previews:
+        tracker.artifact(preview, step=result.step)
+    print(result.scores)
+```
+
+This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. Plots render when the tracker closes, rather than on every training step. Use `plots=False` for scalar/artifact recording only, or call `tracker.plot()` explicitly.
+
+For W&B, install `dew-ml[wandb]` and pass a `WandbTracker`. `Trackers` sends the same reports to multiple backends:
+
+```python
+from dew import LocalTracker, Trackers, WandbTracker
+
+tracker = Trackers(
+    LocalTracker("runs/experiment/tracking"),
+    WandbTracker(project="dew-experiments", offline=True),
+)
+```
+
+Use this tracker in the same `with` block and `Trainer` call above. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, and failures use typed reporting records. Detailed device traces are enabled through `Profile`; ordinary reporting does not copy model tensors every step.
 
 ## Diffusion and sampling
 
