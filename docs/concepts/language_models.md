@@ -134,6 +134,51 @@ with TemporaryDirectory() as checkpoint:
 
 The final canvas is refined at its full width, then the returned response is clipped to `max_new_tokens`. The prefix plus rounded-up canvas capacity must fit `max_seq_len`. Generation defaults come from `generation_config.json`; pass a `BlockProcess` as `generation=` to override them. Media are prepared through the checkpoint processor and run only during prompt prefill, not once per refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the available official fine-tuning recipe from the still-undisclosed original sampler-distillation/RL objective.
 
+### Fine-tune with the official block loss
+
+`BlockDiffusionObjective` ports Google's public post-release SFT adapter. It samples a valid response canvas, corrupts the entire response with uniform-vocabulary noise, performs detached-first-pass self-conditioning, and combines independently row-normalized canvas and encoder losses. The default time safety margin is 1e-4 and self-conditioning probability is 0.5. This is not the undisclosed original sampler-distillation/RL objective.
+
+The following CPU example takes a real optimizer step on the tiny official-reference model. It deliberately uses a synthetic vocabulary and unequal target support. The objective prepares trainable layer scalars; the checkpoint's ordinary HF view keeps those same tensors frozen. Pass the objective's native model value when exporting the trained variables.
+
+```python
+from dataclasses import replace
+from tempfile import TemporaryDirectory
+
+import jax
+import numpy as np
+import optax
+from dew import Dataset, Trainer
+from dew.interop import load_pretrained
+from dew.objectives.diffusion import BlockDiffusionObjective
+
+training_source = "tests/fixtures/hf/diffusion-gemma-sft"
+training_bundle = load_pretrained(training_source, dtype="float32", attention_impl="xla", max_seq_len=32)
+with np.load(training_source + "/reference.npz") as reference:
+    train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
+training_data = Dataset(train=lambda: iter([{"text": train_tokens}]), val=None,
+                        records=len(train_tokens), batch=len(train_tokens))
+block_objective = BlockDiffusionObjective(training_bundle.model, prompt_length=4,
+                                         num_canvases=2, pretrained=training_bundle.variables)
+block_trainer = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2))
+block_state = block_trainer.fit(training_data, steps=1, log_every=1)
+with TemporaryDirectory() as checkpoint:
+    replace(training_bundle, model=block_objective.model).save(checkpoint, variables=block_state.params)
+    trained_bundle = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+print("Optimizer updates:", int(block_state.updates))
+```
+
+The same objective is available in `recipes/lm/train.py`, not a second recipe. It uses complete token-window rows: `data.seq_len + 1` must equal `block_prompt_tokens` plus whole training canvases. `block_canvas_size` defaults to the checkpoint's canvas length. Packed documents are rejected because they have different context boundaries. Block SFT logs `canvas_ce` and `encoder_ce`; it does not report autoregressive perplexity or use the AR preview settings. Generate text through the shared pretrained interface when needed.
+
+```bash
+python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-windows \
+    --data.seq-len 511 --block-prompt-tokens 256 \
+    --pretrained google/diffusiongemma-26B-A4B-it \
+    --tokenizer google/diffusiongemma-26B-A4B-it --objective block_diffusion \
+    --sample-tokens 0 --ema-decay None --optim.learning-rate 0.00015
+```
+
+Those token files must use the checkpoint tokenizer and arrange the intended clean prompt prefix and response canvases. The large-checkpoint command is not part of the CPU example and was not run here. Trainer checkpoints preserve optimizer and iterator state; `Pretrained.save` instead writes a complete source-format inference checkpoint.
+
 Multimodal wrapper translation separates decoder, vision tower, and projector variables. The projector produces soft image tokens, which enter the decoder at image positions. Supported paths and remaining restrictions are listed in the [capability reference](../reference/support.md). Ordinary `generate` is not a general multimodal preprocessing pipeline.
 
 Gemma 3n uses the MobileNet-v5 encoder. It accepts floating processor output shaped `[B, C, H, W]` and emits `[B, R * R, 2048]` features; `R` is `msfa_output_resolution`, 16 by default. Its projector handles soft image features and hard IDs from the vision vocabulary. `model_inputs` receives the decoder's scaled token embeddings, original IDs, projected soft tokens, and precomputed integer image positions. Set `per_layer_input_vocab=decoder.per_layer_input_vocab`. The prepared dictionary supplies `tokens`, `input_embeddings`, and `embedding_positions` to `decoder.apply`.

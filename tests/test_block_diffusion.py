@@ -220,3 +220,13 @@ def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
         individual = prefill(model, variables, tokens[row:row + 1, start:])
         expected = model.apply({**variables, "cache": individual}, reference["canvas"][row:row + 1])
         np.testing.assert_allclose(batched[row:row + 1], np.asarray(expected), atol=1e-5, rtol=0)
+
+
+def test_canvas_generation_rejects_lossy_token_coercion_and_batched_keys(system):
+    model, variables, process, reference, _ = system
+    with pytest.raises(ValueError, match="integer"):
+        process.generate(model, variables, reference["prompt"].astype(np.float32),
+                         3, key=jax.random.key(1))
+    with pytest.raises(ValueError, match="PRNG key"):
+        process.generate(model, variables, reference["prompt"], 3,
+                         key=jax.random.split(jax.random.key(1), 2))
