@@ -278,9 +278,13 @@ class Trainer(Generic[Loss, Effects]):
         return build_mesh(self.mesh)
 
     def shardings(self, state: TrainState) -> Placement:
-        """Parameter gradients follow parameters; replay records follow batches."""
+        """Parameter gradients follow parameters; replay records follow batches;
+        the layout's host-resident fields sit in pinned host memory."""
         mesh = self.device_mesh
         placed = self.layout.shardings(mesh, dataclasses.replace(state, accumulation=None))
+        placed = dataclasses.replace(placed, **{
+            field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
+            for field in self.layout.host})
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -297,6 +301,14 @@ class Trainer(Generic[Loss, Effects]):
             batches=buffered_shardings(accumulation.batches, True),
             variables=buffered_shardings(accumulation.variables, False))
         return dataclasses.replace(placed, accumulation=pending)
+
+    def _fetched(self, state: TrainState, shardings: Placement) -> TrainState:
+        """`state` with the layout's host-resident fields brought to the
+        device, where a step or an evaluation reads them."""
+        return dataclasses.replace(state, **{
+            field: jax.device_put(getattr(state, field), jax.tree.map(
+                lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
+            for field in self.layout.host})
 
     def place(self) -> tuple[TrainState, Placement, bytes | None]:
         """The state itself, fresh or restored, on the mesh, with its shardings
@@ -543,7 +555,9 @@ class Trainer(Generic[Loss, Effects]):
             replicated = NamedSharding(mesh, P())
 
             def step(current, batch):
-                result, loss, aux = body(current, batch)
+                # The body sees every field on the device; the out shardings
+                # return the host-resident ones to pinned host memory.
+                result, loss, aux = body(self._fetched(current, shardings), batch)
                 return (dataclasses.replace(result, step=current.step + 1), loss, aux.metrics,
                         jnp.isfinite(loss), result.microstep > current.microstep)
 
@@ -719,7 +733,7 @@ class Trainer(Generic[Loss, Effects]):
 
                 if eval_every and current % eval_every == 0 and current < steps:
                     paused = time.perf_counter()
-                    self._evaluate(state, data, metrics, preview, mesh)
+                    self._evaluate(state, shardings, data, metrics, preview, mesh)
                     other += time.perf_counter() - paused
 
                 # On its own clock, not the logging one: nested inside the log
@@ -758,7 +772,7 @@ class Trainer(Generic[Loss, Effects]):
                 loss.block_until_ready()
             paused = time.perf_counter()
             if eval_every:
-                self._evaluate(state, data, metrics, preview, mesh)
+                self._evaluate(state, shardings, data, metrics, preview, mesh)
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -836,12 +850,13 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, data: "Dataset", metrics: Sequence[Metric],
-                  preview: bool, mesh) -> None:
+    def _evaluate(self, state: TrainState, shardings: Placement, data: "Dataset",
+                  metrics: Sequence[Metric], preview: bool, mesh) -> None:
         self._report_evaluation(evaluate(
             self.objective, state.params, data.val, metrics=metrics, key=state.key,
             step=state.step, schedule_step=state.microstep,
-            averaged=with_ema(state.params, state.ema), preview=preview, mesh=mesh))
+            averaged=with_ema(state.params, self._fetched(state, shardings).ema),
+            preview=preview, mesh=mesh))
 
     def _report_evaluation(self, result: Evaluation) -> None:
         error = None
