@@ -1,10 +1,11 @@
-"""One front door: a source on disk or the Hub as the inference task for its kind.
+"""Load the native inference task for a saved run or published checkpoint.
 
 A run directory holds `run.json` and checkpoints; a diffusion run becomes a
 `TextToImage`, a language-model run a `TextGeneration`. A source checkpoint
 (a Hub repository or a directory in its layout) loads through
 `dew.interop.load_pretrained` and becomes a `TextGeneration`, or a
-`BlockGeneration` for a DiffusionGemma. Weights are placed once: on a mesh
+`BlockGeneration` for a DiffusionGemma. Diffusion sources produce an image
+task. Weights are placed once on a mesh
 under a layout, the way the trainer places a train state. The default mesh
 uses the current pool's devices. A just-trained state needs no reload; its objective's
 `pipeline(state)` binds it in place.
@@ -24,8 +25,9 @@ from etils import epath
 
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, TextGeneration
-from dew.nn.inputs import ModelInputs
-from dew.sampling.pipelines import TextToImage, cast_floating, restore_variables
+from dew.nn.inputs import ModelInputs, pad_token_rows
+from dew.sampling.pipelines import TextToImage, restore_variables
+from dew.objectives.base import Variables
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -54,37 +56,79 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, revision=revision)
 
 
-def _from_run(root: epath.Path, *, mesh, layout, dtype, ema, step):
-    record = json.loads((root / RUN_FILE).read_text())
-    directory = str(root)
-    if "objective" not in record:
-        return TextToImage.from_run(directory, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype)
-    kind = record["objective"]
-    if kind != "lm":
-        raise TypeError(f"a {kind} run has no standalone inference task; train it and use Objective.pipeline")
+def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
+              dtype: str | None, ema: bool, step: int | None) -> TextToImage | TextGeneration | BlockGeneration:
     from dew.config import ModelConfig
+    from dew.data import tokenizer_for
+    from dew.registry import objectives
+    import dew.objectives.lm  # noqa: F401 registers the saved objective kinds
+    import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
     from dew.objectives.lm.objective import model_variables
 
-    model = ModelConfig.from_dict(record["model"]).build()
-    variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype)
-    tokenizer = _run_tokenizer(record.get("tokenizer", "byte"))
+    record = json.loads((root / RUN_FILE).read_text())
+    if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
+        raise ValueError("run.json must name its objective kind")
+    kind = record["objective"]
+    directory = str(root)
+    if kind == "diffusion":
+        return TextToImage.from_run(directory, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype)
+    if kind not in ("lm", "dpo", "grpo", "ppo", "block_diffusion"):
+        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are diffusion, lm, dpo, grpo, ppo and block_diffusion")
+    model_config = ModelConfig.from_dict(record["model"])
+    tokenizer = tokenizer_for(record["tokenizer"])
+    if kind == "block_diffusion":
+        from dew.diffusion.block import BlockProcess
+        from dew.interop import diffusion_gemma
+        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
+                                      attention_impl=model_config.attention_impl,
+                                      max_seq_len=model_config.config["max_seq_len"])
+        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
+        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype)
+        return BlockGeneration(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
+                               RunProcessor(tokenizer), pad_token_id=int(record.get("pad_token_id", 0)))
+    objective_type = objectives[kind]
+    variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
+                                  step=step, mesh=mesh, layout=layout, dtype=dtype)
+    if kind == "ppo":
+        from dew.objectives.rl.ppo import _part
+        variables = _part(variables, "policy")
+    model = model_config.build()
+    if record.get("quantization") is not None:
+        from dew.training.quantization import Quantization, apply_quantization
+        model = apply_quantization(model, Quantization(**record["quantization"]))
     budget = record.get("sample_tokens")
-    return TextGeneration(model, model_variables(variables), RunProcessor(tokenizer),
-                          sampling=Sampling(eos_id=tokenizer.eos_id),
-                          max_new_tokens=budget if isinstance(budget, int) and budget > 0 else None)
+    if budget is not None and (type(budget) is not int or budget < 0):
+        raise ValueError("sample_tokens must be a nonnegative integer")
+    controls = record.get("sampling")
+    if controls is None and budget:
+        raise ValueError("run.json lacks the sampling policy for its text previews")
+    if controls is not None and not isinstance(controls, dict):
+        raise ValueError("the run's sampling policy must be a Sampling record")
+    if budget:
+        assert controls is not None
+        sampling = Sampling(**controls)
+    else:
+        sampling = Sampling()
+    return TextGeneration(model, model_variables(variables), RunProcessor(tokenizer), sampling=sampling,
+                          max_new_tokens=budget if budget else None)
 
-
-def _from_source(source: str, *, mesh, layout, dtype, revision):
+def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
+                 dtype: str | None, revision: str | None) -> TextToImage | TextGeneration | BlockGeneration:
     from dew.interop import load_pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
 
-    options = {} if dtype is None else {"dtype": dtype}
-    loaded = load_pretrained(source, revision=revision, **options)
-    task = loaded.block_generation() if isinstance(loaded.model, DiffusionGemma) else loaded.text_generation()
+    loaded = (load_pretrained(source, revision=revision) if dtype is None else
+              load_pretrained(source, revision=revision, dtype=dtype))
+    if loaded.process is not None:
+        task = loaded.text_to_image()
+    elif isinstance(loaded.model, DiffusionGemma):
+        task = loaded.block_generation()
+    else:
+        task = loaded.text_generation()
     return task.bind(place(loaded.variables, mesh, layout))
 
 
-def place(variables, mesh: MeshSpec | None, layout: Layout | None):
+def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) -> Variables:
     """`variables` on the mesh `mesh` describes, sharded the way the trainer
     shards a train state's parameters under `layout`."""
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
@@ -96,21 +140,15 @@ def place(variables, mesh: MeshSpec | None, layout: Layout | None):
     return jax.device_put(variables, shardings)
 
 
-def _run_tokenizer(name: str):
-    from dew.data.text import ByteTokenizer, HFTokenizer
-
-    return ByteTokenizer() if name == "byte" else HFTokenizer(name)
 
 
 class RunTokenizer(Protocol):
     """What a run's tokenizer offers: `dew.data.ByteTokenizer` and `HFTokenizer` do."""
 
-    @property
-    def eos_id(self) -> int: ...
 
     def encode(self, text: str) -> list[int]: ...
 
-    def decode(self, ids) -> str: ...
+    def decode(self, ids: jax.typing.ArrayLike | Sequence[int]) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -125,15 +163,8 @@ class RunProcessor:
             raise ValueError("a text run takes no images or audio")
         rows = [text] if isinstance(text, str) else list(text)
         ids = [self.tokenizer.encode(row) for row in rows]
-        if any(not row for row in ids):
-            raise ValueError("every prompt must tokenize to at least one id")
-        width = max(len(row) for row in ids)
-        tokens = np.zeros((len(ids), width), np.int32)
-        mask = np.zeros((len(ids), width), bool)
-        for index, row in enumerate(ids):
-            tokens[index, width - len(row):] = row
-            mask[index, width - len(row):] = True
-        return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})
+        tokens, fields = pad_token_rows(ids)
+        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
 
-    def decode(self, tokens) -> list[str]:
+    def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         return [self.tokenizer.decode(row) for row in np.asarray(tokens)]

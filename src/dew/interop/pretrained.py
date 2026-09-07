@@ -21,7 +21,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.sampling.text import Sampling
 from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
@@ -60,6 +60,21 @@ class Processor:
 
     def __call__(self, text: str | Sequence[str], *, images: object | None = None,
                  audio: object | None = None) -> ModelInputs:
+        if images is None and audio is None:
+            rows = [text] if isinstance(text, str) else list(text)
+            values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
+            tokenizer = getattr(self.reference, "tokenizer", self.reference)
+            pad_id = getattr(tokenizer, "pad_token_id", None)
+            side = getattr(tokenizer, "padding_side", "right")
+            if side not in ("left", "right"):
+                raise ValueError("the tokenizer padding_side must be left or right")
+            ids = values["input_ids"]
+            ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
+            fields = {name: value if isinstance(value, Sequence) else np.asarray(value)
+                      for name, value in values.items() if name != "input_ids"}
+            tokens, fields = pad_token_rows(ids, pad_id=0 if pad_id is None else pad_id,
+                                           padding_side=side, fields=fields)
+            return self.from_hf({"input_ids": tokens, **fields})
         import torch
 
         # truncation is off for text anyway; reloaded Gemma processors forward
@@ -499,7 +514,8 @@ class Pretrained:
             raise TypeError("a DiffusionGemma source generates through block_generation")
         return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
                               else _source_sampling(self.config, self.generation_config),
-                              max_new_tokens=_budget(self.config, self.generation_config))
+                              max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                              max_length=_generation_limit(self.config, self.generation_config, "max_length"))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -510,7 +526,8 @@ class Pretrained:
                                diffusion_gemma.generation_process(self.config, self.generation_config),
                                self.processor, _eos_ids(self.config, self.generation_config),
                                _pad_id(self.config, self.generation_config),
-                               max_new_tokens=_budget(self.config, self.generation_config))
+                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                               max_length=_generation_limit(self.config, self.generation_config, "max_length"))
 
     def text_to_image(self) -> TextToImage:
         """The latent diffusion source as an image task with its published policy."""
@@ -592,13 +609,13 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
     return value
 
 
-def _budget(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int | None:
-    """The source's own generation budget, when it ships one."""
-    value = _generation_value(config, generation_config, "max_new_tokens")
+def _generation_limit(config: Mapping[str, object], generation_config: Mapping[str, object], name: str) -> int | None:
+    """Read a nonnegative source generation limit."""
+    value = _generation_value(config, generation_config, name)
     if value is None:
         return None
     if type(value) is not int or value < 0:
-        raise ValueError("max_new_tokens must be a nonnegative integer")
+        raise ValueError(f"{name} must be a nonnegative integer")
     return value
 
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -611,21 +628,15 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
-# Transformers 5.16.1 generation controls (GenerationConfig.to_dict keys) by
-# what they do to the token distribution. Every value is None when unset.
-# SUPPORTED: the native Sampling value carries them. TASK_OWNED: prompt
-# creation, output size, execution and metadata; they leave the distribution
-# alone. NEUTRAL: unset or the value at which generate() adds no processor,
-# criterion or search mode (utils._get_logits_processor,
-# configuration_utils.get_generation_mode); anything else is an active
-# control the native sampler cannot honor. BEAM_ONLY matter only when
-# num_beams is active. tests/test_inference_sampling.py holds the union of
-# these names equal to the pinned library's keys.
+# Checkpoint generation_config.json is data; interpreting it must not run
+# Transformers generation code. Neutral values follow Transformers 5.16.1
+# generation/utils.py::_get_logits_processor and get_generation_mode in
+# generation/configuration_utils.py. Other active controls are refused.
 _SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
                                  "eos_token_id", "pad_token_id"})
 _TASK_OWNED_CONTROLS = frozenset({
-    "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens", "max_time",
-    "num_return_sequences", "use_cache", "cache_implementation", "cache_config",
+    "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens",
+    "use_cache", "cache_implementation", "cache_config",
     "max_cache_len", "prefill_chunk_size", "continuous_batching_config", "compile_config",
     "disable_compile", "low_memory", "use_mtp", "speculation_type", "is_assistant",
     "num_assistant_tokens", "num_assistant_tokens_schedule", "assistant_confidence_threshold",
@@ -636,6 +647,7 @@ _TASK_OWNED_CONTROLS = frozenset({
     "tokenizer_name",
 })
 _NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
+    "num_return_sequences": (1,), "max_time": (),
     "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
     "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
     "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),

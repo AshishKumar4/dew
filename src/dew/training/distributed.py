@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.linen import spmd
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 from dew.data.dataset import Checkpointable
+from dew.nn.inputs import BATCH_AXES
 from dew.nn.sharding import (
     DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LogicalAxes,
     declared_axes,
@@ -33,7 +34,7 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 # they sit on; the sequence dimension splits over the sequence axis. Every
 # stage sees the whole batch, since the pipeline hands its microbatches from
 # stage to stage itself. Only parameters distinguish the axes further.
-BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS), SEQUENCE_AXIS)
+BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
 Placement: TypeAlias = Any

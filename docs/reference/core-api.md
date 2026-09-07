@@ -179,7 +179,7 @@ The compiled decoder uses one padded input shape with per-row cache cursors and 
 
 `Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)` with `B` the placed rows. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. `rows` counts this process's real rows; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound.
 
-`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`.
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. Reward text excludes EOS and padding. GRPO does not silently replace raw-policy ratios with behavior probabilities. The next-token objective refuses models declaring `causal=False`.
 
 ### Inference tasks
 
@@ -190,14 +190,16 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, ema=True, step=None, rev
     -> TextGeneration | BlockGeneration | TextToImage
 Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
 LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
-TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None)
+TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None, max_length=None)
 task(request, max_new_tokens=None, *, key=None, seed=None, sampling=None, images=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
 BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
-                max_new_tokens=None)
+                max_new_tokens=None, max_length=None)
 task(request, max_new_tokens=None, *, key=None, seed=None, process=None, images=None) -> CanvasGeneration
 Pretrained.text_generation(sampling=None) -> TextGeneration
 Pretrained.block_generation() -> BlockGeneration
+Pretrained.text_to_image() -> TextToImage
+PPOObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
             sampler=DDIM(), grid=None, final_denoise=True, finish=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
@@ -205,16 +207,19 @@ TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, 
 TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None)
 LMObjective.policy(params, sampling=Sampling()) -> TextGeneration
 image_task.bind(variables) -> TextToImage
-image_task.prepare(prompts, *, key=None, seed=None, steps=None) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, seed=None) -> Images
+image_task.prepare(prompts, *, key=None, seed=None, steps=None, unconditional=None,
+                   image=None, image_latents=None, mask=None, noise=None, initial=None,
+                   times=None, encode_key=None) -> DenoisingInputs
+image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None,
+           seed=None, decode=True) -> Images
 RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 ```
 
 A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
 
-`max_new_tokens` defaults to the budget the source declares (a checkpoint's `max_new_tokens`, an LM run's `sample_tokens`, an objective's `Samples`); without one the call must pass it. Equal shapes and controls reuse the compiled executable, across calls and across `bind`.
+`max_new_tokens` takes precedence over a source default. If only `max_length` is declared, the budget is that total minus the padded prompt width. Otherwise an LM run records its `sample_tokens` and `sampling` value; an objective uses its `Samples`. With no limit the call must provide one. Equal shapes and controls reuse the compiled executable across calls and `bind`.
 
-`LMObjective.policy(params)` returns the `TextGeneration` bound to those parameters, which is the task `SampledRollout` samples with, so a rollout and a hand-written draw share one decode path. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
+`LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
 

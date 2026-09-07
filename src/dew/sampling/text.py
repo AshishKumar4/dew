@@ -6,6 +6,7 @@ import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +16,7 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables
 
 
@@ -52,7 +53,7 @@ class Sampling:
 
 
 @struct.dataclass
-class Generation:
+class Generation(Generic[ArrayT]):
     """Prompt plus padded continuation, and response-aligned likelihoods.
 
     ``lengths`` counts response actions, including EOS. ``terminated`` marks
@@ -67,12 +68,12 @@ class Generation:
     ``text`` decodes them through the processor the task was bound to.
     """
 
-    tokens: jax.Array
-    lengths: jax.Array
-    terminated: jax.Array
-    behavior_log_probs: jax.Array
-    raw_log_probs: jax.Array
-    rows: int = struct.field(pytree_node=False, default=0)
+    tokens: ArrayT
+    lengths: ArrayT
+    terminated: ArrayT
+    behavior_log_probs: ArrayT
+    raw_log_probs: ArrayT
+    rows: int | None = struct.field(pytree_node=False, default=None)
     decoder: Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None = struct.field(
         pytree_node=False, default=None)
 
@@ -80,11 +81,11 @@ class Generation:
     def prompt_width(self) -> int:
         return self.tokens.shape[1] - self.behavior_log_probs.shape[1]
 
-    def host(self) -> Generation:
+    def host(self) -> Generation[np.ndarray]:
         """This process's real rows as host arrays."""
         return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
-    @property
+    @functools.cached_property
     def text(self) -> tuple[str, ...]:
         """Each real row's valid continuation, decoded on first access."""
         if self.decoder is None:
@@ -244,6 +245,18 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_generate, static_argnames=("model", "max_new_tokens", "sampling"),
                    in_shardings=(None, rows, rows), out_shardings=rows)
+
+
+@overload
+def generate(model: nn.Module, params: Variables,
+             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+             *, key: jax.Array, sampling: Sampling = Sampling()) -> Generation: ...
+
+
+@overload
+def generate(model: nn.Module, params: Variables,
+             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+             *, seed: int, sampling: Sampling = Sampling()) -> Generation: ...
 
 
 def generate(model: nn.Module, params: Variables,

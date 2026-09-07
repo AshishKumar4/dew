@@ -35,7 +35,7 @@ class VideoGrid:
 @struct.dataclass
 class TextSamples:
     """Generated token rows, with optional decoded preview text and prompt."""
-    tokens: jax.Array
+    tokens: jax.Array | np.ndarray
     prompt: str = struct.field(pytree_node=False, default="")
     texts: tuple[str, ...] = struct.field(pytree_node=False, default=())
 

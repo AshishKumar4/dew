@@ -276,6 +276,7 @@ class RunConfig:
         default_factory=lambda: datasets["oxford_flowers102"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
+    objective: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe record of the run; a registered member is written as its
@@ -320,6 +321,10 @@ class RunConfig:
         name with slashes and spaces replaced, since an artifact name allows
         neither. Local tracking journals live in a separate tracking directory.
         """
+        objective_type = type(objective)
+        kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
+                else f"{objective_type.__module__}.{objective_type.__qualname__}")
+        self = dataclasses.replace(self, objective=kind)
         trainer = self.trainer
         steps = trainer.total_steps(data)
         tracker = None

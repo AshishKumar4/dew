@@ -421,7 +421,7 @@ class EpisodeRollout:
             raise failure from None
         raise failure from error
 
-    def _action(self, result: Generation, row: int, context: tuple[int, ...], policy_step: int,
+    def _action(self, result: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
         """Validate a cohort row's provenance before an environment acts."""
         tokens = np.asarray(result.tokens)[row]

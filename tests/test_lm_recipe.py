@@ -16,7 +16,7 @@ import tyro
 from dew.data import PackedTokens, TokenWindows
 from dew.inference import TextGeneration
 from dew.sampling import Sampling
-from dew.objectives.lm import Samples
+from dew.objectives.lm import LMObjective, Samples
 
 pytestmark = pytest.mark.mesh
 
@@ -122,6 +122,12 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
         drawn.host().tokens,
         TextGeneration(task.model, state.averaged)([list(b"the ")], 4, seed=1,
                                                    sampling=Sampling(temperature=0)).host().tokens)
+    objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
+    trained = objective.pipeline(state, processor=task.processor)
+    actual = task("the ", seed=11).host()
+    expected = trained("the ", seed=11).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
@@ -449,3 +455,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     restored = recipe.main(config)
     for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params)):
         np.testing.assert_array_equal(actual, wanted)
+    task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
+    trained = recipe.build_block_objective(config, original.model, original.variables).pipeline(state, ema=False)
+    prompt = [[4, 5, 6, 7]]
+    np.testing.assert_array_equal(task(prompt, 4, seed=9).host().tokens,
+                                  trained(prompt, 4, seed=9).host().tokens)

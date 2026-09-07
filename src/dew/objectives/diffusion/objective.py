@@ -12,7 +12,7 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,10 @@ from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
+
+if TYPE_CHECKING:
+    from dew.training.state import TrainState
+    from dew.sampling.pipelines import TextToImage
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -93,13 +97,12 @@ class DiffusionObjective(Objective[Mean]):
             for keyword, condition in inputs.conditions.items()})
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def pipeline(self, state, *, ema: bool = True):
+    def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:
         """The model over the state's published weights as a `TextToImage`
         task, sampling the way this objective's evaluation does."""
-        from dew.objectives.base import published
         from dew.sampling.pipelines import TextToImage
 
-        return TextToImage.from_objective(self, published(state, ema))
+        return TextToImage.from_objective(self, self._pipeline_weights(state, ema))
 
     @property
     def latent_shape(self) -> tuple[int, ...]:

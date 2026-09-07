@@ -945,8 +945,8 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     make_run(tmp_path / "diffusion", encoder="char_table", checkpoint="char_table")
     make_lm_run(tmp_path / "lm")
     runs = dict(run_dir=str(tmp_path / "diffusion"), lm_dir=str(tmp_path / "lm"))
-    reports = run_pool("pipeline", tmp_path, 2, fsdp_size=2, timeout=240, **runs)
-    single = run_worker("pipeline", tmp_path / "single.json", fsdp_size=1, devices=1, **runs)
+    reports = run_pool("inference_pipeline", tmp_path, 2, fsdp_size=2, timeout=240, **runs)
+    single = run_worker("inference_pipeline", tmp_path / "single.json", fsdp_size=1, devices=1, **runs)
 
     for report in reports:
         assert report["process_count"] == 2
