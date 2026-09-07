@@ -29,13 +29,14 @@ this path takes.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Optional
 
 import grain.python as pygrain
 
-Row = Mapping[str, object]
-Options = Mapping[str, object]
+from .hf import HFOptions
+
+Row = dict[str, object]
 
 STREAMING_HINT = ("streaming a Hugging Face dataset needs the streaming extra: "
                   "pip install 'dew-ml[streaming]'")
@@ -49,17 +50,8 @@ NO_POSITION = (
     "is random access and resumes on any process count.")
 
 
-def _datasets():
-    """The HF `datasets` module, imported on use so `import dew.data` is cheap."""
-    try:
-        import datasets
-    except ImportError as missing:
-        raise ImportError(STREAMING_HINT) from missing
-    return datasets
-
-
-def open_rows(name: str, split: str, *, options: Options, seed: int, epoch: int,
-              rank: int, world_size: int, buffer: int):
+def open_rows(name: str, split: str, *, options: HFOptions, seed: int, epoch: int,
+              rank: int, world_size: int, buffer: int) -> Iterable[Row]:
     """One process's rows of `split`, shuffled through a bounded buffer.
 
     The shuffle comes before the node split and takes a seed every rank
@@ -68,8 +60,9 @@ def open_rows(name: str, split: str, *, options: Options, seed: int, epoch: int,
     each of them owns. `epoch` goes into that seed, so a second pass over the
     same shard is a different order and no pass is held in memory.
     """
-    datasets = _datasets()
-    rows = datasets.load_dataset(name, split=split, streaming=True, **options)
+    import datasets
+
+    rows = options.load(name, split, streaming=True)
     if not isinstance(rows, datasets.IterableDataset):
         raise TypeError(
             f"streaming {name!r} split {split!r} gave "
@@ -92,7 +85,7 @@ class _Rows(pygrain.DatasetIterator):
     what a validation pass is.
     """
 
-    def __init__(self, open_pass: Callable[[int], object], epochs: Optional[int]):
+    def __init__(self, open_pass: Callable[[int], Iterable[Row]], epochs: Optional[int]):
         super().__init__()
         self._open_pass = open_pass
         self._epochs = epochs
@@ -103,9 +96,10 @@ class _Rows(pygrain.DatasetIterator):
         while True:
             if self._epochs is not None and self._epoch >= self._epochs:
                 raise StopIteration
-            if self._rows is None:
-                self._rows = iter(self._open_pass(self._epoch))  # type: ignore[call-overload]
-            row = next(self._rows, None)
+            rows = self._rows
+            if rows is None:
+                rows = self._rows = iter(self._open_pass(self._epoch))
+            row = next(rows, None)
             if row is not None:
                 return row
             self._rows = None
@@ -137,7 +131,7 @@ class HFRows(pygrain.IterDataset):
     ones rather than growing a reader of its own.
     """
 
-    def __init__(self, name: str, split: str, *, options: Options, seed: int,
+    def __init__(self, name: str, split: str, *, options: HFOptions, seed: int,
                  rank: int, world_size: int, buffer: int, epochs: Optional[int]):
         super().__init__()
         if world_size < 1 or not 0 <= rank < world_size:
@@ -146,7 +140,7 @@ class HFRows(pygrain.IterDataset):
             raise ValueError("a streamed pass count is positive or None for endless")
         self.name = name
         self.split = split
-        self.options = dict(options)
+        self.options = options
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
@@ -155,16 +149,16 @@ class HFRows(pygrain.IterDataset):
 
     def __repr__(self) -> str:
         return (f"HFRows(name={self.name!r}, split={self.split!r}, "
-                f"options={sorted(self.options.items())!r}, seed={self.seed}, "
+                f"options={self.options!r}, seed={self.seed}, "
                 f"shard={self.rank}/{self.world_size}, buffer={self.buffer}, "
                 f"epochs={self.epochs})")
 
-    def _pass(self, epoch: int):
+    def _pass(self, epoch: int) -> Iterable[Row]:
         return open_rows(self.name, self.split, options=self.options, seed=self.seed,
                          epoch=epoch, rank=self.rank, world_size=self.world_size,
                          buffer=self.buffer)
 
-    def __iter__(self) -> pygrain.DatasetIterator:
+    def __iter__(self) -> pygrain.DatasetIterator[Row]:
         return _Rows(self._pass, self.epochs)
 
 
@@ -179,13 +173,13 @@ class Unresumable:
     reads the pair statically and refuses `checkpoint_every` over this.
     """
 
-    def __init__(self, iterator: pygrain.DatasetIterator):
+    def __init__(self, iterator: pygrain.DatasetIterator[dict[str, object]]):
         self._iterator = iterator
 
-    def __iter__(self) -> Iterator[Row]:
+    def __iter__(self) -> Iterator[dict[str, object]]:
         return self
 
-    def __next__(self) -> Row:
+    def __next__(self) -> dict[str, object]:
         return next(self._iterator)
 
     def close(self) -> None:
