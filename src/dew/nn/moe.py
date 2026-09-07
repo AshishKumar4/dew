@@ -66,10 +66,12 @@ class RouterMoments:
 
 def router_moments(scores: jax.Array, indices: jax.Array) -> RouterMoments:
     experts = scores.shape[-1]
+    dtype = jnp.promote_types(scores.dtype, jnp.float32)
+    # These counts enter a floating loss, unlike the exact integer bias effects.
     return RouterMoments(
-        jnp.sum(scores.astype(jnp.promote_types(scores.dtype, jnp.float32)), axis=(0, 1)),
-        jnp.bincount(indices.ravel(), length=experts),
-        jnp.asarray(scores.shape[0] * scores.shape[1], jnp.int32), indices.shape[-1])
+        jnp.sum(scores.astype(dtype), axis=(0, 1)),
+        jnp.bincount(indices.ravel(), length=experts).astype(dtype),
+        jnp.asarray(scores.shape[0] * scores.shape[1], dtype), indices.shape[-1])
 
 
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
@@ -123,10 +125,27 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate):
 
 
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
-    """Bias displacement from accepted selected-slot counts."""
+    """Bias displacement from nonnegative per-expert counts.
+
+    Integer counts must individually fit their dtype; their total need not.
+    """
     if jnp.issubdtype(counts.dtype, jnp.integer):
-        # Compare to the exact mean without float rounding or count multiplication.
-        average, remainder = jnp.divmod(jnp.sum(counts), counts.size)
+        # Partial sums are represented divided by the expert count. Their
+        # quotients never exceed the largest count, even when the total does.
+        divisor = counts.size
+        quotients, remainders = jnp.divmod(counts, divisor)
+
+        def combine(left, right):
+            quotient, remainder = left
+            other_quotient, other_remainder = right
+            gap = divisor - other_remainder
+            carry = remainder >= gap
+            remainder = jnp.where(carry, remainder - gap, remainder + other_remainder)
+            return quotient + other_quotient + carry.astype(counts.dtype), remainder
+
+        zero = jnp.zeros((), counts.dtype)
+        average, remainder = jax.lax.reduce(
+            (quotients, remainders), (zero, zero), combine, dimensions=(0,))
         direction = jnp.where(counts > average, -1,
                               jnp.where((counts < average) | (remainder > 0), 1, 0))
     else:

@@ -440,7 +440,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 raise ValueError("aux_loss_alpha requires a model with a mixture")
             routers = _router_scores(routing)
             sequence = tuple(Mean(jnp.sum(sequence_router_losses(s, i, alpha)),
-                                  jnp.asarray(s.shape[0], jnp.int32))
+                                  jnp.asarray(s.shape[0], jnp.promote_types(s.dtype, jnp.float32)))
                              for s, i in routers) if self.seq_aux else ()
             global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
             statistics = LMStatistics(prediction, sequence, global_routers)
