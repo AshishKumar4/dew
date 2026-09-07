@@ -21,9 +21,12 @@ from scipy.special import erfc
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_projection
 from dew.training import MeshSpec, build_mesh
 
-pytestmark = pytest.mark.mesh
-
-LAYOUTS = ((2, 4), (4, 2), (8, 1))
+# The multi-device layouts need the eight simulated CPU devices conftest
+# configures; a 1x1 mesh runs on the GPU lane's single device, where the
+# contract meets cuBLAS.
+MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
+                     for expert, fsdp in ((2, 4), (4, 2), (8, 1)))
+LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
 TOLERANCE = 3e-5
 
 
@@ -274,7 +277,7 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit):
 
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 @pytest.mark.parametrize('skewed,scale_inputs,limit', [(False, False, None), (True, True, .7)])
-@pytest.mark.parametrize('expert,fsdp', LAYOUTS)
+@pytest.mark.parametrize('expert,fsdp', MESH_LAYOUTS)
 def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, scale_inputs, limit,
                                                           expert, fsdp):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
@@ -315,6 +318,7 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
             np.testing.assert_allclose(np.asarray(a, np.float64), np.asarray(b, np.float64), atol=TOLERANCE, rtol=TOLERANCE)
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 def test_both_dispatches_carry_the_same_tangents(activation):
     """A JVP through the whole routed layer, parameters, tokens and router
