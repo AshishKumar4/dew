@@ -134,3 +134,26 @@ def test_source_policy_preserves_supported_filters_and_requires_an_override_for_
     np.testing.assert_array_equal(override([[1, 2]], 2, key=jax.random.key(1)).behavior_log_probs, 0)
     inactive = replace(source, generation_config={"do_sample": False, "typical_p": 0.1})
     assert inactive.text_generation().sampling.temperature == 0
+
+
+def test_native_control_table_matches_the_pinned_generation_config(task):
+    """The source policy judges shipped controls from Dew's own table; the
+    pinned library is the oracle for its names and for what counts as active."""
+    from pathlib import Path
+    from transformers import GenerationConfig
+    from dew.interop import pretrained
+    from dew.interop.pretrained import Pretrained
+
+    names = (pretrained._SUPPORTED_CONTROLS | pretrained._TASK_OWNED_CONTROLS
+             | pretrained._NEUTRAL_CONTROLS.keys() | pretrained._BEAM_ONLY_CONTROLS.keys())
+    assert set(GenerationConfig().to_dict()) <= names
+    assert pretrained._SAMPLED_ONLY_CONTROLS <= names
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
+    neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
+               "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None}
+    assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
+    for active in ({"stop_strings": ["END"]}, {"num_beams": 2}, {"num_beams": 2, "length_penalty": 0.8},
+                   {"do_sample": True, "penalty_alpha": 0.6, "top_k": 4}, {"a_future_control": 3},
+                   {"remove_invalid_values": True}):
+        with pytest.raises(ValueError, match="cannot honor"):
+            replace(source, generation_config=active).text_generation()
