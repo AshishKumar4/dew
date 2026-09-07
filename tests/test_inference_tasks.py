@@ -144,3 +144,27 @@ def test_text_decodes_lazily_through_the_bound_processor():
     assert result.text == task.decode(result)
     assert result.text == tuple("".join(str(token) for token in row[2:2 + length])
                                 for row, length in zip(rows.tokens, rows.lengths))
+
+
+@pytest.mark.mesh
+def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same_canvases():
+    """Placed under the trainer's layout, a canvas task shards its weights,
+    splits rows over the mesh's batch axes and reads them back from `host()`;
+    with one row per device there is no padding, so the batch-wide canvas
+    draw matches the single-device one row for row."""
+    from dew.inference.pipeline import place
+    from dew.nn.inputs import BATCH_AXES
+    from dew.training import Layout, MeshSpec
+
+    loaded = load_pretrained(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+                             max_seq_len=32)
+    plain = loaded.block_generation()
+    placed = plain.bind(place(loaded.variables, MeshSpec(fsdp=2), Layout(min_shard=2 ** 6)))
+    assert any("fsdp" in str(leaf.sharding.spec) for leaf in jax.tree.leaves(placed.variables))
+    prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * (jax.device_count() // 2)
+    result = placed(prompts, 7, seed=11)
+    assert result.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert result.rows == len(prompts) and result.prompt_width == 5
+    rows = result.host()
+    np.testing.assert_array_equal(rows.tokens, plain(prompts, 7, seed=11).host().tokens)
+    assert result.text == plain.decode(plain(prompts, 7, seed=11), 5)
