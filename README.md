@@ -35,7 +35,7 @@ Dew is under active development. APIs and training checkpoint formats can change
 
 ## Getting started
 
-Train a diffusion transformer on Oxford Flowers at 64×64, then generate a sample grid on an NVIDIA GPU. This uses the dataset's training split, bfloat16 computation, AdamW, and EMA sampling.
+Train a diffusion transformer on Oxford Flowers at 64×64, then generate a sample grid on an NVIDIA GPU.
 
 Install Dew and CUDA JAX in a virtual environment:
 
@@ -127,9 +127,65 @@ CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
     --steps 1000
 ```
 
-Use `--steps 20` for a short setup check. That path completed on an RTX 4080 with the real Flowers records and wrote a checkpoint and sample grid. Image quality needs a longer training run.
+Use `--steps 20` for a short run, or increase `--steps` to train longer.
 
 [`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning. For an offline run without a dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) demonstrates language modeling, checkpoint continuation, DPO, and flow matching.
+
+### Change the training setup
+
+Pass an Optax optimizer to `Trainer`. To use momentum SGD in the Flowers script, replace its optimizer argument:
+
+```python
+optimizer = optax.sgd(learning_rate=1e-2, momentum=0.9)
+trainer = Trainer(
+    objective,
+    optimizer,
+    key=jax.random.key(0),
+    checkpoints=Checkpoints("runs/flowers-sgd/checkpoints"),
+)
+```
+
+Set `ema_decay` when you construct the objective. A value closer to 1 averages weights over more updates:
+
+```python
+process = EDM()()
+objective = DiffusionObjective(
+    model,
+    process,
+    InputSpec(Field("image", (64, 64, 3))),
+    ema_decay=0.999,
+)
+```
+
+After training, sample from the averaged weights with `state.averaged`. Use `state.params` instead to sample from the latest weights:
+
+```python
+from dew import sample
+from dew.sampling import Heun
+
+denoise = process.denoiser(model, state.averaged, conditions={})
+images = sample(
+    denoise,
+    process.noise(jax.random.key(1), (8, 64, 64, 3)),
+    solver=Heun(),
+    steps=40,
+    key=jax.random.key(2),
+)
+```
+
+Set `ema_decay=None` to train without an averaged copy, then sample with `state.params`.
+
+Choose the Flowers model's computation precision with the `dtype` argument to `models.build`: `"bfloat16"` for bf16 or `"float32"` for fp32. Its master weights and optimizer state stay fp32.
+
+For int8 quantization-aware training, install Qwix with `uv pip install qwix` and wrap the model **before** constructing the objective:
+
+```python
+from dew.training.quantization import Quantization, apply_quantization
+
+model = apply_quantization(model, Quantization(dtype="int8"))
+```
+
+Qwix quantizes the trunk matmuls while retaining fp32 master weights. This changes the training arithmetic; it is a separate choice from bf16 computation.
 
 ## Features
 
