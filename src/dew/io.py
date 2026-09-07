@@ -18,7 +18,7 @@ REGISTRY = "wandb-registry-model"
 
 
 def publish(directory: str, name: str, *, tracker: WandbTracker,
-            aliases: Sequence[str] = (), registry: str = REGISTRY):
+            aliases: Sequence[str] = ()):
     """Log the checkpoint step directory at `directory` as a model artifact of
     the tracker's run, with the run's `run.json` beside it, and link it into the
     W&B model registry under `name`.
@@ -54,5 +54,5 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
             artifact.add_file(str(spec))
     logged = tracker.run.log_artifact(artifact, aliases=["latest", *aliases])
     tracker.run.link_artifact(
-        artifact=logged, target_path=f"{registry}/{name}", aliases=list(aliases))
+        artifact=logged, target_path=f"{REGISTRY}/{name}", aliases=list(aliases))
     return logged

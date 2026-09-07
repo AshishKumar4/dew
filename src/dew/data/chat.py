@@ -4,9 +4,10 @@ A `ChatMessages` source reads a parquet file of conversations and renders
 each with the tokenizer's chat template. Every token gets the role of the
 message that wrote it, so `LMObjective` with `loss_role=Role.ASSISTANT`
 trains on assistant tokens only. Packing reuses the token pipeline's
-first-fit bins with `text_roles` as one more per-token feature, and the bins
-come out with `text`, `text_roles`, `text_segment_ids` and `text_positions`
-aligned.
+first-fit bins with `text_roles` as one more per-token feature. Grain emits
+segment ids and positions per packed feature, so a bin carries `text`,
+`text_roles`, `text_segment_ids`, `text_positions` and the identical
+`text_roles_segment_ids`, `text_roles_positions`, all aligned.
 
 Conversations are structured. A `Message` carries what the Hugging Face
 chat-template contract reads: a role, content that is a string, a list of

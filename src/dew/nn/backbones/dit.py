@@ -1,4 +1,3 @@
-import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional, Literal
 from flax.typing import Dtype, PrecisionLike
