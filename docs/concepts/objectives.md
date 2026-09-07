@@ -12,11 +12,13 @@ The [regression tutorial](../getting-started.md#define-initialization-and-loss) 
 
 ## Loss and auxiliary values
 
-`loss(variables, batch, step)` returns `(scalar_loss, aux)`. The scalar must be differentiable with respect to `variables["params"]`. Batch fields are a contract between your data and objective: Dew does not infer whether a column is an image, a token sequence, or a label.
+`loss(variables, batch, step)` returns `(statistics, aux)`. Return `Mean(total, mass)` for additive terms sharing one nonnegative, parameter-independent denominator. The default reducer divides the summed numerator by the summed mass and treats zero support as inactive. A plain scalar explicitly denotes one unit-mass term. Dew does not infer token or row weights from a scalar.
+
+For a composite loss, return an objective-owned Flax PyTree whose leaves are additive sufficient statistics and implement `reduce_loss(statistics) -> (value, has_data)`. Keep independent denominators separate. For direct differentiation, `scalar_loss(objective, variables, batch, step)` derives `(value, aux)` from these same statistics. Arbitrary non-additive batch losses need their own decomposition; a local mean is not a general substitute.
 
 `Aux(metrics=...)` contains scalar arrays to report with the loss. If a tracker is configured, the trainer records these values under `train/<name>` at the logging cadence. A metric in `Aux` is a training-batch measurement; it is not automatically a whole-validation-set score.
 
-Use `Aux.variables` for updated non-parameter collections, such as batch statistics. The update replaces the specified collections; it is not an optimizer update to the `params` collection. `Aux.qk_stats` supplies attention statistics to the optional QK-Clip optimizer path.
+`Aux.variables` contains sequential accepted-microbatch replacements such as BatchNorm state. `Aux.effects` contains additive observations for `apply_effects(variables, effects)`, which returns nonparameter replacements once per supported optimizer commit. Router balancing uses deferred counts so its bias stays fixed within a window. `Aux.qk_stats` carries attention observations; the trainer retains per-head maxima across accepted microbatches.
 
 ## Update non-parameter state
 
@@ -44,7 +46,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import Aux, Mean, Objective, mean_loss
 
 
 class NormalizedRegressor(nn.Module):
@@ -65,8 +67,10 @@ class StatefulRegression(Objective):
         prediction, updated = self.model.apply(
             variables, batch["x"], train=True, mutable=["batch_stats"],
         )
-        mse = jnp.mean((prediction - batch["y"]) ** 2)
-        return mse, Aux(metrics={"mse": mse}, variables=updated)
+        errors = (prediction - batch["y"]) ** 2
+        loss = Mean(jnp.sum(errors), jnp.asarray(errors.size))
+        mse, _ = mean_loss(loss)
+        return loss, Aux(metrics={"mse": mse}, variables=updated)
 
 
 x = np.arange(32, dtype=np.float32).reshape(8, 4)
@@ -86,7 +90,7 @@ The [core reference](../reference/core-api.md#collections-and-ema-selection) des
 
 ## Randomness
 
-`step` is a `Step` containing a scalar step number, a JAX key, and optional averaged variables. Use `jax.random.split(step.key, n)` when the loss needs several independent random draws. Do not create a new fixed key inside the loss, since that repeats noise or dropout masks.
+`Step.step` is the accepted-microbatch schedule index. `Step.key` derives from the root key and consumed-attempt count, so rejected attempts do not repeat their draws. Split this key when a loss needs independent random operations.
 
 A `TrainState` stores the run key. A deterministic step key does not by itself guarantee bitwise equality across devices, compiler versions, different reduction orders, or untracked data-loader randomness. Exact continuation also depends on checkpointing the relevant state and iterator position.
 
@@ -94,9 +98,9 @@ A `TrainState` stores the run key. A deterministic step key does not by itself g
 
 The base `Objective` has `ema=None`. Set an `EMASpec` only when the method uses an exponential moving average. It specifies a decay schedule and a path filter selecting the leaves to average. JEPA selects its context encoder; DPO uses unit decay for a frozen reference.
 
-The trainer stores the selected copy in `TrainState.ema`. `state.averaged` overlays that copy onto the live variables tree. It raises when the objective has no EMA. Some built-in objectives enable EMA by default, so account for the extra parameter storage when sizing a run.
+The trainer stores the selected copy in `TrainState.ema`. `state.averaged` overlays it onto live variables and raises when no EMA is configured. EMA calculations use at least fp32 and retain explicit fp64, then store each result in its initialized leaf dtype. This can round differently from earlier implicit dtype promotion, but does not allocate a wider persistent EMA. Unit-decay frozen references remain exact. Account for the selected copy when sizing a run.
 
-The default training step updates EMA on optimizer-update boundaries when gradient accumulation is enabled. The current implementation has unresolved overflow/checkpoint clock issues and does not preserve token-weighted equivalence across unequal-mask microbatches. See [capabilities and limitations](../reference/support.md).
+The trainer updates EMA only on a supported optimizer commit. Shared `Mean` accumulation keeps one gradient tree at least as precise as fp32 and a mass; explicit float64 inputs keep their precision when JAX x64 is enabled. The completed gradient converts to each parameter's dtype before Optax, preserving its optimizer-state contract. Composite accumulation retains realized inputs and mutable read snapshots, then replays scalar pullbacks with final normalization coefficients. Keep loss computation pure; collect rollouts and external rewards before the compiled step. Replays do not apply mutable writes twice. Separate microbatch BatchNorm calls retain their sequential semantics and do not equal one full-batch BatchNorm forward.
 
 ## Evaluation
 

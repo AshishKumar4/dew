@@ -25,7 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
@@ -49,7 +49,7 @@ def check_solver(process, sampler) -> None:
 
 
 @objectives("diffusion")
-class DiffusionObjective(Objective):
+class DiffusionObjective(Objective[Mean]):
     """Denoising diffusion: sample a noise level, corrupt, predict, weight."""
 
     def __init__(
@@ -60,7 +60,7 @@ class DiffusionObjective(Objective):
         *,
         autoencoder: Optional[AutoEncoder] = None,
         unconditional_prob: float = 0.12,
-        ema_decay: float = 0.999,
+        ema_decay: float | None = 0.999,
         sampler: Solver[Any] = DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
         steps: int = 200,
@@ -75,7 +75,8 @@ class DiffusionObjective(Objective):
         self.sampler = sampler
         self.guidance = guidance
         self.steps = steps
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params"))
+        self.ema = (None if ema_decay is None else
+                    EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
         check_solver(process, sampler)
         # The unconditional datum's value: the encoders are frozen, so one
@@ -154,7 +155,7 @@ class DiffusionObjective(Objective):
         preds = self.process.prediction.pred_transform(noisy, preds, rates)
         losses = optax.l2_loss(preds, target)
         weights = expand(self.process.weight(t), losses)
-        return jnp.mean(losses * weights), Aux(metrics={})
+        return Mean(jnp.sum(losses * weights), jnp.asarray(losses.size)), Aux(metrics={})
 
     def _sample_impl(self, params, tokens, key, *, count: int):
         given = self.encode(params["encoders"], tokens)

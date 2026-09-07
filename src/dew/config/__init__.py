@@ -36,7 +36,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
-from dew.objectives.base import Metric, Objective
+from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.registry import Registry, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.training.distributed import Layout, MeshSpec
@@ -102,7 +102,7 @@ class OptimConfig:
     learning_rate_end: float = 2e-4
     learning_rate_warmup_steps: int = 10000
     learning_rate_decay_steps: Optional[int] = None
-    """Steps the cosine decays over; unset decays over the run."""
+    """Optimizer updates the cosine decays over; unset uses the training step target."""
     weight_decay: Optional[float] = None
     clip_grads: float = 0.0
 
@@ -293,7 +293,7 @@ class RunConfig:
         """The config a run in `directory` was built from, as this class."""
         return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
 
-    def train(self, objective: Objective, data: Dataset, *, name: str,
+    def train(self, objective: Objective[Loss, Effects], data: Dataset, *, name: str,
               metrics: Sequence[Metric] = (),
               summary: Mapping[str, object] | None = None) -> TrainState:
         """Train `objective` on `data` as this run says; every recipe calls

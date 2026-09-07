@@ -127,7 +127,8 @@ class DiffusionRunConfig(RunConfig):
     sampling_steps: int = 200
     unconditional_prob: float = 0.12
     """Fraction of training examples whose condition is dropped."""
-    ema_decay: float = 0.999
+    ema_decay: float | None = 0.999
+    """None disables EMA; 1.0 retains a frozen copy."""
     text: Optional[TextCondition] = dataclasses.field(default_factory=TextCondition)
     """The text condition, under the models' `textcontext` keyword; None
     trains unconditionally."""

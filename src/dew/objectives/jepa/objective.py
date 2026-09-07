@@ -33,7 +33,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.objectives.base import Aux, EMASpec, Objective, Step, under
+from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, under
 from dew.registry import objectives
 from .masking import MultiBlockMask
 
@@ -77,7 +77,7 @@ def normalize_targets(x, epsilon: float = 1e-6):
 
 
 @objectives("jepa")
-class JepaObjective(Objective):
+class JepaObjective(Objective[Mean]):
     """Joint-embedding prediction over images (B,H,W,C) or video (B,T,H,W,C).
 
     Evaluation returns the pooled target-encoder embeddings of a batch with
@@ -169,8 +169,8 @@ class JepaObjective(Objective):
         assert not isinstance(predictions, tuple)  # no mutable collections were asked for
         predictions = predictions.reshape(targets.shape)
 
-        loss = jnp.mean(
-            (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2)
+        squared = (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2
+        loss = Mean(jnp.sum(squared), jnp.asarray(squared.size))
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
         return loss, Aux(representation_health(pooled))
 

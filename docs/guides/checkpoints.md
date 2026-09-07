@@ -1,6 +1,6 @@
 # Resuming training
 
-This guide assumes you understand the [training example](../getting-started.md) and Flax variables. A checkpoint can hold model variables, optimizer state, the training step, the run key, EMA variables when configured, and the training iterator's position. Continuing a run requires the same model and compatible optimizer and data configuration.
+A training checkpoint holds variables, optimizer state, attempted/accepted/update clocks, the root key, EMA when configured, scaler history, and the actual partial accumulation window. Exact data continuation also needs the iterator position. Resume with the same model, optimizer, accumulation length, and scaler configuration.
 
 ## Save and restore a small run
 
@@ -18,7 +18,7 @@ from flax import linen as nn
 
 from dew import Checkpoints, Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import Aux, Mean, Objective
 
 
 class Regression(Objective):
@@ -30,7 +30,8 @@ class Regression(Objective):
 
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux(metrics={})
+        errors = (prediction - batch["y"]) ** 2
+        return Mean(jnp.sum(errors), jnp.asarray(errors.size)), Aux(metrics={})
 
 
 class Batches:
@@ -93,6 +94,6 @@ Use [distributed training](../concepts/distributed.md) for topology requirements
 
 ## Current limits
 
-This example uses ordinary float32 training with no accumulation or loss scaling. The current overflow path has a confirmed discrepancy between attempted loop steps and saved `state.step`; dynamic loss-scale state also resets on restore. Exact continuation after rejected scaled-gradient updates is not established. Unequal-mask gradient accumulation is a separate normalization issue. Track these before relying on such runs for reproducibility.
+Scaled-gradient rejection consumes an attempt but preserves previously accepted accumulation records, optimizer state, EMA and mutable contributions. Restore keeps the scaler's finite streak and scale, including a partially filled window. The trainer rejects a changed accumulation length. Resuming at the saved attempted-work target performs no new data, evaluation, compilation, or save work.
 
-Prefetch iterator cancellation and cleanup after exceptions also remain under review. The successful small example verifies the normal checkpoint path only.
+Deterministic CPU regressions cover partial and rejected-attempt checkpoints, including composite replay. They do not establish GPU/TPU cross-host recovery or replay of external rollout side effects. Record software and data versions with the run; the per-fit nonfinite-loss abort counter is not checkpointed. Older training checkpoints lack the required clocks and accumulation fields and cannot resume through this interface. Parameter-only loading remains available.

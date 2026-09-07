@@ -14,12 +14,13 @@ from __future__ import annotations
 import dataclasses
 
 import jax.numpy as jnp
+from dew.objectives.base import Variables
 
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
-from dew.objectives.base import Aux
+from dew.objectives.base import Aux, Mean
 from dew.registry import objectives
-from dew.rl import preference_logsigmoid
+from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm import LMObjective
 
@@ -91,13 +92,11 @@ class DPOObjective(LMObjective):
         policy_rejected = self.per_token_log_probs(params, rejected_ids)
         ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
         ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
-        loss = preference_logsigmoid(
+        terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
-        pair_chosen = self.beta * (policy_chosen * chosen_mask).sum(-1)
-        pair_rejected = self.beta * (policy_rejected * rejected_mask).sum(-1)
         accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
-        return loss, Aux({
+        return Mean(jnp.sum(terms), jnp.asarray(terms.size)), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,

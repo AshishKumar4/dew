@@ -6,8 +6,8 @@ the parameter tree it initialises, the loss it computes from a batch, and what
 its evaluation produces. Swapping the objective swaps the research question
 without touching any of the mechanics.
 
-Everything an objective sees in one call arrives as a `Step`, and everything
-it reports back rides in an `Aux`. Both are pytrees, so they cross `jit`.
+An objective receives schedule and randomness through Step, and returns
+additive loss statistics with Aux reports. These values are JAX PyTrees.
 """
 
 from __future__ import annotations
@@ -15,10 +15,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias
+from typing_extensions import TypeVar
 
 from flax import struct
 import jax
+import jax.numpy as jnp
 import optax
 
 from dew.artifacts import Artifacts
@@ -37,10 +39,32 @@ PathFilter: TypeAlias = Callable[[Path], bool]
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
 
+@struct.dataclass
+class Mean:
+    """A scalar sum with nonnegative, parameter-independent support mass.
+
+    Zero mass declares a zero numerator and no contribution.
+    """
+    total: jax.Array
+    mass: jax.Array
+
+
+def mean_loss(stats: Mean) -> tuple[jax.Array, jax.Array]:
+    """Reduce a shared-denominator estimator, including empty support."""
+    mass = jax.lax.stop_gradient(stats.mass)
+    active = mass > 0
+    dtype = jnp.result_type(stats.total.dtype, mass.dtype, jnp.float32)
+    value = stats.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
+    return jnp.where(active, value, 0), active
+
+
+Loss = TypeVar("Loss", default=Mean | jax.Array | float)
+Effects = TypeVar("Effects", default=None)
+
 
 @struct.dataclass
 class Step:
-    """What an objective sees in one call."""
+    """Accepted-microbatch schedule index, attempted-work key, and EMA view."""
     step: jax.Array
     key: jax.Array
     ema: Variables | None
@@ -49,13 +73,13 @@ class Step:
 
 
 @struct.dataclass
-class Aux:
-    """What a loss reports beside its scalar."""
+class Aux(Generic[Effects]):
+    """Reports, sequential mutable replacements, and deferred effects."""
     metrics: dict[str, jax.Array]
     variables: Variables | None = None
-    """Non-parameter collections to write back into the state as a whole: the
-    MoE balancing bias, batch statistics, sown values. The `params` collection
-    is the optimizer's and cannot be written this way."""
+    """Complete nonparameter replacements from one accepted microbatch,
+    such as BatchNorm statistics. The optimizer owns the params collection;
+    deferred router-bias updates belong in effects instead."""
     qk_stats: Variables | None = None
     """The `qk` collection the attention layers sowed, for the optimizer's
     QK-Clip: nested by module path, each attention layer holding
@@ -64,6 +88,8 @@ class Aux:
     scalar naming its nope width. Rows are the batch's rows, microbatches
     concatenated under a pipeline. None when the loss never opened the
     collection, in which case the clip steps aside."""
+    effects: Effects | None = None
+    """Additive observations applied once on a supported optimizer commit."""
 
 
 def everything(path: Path) -> bool:
@@ -116,7 +142,7 @@ class EMASpec:
     select: PathFilter = everything
 
 
-class Objective(ABC):
+class Objective(ABC, Generic[Loss, Effects]):
     """What is being learned: parameters, loss, what evaluation produces."""
 
     inputs: InputSpec
@@ -131,12 +157,29 @@ class Objective(ABC):
         the trainer traces it once for shapes and once for values."""
 
     @abstractmethod
-    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux]:
-        """Scalar loss over the batch and what to report beside it.
+    def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
+        """Additive loss statistics and the reports from one realized batch.
 
-        Differentiated with respect to `params["params"]`; every other
-        collection is read as state and rewritten only through `Aux.variables`.
+        Mean declares a shared normalization mass. A plain scalar is one
+        unit-mass term. Composite statistics are objective-owned Flax PyTrees;
+        their leaves add across records before reduce_loss is evaluated.
         """
+
+    def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
+        """The objective value and whether its statistical support is active."""
+        if isinstance(stats, Mean):
+            return mean_loss(stats)
+        if isinstance(stats, (jax.Array, float, int)):
+            value = jnp.asarray(stats)
+            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            if value.ndim != 0:
+                raise ValueError("a unit-mass loss must be scalar")
+            return value, jnp.asarray(True)
+        raise TypeError("custom loss statistics require Objective.reduce_loss")
+
+    def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
+        """Nonparameter replacements from accepted-window observations."""
+        raise TypeError("deferred effects require Objective.apply_effects")
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         """Scoring artifacts for every row of the coordinated global batch.
@@ -158,6 +201,13 @@ class Objective(ABC):
         hook's final outcome before any subsequent collective.
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
+
+def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
+                batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
+    """Evaluate and reduce canonical statistics for direct JAX differentiation."""
+    stats, aux = objective.loss(variables, batch, step)
+    value, _ = objective.reduce_loss(stats)
+    return value, aux
 
 
 S = TypeVar("S")

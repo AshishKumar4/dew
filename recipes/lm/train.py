@@ -52,7 +52,8 @@ class LmRunConfig(RunConfig):
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """What the token files were written with: 'byte', or an HF tokenizer name."""
-    ema_decay: float = 0.999
+    ema_decay: float | None = 0.999
+    """None disables EMA; 1.0 retains a frozen copy."""
     sample_prompt: str = ""
     """Prompt the validation samples continue; empty continues a newline."""
     sample_tokens: int = 128
@@ -260,32 +261,28 @@ def main(config: LmRunConfig) -> TrainState:
             config.pretrained, config.model, vocab_size, context, meta)
     if config.quantization is not None:
         model = apply_quantization(model, config.quantization)
-    if config.objective == "masked_diffusion":
-        objective = build_masked_objective(config, model, fields)
-        objective_metrics = ()
-    else:
-        objective = LMObjective(
-            model,
-            config.data.seq_len,
-            ema_decay=config.ema_decay,
-            samples=samples,
-            pretrained=pretrained,
-            balance_rate=config.balance_rate,
-            mtp_weight=config.mtp_weight,
-            qk_stats=config.optim.optimizer == "muonclip",
-        )
-        objective_metrics = (metrics.perplexity(),)
-
     name = config.trainer.name or (
         f"lm-{tokens.name}/seq-{config.data.seq_len}/"
         f"emb-{model.emb_features}/layers-{model.num_layers}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
-    return config.train(
-        objective, data, name=name, metrics=objective_metrics,
-        summary={"model": fields, "arguments": run_summary(config, fields),
-                 "dataset": {"path": config.data.path, "records": data.records,
-                             "tokens": meta.get('train_tokens')}})
+    summary = {"model": fields, "arguments": run_summary(config, fields),
+               "dataset": {"path": config.data.path, "records": data.records,
+                           "tokens": meta.get("train_tokens")}}
+    if config.objective == "masked_diffusion":
+        return config.train(build_masked_objective(config, model, fields), data,
+                            name=name, summary=summary)
+    objective = LMObjective(
+        model,
+        config.data.seq_len,
+        ema_decay=config.ema_decay,
+        samples=samples,
+        pretrained=pretrained,
+        balance_rate=config.balance_rate,
+        mtp_weight=config.mtp_weight,
+        qk_stats=config.optim.optimizer == "muonclip",
+    )
+    return config.train(objective, data, name=name, metrics=(metrics.perplexity(),), summary=summary)
 
 
 if __name__ == '__main__':

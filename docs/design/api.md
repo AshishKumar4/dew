@@ -1,6 +1,7 @@
 # The API: one registry, one objective, one trainer
 
-Design, 2026-09-03, **built and merged**. Sections 0 to 4 describe the surface that ships on `main`; section 11 lists where the built surface differs from what was drafted here, and section 10 was added afterwards. Section 1's "what is wrong today" and the seam table are the state of `102baa4`, which the review in `docs/design/review-api-2026-09-03.md` read, and are kept as the record of what was replaced rather than as a description of the code. The line citations in those two sections point at commits that no longer exist on `main`; every citation in sections 3, 10 and 11 points at the tree as it is.
+This page records the original API design and its implementation history. The statistics-first C01/C02 cutover supersedes its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples; use the [current core API](../reference/core-api.md) and [objective guide](../concepts/objectives.md) for executable contracts.
+Design record, 2026-09-03. The historical examples and ticket states below describe their cited revisions. Current executable interfaces live in the linked objective and core API guides.
 
 ## 0. The decisions
 

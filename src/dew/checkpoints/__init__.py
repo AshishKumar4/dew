@@ -31,7 +31,8 @@ from jax.experimental import multihost_utils
 from orbax.checkpoint.checkpoint_manager import MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
-STATE_LEAVES = ("step", "params", "opt_state", "ema", "key")
+STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
+                "scale", "window_size", "accumulation")
 
 RUN_FILE = "run.json"
 """The run record `RunConfig.save` writes into the run directory, beside the
@@ -255,6 +256,21 @@ class Checkpoints:
         if position is not None:
             item['position'] = gather_positions(position)
         return item
+    def accumulation_template(self, step: int):
+        """The persisted pending-array shapes, without reading their values."""
+        from dew.training.state import Accumulation
+        manager = self._open_local() if step == self._local_latest() else self._open()
+        metadata = manager.item_metadata(step)
+        missing = set(STATE_LEAVES).difference(metadata.keys())
+        if missing:
+            raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
+        pending = metadata["accumulation"]
+        if pending is None:
+            return None
+        arrays = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(pending))
+        arrays["statistics"] = tuple(arrays["statistics"])
+        arrays["effects"] = tuple(arrays["effects"])
+        return Accumulation(**arrays)
 
     def restore(self, template=None, step: int | None = None) -> tuple[Any, bytes | None]:
         """The state at `step` (the latest by default) and this process's data position.
@@ -284,6 +300,14 @@ class Checkpoints:
                 f"persistent checkpoint at {self.path(step)}")
         metadata = manager.item_metadata(step)
         stored = metadata.keys()
+        if template is not None and not isinstance(template, Mapping):
+            missing = set(STATE_LEAVES).difference(stored)
+            if missing:
+                raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
+            if (metadata["scale"] is None) != (template.scale is None):
+                raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
+            if (metadata["ema"] is None) != (template.ema is None):
+                raise ValueError("checkpoint EMA configuration differs from this run")
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
             # about none. A local checkpoint knows device arrays only, so its
@@ -309,11 +333,17 @@ class Checkpoints:
                 # iterator's position, so it comes from the checkpoint's own
                 # metadata, not from the template. A local checkpoint
                 # holds it as a device array, replicated like the step.
-                item['position'] = jax.tree.map(
+                target = next(iter(jax.tree.leaves(item)), None)
+                target_sharding = getattr(target, "sharding", None)
+                position_sharding = (
+                    jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
+                    if isinstance(target_sharding, jax.sharding.NamedSharding) else
+                    jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+                item["position"] = jax.tree.map(
                     lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
                     dict(metadata['position']))
                 restore_args['position'] = jax.tree.map(
-                    lambda leaf: (ocp.ArrayRestoreArgs(sharding=item['step'].sharding,
+                    lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
                                                        global_shape=leaf.shape)
                                   if from_local else ocp.RestoreArgs()),
                     item['position'])
@@ -323,12 +353,7 @@ class Checkpoints:
                 restored = manager.restore(step, args=ocp.args.PyTreeRestore(
                     item=item, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
-                # A structural mismatch surfaces from inside orbax's tree walk
-                # as a key path and a pair of container types, which says
-                # nothing about what to do. opt_state is shaped by the
-                # optimizer and by the MultiSteps wrapper gradient
-                # accumulation puts around it, so changing either between
-                # runs is what usually lands here.
+                # Model, optimizer and retained record shapes are a resume contract.
                 raise ValueError(
                     f"The checkpoint at {where} does not fit this run's "
                     f"train state ({mismatch}). A checkpoint carries the optimizer "
@@ -353,6 +378,11 @@ class Checkpoints:
                     f"count.")
             position = own_position(table)
         if template is not None and not isinstance(template, Mapping):
+            if int(restored["step"]) != step:
+                raise ValueError("checkpoint directory and serialized attempted step disagree")
+            if not isinstance(template.window_size, jax.ShapeDtypeStruct):
+                if int(restored["window_size"]) != int(template.window_size):
+                    raise ValueError("checkpoint accumulation window_size differs from this run")
             restored = template.replace(**restored)
         return restored, position
 

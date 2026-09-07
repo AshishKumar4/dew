@@ -1,37 +1,61 @@
-"""The values that cross `jit` in a training run."""
+"""Numerical state and retained accumulation records that cross jit."""
 
 from __future__ import annotations
 
 from flax import struct
+from flax.training.dynamic_scale import DynamicScale
 import jax
 import optax
 
-from dew.objectives.base import Aux, Step, Variables, merge
+from dew.objectives.base import Aux, Batch, Step, Variables, merge
 
-__all__ = ["Aux", "Step", "TrainState", "Variables"]
+__all__ = ["Accumulation", "Aux", "Step", "TrainState", "Variables"]
+
+
+@struct.dataclass
+class Accumulation:
+    """Partial accepted work, without forward tapes or statistic Jacobians.
+
+    Statistics and effects retain their array leaves in canonical tree order;
+    the objective's traced result supplies their PyTree structure. Replay
+    buffers have a leading window-slot dimension, followed by the original
+    batch or mutable-collection dimensions. Only collections rewritten by
+    Aux.variables need per-record read snapshots.
+    """
+    gradient: Variables | None
+    mass: jax.Array | None
+    statistics: tuple[jax.Array, ...]
+    effects: tuple[jax.Array, ...]
+    qk_stats: Variables | None
+    batches: Batch | None
+    variables: Variables | None
+    attempts: jax.Array | None
+
 
 
 @struct.dataclass
 class TrainState:
-    """What a run carries from step to step, and what a checkpoint holds.
+    """Completed attempts, accepted microbatches, and committed updates.
 
-    `params` is the objective's whole variables tree, every collection; the
-    optimizer moves its `params` collection and the objective rewrites the
-    others through `Aux.variables`. `ema` holds the leaves the objective's
-    `EMASpec` selected, in the same nesting, or None. Step keys are
-    `jax.random.fold_in(key, step)`.
+    The immutable root key and attempted step determine the next training
+    draw. microstep indexes objective schedules; updates indexes optimizer
+    and EMA schedules. The scaler and retained partial window are numerical
+    state and travel through the same checkpoint as the parameters.
     """
     step: jax.Array
+    microstep: jax.Array
+    updates: jax.Array
     params: Variables
     opt_state: optax.OptState
     ema: Variables | None
     key: jax.Array
+    scale: DynamicScale | None
+    window_size: jax.Array
+    accumulation: Accumulation | None = None
 
     @property
     def averaged(self) -> Variables:
-        """The variables tree with the averaged leaves in place of the live
-        ones. Samples, exports and validation read this. An objective that
-        keeps no EMA has nothing to average."""
+        """The objective's EMA leaves merged into the live variables."""
         if self.ema is None:
             raise ValueError(
                 "the objective keeps no EMA, so there are no averaged weights; "

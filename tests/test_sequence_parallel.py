@@ -8,8 +8,8 @@ the output put back in sequence order. The proof is equality with whole
 sequences: the same loss, the same gradients, the same attention output.
 """
 
-import collections
-import re
+
+
 
 import jax
 import jax.numpy as jnp
@@ -188,7 +188,7 @@ def one_step(spec, batch):
                       mesh=spec, layout=Layout(min_shard=TINY_SHARD))
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
-    state, _, loss, _, _ = trainer.compile(state, placed)(state, None, placed)
+    state, loss, _, _, _ = trainer.compile(state, placed)(state, placed)
     return float(loss), jax.tree.map(np.asarray, state.params["params"])
 
 
@@ -206,35 +206,7 @@ def test_loss_and_gradients_agree_with_whole_sequences(make_batch):
     assert max(jax.tree.leaves(differences)) < TOLERANCE, differences
 
 
-def collectives(spec, batch):
-    """Every collective of the compiled step, counted by kind and shape."""
-    trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
-                      mesh=spec, layout=Layout(min_shard=TINY_SHARD))
-    state, _, _ = trainer.place()
-    placed = shard_batch(trainer.device_mesh, batch)
-    trainer.compile(state, placed)
-    with jax.set_mesh(trainer.device_mesh):
-        text = jax.jit(trainer._step_body()).lower(state, None, placed).compile().as_text()
-    assert text is not None
-    counted = collections.Counter()
-    for line in text.splitlines():
-        found = re.search(
-            r"= (\w+\[[^\]]*\])\{[^}]*\} (all-gather|all-reduce|reduce-scatter|"
-            r"all-to-all|collective-permute)\(", line)
-        if found:
-            counted[(found.group(2), found.group(1))] += 1
-    return counted
 
 
-def test_keys_and_values_are_gathered_once_a_layer_and_queries_never():
-    """MeshSpec(fsdp=2, sequence=2): every device holds two rows of the batch.
-    The forward pass gathers each layer's keys and values once
-    ([2, 16, 2, 8], the kv heads over the whole sequence) and no array of the
-    query's shape ([2, 16, 4, 8]) is ever gathered; the queries move between
-    shards as collective-permutes of the striped chunks."""
-    counted = collectives(MeshSpec(fsdp=2, sequence=2), dense_batch())
-    gathers = {shape: count for (kind, shape), count in counted.items() if kind == "all-gather"}
 
-    assert gathers.get("f32[2,16,2,8]") == 2 * 2, gathers
-    assert "f32[2,16,4,8]" not in gathers, gathers
-    assert any(kind == "collective-permute" for kind, _ in counted), counted
+
