@@ -33,20 +33,23 @@ def repeat_kv_heads(x, num_heads: int):
     return jnp.repeat(x, num_heads // kv_heads, axis=-2)
 
 
-def causal_attention_mask(query_positions, kv_len: int, sliding_window=None):
-    """Boolean [1, 1, T, S] mask keeping keys at or before each query's position.
+def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, key_valid=None):
+    """Boolean [B, 1, T, S] mask from shared [T] or per-row [B, T] slots.
 
-    query_positions are absolute: jnp.arange(T) for a plain forward pass, and
-    the cache slots the queries occupy when decoding against a KV cache, where
-    a query's row index and its position differ. sliding_window=w narrows the
-    mask to the w most recent keys (the query itself plus the w-1 before it).
+    A negative query slot denotes an invalid token. Cache validity excludes
+    unfilled slots; a window retains the query and its preceding W-1 keys.
     """
-    q_pos = jnp.asarray(query_positions)[:, None]
-    k_pos = jnp.arange(kv_len)[None, :]
-    mask = k_pos <= q_pos
+    positions = jnp.asarray(query_positions)
+    if positions.ndim == 1:
+        positions = positions[None, :]
+    q_pos = positions[:, :, None]
+    k_pos = jnp.arange(kv_len)[None, None, :]
+    mask = (q_pos >= 0) & (k_pos <= q_pos)
     if sliding_window is not None:
-        mask = jnp.logical_and(mask, k_pos > q_pos - sliding_window)
-    return mask[None, None]
+        mask = mask & (k_pos > q_pos - sliding_window)
+    if key_valid is not None:
+        mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
+    return mask[:, None]
 
 
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
@@ -259,58 +262,60 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
-def open_kv_cache(module: nn.Module, key, max_seq_len):
-    """Fixed-size KV cache in the flax MultiHeadDotProductAttention style.
+def _cache_positions(module: nn.Module, batch: int, length: int, capacity: int, valid):
+    """Allocate compact cache slots for real tokens, independently per row."""
+    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
+    if valid.shape != (batch, length):
+        raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
+    allocated = module.has_variable("cache", "cache_index")
+    index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
+    cached_valid = module.variable("cache", "cache_valid", jnp.zeros, (batch, capacity), bool)
+    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    positions = jnp.where(valid, positions, -1)
+    if allocated:
+        index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
+        cached_valid.value = jnp.arange(capacity)[None, :] < index.value[:, None]
+    return positions, allocated
 
-    Declares cached_key/cached_value/cache_index in the 'cache' collection,
-    sized from `key` at the full decode length, and returns the absolute
-    positions of the tokens this step appends together with the writer that
-    appends them. Positions come out before the write because rotary positions
-    have to rotate the keys going into the cache, not the ones already in it.
 
-    The writer advances the index by the number of tokens written, so one code
-    path covers a whole-prompt prefill and the single-token steps after it. The
-    first call only allocates: a freshly initialised model hands back a zeroed
-    cache at index 0.
+def _write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> jax.Array:
+    """Append at per-row slots; invalid queries do not change cache storage."""
+    slots = jnp.where(positions >= 0, positions, buffer.shape[1])
+    return buffer.at[jnp.arange(buffer.shape[0])[:, None], slots].set(
+        values.astype(buffer.dtype), mode="drop")
+
+
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None):
+    """Fixed-size K/V with a cursor and cached validity for each batch row.
+
+    Returns [B, S] compact slot positions and a writer. Invalid tokens have
+    position -1 and do not advance the cursor. The allocation-only call leaves
+    every row empty. The writer returns full cache arrays, including unused
+    slots which the caller excludes with cache_valid.
     """
     shards = sequence_shards()
     if shards > 1:
         raise ValueError(
             f"decoding is not supported under a sequence axis of {shards}: the KV "
-            "cache holds whole sequences and appends one token to each, which "
-            "sequence parallelism splits over devices. Generate on a mesh with "
-            "sequence=1.")
+            "cache holds whole sequences. Generate on a mesh with sequence=1.")
     if max_seq_len is None:
-        raise ValueError(
-            "decoding needs max_seq_len: the KV cache is allocated once, at the "
-            "full decode length, and never grows.")
+        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
     batch, length, heads, head_dim = key.shape
     if length > max_seq_len:
-        raise ValueError(
-            f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    allocated = module.has_variable('cache', 'cached_key')
-    cached_key = module.variable('cache', 'cached_key', jnp.zeros,
+        raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
+    cached_key = module.variable("cache", "cached_key", jnp.zeros,
                                  (batch, max_seq_len, heads, head_dim), key.dtype)
-    cached_value = module.variable('cache', 'cached_value', jnp.zeros,
+    cached_value = module.variable("cache", "cached_value", jnp.zeros,
                                    (batch, max_seq_len, heads, head_dim), key.dtype)
-    cache_index = module.variable('cache', 'cache_index',
-                                  lambda: jnp.array(0, jnp.int32))
-    index = cache_index.value
+    positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
 
     def append(key, value):
-        if not allocated:
-            return key, value
-        zero = jnp.array(0, index.dtype)
-        cached_key.value = jax.lax.dynamic_update_slice(
-            cached_key.value, key.astype(cached_key.value.dtype),
-            (zero, index, zero, zero))
-        cached_value.value = jax.lax.dynamic_update_slice(
-            cached_value.value, value.astype(cached_value.value.dtype),
-            (zero, index, zero, zero))
-        cache_index.value = index + length
+        if allocated:
+            cached_key.value = _write_cache(cached_key.value, key, positions)
+            cached_value.value = _write_cache(cached_value.value, value, positions)
         return cached_key.value, cached_value.value
 
-    return index + jnp.arange(length), append
+    return positions, append
 
 
 def _pad_rows(x, rows: int):
