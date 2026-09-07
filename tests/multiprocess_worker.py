@@ -847,7 +847,7 @@ def mode_builtin_preview_failures(args) -> dict:
     """Exercise nested builtin preview failures while both ranks remain alive."""
     import jax
     import optax
-    import dew.sampling.text as text_sampling
+    from dew.inference import TextGeneration
     from dew.data import Dataset
     from dew.diffusion import presets
     from dew.diffusion.discrete import MDLM
@@ -886,7 +886,7 @@ def mode_builtin_preview_failures(args) -> dict:
         state, _, _ = trainer.place()
         field = "_prompt" if kind == "lm" else "_sample"
         original = getattr(objective, field)
-        original_generate = text_sampling.generate
+        original_generate = TextGeneration.__call__
         closed = []
 
         def validation():
@@ -923,7 +923,7 @@ def mode_builtin_preview_failures(args) -> dict:
                     if rank == source:
                         delattr(objective, field)
                 elif kind == "lm":
-                    text_sampling.generate = sample_failure
+                    TextGeneration.__call__ = sample_failure
                 else:
                     objective._sample = sample_failure
                 try:
@@ -937,7 +937,7 @@ def mode_builtin_preview_failures(args) -> dict:
                     reports[case] = {"error": None}
                 finally:
                     setattr(objective, field, original)
-                    text_sampling.generate = original_generate
+                    TextGeneration.__call__ = original_generate
                 # Files keep the successful escapee alive without accidentally
                 # matching the stranded rank's next JAX phase agreement.
                 ready = args.out.parent / f"{case}.{rank}.ready"
