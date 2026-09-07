@@ -69,9 +69,9 @@ class HFDatasetSource:
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
-        # grain writes repr(source) into a DataLoader iterator's checkpoint and
-        # refuses a state whose repr differs, so this names the dataset, not
-        # an address, and without touching the table.
+        # A saved data position names the order it counts into by naming its
+        # source, and a resume refuses a description it cannot match, so this
+        # names the dataset, not an address, and without touching the table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"cache={self._cache_path!r})")
 

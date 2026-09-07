@@ -329,8 +329,8 @@ def test_a_training_step_reads_the_same_records_at_every_process_count(
     """Step k is records [k * batch, (k + 1) * batch) of one order whatever
     the process count is, because the iterator owns the sharding and the
     batching together. Shuffling the corpus per shard first, as an index
-    sampler does, gave each count a different order and made a saved position
-    untranslatable in principle, not just in its encoding."""
+    sampler does, gave each count a different order, which no encoding of a
+    position could have translated."""
     alone, _ = _steps(monkeypatch, 1, 4)
     together, _ = _steps(monkeypatch, processes, 4)
 
