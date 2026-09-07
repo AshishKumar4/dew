@@ -29,6 +29,7 @@ images meant to stay bytes or drop a column a run needs.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
@@ -272,17 +273,27 @@ def _stream(name: str, split: str, *, options: HFOptions,
 
     from .sources.hf_stream import HFRows, Unresumable
 
+    # This factory's own copy of a dataset a caller handed over, taken here,
+    # before anything reads it: the library sets state on the object it is
+    # iterating and restored into, so a stream that shared the caller's
+    # object could leave it somewhere other than its beginning. Copied once
+    # rather than per pass, because copying an object another thread is
+    # iterating reads its attributes as they change.
+    own = None if dataset is None else copy.deepcopy(
+        _iterable(dataset, "the dataset load() was given"))
+
     def open_split() -> "IterableDataset":
-        if dataset is None:
+        if own is None:
             return _iterable(options.load(name, split, streaming=True), f"{name}/{split}")
-        return _iterable(dataset, "the dataset load() was given")
+        return own
 
     what = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
 
     def stream() -> Iterator[Batch]:
         source = HFRows(open_split, what=what, seed=seed, rank=jax.process_index(),
                         world_size=jax.process_count(),
-                        shuffle_buffer=shuffle_buffer, epochs=epochs)
+                        shuffle_buffer=shuffle_buffer, epochs=epochs,
+                        given=dataset is not None)
         piped: pygrain.IterDataset = source
         if preprocess is not None:
             piped = piped.random_map(Preprocessing(preprocess), seed=seed)

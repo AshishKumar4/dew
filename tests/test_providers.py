@@ -282,7 +282,6 @@ def test_a_split_the_caller_already_has_is_read_as_it_is():
                          preprocess=just_index, **READ)
 
     assert data.records == 8
-    assert indices(data.train(), 1) in ([[0, 1, 2, 3]], [[4, 5, 6, 7]]) or True
     assert sorted(i for b in indices(data.train(), 2) for i in b) == list(range(8))
 
 
@@ -460,10 +459,68 @@ def test_a_shuffled_streamed_position_says_why_it_cannot_be_restored(jsonl):
                                      streaming=True)
 
     shuffled = HFRows(open_split, what="the rows", seed=0, rank=0, world_size=1,
-                      shuffle_buffer=4, epochs=1)
+                      shuffle_buffer=4, epochs=1, given=False)
     assert not shuffled.resumable
     rows = iter(shuffled)
     with pytest.raises(NotImplementedError, match="shuffle buffer it was drawing from"):
+        rows.set_state({"epoch": 0, "read": 0, "rows": None})
+    rows.close()
+
+
+def _stream_of(rows):
+    """A streamed split over `rows`, as `dataset=` hands one over."""
+    return datasets.Dataset.from_dict({"index": list(rows)}).to_iterable_dataset()
+
+
+def test_a_given_streamed_dataset_reports_no_position(jsonl):
+    """A caller's stream arrives through transformations dew did not apply,
+    an upstream `.shuffle` among them, and an IterableDataset cannot be asked
+    what it has been through. Advertising a position over it would restore a
+    run onto rows nobody verified."""
+    for rows in (_stream_of(range(12)), _stream_of(range(12)).shuffle(seed=9,
+                                                                     buffer_size=8)):
+        data = dew.data.load("hf/given", batch=4, dataset=rows, streaming=True,
+                             records=12, preprocess=just_index, **READ)
+        stream = data.train()
+        try:
+            assert not isinstance(stream, Checkpointable)
+            assert not hasattr(stream, "get_state")
+            assert len(indices(stream, 2)) == 2
+        finally:
+            stream.close()
+
+
+def test_every_pass_over_a_given_streamed_dataset_starts_at_its_beginning():
+    """Each pass reads a copy, so no pass and no later factory call inherits
+    where an earlier one stopped, and the caller's own object is untouched."""
+    rows = _stream_of(range(8))
+    data = dew.data.load("hf/given", batch=4, dataset=rows, streaming=True, records=8,
+                         preprocess=just_index, **READ)
+
+    first = data.train()
+    try:
+        crossing = indices(first, 4)
+    finally:
+        first.close()
+    again = data.train()
+    try:
+        fresh = indices(again, 1)
+    finally:
+        again.close()
+
+    assert crossing == [[0, 1, 2, 3], [4, 5, 6, 7]] * 2, "a pass reads the whole stream"
+    assert fresh == [[0, 1, 2, 3]], "a fresh stream starts at the first row"
+    assert [int(row["index"]) for row in rows] == list(range(8)), "the caller's own"
+
+
+def test_a_given_streamed_position_says_which_route_resumes():
+    from dew.data.sources.hf_stream import HFRows
+
+    given = HFRows(lambda: _stream_of(range(8)), what="the rows", seed=0, rank=0,
+                   world_size=1, shuffle_buffer=0, epochs=1, given=True)
+    assert not given.resumable
+    rows = iter(given)
+    with pytest.raises(NotImplementedError, match="dew builds and can resume"):
         rows.set_state({"epoch": 0, "read": 0, "rows": None})
     rows.close()
 
