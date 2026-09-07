@@ -4,7 +4,7 @@ This page assumes you have run [the first training example](../getting-started.m
 
 ## Initialization
 
-Subclass `dew.objectives.base.Objective`. Implement `init(key)` to return the complete Flax variables mapping, including a `params` collection. It can contain one model or several models, as long as your loss interprets the same structure.
+Subclass `dew.objectives.base.Objective`. Implement `init(key, variables=None)` to return the complete Flax variables mapping, including a `params` collection. It can contain one model or several models, as long as your loss interprets the same structure. Callers pass only the key; the second parameter is for objectives that start from held weights (below).
 
 The trainer traces initialization to determine shapes and then initializes variables with their device placement. Keep `init` pure: it should compute arrays from its key and configuration, without downloading weights or opening files. Load external weights explicitly before constructing an objective that accepts pretrained variables.
 
@@ -12,9 +12,9 @@ The [regression tutorial](../getting-started.md#define-initialization-and-loss) 
 
 ### Objectives that start from held weights
 
-An objective that continues from a checkpoint, or that keeps a frozen tower beside the model it trains, holds real arrays. Those arrays cross into the trainer's compiled state construction at one boundary, and the objective describes them through two public methods: `held_variables()` reports what it starts from, and `init(key, variables=None)` initializes from what the caller supplies.
+An objective that continues from a checkpoint, or keeps a frozen tower beside the model it trains, holds real arrays. Those arrays cross into the trainer's compiled state construction as JIT arguments, never as compiled-in constants: a 0.6B checkpoint captured as a constant is 2.2 GiB inside the executable, past the 2 GiB limit on a compilation cache entry.
 
-`Objective.initializer` builds those into the one value a JIT can take: `Partial(self.init)` when `held_variables()` is None, and `Partial(self.init, variables=held)` otherwise. `jax.tree_util.Partial` is a pytree whose bound arguments are children, so the held tree arrives as a JIT argument. An objective that draws its whole tree from the key implements neither method beyond `init` and inherits the rest:
+Two public methods describe the held arrays. `held_variables()` reports what the objective starts from; `init(key, variables=None)` initializes from what the caller supplies. `Objective.initializer` combines them into the one value a JIT accepts: `Partial(self.init)` when `held_variables()` is None, otherwise `Partial(self.init, variables=held)`. `jax.tree_util.Partial` is a pytree whose bound arguments are children, so the held tree arrives as data. An objective that draws its whole tree from the key implements only `init`:
 
 ```python
 class Continued(Objective):
@@ -31,13 +31,11 @@ class Continued(Objective):
         return self.model.init(key, jnp.zeros((1, 4), jnp.float32))
 ```
 
-`variables=None` means resolve the configured input, which is what a plain `init(key)` call does, so every existing caller is unaffected. When the trainer calls through the initializer it always supplies the tree, so nothing is read off the objective inside the trace.
+`variables=None` means resolve the configured input, which is what a plain `init(key)` does. The trainer always supplies the tree through the initializer, so nothing is read off the objective inside the trace.
 
-Two properties make this a contract rather than a convention. The call dispatches through public `init`, so a subclass that overrides `init` decides what the state holds whether it is called directly or compiled by the trainer. And because the tree is an argument, it stays one however deeply `init` nests its own `jax.jit`, and an objective that composes another one passes the held tree to that objective's `init`. A subclass of an objective that holds arrays must accept the second parameter; it will raise rather than be quietly bypassed if it does not.
+The call dispatches through public `init`, so a subclass that overrides `init` decides what the state holds whether called directly or compiled by the trainer. Because the tree is an argument it stays one however deeply `init` nests its own `jax.jit`, and an objective that composes another passes the held tree to that objective's `init`. A subclass of a holding objective must accept the second parameter; otherwise the call raises rather than being bypassed.
 
-What it buys is the difference between a parameter tree that arrives on the device as an argument and one that is compiled into the state executable as a constant. For a 0.6B checkpoint the second is 2.2 GiB inside the module, past the 2 GiB limit on a compilation cache entry, so the cache silently stops working for the run that most needs it.
-
-`Trainer.initial_state(initializer=None, key=None)` is the single state implementation and resolves each None from the run. `place` resolves both inputs once and then calls that same method for the shapes and for the values, so a `Trainer` subclass that overrides `initial_state` is honoured on every path, and `trainer.initial_state()` with no arguments still returns the state a run starts from.
+`Trainer.initial_state(initializer=None, key=None)` is the single state implementation; each None resolves from the run. `place` resolves both inputs once and calls that method for shapes and for values, so a `Trainer` subclass overriding `initial_state` is honoured on every path, and `trainer.initial_state()` still returns the state a run starts from.
 
 
 ## Loss and auxiliary values
