@@ -293,4 +293,3 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree), jax.tree.leaves(loaded.variables[collection])):
                 np.testing.assert_array_equal(actual, original)
-

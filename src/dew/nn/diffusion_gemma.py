@@ -1,12 +1,11 @@
-"""DiffusionGemma's self-conditioning MLP, in the reference layout.
+"""DiffusionGemma's shared native encoder/decoder and self-conditioning MLP.
 
-The decoder folds the previous step's logits back into its input embeddings
-through this gated MLP with a scaled pre-norm and a scale-free post-norm
-(TF/models/diffusion_gemma/modeling_diffusion_gemma.py:790-823, the norms at
-:147-165). The previous logits become soft embeddings through
-`soft_embeddings` (softmax in fp32 against the embedding table times its
-scale, :1271-1280), zeroed wherever training disables conditioning for the
-row. Weights load under the module's own tensor names.
+The MLP follows Transformers modeling_diffusion_gemma.py:790-823: a scaled
+pre-norm, gated feed-forward, and scale-free post-norm. Previous logits become
+soft embeddings through an fp32 softmax against the scaled embedding table.
+An explicit self-conditioning mask zeros embeddings for the first inference
+step. The official SFT objective instead supplies zero logits for its dropout
+branch; those are uniform soft embeddings, not a zero signal.
 """
 
 from __future__ import annotations
@@ -103,13 +102,18 @@ class DiffusionGemma(nn.Module):
         self.text.init_cache(batch_size)
 
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
+               attention_mask=None, image_groups=None, rotary_positions=None,
+               attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False):
         """Append a clean prompt or committed canvas, evaluating media only when supplied."""
         if not conditioning:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
             return self.text(tokens, decode=True, train=train, positions=positions,
-                             segment_ids=segment_ids)
+                             segment_ids=segment_ids, attention_mask=attention_mask,
+                             image_groups=image_groups, rotary_positions=rotary_positions,
+                             attention_pairwise_mask=attention_pairwise_mask,
+                             attention_key_positions=attention_key_positions)
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
@@ -120,10 +124,14 @@ class DiffusionGemma(nn.Module):
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.text(fused.tokens, decode=True, train=train, positions=positions,
                          segment_ids=segment_ids, input_embeddings=fused.embeddings,
-                         embedding_positions=slots)
+                         embedding_positions=slots, attention_mask=attention_mask,
+                         image_groups=image_groups, rotary_positions=rotary_positions,
+                         attention_pairwise_mask=attention_pairwise_mask,
+                         attention_key_positions=attention_key_positions)
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
-                 self_conditioning_mask=None, train: bool = False):
+                 self_conditioning_mask=None, train: bool = False, positions=None,
+                 attention_pairwise_mask=None, attention_key_positions=None):
         tokens = jnp.asarray(tokens, jnp.int32)
         embedded = self.decoder.embed_tokens(tokens)
         table = self.decoder.embed_tokens.embedding
@@ -140,7 +148,9 @@ class DiffusionGemma(nn.Module):
         # Parameter initialization needs no prefix. Loaded inference always
         # takes the frozen-cache branch, which refuses an absent prefill.
         return self.decoder(tokens, train=train, decode=not self.is_initializing(),
-                            input_embeddings=conditioned, embedding_positions=indices)
+                            input_embeddings=conditioned, embedding_positions=indices,
+                            positions=positions, attention_pairwise_mask=attention_pairwise_mask,
+                            attention_key_positions=attention_key_positions)
 
 
 def translate_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:

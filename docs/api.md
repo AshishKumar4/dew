@@ -32,7 +32,7 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.objectives` |  |
-| `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
+| `dew.objectives.diffusion` | `DiffusionObjective`, `DiffusionRunConfig`, `MaskedDiffusionObjective`, `BlockDiffusionObjective`, `StableDiffusionAutoencoder`, `TextCondition`, `VALIDATION_SAMPLES` |
 | `dew.objectives.jepa` |  |
 | `dew.objectives.lm` |  |
 | `dew.objectives.rl` | `ADVANTAGES_KEY`, `DPOObjective`, `GRPOObjective`, `IDS_KEY`, `OLD_LOG_PROBS_KEY`, `PREFERENCE_IDS_KEY`, `PREFERENCE_MASK_KEY`, `RESPONSE_MASK_KEY`, `REWARDS_KEY`, `Reward`, `SampledRollout`, `FlowGRPOObjective`, `FlowReward`, `FlowRollout` |
@@ -53,7 +53,7 @@ module has no importable names.
 | --- | --- |
 | `dew.sampling` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP`, `CFG`, `sample`, `generate`, `Generation`, `Sampling`, `TextToImage`, `FlowSDE`, `FlowTrajectory`, `GaussianTransition`, `flow_transition`, `sample_trajectory` |
 | `dew.sampling.solvers` | `Solver`, `DDPM`, `DDIM`, `Euler`, `EulerAncestral`, `Heun`, `RK4`, `MultiStepDPM`, `DPMSolverPP` |
-| `dew.sampling.text` | `Generation`, `Sampling`, `generate` |
+| `dew.sampling.text` | `DecoderState`, `Generation`, `Sampling`, `TokenSample`, `generate` |
 
 ## Models
 
@@ -62,7 +62,7 @@ module has no importable names.
 | `dew.nn` |  |
 | `dew.nn.backbones` | `Unet`, `UViT`, `SimpleUDiT`, `SimpleDiT`, `SimpleMMDiT`, `HierarchicalMMDiT`, `HybridSSMAttentionDiT`, `CausalTransformer`, `VideoDiT`, `UNet3D` |
 | `dew.nn.autoencoders` | `AutoEncoder`, `StableDiffusionVAE`, `SimpleAutoEncoder` |
-| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `RouterMoments`, `SparseMLP`, `calculate_load_balance_updates`, `deepseek_v2_aux_loss`, `global_router_loss`, `load_balance_update`, `router_moments`, `sequence_router_losses` |
+| `dew.nn.moe` | `ExpertLinear`, `ExpertMLP`, `Router`, `RouterMoments`, `SparseMLP`, `calculate_load_balance_updates`, `deepseek_v2_aux_loss`, `global_router_loss`, `grouped_matmul`, `load_balance_update`, `router_moments`, `sequence_router_losses` |
 | `dew.nn.text_encoders` | `CLIP`, `CLIPAttention`, `CLIPEncoderLayer`, `CLIPModel`, `CLIPTextModel`, `CLIPTextTransformer`, `CLIPTowerOutput`, `CLIPVisionTransformer`, `MLP`, `T5Block`, `T5DenseGatedGeluDense`, `T5DenseReluDense`, `T5EncoderModel`, `T5EncoderTransformer`, `T5LayerNorm`, `T5SelfAttention`, `quick_gelu`, `translate_clip_config`, `translate_clip_weights`, `translate_config`, `translate_t5_config`, `translate_t5_weights`, `translate_vision_config`, `translate_weights` |
 | `dew.nn.sharding` | `declared_axes`, `is_heuristic`, `logical_axes`, `microbatches`, `parameter_path`, `pipeline_microbatches`, `pipeline_stages`, `sequence_shards` |
 
@@ -78,5 +78,5 @@ module has no importable names.
 | Module | Exports |
 | --- | --- |
 | `dew.eval` | `ImageMetric`, `frames`, `clip`, `clip_score`, `fid`, `frechet_distance`, `peak_signal_noise_ratio`, `psnr`, `structural_similarity`, `ssim` |
-| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights` |
+| `dew.interop` | `dequantize_checkpoint`, `dequantize_fp8_blocks`, `fp8_block`, `load_params`, `load_pretrained_decoder`, `pull_from_hub`, `push_to_hub`, `save_hf_layout`, `save_params`, `save_pretrained_decoder`, `translate_config`, `translate_weights`, `Pretrained`, `Processor`, `load_pretrained` |
 | `dew.rl` | `gae`, `group_advantage`, `masked_mean`, `masked_whiten`, `rloo_advantage`, `clipped_surrogate`, `k3_kl`, `preference_logsigmoid`, `sequence_log_ratio`, `token_log_ratio`, `token_mean` |

@@ -5,7 +5,7 @@
   "added_tokens": [
     {
       "id": 0,
-      "content": "t0",
+      "content": "<pad>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -14,7 +14,7 @@
     },
     {
       "id": 1,
-      "content": "t1",
+      "content": "<eos>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -23,7 +23,7 @@
     },
     {
       "id": 2,
-      "content": "t2",
+      "content": "<bos>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -32,7 +32,7 @@
     },
     {
       "id": 3,
-      "content": "t3",
+      "content": "<unk>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -74,10 +74,10 @@
   "model": {
     "type": "WordLevel",
     "vocab": {
-      "t0": 0,
-      "t1": 1,
-      "t2": 2,
-      "t3": 3,
+      "<pad>": 0,
+      "<eos>": 1,
+      "<bos>": 2,
+      "<unk>": 3,
       "t4": 4,
       "t5": 5,
       "t6": 6,
@@ -139,6 +139,6 @@
       "t62": 62,
       "t63": 63
     },
-    "unk_token": "t3"
+    "unk_token": "<unk>"
   }
 }

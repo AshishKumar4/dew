@@ -71,7 +71,7 @@ def tiny_model() -> DiffusionGemmaForBlockDiffusion:
     return model
 
 
-def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=1, eos=None):
+def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=1, eos=None, model_kwargs=None):
     """The reference generate call with independent, matched random inputs."""
     from transformers.models.diffusion_gemma.generation_diffusion_gemma import DiffusionGemmaGenerationMixin
 
@@ -131,7 +131,7 @@ def reference_generation(model, prompt, *, steps=4, confidence=0.005, stability=
          patch.object(torch, "multinomial", categorical), \
          patch.object(model, "forward", capture), \
          patch.object(model, "_compute_tokens_per_forward", capture_counts):
-        result = model.generate(prompt, generation_config=generation)
+        result = model.generate(prompt, generation_config=generation, **(model_kwargs or {}))
     if isinstance(result, torch.Tensor):
         raise TypeError("reference generate must return its structured output")
     return result, np.stack(logits), counts[0]
@@ -150,10 +150,11 @@ def main():
         eos_token_id=1,
         sampler_config={"_cls_name": "EntropyBoundSamplerConfig", "entropy_bound": 0.1})
     generation.save_pretrained(FIXTURE)
-    tokenizer = Tokenizer(WordLevel({f"t{i}": i for i in range(64)}, unk_token="t3"))
+    vocabulary = {("<pad>", "<eos>", "<bos>", "<unk>")[i] if i < 4 else f"t{i}": i for i in range(64)}
+    tokenizer = Tokenizer(WordLevel(vocabulary, unk_token="<unk>"))
     tokenizer.pre_tokenizer = WhitespaceSplit()
-    processor = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t3",
-                                       pad_token="t0", bos_token="t2", eos_token="t1")
+    processor = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="<unk>",
+                                       pad_token="<pad>", bos_token="<bos>", eos_token="<eos>")
     processor.save_pretrained(FIXTURE)
     prompt = torch.tensor([[2, 5, 7, 9, 11], [2, 6, 8, 10, 12]])
     canvas = torch.tensor([[3, 4, 5, 6], [7, 8, 9, 10]])
@@ -166,13 +167,23 @@ def main():
     stopped, stop_trajectory, stopped_counts = reference_generation(model, prompt, confidence=10.0, stability=0)
     eos_id = int(generated.sequences[0, prompt.shape[1]])
     eos_result, _, eos_counts = reference_generation(model, prompt, eos=[eos_id])
+    pixels = torch.rand((2, 1, 3, 4, 4), generator=torch.Generator().manual_seed(91))
+    from transformers.models.gemma4.image_processing_pil_gemma4 import convert_image_to_patches
+    patches = torch.from_numpy(np.stack([convert_image_to_patches(image.numpy(), 2) for image in pixels[:, 0]]))
+    image_positions = torch.tensor([[[0, 0], [1, 0], [0, 1], [1, 1]]]).expand(2, -1, -1)
+    image_prompt = torch.tensor([[2, 5, 60, 9, 11], [2, 6, 8, 60, 12]])
+    media = {"pixel_values": patches, "image_position_ids": image_positions}
+    with torch.no_grad():
+        image_logits = model(input_ids=image_prompt, decoder_input_ids=canvas, **media).logits.numpy()
+    image_result, _, image_counts = reference_generation(model, image_prompt, model_kwargs=media)
     np.savez(FIXTURE / "reference.npz", prompt=prompt.numpy(), canvas=canvas.numpy(),
              previous=previous.numpy(), bare=bare, conditioned=conditioned,
              tokens=generated.sequences.numpy(), steps=counts,
              trajectory=trajectory, stopped=stopped.sequences.numpy(),
              stopped_steps=stopped_counts, stop_trajectory=stop_trajectory,
              eos_tokens=eos_result.sequences.numpy(), eos_steps=eos_counts,
-             eos_id=np.array(eos_id))
+             eos_id=np.array(eos_id), pixels=pixels.numpy(), image_prompt=image_prompt.numpy(),
+             image_logits=image_logits, image_tokens=image_result.sequences.numpy(), image_steps=image_counts)
     print(json.dumps({"files": sorted(p.name for p in FIXTURE.iterdir()),
                       "parameter_count": sum(p.numel() for p in model.parameters()),
                       "decoder_calls": len(trajectory), "steps": counts.tolist(),
