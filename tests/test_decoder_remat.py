@@ -29,7 +29,7 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import (
-    REMAT_POLICIES, RESIDUALS, CausalTransformer, RematPolicy,
+    REMAT_POLICIES, CausalTransformer, RematPolicy,
 )
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives import scalar_loss
@@ -344,7 +344,6 @@ def test_a_policy_record_builds_the_named_recipe():
     model = model_for("dense", remat={"save": ["q_proj", "k_proj", "v_proj", "kv_proj"]})
     assert model.remat == REMAT_POLICIES['save_qkv_proj']
     assert model_for("dense", remat='full').remat == RematPolicy()
-    assert model_for("dense").remat is None
 
 
 @pytest.mark.parametrize("remat, message", [

@@ -94,7 +94,7 @@ Replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files, and rerun
 
 `--pretrained` accepts a supported Hugging Face model directory or Hub ID. A Hub ID can trigger a download, authentication, and license requirements. For an offline run, prepare a local checkpoint and tokenizer, tokenize with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. Also pass `--model.config '{}'` to clear the recipe's default architecture JSON; otherwise unsupported overrides can stop loading. The checkpoint selects the architecture, and only `max_seq_len` may be overridden in that mode. Consult [language models](concepts/language_models.md) for the import and export requirements.
 
-The LM recipe's `--objective` accepts `lm` or `masked_diffusion`. The latter trains a bidirectional masked-denoising model with its own mask-token requirements. It is not a flag for SFT, DPO, or GRPO; those data layouts and their Python workflows are in [post-training](concepts/post_training.md).
+The LM recipe's `--objective` accepts `lm`, `masked_diffusion`, or `block_diffusion`. `masked_diffusion` trains a bidirectional masked-denoising model with its own mask-token requirements. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and requires `--pretrained` and `data:token-windows`; [language models](concepts/language_models.md) has that workflow. None of the three is a flag for SFT, DPO, or GRPO; those data layouts and their Python workflows are in [post-training](concepts/post_training.md).
 
 ## Diffusion and JEPA recipes
 

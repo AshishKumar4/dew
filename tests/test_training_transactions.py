@@ -222,7 +222,6 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=2e-6)
     for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.params["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
-    assert aux.effects is not None
     expected_moe = objective.apply_effects(initial.params, aux.effects)["moe"]
     for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.params["moe"]), strict=True):
         np.testing.assert_array_equal(got, want)

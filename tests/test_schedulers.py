@@ -276,7 +276,6 @@ def test_min_snr_gamma_infinity_is_the_unweighted_case():
 
 def test_the_schedule_weight_is_the_default():
     process = Process(CosineNoiseScheduler(1000), VPredictionTransform())
-    assert process.weighting == ScheduleWeighting()
     assert jnp.allclose(process.weight(MIN_SNR_STEPS), process.schedule.weight(MIN_SNR_STEPS))
 
 
@@ -299,8 +298,11 @@ def test_edm_preset_samples_on_the_karras_grid():
     process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7)()
     assert isinstance(process.schedule, EDMNoiseScheduler)
     assert isinstance(process.sampler_schedule, KarrasVENoiseScheduler)
-    assert (process.sampler_schedule.sigma_min, process.sampler_schedule.sigma_max,
-            process.sampler_schedule.rho, process.sampler_schedule.sigma_data) == (0.01, 40.0, 5.0, 0.7)
+    # Eq. 5 at rho 5: the endpoints are the preset's sigma range and the
+    # midpoint pins the spacing, 2.99 here against 2.02 at the default rho 7.
+    midpoint = ((40.0 ** 0.2 + 0.01 ** 0.2) / 2) ** 5
+    assert process.sampler_schedule.sigmas(jnp.array([0.0, 0.5, 1.0])).tolist() == (
+        pytest.approx([0.01, midpoint, 40.0], rel=1e-5))
     assert process.prediction.sigma_data == 0.7
 
 

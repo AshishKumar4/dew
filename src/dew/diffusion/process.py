@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.diffusion.schedules import NoiseScheduler, expand
+from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import (
     PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates,
 )
@@ -102,4 +102,4 @@ class Denoiser:
         return (x_0[:batch], eps[:batch]), (x_0[batch:], eps[batch:])
 
 
-__all__ = ["Process", "Denoiser", "expand"]
+__all__ = ["Process", "Denoiser"]

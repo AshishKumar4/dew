@@ -1,5 +1,4 @@
-"""Device mesh, parameter layout, host-to-device prefetch, and the values a
-process pool has to agree on."""
+"""Device mesh, parameter layout, and host-to-device prefetch."""
 
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ import jax
 import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
-from jax.experimental import multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 from dew.data.dataset import Checkpointable
 from dew.nn.sharding import (
@@ -326,7 +324,7 @@ class Layout:
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
     """A sharding per leaf of `batch`, from the batch spec and the leaf's shape.
 
-    Rows split over every axis but sequence. A leaf of rank 2 or 3 is a
+    Rows split over the data, expert, fsdp, and tensor axes. A leaf of rank 2 or 3 is a
     sequence per row (token ids, segment ids, positions, encoded tokens), and
     its second dimension splits over the sequence axis when the axis divides
     it; otherwise that dimension stays whole, the way `_mesh_spec` drops a
@@ -569,13 +567,3 @@ class DevicePrefetchIterator:
             self.source_state = position
             return batch
         raise StopIteration
-
-
-
-# --------------------------------------------------------------------------
-# What every process has to agree on
-# --------------------------------------------------------------------------
-
-def minimum_across_processes(count: int) -> int:
-    """The smallest `count` any process holds."""
-    return int(multihost_utils.process_allgather(np.asarray(count, np.int64)).min())

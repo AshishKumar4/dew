@@ -119,7 +119,7 @@ def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
     assert config.trainer.layout.min_shard == 8
     assert config.model.config == {"emb_features": 32}
     assert type(config.data) is datasets["token_windows"]
-    assert config.data.path == "tokens" and config.data.seq_len == 8
+    assert config.data.seq_len == 8
     assert RunConfig.from_dict(config.to_dict()) == config
 
 

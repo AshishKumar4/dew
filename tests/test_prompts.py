@@ -87,12 +87,17 @@ def test_non_string_reward_columns_travel_as_json():
 
 
 def test_a_string_prompt_encodes_on_its_own():
+    """Plain text is tokenized as it is: no chat template, no special tokens."""
+    from dew.data.chat import load_tokenizer
+
     rows = source({"prompt": "hi"})
 
     batch = rows[0]
 
-    assert 0 < int(batch[LENGTH_KEY]) <= WINDOW
-    assert int(batch[PROMPT_KEY][-1]) != 0, "the text sits at the right, not under the pad"
+    ids = load_tokenizer(TOKENIZER).encode("hi", add_special_tokens=False)
+    assert int(batch[LENGTH_KEY]) == len(ids)
+    np.testing.assert_array_equal(batch[PROMPT_KEY][WINDOW - len(ids):], ids)
+    np.testing.assert_array_equal(batch[PROMPT_KEY][:WINDOW - len(ids)], 0)
 
 
 def test_messages_render_with_the_generation_prompt():

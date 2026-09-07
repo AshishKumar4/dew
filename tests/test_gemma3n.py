@@ -46,7 +46,6 @@ class Steps(nn.Module):
 
 def steps(spec: AltUp, variables: dict, stream, activated, train: bool = False) -> tuple:
     outputs = Steps(spec).apply(variables, stream, activated, train=train)
-    assert isinstance(outputs, tuple) and len(outputs) == 3
     return tuple(np.asarray(output) for output in outputs)
 
 

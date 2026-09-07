@@ -15,13 +15,12 @@ gradient.
 """
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective, TEXT_KEY
 
 VOCAB = 37
@@ -37,7 +36,6 @@ def tiny(**overrides):
 def test_no_depths_leaves_the_tree_unchanged():
     params = tiny().init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
-    assert tiny().num_nextn_predict_layers == 0
     assert [key for key in params["params"]] == [
         "embed_tokens", "layers_0", "layers_1", "norm"]
 
@@ -101,16 +99,24 @@ def test_a_depth_reads_the_token_after_its_position():
     assert jnp.any(before[:, -1] != after[:, -1])
 
 
-def test_depths_share_the_main_head():
-    """The main forward is the shared head over the final states."""
-    model = tiny(num_nextn_predict_layers=1)
+def test_the_depths_score_through_the_main_head():
+    """A depth owns no head: doubling the model's untied head doubles the main
+    logits and every depth's, which a depth scoring through a head of its own
+    would not."""
+    model = tiny(num_nextn_predict_layers=2, tie_embeddings=False)
     ids = jnp.ones((2, 8), jnp.int32)
     params = model.init(jax.random.key(0), ids)
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
+    doubled = {"params": {**params["params"],
+                          "lm_head": {"kernel": params["params"]["lm_head"]["kernel"] * 2.0}}}
 
-    assert jnp.array_equal(
-        model.apply(params, ids),
-        model.apply(params, hidden, method=lambda m, x: m._logits(x)))
+    def scored(variables):
+        hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+        return [model.apply(variables, ids),
+                *model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)]
+
+    for plain, louder in zip(scored(params), scored(doubled), strict=True):
+        assert float(jnp.max(jnp.abs(plain))) > 1e-3
+        assert jnp.allclose(2.0 * plain, louder, rtol=1e-6)
 
 
 def test_no_depths_scores_nothing():

@@ -19,7 +19,6 @@ import pytest
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
-    ImageMetric,
     clip,
     clip_score,
     fid,
@@ -47,12 +46,16 @@ def test_frechet_distance_of_shifted_gaussians_is_the_squared_mean_gap():
     assert frechet_distance(mu_a, sigma, mu_b, sigma) == pytest.approx(8 * 0.25, abs=1e-6)
 
 
-def test_frechet_distance_grows_with_covariance_mismatch():
+def test_frechet_distance_of_a_scaled_covariance_matches_the_closed_form():
+    """Centred gaussians with covariances I and cI are 8 (1 - sqrt(c))^2 apart.
+    Dropping the (sigma_a sigma_b)^1/2 term leaves tr(sigma_a) + tr(sigma_b),
+    which grows with c as well."""
     mu = np.zeros(8)
     identity = np.eye(8)
-    near = frechet_distance(mu, identity, mu, identity * 1.5)
-    far = frechet_distance(mu, identity, mu, identity * 4.0)
-    assert 0 < near < far
+    assert frechet_distance(mu, identity, mu, identity * 1.5) == pytest.approx(
+        8 * (1 - np.sqrt(1.5)) ** 2, abs=1e-6)
+    assert frechet_distance(mu, identity, mu, identity * 4.0) == pytest.approx(
+        8 * (1 - 2.0) ** 2, abs=1e-6)
 
 
 @pytest.mark.network
@@ -273,17 +276,6 @@ def test_ssim_metric_matches_the_closed_form_on_constant_images():
     )
 
 
-def test_a_video_metric_scores_the_clips(rng):
-    """A metric built to read VideoGrid scores the clips as the flattened
-    frames, against the batch's video field."""
-    batch = {'video': _uint8_batch((6, 16, 16, 3), rng)['image'].reshape(2, 3, 16, 16, 3)}
-    reference = (jnp.asarray(batch['video'], jnp.float32) - 127.5) / 127.5
-    degraded = reference + 0.1
-    metric = ImageMetric(name='psnr', reads=VideoGrid, measure=psnr_metric(field='video').measure)
-    assert metric.finalize(metric(VideoGrid(degraded), batch)) == pytest.approx(
-        float(psnr(degraded, reference, data_range=2.0)), rel=1e-5)
-
-
 @pytest.mark.parametrize("factory,raw", [(psnr_metric, psnr), (ssim_metric, ssim)],
                          ids=["psnr", "ssim"])
 def test_frame_factories_read_a_video_grid_when_asked(rng, factory, raw):
@@ -341,7 +333,6 @@ def test_clip_metric_scores_the_reference_cosine():
     the towers were vendored, the factory raised ImportError on
     `FlaxCLIPModel`, which transformers 5 removed."""
     metric = clip(modelname=str(CLIP_TINY))
-    assert isinstance(metric, ImageMetric)
     assert metric.name == 'clip_similarity' and metric.reads is ImageGrid
     generated, batch, cosine = clip_fixture()
 

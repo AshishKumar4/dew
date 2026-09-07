@@ -14,7 +14,6 @@ from dew.data import OxfordFlowers
 from dew.inputs import Field
 from dew.interop import save_params
 from dew.objectives.jepa import JepaObjective, multi_block_mask
-import dew.nn.backbones  # registers the models
 from dew.registry import metrics, models
 from dew.training import Checkpoints, Trainer
 

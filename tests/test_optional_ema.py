@@ -61,7 +61,7 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     frozen_trainer = Trainer(frozen_objective, optimizer, key=jax.random.PRNGKey(1))
     initial = trainer.initial_state()
     assert initial.ema is None
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="keeps no EMA"):
         _ = initial.averaged
     reference = select(initial.params, frozen_objective.ema.select)
     frozen_state = dataclasses.replace(initial, ema=reference)

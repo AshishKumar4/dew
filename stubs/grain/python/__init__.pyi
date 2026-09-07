@@ -1,7 +1,7 @@
 """Used-surface stubs for grain, which ships no `py.typed`.
 
 grain's own source carries inline types, and pyright reads those for what
-they cover — but `RandomMap.random_map` is an unannotated abstract method, so
+they cover. `RandomMap.random_map` is an unannotated abstract method, so
 dew's transforms, which return records from it, look like incompatible
 overrides. These stubs declare the surface dew uses as it really is: the
 real parameter names and defaults (checked against the installed grain),

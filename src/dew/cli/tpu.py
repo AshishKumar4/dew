@@ -127,13 +127,13 @@ def _slice(tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> tuple[int, s
     return node.workers, node.accelerator_type or type_hint or cfg.accelerator_type
 
 
-def _workers(spec: str, tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> list[int]:
+def _workers(spec: str, tpu: Tpu, cfg: config.TpuConfig) -> list[int]:
     """`all` means every worker in the slice, anything else is one index."""
     if spec != "all":
         if not spec.isdigit():
             raise SystemExit(f"--worker takes a worker index or all, got {spec!r}")
         return [int(spec)]
-    return list(range(_slice(tpu, cfg, type_hint)[0]))
+    return list(range(_slice(tpu, cfg)[0]))
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
