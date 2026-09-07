@@ -1626,17 +1626,17 @@ def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     return record
 
 
-def _wrapper_tower_weights(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+def _wrapper_tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     if kind == "siglip":
-        return vision_nn.translate_siglip_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_siglip_vision_weights(hf_tensors)}
     if kind == "llama4":
-        return vision_nn.translate_llama4_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_llama4_vision_weights(hf_tensors)}
     if kind == "gemma4":
         return vision_nn.translate_gemma4_vision_weights(hf_tensors)
     if kind == "qwen3_5":
-        return vision_nn.translate_qwen35_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_qwen35_vision_weights(hf_tensors)}
     if kind == "gemma3n":
-        return vision_nn.translate_gemma3n_vision_weights(hf_tensors)
+        return {"params": vision_nn.translate_gemma3n_vision_weights(hf_tensors)}
     raise ValueError(f"tower kind {kind!r} has no weight map here")
 
 
@@ -1702,7 +1702,7 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             raise ValueError(f"unknown tensor name {name!r}")
     return {
         "language_model": translate_weights(text_tensors, record["text"]),
-        "tower": {"params": _wrapper_tower_weights(tower_kind, tower_tensors)},
+        "tower": _wrapper_tower_variables(tower_kind, tower_tensors),
         "projector": {"params": _wrapper_projector_weights(projector_kind,
                                                             projector_tensors)},
     }

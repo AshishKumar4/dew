@@ -172,7 +172,7 @@ def _wrapper_layouts(tensors, record):
         elif bare.startswith(tower_prefix):
             path = tower_path(bare.removeprefix(tower_prefix))
             if path is not None:
-                paths = (("params", "tower", *path),)
+                paths = ((path[0], "tower", *path[1:]),) if tower_kind == "gemma4" else (("params", "tower", *path),)
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim == 2 else (3, 2, 0, 1)
                     if tensor.ndim == 5:
@@ -227,7 +227,7 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    generation_adapter: Callable[[Pretrained, ModelInputs, int, jax.Array, Sampling | BlockProcess | None], Generation | CanvasGeneration] | None = field(default=None, repr=False)
+    generation_adapter: Callable[[Pretrained, ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], int, jax.Array, Sampling | BlockProcess | None], Generation | CanvasGeneration] | None = field(default=None, repr=False)
     export_adapter: Callable[[Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
 
     @property
@@ -236,14 +236,12 @@ class Pretrained:
         return {item.name: getattr(self.model, item.name) for item in fields(self.model)
                 if item.init and item.name not in ("parent", "name")}
 
-    def generate(self, inputs: ModelInputs | jax.Array, max_new_tokens: int, *,
+    def generate(self, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], max_new_tokens: int, *,
                  key: jax.Array, generation: Sampling | BlockProcess | None = None) -> Generation | CanvasGeneration:
         """Generate through the model family's shared native sampling algorithm."""
-        prepared = inputs if isinstance(inputs, ModelInputs) else ModelInputs(jnp.asarray(inputs, jnp.int32))
-        prepared.validate()
         if self.generation_adapter is None:
             raise ValueError("this source has no native generation algorithm")
-        return self.generation_adapter(self, prepared, max_new_tokens, key, generation)
+        return self.generation_adapter(self, inputs, max_new_tokens, key, generation)
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with processor artifacts."""
@@ -305,36 +303,54 @@ def _pad_id(bundle: Pretrained) -> int:
     return value
 
 
-def _generate_autoregressive(bundle: Pretrained, inputs: ModelInputs, max_new_tokens: int,
+def _generate_autoregressive(bundle: Pretrained, inputs, max_new_tokens: int,
                              key: jax.Array, generation: Sampling | BlockProcess | None):
+    from dew.artifacts import agree_process_phase
     from dew.sampling.text import generate
-    if generation is None:
-        temperature = _generation_value(bundle, "temperature", 1.0)
-        if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
-            raise ValueError("temperature must be numeric")
-        top_k = _generation_value(bundle, "top_k")
-        if top_k is not None and type(top_k) is not int:
-            raise ValueError("top_k must be an integer")
-        generation = Sampling(
-            temperature=float(temperature) if _generation_value(bundle, "do_sample", False) else 0.0,
-            top_k=top_k if top_k else None, eos_id=_eos_ids(bundle), pad_id=_pad_id(bundle))
-    if not isinstance(generation, Sampling):
-        raise ValueError("autoregressive generation requires Sampling")
+    error = None
+    try:
+        if generation is None:
+            temperature = _generation_value(bundle, "temperature", 1.0)
+            if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
+                raise ValueError("temperature must be numeric")
+            top_k = _generation_value(bundle, "top_k")
+            if top_k is not None and type(top_k) is not int:
+                raise ValueError("top_k must be an integer")
+            generation = Sampling(
+                temperature=float(temperature) if _generation_value(bundle, "do_sample", False) else 0.0,
+                top_k=top_k if top_k else None, eos_id=_eos_ids(bundle), pad_id=_pad_id(bundle))
+        if not isinstance(generation, Sampling):
+            raise ValueError("autoregressive generation requires Sampling")
+    except BaseException as failure:
+        error = failure
+    agree_process_phase(error, phase="pretrained generation policy")
+    assert isinstance(generation, Sampling)
     return generate(bundle.model, bundle.variables, inputs, max_new_tokens, key=key, sampling=generation)
 
 
-def _generate_canvas(bundle: Pretrained, inputs: ModelInputs, max_new_tokens: int,
+def _generate_canvas(bundle: Pretrained, inputs, max_new_tokens: int,
                      key: jax.Array, generation: Sampling | BlockProcess | None):
+    from dew.artifacts import agree_process_phase
     from dew.interop import diffusion_gemma
     from dew.nn.diffusion_gemma import DiffusionGemma
-    if not isinstance(bundle.model, DiffusionGemma):
-        raise TypeError("canvas generation requires DiffusionGemma")
-    if generation is None:
-        generation = diffusion_gemma.generation_process(bundle.config, bundle.generation_config)
-    if not isinstance(generation, BlockProcess):
-        raise ValueError("DiffusionGemma generation requires BlockProcess")
+    error = None
+    eos: tuple[int, ...] = ()
+    pad = 0
+    try:
+        if not isinstance(bundle.model, DiffusionGemma):
+            raise TypeError("canvas generation requires DiffusionGemma")
+        if generation is None:
+            generation = diffusion_gemma.generation_process(bundle.config, bundle.generation_config)
+        if not isinstance(generation, BlockProcess):
+            raise ValueError("DiffusionGemma generation requires BlockProcess")
+        eos, pad = _eos_ids(bundle), _pad_id(bundle)
+    except BaseException as failure:
+        error = failure
+    agree_process_phase(error, phase="pretrained canvas policy")
+    assert isinstance(generation, BlockProcess) and isinstance(bundle.model, DiffusionGemma)
     return generation.generate(bundle.model, bundle.variables, inputs, max_new_tokens,
-                               key=key, eos_token_ids=_eos_ids(bundle), pad_token_id=_pad_id(bundle))
+                               key=key, eos_token_ids=eos, pad_token_id=pad)
+
 
 
 
