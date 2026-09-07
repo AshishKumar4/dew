@@ -19,11 +19,13 @@ from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.sampling.text import Sampling
+from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
+from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 
 
@@ -47,15 +49,21 @@ class Processor:
     reference: HostProcessor
     config: Mapping[str, object]
     record: Mapping[str, object]
+    vocab_size: int
 
-    def __call__(self, text: str | Sequence[str], *, images: object | None = None) -> ModelInputs:
+    def __call__(self, text: str | Sequence[str], *, images: object | None = None,
+                 audio: object | None = None) -> ModelInputs:
         import torch
 
+        # truncation is off for text anyway; reloaded Gemma processors forward
+        # the tokenizer's unset max_length into audio kwargs otherwise.
         arguments: dict[str, object] = {
             "text": text if isinstance(text, str) else list(text),
-            "padding": not isinstance(text, str) and len(text) > 1, "return_tensors": "pt"}
+            "padding": not isinstance(text, str) and len(text) > 1, "truncation": False, "return_tensors": "pt"}
         if images is not None:
             arguments["images"] = images
+        if audio is not None:
+            arguments["audio"] = audio
         arrays: dict[str, np.ndarray] = {}
         for name, value in self.reference(**arguments).items():
             if not isinstance(value, torch.Tensor):
@@ -68,7 +76,7 @@ class Processor:
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
-                 "image_position_ids", "image_grid_thw"}
+                 "image_position_ids", "image_grid_thw", "input_features", "input_features_mask"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -87,6 +95,14 @@ class Processor:
             if self.config.get("model_type") == "qwen3_5":
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
+        if ("input_features" in values) != ("input_features_mask" in values):
+            raise ValueError("input_features and input_features_mask arrive together")
+        if "input_features" in values:
+            audio_fields, audio_conditioning = self._audio(values, tokens)
+            token_fields.update(audio_fields)
+            conditioning = {**conditioning, **audio_conditioning}
+        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
+            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
         return result
@@ -196,6 +212,63 @@ class Processor:
         if padded_grid is not None:
             conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
         return {"image_indices": jnp.asarray(indices), "image_groups": jnp.asarray(groups)}, conditioning
+
+    def _audio(self, values: Mapping[str, object], tokens: np.ndarray
+               ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        """Row-align the processor's clip features and index their placeholders.
+
+        Each contiguous run of the audio placeholder is one clip, in the
+        processor's clip order. Gemma 4 inserts one placeholder per encoded
+        valid frame; Gemma 3n inserts its fixed slot count. Both are checked
+        against the encoder's frame stride here, before any device work.
+        """
+        audio_id = self.record.get("audio_token_id")
+        audio = self.record.get("audio")
+        if type(audio_id) is not int or not isinstance(audio, Mapping):
+            raise ValueError("this source has no audio tower")
+        encoder = tower_from_record(audio)
+        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+            raise ValueError("audio conditioning requires a Gemma audio encoder")
+        features = np.asarray(values["input_features"])
+        mask = np.asarray(values["input_features_mask"])
+        if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
+            raise ValueError("input_features must be floating [clips, frames, mel]")
+        if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
+            raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
+        encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+        slots = self.record.get("audio_soft_tokens")
+        if slots is None:
+            expected = encoded.sum(axis=1)
+            capacity = encoded.shape[1]
+        else:
+            if type(slots) is not int or encoded.shape[1] > slots:
+                raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
+            expected = np.full(features.shape[0], slots)
+            capacity = slots
+        runs = []
+        for row in tokens:
+            locations = np.flatnonzero(row == audio_id)
+            runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
+        counts = np.array([len(row) for row in runs], np.int32)
+        if int(counts.sum()) != features.shape[0]:
+            raise ValueError("input_features and audio placeholder runs disagree")
+        width = int(counts.max())
+        padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
+        padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
+        indices = np.full(tokens.shape, -1, np.int32)
+        offset = 0
+        for row, clips in enumerate(runs):
+            for clip, run in enumerate(clips):
+                if len(run) != int(expected[offset]):
+                    raise ValueError("audio placeholder counts do not match the encoded frame counts")
+                padded[row, clip] = features[offset]
+                padded_mask[row, clip] = mask[offset]
+                indices[row, run] = clip * capacity + np.arange(len(run))
+                offset += 1
+        conditioning = {"input_features": jnp.asarray(padded), "input_features_mask": jnp.asarray(padded_mask),
+                        "audio_lengths": jnp.asarray(counts)}
+        return {"audio_indices": jnp.asarray(indices)}, conditioning
+
 
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
@@ -326,6 +399,11 @@ def _wrapper_layouts(tensors, record):
                   "gemma3n": vision.gemma3n_vision_path}[tower_kind]
     tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
+    audio_encoder = None
+    if record["audio"] is not None:
+        audio_encoder = tower_from_record(record["audio"])
+        if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+            raise ValueError("source export requires a Gemma audio encoder")
     bindings = []
     retained = {}
     for name, tensor in tensors.items():
@@ -347,6 +425,18 @@ def _wrapper_layouts(tensors, record):
                     transpose = (1, 0) if tensor.ndim == 2 else (3, 2, 0, 1)
                     if tensor.ndim == 5:
                         transpose = (1, 0)
+        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX):
+            tail = bare.removeprefix(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX)
+            path = vision.projector_weight_path(record["audio_projector"]["kind"], tail)
+            paths = (("params", "audio_projector", *path),)
+            if path[-1] == "kernel":
+                transpose = (1, 0)
+        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PREFIX):
+            path = audio_nn.audio_weight_path(bare.removeprefix(decoders._WRAPPER_AUDIO_PREFIX), audio_encoder)
+            paths = ((path[0], "audio_tower", *path[1:]),)
+            if path[-1] == "kernel":
+                # Kernels store [*window, in, out]; the source keeps [out, in, *window].
+                transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
         elif bare.startswith("language_model.") or bare == "lm_head.weight":
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
@@ -379,7 +469,7 @@ class Pretrained:
     """
 
     model: nn.Module
-    variables: Mapping[str, Mapping[str, object]]
+    variables: Variables
     processor: Processor | None
     config: Mapping[str, object]
     source: Path
@@ -394,7 +484,8 @@ class Pretrained:
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
         return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
-                              else _source_sampling(self.config, self.generation_config))
+                              else _source_sampling(self.config, self.generation_config),
+                              max_new_tokens=_budget(self.config, self.generation_config))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -404,13 +495,15 @@ class Pretrained:
         return BlockGeneration(self.model, self.variables,
                                diffusion_gemma.generation_process(self.config, self.generation_config),
                                self.processor, _eos_ids(self.config, self.generation_config),
-                               _pad_id(self.config, self.generation_config))
+                               _pad_id(self.config, self.generation_config),
+                               max_new_tokens=_budget(self.config, self.generation_config))
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
-        """Write trained variables back to the source layout with processor artifacts."""
+        """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
         destination = Path(directory)
+        generation_config = dict(self.generation_config)
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
@@ -419,16 +512,20 @@ class Pretrained:
             tensors = {**self.retained_tensors,
                        **{layout.name: layout.export(values, scalar_mode) for layout in self.weight_layouts}}
         elif isinstance(self.model, CausalTransformer):
-            decoders.save_pretrained_decoder(self.model, values, destination)
-            tensors = None
+            # A source with no layout to run backwards is written by the
+            # decoder export, which writes the whole directory: weights, the
+            # config it derives, this processor's files and this generation
+            # config. One export path, so a decoder saved here and one saved
+            # directly leave the same files behind.
+            decoders.save_pretrained_decoder(self.model, values, destination,
+                                             tokenizer=self.processor,
+                                             generation_config=generation_config)
+            return
         else:
             raise ValueError("this source has no reversible weight layout")
-        if tensors is not None:
-            save_hf_layout(tensors, dict(self.config), destination)
-        if self.processor is not None:
-            self.processor.save_pretrained(destination)
-        with open(destination / "generation_config.json", "w") as handle:
-            json.dump(dict(self.generation_config), handle, indent=2)
+        save_hf_layout(tensors, dict(self.config), destination)
+        decoders.save_export_assets(destination, tokenizer=self.processor,
+                                    generation_config=generation_config)
 
 
 
@@ -469,6 +566,15 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
     return value
 
 
+def _budget(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int | None:
+    """The source's own generation budget, when it ships one."""
+    value = _generation_value(config, generation_config, "max_new_tokens")
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError("max_new_tokens must be a nonnegative integer")
+    return value
+
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
@@ -479,37 +585,83 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
+# Transformers 5.16.1 generation controls (GenerationConfig.to_dict keys) by
+# what they do to the token distribution. Every value is None when unset.
+# SUPPORTED: the native Sampling value carries them. TASK_OWNED: prompt
+# creation, output size, execution and metadata; they leave the distribution
+# alone. NEUTRAL: unset or the value at which generate() adds no processor,
+# criterion or search mode (utils._get_logits_processor,
+# configuration_utils.get_generation_mode); anything else is an active
+# control the native sampler cannot honor. BEAM_ONLY matter only when
+# num_beams is active. tests/test_inference_sampling.py holds the union of
+# these names equal to the pinned library's keys.
+_SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
+                                 "eos_token_id", "pad_token_id"})
+_TASK_OWNED_CONTROLS = frozenset({
+    "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens", "max_time",
+    "num_return_sequences", "use_cache", "cache_implementation", "cache_config",
+    "max_cache_len", "prefill_chunk_size", "continuous_batching_config", "compile_config",
+    "disable_compile", "low_memory", "use_mtp", "speculation_type", "is_assistant",
+    "num_assistant_tokens", "num_assistant_tokens_schedule", "assistant_confidence_threshold",
+    "assistant_early_exit", "assistant_lookbehind", "assistant_ensemble_weight",
+    "target_lookbehind", "prompt_lookup_num_tokens", "max_matching_ngram_size",
+    "output_attentions", "output_hidden_states", "output_scores", "output_logits",
+    "return_dict_in_generate", "transformers_version", "_from_model_config", "_commit_hash",
+    "tokenizer_name",
+})
+_NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
+    "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
+    "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
+    "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),
+    "typical_p": (1.0,), "epsilon_cutoff": (0.0,), "eta_cutoff": (0.0,), "top_h": (),
+    "guidance_scale": (1.0,), "remove_invalid_values": (False,), "renormalize_logits": (False,),
+    "token_healing": (False,), "sequence_bias": (), "bad_words_ids": (), "force_words_ids": (),
+    "constraints": (), "forced_bos_token_id": (), "forced_eos_token_id": (),
+    "exponential_decay_length_penalty": (), "suppress_tokens": (), "begin_suppress_tokens": (),
+    "watermarking_config": (), "dola_layers": (), "stop_strings": (),
+}
+_BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
+    "early_stopping": (False,), "length_penalty": (1.0,), "num_beam_groups": (1,),
+    "diversity_penalty": (0.0,),
+}
+_SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"})
+
+
+def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
+    if value is None:
+        return True
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return any(value == item and (numeric and not isinstance(item, bool) or type(value) is type(item))
+               for item in neutral)
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
     """Construct only policies whose active controls the native sampler implements."""
-    from transformers import GenerationConfig
-
-    defaults = GenerationConfig().to_dict()
     do_sample = _generation_value(config, generation_config, "do_sample", False)
+    if do_sample is None:
+        do_sample = False
     if type(do_sample) is not bool:
         raise ValueError("do_sample must be a boolean")
-    supported = {"do_sample", "temperature", "top_k", "top_p", "min_p", "eos_token_id", "pad_token_id"}
-    # Prompt creation, requested output size and output representation belong
-    # to the task. These source fields do not transform its token distribution.
-    task_owned = {"bos_token_id", "max_length", "max_new_tokens", "use_cache",
-                  "cache_implementation", "cache_config", "return_legacy_cache", "compile_config",
-                  "disable_compile", "output_attentions", "output_hidden_states", "output_scores",
-                  "output_logits", "return_dict_in_generate", "transformers_version",
-                  "_from_model_config", "_commit_hash", "tokenizer_name"}
-    sampled_only = {"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"}
+    beams = _generation_value(config, generation_config, "num_beams")
+    judged = dict(_NEUTRAL_CONTROLS)
+    if not _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
+        judged.update(_BEAM_ONLY_CONTROLS)
     unsupported = []
-    for name in set(defaults) | set(generation_config):
-        if name in supported or name in task_owned:
+    for name in sorted(set(judged) | set(generation_config)):
+        if name in _SUPPORTED_CONTROLS or name in _TASK_OWNED_CONTROLS or (
+                name in _BEAM_ONLY_CONTROLS and name not in judged):
             continue
-        if not do_sample and name in sampled_only:
+        if not do_sample and name in _SAMPLED_ONLY_CONTROLS:
             continue
-        default = defaults.get(name)
-        value = _generation_value(config, generation_config, name, default)
-        if value != default:
+        value = _generation_value(config, generation_config, name)
+        if not _neutral(value, judged.get(name, ())):
             unsupported.append(name)
     if unsupported:
-        raise ValueError(f"native sampling cannot honor active source controls {sorted(unsupported)}; "
+        raise ValueError(f"native sampling cannot honor active source controls {unsupported}; "
                          "pass an explicit sampling=Sampling(...) policy to text_generation")
     temperature = _generation_value(config, generation_config, "temperature", 1.0)
+    if temperature is None:
+        temperature = 1.0
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
     top_k = _generation_value(config, generation_config, "top_k", defaults["top_k"])
@@ -581,6 +733,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         language_model = models.build("causal_transformer", **built["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
+        audio_record = record["audio"]
         model = MultimodalTransformer(
             language_model, tower_from_record(record["tower"]),
             projector_from_record(record["projector"]), family,
@@ -588,6 +741,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             pad_token_id=config["text_config"].get("pad_token_id", 0),
             extra_placeholder_ids=(tuple(config.get(name, default) for name, default in
                 (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
+            audio=None if audio_record is None else tower_from_record(audio_record),
+            audio_projection=None if audio_record is None else projector_from_record(record["audio_projector"]),
+            audio_soft_tokens=record["audio_soft_tokens"],
             attention_impl=None if attention_impl == "reference" else attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record))
         layouts, retained = _wrapper_layouts(tensors, record)
@@ -613,11 +769,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         from transformers import AutoProcessor
         options = {"backend": "pil"} if family == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        processor = Processor(reference, config, record)
+        processor = Processor(reference, config, record, model.vocab_size)
     elif (directory / "tokenizer_config.json").exists():
         from transformers import AutoTokenizer
         reference = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
-        processor = Processor(reference, config, record)
+        processor = Processor(reference, config, record, model.vocab_size)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     error = None

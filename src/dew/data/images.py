@@ -237,28 +237,9 @@ class OxfordFlowers(ImageDataset):
                 "TFDS ArrayRecords. Prepare oxford_flowers102 separately with "
                 "download_and_prepare(file_format='array_record'), then pass "
                 "the builder.data_dir version directory to training.")
-        directory = epath.Path(os.path.expanduser(self.path))
-        if not all((directory / name).is_file()
-                   for name in ("dataset_info.json", "features.json")):
-            raise FileNotFoundError(
-                f"No prepared TFDS metadata at {self.path!r}. Run "
-                "download_and_prepare(file_format='array_record') in a "
-                "separate preparation environment, then set --data.path to "
-                "its builder.data_dir.")
-        import tensorflow_datasets as tfds
-        builder = tfds.builder_from_directory(directory)
-        if builder.info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
-            raise ValueError(
-                f"Prepared data at {self.path!r} uses {builder.info.file_format}, "
-                "but OxfordFlowers reads ArrayRecords without TensorFlow. "
-                "Prepare file_format='array_record' in a separate directory.")
-        for instruction in builder.info.splits[self.split].file_instructions:
-            if not epath.Path(instruction.filename).is_file():
-                raise FileNotFoundError(
-                    f"Missing prepared ArrayRecord shard {instruction.filename!r}. "
-                    "Copy the complete prepared dataset or rerun preparation "
-                    "outside the training environment.")
-        return builder.as_data_source(self.split)
+        from .sources.tfds import prepared_source
+
+        return prepared_source(self.path, self.split)
 
     def record(self, element, rng):
         label = int(element["label"])

@@ -1,5 +1,6 @@
 """Reporting persists real results and releases owned sinks on failures."""
 
+import io
 import json
 import math
 
@@ -191,3 +192,109 @@ def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch
         store.close()
     assert exit_codes == [1]
 
+
+def fit(tracker, objective=None):
+    """Two logged steps of the small regression through `tracker`."""
+    trainer = Trainer(objective or Regression(), optax.sgd(0.01), key=jax.random.key(0),
+                      tracker=tracker)
+    return trainer.fit(Dataset(batches, None, None, 8), steps=2, log_every=1)
+
+
+def mlflow_store(tmp_path, monkeypatch):
+    """A local MLflow store under `tmp_path`. MLflow 3.16 gates its file
+    backend behind this switch, and a file store keeps the run's artifacts in
+    the temporary directory instead of a cwd-relative artifact root."""
+    pytest.importorskip('mlflow')
+    monkeypatch.setenv('MLFLOW_ALLOW_FILE_STORE', 'true')
+    return (tmp_path / 'mlruns').as_uri()
+
+
+def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkeypatch):
+    store = mlflow_store(tmp_path, monkeypatch)
+    import mlflow.artifacts
+    from dew.training import MLflowTracker
+
+    with MLflowTracker('dew-reporting', 'tiny-fit', uri=store) as tracker:
+        fit(tracker)
+        tracker.artifact(ImageGrid(np.zeros((1, 8, 8, 3)), ('a caption',)), 2)
+        client, run = tracker.run
+
+    assert [(point.step, math.isfinite(point.value))
+            for point in client.get_metric_history(run, 'train/loss')] == [(1, True), (2, True)]
+    assert client.get_run(run).info.status == 'FINISHED'
+    assert ({file.path for file in client.list_artifacts(run, 'records')}
+            == {'records/FitStarted-0.json', 'records/FitEnded-2.json'})
+    artifacts = client.get_run(run).info.artifact_uri
+    outcome = mlflow.artifacts.load_dict(f'{artifacts}/records/FitEnded-2.json')
+    assert outcome['step'] == 2 and outcome['value']['status'] == 'completed'
+    assert ({file.path for file in client.list_artifacts(run, 'previews/step-2')}
+            == {'previews/step-2/preview-2-0.png', 'previews/step-2/preview-2.json'})
+    drawn = mlflow.artifacts.download_artifacts(f'{artifacts}/previews/step-2/preview-2-0.png')
+    assert Image.open(drawn).size == (8, 8)
+
+
+def test_mlflow_marks_the_run_of_a_failed_fit_failed(tmp_path, monkeypatch):
+    store = mlflow_store(tmp_path, monkeypatch)
+    from dew.training import MLflowTracker
+
+    class Broken(Regression):
+        def loss(self, params, batch, step):
+            raise ValueError('objective broke')
+
+    with MLflowTracker('dew-reporting', 'failed-fit', uri=store) as tracker:
+        with pytest.raises(ValueError, match='objective broke'):
+            fit(tracker, Broken())
+        client, run = tracker.run
+    assert client.get_run(run).info.status == 'FAILED'
+
+
+def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):
+    pytest.importorskip('tensorboard')
+    from tensorboard.backend.event_processing.event_accumulator import (
+        EventAccumulator, IMAGES, SCALARS, TENSORS,
+    )
+    from dew.training import TensorBoardTracker
+
+    with TensorBoardTracker(tmp_path / 'events') as tracker:
+        fit(tracker)
+        tracker.artifact(ImageGrid(np.zeros((1, 8, 8, 3)), ('a caption',)), 2)
+        tracker.artifact(Representations(np.zeros((4, 3)), np.zeros((4,))), 2)
+
+    reader = EventAccumulator(str(tmp_path / 'events'),
+                              size_guidance={SCALARS: 0, IMAGES: 0, TENSORS: 0})
+    reader.Reload()
+    assert [(point.step, math.isfinite(point.value))
+            for point in reader.Scalars('train/loss')] == [(1, True), (2, True)]
+    outcome = json.loads(reader.Tensors('reporting/FitEnded')[0].tensor_proto.string_val[0])
+    assert outcome['status'] == 'completed'
+    assert json.loads(reader.Tensors('reporting/FitStarted')[0]
+                      .tensor_proto.string_val[0])['target_steps'] == 2
+    drawn = reader.Images('val/samples/0')
+    assert [(image.step, Image.open(io.BytesIO(image.encoded_image_string)).size)
+            for image in drawn] == [(2, (8, 8))]
+    assert json.loads(reader.Tensors('val/samples/captions')[0]
+                      .tensor_proto.string_val[0]) == ['a caption']
+    assert reader.Histograms('val/representation_std')[0].histogram_value.num == 3
+
+
+def test_the_previews_tensorboard_can_show_render_and_the_rest_raises(tmp_path):
+    pytest.importorskip('tensorboard')
+    from tensorboard.backend.event_processing.event_accumulator import (
+        EventAccumulator, IMAGES, TENSORS,
+    )
+    from dew.training import TensorBoardTracker
+
+    with TensorBoardTracker(tmp_path / 'events') as tracker:
+        # Distinct frames: a GIF drops one that does not differ from the last.
+        clip = np.stack([np.full((8, 8, 3), -1.0), np.full((8, 8, 3), 1.0)])[None]
+        tracker.artifact(VideoGrid(clip, ('a clip',)), 1)
+        tracker.artifact(TextSamples(np.array([[1, 2]]), texts=('text',)), 1)
+        with pytest.raises(TypeError, match='no renderer for TokenScores'):
+            tracker.artifact(TokenScores(np.zeros((1, 2)), np.ones((1, 2))), 1)
+
+    reader = EventAccumulator(str(tmp_path / 'events'), size_guidance={IMAGES: 0, TENSORS: 0})
+    reader.Reload()
+    clip = Image.open(io.BytesIO(reader.Images('val/samples/0')[0].encoded_image_string))
+    assert (clip.format, clip.n_frames) == ('GIF', 2)
+    assert json.loads(reader.Tensors('val/samples')[0]
+                      .tensor_proto.string_val[0]) == {'prompt': '', 'texts': ['text']}

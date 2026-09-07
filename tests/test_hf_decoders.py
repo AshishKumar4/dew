@@ -95,6 +95,8 @@ from dew.nn.gpt_oss import dequantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+# The committed byte-level BPE an export can name without a download.
+TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-tools"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
@@ -649,7 +651,7 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
     model, variables = fp32_decoder(FIXTURES / name)
     export = tmp_path / name
 
-    save_pretrained_decoder(model, variables, export, tokenizer_name="byte")
+    save_pretrained_decoder(model, variables, export, tokenizer="byte")
     again, reloaded = fp32_decoder(export)
 
     # against the fixture's config, not the exported one read twice: a field
@@ -662,7 +664,55 @@ def test_export_round_trips_the_weights_and_the_config(name, tmp_path):
         assert np.array_equal(np.asarray(leaf),
                               np.asarray(flat_tree(variables['params'])[path])), path
     generation = json.loads((export / "generation_config.json").read_text())
+    # Dew's byte vocabulary is no HF tokenizer and has no files to write, so
+    # the name it was exported with is the whole record of it.
     assert generation['tokenizer_name'] == "byte"
+    assert not (export / "tokenizer_config.json").exists()
+
+
+def test_an_export_carries_the_tokenizer_it_names(tmp_path):
+    """A named tokenizer writes its own files into the export directory.
+
+    What makes the directory a checkpoint rather than weights: transformers'
+    AutoTokenizer, llama.cpp's converter and everything built on it look for
+    tokenizer_config.json beside the weights, and a `tokenizer_name` string
+    is not a tokenizer. The name is resolved through the loader a training
+    run uses, from local files only, so an export copies what the host
+    already has and reaches nothing.
+    """
+    from transformers import AutoTokenizer
+
+    model, variables = fp32_decoder(FIXTURES / "llama-tiny")
+    export = tmp_path / "named"
+
+    save_pretrained_decoder(model, variables, export, tokenizer=str(TOKENIZER))
+
+    assert (export / "tokenizer_config.json").exists()
+    written = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
+    expected = AutoTokenizer.from_pretrained(str(TOKENIZER), local_files_only=True)
+    assert written.get_vocab() == expected.get_vocab()
+    assert written.encode("The trainer") == expected.encode("The trainer")
+    assert json.loads((export / "generation_config.json").read_text()
+                      )['tokenizer_name'] == str(TOKENIZER)
+
+
+def test_a_tokenizer_object_is_exported_without_being_named(tmp_path):
+    """An export given the tokenizer itself writes its files and records no
+    name: an HF tokenizer knows its vocabulary, not which hub repo or run a
+    caller means by it, and the directory it lands in is the answer to that.
+    """
+    from transformers import AutoTokenizer
+
+    model, variables = fp32_decoder(FIXTURES / "llama-tiny")
+    export = tmp_path / "object"
+
+    save_pretrained_decoder(model, variables, export,
+                            tokenizer=AutoTokenizer.from_pretrained(
+                                str(TOKENIZER), local_files_only=True))
+
+    assert (export / "tokenizer_config.json").exists()
+    assert "tokenizer_name" not in json.loads(
+        (export / "generation_config.json").read_text())
 
 
 def biased_qwen3(rng):
@@ -1116,7 +1166,7 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
     params = model.init(rng, jnp.ones((1, 4), jnp.int32))
     prompt = jax.random.randint(rng, (1, 3), 0, 64)
 
-    cache = model.apply(params, 1, method=type(model).init_cache, mutable=["cache"])[1]["cache"]
+    cache = model.apply(params, 1, method="init_cache", mutable=["cache"])[1]["cache"]
     variables = {**params, "cache": cache}
     logits, mutated = model.apply(variables, prompt, decode=True, mutable=["cache"])
     first = jnp.argmax(logits[:, -1], axis=-1)
@@ -1513,9 +1563,9 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
     directory = FIXTURES / "qwen35-tiny"
     model, variables = fp32_decoder(directory, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    full = model.apply(variables, ids)
+    full = jnp.asarray(model.apply(variables, ids))
 
-    cache = model.apply(variables, ids.shape[0], method=type(model).init_cache,
+    cache = model.apply(variables, ids.shape[0], method="init_cache",
                         mutable=["cache"])[1]["cache"]
     logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
                                   decode=True, mutable=["cache"])
@@ -2244,7 +2294,7 @@ def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
     steps through the KV cache agree with the whole sequence."""
     model, variables = fp32_decoder(GEMMA3N, max_seq_len=16)
     ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
-    full = model.apply(variables, ids)
+    full = jnp.asarray(model.apply(variables, ids))
     state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
     steps = []
     for position in range(ids.shape[1]):

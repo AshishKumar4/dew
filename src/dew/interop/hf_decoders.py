@@ -34,7 +34,8 @@ import os
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple, Union
+from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Protocol,
+                    Tuple, Union)
 
 import ml_dtypes
 import numpy as np
@@ -46,7 +47,8 @@ from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
-from dew.registry import models
+from dew.registry import from_record, models
+from dew.nn import audio as audio_nn
 from dew.nn import vision as vision_nn
 
 GENERATION_CONFIG_FILE = "generation_config.json"
@@ -82,7 +84,7 @@ _LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
 
 _IGNORED_FIELDS = {
     'architectures', 'attention_dropout', 'attn_implementation', 'auto_map',
-    'bos_token_id', 'cache_implementation', 'dtype', 'eos_token_id',
+    'bos_token_id', 'cache_implementation', 'chunk_size_feed_forward', 'dtype', 'eos_token_id',
     'id2label', 'initializer_range', 'is_encoder_decoder', 'label2id',
     'max_window_layers', 'mlp_bias', 'output_attentions',
     'output_hidden_states', 'pad_token_id', 'pretraining_tp',
@@ -1450,6 +1452,11 @@ def _wrapper_image_id(hf_config: Mapping[str, Any], used: set, *names: str) -> i
             f"the image positions are marked by {list(names)}, none is set")
 
 
+# Every wrapper record carries the audio fields; families without an audio
+# tower carry them as None.
+_NO_AUDIO: Dict[str, Any] = {"audio": None, "audio_projector": None, "audio_token_id": None, "audio_soft_tokens": None}
+
+
 def _wrapper_tokens(hf_config: Mapping[str, Any], used: set) -> None:
     """The wrapper-level keys every multimodal repo carries, marked read."""
     used.update(("architectures", "tie_word_embeddings", "torch_dtype",
@@ -1495,6 +1502,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         "projector": projector,
         "image_token_id": image,
         "tokens_per_image": _record_int(projector, "tokens_per_side") ** 2,
+        **_NO_AUDIO,
     }
 
 
@@ -1521,7 +1529,41 @@ def _llama4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         "projector": projector,
         "image_token_id": image,
         "tokens_per_image": int(tokens),
+        **_NO_AUDIO,
     }
+
+
+def _wrapper_audio(hf_config: Mapping[str, Any], used: set, text_width: int) -> Dict[str, Any]:
+    """The optional audio tower, its embedder and placeholder id for a Gemma wrapper.
+
+    Gemma 4 projects encoded frames through the same norm-and-project
+    embedder as its images, at the encoder's output width; the processor
+    inserts exactly one placeholder per valid encoded frame. Gemma 3n keeps
+    a fixed audio_soft_tokens_per_image slots per clip through its vocabulary
+    embedder.
+    """
+    audio = hf_config.get("audio_config")
+    used.update(("audio_config", "audio_token_id", "audio_soft_tokens_per_image"))
+    if audio is None:
+        return dict(_NO_AUDIO)
+    encoder = audio_nn.audio_config(audio)
+    record: Dict[str, Any] = {"audio": {"kind": audio["model_type"], **asdict(encoder)},
+                              "audio_token_id": _wrapper_image_id(hf_config, used, "audio_token_id"),
+                              "audio_soft_tokens": None}
+    if isinstance(encoder, audio_nn.Gemma4Audio):
+        record["audio_projector"] = vision_nn.translate_gemma4_projector_config(
+            {"hidden_size": encoder.output_proj_dims, "rms_norm_eps": encoder.rms_norm_eps}, text_width)
+    else:
+        slots = hf_config.get("audio_soft_tokens_per_image")
+        if type(slots) is not int or slots < 1:
+            _refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
+        record["audio_soft_tokens"] = slots
+        record["audio_projector"] = {"kind": "gemma3n", **asdict(from_record(vision_nn.Gemma3nProjector, {
+            "vision_width": encoder.hidden_size, "text_width": text_width,
+            "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
+            "norm_eps": encoder.rms_norm_eps}))}
+    return record
+
 
 def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
     """A Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
@@ -1532,17 +1574,10 @@ def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         tower, text["emb_features"])
     image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(hf_config, used)
-    audio = hf_config.get("audio_config")
-    if audio is None:
-        used.add("audio_config")
-    else:
-        _refuse("audio_config",
-                "the audio tower has no counterpart here; only wrappers without "
-                "one translate")
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
     # vision_soft_tokens_per_image is the processor's budget, not the count.
-    used.update(("vision_soft_tokens_per_image", "video_token_id", "audio_token_id",
+    used.update(("vision_soft_tokens_per_image", "video_token_id",
                  "boa_token_id", "eoa_token_id", "eoa_token_index"))
     return {
         "model_type": "gemma4",
@@ -1552,6 +1587,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         "projector": projector,
         "image_token_id": image,
         "tokens_per_image": None,
+        **_wrapper_audio(hf_config, used, _record_int(text, "emb_features")),
     }
 
 
@@ -1575,14 +1611,12 @@ def _qwen35_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
         "projector": projector,
         "image_token_id": image,
         "tokens_per_image": None,
+        **_NO_AUDIO,
     }
 
 
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
-    """An image-only Gemma 3n wrapper with MobileNet and both vision embeddings."""
-    if hf_config.get("audio_config") is not None:
-        _refuse("audio_config", "Gemma 3n audio is not implemented; an image-only bundle must omit its audio config and weights")
-    used.update(("audio_config", "chunk_size_feed_forward"))
+    """A Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_gemma3n_vision_config(hf_config)
     projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
@@ -1592,21 +1626,21 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> dict[st
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
     image = _wrapper_image_id(hf_config, used, "image_token_id")
     _wrapper_tokens(hf_config, used)
-    used.update(("vision_soft_tokens_per_image", "audio_soft_tokens_per_image", "audio_token_id",
-                 "boa_token_id", "eoa_token_id"))
+    used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
     return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
             "tower": tower, "projector": projector, "image_token_id": image,
-            "tokens_per_image": count}
+            "tokens_per_image": count,
+            **_wrapper_audio(hf_config, used, _record_int(text, "emb_features"))}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """A multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5 and image-only gemma3n bundles translate.
-    Records retain the decoder, tower, projector, image token ID and token
-    count. Gemma 3n's projector also embeds hard vision-vocabulary IDs.
-    Callers mask non-text IDs before the per-layer embedding lookup.
-    Audio config and weights remain unsupported.
+    gemma3, llama4, gemma4, qwen3_5 and gemma3n bundles translate. Records
+    retain the decoder, tower, projector, image token ID and token count, and
+    for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
+    audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
+    embedders also embed their hard vocabulary ranges.
     """
     model_type = hf_config.get("model_type")
     used = {"model_type"}
@@ -1668,27 +1702,34 @@ _WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
 _WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
                              "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
                              "gemma3n": "embed_vision."}
+# Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
+_WRAPPER_AUDIO_PREFIX = "audio_tower."
+_WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
 
 
 def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
                               record: Mapping[str, Any]) -> Dict[str, Any]:
-    """Wrapper tensors into language, tower and projector trees, in fp32.
+    """Wrapper tensors into language, tower, projector and audio trees, in fp32.
 
     One leading `model.` comes off every name first, which is the released
     nesting; what stays routes by prefix. The language half rides the text
     family's own map, including the top-level tied head copy, and the tower
     and projector halves ride theirs. Gemma 4 keeps its embedder under
     `embed_vision`, and Qwen 3.5 keeps its merger inside the vision model, so
-    the projector prefix runs before the tower's. A prefix outside the three
+    the projector prefix runs before the tower's. A record with an audio
+    tower routes `audio_tower` and `embed_audio` too. A prefix outside those
     raises ValueError with the tensor name.
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
     tower_prefix = _WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = _WRAPPER_PROJECTOR_PREFIX[projector_kind]
+    audio = record.get("audio")
     text_tensors: Dict[str, np.ndarray] = {}
     tower_tensors: Dict[str, np.ndarray] = {}
     projector_tensors: Dict[str, np.ndarray] = {}
+    audio_tensors: Dict[str, np.ndarray] = {}
+    audio_projector_tensors: Dict[str, np.ndarray] = {}
     for name, tensor in hf_tensors.items():
         bare = name[6:] if name.startswith("model.") else name
         if bare.startswith("language_model."):
@@ -1702,16 +1743,29 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             projector_tensors[bare[len(projector_prefix):]] = tensor
         elif bare.startswith(tower_prefix):
             tower_tensors[bare[len(tower_prefix):]] = tensor
+        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PROJECTOR_PREFIX):
+            audio_projector_tensors[bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]] = tensor
+        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
+            audio_tensors[bare[len(_WRAPPER_AUDIO_PREFIX):]] = tensor
         elif bare == "lm_head.weight":
             text_tensors["lm_head.weight"] = tensor
         else:
             raise ValueError(f"unknown tensor name {name!r}")
-    return {
+    variables = {
         "language_model": translate_weights(text_tensors, record["text"]),
         "tower": _wrapper_tower_variables(tower_kind, tower_tensors),
         "projector": {"params": _wrapper_projector_weights(projector_kind,
                                                             projector_tensors)},
     }
+    if audio is not None:
+        encoder = vision_nn.tower_from_record(audio)
+        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+            raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
+        variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder)
+        variables["audio_projector"] = {"params": _wrapper_projector_weights(
+            record["audio_projector"]["kind"], audio_projector_tensors)}
+    return variables
+
 
 
 # Where a layer's norms sit in the two trees. Without the sandwich the names
@@ -2061,8 +2115,48 @@ def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
         allow_patterns=["*.safetensors", "*.json"]))
 
 
+class ExportTokenizer(Protocol):
+    """A tokenizer that writes its own HF files. The byte vocabulary has none, so it is recorded by name only."""
+
+    def save_pretrained(self, directory: str, /) -> object: ...
+
+
+def save_export_assets(directory, *, tokenizer: Union[str, ExportTokenizer, None] = None,
+                       generation_config: Optional[Mapping[str, Any]] = None) -> None:
+    """Write the tokenizer files and generation_config.json beside exported weights.
+
+    Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
+    vocabulary through tokenizer_config.json, so a name alone is not a loadable export.
+    A name is resolved through `tokenizer_for` from local files only and recorded under
+    `tokenizer_name`, which is the whole record for the byte vocabulary.
+    """
+    values: Dict[str, Any] = ({'do_sample': True, 'use_cache': True}
+                              if generation_config is None else dict(generation_config))
+    name: Optional[str] = None
+    writer: Optional[ExportTokenizer] = None
+    if isinstance(tokenizer, str):
+        from dew.data.text import ByteTokenizer, tokenizer_for
+        name = tokenizer
+        resolved = tokenizer_for(tokenizer, local_files_only=True)
+        # Dew's byte vocabulary is no HF tokenizer and no HF file describes
+        # it, so the name it was exported with is the whole record of it.
+        writer = None if isinstance(resolved, ByteTokenizer) else resolved
+    elif tokenizer is not None:
+        writer = tokenizer
+        recorded = getattr(tokenizer, 'name', None)
+        name = recorded if isinstance(recorded, str) else None
+    os.makedirs(directory, exist_ok=True)
+    if writer is not None:
+        writer.save_pretrained(str(directory))
+    if name is not None:
+        values.setdefault('tokenizer_name', name)
+    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
+        json.dump(values, handle, indent=2)
+
+
 def save_pretrained_decoder(model, variables, directory, *,
-                            tokenizer_name: Optional[str] = None) -> None:
+                            tokenizer: Union[str, ExportTokenizer, None] = None,
+                            generation_config: Optional[Mapping[str, Any]] = None) -> None:
     """Write a decoder back out in the HF layout: config.json, model.safetensors.
 
     The inverse of load_pretrained, the same field map run backwards.
@@ -2071,6 +2165,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     predicate matches the model names the model_type: a model with the
     sandwich norms writes gemma3_text, one with q/k norms qwen3, one with
     biased q/k/v over a bias-free o_proj qwen2, and a plain stack llama.
+
+    `tokenizer` is the vocabulary the weights were trained against, by object
+    or by name; `save_export_assets` writes its files beside them, so one call
+    leaves a directory `load_pretrained` reads back with its processor. This is
+    the writer `Pretrained.save` delegates a decoder to, so the two agree on
+    what a complete export contains.
     """
     from dew.interop.safetensors_io import save_hf_layout
 
@@ -2112,13 +2212,8 @@ def save_pretrained_decoder(model, variables, directory, *,
         hf_tensors[hf_name] = np.ascontiguousarray(
             leaf.T if name.endswith('.kernel') else leaf)
 
-    os.makedirs(directory, exist_ok=True)
     save_hf_layout(hf_tensors, config, directory)
-    generation_config: Dict[str, Any] = {'do_sample': True, 'use_cache': True}
-    if tokenizer_name is not None:
-        generation_config['tokenizer_name'] = tokenizer_name
-    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
-        json.dump(generation_config, handle, indent=2)
+    save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
 
 
 def _flatten(tree: Mapping[str, Any], prefix: str = '') -> Dict[str, Any]:

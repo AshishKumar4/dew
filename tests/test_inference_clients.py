@@ -71,10 +71,25 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
     sampling = Sampling(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1, eos_id=2)
     with pytest.raises(ValueError, match="vllm"):
         task("prompt", 5, sampling=sampling)
-    replace(task, provider="vllm")("prompt", 5, sampling=sampling)
+    vllm = replace(task, provider="vllm")
+    vllm("prompt", 5, sampling=sampling)
     assert calls[0]["repetition_penalty"] == 1.0
     assert calls[0]["stop_token_ids"] == [2]
     assert calls[0]["top_k"] == 4 and calls[0]["min_p"] == 0.1
+    # The SDK writes extra_body over the named parameters, so a policy field
+    # hidden there would reach the backend after the named checks passed.
+    policy = Sampling(temperature=0, top_p=0.5)
+    for hidden in ({"temperature": 1.5}, {"top_p": 1.0}, {"presence_penalty": 2}, {"repetition_penalty": 1.3}):
+        with pytest.raises(ValueError, match="conflict"):
+            vllm("prompt", 5, sampling=policy, extra_body=hidden)
+        with pytest.raises(ValueError, match="conflict"):
+            vllm.chat([{"role": "user", "content": "hi"}], 5, sampling=policy, extra_body=hidden)
+    with pytest.raises(ValueError, match="vllm"):
+        task("prompt", 5, sampling=policy, extra_body={"top_k": 5})
+    assert len(calls) == 1
+    vllm("prompt", 5, sampling=policy, extra_body={"temperature": 0.0, "guided_regex": "[a-z]+"})
+    assert calls[1]["temperature"] == 0.0 and calls[1]["top_p"] == 0.5
+    assert calls[1]["presence_penalty"] == 0.0 and calls[1]["guided_regex"] == "[a-z]+"
 
 
 def test_ollama_retains_sdk_metadata_and_full_options(clients):
@@ -99,10 +114,12 @@ def test_ollama_retains_sdk_metadata_and_full_options(clients):
 
 @pytest.mark.parametrize("answer", [
     {}, {"response": None}, {"response": {}}, {"response": "", "eval_count": -1},
-    {"response": "", "eval_count": True}, {"response": "", "eval_count": 1.5},
-    {"response": "", "eval_count": "3"},
+    {"response": "", "eval_count": 1.5},
 ])
-def test_ollama_rejects_bad_wire_fields_before_sdk_coercion(clients, answer):
+def test_ollama_malformed_or_negative_wire_values_fail(clients, answer):
+    """The public SDK methods parse the wire; unparsable text and counts fail
+    there, and a negative count fails in the adapter. Bool and numeric-string
+    counts are the SDK's own lax coercion and are not visible to the adapter."""
     task, _ = clients("ollama", lambda http, request, body: http.Response(200, json=answer))
     with pytest.raises(ValueError):
         task("a", 3)

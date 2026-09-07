@@ -102,6 +102,27 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
     assert largest(chunked_state, recurrent_state) < 1e-5
 
 
+def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
+    """Masked positive log differences must never reach exp in the chunk rule.
+
+    At g=-4 a 64-token chunk has finite outputs but exp of its unused upper
+    triangle overflows; masking afterwards leaves a 0*inf NaN in backward.
+    The recurrent form stays finite and supplies the behavioral reference.
+    """
+    query = jnp.asarray(np.random.default_rng(99).normal(size=(1, 64, 1, 4)) * .1, jnp.float32)
+    key, value = query * .7, query * .3
+    beta, decay = jnp.full((1, 64, 1), .2), jnp.full((1, 64, 1), -4.)
+
+    def differentiate(rule):
+        return jax.jit(jax.value_and_grad(lambda g: rule(query, key, value, g, beta)[0].sum()))(decay)
+
+    expected, expected_grad = differentiate(recurrent_gated_delta_rule)
+    actual, actual_grad = differentiate(chunk_gated_delta_rule)
+    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-5)
+    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-7, rtol=1e-5)
+
+
+
 def test_an_initial_state_is_carried_by_both_forms(reference):
     """Starting from a memory, as every decode step past the first does,
     matches the reference started from the same memory: 4.5e-07 chunked,

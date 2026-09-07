@@ -65,8 +65,12 @@ def hub(monkeypatch):
     """Hub names resolve to a local table, and record the load arguments."""
     calls = []
 
-    def load_dataset(name, split=None, **kwargs):
-        calls.append({"name": name, "split": split, **kwargs})
+    # `path` is what the library calls its first parameter; the double has to
+    # agree with it, because dew names every argument it forwards.
+    def load_dataset(path, split=None, **kwargs):
+        # The dataset and the split are what a reload has to get right; the
+        # rest of what dew names are the library's own defaults.
+        calls.append({"name": path, "split": split})
         return _table()
 
     monkeypatch.setattr(datasets, "load_dataset", load_dataset)
@@ -143,8 +147,8 @@ def test_the_table_loads_once_under_concurrent_reads(monkeypatch):
     the same table raced inside datasets and tore down tqdm's lock."""
     loads = []
 
-    def slow_load_dataset(name, split=None, **kwargs):
-        loads.append(name)
+    def slow_load_dataset(path, split=None, **kwargs):
+        loads.append(path)
         time.sleep(0.05)  # hold the first load open while the others arrive
         return _table()
 

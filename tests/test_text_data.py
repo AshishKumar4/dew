@@ -25,6 +25,7 @@ from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
 from dew.objectives.lm import LMObjective
+from dew.position import ENVELOPE
 from dew.training import Step
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -960,10 +961,9 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
 
 @pytest.mark.slow
 def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
-    """A resumed run builds its loader again, in a new process, and grain
-    checks the saved position against `repr(source)` before it will restore:
-    the description has to name the file, not an address in the process that
-    wrote it."""
+    """A resumed run builds its loader again, in a new process, and the saved
+    position is a record count into an order the source names: the description
+    has to name the file, not an address in the process that wrote it."""
     seq_len = 8
     _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len, seq_len=seq_len)
 
@@ -983,7 +983,7 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     after = list(itertools.islice(restored, 2 * epoch - 1))
     resumed = [row.tobytes() for batch in after for row in batch["text"]]
 
-    assert "object at 0x" not in json.loads(state)["data_source"], (
+    assert "object at 0x" not in json.loads(state)[ENVELOPE]["order"], (
         "a source described by its address can only be restored in the process "
         "that saved it")
     assert resumed == unseen

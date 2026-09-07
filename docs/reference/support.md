@@ -17,11 +17,11 @@ The [README model list](../../README.md#models) distinguishes complete supported
 
 The [family reference](model-families.md) describes checkpoint translation. The [language model guide](../concepts/language_models.md) covers training and generation. Configuration translation alone does not make an unfinished model workflow supported.
 
-Gemma 3, Llama 4, Gemma 4, Qwen 3.5, and image-only Gemma 3n have vision towers and wrapper translation with small reference fixtures. Some image paths support fixed-resolution still images only. Gemma 3n includes the MobileNet-v5 encoder and hard/soft vision embeddings; complete audio-bearing bundles still raise an error. Audio towers are not implemented. Diffusion Gemma has a block sampler and denoiser comparison against a small reference model; this does not mean its full released checkpoint was loaded on the local GPU.
+Gemma 3, Llama 4, Gemma 4, Qwen 3.5 and Gemma 3n load as complete native models with their checkpoint's processor, images for all five and waveforms for Gemma 3n and Gemma 4. Each has a tiny fixture covering the processor call, forward, backward, export and cached generation against the actual Transformers model; the [family reference](model-families.md) lists what each processor emits. Diffusion Gemma has a block sampler and denoiser comparison against a small reference model; this does not mean its full released checkpoint was loaded on the local GPU.
 
 The Gemma 3n reference comparisons use float32. On GPU, the strict comparison sets `precision=jax.lax.Precision.HIGHEST` on the tower, projector, and decoder. Default GPU precision and bf16 show larger differences on the scaled fixture. The bf16/cuDNN execution path was exercised separately; it is not qualified at the float32 reference tolerance.
 
-Gemma 3n hard-token embedding and input preparation check token ranges, including the image-only audio-ID restriction. Compiled callers must use `jit(checkify.checkify(...))` and call `Error.throw()` on the host before using the result. Ordinary `jit` alone does not support these checked boundaries.
+The processor validates token ids, placeholder counts and media shapes on the host before any device work; the compiled model runs pure kernels. Gemma 3n embeds its hard vision and audio vocabulary ranges through the embedders and masks them for its per-layer inputs on every call, including decode steps that sample such ids.
 
 
 ## Devices and numerical computation

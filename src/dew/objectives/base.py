@@ -27,6 +27,10 @@ from dew.artifacts import Artifacts
 
 if TYPE_CHECKING:
     from dew.inputs import InputSpec
+    from dew.inference.tasks import BlockGeneration, TextGeneration
+    from dew.sampling.pipelines import TextToImage
+
+    Task: TypeAlias = TextGeneration | BlockGeneration | TextToImage
 
 Variables: TypeAlias = Mapping[str, Any]
 """A flax variables dict: the `params` collection plus any other collection
@@ -190,6 +194,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def pipeline(self, state, *, ema: bool = True) -> Task:
+        """The trained model as its inference task over `state`'s weights.
+
+        `state` is the trainer's `TrainState`; the task binds `state.averaged`
+        when the objective keeps an EMA and `ema` asks for it, else
+        `state.params`, and runs on the mesh the state is placed on. No
+        reload, no copy. Objectives that generate nothing raise.
+        """
+        raise TypeError(f"{type(self).__name__} has no inference task")
+
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
         """One display per event, reusing first-batch scoring when available.
@@ -201,6 +215,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         hook's final outcome before any subsequent collective.
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
+
+def published(state, ema: bool) -> Variables:
+    """The weights a train state publishes: the EMA copy merged over the live
+    variables when the objective keeps one and `ema` asks for it."""
+    return state.averaged if ema and state.ema is not None else state.params
+
 
 def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
                 batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:

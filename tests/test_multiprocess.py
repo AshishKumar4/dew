@@ -528,6 +528,54 @@ def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_chec
     assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
+@pytest.fixture(scope="module")
+def elastic_checkpoint(tmp_path_factory):
+    """A three-step fit on two processes over `train_stream`, saved."""
+    directory = tmp_path_factory.mktemp("elastic-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, name="elastic", elastic=True,
+                       run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
+                       records=RECORDS)
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different global positions"
+    saved = json.loads(positions.pop())[worker.ENVELOPE]
+    assert saved["records"] == POOL_STEPS * worker.BATCH
+    return {"run_dir": directory / "run", "reports": reports}
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_checkpoint,
+                                                          processes):
+    """Two processes save where the run's data stopped, and one process or
+    four take it over.
+
+    Real processes, because a pool is where the position is gathered onto
+    every host, written by orbax from process zero and read back by
+    `read_position` against a process count that is not the one that wrote
+    it. The resumed pool has to land on the parameters of a pool of its own
+    size that nobody stopped: the global batches after the resume are the
+    global batches that run trained on, and the loss is a mean over the
+    step's rows, so which process holds which row cannot change them.
+    """
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(elastic_checkpoint["run_dir"], directory)
+    flags = {"name": "elastic", "elastic": True, "fsdp_size": 1,
+             "steps": 2 * POOL_STEPS, "records": RECORDS}
+
+    resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
+    whole = run_pool("fit", tmp_path / "whole", processes,
+                     run_dir=tmp_path / "whole-run", **flags)
+
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert json.loads(report["restored_dataset_state"])[worker.ENVELOPE]["records"] == (
+            POOL_STEPS * worker.BATCH)
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 # --------------------------------------------------------------------------
 # Preemption
 # --------------------------------------------------------------------------
@@ -874,8 +922,41 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         np.testing.assert_allclose(reports[0][name] + reports[1][name], single[name],
                                    rtol=1e-5, atol=1e-6)
     assert any(value < 0 for row in single["drawn_behavior"] for value in row)
+    # A task takes a resident global array without fetching it to the host;
+    # each rank generates from its own rows exactly as the direct call does.
+    for report in reports:
+        assert report["resident_addressable"] is False
+        assert report["resident_tokens"] == report["direct_tokens"]
+        np.testing.assert_allclose(report["resident_behavior"], report["direct_behavior"],
+                                   rtol=1e-5, atol=1e-6)
+    assert reports[0]["resident_tokens"] + reports[1]["resident_tokens"] == single["resident_tokens"]
     assert_same_parameters(dumped_params(tmp_path / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
+
+
+@pytest.mark.distributed
+def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
+    """Identical user code on one device and on a two-process pool: the run's
+    weights land on the mesh under the trainer's layout, each rank hands in
+    its own prompts, results stay row-sharded, and `host()` gives every rank
+    the rows a single process draws for the same prompts."""
+    from test_inference import make_lm_run, make_run
+
+    make_run(tmp_path / "diffusion", encoder="char_table", checkpoint="char_table")
+    make_lm_run(tmp_path / "lm")
+    runs = dict(run_dir=str(tmp_path / "diffusion"), lm_dir=str(tmp_path / "lm"))
+    reports = run_pool("pipeline", tmp_path, 2, fsdp_size=2, timeout=240, **runs)
+    single = run_worker("pipeline", tmp_path / "single.json", fsdp_size=1, devices=1, **runs)
+
+    for report in reports:
+        assert report["process_count"] == 2
+        assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["image_rows"] == report["rows"] == 3
+        assert any("fsdp" in spec for spec in report["parameter_specs"])
+    assert single["image_rows"] == single["rows"] == 6
+    np.testing.assert_allclose(reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5)
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["text"] + reports[1]["text"] == single["text"]
 
 
 @pytest.mark.distributed

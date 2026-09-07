@@ -69,56 +69,61 @@ Accumulation weights CE and MTP by the main supported-target mass, including tar
 
 ## Generate from a checkpoint
 
-`generate(model, variables, inputs, max_new_tokens, key=..., sampling=Sampling(...))` accepts the complete Flax variables mapping, including its outer `params` key. An integer array `(B, P)` is shorthand for all-valid text. For padding or media, pass `ModelInputs` from `dew.nn.inputs`; its `token_fields["attention_mask"]` is the sole validity source. The `Generation.tokens` array has shape `(B, P + max_new_tokens)` and preserves the input token slots.
+`load_pretrained` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its explicit variables tree, the checkpoint's own processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` is the front door over the same loader: it answers with a `TextGeneration` (or a `BlockGeneration` for DiffusionGemma) whose weights are placed once, on the default device or on a mesh, and whose sampling policy and budget come from the checkpoint. [Inference](inference.md) describes placement, `seed`, `host()` and `text`, and the workflows from a trained objective, a run directory and a published checkpoint.
 
-The real prompt plus continuation must fit `model.max_seq_len`; input padding consumes no capacity. `Sampling` carries temperature, top-k, top-p, min-p, EOS and the output padding id. `eos_id` accepts one id or a tuple of stop ids. EOS counts as a valid generated action. `Generation.lengths` counts response actions; `terminated` distinguishes EOS from the token budget. Likelihood arrays cover only the response: `behavior_log_probs` includes temperature/top-k/top-p/min-p, while `raw_log_probs` records the original policy. Ignore slots beyond each response length.
-
-Generation prepares inputs on the host and runs prefill and decode in one compiled call. Each row has its own cache cursor. Invalid tokens consume no cache slots; paused recurrent rows retain their convolution history and recurrent memory. Different valid lengths at the same padded shape reuse the executable. Changing batch size, padded width, model or sampling settings can still compile a new executable. Media conditioning runs at prefill; subsequent steps use the native model's cache and logical positions.
-
-On a mesh, rows split over the batch axes and parameters retain their placement. The decode executes a fixed number of steps. EOS disables cache writes and output recording for the finished row without skipping collectives. In a multi-process run, each process passes and receives its own rows. Processes validate inputs together and require matching input shapes and sampling settings. Invalid input on one rank raises on all ranks before device execution; this does not recover a failed device collective.
-
-### Generate through a task
-
-`TextGeneration` from `dew.inference` binds a decoder, one variables tree and the source's processor, so a call takes text or prepared inputs and returns the same `Generation` as `generate`. `bind` returns the task over other weights; a rollout binds a policy snapshot once and draws from it for the whole collection, with the actual and raw-policy likelihood of every action in the result.
+The real prompt plus continuation must fit `model.max_seq_len`; input padding consumes no capacity. `Sampling` carries temperature, top-k, top-p, min-p, EOS and the output padding id; the source's `generation_config.json` fills it for a loaded checkpoint, and `text_generation(sampling=...)` overrides it. Generation prepares inputs on the host and runs prefill and decode in one compiled call with one padded input shape and per-row cache cursors; different valid lengths at the same padded shape reuse the executable.
 
 ```python
-from dew.inference import TextGeneration
+import dew
+
+task = dew.pipeline("tests/fixtures/hf/gemma3-native-tiny", dtype="float32")
+print(task("token7 token9", 3, seed=1).text[0])
+```
+
+This example runs offline on the tiny Gemma 3 fixture that the wrapper tests use. A Hub name such as `"Qwen/Qwen3-0.6B"` works the same way with the `interop` extra and a download; a real checkpoint needs enough host and device memory for its weights and cache.
+
+```python
+import jax
+import numpy as np
+from dew.interop import load_pretrained
 from dew.sampling import Sampling
 
-policy = TextGeneration(model, variables, sampling=Sampling(temperature=0.8, top_k=40))
-drawn = policy([[1, 2, 3], [4, 5, 6]], 32, key=jax.random.key(0))
-later = policy.bind(state.params)
+source = "tests/fixtures/hf/gemma3-native-tiny"
+bundle = load_pretrained(source, dtype="float32", max_seq_len=64)
+images = np.load(f"{source}/raw_images.npy")          # uint8 [3, 32, 32, 3]
+inputs = bundle.processor(["token7 <start_of_image> token9",
+                           "token5 <start_of_image> token8 <start_of_image> token6"],
+                          images=[[images[0]], [images[1], images[2]]])
+logits = bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs())
+task = bundle.text_generation(sampling=Sampling(temperature=0))
+for text in task(inputs, 3, seed=1).text:
+    print(text)
 ```
 
-Serving stays outside Dew: export a checkpoint with `Pretrained.save` and serve it with vLLM or Ollama.
+The rows have different image counts, so the processor left-pads the shorter one; `inputs.token_fields["attention_mask"]` is the sole validity source and the padded slots consume no cache. Text-only prompts skip the `images` argument, and Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
 
-Checkpoint loading needs the `interop` extra and may download substantial files. The following complete checkpoint-to-text example is not part of the offline quickstart and has not been run during this documentation validation:
+To continue training, hand the loaded variables to the objective and feed `{"text": inputs}` batches to the trainer; `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names with the processor, so the directory loads again here and in Transformers.
 
 ```python
-# runs elsewhere: downloads Qwen weights and requires enough host/device memory
-import jax
-import jax.numpy as jnp
-from dew.interop import load_pretrained
-from dew.sampling import Sampling, generate
-from transformers import AutoTokenizer
+import optax
+from dew.data.dataset import Dataset
+from dew.objectives.lm import LMObjective
+from dew.training import Layout, MeshSpec, Trainer
 
-name = "Qwen/Qwen3-0.6B"
-tokenizer = AutoTokenizer.from_pretrained(name)
-pretrained = load_pretrained(name, max_seq_len=64)
-encoded = tokenizer("A short prompt", return_tensors="np")
-ids = jnp.asarray(encoded["input_ids"], dtype=jnp.int32)
-generated = generate(pretrained.model, pretrained.variables, ids, max_new_tokens=24,
-                     key=jax.random.key(1), sampling=Sampling(temperature=0.8, top_k=40,
-                                                            eos_id=tokenizer.eos_token_id))
-continuation = generated.tokens[0, ids.shape[1]:ids.shape[1] + int(generated.lengths[0])]
-print(tokenizer.decode(continuation.tolist(), skip_special_tokens=True))
+objective = LMObjective(bundle.model, inputs.tokens.shape[1] - 1,
+                        pretrained=bundle.variables, ema_decay=None, pad_id=0)
+rows = 2 * jax.device_count()
+batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
+data = Dataset(train=lambda: iter([{"text": batch}]), val=None, records=rows, batch=rows)
+trainer = Trainer(objective, optax.sgd(1e-4), key=jax.random.key(3),
+                  mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+state = trainer.fit(data, steps=1, log_every=1)
+bundle.save("gemma3-tiny-step1", variables=state.params)
 ```
 
-The displayed string contains only valid continuation tokens. `Generation.tokens` also contains the original prompt and padded response slots. The base model is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model.
+The base fixture is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
 
-Use `pretrained.model_config` when continuing training. A translated configuration, tiny reference parity, and full-checkpoint execution are distinct checks. [Decoder family reference](../reference/model-families.md) lists the translation coverage and limitations.
-
-## Diffusion language models and vision inputs
+## Diffusion language models and media inputs
 
 LLaDA and Dream use bidirectional masked-token prediction. They require a mask token ID and a masked-diffusion objective; replacing an autoregressive loss without changing the attention and corruption process is not sufficient.
 
@@ -194,47 +199,10 @@ python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-w
 
 Those token files must use the checkpoint tokenizer and arrange the intended clean prompt prefix and response canvases. The large-checkpoint command is not part of the CPU example and was not run here. Trainer checkpoints preserve optimizer and iterator state; `Pretrained.save` instead writes a complete source-format inference checkpoint.
 
-Multimodal wrapper translation separates decoder, vision tower, and projector variables. The projector produces soft image tokens, which enter the decoder at image positions. Supported paths and remaining restrictions are listed in the [capability reference](../reference/support.md). Ordinary `generate` is not a general multimodal preprocessing pipeline.
+A multimodal checkpoint loads as a `MultimodalTransformer`: the text decoder, the vision tower and projector, and for Gemma 3n and Gemma 4 the audio tower and its embedder, under the variable names `language_model`, `tower`, `projector`, `audio_tower` and `audio_projector`. The checkpoint's processor owns resizing, normalization, patching and placeholder expansion; Dew's `Processor` runs it and lays its outputs out row by row. `ModelInputs.tokens` is `[B, S]`; `token_fields` holds `attention_mask`, `positions`, `image_indices` and `image_groups` (the soft feature and the image behind each slot, -1 for text), `audio_indices` for audio slots and, for Qwen 3.5, the three-axis `rotary_positions`; `conditioning` holds the media, padded to the row with the most images or clips: `pixel_values` as `[B, images, ...]` in the processor's own layout, `image_position_ids` (Gemma 4) or `image_grid_thw` (Qwen 3.5) beside it, and `input_features` with `input_features_mask` as `[B, clips, frames, mel]`. The processor checks token ids, placeholder counts and media shapes on the host; the compiled model is pure. The same `ModelInputs` feeds `model.apply`, the objective and `generate`; media are evaluated at prefill and decode steps read the cache.
 
-Gemma 3n uses the MobileNet-v5 encoder. It accepts floating processor output shaped `[B, C, H, W]` and emits `[B, R * R, 2048]` features; `R` is `msfa_output_resolution`, 16 by default. Its projector handles soft image features and hard IDs from the vision vocabulary. `model_inputs` receives the decoder's scaled token embeddings, original IDs, projected soft tokens, and precomputed integer image positions. Set `per_layer_input_vocab=decoder.per_layer_input_vocab`. The prepared dictionary supplies `tokens`, `input_embeddings`, and `embedding_positions` to `decoder.apply`.
+Per family, the processor emits what the reference expects. Gemma 3 gives one fixed-resolution image per placeholder block. Llama 4 tiles each image into local tiles and a global tile with separator tokens, normalizing pixels in bfloat16 as its original implementation does; the loader widens them to float32 exactly. Gemma 4 emits padded patch streams with 2D patch positions and expands video placeholders that the decoder maps to the pad embedding. Qwen 3.5 packs channel-then-time patches with a per-image grid, and the loader derives the spatial rotary coordinates the reference's `get_rope_index` computes. Gemma 3n uses the MobileNet-v5 encoder, embeds its hard vision and audio vocabulary ranges through the multimodal embedders, and keeps placeholder ids for its per-layer inputs while masking the hard ranges, on training and decode steps alike. Audio clips carry a mask that is True for valid frames; Gemma 4 inserts one placeholder per encoded frame, Gemma 3n a fixed `audio_soft_tokens_per_image` per clip with the embedder's padding token in the remaining slots.
 
-`hard_embeddings` checks the interval `[vocab_offset, vocab_offset + vocab_size)`. `model_inputs` accepts only `[0, vocab_offset + vocab_size)`; it rejects negative and audio-vocabulary IDs before fusion. Both methods raise on invalid eager input. Compiled callers must use `jax.jit(checkify.checkify(...))` and call the returned `error.throw()` on the host before consuming the result or applying an update. Plain `jit` does not functionalize these checks. The private numerical path stays pure and does not clip or poison IDs.
+`bundle.save` writes trained variables under the source tensor names, including Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bitwise through training. The [family reference](../reference/model-families.md) lists each wrapper's fixture and processor inputs.
 
-This small projector demonstrates the checked boundary without a checkpoint:
-
-```python
-import jax
-import jax.numpy as jnp
-from jax.experimental import checkify
-from dew.nn.vision import Gemma3nProjectorModule
-
-projector = Gemma3nProjectorModule(vision_width=8, text_width=4,
-                                  vocab_offset=16, vocab_size=3)
-features = jnp.arange(8, dtype=jnp.float32).reshape(1, 1, 8)
-variables = projector.init(jax.random.key(0), features)
-soft_tokens = projector.apply(variables, features)
-text_embeddings = jnp.ones((1, 4, 4), dtype=jnp.float32)
-ids = jnp.array([[2, 16, 17, 18]], dtype=jnp.int32)
-image_positions = jnp.array([[2]], dtype=jnp.int32)
-
-def prepare(params, embeddings, tokens, soft, positions):
-    return projector.apply(params, embeddings, tokens, soft, positions,
-                           per_layer_input_vocab=16, method=projector.model_inputs)
-
-checked_prepare = jax.jit(checkify.checkify(prepare))
-error, inputs = checked_prepare(variables, text_embeddings, ids,
-                                soft_tokens, image_positions)
-error.throw()                         # On the host, before using inputs.
-print(inputs["tokens"].tolist())      # [[2, 0, 0, 0]]
-
-error, _ = checked_prepare(variables, text_embeddings, ids.at[0, 3].set(19),
-                           soft_tokens, image_positions)
-try:
-    error.throw()
-except ValueError:
-    print("Rejected unsupported token ID")
-```
-
-After `error.throw()` succeeds, the prepared dictionary can enter the decoder. Valid vision IDs map to zero only for its smaller per-layer embedding table; the fused image and hard-vision embeddings retain their values.
-
-Gemma 3n wrapper translation accepts image-only bundles whose audio config is absent or `None` and whose tensor files contain no audio component. Full released audio-bearing bundles remain unsupported. Translation checks the full vision record, its model type, and its `model_args` before tensor loading. Unknown computational fields, arbitrary timm backbones, classifier pooling, alternative norm layers, and feature-only timm wrappers are rejected.
+Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields; `audio_weights` converts the tower's own tensors, keeping Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)` with the mask subsampled to the encoder's frame rate. `dew.data.audio.AudioProcessor` builds the checkpoint's feature extractor from its `preprocessor_config.json` record and converts 16 kHz mono waveforms into those two arrays without resampling. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the vision-only scaling; Gemma 4 reuses `Gemma4ProjectorModule` with its input width taken from `output_proj_dims`.

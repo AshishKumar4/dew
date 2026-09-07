@@ -166,69 +166,56 @@ The model must implement Linen `hidden_states(tokens, train=..., positions=..., 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
-generate(model, params, inputs, max_new_tokens, *, key,
+generate(model, params, inputs, max_new_tokens, *, key=None, seed=None,
          sampling=Sampling()) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
 ```
 
-`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Scalar `positions` supplied in token fields continue from the last valid position.
+`params` is the complete variables tree. `inputs` is a `ModelInputs` from `dew.nn.inputs`, or an integer `(B, P)` array normalized to all-valid text. `ModelInputs.token_fields["attention_mask"]` identifies real token slots; there is no separate generation length argument. Every row needs a real token. Only real tokens count against `model.max_seq_len`. Conditioning arrays are batch-aligned and used during prefill; decode keeps the model's cached logical positions. Exactly one of `key` and `seed` is given; `seed=n` is `jax.random.key(n)`.
 
-The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over batch axes; each process receives its own rows. All participating processes validate inputs and agree on input shapes and sampling controls before device execution. Host input rejection propagates to peers; blocked device collectives cannot be recovered by this protocol. Changing padded shapes or static controls can still compile a new executable. Streaming and request scheduling are not part of this batch function.
+The compiled decoder uses one padded input shape with per-row cache cursors and a fixed trip count. Finished rows preserve their cached state. On a mesh, rows split over the batch axes and the result keeps that sharding; each process hands in its own rows, at the same count and padded width on every process, and reads them back with `Generation.host()`. Keys fold in the global row index, so a pool draws what one process draws for the same rows. Invalid input on one rank raises on all ranks before device execution.
 
 `Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering.
 
-`Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)`. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)` and zero invalid tails. Only slots below `lengths` are likelihoods. Behavior probabilities include temperature/top-k/top-p/min-p; raw probabilities describe the unmodified model. Greedy behavior has probability one for its selected action.
+`Generation.tokens` includes the original prompt and has shape `(B, P + max_new_tokens)` with `B` the placed rows. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. `rows` counts this process's real rows; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound.
 
-`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. GRPO compares current and old raw-policy likelihoods; it does not silently substitute the behavior distribution. Reward text excludes EOS and the invalid tail. Models explicitly declaring `causal=False` are refused by the next-token objective.
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`.
 
 ### Inference tasks
 
-Import `TextGeneration`, `BlockGeneration`, `TextToImage` and `DenoisingInputs` from `dew.inference`.
+Import `pipeline`, `TextGeneration`, `BlockGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`; `dew.pipeline` is the same front door. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
 ```text
-TextGeneration(model, variables, processor=None, sampling=Sampling())
-task(request, max_new_tokens, *, key, sampling=None, images=None) -> Generation
+pipeline(source, *, mesh=None, layout=None, dtype=None, ema=True, step=None, revision=None)
+    -> TextGeneration | BlockGeneration | TextToImage
+Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
+LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
+TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None)
+task(request, max_new_tokens=None, *, key=None, seed=None, sampling=None, images=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
-BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0)
-task(request, max_new_tokens, *, key, process=None, images=None) -> CanvasGeneration
+BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
+                max_new_tokens=None)
+task(request, max_new_tokens=None, *, key=None, seed=None, process=None, images=None) -> CanvasGeneration
 Pretrained.text_generation(sampling=None) -> TextGeneration
 Pretrained.block_generation() -> BlockGeneration
+TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
+            sampler=DDIM(), grid=None, final_denoise=True, finish=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
+TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None)
+TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None)
 image_task.bind(variables) -> TextToImage
-image_task.prepare(prompts, *, key) -> DenoisingInputs
-image_task(prompts_or_prepared, *, steps=50, sampler=DDIM(), guidance=None, key) -> jax.Array
+image_task.prepare(prompts, *, key=None, seed=None, steps=None) -> DenoisingInputs
+image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, seed=None) -> Images
+RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 ```
 
-A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text/numeric batches, floats, strings inside token rows and booleans are rejected without filtering rows or coercing IDs. `ModelInputs` carries prepared images and other numeric conditioning; raw images go through the bound processor in both text and canvas tasks.
+A task captures the variables mapping at construction and on `bind`. Replacing the caller's mapping does not change the existing task. Array buffers remain shared; do not mutate, donate or delete them while a task uses them. Text requests need a processor. Numeric token rows remain integers: mixed text and token rows, floats, booleans and strings are refused; a resident `jax.Array` or `ModelInputs` reaches the model without a host copy.
 
-Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` to choose an explicit supported policy. This override is a deliberate change of policy, not inferred equivalence with the source default.
+`max_new_tokens` defaults to the budget the source declares (a checkpoint's `max_new_tokens`, an LM run's `sample_tokens`, an objective's `Samples`); without one the call must pass it. Equal shapes and controls reuse the compiled executable, across calls and across `bind`.
 
-`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods. Text and canvas tasks retain different result types. `TextToImage.prepare` returns initial noise and encoded conditional/unconditional values. Passing those arrays back to the image task reuses preparation while varying a solver or guidance value. Rebinding the image task preserves its model and encoders.
+Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
 
-### Saved Diffusers pipelines
-
-Install `[image-pipelines]` for the optional Diffusers 0.34.0 adapter. `TextToImage.from_diffusers(directory, local_files_only=True)` loads a saved SD or SDXL pipeline through the source-specific adapter. The default sampler is the saved official scheduler; an explicit Dew solver uses the existing `Process` and solver loop. Negative prompts, supplied latents, and image/mask inputs follow the selected task. The returned images are NHWC in `[-1, 1]`.
-
-```python
-import jax
-from dew.inference import TextToImage
-
-pipe = TextToImage.from_diffusers("./saved-sd", local_files_only=True)
-objective = pipe.objective(ema_decay=None)
-variables = objective.init(jax.random.key(0))
-bound = pipe.bind(variables)
-images = bound(["a flower"], steps=2, key=jax.random.key(1))
-bound.save_pretrained("./pipeline-copy")
-```
-
-Use uint8 NHWC image batches with `pipe.inputs.tokenize(captions)`. For inpainting training, add `batch["mask"]`: a binary array shaped `[B, H, W, 1]`, with white pixels marking the region to repaint. The objective keeps the VAE, text towers and checker frozen; caption dropout preserves the mask and masked-image latent conditions. `TextToImage.from_objective(objective, updated_variables)` retains the checkpoint's inference task. Save bound variables with `save_pretrained`; reload preserves the configured resolution and checker state.
-
-The adapter supports SD and SDXL text-to-image, image-to-image and inpainting, plus the SDXL refiner's single projected text tower and aesthetic conditioning. Supply PIL images and masks to image tasks. Image-to-image also accepts NHWC image latents. For a base/refiner handoff, request `output_type="latent", denoising_end=0.8` from the base, then pass those latents as the refiner's `image` with `denoising_start=0.8`. Use matching step counts and image geometry. Nine-channel inpainting conditions the network on the mask; it does not promise exact copying of unmasked source pixels.
-
-SDXL uses both prompt towers when present. `prompt_2`, `negative_prompt_2`, resolution/crop coordinates and aesthetic scores follow the selected model's conditioning contract. Omitted negatives use zeros when the checkpoint enables `force_zeros_for_empty_prompt`; otherwise the adapter encodes empty prompts. Explicit empty negative prompts always use their encoded values. `prepare(prompts, key=key, negative_prompts=...)` supplies the same noise and conditions as a raw text-to-image call.
-
-Flax msgpack directories are the default input. With `from_pt=True`, the adapter reads UNet/VAE safetensors or legacy `.bin` weights and CLIP/checker safetensors. It uses official Flax model modules and Dew's native CLIP primitives on the current Transformers stack. For LMS, the official scheduler prepares the small sigma/timestep table once; Dew's existing JAX LMS solver executes the trajectory without per-step Torch latent transfers. PNDM consumes its complete expanded timetable. The reference tools pin Diffusers 0.34.0 and isolate Transformers 4.49.0; the runtime tests use Transformers 5.16.1.
-
+`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()` and `text`. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose sampler pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; exactly one of `steps` and `times` is passed, and an explicit grid decides the trajectory's length. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
 
 ### External engine clients
 
@@ -255,7 +242,7 @@ The convenience call returns `Completion(texts, finish_reasons, token_counts, us
 
 An explicit `sampling=Sampling(...)` sets the native policy controls supported by the selected backend. Ollama receives neutral repetition/presence/frequency penalties and explicit top-k/top-p/min-p values, so its hidden `repeat_penalty=1.1` default does not alter the request. Conflicting explicit options are refused. `OpenAICompletion(..., provider="vllm")` enables vLLM-specific Sampling translation, including `repetition_penalty=1.0` and optional EOS-token IDs. Without a Sampling value, provider defaults or the caller's SDK options apply. Native and backend tokenizers can still differ; this is not an RL interoperability guarantee.
 
-`stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama request conversion, HTTP behavior, error handling and line-stream framing use its SDK; the adapter validates counts before SDK coercion. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget and requested choice count cannot be overridden through provider extensions.
+`stream` returns native SDK response chunks. `chat(messages, max_new_tokens, stream=..., **parameters)` preserves SDK tools, tool-result messages, structured-output controls and media fields. Inject an `AsyncClient`/`AsyncOpenAI` and use `acall`, `astream` or `achat` for asynchronous execution. Ollama requests go through the SDK's public `generate` and `chat` methods, which own request conversion, HTTP behavior, error handling and line-stream framing; the adapter rejects request fields the installed SDK does not accept and negative token counts, and the SDK's own parsing rejects unparsable values. OpenAI completions use the SDK's public `with_raw_response` hook, so choice and usage fields are checked on the wire before parsing. OpenAI request parameters go to its completion/chat resources. vLLM-only parameters belong explicitly in `extra_body`. The task's model, prompt, token budget, requested choice count and an explicit `Sampling` policy cannot be overridden through provider extensions; the SDK writes `extra_body` over the named parameters, so a policy field there must equal the policy or the request is refused before any network call.
 
 Live CPU verification imported a locally trained Dew model through `Pretrained.save`, including tokenizer assets, then exercised official SDK completion and streaming on Ollama and its OpenAI-compatible endpoint. Native save/reload was exact. This does not establish numerical parity between Dew and Ollama, or a live vLLM run.
 

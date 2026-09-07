@@ -8,6 +8,9 @@ and nothing under `dew` outside these two packages may read `dew.rl`.
 from dew.data.preferences import IDS_KEY as PREFERENCE_IDS_KEY
 from dew.data.preferences import MASK_KEY as PREFERENCE_MASK_KEY
 
+from .episodes import (Action, Environment, EnvironmentFactory, Episode, EpisodeCancelled,
+                       EpisodeFailure, EpisodeId, EpisodeInference, EpisodeRecorder,
+                       EpisodeRollout, EpisodeStatus, Observation, Transition, Verifier)
 from .grpo import GRPOObjective
 from .flow import FlowGRPOObjective, FlowReward, FlowRollout
 from .preference import DPOObjective
@@ -19,4 +22,7 @@ __all__ = [
     "PREFERENCE_IDS_KEY", "PREFERENCE_MASK_KEY", "RESPONSE_MASK_KEY", "REWARDS_KEY",
     "Reward", "SampledRollout",
     "FlowGRPOObjective", "FlowReward", "FlowRollout",
+    "Action", "Environment", "EnvironmentFactory", "Episode", "EpisodeCancelled",
+    "EpisodeFailure", "EpisodeId", "EpisodeInference", "EpisodeRecorder", "EpisodeRollout",
+    "EpisodeStatus", "Observation", "Transition", "Verifier",
 ]

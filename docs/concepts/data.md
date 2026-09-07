@@ -46,6 +46,26 @@ Built-in sources such as `OxfordFlowers`, `TokenWindows`, and `ChatMessages` are
 
 Image sources can require network access on first use. Token-window sources read files created by the tokenizer preparation tool. Streaming sources may depend on remote servers and may not expose a restorable iterator position. See [recipes](../recipes.md) for entry points and [installation extras](../installation.md#add-optional-dependencies) for dependencies.
 
+## Read a dataset a provider already holds
+
+`dew.data.load("<provider>/<name>", batch=...)` returns the same `Dataset` a specification returns, for data TFDS or Hugging Face already holds. `preprocess(record, rng)` is required to turn a provider record into batch fields; there is no default, because a provider's rows are its own shape.
+
+```python
+import dew.data
+
+data = dew.data.load("tfds/dew_images", batch=8, split="train", val_split="test",
+                     path="/data/prepared", preprocess=lambda record, rng: {
+                         "image": record["image"]})
+```
+
+`split` and `val_split` take the provider's own split expressions; the validation pass is read in split order and never shuffled. `records` supplies the record count for a source that cannot report one. `seed` keys the order and the per-record RNG, and `shuffle_buffer` is how many rows a streamed split shuffles through. `Loading` remains performance only.
+
+`tfds/<builder>` reads the ArrayRecords a preparation run wrote under `path`, through TFDS's read-only builder, so the training process needs no TensorFlow. Preparation is never run here. `path` is either a prepared version directory or the `data_dir` above one, in which case `config` and `version` name the directory inside it; either way the prepared metadata is compared with the builder, config and version requested. `decoders` reaches the builder unchanged.
+
+`hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`, which downloads the dataset and writes its Arrow cache when the local cache holds neither. `dataset=` reads a split the caller already built. `config`, `data_files`, `features`, `storage_options` and the rest of that function's arguments are forwarded with its own types.
+
+`streaming=True` reads an `IterableDataset` as it goes. Such a split has no length, so `records` is `None` unless supplied, and `Dataset.steps_per_epoch` is `None`. Processes share the rows through `datasets.distributed.split_dataset_by_node`; a pool with more processes than the split has rows leaves a rank empty and is refused. A streamed split dew loads by name, unshuffled, resumes on the record it stopped at with the same per-record draws. Three kinds report no position instead: one read with `shuffle_buffer` set, because the buffer the shuffle drew from is not in what the library restores; one handed over as `dataset=`, because it arrives through transformations dew did not apply and an `IterableDataset` cannot be asked what it has been through; and one whose source implements no state in `datasets`. Those runs train with `checkpoint_every=None`, which `Trainer.fit` requires of any stream without a position.
+
 ## Epochs, batching, and packing
 
 `Dataset.steps_per_epoch` uses integer division of `records` by the global batch size when a record count is available. It returns `None` when the count is unknown. Use an explicit step target for a stream without a finite record count.
@@ -56,7 +76,24 @@ Padding and packing affect the number of valid targets, even when array shapes m
 
 ## Resume from a data position
 
-A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires compatible data ordering, tokenizer, transforms, and process topology as well as the model checkpoint.
+A restorable iterator implements `get_state()` and `set_state(state)`. Dew checkpoints the consumed iterator position when available. A resume requires the same data ordering, tokenizer, and transforms as the model checkpoint.
+
+A position is one of two kinds, and the kind decides whether the process count is part of the resume contract.
+
+| Kind | Written by | Resumes on |
+|---|---|---|
+| Global record count | Every record dataset built on `train_stream`: token windows, images, video, prompts, preference pairs | Any process count that divides the global batch |
+| Shard offset | `PackedTokens` and `ChatMessages`, whose windows are packed out of one process's own documents, and custom iterators reporting their own state | The process count that wrote it |
+
+A global position is the number of records the whole run has consumed. Every process reports the same number, because the stream owns both the sharding and the batching: step *k* is records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*th record of that step. A checkpoint saved by two processes therefore restores on one or on four, and the steps after the resume are the steps an uninterrupted run would have taken. Restoring is a slice bound, not a replay: the resumed stream reads nothing it has already read.
+
+The position also records the order it counts into: the source's description, its record count, and the shuffle seed. A resume against a different record count or a different seed is refused. Two corpora of the same length and seed are told apart only when the source describes itself; a source without its own `__repr__` is named by type, so give a source you resume across runs a description that names its data.
+
+Which process holds which row of a step still depends on the process count. Record *q* of step *k* is read by process *q % n*, and the mesh lays each process's rows out together, so the same step arrives in a different row order at a different process count. Row-keyed randomness such as diffusion noise or sampled timesteps therefore lands on different records, and two process counts agree on a loss only because it is a mean over the step's rows.
+
+A record's own randomness does not depend on the count: the per-record RNG is keyed by the record's place in the endless shuffled stream. That key changed with the global position, so at a given seed the augmentations, captions, and clip starts of a run differ from those of a run recorded before the change, even where the record order is identical.
+
+A shard offset has no equivalent on another process count, and `Checkpoints.restore` refuses one whose table was written by a different number of processes, naming both counts. Resume such a run on the count that wrote it; there is no conversion to a global position.
 
 [Resuming training](../guides/checkpoints.md) shows the complete save/restore path. A model-only checkpoint cannot recover records consumed by an arbitrary generator.
 
