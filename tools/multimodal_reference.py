@@ -42,17 +42,65 @@ def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str
 
 
 
-def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str]) -> None:
+def _runs(row: torch.Tensor, token_id: int) -> int:
+    """Contiguous placeholder runs in one row: one per image, tile or clip."""
+    marks = (row == token_id).long()
+    return int(((marks[1:] - marks[:-1]) == 1).sum() + marks[0])
+
+
+def _row_slices(encoded: dict, model) -> list[dict]:
+    """Each row of the batch encoding on its own, without padding.
+
+    Media tensors are sliced in placeholder-run order, which is the order the
+    processor emits them: images or tiles for pixel_values (patches for Qwen's
+    packed grids), clips for input_features. The model then sees exactly the
+    numbers the batch carries, so the reference does not depend on how the
+    reference model batches padded rows (Llama 4 scales attention by the
+    padded slot index) nor on how the processor frames padded audio.
+    """
+    valid = encoded["attention_mask"].bool()
+    image_id = model.config.image_token_id
+    grid = encoded.get("image_grid_thw")
+    image_offset = clip_offset = 0
+    singles = []
+    for row in range(encoded["input_ids"].shape[0]):
+        ids = encoded["input_ids"][row][valid[row]]
+        single = {"input_ids": ids[None], "attention_mask": torch.ones_like(ids)[None]}
+        for name in ("token_type_ids", "mm_token_type_ids"):
+            if name in encoded:
+                single[name] = encoded[name][row][valid[row]][None]
+        images = _runs(ids, image_id)
+        if grid is None:
+            single["pixel_values"] = encoded["pixel_values"][image_offset:image_offset + images]
+            if "image_position_ids" in encoded:
+                single["image_position_ids"] = encoded["image_position_ids"][image_offset:image_offset + images]
+        else:
+            patches = grid.prod(dim=1)
+            start = int(patches[:image_offset].sum())
+            stop = int(patches[:image_offset + images].sum())
+            single["pixel_values"] = encoded["pixel_values"][start:stop]
+            single["image_grid_thw"] = grid[image_offset:image_offset + images]
+        image_offset += images
+        if "input_features" in encoded:
+            clips = _runs(ids, model.config.audio_token_id)
+            single["input_features"] = encoded["input_features"][clip_offset:clip_offset + clips]
+            single["input_features_mask"] = encoded["input_features_mask"][clip_offset:clip_offset + clips]
+            clip_offset += clips
+        singles.append(single)
+    assert image_offset == (encoded["pixel_values"].shape[0] if grid is None else grid.shape[0])
+    return singles
+
+
+def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
+                            audio: list[np.ndarray] | None = None) -> None:
     """Actual wrapper forward, cached continuation, pixel gradient and SGD output.
 
-    Every reference quantity comes from one unpadded row at a time, so the
-    numbers do not depend on how the reference batches padded rows (Llama 4
-    scales attention by the padded slot index rather than the token position).
-    The padded batch encoding is what Dew consumes, and each row's tokens and
-    pixels are checked against it.
+    The padded batch encoding is what Dew consumes; every reference quantity
+    comes from the reference model over one row of it at a time.
     """
     rows = [[images[0]], [images[1], images[2]]]
-    encoded = processor(text=prompts, images=rows, padding=True, return_tensors="pt")
+    media: dict[str, object] = {} if audio is None else {"audio": list(audio)}
+    encoded = processor(text=prompts, images=rows, padding=True, truncation=False, return_tensors="pt", **media)
     # The fp32 reference widens bfloat16 processor pixels exactly.
     encoded["pixel_values"] = encoded["pixel_values"].float()
     valid = encoded["attention_mask"].bool()
@@ -61,12 +109,9 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
     updated = torch.zeros_like(logits)
     targets = int((valid[:, :-1] & valid[:, 1:]).sum())
     loss = torch.zeros(())
-    continuation, pixel_inputs, singles = [], [], []
-    for row, (prompt, row_images) in enumerate(zip(prompts, rows)):
-        single = processor(text=[prompt], images=[row_images], return_tensors="pt")
-        single["pixel_values"] = single["pixel_values"].float()
-        assert torch.equal(single["input_ids"][0], encoded["input_ids"][row][valid[row]])
-        singles.append(single)
+    continuation, pixel_inputs = [], []
+    singles = _row_slices(encoded, model)
+    for row, single in enumerate(singles):
         with torch.no_grad():
             logits[row, valid[row]] = model(**single, use_cache=False).logits[0]
             generated = model.generate(**single, max_new_tokens=3, do_sample=False,
@@ -77,7 +122,6 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
         predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
         loss = loss + torch.nn.functional.cross_entropy(
             predictions, single["input_ids"][0, 1:], reduction="sum") / targets
-    assert torch.equal(torch.cat([single["pixel_values"] for single in singles]), encoded["pixel_values"])
     loss.backward()
     np.save(destination / "pixel_gradient.npy", torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
     with torch.no_grad():
@@ -97,6 +141,29 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
         np.save(destination / f"{key}.npy", value.numpy())
     print(destination, "bytes", sum(p.stat().st_size for p in destination.iterdir()),
           "tokens", tuple(encoded["input_ids"].shape), "pixel_values", tuple(encoded["pixel_values"].shape))
+
+
+
+
+def write_gemma3n_native() -> None:
+    """The actual Gemma3nProcessor over images and audio: MobileNet-v5 features,
+    hard vocabulary ranges, fixed audio slots and per-layer input masking.
+
+    The complete checkpoint and processor stay in gemma-3n-audio-tiny, written
+    by tools/audio_wrapper_reference.py; only the references land here. This
+    run needs timm for the vision encoder.
+    """
+    from transformers import Gemma3nForConditionalGeneration
+
+    source = ROOT / "gemma-3n-audio-tiny"
+    destination = ROOT / "gemma3n-native-tiny"
+    destination.mkdir(parents=True, exist_ok=True)
+    model = Gemma3nForConditionalGeneration.from_pretrained(source, attn_implementation="eager").float().eval()
+    processor = AutoProcessor.from_pretrained(source, local_files_only=True)
+    audio = [np.load(source / "waveform_0.npy"), np.load(source / "waveform_1.npy")]
+    images = np.random.default_rng(2604).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
+    prompts = ["listen <audio> <image> ok", "say <image> <audio> again <image> ok"]
+    _write_forward_backward(model, processor, destination, images, prompts, audio=audio)
 
 
 

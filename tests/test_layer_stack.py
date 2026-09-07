@@ -79,7 +79,7 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
     CPU: 3.4e-06 (qwen3-tiny)."""
     model, scanned, variables, directory = fixture_pair(name, max_seq_len=16)
     ids = jnp.asarray(np.load(directory / "input_ids.npy")[:1, :8], jnp.int32)
-    whole = scanned.apply(variables, ids)
+    whole = jnp.asarray(scanned.apply(variables, ids))
 
     state = scanned.init(jax.random.key(0), ids[:, :1], decode=True)
     assert paths(state["cache"]) == paths(model.init(jax.random.key(0), ids[:, :1],

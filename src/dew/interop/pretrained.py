@@ -19,11 +19,13 @@ from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.sampling.text import Sampling
+from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
+from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 
 
@@ -48,14 +50,19 @@ class Processor:
     config: Mapping[str, object]
     record: Mapping[str, object]
 
-    def __call__(self, text: str | Sequence[str], *, images: object | None = None) -> ModelInputs:
+    def __call__(self, text: str | Sequence[str], *, images: object | None = None,
+                 audio: object | None = None) -> ModelInputs:
         import torch
 
+        # truncation is off for text anyway; reloaded Gemma processors forward
+        # the tokenizer's unset max_length into audio kwargs otherwise.
         arguments: dict[str, object] = {
             "text": text if isinstance(text, str) else list(text),
-            "padding": not isinstance(text, str) and len(text) > 1, "return_tensors": "pt"}
+            "padding": not isinstance(text, str) and len(text) > 1, "truncation": False, "return_tensors": "pt"}
         if images is not None:
             arguments["images"] = images
+        if audio is not None:
+            arguments["audio"] = audio
         arrays: dict[str, np.ndarray] = {}
         for name, value in self.reference(**arguments).items():
             if not isinstance(value, torch.Tensor):
@@ -68,7 +75,7 @@ class Processor:
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
-                 "image_position_ids", "image_grid_thw"}
+                 "image_position_ids", "image_grid_thw", "input_features", "input_features_mask"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -87,6 +94,17 @@ class Processor:
             if self.config.get("model_type") == "qwen3_5":
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
+        if ("input_features" in values) != ("input_features_mask" in values):
+            raise ValueError("input_features and input_features_mask arrive together")
+        if "input_features" in values:
+            audio_fields, audio_conditioning = self._audio(values, tokens)
+            token_fields.update(audio_fields)
+            conditioning = {**conditioning, **audio_conditioning}
+        text = self.record["text"]
+        if not isinstance(text, Mapping) or type(text.get("vocab_size")) is not int:
+            raise ValueError("the text record must carry its integer vocab_size")
+        if np.any(tokens < 0) or np.any(tokens >= text["vocab_size"]):
+            raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
         result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
         result.validate()
         return result
@@ -196,6 +214,63 @@ class Processor:
         if padded_grid is not None:
             conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
         return {"image_indices": jnp.asarray(indices), "image_groups": jnp.asarray(groups)}, conditioning
+
+    def _audio(self, values: Mapping[str, object], tokens: np.ndarray
+               ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        """Row-align the processor's clip features and index their placeholders.
+
+        Each contiguous run of the audio placeholder is one clip, in the
+        processor's clip order. Gemma 4 inserts one placeholder per encoded
+        valid frame; Gemma 3n inserts its fixed slot count. Both are checked
+        against the encoder's frame stride here, before any device work.
+        """
+        audio_id = self.record.get("audio_token_id")
+        audio = self.record.get("audio")
+        if type(audio_id) is not int or not isinstance(audio, Mapping):
+            raise ValueError("this source has no audio tower")
+        encoder = tower_from_record(audio)
+        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+            raise ValueError("audio conditioning requires a Gemma audio encoder")
+        features = np.asarray(values["input_features"])
+        mask = np.asarray(values["input_features_mask"])
+        if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
+            raise ValueError("input_features must be floating [clips, frames, mel]")
+        if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
+            raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
+        encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+        slots = self.record.get("audio_soft_tokens")
+        if slots is None:
+            expected = encoded.sum(axis=1)
+            capacity = encoded.shape[1]
+        else:
+            if type(slots) is not int or encoded.shape[1] > slots:
+                raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
+            expected = np.full(features.shape[0], slots)
+            capacity = slots
+        runs = []
+        for row in tokens:
+            locations = np.flatnonzero(row == audio_id)
+            runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
+        counts = np.array([len(row) for row in runs], np.int32)
+        if int(counts.sum()) != features.shape[0]:
+            raise ValueError("input_features and audio placeholder runs disagree")
+        width = int(counts.max())
+        padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
+        padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
+        indices = np.full(tokens.shape, -1, np.int32)
+        offset = 0
+        for row, clips in enumerate(runs):
+            for clip, run in enumerate(clips):
+                if len(run) != int(expected[offset]):
+                    raise ValueError("audio placeholder counts do not match the encoded frame counts")
+                padded[row, clip] = features[offset]
+                padded_mask[row, clip] = mask[offset]
+                indices[row, run] = clip * capacity + np.arange(len(run))
+                offset += 1
+        conditioning = {"input_features": jnp.asarray(padded), "input_features_mask": jnp.asarray(padded_mask),
+                        "audio_lengths": jnp.asarray(counts)}
+        return {"audio_indices": jnp.asarray(indices)}, conditioning
+
 
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
@@ -326,6 +401,11 @@ def _wrapper_layouts(tensors, record):
                   "gemma3n": vision.gemma3n_vision_path}[tower_kind]
     tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
+    audio_encoder = None
+    if record["audio"] is not None:
+        audio_encoder = tower_from_record(record["audio"])
+        if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+            raise ValueError("source export requires a Gemma audio encoder")
     bindings = []
     retained = {}
     for name, tensor in tensors.items():
@@ -347,6 +427,18 @@ def _wrapper_layouts(tensors, record):
                     transpose = (1, 0) if tensor.ndim == 2 else (3, 2, 0, 1)
                     if tensor.ndim == 5:
                         transpose = (1, 0)
+        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX):
+            tail = bare.removeprefix(decoders._WRAPPER_AUDIO_PROJECTOR_PREFIX)
+            path = vision.projector_weight_path(record["audio_projector"]["kind"], tail)
+            paths = (("params", "audio_projector", *path),)
+            if path[-1] == "kernel":
+                transpose = (1, 0)
+        elif audio_encoder is not None and bare.startswith(decoders._WRAPPER_AUDIO_PREFIX):
+            path = audio_nn.audio_weight_path(bare.removeprefix(decoders._WRAPPER_AUDIO_PREFIX), audio_encoder)
+            paths = ((path[0], "audio_tower", *path[1:]),)
+            if path[-1] == "kernel":
+                # Kernels store [*window, in, out]; the source keeps [out, in, *window].
+                transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
         elif bare.startswith("language_model.") or bare == "lm_head.weight":
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
@@ -379,7 +471,7 @@ class Pretrained:
     """
 
     model: nn.Module
-    variables: Mapping[str, Mapping[str, object]]
+    variables: Variables
     processor: Processor | None
     config: Mapping[str, object]
     source: Path
@@ -581,6 +673,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         language_model = models.build("causal_transformer", **built["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
+        audio_record = record["audio"]
         model = MultimodalTransformer(
             language_model, tower_from_record(record["tower"]),
             projector_from_record(record["projector"]), family,
@@ -588,6 +681,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             pad_token_id=config["text_config"].get("pad_token_id", 0),
             extra_placeholder_ids=(tuple(config.get(name, default) for name, default in
                 (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
+            audio=None if audio_record is None else tower_from_record(audio_record),
+            audio_projection=None if audio_record is None else projector_from_record(record["audio_projector"]),
+            audio_soft_tokens=record["audio_soft_tokens"],
             attention_impl=None if attention_impl == "reference" else attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record))
         layouts, retained = _wrapper_layouts(tensors, record)

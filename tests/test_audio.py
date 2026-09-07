@@ -156,3 +156,20 @@ def test_processor_rejects_wrong_sampling_rate_without_resampling():
         processor(np.ones(1000, np.float32), sampling_rate=8000)
     with pytest.raises(ValueError, match="nonempty mono"):
         processor([np.ones((100, 2), np.float32)], sampling_rate=16000)
+
+
+def test_released_geometries_emit_the_processor_token_counts():
+    """30 s of 10 ms frames become 188 Gemma 3n and 750 Gemma 4 soft tokens.
+
+    Those are the counts the checkpoint processors expand (Gemma3nProcessor
+    audio_seq_length=188, Gemma4Processor audio_seq_length=750). Checked
+    abstractly, without allocating the 681M and 305M encoder parameters.
+    """
+    released = json.loads((FIXTURES.parent / "hf" / "gemma-3n-e2b" / "config.json").read_text())["audio_config"]
+    for record, tokens in ((released, 188), ({"model_type": "gemma4_audio"}, 750)):
+        encoder = audio_config(record).build()
+        output, _ = jax.eval_shape(encoder.init_with_output, jax.random.key(0),
+                                   jax.ShapeDtypeStruct((1, 3000, 128), jnp.float32),
+                                   jax.ShapeDtypeStruct((1, 3000), jnp.bool_))
+        assert output.features.shape[:2] == (1, tokens)
+        assert output.mask.shape == (1, tokens)
