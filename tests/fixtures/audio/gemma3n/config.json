@@ -1,0 +1,61 @@
+{
+  "transformers_version": "5.16.1",
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  },
+  "problem_type": null,
+  "vocab_size": 8,
+  "vocab_offset": 56,
+  "input_feat_size": 16,
+  "hidden_size": 16,
+  "rms_norm_eps": 1e-05,
+  "gradient_clipping": 10000000000.0,
+  "conf_attention_chunk_size": 4,
+  "conf_attention_context_left": 5,
+  "conf_attention_context_right": 2,
+  "conf_attention_logit_cap": 50.0,
+  "conf_num_attention_heads": 2,
+  "conf_num_hidden_layers": 2,
+  "conf_conv_kernel_size": 5,
+  "conf_reduction_factor": 2,
+  "conf_residual_weight": 0.5,
+  "sscp_conv_channel_size": [
+    8,
+    4
+  ],
+  "sscp_conv_group_norm_eps": 0.001,
+  "sscp_conv_kernel_size": [
+    [
+      3,
+      3
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "sscp_conv_stride_size": [
+    [
+      2,
+      2
+    ],
+    [
+      2,
+      2
+    ]
+  ],
+  "_name_or_path": "",
+  "model_type": "gemma3n_audio",
+  "output_attentions": false
+}
