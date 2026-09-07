@@ -416,3 +416,27 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     assert result.rows == 3
     np.testing.assert_allclose(result.host().images, plain(["a", "b", "c"], steps=3, seed=7).host().images,
                                atol=2e-5, rtol=2e-5)
+
+
+def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):
+    """A source whose sampler pairs its own tables hands the task a `grid`:
+    for a step count it answers the process and the explicit time grid the
+    trajectory walks, and the prior the noise is drawn from. The process's
+    own grid at the same points reproduces the plain task; a different grid
+    changes the draw; `final_denoise=False` skips the closing clean
+    prediction; a grid of the wrong length is refused."""
+    import jax.numpy as jnp
+
+    objective, state = make_run(tmp_path)
+    plain = TextToImage.from_objective(objective, state.params)
+    same = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps)))
+    key = jax.random.key(3)
+    reference = plain(["a"], steps=4, sampler=Heun(), key=key).host().images
+    np.testing.assert_array_equal(same(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    warped = dataclasses.replace(plain, grid=lambda steps: (plain.process, plain.process.times(steps) ** 2))
+    assert not np.allclose(warped(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    open_ended = dataclasses.replace(plain, final_denoise=False)
+    assert not np.allclose(open_ended(["a"], steps=4, sampler=Heun(), key=key).host().images, reference)
+    short = dataclasses.replace(plain, grid=lambda steps: (plain.process, jnp.linspace(1.0, 0.0, steps + 1)))
+    with pytest.raises(ValueError, match="grid points"):
+        short(["a"], steps=4, sampler=Heun(), key=key)

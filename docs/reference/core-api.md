@@ -199,12 +199,12 @@ task(request, max_new_tokens=None, *, key=None, seed=None, process=None, images=
 Pretrained.text_generation(sampling=None) -> TextGeneration
 Pretrained.block_generation() -> BlockGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
-            sampler=DDIM(), finish=None)
+            sampler=DDIM(), grid=None, final_denoise=True, finish=None)
 TextToImage.from_objective(objective, variables) -> TextToImage
 TextToImage.from_run(directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None)
 TextToImage.from_pretrained(repo_id, *, ema=True, mesh=None, layout=None, dtype=None)
 image_task.bind(variables) -> TextToImage
-image_task.prepare(prompts, *, key=None, seed=None) -> DenoisingInputs
+image_task.prepare(prompts, *, key=None, seed=None, steps=None) -> DenoisingInputs
 image_task(prompts_or_prepared, *, steps=None, guidance=<default>, sampler=None, key=None, seed=None) -> Images
 RunProcessor(tokenizer)   # a run's ByteTokenizer or HFTokenizer as a task processor
 ```
@@ -215,7 +215,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
 
-`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()` and `text`. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
+`BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()` and `text`. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose sampler pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
 
 ### External engine clients
 
