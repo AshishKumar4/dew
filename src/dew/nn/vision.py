@@ -969,40 +969,23 @@ class Gemma4Projector(ProjectorBase):
     def build(self) -> nn.Module:
         return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
 
-def _qwen35_interp_taps(index: jax.Array, size: int, side: int) -> Tuple[jax.Array, jax.Array]:
+def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> Tuple[jax.Array, jax.Array]:
     """Bilinear taps into a `side`-long table for positions along one axis.
 
     The closed form of the align-corners linspace the reference resamples
     with (vision_utils.py, _interpolation_axis_taps_weights): each position
     reads its floor and ceiling with the linear hat weights.
     """
-    src = index.astype(jnp.float32) * (side - 1) / max(size - 1, 1)
+    src = index.astype(jnp.float32) * (side - 1) / jnp.maximum(size - 1, 1)
     floor = jnp.floor(src).astype(jnp.int32)
-    distance = (src - floor.astype(jnp.float32))[:, None]
+    distance = (src - floor.astype(jnp.float32))[..., None]
     taps = jnp.stack([floor, floor + 1], axis=-1).clip(0, side - 1)
     weights = jnp.concatenate([1 - distance, distance], axis=-1).clip(min=0)
     return taps, weights
 
 
-def _qwen35_patch_positions(grid_height: int, grid_width: int,
-                            merge_size: int) -> Tuple[jax.Array, jax.Array]:
-    """Patch rows and columns in spatial-merge-block order.
-
-    The tokens run block by block (vision_utils.py,
-    get_vision_interpolation_indices_and_weights): the block row and column
-    vary slowly, the within-block row and column fast.
-    """
-    within = jnp.arange(grid_height * grid_width)
-    blocks_wide = grid_width // merge_size
-    in_col = within % merge_size
-    in_row = (within // merge_size) % merge_size
-    block_col = (within // (merge_size * merge_size)) % blocks_wide
-    block_row = within // (merge_size * merge_size * blocks_wide)
-    return block_row * merge_size + in_row, block_col * merge_size + in_col
-
-
-def _qwen35_pos_embeds(table: jax.Array, grid_height: int, grid_width: int,
-                       merge_size: int) -> jax.Array:
+def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
+                       grid_height: int | jax.Array, grid_width: int | jax.Array) -> jax.Array:
     """The learned table resampled to one image's patch grid.
 
     Bilinear over the square table's rows and columns separately, outer
@@ -1010,12 +993,11 @@ def _qwen35_pos_embeds(table: jax.Array, grid_height: int, grid_width: int,
     get_vision_interpolation_indices_and_weights).
     """
     side = int(round(len(table) ** 0.5))
-    rows, cols = _qwen35_patch_positions(grid_height, grid_width, merge_size)
     row_taps, row_weights = _qwen35_interp_taps(rows, grid_height, side)
     col_taps, col_weights = _qwen35_interp_taps(cols, grid_width, side)
-    indices = (row_taps[:, :, None] * side + col_taps[:, None, :]).reshape(-1, 4)
-    weights = (row_weights[:, :, None] * col_weights[:, None, :]).reshape(-1, 4)
-    return (table[indices] * weights[..., None]).sum(axis=1)
+    indices = (row_taps[..., :, None] * side + col_taps[..., None, :]).reshape(*rows.shape, 4)
+    weights = (row_weights[..., :, None] * col_weights[..., None, :]).reshape(*rows.shape, 4)
+    return (table[indices] * weights[..., None]).sum(axis=-2)
 
 
 def _qwen35_rope_tables(positions: jax.Array, head_dim: int) -> Tuple[jax.Array, jax.Array]:
@@ -1027,8 +1009,8 @@ def _qwen35_rope_tables(positions: jax.Array, head_dim: int) -> Tuple[jax.Array,
     """
     dim = head_dim // 2
     inv_freq = 1.0 / (10000.0 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    flat = (positions.astype(jnp.float32)[:, :, None] * inv_freq).reshape(
-        positions.shape[0], -1)
+    flat = (positions.astype(jnp.float32)[..., None] * inv_freq).reshape(
+        *positions.shape[:-1], -1)
     doubled = jnp.concatenate([flat, flat], axis=-1)
     return jnp.cos(doubled), jnp.sin(doubled)
 
@@ -1060,7 +1042,7 @@ class Qwen35VisionAttention(nn.Module):
         self.proj = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype,
                              precision=self.precision, name="proj")
 
-    def __call__(self, hidden_states, cos, sin) -> jax.Array:
+    def __call__(self, hidden_states, cos, sin, mask=None) -> jax.Array:
         batch, length, _ = hidden_states.shape
         head_dim = self.hidden_size // self.num_heads
         fused = self.qkv(hidden_states).reshape(batch, length, 3, self.num_heads, head_dim)
@@ -1068,7 +1050,7 @@ class Qwen35VisionAttention(nn.Module):
         query = _qwen35_rope(query, cos[:, :, None, :], sin[:, :, None, :])
         key = _qwen35_rope(key, cos[:, :, None, :], sin[:, :, None, :])
         attended = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision)
+            query, key, value, dtype=self.dtype, precision=self.precision, mask=mask)
         return self.proj(attended.reshape(batch, length, self.hidden_size))
 
 
@@ -1093,20 +1075,19 @@ class Qwen35VisionBlock(nn.Module):
                        activation=self.hidden_act, dtype=self.dtype,
                        precision=self.precision, name="mlp")
 
-    def __call__(self, hidden_states, cos, sin):
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cos, sin)
+    def __call__(self, hidden_states, cos, sin, mask=None):
+        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cos, sin, mask)
         return hidden_states + self.mlp(self.norm2(hidden_states))
 
 
 class Qwen35VisionTransformer(nn.Module):
     """The Qwen 3.5 vision trunk, param layout of `Qwen3_5VisionConfig`.
 
-    `pixel_values` are [B, C, H, W] stills, one resolution per call: each
-    frame repeats along time the way the processor fills the temporal patch
-    (image_processing_qwen2_vl.py, patchify), the learned positions resample
-    to the patch grid, and what returns is the pre-merge sequence the merger
-    reads. Packed batches of mixed resolutions ride cumulative lengths the
-    pixel Field cannot carry, so only stills of one resolution map here.
+    Packed processor pixels are padded to [B, patches, patch_pixels] and
+    accompanied by each row's [time, height, width] patch grid. Attention stays
+    inside each frame and excludes padded keys. Fixed NCHW images use the
+    processor's channel-then-time patch order. The return value is the
+    pre-merge sequence; the projector owns the merger.
     """
 
     depth: int = 27
@@ -1140,41 +1121,49 @@ class Qwen35VisionTransformer(nn.Module):
                 name=f"blocks_{index}")
             for index in range(self.depth)]
 
-    def __call__(self, pixel_values) -> jax.Array:
-        pixel_values = jnp.asarray(pixel_values)
-        batch, channels, height, width = pixel_values.shape
-        stride = self.patch_size * self.spatial_merge_size
-        if channels != self.in_channels or height % stride or width % stride:
-            raise ValueError(
-                f"pixel_values of {channels}x{height}x{width} are not "
-                f"{self.in_channels}-channel images tiled by {stride}px merge "
-                "blocks")
-        grid_height, grid_width = height // self.patch_size, width // self.patch_size
-        patches = pixel_values.reshape(
-            batch, channels, grid_height, self.patch_size, grid_width, self.patch_size)
-        patches = patches.transpose(0, 2, 4, 1, 3, 5)
-        order = _qwen35_patch_positions(grid_height, grid_width, self.spatial_merge_size)
-        flat = patches.reshape(batch, grid_height * grid_width, -1)[
-            :, order[0] * grid_width + order[1]]
-        # The still frame repeats along time (image_processing_qwen2_vl.py,
-        # patchify), and the trunk views the flat buffer as [channel, time]:
-        # slot (c, t) reads pixel channel (c*tp + t) % in_channels, which is
-        # the flat tile below, while the weight map stays a plain reshape.
-        patch = flat.reshape(batch, -1, channels, self.patch_size, self.patch_size)
-        frames = jnp.tile(patch, (1, 1, self.temporal_patch_size, 1, 1))
-        hidden_states = self.patch_embed(
-            frames.reshape(batch, -1, channels * self.temporal_patch_size
-                           * self.patch_size ** 2))
-        table = self.position_table.embedding.astype(hidden_states.dtype)
-        hidden_states = hidden_states + _qwen35_pos_embeds(
-            table, grid_height, grid_width, self.spatial_merge_size)
-        head_dim = self.hidden_size // self.num_heads
-        cos, sin = _qwen35_rope_tables(jnp.stack(order, axis=-1), head_dim)
-        cos = jnp.broadcast_to(cos, (batch,) + cos.shape)
-        sin = jnp.broadcast_to(sin, (batch,) + sin.shape)
+    def __call__(self, pixel_values, grid_thw=None) -> jax.Array:
+        pixels = jnp.asarray(pixel_values)
+        merge = self.spatial_merge_size
+        patch = self.patch_size
+        if pixels.ndim == 4:
+            if grid_thw is not None:
+                raise ValueError("grid_thw accompanies packed pixels, not NCHW images")
+            batch, channels, height, width = pixels.shape
+            stride = patch * merge
+            if channels != self.in_channels or height % stride or width % stride:
+                raise ValueError(f"pixel_values must be {self.in_channels}-channel images tiled by {stride}px blocks")
+            rows, columns = height // patch, width // patch
+            blocks = pixels.reshape(batch, channels, rows // merge, merge, patch,
+                                    columns // merge, merge, patch)
+            blocks = blocks.transpose(0, 2, 5, 3, 6, 1, 4, 7)
+            flat = blocks.reshape(batch, rows * columns, channels, 1, patch, patch)
+            frames = jnp.broadcast_to(flat, (batch, rows * columns, channels,
+                                            self.temporal_patch_size, patch, patch))
+            pixels = frames.reshape(batch, rows * columns, -1)
+            grid_thw = jnp.broadcast_to(jnp.array([1, rows, columns], jnp.int32), (batch, 3))
+        if pixels.ndim != 3 or pixels.shape[-1] != self.in_channels * self.temporal_patch_size * patch ** 2:
+            raise ValueError("packed Qwen pixels must be [B, patches, C * temporal_patch_size * patch_size**2]")
+        batch, length, _ = pixels.shape
+        if grid_thw is None or grid_thw.shape != (batch, 3):
+            raise ValueError("packed Qwen pixels require aligned [B, 3] grid_thw")
+        grid = jnp.asarray(grid_thw)
+        heights, widths = grid[:, 1:2], grid[:, 2:3]
+        area = heights * widths
+        within = jnp.arange(length)[None, :] % area
+        blocks_wide = widths // merge
+        rows = (within // (merge * merge * blocks_wide)) * merge + (within // merge) % merge
+        columns = ((within // (merge * merge)) % blocks_wide) * merge + within % merge
+        hidden_states = self.patch_embed(pixels)
+        table = jnp.asarray(self.position_table.embedding, hidden_states.dtype)
+        hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
+        cos, sin = _qwen35_rope_tables(jnp.stack([rows, columns], axis=-1), self.hidden_size // self.num_heads)
+        valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
+        frames = jnp.arange(length)[None, :] // area
+        keep = (frames[:, :, None] == frames[:, None, :]) & valid[:, None, :]
         for block in self.blocks:
-            hidden_states = block(hidden_states, cos, sin)
+            hidden_states = block(hidden_states, cos, sin, keep[:, None])
         return hidden_states
+
 
 
 @towers("qwen3_5")
@@ -1939,15 +1928,19 @@ class Gemma3nProjectorModule(nn.Module):
 
     def __call__(self, features):
         features = jnp.asarray(features)
+        return self.soft_embeddings(features * jnp.asarray(self.vision_width ** 0.5, features.dtype))
+
+    def soft_embeddings(self, features):
+        """The reference embedder over soft features, without vision-only scaling."""
+        features = jnp.asarray(features)
         if features.ndim != 3 or features.shape[-1] != self.vision_width:
-            raise ValueError(f"vision features must be [B, N, {self.vision_width}], got {features.shape}")
+            raise ValueError(f"soft features must be [B, N, {self.vision_width}], got {features.shape}")
         if not jnp.issubdtype(features.dtype, jnp.floating):
-            raise ValueError("vision features must be floating point")
+            raise ValueError("soft features must be floating point")
         if self.is_initializing():
             # Both paths belong to one checkpoint even when init starts with
             # image features. Linen creates an embedding only when called.
             self.hard_embedding_norm(self.embedding(jnp.zeros((1, 1), jnp.int32)))
-        features = features * jnp.asarray(self.vision_width ** 0.5, features.dtype)
         return self.embedding_post_projection_norm(
             self.embedding_projection(self.soft_embedding_norm(features)))
 
