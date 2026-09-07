@@ -6,16 +6,18 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
 from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.diffusion.block import BlockProcess, CanvasGeneration
+from dew.sampling.engine import GenerationFamily
 from dew.sampling.text import Sampling, Generation
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
@@ -385,7 +387,7 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    generation_adapter: Callable[[Pretrained, ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], int, jax.Array, Sampling | BlockProcess | None], Generation | CanvasGeneration] | None = field(default=None, repr=False)
+    generation_adapter: GenerationFamily[Any, Any, Any, Any, Any] | None = field(default=None, repr=False)
     export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
 
     def generate(self, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], max_new_tokens: int, *,
@@ -393,7 +395,8 @@ class Pretrained:
         """Generate through the model family's shared native sampling algorithm."""
         if self.generation_adapter is None:
             raise ValueError("this source has no native generation algorithm")
-        return self.generation_adapter(self, inputs, max_new_tokens, key, generation)
+        return self.generation_adapter.generate(self.model, self.variables, inputs, max_new_tokens,
+                                                key=key, generation=generation)
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with processor artifacts."""
@@ -431,15 +434,16 @@ def _native_variables(parts: Mapping[str, Mapping[str, object]]) -> dict[str, di
     return collections
 
 
-def _generation_value(bundle: Pretrained, name: str, default: object = None) -> object:
-    text = bundle.config.get("text_config", bundle.config)
+def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
+                      name: str, default: object = None) -> object:
+    text = config.get("text_config", config)
     if not isinstance(text, Mapping):
         raise ValueError("text_config must be a mapping")
-    return bundle.generation_config.get(name, bundle.config.get(name, text.get(name, default)))
+    return generation_config.get(name, config.get(name, text.get(name, default)))
 
 
-def _eos_ids(bundle: Pretrained) -> tuple[int, ...]:
-    value = _generation_value(bundle, "eos_token_id")
+def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
+    value = _generation_value(config, generation_config, "eos_token_id")
     if value is None:
         return ()
     values = (value,) if type(value) is int else value
@@ -448,8 +452,8 @@ def _eos_ids(bundle: Pretrained) -> tuple[int, ...]:
     return tuple(values)
 
 
-def _pad_id(bundle: Pretrained) -> int:
-    value = _generation_value(bundle, "pad_token_id", 0)
+def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
+    value = _generation_value(config, generation_config, "pad_token_id", 0)
     if value is None:
         value = 0
     if type(value) is not int or value < 0:
@@ -457,54 +461,27 @@ def _pad_id(bundle: Pretrained) -> int:
     return value
 
 
-def _generate_autoregressive(bundle: Pretrained, inputs, max_new_tokens: int,
-                             key: jax.Array, generation: Sampling | BlockProcess | None):
-    from dew.artifacts import agree_process_phase
-    from dew.sampling.text import generate
-    error = None
-    try:
-        if generation is None:
-            temperature = _generation_value(bundle, "temperature", 1.0)
-            if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
-                raise ValueError("temperature must be numeric")
-            top_k = _generation_value(bundle, "top_k")
-            if top_k is not None and type(top_k) is not int:
-                raise ValueError("top_k must be an integer")
-            generation = Sampling(
-                temperature=float(temperature) if _generation_value(bundle, "do_sample", False) else 0.0,
-                top_k=top_k if top_k else None, eos_id=(_eos_ids(bundle) or None), pad_id=_pad_id(bundle))
-        if not isinstance(generation, Sampling):
-            raise ValueError("autoregressive generation requires Sampling")
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase="pretrained generation policy")
-    assert isinstance(generation, Sampling)
-    return generate(bundle.model, bundle.variables, inputs, max_new_tokens, key=key, sampling=generation)
-
-
-def _generate_canvas(bundle: Pretrained, inputs, max_new_tokens: int,
-                     key: jax.Array, generation: Sampling | BlockProcess | None):
-    from dew.artifacts import agree_process_phase
-    from dew.interop import diffusion_gemma
+def _source_family(model: nn.Module, config: Mapping[str, object],
+                   generation_config: Mapping[str, object]) -> GenerationFamily[Any, Any, Any, Any, Any]:
+    """The native generation family with the source's published policy as its default."""
     from dew.nn.diffusion_gemma import DiffusionGemma
-    error = None
-    eos: tuple[int, ...] = ()
-    pad = 0
-    try:
-        if not isinstance(bundle.model, DiffusionGemma):
-            raise TypeError("canvas generation requires DiffusionGemma")
-        if generation is None:
-            generation = diffusion_gemma.generation_process(bundle.config, bundle.generation_config)
-        if not isinstance(generation, BlockProcess):
-            raise ValueError("DiffusionGemma generation requires BlockProcess")
-        eos, pad = _eos_ids(bundle), _pad_id(bundle)
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase="pretrained canvas policy")
-    assert isinstance(generation, BlockProcess) and isinstance(bundle.model, DiffusionGemma)
-    return generation.generate(bundle.model, bundle.variables, inputs, max_new_tokens,
-                               key=key, eos_token_ids=eos, pad_token_id=pad)
-
+    if isinstance(model, DiffusionGemma):
+        from dew.diffusion.block import CanvasFamily
+        from dew.interop import diffusion_gemma
+        return CanvasFamily(diffusion_gemma.generation_process(config, generation_config),
+                            _eos_ids(config, generation_config), _pad_id(config, generation_config))
+    from dew.sampling.text import AutoregressiveFamily
+    temperature = _generation_value(config, generation_config, "temperature", 1.0)
+    if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
+        raise ValueError("temperature must be numeric")
+    top_k = _generation_value(config, generation_config, "top_k")
+    if top_k is not None and type(top_k) is not int:
+        raise ValueError("top_k must be an integer")
+    sampling = Sampling(
+        temperature=float(temperature) if _generation_value(config, generation_config, "do_sample", False) else 0.0,
+        top_k=top_k if top_k else None, eos_id=(_eos_ids(config, generation_config) or None),
+        pad_id=_pad_id(config, generation_config))
+    return AutoregressiveFamily(sampling)
 
 
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
@@ -525,7 +502,6 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
     layouts: tuple[WeightLayout, ...] = ()
     retained: dict[str, np.ndarray] = {}
     export_adapter = None
-    generation_adapter = _generate_autoregressive
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
         model = diffusion_gemma.build(config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
@@ -533,7 +509,6 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         record = config
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-        generation_adapter = _generate_canvas
     elif "text_config" in config:
         record = decoders.translate_wrapper_config(config)
         text_fields = dict(record["text"])
@@ -606,5 +581,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         processor = Processor(reference, config, record)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
+    error = None
+    generation_adapter = None
+    try:
+        generation_adapter = _source_family(model, config, generation_config)
+    except BaseException as failure:
+        error = failure
+    agree_process_phase(error, phase="pretrained generation policy")
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
                       layouts, retained, generation_adapter, export_adapter)
