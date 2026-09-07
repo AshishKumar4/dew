@@ -7,15 +7,15 @@ name = "dew-ml"
 dynamic = ["version"]
 description = "A JAX/Flax framework for training diffusion, JEPA and other large models from scratch"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
-    "flax>=0.8.4",
-    "jax>=0.4.28",
+    "flax>=0.12.9",
+    "jax>=0.11.1",
     "optax>=0.2.2",
-    "orbax",
+    "orbax-checkpoint>=0.12.4",
     "numpy",
     "pillow",
     "clu",
@@ -27,8 +27,9 @@ dependencies = [
     "albumentations",
     "rich",
     "tyro",
+    "typing_extensions>=4.14",
     "python-dotenv",
-    "transformers",
+    "transformers>=5.16.1",
     "jinja2",
     "filelock",
     "huggingface_hub",
@@ -51,7 +52,7 @@ test = [
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
     # dew against a different reference while the tolerances stayed. The
-    # library dependency stays unbounded; only the suite pins.
+    # library accepts this release and later; the reference suite pins it.
     "transformers==5.16.1",
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
     # unbounded so the suite runs the release `pip install dew-ml[streaming]`
@@ -76,7 +77,7 @@ interop = ["safetensors"]
 # a real weakness or a type that is not yet true, and both get fixed rather
 # than silenced. No file list, no ignore comments, no lowered severity.
 include = ["src/dew"]
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 typeCheckingMode = "standard"
 # Name the environment, or two people get two counts for the same tree.
 venvPath = "."
