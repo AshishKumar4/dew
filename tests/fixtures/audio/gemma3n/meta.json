@@ -1,0 +1,11 @@
+{
+  "torch": "2.14.0+cpu",
+  "transformers": "5.16.1",
+  "seed": 314,
+  "sampling_rate": 16000,
+  "learning_rate": 0.002,
+  "text_width": 32,
+  "backend": "cpu",
+  "dtype": "float32",
+  "parameters": 13380
+}
