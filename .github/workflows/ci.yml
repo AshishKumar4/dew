@@ -54,6 +54,9 @@ jobs:
         python - <<'EOF'
         import xml.etree.ElementTree as ET
         from pathlib import Path
+        def escape(value):
+            return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
         if not Path("pytest-report.xml").is_file():
             print("::notice::No pytest report was produced; inspect earlier CI steps.")
             raise SystemExit(0)
@@ -62,8 +65,10 @@ jobs:
             for kind in ("failure", "error"):
                 node = case.find(kind)
                 if node is not None:
-                    detail = " | ".join(line.strip() for line in (node.text or "").strip().splitlines()[-3:])
-                    print(f"::error title={case.get('classname')}.{case.get('name')}::{(node.get('message') or '')[:400]} || {detail[:600]}")
+                    title = escape(f"{case.get('classname')}.{case.get('name')}")
+                    title = title.replace(":", "%3A").replace(",", "%2C")
+                    detail = escape(node.text or node.get("message") or "Test failed")
+                    print(f"::error title={title}::{detail}")
         EOF
     - name: Upload the test report
       if: always() && hashFiles('pytest-report.xml') != ''
