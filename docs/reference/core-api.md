@@ -1,6 +1,6 @@
 # Core API reference
 
-This page describes the interfaces used in the tutorials. Read [your first training run](../getting-started.md) for a complete example. The [module index](../api.md) locates other public modules; it is an index, not a complete signature reference.
+This page describes the interfaces used in the tutorials; it does not list every public module. Read [your first training run](../getting-started.md) for a complete example.
 
 ## Objective
 
