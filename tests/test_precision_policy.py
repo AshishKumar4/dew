@@ -13,6 +13,9 @@ import pytest
 from dew import models
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import dtype_name, resolve_dtype, with_precision
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
@@ -103,7 +106,27 @@ PER_ARCH = {
     "jepa_predictor": {"num_layers": 1, "num_heads": 2, "grid": (4, 4), "predictor_features": 16},
     "causal_transformer": LM,
 }
+COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
+
+
+def build_model(architecture, dtype="bfloat16"):
+    """Every registered architecture at a tiny size, the policy applied where
+    it enters: leaf models through `with_precision`; the composites wrap a
+    language model built that way, so the compute dtype reaches their trunk."""
+    if architecture not in COMPOSITES:
+        return models.build(architecture, **with_precision(
+            architecture, {**TINY, **PER_ARCH[architecture]}, dtype=dtype, attention_impl="auto"))
+    text = models.build("causal_transformer", **with_precision(
+        "causal_transformer", {**TINY, **LM, "mlp_features": 64}, dtype=dtype, attention_impl="auto"))
+    if architecture == "diffusion_gemma":
+        return DiffusionGemma(text, canvas_length=4)
+    return MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(vision_width=16, text_width=TINY["emb_features"],
+                       patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1, dtype=resolve_dtype(dtype))
 
 
 def tiny_inputs(architecture, rng):
@@ -117,6 +140,12 @@ def tiny_inputs(architecture, rng):
         return (image,)
     if architecture == "causal_transformer":
         return (jnp.zeros((1, 8), jnp.int32),)
+    if architecture == "diffusion_gemma":
+        return (jnp.zeros((1, 4), jnp.int32),)
+    if architecture == "multimodal_transformer":
+        tokens = jnp.array([[2, 1, 3, 4, 5, 6, 7, 2]], jnp.int32)
+        return (tokens,), {"image_indices": jnp.where(tokens == 1, 0, -1),
+                           "conditioning": {"pixel_values": jax.random.normal(rng, (1, 1, 3, 8, 8))}}
     if architecture == "jepa_video_encoder":
         return (video,)
     if architecture == "jepa_predictor":
@@ -129,19 +158,25 @@ def tiny_inputs(architecture, rng):
 def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng):
     """bf16 is a compute dtype: every param leaf stays float32 so checkpoints
     and the optimizer state are unchanged. The unets and the jepa models hand
-    back bf16; the DiT family casts its final projection to fp32 on purpose."""
-    fields = with_precision(
-        architecture, {**TINY, **PER_ARCH[architecture]},
-        dtype="bfloat16", attention_impl="auto")
-    model = models.build(architecture, **fields)
+    back bf16; the DiT family casts its final projection to fp32 on purpose.
+    DiffusionGemma refines a canvas against an encoded prompt, so its forward
+    is the encode-then-refine pair."""
+    model = build_model(architecture)
 
-    args = tiny_inputs(architecture, rng)
-    params = model.init(rng, *args)
+    inputs = tiny_inputs(architecture, rng)
+    args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
+    variables = model.init(rng, *args, **kwargs)
+    if architecture == "diffusion_gemma":
+        prompt = jnp.zeros((1, 8), jnp.int32)
+        cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]["cache"]
+        cache = model.apply({**variables, "cache": cache}, prompt, method=model.encode,
+                            mutable=["cache"])[1]["cache"]
+        variables = {**variables, "cache": cache}
     demoted = {jax.tree_util.keystr(path): str(leaf.dtype)
-               for path, leaf in jax.tree_util.tree_flatten_with_path(params)[0]
+               for path, leaf in jax.tree_util.tree_flatten_with_path(variables["params"])[0]
                if leaf.dtype != jnp.float32}
     assert not demoted
 
-    out = model.apply(params, *args)
+    out = model.apply(variables, *args, **kwargs)
     assert out.dtype in (jnp.bfloat16, jnp.float32)
     assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))

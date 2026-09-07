@@ -369,24 +369,24 @@ def _wrapper_layouts(tensors, record):
 
 @dataclass(frozen=True)
 class Pretrained:
-    """A native model, explicit variables and its checkpoint's host processor."""
+    """A native model, explicit variables and its checkpoint's host processor.
+
+    `model_config` is the record the model was built from, in Dew's own
+    vocabulary with the run's compute dtype and attention kernel, so a caller
+    logs the model it ran.
+    """
 
     model: nn.Module
     variables: Mapping[str, Mapping[str, object]]
     processor: Processor | None
     config: Mapping[str, object]
     source: Path
+    model_config: Mapping[str, object]
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
     generation_adapter: Callable[[Pretrained, ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], int, jax.Array, Sampling | BlockProcess | None], Generation | CanvasGeneration] | None = field(default=None, repr=False)
     export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
-
-    @property
-    def model_config(self) -> dict[str, object]:
-        """The native model's construction fields, read directly from its value."""
-        return {item.name: getattr(self.model, item.name) for item in fields(self.model)
-                if item.init and item.name not in ("parent", "name")}
 
     def generate(self, inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]], max_new_tokens: int, *,
                  key: jax.Array, generation: Sampling | BlockProcess | None = None) -> Generation | CanvasGeneration:
@@ -531,6 +531,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = diffusion_gemma.build(config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
         variables = diffusion_gemma.translate_weights(tensors, config)
         record = config
+        built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
         generation_adapter = _generate_canvas
     elif "text_config" in config:
@@ -542,11 +543,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             # Gemma3ForConditionalGeneration projects logits without the
             # causal-LM class's optional final tanh cap.
             text_fields["final_logit_softcap"] = None
-            text_fields["mixer"] = AttentionMixer(bidirectional_images=True)
+            text_fields["mixer"] = {"kind": "attention", "bidirectional_images": True}
         if family == "gemma4" and config["text_config"].get("use_bidirectional_attention") == "vision":
             kinds = dict(text_fields["kinds"])
             sliding = dict(kinds.get("sliding_attention", {}))
-            sliding["mixer"] = AttentionMixer(bidirectional_images=True)
+            sliding["mixer"] = {"kind": "attention", "bidirectional_images": True}
             kinds["sliding_attention"] = sliding
             text_fields["kinds"] = kinds
         if family == "qwen3_5":
@@ -557,12 +558,13 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
                 raise ValueError("mrope_section must contain three nonnegative integer widths")
             kinds = dict(text_fields["kinds"])
             full = dict(kinds.get("full_attention", {}))
-            full["mixer"] = AttentionMixer(mrope_section=(sections[0], sections[1], sections[2]))
+            full["mixer"] = {"kind": "attention", "mrope_section": [sections[0], sections[1], sections[2]]}
             kinds["full_attention"] = full
             text_fields["kinds"] = kinds
 
-        language_model = models.build("causal_transformer", **with_precision(
-            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl))
+        built = {**record, "text": with_precision(
+            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
+        language_model = models.build("causal_transformer", **built["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         model = MultimodalTransformer(
@@ -579,8 +581,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         record = decoders.translate_config(config)
         if max_seq_len is not None:
             record["max_seq_len"] = max_seq_len
-        model = models.build("causal_transformer", **with_precision(
-            "causal_transformer", record, dtype=dtype, attention_impl=attention_impl))
+        built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
+        model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
         if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text"):
@@ -604,5 +606,5 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         processor = Processor(reference, config, record)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
-    return Pretrained(model, variables, processor, config, directory, generation_config,
+    return Pretrained(model, variables, processor, config, directory, built, generation_config,
                       layouts, retained, generation_adapter, export_adapter)
