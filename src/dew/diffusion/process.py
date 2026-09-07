@@ -80,7 +80,7 @@ class Denoiser:
         c_in = process.prediction.get_input_scale(rates)
         output = self.model.apply(
             self.params, x_t * c_in, process.sampler_schedule.model_time(t), **conditions)
-        preds = process.prediction.pred_transform(x_t, output, rates)
+        preds = process.prediction.pred_transform(x_t, output, rates, t)
         return process.prediction.backward_diffusion(x_t, preds, rates)
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:

@@ -30,6 +30,6 @@ def sample(denoise, x_T, steps: int, *, solver, guidance=None, key):
         return (x, state), None
 
     (x, _), _ = lax.scan(
-        body, (x_T, solver.init(x_T)),
+        body, (x_T, solver.init(x_T, times)),
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     return denoise(x, jnp.full((batch,), times[-1]))[0]
