@@ -1064,7 +1064,7 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
         # continuations: the padded prompt's group stays out of the result.
         assert report["global_rows"] == 24 and report["rows"] == 9
         assert len(report["tokens"]) == 9
-        assert len(report["rejected"]) == 1 and "continuations" in report["rejected"][0]
+        assert len(report["rejected"]) == 1 and "agree across processes" in report["rejected"][0]
     assert single["rows"] == 18 and single["global_rows"] == 18
     assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
     assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
