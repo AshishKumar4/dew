@@ -165,6 +165,29 @@ def test_text_decodes_lazily_through_the_bound_processor():
                                 for row, length in zip(rows.tokens, rows.lengths))
 
 
+def test_a_prompt_batch_carries_validity_only_where_it_padded():
+    """A host that padded nothing says so by omitting validity. The model
+    cannot read the contents of an all-true mask, so it would build one and
+    leave its fused attention kernel; ragged prompts still carry theirs, and
+    the values say which slots the padding took."""
+    from dew.inference import RunProcessor
+
+    class Digits:
+        def encode(self, text):
+            return [int(character) for character in text]
+
+        def decode(self, ids):
+            return "".join(str(int(token)) for token in ids)
+
+    processor = RunProcessor(Digits())
+
+    assert "attention_mask" not in processor(["12", "34"]).token_fields
+    assert "attention_mask" not in processor("789").token_fields
+    ragged = processor(["12", "5"])
+    np.testing.assert_array_equal(ragged.token_fields["attention_mask"],
+                                  [[True, True], [False, True]])
+
+
 @pytest.mark.mesh
 def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same_canvases():
     """Placed under the trainer's layout, a canvas task shards its weights,

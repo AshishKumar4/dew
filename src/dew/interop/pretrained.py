@@ -139,7 +139,12 @@ class Processor:
         if valid.shape != tokens.shape:
             raise ValueError("attention_mask must align with input_ids")
         positions = np.maximum(np.cumsum(valid, axis=1) - 1, 0).astype(np.int32)
-        token_fields = {"attention_mask": jnp.asarray(valid), "positions": jnp.asarray(positions)}
+        # An unpadded batch carries no validity field. The host knows the rows
+        # are whole here; the model would have to take an all-true mask on
+        # trust and build one anyway.
+        token_fields = {"positions": jnp.asarray(positions)}
+        if not valid.all():
+            token_fields["attention_mask"] = jnp.asarray(valid)
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if "pixel_values_videos" in values and self.config.get("model_type") != "qwen3_5":

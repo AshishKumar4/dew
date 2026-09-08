@@ -94,21 +94,46 @@ def causal_conv1d(x, kernel, activation: bool = True):
 
 
 def _masked_conv1d(x, kernel, valid, state=None):
-    """Convolve real tokens without advancing a paused row's history."""
-    batch, channels, _ = x.shape
+    """Convolve real tokens without advancing a paused row's history.
+
+    A row's real tokens keep their order and their history: the j-th of them
+    reads the K-1 real tokens before it, whatever padding sits between them,
+    and an invalid slot neither reads a window nor advances the history. That
+    is a statement about the row's stream of real tokens, so the stream is
+    what the convolution reads. `cumsum(valid) - 1` is each real token's index
+    in it; gathering by that index hands `causal_conv1d` the same ordered
+    stream a token-by-token scan fed it, behind the row's existing history,
+    in one convolution instead of S sequential windows.
+
+    Masking the input of an ordinary convolution over the physical slots
+    instead is a different function: a token after an interior gap would read
+    the zeros in the gap rather than the real tokens before it. On nine slots
+    with holes at 2, 5 and 6 that moves the outputs by 5.0 in fp32, which
+    test_the_masked_conv_reads_across_a_gap measures.
+    """
+    batch, channels, length = x.shape
     width = kernel.shape[1] - 1
     if state is None:
         state = jnp.zeros((batch, channels, width), x.dtype)
-
-    def step(history, inputs):
-        token, active = inputs
-        window = jnp.concatenate([history, token[:, :, None]], axis=-1)
-        output = nn.silu(jnp.sum(window * kernel[None, :, :], axis=-1))
-        history = jnp.where(active[:, None, None], window[:, :, 1:], history)
-        return history, jnp.where(active[:, None], output, 0.0)
-
-    state, output = jax.lax.scan(step, state, (jnp.moveaxis(x, 2, 0), valid.T))
-    return jnp.moveaxis(output, 0, 2), state
+    valid = jnp.asarray(valid, bool)
+    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    # Which physical slot each compact column holds. A column past the row's
+    # real tokens keeps an out-of-range index, so it gathers a zero and
+    # scatters no cotangent back onto a padded slot; every real token writes
+    # its own column, so no two writers meet.
+    source = jnp.full((batch, length), length, jnp.int32).at[
+        jnp.arange(batch)[:, None], jnp.where(valid, rank, length)].set(
+            jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length)), mode='drop')
+    compact = jnp.take_along_axis(x, source[:, None, :], axis=2, mode='fill', fill_value=0)
+    stream = jnp.concatenate([state, compact], axis=2)
+    # The history in front carries the K-1 taps the first real token reads, so
+    # column width + j of the convolution is the output of real token j, and
+    # the K-1 columns from the row's token count on are the history it leaves.
+    convolved = causal_conv1d(stream, kernel)
+    output = jnp.take_along_axis(convolved, (rank + width)[:, None, :], axis=2)
+    history = jnp.take_along_axis(
+        stream, (rank[:, -1] + 1)[:, None, None] + jnp.arange(width)[None, None, :], axis=2)
+    return jnp.where(valid[:, None, :], output, 0), history
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
