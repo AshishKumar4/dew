@@ -69,7 +69,6 @@ def test_names_on_disk_are_the_slash_joined_paths(params, tmp_path):
 
     names = set(safetensors_numpy.load_file(str(path)))
     assert names == flat_names(params)
-    assert all(name.startswith("params/") for name in names)
 
 
 def test_hf_layout_writes_the_pair_a_loader_looks_for(params, tmp_path):

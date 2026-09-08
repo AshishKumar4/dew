@@ -19,7 +19,6 @@ mixer through `mixer.build(ctx)`.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Callable, Mapping
 from typing import Optional
 

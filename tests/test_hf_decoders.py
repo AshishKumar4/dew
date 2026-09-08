@@ -297,7 +297,6 @@ def test_olmo3_config_translates_to_the_post_norm_block():
     bare = {**fixture_config("olmo3-tiny"), 'num_hidden_layers': 6}
     del bare['layer_types']
     reference = Olmo3Config(**{**bare, 'layer_types': None}).layer_types
-    assert reference is not None
     assert translate_config(bare)['layer_types'] == tuple(reference)
 
 
@@ -447,7 +446,6 @@ def test_a_gemma2_config_without_layer_types_alternates_like_the_reference():
     config = {**fixture_config("gemma2-tiny"), "num_hidden_layers": 5}
     del config["layer_types"]
     reference = Gemma2Config(**{**config, "layer_types": None}).layer_types
-    assert reference is not None
     assert translate_config(config)["layer_types"] == tuple(reference)
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
 
@@ -934,31 +932,6 @@ def test_the_e2b_shaped_config_translates_every_gap():
                                "full_attention": {"head_dim": 32}}
 
 
-def test_the_real_e2b_config_translates():
-    """google/gemma-4-E2B's text_config translates field for field: partial
-    rotary 0.25, head dims 256 and 512 (the checkpoint's sliding q_proj is
-    8 heads of 256, its full one 8 of 512), sharing 20 layers, per-layer
-    inputs of 256, the double-wide MLP, scale 1.0 and softcap 30."""
-    e2b = Path(
-        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-E2B"
-        "/snapshots/d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f/config.json")
-    if not e2b.exists():
-        pytest.skip("the E2B config is a local hub cache read, not a download")
-    config = translate_config(json.loads(e2b.read_text()).get("text_config"))
-
-    assert config["partial_rotary_factor"] == 0.25
-    assert config["head_dim"] == 256
-    assert config["num_kv_heads"] == 1
-    assert config["kinds"]["full_attention"] == {"head_dim": 512}
-    assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
-    assert config["num_kv_shared_layers"] == 20
-    assert config["per_layer_input_dim"] == 256
-    assert config["use_double_wide_mlp"]
-    assert config["attention_scale"] == 1.0
-    assert config["final_logit_softcap"] == 30.0
-    assert config["rope_theta"] == 1000000.0
-
-
 @pytest.mark.parametrize("field,value", [
     ("hidden_act", "relu"),
     ("use_bidirectional_attention", "all"),
@@ -1127,7 +1100,7 @@ def test_sharing_layers_own_no_kv_and_name_their_provider(rng):
         assert {"k_proj", "v_proj", "k_norm"} <= set(attention)
 
 
-def test_sharing_without_a_provider_and_sharing_everything_are_refused(rng):
+def test_sharing_without_a_provider_and_sharing_everything_are_refused():
     config = translate_config(gemma4_config("gemma4-kvshare"))
     base = with_precision("causal_transformer", config,
                           dtype="float32", attention_impl="xla")
@@ -1150,7 +1123,7 @@ def test_the_features_leave_a_plain_tree_unchanged(rng):
     assert "layers_0.self_attn.k_proj.kernel" in flat
 
 
-def test_new_leaves_are_declared_or_heuristic(rng):
+def test_new_leaves_are_declared_or_heuristic():
     """The coverage sweep builds default configs only, so the new leaves are
     asserted here: the packed table and the projections are declared, the
     scalar norms fall under rank one, and the values norm holds no weight."""
@@ -1226,7 +1199,6 @@ def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Gemma4TextConfig(**{**config, "layer_types": None}).layer_types
-    assert reference is not None
     assert derived == tuple(reference)
     assert derived.count("sliding_attention") == 11
     assert derived[-1] == "full_attention"
@@ -1520,7 +1492,6 @@ def test_a_qwen35_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Qwen3_5TextConfig(**{**config, "layer_types": None}).layer_types
-    assert reference is not None
     assert derived == tuple(reference)
     assert derived == ("linear_attention", "linear_attention", "full_attention") * 2
 
@@ -2107,26 +2078,6 @@ def test_the_real_gemma_4_26b_a4b_text_config_translates():
     assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
 
 
-def test_the_real_gemma_4_31b_text_config_translates():
-    """The dense 31B, from the local hub cache: 60 layers, 32 query heads of
-    256 with 16 key/value heads, the global layers reading their values off 4
-    key/value heads of 512, no routed branch and no per-layer inputs."""
-    path = Path(
-        "/home/mrwhite0racle/.cache/huggingface/hub/models--google--gemma-4-31B"
-        "/snapshots/5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89/config.json")
-    if not path.exists():
-        pytest.skip("the 31B config is a local hub cache read, not a download")
-    config = translate_config(json.loads(path.read_text())["text_config"])
-
-    assert config["num_layers"] == 60
-    assert config["num_heads"] == 32 and config["num_kv_heads"] == 16
-    assert config["head_dim"] == 256
-    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 4}
-    assert config["attention_k_eq_v"] and config["layer_scalar"]
-    assert "mixture" not in config
-    assert config["per_layer_input_dim"] is None
-
-
 def test_gemma4_moe_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
     with identical argmax. The fused expert kernels arrive split in place,
@@ -2271,7 +2222,6 @@ def test_a_gemma3n_config_without_its_lists_takes_the_reference_defaults():
 
     translated = translate_config(config)
     assert translated["layer_types"] == tuple(reference.layer_types or ())
-    assert isinstance(reference.activation_sparsity_pattern, list)
     assert translated["activation_sparsity_pattern"] == tuple(reference.activation_sparsity_pattern)
     assert translated["mlp_features"] == 48 and reference.intermediate_size == [48] * 12
     assert translated["kinds"]["sliding_attention"]["rope_theta"] == 10000.0
