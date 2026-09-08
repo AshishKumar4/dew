@@ -898,7 +898,8 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
     A shared padded shape and fixed decode trip count keep collectives in
     the same order despite different validity masks. Both ranks reach the
-    rendezvous after sampling and after a peer rejects invalid input.
+    rendezvous after sampling and after a peer rejects invalid input or a
+    decoding component only it can describe.
     The sampled rows, lengths and likelihoods match a single process over
     the same prompts, and the update that follows moves the same parameters.
     """
@@ -910,6 +911,7 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         assert "vocabulary" in report["invalid_errors"]["token"]
         assert "prompt_length" in report["invalid_errors"]["length"]
         assert "single JAX PRNG key" in report["invalid_errors"]["key"]
+        assert "memory address" in report["invalid_errors"]["component"]
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2
@@ -1187,3 +1189,33 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
         for want, got in zip(single["state"], report["state"], strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
 
+
+
+@pytest.mark.distributed
+def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_path):
+    """Two processes resolving the same chain answer the same rows as one, and
+    a rank whose components differ only in their values is refused on both
+    ranks rather than issuing a decode collective its peer never enters.
+
+    The disagreements keep every shape and dtype identical: one rank bans a
+    different token, one names a different function, one suppresses a
+    different token. A pool comparing only the schema would accept all three
+    and run two different policies without saying so.
+    """
+    reports = run_pool("decoding_components", tmp_path, 2, devices=2, fsdp_size=2, timeout=240)
+    single = run_worker("decoding_components", tmp_path / "single.json", fsdp_size=1, devices=1)
+
+    for report in reports:
+        assert report["rows"] == 3
+        assert report["refused"] == ["criterion payload", "transform identity", "transform payload"]
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
+    np.testing.assert_allclose(reports[0]["behavior"] + reports[1]["behavior"],
+                               single["behavior"], rtol=1e-5, atol=1e-6)
+    # A search and a speculative block both run ragged rows over the pool: a
+    # criterion ends some rows early while their peers keep going, and each
+    # rank still answers exactly what one process answers for its own rows.
+    for name in ("beam_tokens", "beam_lengths", "draft_tokens", "draft_lengths"):
+        assert reports[0][name] + reports[1][name] == single[name], name
+    assert len(set(single["draft_lengths"])) > 1, "the rows did not end raggedly"
+    assert len(single["beam_tokens"]) == 2 * len(single["draft_tokens"])

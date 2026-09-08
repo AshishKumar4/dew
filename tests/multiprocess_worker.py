@@ -1130,7 +1130,14 @@ def mode_rollout(args) -> dict:
     direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
-        for fault in ("token", "length", "key"):
+        # A component only one rank can describe: its closure holds an object
+        # whose identity is this process's address.
+        captured = None if rank == 0 else object()
+
+        def rewrite(state, logits):
+            return logits if captured is None else logits
+
+        for fault in ("token", "length", "key", "component"):
             broken = {name: np.array(value, copy=True) for name, value in local.items()}
             if rank == 1:
                 if fault == "token":
@@ -1139,7 +1146,11 @@ def mode_rollout(args) -> dict:
                     broken["prompt_length"][0] = 0
             key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
             try:
-                rollout(state, broken, key)
+                if fault == "component":
+                    generate(model, state.params, inputs_for(local), 4, key=key, sampling=sampling,
+                             logits=(jax.tree_util.Partial(rewrite),))
+                else:
+                    rollout(state, broken, key)
             except (ValueError, RuntimeError) as error:
                 invalid_errors[fault] = str(error)
             else:
@@ -1473,9 +1484,120 @@ def mode_mixed_validity(args) -> dict:
     }
 
 
+def mode_decoding_components(args) -> dict:
+    """Decoding components over a pool, and the disagreements it has to refuse.
+
+    Every process resolves its own chain and criteria. A pool that agreed only
+    on their shapes would run two different policies and never say so, so the
+    disagreements here keep the shapes identical and change the values: one
+    rank bans a different token, and one rank names a different function.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+    from dew.inference import TextGeneration
+    from dew.inference.pipeline import place
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Beam, Sampling, Speculative, decoding
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla",
+                              num_nextn_predict_layers=1)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
+    prompts, lengths = continuation_prompts()
+    rows = len(prompts) // processes
+    local = slice(rank * rows, (rank + 1) * rows)
+    mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
+    request = ModelInputs(jnp.asarray(prompts[local]), {"attention_mask": jnp.asarray(mask[local])})
+
+    def raise_last(state, scores):
+        return scores.at[:, -1].add(4.0)
+
+    chain = (decoding.RepetitionPenalty(1.3), jax.tree_util.Partial(raise_last),
+             decoding.Temperature(0.8), decoding.TopK(5))
+    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_id=12),
+                          logits=chain, stopping=(decoding.MaxNewTokens(3),))
+    result = task(request, 4, seed=7).host()
+    # An explicit chain replaces these sampling filters. Their rank-local
+    # values are not part of the executed policy or its agreement identity.
+    equivalent = task(request, 4, seed=7, logits=chain,
+                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_id=12)).host()
+    for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+        if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
+            raise AssertionError(f"unused sampling filters changed {name}")
+
+    refused = []
+    if processes > 1:
+        divergences = {
+            "criterion payload": (chain, (decoding.EndOfSequence(
+                jnp.asarray([3 if rank == 1 else 5], jnp.int32)),)),
+            "transform identity": (
+                chain[:1] + (jax.tree_util.Partial(
+                    (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last),)
+                + chain[2:], ()),
+            "transform payload": (
+                (decoding.RepetitionPenalty(1.3),
+                 decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32))), ()),
+        }
+        for name, (logits, stopping) in divergences.items():
+            try:
+                task(request, 4, seed=7, logits=logits, stopping=stopping)
+            except (ValueError, RuntimeError, AssertionError) as failure:
+                refused.append(name)
+                del failure
+            else:
+                raise AssertionError(f"a peer's different {name} was accepted")
+            # A rank stranded in a collective never reaches this rendezvous.
+            arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+            if arrivals.tolist() != list(range(processes)):
+                raise AssertionError("a rank did not return from the rejected request")
+        agreed = task(request, 4, seed=7, logits=chain,
+                      stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
+        if int(agreed.lengths.sum()) < 1:
+            raise AssertionError("the agreed request emitted nothing")
+    # Ragged rows: a criterion ends some of them early, so the search and the
+    # speculative block both have to finish while their peers keep going.
+    # A token the greedy walk of the global prompts reaches at different
+    # steps, so the rows end raggedly. It is read from the whole batch on
+    # unsharded weights, so every process resolves the same component.
+    walked = jnp.asarray(prompts)
+    for _ in range(3):
+        step = jnp.argmax(model.apply(params, walked)[:, -1], axis=-1)[:, None].astype(jnp.int32)
+        walked = jnp.concatenate([walked, step], axis=1)
+    early = (decoding.EndOfSequence(jnp.asarray([int(walked[0, -1])], jnp.int32)),)
+    searched = TextGeneration(model, placed, sampling=Sampling(pad_id=12), stopping=early,
+                              strategy=Beam(width=3, length_penalty=0.7), n=2)(
+                                  request, 4, seed=7).host()
+    drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+                             stopping=early, strategy=Speculative(block=3))(
+                                 request, 5, seed=7).host()
+    plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+                           stopping=early)(request, 5, seed=7).host()
+    if not np.array_equal(drafted.tokens, plain.tokens):
+        raise AssertionError("speculation and sampling disagreed on a greedy pool run")
+    return {
+        "process_index": rank,
+        "rows": int(result.rows),
+        "tokens": result.tokens.tolist(),
+        "lengths": result.lengths.tolist(),
+        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
+        "refused": refused,
+        "beam_tokens": searched.tokens.tolist(),
+        "beam_lengths": searched.lengths.tolist(),
+        "draft_tokens": drafted.tokens.tolist(),
+        "draft_lengths": drafted.lengths.tolist(),
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
+         "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,

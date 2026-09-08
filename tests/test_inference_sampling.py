@@ -14,7 +14,8 @@ from transformers.generation.logits_process import (
 from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling
-from dew.sampling.text import _sample_token
+from dew.sampling.decoding import StepState, chain
+from dew.sampling.strategies import draw
 from test_text_rollout_contract import decoder
 
 
@@ -147,7 +148,10 @@ def test_every_continuation_records_the_likelihoods_of_its_own_draw(task):
 @pytest.mark.parametrize("sampling", [Sampling(top_p=0), Sampling(min_p=1), Sampling(top_k=1, top_p=0.1)])
 def test_filters_keep_the_best_token_at_the_boundary(sampling):
     logits = jnp.array([[1.0, 3.0, -2.0]])
-    token, behavior, raw = _sample_token(logits, jax.random.split(jax.random.key(3), 1), sampling)
+    state = StepState(tokens=jnp.zeros((1, 1), jnp.int32), valid=jnp.ones((1, 1), bool),
+                      step=jnp.zeros(1, jnp.int32), active=jnp.ones(1, bool),
+                      keys=jax.random.split(jax.random.key(3), 1), prompt_width=1)
+    token, behavior, raw = draw(state, logits, chain(sampling.transforms()))
     np.testing.assert_array_equal(token, [1])
     np.testing.assert_allclose(behavior, [0.0], atol=1e-6)
     np.testing.assert_allclose(raw, jax.nn.log_softmax(logits)[0, 1:2], atol=1e-6)
@@ -161,42 +165,69 @@ def test_invalid_probability_controls_are_refused():
             Sampling(min_p=value)
 
 
-def test_source_policy_preserves_supported_filters_and_requires_an_override_for_others(task):
+def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
+    """A source builds the complete chain in the reference's order, keeping
+    its basic policy visible as a `Sampling` value. An explicit policy
+    replaces that policy and clears the chain it was built around, while the
+    row count stays the source's."""
     from dew.interop.pretrained import Pretrained
     from pathlib import Path
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
-                        generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4, "min_p": 0.1})
-    policy = source.text_generation()
-    assert policy.sampling.top_p == 0.4 and policy.sampling.min_p == 0.1
-    altered = replace(source, generation_config={**source.generation_config, "repetition_penalty": 2.0})
-    with pytest.raises(ValueError, match="repetition_penalty"):
-        altered.text_generation()
+                        generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
+                                           "min_p": 0.1, "num_return_sequences": 2})
+    altered = replace(source, generation_config={**source.generation_config,
+                                                 "repetition_penalty": 2.0, "typical_p": 0.9})
     override = altered.text_generation(sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(override([[1, 2]], 2, key=jax.random.key(1)).behavior_log_probs, 0)
-    inactive = replace(source, generation_config={"do_sample": False, "typical_p": 0.1})
-    assert inactive.text_generation().sampling.temperature == 0
+    plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
+    np.testing.assert_array_equal(plain.behavior_log_probs, 0)
+    penalized = replace(override, logits=altered.text_generation().logits)
+    assert not np.array_equal(np.asarray(plain.tokens),
+                              np.asarray(penalized([[1, 2]], 6, key=jax.random.key(1), n=1).tokens))
 
 
-def test_neutral_source_controls_are_accepted_and_active_unsupported_controls_raise(task):
+def test_unsupported_source_controls_report_their_reason(task):
+    """An unsupported active source control names itself and the missing behavior."""
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
-    neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
-               "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None}
-    assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
-    for active in ({"stop_strings": ["END"]}, {"num_beams": 2}, {"num_beams": 2, "length_penalty": 0.8},
-                   {"do_sample": True, "penalty_alpha": 0.6, "top_k": 4}, {"a_future_control": 3},
-                   {"remove_invalid_values": True}, {"max_time": 5.0}):
-        with pytest.raises(ValueError, match="cannot honor"):
+    refusals = {
+        "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
+        "beams below rows": ({"num_beams": 2, "num_return_sequences": 3}, "exceeds num_beams"),
+        "num_beam_groups": ({"num_beams": 2, "num_beam_groups": 2}, "group beam search"),
+        "penalty_alpha": ({"do_sample": True, "penalty_alpha": 0.6}, "contrastive search"),
+        "unknown": ({"a_future_control": 3}, "does not know this control"),
+        "max_time": ({"max_time": 5.0}, "host clock"),
+        "token_healing": ({"token_healing": True}, "prompt construction"),
+        "guidance_scale": ({"guidance_scale": 2.0}, "second time per step"),
+        "dola_layers": ({"dola_layers": "high"}, "DoLa"),
+        "watermark": ({"watermarking_config": {"greenlist_ratio": 0.5}}, "watermarking"),
+        "constraints": ({"force_words_ids": [[3]]}, "constrained beam search"),
+        "ensemble": ({"assistant_ensemble_weight": 0.5}, "biased distribution"),
+        "lookup": ({"prompt_lookup_num_tokens": 3}, "prompt lookup"),
+        "early exit": ({"assistant_early_exit": 2}, "early-exit"),
+        "no depths": ({"use_mtp": True}, "no prediction-depth weights"),
+        "other proposer": ({"speculation_type": "ngram"}, "names no native proposer"),
+        "both searches": ({"num_beams": 2, "use_mtp": True}, "at once"),
+        "cache": ({"use_cache": False}, "its own cache"),
+        "quantized cache": ({"cache_config": {"backend": "quanto"}}, "quantized and offloaded"),
+        "chunked prefill": ({"prefill_chunk_size": 8}, "one call"),
+        "continuous batching": ({"continuous_batching_config": {"max_batch_tokens": 8}}, "continuous batching"),
+        "scores": ({"output_scores": True}, "per-step distributions"),
+        "hidden states": ({"output_hidden_states": True}, "hidden states"),
+        "no compile": ({"disable_compile": True}, "always runs compiled"),
+        "capacity": ({"max_cache_len": 4096}, "max_seq_len"),
+    }
+    for name, (active, reason) in refusals.items():
+        with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
 
 
 def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(task):
-    """num_return_sequences counts continuations rather than filtering the
-    distribution, so the loaded task draws that many rows per prompt. An
-    explicit call count overrides it in either direction, an explicit
-    sampling policy leaves it alone, and beam search stays refused."""
+    """num_return_sequences counts returned rows rather than filtering the
+    distribution, so the loaded task returns that many per prompt whichever
+    strategy runs. An explicit call count overrides it in either direction and
+    an explicit sampling policy leaves it alone."""
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
 
@@ -204,14 +235,17 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
                         generation_config={"do_sample": True, "temperature": 0.9,
                                            "num_return_sequences": 3})
     policy = source.text_generation()
-    assert policy.n == 3
     rows = policy([[1, 2], [3, 4]], 4, seed=5).host()
     assert rows.tokens.shape == (6, 6) and rows.lengths.shape == (6,)
     np.testing.assert_array_equal(rows.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
     assert policy([[1, 2], [3, 4]], 4, n=1, seed=5).host().tokens.shape == (2, 6)
-    assert source.text_generation(sampling=Sampling(temperature=0)).n == 3
-    with pytest.raises(ValueError, match="cannot honor"):
-        replace(source, generation_config={**source.generation_config, "num_beams": 4}).text_generation()
+    overridden = source.text_generation(sampling=Sampling(temperature=0))
+    assert overridden([[1, 2], [3, 4]], 1, seed=5).lengths.shape == (6,)
+    searched = replace(source, generation_config={"num_return_sequences": 3, "num_beams": 4})
+    beamed = searched.text_generation()
+    found = beamed([[1, 2], [3, 4]], 4, seed=5).host()
+    assert found.tokens.shape == (6, 6)
+    np.testing.assert_array_equal(found.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
     with pytest.raises(ValueError, match="num_return_sequences"):
         replace(source, generation_config={"num_return_sequences": 0}).text_generation()
 
@@ -229,3 +263,80 @@ def test_source_total_length_and_explicit_continuation_budget_have_defined_prece
     np.testing.assert_array_equal(overridden.tokens, full.tokens[:, :3])
     with pytest.raises(ValueError, match="prompt width"):
         policy([[1, 2, 3, 4, 5, 6]], seed=1)
+
+
+def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
+    """`forced_eos_token_id` accepts several ids and fires one step before the
+    end of the request, so a call that changes the budget moves it. Pinning
+    the position to the source's own length would force at the wrong step."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config={"forced_eos_token_id": [2, 5],
+                                           "max_new_tokens": 3, "max_length": 18,
+                                           "pad_token_id": 0})
+    policy = source.text_generation()
+    from dew.sampling import decoding
+    plain = replace(policy, logits=(decoding.Greedy(),))
+    moved = False
+    for budget in (3, 5):
+        drawn = policy([[1, 2]], budget, seed=0).host()
+        assert drawn.tokens.shape == (1, 2 + budget)
+        # The last step allows either id and nothing else.
+        assert int(drawn.tokens[0, 2 + budget - 1]) in (2, 5)
+        free = plain([[1, 2]], budget, seed=0).host()
+        moved = moved or int(free.tokens[0, -1]) != int(drawn.tokens[0, -1])
+    assert moved, "the control changed nothing, so the position it fires at is untested"
+    # Without an explicit budget the source's own max_new_tokens decides.
+    assert policy([[1, 2]], seed=0).host().tokens.shape == (1, 5)
+
+
+def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
+    """The override replaces the basic policy and the chain, so a control that
+    only shapes the distribution is neither built nor judged: a watermark the
+    caller just replaced cannot block the call. Everything the task keeps is
+    still judged, and an unknown name still refuses because nothing says who
+    would own it."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    blocked = {"watermarking_config": {"greenlist_ratio": 0.5}, "guidance_scale": 2.0,
+               "temperature": "warm", "num_return_sequences": 2}
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config=blocked)
+    with pytest.raises(ValueError):
+        source.text_generation()
+    overridden = source.text_generation(sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(overridden([[1, 2]], 2, key=jax.random.key(0), n=1
+                                             ).behavior_log_probs, 0)
+    # A control the task still owns keeps refusing under the same override.
+    for active, reason in (({"max_time": 5.0}, "host clock"),
+                           ({"output_scores": True}, "per-step distributions"),
+                           ({"a_future_control": 3}, "does not know this control")):
+        with pytest.raises(ValueError, match=reason):
+            replace(source, generation_config={**blocked, **active}).text_generation(
+                sampling=Sampling(temperature=0))
+    # A constant proposal length is the fixed block size, so it is not adaptive.
+    steady = replace(source, generation_config={"num_assistant_tokens_schedule": "constant"})
+    assert steady.text_generation().strategy is None
+    with pytest.raises(ValueError, match="constant proposal length"):
+        replace(source, generation_config={"num_assistant_tokens_schedule": "heuristic"}
+                ).text_generation()
+
+
+def test_neutral_beam_controls_preserve_the_search(task):
+    """Serialized beam defaults remain inert while beam search is active."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    config = {"num_beams": 2, "num_return_sequences": 2, "eos_token_id": 5}
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config=config)
+    expected = source.text_generation()([[1, 2]], 3, seed=7)
+    declared = replace(source, generation_config={
+        **config, "num_beam_groups": 1, "diversity_penalty": 0.0,
+        "early_stopping": False, "length_penalty": 1.0})
+    actual = declared.text_generation()([[1, 2]], 3, seed=7)
+    for name in ("tokens", "lengths", "terminated", "raw_log_probs", "behavior_log_probs"):
+        np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
