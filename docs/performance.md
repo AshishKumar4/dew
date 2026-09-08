@@ -263,6 +263,74 @@ digit, which is the two kernels' bf16 rounding compounded by Adam. Decode
 asks for one query position at a time, an odd length, and now runs on
 cudnn with the cache mask as an additive bias; its speed was not measured.
 
+## Attention metadata and the masked conv, 2026-09-07
+
+Carrying `AttentionMetadata` used to cost the fused kernel whatever the
+metadata said. The mixer built its `[B, 1, S, S]` mask and forced the xla
+path as soon as any metadata arrived, so a batch that only spelled out
+rotary positions, or one whose validity marked every slot real, paid for a
+mask that excluded nothing. The mixer now asks what the metadata restricts:
+key validity, or image groups on a bidirectional-image layer. A validity
+array is opaque at trace time, so an all-true one still builds the mask;
+the host producers that used to emit one (`pad_token_rows`, the
+processor's `from_hf`, generation's input validation, the rollout collector
+and episode cohorts, the PPO critic without lengths, every MTP depth) leave
+it out when they know the rows are whole.
+
+The Gated DeltaNet short conv had the same shape of problem inside it.
+`_masked_conv1d` convolved one token per scan step to keep a paused row's
+history still; it now compacts each row's real tokens by
+`cumsum(valid) - 1` and calls the same fp32 `causal_conv1d` once.
+
+One RTX 4080, bf16 compute with fp32 master parameters, one fresh process
+per case, `XLA_PYTHON_CLIENT_PREALLOCATE=false`, no XLA flags, 5 warmups
+then 3 windows of 50 calls, dispatch-to-`block_until_ready` medians, at
+`14622ba` against `83f08e5`:
+
+| case | fwd before | fwd after | fwd+bwd before | fwd+bwd after | peak MiB before / after | kernels a call before / after |
+|---|---:|---:|---:|---:|---|---|
+| attention, no metadata | 0.378 | 0.380 | 1.198 | 1.200 | 169 / 169 | 43 / 43 |
+| attention, opaque all-true validity | 1.030 | 1.048 | 2.960 | 2.960 | 496 / 496 | 50 / 50 |
+| attention, canonical metadata | 1.017 | 0.378 | 2.959 | 1.175 | 496 / 169 | 50 / 43 |
+| attention, packed segments | 1.040 | 1.046 | 2.974 | 2.956 | 496 / 496 | 50 / 50 |
+| GDN, no mask | 4.382 | 4.404 | 16.14 | 16.12 | 1460 / 1460 | 1882 / 1882 |
+| GDN, all-true dynamic mask | 16.15 | 4.915 | 54.79 | 18.56 | 1923 / 1544 | 36700 / 1884 |
+| GDN, lengths 2048 and 1537 | 16.09 | 4.876 | 54.70 | 18.46 | 1923 / 1544 | 36700 / 1884 |
+
+Attention is batch 1, 2048 tokens, 8 query and 4 key heads of 128; GDN is
+batch 2, 2048 tokens, 8 key and 16 value heads, conv kernel 4. Peaks and
+kernel counts are the forward+backward figures. The canonical row is the
+same batch as the opaque row with the redundant validity left out, so it is
+the shape of a real unpadded request; its before column is that same call
+measured against `83f08e5`, and its `__cudnn$fmhaSoftmax` custom call in
+the compiled HLO, absent before and present after, is what says the route
+changed rather than the clock. The opaque and packed rows are unchanged by
+design and their spread across windows covers the difference; the peaks the
+process allocator reports move by up to 20 MiB between identical runs
+(the packed forward gave 496.02 and 476.02 MiB on two repeats of the same
+executable, whose own `memory_analysis` is byte-identical), so read the
+column at that resolution.
+
+What the numbers mean case by case. Canonical metadata now runs the plain
+call, exactly: outputs bitwise equal to the no-metadata forward and
+parameter gradients within 2.4e-06 of it. The opaque all-true mask stays on
+the xla kernel, at the cost it always had, because nothing in the shape of
+a validity array says its contents are all true. The masked GDN conv is
+3.3 times faster forward and 3.0 times faster with the gradient, and 22
+times fewer kernel launches a call: the scan's `while` loop is gone from
+the HLO and the `__cudnn$convForward` of the unmasked path is there
+instead. Against the reference it is exact where it has to be: on
+lengths 2048 and 1537 the outputs agree with row-by-row evaluation to
+2.4e-04 (the layer's 5e-4 bound), the padded row's input gradients are
+exactly zero and its outputs exactly zero, and against the token scan on
+CPU at fp32 the largest difference over left, right, interior and paused
+padding at kernels 2, 4 and 8 is 4.8e-07.
+
+Head-chunk and head-dimension-256 cases were not rerun; nothing here
+reaches them. Reproduce with `run_batch.sh` in
+`.cache/dew/mask-routing-83f08e5`, whose `kernel_cases.py` carries the case
+definitions, the allocator and HLO capture and the correctness groups.
+
 ## XLA flags
 
 `TrainerConfig.xla_flags` appends to `XLA_FLAGS`, applied by
