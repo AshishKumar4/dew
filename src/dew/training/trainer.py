@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -27,7 +28,7 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable
+from dew.data.dataset import Checkpointable, RampedStream, Stage, rows_of
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
                                  Step, Variables, merge, select, mean_loss)
@@ -55,6 +56,21 @@ CompiledStep = Callable[
     [TrainState, Batch],
     tuple[TrainState, jax.Array, Mapping[str, jax.Array], jax.Array, jax.Array]]
 """A call returns state, scalar loss, metrics, loss_finite, and accepted."""
+
+Shapes = tuple[tuple[int, ...], ...]
+"""A batch's leaf shapes in tree order, the key a compiled step is held
+under: a step is compiled for the shapes it was traced on and no others."""
+
+
+def batch_shapes(batch: Batch) -> Shapes:
+    """`batch`'s shapes, in tree order.
+
+    A run whose batch never changes has one of these and compiles once. A run
+    whose dataset ramps the batch has one per stage of the ramp, so the set of
+    compiled steps is that ramp's stages: `Ramp.stages` bounds it and
+    `Trainer.fit` compiles each one on the first step that reads it.
+    """
+    return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
 
 
 class Rollout(Protocol):
@@ -241,7 +257,8 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.profile = profile
-        # Measured off the compiled step, once per fit.
+        # Measured off the step `compile` last compiled, which for a ramped
+        # run is the stage it was called for; `fit` keeps one per stage.
         self.flops_per_step = None
 
     # ------------------------------------------------------------------
@@ -640,13 +657,24 @@ class Trainer(Generic[Loss, Effects]):
             if current == steps and checkpoints is not None and checkpoints.latest is not None:
                 return state
             local_every = None if checkpoints is None else checkpoints.local_every
-            train_step = None
+            # One compiled step per batch shape, with the FLOPs measured off
+            # it. A run whose batch is fixed compiles once; a ramped run
+            # compiles once per stage of its ramp, and the shapes are that
+            # ramp's stages and no others.
+            compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+            stages: tuple[Stage, ...] | None = None
             # Rebound once the step is compiled, so the first tick measures steps,
             # not the compile.
             last_log_time = time.time()
             last_saved = current if checkpoints is not None and checkpoints.latest is not None else None
             interval_steps = 0
             steps_since_log = 0
+            # The records this logging interval trained on, and the FLOPs the
+            # compiler measured for the steps that read them. Both are summed
+            # per step rather than taken off the dataset's batch, so a ramped
+            # run reports the samples it read and not the batch it ends at.
+            interval_samples = 0
+            interval_flops: float | None = 0.0
             # Seconds spent sampling this interval, logged under
             # train/rollout_seconds when a rollout is set.
             rollout_seconds = 0.0
@@ -668,6 +696,13 @@ class Trainer(Generic[Loss, Effects]):
                         f"written without the data position would replay the data on "
                         f"resume. Train it with checkpoint_every=None "
                         f"(--trainer.checkpoint-every None)")
+                stages = source.stages if isinstance(source, RampedStream) else None
+                if stages is not None and self.accumulation > 1:
+                    raise ValueError(
+                        f"a batch ramp grows the records a step reads, and an "
+                        f"accumulation window of {self.accumulation} pools "
+                        f"microbatches of one shape into one update; ramp the batch "
+                        f"or accumulate, not both")
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
@@ -693,9 +728,17 @@ class Trainer(Generic[Loss, Effects]):
                         jax.random.fold_in(state.key, state.step), 1)
                     batch = shard_batch(mesh, self.rollout(state, batch, key))
                     rollout_seconds += time.perf_counter() - began
-                if train_step is None:
-                    train_step = self.compile(state, batch)
-                    last_log_time = time.time()
+                shapes = batch_shapes(batch)
+                if shapes not in compiled:
+                    if not compiled and stages is not None:
+                        # The first batch is where the shardings a stage's rows
+                        # would take exist, so it is where every stage of the
+                        # ramp is answered for.
+                        self._check_stages(stages, batch, mesh)
+                    compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+                    if len(compiled) == 1:
+                        last_log_time = time.time()
+                train_step, measured_flops = compiled[shapes]
                 if (profile is not None and not tracing and traced == 0
                         and seen >= profile.warmup):
                     jax.profiler.start_trace(profile.directory)
@@ -707,6 +750,9 @@ class Trainer(Generic[Loss, Effects]):
                 seen += 1
                 steps_since_log += 1
                 interval_steps += 1
+                interval_samples += rows_of(batch)
+                interval_flops = (None if interval_flops is None or measured_flops is None
+                                  else interval_flops + measured_flops)
                 book = bookkeep(book, loss, finite)
                 if first_step is None:
                     loss.block_until_ready()
@@ -732,7 +778,7 @@ class Trainer(Generic[Loss, Effects]):
                             scalars = {"train/loss": float(loss),
                                        **{f"train/{k}": float(v) for k, v in aux.items()},
                                        **self._throughput(now - last_log_time, steps_since_log,
-                                                          data.batch)}
+                                                          interval_samples, interval_flops)}
                             scalars["train/accepted"] = float(accepted)
                             if state.scale is not None:
                                 scalars["train/loss_scale"] = float(state.scale.scale)
@@ -742,6 +788,7 @@ class Trainer(Generic[Loss, Effects]):
                             if self.tracker is not None:
                                 self.tracker.log(scalars, current)
                             last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                            interval_samples, interval_flops = 0, 0.0
 
                     except BaseException as failure:
                         error = failure
@@ -937,13 +984,52 @@ class Trainer(Generic[Loss, Effects]):
         if streak:
             print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
 
-    def _throughput(self, elapsed: float, steps: int, batch: int) -> dict[str, float]:
+    def _throughput(self, elapsed: float, steps: int, samples: int,
+                    flops: float | None) -> dict[str, float]:
+        """The interval's rates, from the records it actually read.
+
+        `samples` is summed over the interval's steps rather than taken as
+        `batch * steps`, so a ramped run's throughput is the records it read;
+        `flops` is summed the same way, over what the compiler measured for
+        each step's own shape, and is None when a shape's measurement was
+        unavailable. An interval that spans a stage boundary carries that
+        stage's compile in its wall time, as MaxText's does; it hides the
+        performance metrics during a ramp instead
+        (`common/metric_logger.py:166-194`).
+        """
         if elapsed <= 0 or steps <= 0:
             return {}
         step_time = elapsed / steps
         scalars = {"train/step_time_ms": step_time * 1000,
-                   "train/samples_per_sec": batch / step_time}
-        mfu = model_flops_utilization(self.flops_per_step, step_time)
+                   "train/samples_per_sec": samples / elapsed}
+        mfu = None if flops is None else model_flops_utilization(flops / steps, step_time)
         if mfu is not None:
             scalars["train/mfu"] = mfu
         return scalars
+
+    def _check_stages(self, stages: Sequence[Stage], batch: Batch, mesh: Mesh) -> None:
+        """Refuse a batch ramp with a stage this mesh cannot hold, before the
+        run reaches it.
+
+        A stage's rows are sharded over the mesh's batch axes like any other
+        batch's, so a stage those axes do not divide fails when it is placed,
+        which for a later stage is an hour into the run. The first batch's own
+        placement says how many shards the rows are cut into, and that answers
+        every stage at once.
+        """
+        shardings = batch_shardings(mesh, batch)
+        rows, held = next(
+            ((np.shape(leaf)[0], sharding.shard_shape(np.shape(leaf))[0])
+             for leaf, sharding in zip(jax.tree.leaves(batch), jax.tree.leaves(shardings))
+             if np.shape(leaf)),
+            (0, 0))
+        if not held:
+            return
+        shards = rows // held
+        refused = [stage.batch for stage in stages if stage.batch % shards]
+        if refused:
+            raise ValueError(
+                f"the batch ramp reads {refused} records a step at some of its "
+                f"stages, and this mesh cuts a batch into {shards} shards: "
+                f"{dict(mesh.shape)} places whole rows per shard, so every stage "
+                f"of a ramp has to be a multiple of that count")

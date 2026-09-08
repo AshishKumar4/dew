@@ -8,12 +8,12 @@ the segment ids and positions the backbone's mask needs. Train shuffles from
 file order, in whole batches, so every validation pass scores the same
 windows. Both shard by JAX process.
 
-They resume differently, and the difference is where the sharding sits.
-`TokenWindows` reads windows the loader shards after they are ordered, so a
-step is the same windows at any process count and its saved position is a
-global record count. `PackedTokens` packs its windows out of the documents
-one process was given, so a window depends on that slice and the position it
-saves is its own shard's; a resume needs the process count that wrote it.
+Both resume from a global record count, because both put the sharding last.
+`TokenWindows` reads windows off the stream at a fixed stride; `PackedTokens`
+plans its packing over the whole corpus in file order and reads windows off
+that plan. A step is then the same windows at any process count, and the
+position a checkpoint holds is a place in one order rather than one
+process's offset into its shard.
 """
 
 from __future__ import annotations
@@ -24,13 +24,12 @@ from pathlib import Path
 from typing import Callable, Iterator, overload
 
 import grain.python as pygrain
-import jax
 import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream,
-                      validation_pass)
+from .dataset import (Batch, Dataset, DatasetSpec, Loading, describe, local_batch,
+                      train_stream, validation_pass)
 
 
 def token_files(path: str | None, name: str) -> tuple[str, str]:
@@ -125,6 +124,71 @@ def chunk_counts(lengths, chunk_len: int):
     return -(-np.asarray(lengths, np.int64) // chunk_len)
 
 
+def chunk_lengths(lengths, chunk_len: int) -> np.ndarray:
+    """The token count of every chunk `DocumentChunks` cuts `lengths` into.
+
+    A document of `chunk_len` tokens or fewer is one chunk of its own length;
+    a longer one is whole chunks and a remainder. A document of no tokens is
+    no chunks, as `chunk_counts` says.
+    """
+    lengths = np.asarray(lengths, np.int64)
+    counts = chunk_counts(lengths, chunk_len)
+    sizes = np.full(int(counts.sum()), chunk_len, np.int64)
+    kept = counts > 0
+    last = np.cumsum(counts)[kept] - 1
+    sizes[last] = lengths[kept] - (counts[kept] - 1) * chunk_len
+    return sizes
+
+
+def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np.ndarray]:
+    """The plan grain's first-fit packer would follow over chunks of `sizes`.
+
+    Grain's packer holds `bins` open windows, adds each record to the first
+    with room, and emits all of them when a record fits in none
+    (`grain/_src/python/dataset/transformations/packing.py:341-355`). Over
+    the lengths alone that is a plan rather than a pass: which window every
+    chunk belongs to, without reading a token. The plan is what lets the
+    packing run ahead of the shard, over the whole corpus in file order, so
+    a window holds the same chunks at any process count and the loader can
+    shard windows the way it shards any other record.
+
+    Returns the chunk indices grouped by window, in the order the packer
+    added them, and where each window starts in that grouping. A window the
+    packer never added anything to is dropped: it would be a batch row of
+    pure padding, which trains on nothing. Only the last set of bins can
+    hold one, because a record goes to the first window with room and an
+    empty window has room for anything.
+    """
+    if bins < 1:
+        raise ValueError(f"a packer fills at least one window at a time, got {bins}")
+    longest = int(sizes.max()) if len(sizes) else 0
+    if longest > window:
+        raise ValueError(
+            f"a chunk of {longest} tokens does not fit a window of {window}; "
+            f"documents are cut to the window before they are packed")
+    room = [window] * bins
+    plan = np.empty(len(sizes), np.int64)
+    closed = 0
+    for index, size in enumerate(sizes.tolist()):
+        chosen = -1
+        for candidate, free in enumerate(room):
+            if free >= size:
+                chosen = candidate
+                break
+        if chosen < 0:
+            # Every open window is short of room, so the packer emits all of
+            # them and starts this chunk in the first of a fresh set.
+            closed += bins
+            room = [window] * bins
+            chosen = 0
+        plan[index] = closed + chosen
+        room[chosen] -= size
+    windows = closed + bins - room.count(window)
+    starts = np.concatenate([np.zeros(1, np.int64),
+                             np.cumsum(np.bincount(plan, minlength=windows))])
+    return np.argsort(plan, kind="stable"), starts
+
+
 class DocumentChunks(pygrain.MapDataset[Batch]):
     """Documents cut into consecutive chunks of at most `chunk_len` tokens.
 
@@ -171,6 +235,81 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
         return {key: value[start:start + self._chunk_len] for key, value in document.items()}
 
 
+class PackedWindows(pygrain.MapDataset[Batch]):
+    """Documents packed into windows of `window` tokens, by one plan over the
+    whole corpus.
+
+    Every window carries, beside each per-token field, `<field>_segment_ids`
+    (which chunk of the window each token came from, counted from 1, and 0
+    for the padding at the end) and `<field>_positions` (the token's place
+    inside its chunk), the two arrays a block-diagonal mask and per-document
+    RoPE read; grain's packer writes the same pair per packed feature
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`).
+    Chunks are cut the same way in every field, so one pair describes them
+    all and the arrays are shared rather than copied per field.
+
+    A window is random access, which is the point: `first_fit` plans the
+    packing from the document lengths, in file order, ahead of any sharding,
+    so window w holds the same chunks in every process of every process
+    count and the training stream can shuffle, shard and count windows the
+    way it does the records of any other source. Packing behind the shard,
+    as this loader did before, made a window a fact about one process's own
+    documents and its saved position a shard offset.
+    """
+
+    def __init__(self, documents: pygrain.RandomAccessDataSource[Batch], lengths,
+                 window: int, bins: int):
+        chunks: pygrain.MapDataset[Batch] = DocumentChunks(
+            pygrain.MapDataset.source(documents), lengths, window)
+        super().__init__(chunks)
+        self._window = window
+        self._described = describe(documents)
+        self._order, self._starts = first_fit(chunk_lengths(lengths, window), window, bins)
+
+    def __repr__(self) -> str:
+        # A saved position names the order it counts into (`dew.position`),
+        # and which chunks share a window is part of that order.
+        return (f"PackedWindows({self._described}, window={self._window}, "
+                f"windows={len(self)})")
+
+    def __len__(self) -> int:
+        return len(self._starts) - 1
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
+    def __getitem__(self, index):
+        # grain's slice is the sharding and windowing API (ds[shard::count]),
+        # and an index past the end wraps, so `repeat` is a length change.
+        if isinstance(index, slice):
+            return self.slice(index)
+        index = index % len(self)
+        chunks = []
+        for position in self._order[self._starts[index]:self._starts[index + 1]]:
+            chunk = self._parent[int(position)]
+            if chunk is None:
+                raise ValueError(f"chunk {int(position)} of the packed corpus is missing")
+            chunks.append(chunk)
+        fields = {key: np.zeros(self._window, value.dtype)
+                  for key, value in chunks[0].items()}
+        segment_ids = np.zeros(self._window, np.int32)
+        positions = np.zeros(self._window, np.int32)
+        filled = 0
+        for segment, chunk in enumerate(chunks, start=1):
+            length = len(next(iter(chunk.values())))
+            for key, value in chunk.items():
+                fields[key][filled:filled + length] = value
+            segment_ids[filled:filled + length] = segment
+            positions[filled:filled + length] = np.arange(length, dtype=np.int32)
+            filled += length
+        return {**fields,
+                **{f"{key}_segment_ids": segment_ids for key in fields},
+                **{f"{key}_positions": positions for key in fields}}
+
+
 @datasets("packed_tokens")
 @dataclasses.dataclass(frozen=True)
 class PackedTokens(DatasetSpec):
@@ -179,23 +318,22 @@ class PackedTokens(DatasetSpec):
     Documents come from `TokenDocumentSource`, which cuts the token stream at
     the eos ids the tokenize tool writes between files (`--pack`). Each
     document (in chunks, when it outgrows the window) is one element the
-    packer adds to the first bin with room, and every emitted window carries
+    packer adds to the first window with room, and every window carries
     `text_segment_ids` (which document each token is from, 0 for padding) and
     `text_positions` (the token's position inside its document), so the model
-    can stop attention and the loss at document boundaries. This uses grain's
-    `Dataset` API, which supports packing. Documents are sliced per process
-    before packing. Sharding after it would have every process pack the same
-    ones, and slicing before it is what ties a saved position to the process
-    count that wrote it: which chunks share a window is a fact about one
-    process's documents, so there is no global record count to resume from.
+    can stop attention and the loss at document boundaries.
 
-    `records` counts window-sized chunks, the upper bound on the windows a
-    pass over the split yields and the count a run has before it packs
-    anything. Every emitted window holds at least one chunk, the bound is
-    tight once documents reach the window, and which chunks share a window
-    depends on the shuffle. Counting documents would report zero steps for a
-    corpus of fewer documents than a batch. `val_batches` bounds a
-    validation pass; None scores all of val.bin.
+    The packing is planned over the whole corpus in file order, ahead of the
+    shard (`PackedWindows`), so a window is a fact about the corpus rather
+    than about one process's documents: the training stream shuffles and
+    shards windows the way it does any other record, and its saved position
+    is a global window count that resumes on any process count. Which
+    documents share a window is then the same in every run over that corpus,
+    and the seed decides the order the windows come in.
+
+    `records` counts the windows a pass over the split holds, exactly, so
+    `steps_per_epoch` is that pass. `val_batches` bounds a validation pass;
+    None scores all of val.bin.
     """
 
     path: str | None = None
@@ -203,55 +341,28 @@ class PackedTokens(DatasetSpec):
     val_batches: int | None = 4
     seed: int = 0
     loading: Loading = Loading()
-    """The packer reads through grain's Dataset API, which takes no read
-    options, so `workers` and `worker_buffer` are the two that reach it."""
     packing_bins: int = 8
+    """Windows the plan keeps open at once. More of them leave less padding
+    in a window and let documents further apart in the file share one."""
 
     def load(self, *, batch: int) -> Dataset:
-        from grain.experimental import FirstFitPackIterDataset
-
         from .sources.text import TokenDocumentSource
 
         train_bin, val_bin = token_files(self.path, "PackedTokens")
-        per_process = local_batch(batch)
-        window = self.seq_len + 1
+        rows, window = local_batch(batch), self.seq_len + 1
 
-        # One source per split, reused by its loader. Finding the boundaries
-        # reads the whole file, so rebuilding it per epoch would read a
+        # One source per split, and one plan over it. Finding the boundaries
+        # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
         train_source = TokenDocumentSource(train_bin)
         val_source = TokenDocumentSource(val_bin)
-
-        def stream(source, shuffle, epochs):
-            chunks: pygrain.MapDataset[Batch] = DocumentChunks(
-                pygrain.MapDataset.source(source), source.lengths, window)
-            chunks = chunks[jax.process_index()::jax.process_count()]  # a slice is a dataset
-            if shuffle:
-                chunks = chunks.shuffle(self.seed)
-            reads = chunks.repeat(epochs).to_iter_dataset()
-            if self.loading.workers:
-                # The workers read documents, and the packer stays behind them
-                # in this process. Grain runs a whole pipeline per worker, so
-                # packing inside them would fill bins from one worker's slice
-                # of the documents and make the windows depend on worker_count.
-                reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
-                    num_workers=self.loading.workers,
-                    per_worker_buffer_size=self.loading.worker_buffer))
-            packed = FirstFitPackIterDataset(
-                reads,
-                length_struct={"text": window},
-                num_packing_bins=self.packing_bins,
-                seed=self.seed,
-                # Bins come out in packing order for val, so a validation pass
-                # is the same batches every time.
-                shuffle_bins=shuffle,
-                padding_struct={"text": 0},
-            )
-            return iter(packed.batch(per_process, drop_remainder=True))
+        train = PackedWindows(train_source, train_source.lengths, window, self.packing_bins)
+        val = PackedWindows(val_source, val_source.lengths, window, self.packing_bins)
 
         return Dataset(
-            train=lambda: stream(train_source, True, None),
-            val=bounded(lambda: stream(val_source, False, 1), self.val_batches),
-            records=int(chunk_counts(train_source.lengths, window).sum()),
+            train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
+            val=bounded(validation_pass(val, [], batch=rows, seed=self.seed,
+                                        loading=self.loading), self.val_batches),
+            records=len(train),
             batch=batch,
         )
