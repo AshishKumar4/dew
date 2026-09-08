@@ -155,7 +155,7 @@ def integrate(process, solver, x_T, steps):
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
     denoise = process.denoiser(model, params, {})
     times = process.times(steps)
-    x, state = x_T, solver.init(x_T, times, process)
+    x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
     for i in range(steps - 1):
         t = jnp.full((x.shape[0],), times[i])
         t_next = jnp.full((x.shape[0],), times[i + 1])
@@ -429,7 +429,7 @@ def walk(solver, process, model, x_T, times, key=jax.random.PRNGKey(0)):
                                process, denoise)
         return (x, state), x
 
-    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T, times, process)),
+    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T, times, process, key=key)),
                               (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
     return latents
 
@@ -587,12 +587,12 @@ class Forgetful:
     def __init__(self, inner):
         self.inner = inner
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         self.times = times
-        return self.inner.init(x, times, process)
+        return self.inner.init(x, times, process, key=key)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x, self.times, process),
+        stepped, _ = self.inner.step(x, t, t_next, denoised, eps, self.inner.init(x, self.times, process, key=key),
                                      key, process, denoise)
         return stepped, state
 
@@ -640,11 +640,11 @@ def test_lambda_solvers_land_on_the_clean_prediction_at_sigma_zero(solver):
         x_0, eps = denoise(x, t)
         return solver.step(x, t, t_next, x_0, eps, state, key, process, denoise)
 
-    fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0]), process))
+    fresh, _ = step(x, 0.25, 0.0, solver.init(x, jnp.asarray([0.25, 0.0]), process, key=key))
     assert jnp.all(jnp.isfinite(fresh)) and jnp.allclose(fresh, denoise(x, jnp.full((3,), 0.25))[0], atol=1e-6)
 
     def two_steps(x):
-        x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0]), process))
+        x, state = step(x, 0.5, 0.25, solver.init(x, jnp.asarray([0.5, 0.25, 0.0]), process, key=key))
         return step(x, 0.25, 0.0, state)[0], denoise(x, jnp.full((3,), 0.25))[0]
 
     with_history, x_0 = two_steps(x)
@@ -771,3 +771,188 @@ def test_guidance_needs_the_unconditional_branch():
     x_T = process.noise(jax.random.PRNGKey(2), (2, 8, 8, 3))
     with pytest.raises(ValueError, match="unconditional"):
         sample(denoise, x_T, 5, solver=DDIM(), guidance=CFG(2.0), key=jax.random.PRNGKey(0))
+
+
+############################################################################################################
+# Published scheduler files, reconstructed by SourceSchedule from their own configs
+############################################################################################################
+
+SOURCE = json.loads((DIFFUSERS_FIXTURES / "source_schedulers.json").read_text())
+SOURCE_ARRAYS = np.load(DIFFUSERS_FIXTURES / "source_schedulers.npz")
+
+
+class SourceOracle(nn.Module):
+    """The model `tools/diffusers_source_reference.py` runs on both sides: a
+    bounded nonlinear function of the scaled input and the model time, so a
+    trajectory and its Jacobian depend on every scheduler decision the config
+    carries and on nothing else."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001
+
+
+class ConditionalSourceOracle(nn.Module):
+    """The same model offset by its condition, so a guided walk reads back the
+    combination that was applied."""
+
+    @nn.compact
+    def __call__(self, x, temb, label):
+        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
+
+
+def source_case(name: str):
+    """The reconstructed process, grid and solver of a fixture case, with the
+    initial latent the reference walked from."""
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    config = json.loads(str(SOURCE_ARRAYS[f"{name}.config"]))
+    schedule = SourceSchedule.from_config(config)
+    process, times = schedule.sampling(SOURCE["cases"][name]["steps"])
+    return schedule, process, times, jnp.asarray(SOURCE_ARRAYS[f"{name}.x_T"])
+
+
+@pytest.mark.parametrize("name", sorted(SOURCE["cases"]))
+def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
+    """Every published scheduler file the reference tool saved, rebuilt from
+    that file alone: its beta table, the standard deviation its
+    `init_noise_sigma` draws, the model time at each grid point, the latent
+    after every interval and the vector-Jacobian product of the last one
+    through the whole trajectory.
+
+    The reference calls the actual scheduler class, saves its config before
+    `set_timesteps` and walks every call a pipeline makes, so a spacing,
+    sigma transformation, terminal sigma, clipping order or stage placement
+    that this reconstruction read differently would move the trajectory.
+    Observed at most 4.0e-5 of a latent's own scale, on the zero-terminal-SNR
+    Euler grid whose substituted terminal alpha of 2^-24 puts sigma near 4e3,
+    and 2.5e-6 for the gradients; the model times land within 1.8e-4 of the
+    source's, which shifts this model's output by under 2e-7.
+    """
+    schedule, process, times, x_T = source_case(name)
+    rescale = SOURCE["cases"][name]["guidance"]
+    if f"{name}.betas" in SOURCE_ARRAYS:
+        np.testing.assert_allclose(schedule.betas, SOURCE_ARRAYS[f"{name}.betas"],
+                                   atol=1e-5, rtol=1e-5)
+    expected_times = SOURCE_ARRAYS[f"{name}.grid_times"]
+    model_times = np.asarray(process.sampler_schedule.model_time(times[:-1]))
+    assert model_times.shape == expected_times.shape
+    np.testing.assert_allclose(model_times, expected_times, atol=1e-3, rtol=1e-6)
+    prior = float(process.sampler_schedule.prior_scale())
+    assert abs(prior - float(SOURCE_ARRAYS[f"{name}.prior"])) < 1e-5 * max(prior, 1.0)
+    expected = SOURCE_ARRAYS[f"{name}.latents"]
+    cotangent = jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"])
+    if rescale is None:
+        model = SourceOracle()
+        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
+        denoise = process.denoiser(model, params, {})
+        run = lambda value: walk(schedule.solver(), process, model, value, times)  # noqa: E731
+        latents = run(x_T)
+        assert latents.shape == expected.shape
+        assert relative_gap(latents, expected) < 1e-4
+        final = lambda value: run(value)[-1]  # noqa: E731
+    else:
+        model = ConditionalSourceOracle()
+        rows = x_T.shape[0]
+        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])),
+                            jnp.ones((1,)), jnp.ones((1,)))
+        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), SOURCE["label"])},
+                                   {"label": jnp.zeros((rows,))})
+        guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
+
+        def final(value):
+            return sample(denoise, value, solver=schedule.solver(), guidance=guidance,
+                          key=jax.random.PRNGKey(0), times=times, final_denoise=False)
+
+        assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
+    (gradient,) = jax.vjp(final, x_T)[1](cotangent)
+    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad"][None]) < 1e-4
+
+
+def source_bridge(depth=None):
+    from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
+
+    bounds = SOURCE_ARRAYS["brownian.bounds"]
+    state = _Brownian(jax.random.PRNGKey(4), jnp.asarray(bounds[0], jnp.float32),
+                      jnp.asarray(bounds[1], jnp.float32))
+    levels = MAX_BROWNIAN_DEPTH if depth is None else depth
+    return lambda first, second, shape=(2, 3, 4): _brownian_noise(
+        state, jnp.asarray(first, jnp.float32), jnp.asarray(second, jnp.float32), shape, levels)
+
+
+def test_the_reference_brownian_tree_is_additive_signed_and_query_order_free():
+    """The identities Dew's bridge is built on, read off the actual `torchsde`
+    tree the source builds: the increment over a union of two adjacent
+    intervals is the sum of theirs, swapping an interval's ends negates it,
+    and asking the same set in the reverse order answers the same. Each is
+    checked on the un-normalized increments, which are the normalized query
+    times the square root of the interval's width."""
+    queries = SOURCE_ARRAYS["brownian.queries"]
+    widths = SOURCE_ARRAYS["brownian.widths"]
+    scaled = SOURCE_ARRAYS["brownian.normalized"] * np.sqrt(widths)[:, None, None, None]
+    first, second, whole = scaled[0], scaled[1], scaled[2]
+    assert (queries[0][1], queries[1][1]) == (queries[1][0], queries[2][1])
+    np.testing.assert_allclose(first + second, whole, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(SOURCE_ARRAYS["brownian.swapped"],
+                               -SOURCE_ARRAYS["brownian.normalized"], atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(SOURCE_ARRAYS["brownian.reordered"],
+                               SOURCE_ARRAYS["brownian.normalized"], atol=0, rtol=0)
+
+
+def test_the_native_brownian_bridge_holds_the_reference_identities():
+    """The same identities for Dew's bridge, plus the two the coupling relies
+    on: refining a query into halves sums back to the whole, and a deeper
+    construction leaves a dyadic node where the shallower one put it."""
+    queries = SOURCE_ARRAYS["brownian.queries"]
+    widths = SOURCE_ARRAYS["brownian.widths"]
+    query = source_bridge()
+    increments = [np.asarray(query(a, b)) * np.sqrt(width)
+                  for (a, b), width in zip(queries, widths)]
+    np.testing.assert_allclose(increments[0] + increments[1], increments[2], atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(query(queries[0][1], queries[0][0])),
+                               -np.asarray(query(*queries[0])), atol=0, rtol=0)
+    np.testing.assert_array_equal(np.asarray(query(*queries[0])),
+                                  np.asarray(query(*queries[0])))
+    low, high = SOURCE_ARRAYS["brownian.bounds"]
+    middle = 0.5 * (low + high)
+    coarse, fine = source_bridge(8), source_bridge(9)
+    np.testing.assert_allclose(np.asarray(coarse(low, middle)) * np.sqrt(middle - low),
+                               np.asarray(fine(low, middle)) * np.sqrt(middle - low),
+                               atol=1e-5, rtol=1e-5)
+
+
+def test_the_native_brownian_increments_have_the_variance_of_the_interval():
+    """A normalized query is a standard normal draw: over the sixteen dyadic
+    intervals of the tree's own domain the increments have unit variance and
+    zero mean, and two disjoint intervals are uncorrelated. Observed a
+    standard deviation of 0.99 and a correlation of 0.02."""
+    low, high = (float(value) for value in SOURCE_ARRAYS["brownian.bounds"])
+    query = source_bridge()
+    edges = np.linspace(low, high, 17)
+    draws = np.stack([np.asarray(query(edges[i], edges[i + 1], (8, 8, 8)))
+                      for i in range(16)])
+    assert abs(float(draws.std()) - 1.0) < 0.06
+    assert abs(float(draws.mean())) < 0.05
+    left, right = draws[3].ravel(), draws[11].ravel()
+    assert abs(float(np.corrcoef(left, right)[0, 1])) < 0.06
+
+
+def test_a_source_noise_sampler_seed_pins_the_brownian_path():
+    """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
+    walks with different keys integrate one path; without it the walk's own
+    key decides, as the source's unseeded tree draws its entropy per run."""
+    from dew.sampling import DPMSolverSDE
+
+    _, process, times, x_T = source_case("dpm_sde.default")
+    model = SourceOracle()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+
+    def run(solver, seed):
+        return sample(denoise, x_T, solver=solver, key=jax.random.PRNGKey(seed), times=times,
+                      final_denoise=False)
+
+    pinned = DPMSolverSDE(seed=7)
+    np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
+    free = DPMSolverSDE()
+    assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)

@@ -133,7 +133,7 @@ class Unmask:
     from the model's categorical; the rest stay masked. Integrates a
     `DiscreteProcess`."""
 
-    def init(self, x, times, process) -> tuple:
+    def init(self, x, times, process, *, key) -> tuple:
         return ()
 
     def step(self, x, t, t_next, denoised, log_probs, state, key, process, denoise):
