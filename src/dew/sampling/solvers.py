@@ -120,9 +120,17 @@ class DDPM:
     and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
 
     `variance` is which of Diffusers 0.34.0's fixed `DDPMScheduler` posterior
-    variances the draw takes: `"small"` is that posterior's own, and `"large"`
-    is the forward step's beta, 1 - alpha_t^2 / alpha_s^2, the wider `Glide`
-    choice. Both are written in rates, so neither assumes alpha^2 + sigma^2 = 1.
+    variances the draw takes. `"small"` is that posterior's own, written in
+    rates and so defined on any schedule. `"large"` is the forward step's
+    beta, 1 - alpha_t^2 / alpha_s^2, the wider `Glide` choice: that is a
+    variance-preserving statement, and it is zero wherever alpha is one, so a
+    variance-exploding grid is refused rather than sampled without noise.
+
+    Neither draws on the step whose own time is the schedule's zero: x_t is
+    the least noised state the schedule holds there, and the source gates its
+    draw on that time the same way. Elsewhere the wide variance at a terminal
+    alpha of one is exactly sigma_t, which is what the source's own
+    `current_beta_t` reduces to.
     """
 
     variance: Literal["small", "large"] = "small"
@@ -132,6 +140,13 @@ class DDPM:
             raise ValueError(f"DDPM's fixed variances are 'small' and 'large', not {self.variance}")
 
     def init(self, x, times, process, *, key):
+        if self.variance == "large":
+            with jax.ensure_compile_time_eval():
+                alpha, _ = process.sampler_schedule.rates(jnp.asarray(times, jnp.float32))
+                if bool(jnp.all(alpha == 1)):
+                    raise ValueError(
+                        "DDPM's wide posterior variance is the variance-preserving forward "
+                        "step's beta, which is zero on a schedule whose alpha is one")
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -142,6 +157,8 @@ class DDPM:
             gamma = jnp.sqrt(1 - alpha_t ** 2 / alpha_s ** 2)
         else:
             gamma = sigma_s * jnp.sqrt(1 - (alpha_t ** 2 / alpha_s ** 2) * (sigma_s ** 2 / sigma_t ** 2))
+        gamma = jnp.where(jnp.reshape(jnp.asarray(t, jnp.float32),
+                                      (-1,) + (1,) * (x.ndim - 1)) > 0, gamma, 0.0)
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
 
 
@@ -456,6 +473,15 @@ class DPMSolverSDE:
         root = key if self.seed is None else jax.random.PRNGKey(self.seed)
         return _Brownian(root, jnp.asarray(low, jnp.float32), jnp.asarray(high, jnp.float32))
 
+    def _noise(self, state, first, second, shape):
+        """The path's standard normal draw over `[first, second]`.
+
+        The bridge is reached through one method so a reference walk can
+        couple the source's own tree here and leave the rest of the step
+        alone; nothing else in this class reads the path.
+        """
+        return _brownian_noise(state, first, second, shape, self.depth)
+
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = _sigma_integrator("DPMSolverSDE", process)
         (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
@@ -469,11 +495,11 @@ class DPMSolverSDE:
         def midpoint(_):
             sigma_mid = jnp.exp(0.5 * (jnp.log(sigma_t) + jnp.log(sigma_s)))
             first_down, first_up = ancestral(sigma_mid)
-            noise = _brownian_noise(state, jnp.min(sigma_t), jnp.min(sigma_mid), x.shape, self.depth)
+            noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_mid), x.shape)
             x_mid = _sde_step(x, denoised, sigma_t, first_down) + noise * first_up
             denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
             down, up = ancestral(sigma_s)
-            noise = _brownian_noise(state, jnp.min(sigma_t), jnp.min(sigma_s), x.shape, self.depth)
+            noise = self._noise(state, jnp.min(sigma_t), jnp.min(sigma_s), x.shape)
             return _sde_step(x, denoised_mid, sigma_t, down) + noise * up
 
         stepped = lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None)

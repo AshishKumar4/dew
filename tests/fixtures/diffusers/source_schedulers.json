@@ -5,7 +5,6 @@
   3,
   4
  ],
- "brownian_depth": 24,
  "guidance_scale": 3.0,
  "label": 0.7,
  "cases": {
@@ -62,6 +61,12 @@
    "steps": 5,
    "guidance": null,
    "latent_scale": 2.5898351669311523
+  },
+  "ddpm.large_leading": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 17.411680221557617
   },
   "lms.default": {
    "scheduler": "LMSDiscreteScheduler",
@@ -151,13 +156,13 @@
    "scheduler": "DPMSolverSDEScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 48.81456756591797
+   "latent_scale": 52.324703216552734
   },
   "dpm_sde.karras_v": {
    "scheduler": "DPMSolverSDEScheduler",
    "steps": 5,
    "guidance": null,
-   "latent_scale": 9.286728858947754
+   "latent_scale": 10.54940128326416
   },
   "dpm_multi.default": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -176,6 +181,12 @@
    "steps": 5,
    "guidance": null,
    "latent_scale": 468.40728759765625
+  },
+  "dpm_multi.cosine_exponential": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 59502.24609375
   },
   "dpm_multi.exponential_trailing": {
    "scheduler": "DPMSolverMultistepScheduler",
@@ -303,5 +314,8 @@
    "guidance": 0.0,
    "latent_scale": 71.86064910888672
   }
- }
+ },
+ "refused": [
+  "cosine_karras"
+ ]
 }
