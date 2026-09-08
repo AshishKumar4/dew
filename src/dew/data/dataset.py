@@ -498,12 +498,13 @@ def _batches(records: pygrain.MapDataset[object], *, batch: int, loading: Loadin
     return iter(stream.batch(batch, drop_remainder=True))
 
 
-def rows_of(batch: Batch) -> int:
+def rows_of(batch: Mapping[str, Any]) -> int:
     """The records `batch` holds, read off its first field that has rows.
 
     A batch may carry a field that is one value for the whole step rather
     than one per record, and that field says nothing about how many records
-    there are.
+    there are. Any mapping of fields answers, so the trainer's own batch
+    type reaches this as it is.
     """
     for leaf in jax.tree.leaves(batch):
         shape = np.shape(leaf)
