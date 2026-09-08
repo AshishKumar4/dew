@@ -23,8 +23,9 @@ presence penalties follow vLLM's formula
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -32,7 +33,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 from jax import lax
-from jax.typing import ArrayLike
 
 FILTER = -jnp.inf
 """The score a removed token keeps, as `logits_process.py`'s filter value."""
@@ -191,11 +191,19 @@ class Greedy:
     exactly zero while running through the same categorical draw as any other
     policy. Transforms placed before it still shape the argmax, which is what
     greedy search does with a processor list.
+
+    A row that arrives without a distribution leaves without one. A point
+    mass over an all-removed row, or over a NaN or `+inf` the model or an
+    earlier transform produced, would turn an undefined draw into a confident
+    token, so those rows pass through and the draw refuses them.
     """
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         best = jnp.argmax(logits, axis=-1)[:, None]
-        return jnp.where(jnp.arange(logits.shape[-1])[None, :] == best, 0.0, FILTER)
+        point = jnp.where(jnp.arange(logits.shape[-1])[None, :] == best, 0.0, FILTER)
+        shaped = jnp.all(jnp.isfinite(logits) | jnp.isneginf(logits), axis=-1, keepdims=True)
+        return jnp.where(shaped & jnp.any(jnp.isfinite(logits), axis=-1, keepdims=True),
+                         point, logits)
 
 
 @struct.dataclass
@@ -330,6 +338,15 @@ class TopH:
     Tokens enter in probability order while the cumulative entropy of the
     truncated head stays within `h` times its total entropy, and the best
     token always enters. `n` is the head the reference fixes at 100.
+
+    The two entropies are computed the way the reference computes them, and
+    they are not the same expression. The budget is
+    `torch.distributions.Categorical.entropy`, which clamps the log
+    probabilities to the dtype's minimum so a removed token contributes
+    nothing. The running sum is the reference's own `-p * log(p)`, whose
+    removed tokens are NaN, and a NaN ends the selection because every
+    comparison against it is false. Substituting one for the other keeps a
+    token the reference drops.
     """
 
     h: float = struct.field(pytree_node=False, default=1.0)
@@ -342,11 +359,11 @@ class TopH:
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         head, index = lax.top_k(logits, min(self.n, logits.shape[-1]))
-        normalized = jax.nn.log_softmax(head)
-        probabilities = jnp.exp(normalized)
-        terms = -probabilities * normalized
-        threshold = jnp.sum(terms, axis=-1, keepdims=True) * self.h
-        selected = jnp.cumsum(terms, axis=-1) <= threshold
+        normalized = head - jax.scipy.special.logsumexp(head, axis=-1, keepdims=True)
+        probabilities = jax.nn.softmax(normalized)
+        budget = -jnp.sum(jnp.maximum(normalized, jnp.finfo(head.dtype).min) * probabilities,
+                          axis=-1, keepdims=True) * self.h
+        selected = jnp.cumsum(-probabilities * jnp.log(probabilities), axis=-1) <= budget
         selected = selected.at[:, 0].set(True)
         rows = jnp.arange(logits.shape[0])[:, None]
         keep = jnp.zeros(logits.shape, bool).at[rows, index].set(selected)
@@ -745,53 +762,176 @@ class StopStrings:
         return jnp.any(jnp.max(reached, axis=(1, 3)) >= self.targets[None, :], axis=-1)
 
 
+@runtime_checkable
 class Vocabulary(Protocol):
-    """What `stop_strings` needs from a tokenizer: text for token rows."""
+    """The tokenizer surface `stop_strings` reads once, on the host.
 
-    def decode(self, tokens: ArrayLike) -> list[str]: ...
+    These are a Transformers tokenizer's own public vocabulary methods plus
+    the piece-name lookup its slow and fast classes both expose. Nothing here
+    runs generation code; the tables are built from token strings.
+    """
+
+    def get_vocab(self) -> dict[str, int]: ...
+    def convert_tokens_to_string(self, tokens: list[str]) -> str: ...
+    def _convert_id_to_token(self, index: int) -> str: ...
+    def __call__(self, text: str, *, add_special_tokens: bool) -> Mapping[str, list[int]]: ...
 
 
-def stop_strings(processor: Vocabulary, strings: str | Sequence[str], vocab_size: int,
-                 *, probe: Sequence[int] = (1,)) -> StopStrings:
+PRINTABLE = (list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1))
+             + list(range(ord("®"), ord("ÿ") + 1)))
+"""The bytes GPT-2's byte-level alphabet maps to themselves."""
+
+
+def byte_alphabet() -> dict[str, int]:
+    """GPT-2's byte-to-unicode table, inverted.
+
+    A byte-level tokenizer stores each byte of a piece as one of these
+    characters, so reading a piece back byte by byte is the only way to keep
+    a code point that two tokens split between them.
+    """
+    used, mapped, spare = list(PRINTABLE), list(PRINTABLE), 0
+    for byte in range(256):
+        if byte not in PRINTABLE:
+            used.append(byte)
+            mapped.append(256 + spare)
+            spare += 1
+    return {chr(code): byte for byte, code in zip(used, mapped)}
+
+
+def _decoder_has(config: object, name: str) -> bool:
+    if isinstance(config, dict):
+        return config.get("type") == name or any(_decoder_has(item, name) for item in config.values())
+    if isinstance(config, list):
+        return any(_decoder_has(item, name) for item in config)
+    return False
+
+
+def matching_mode(tokenizer: object) -> str | None:
+    """Whether a tokenizer's pieces are bytes, and in which spelling.
+
+    `StopStringCriteria._get_stop_string_matching_mode`: a byte-level decoder
+    stores pieces in GPT-2's alphabet and a byte-fallback one spells unknown
+    bytes `<0xNN>`. Either way the match runs over bytes, so a stop string is
+    encoded to UTF-8 and a piece that is half a code point still counts.
+    """
+    decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
+    if decoder is None:
+        return None
+    if type(decoder).__name__ == "ByteLevel":
+        return "byte_level"
+    state = getattr(decoder, "__getstate__", lambda: None)()
+    if isinstance(state, str):
+        state = state.encode()
+    config = None
+    if isinstance(state, bytes):
+        try:
+            config = json.loads(state)
+        except json.JSONDecodeError:
+            config = None
+    if config is not None:
+        if _decoder_has(config, "ByteFallback"):
+            return "byte_fallback"
+        if _decoder_has(config, "ByteLevel"):
+            return "byte_level"
+    return None
+
+
+def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
+                      prefix: str = "abcdef") -> tuple[list[str | bytes], list[int]]:
+    """What each vocabulary entry contributes to the text, and its id.
+
+    `StopStringCriteria.clean_tokenizer_vocab`: a byte-mode piece is read
+    through its byte spelling, and anything else through
+    `convert_tokens_to_string` behind an ordinary prefix, because a decoder
+    adds or removes a leading space depending on what came before. The prefix
+    is tokenized once and its text is cut off the front of every piece.
+    """
+    alphabet = byte_alphabet() if mode == "byte_level" else None
+    base = [tokenizer._convert_id_to_token(token)  # noqa: SLF001 the tokenizer's own piece names
+            for token in tokenizer(prefix, add_special_tokens=False)["input_ids"]]
+    pieces: list[str | bytes] = []
+    ids: list[int] = []
+    for token, index in tokenizer.get_vocab().items():
+        piece = _piece_bytes(token, mode, alphabet)
+        if piece is None:
+            text = tokenizer.convert_tokens_to_string(base + [token])
+            if prefix not in text:
+                raise ValueError(
+                    f"the tokenizer cannot spell the probe {prefix!r}, so a piece's own text "
+                    "cannot be separated from what precedes it")
+            text = text[text.index(prefix) + len(prefix):]
+            piece = text.encode("utf-8") if mode is not None else text
+        pieces.append(piece)
+        ids.append(index)
+    return pieces, ids
+
+
+def _piece_bytes(token: str, mode: str | None, alphabet: dict[str, int] | None) -> bytes | None:
+    if mode == "byte_level" and alphabet is not None:
+        if all(char in alphabet for char in token):
+            return bytes(alphabet[char] for char in token)
+        return None
+    if mode == "byte_fallback" and len(token) == 6 and token.startswith("<0x") and token.endswith(">"):
+        if all(char in "0123456789abcdefABCDEF" for char in token[3:5]):
+            return bytes([int(token[3:5], 16)])
+    return None
+
+
+def stop_strings(tokenizer: object, strings: str | Sequence[str],
+                 vocab_size: int | None = None) -> StopStrings:
     """Compile a tokenizer's vocabulary against `strings` into a `StopStrings`.
 
-    The tables record, for every token, where it can sit inside a stop string
-    and how many of the string's trailing characters its start can cover. This
-    runs once on the host; the criterion itself never decodes.
+    The tables record, for every token, where its piece can sit inside a stop
+    string and how many of the string's trailing units its start can cover.
+    This runs once on the host; the criterion never decodes.
 
-    A token's text is read by decoding `probe` followed by that token and
-    dropping the text `probe` alone produces, because a tokenizer's decoder
-    adds or removes a leading space depending on what came before.
+    A byte-level or byte-fallback vocabulary matches over UTF-8 bytes, so a
+    stop string whose code point two tokens split still ends a row.
+    `vocab_size` sizes the table for the model rather than the tokenizer when
+    a checkpoint pads its head.
     """
     wanted = (strings,) if isinstance(strings, str) else tuple(strings)
     if not wanted or any(not isinstance(value, str) or not value for value in wanted):
         raise ValueError("stop_strings needs non-empty strings")
-    prefix = list(probe)
-    rows = np.asarray([prefix + [token] for token in range(vocab_size)], np.int32)
-    base = processor.decode(np.asarray([prefix], np.int32))[0]
-    texts = [text[len(base):] if text.startswith(base) else text
-             for text in processor.decode(rows)]
-    return _stop_string_tables(texts, wanted)
+    source = getattr(tokenizer, "reference", tokenizer)
+    source = getattr(source, "tokenizer", source)
+    if not isinstance(source, Vocabulary):
+        raise TypeError("stop_strings needs a tokenizer that can list its vocabulary")
+    mode = matching_mode(source)
+    pieces, ids = vocabulary_pieces(source, mode)
+    targets = [value.encode("utf-8") if mode is not None else value for value in wanted]
+    width = max(len(ids) + 1, 1 if vocab_size is None else vocab_size + 1)
+    return _stop_string_tables(pieces, ids, targets, width)
 
 
-def _stop_string_tables(texts: Sequence[str], strings: Sequence[str]) -> StopStrings:
-    """`StopStringCriteria._stop_string_create_embedding_vec` over plain text."""
+def _overlap(part: str | bytes, target: str | bytes, position: int) -> bool:
+    """Whether `part` starts the slice of `target` at `position`."""
+    if isinstance(part, bytes) and isinstance(target, bytes):
+        return part.startswith(target[position:position + len(part)])
+    if isinstance(part, str) and isinstance(target, str):
+        return part.startswith(target[position:position + len(part)])
+    raise TypeError("a stop string and the vocabulary pieces have to be read the same way")
+
+
+def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
+                        strings: Sequence[str | bytes], rows: int) -> StopStrings:
+    """`StopStringCriteria._stop_string_create_embedding_vec` over the pieces."""
     valid: list[dict[int, list[int]]] = []
     overlaps: list[dict[int, list[int]]] = []
     for target in strings:
-        reversed_target = target[::-1]
+        backwards = target[::-1]
         inside: dict[int, list[int]] = {}
         ending: dict[int, list[int]] = {}
-        for index, token in enumerate(texts):
-            reversed_token = token[::-1]
-            for start in range(1 - len(token), len(target)):
+        for piece, index in zip(pieces, ids):
+            reversed_piece = piece[::-1]
+            for start in range(1 - len(piece), len(target)):
                 if start < 0:
-                    piece, position = reversed_token[-start:], 0
+                    part, position = reversed_piece[-start:], 0
                 else:
-                    piece, position = reversed_token, start
-                if piece.startswith(reversed_target[position:position + len(piece)]):
+                    part, position = reversed_piece, start
+                if _overlap(part, backwards, position):
                     if position == 0:
-                        ending.setdefault(index, []).append(min(len(piece), len(target)))
+                        ending.setdefault(index, []).append(min(len(part), len(target)))
                     else:
                         inside.setdefault(index, []).append(position)
         valid.append(inside)
@@ -801,15 +941,15 @@ def _stop_string_tables(texts: Sequence[str], strings: Sequence[str]) -> StopStr
     positions = max((len(item) for row in valid for item in row.values()), default=1)
     ends = max(len(item) for row in overlaps for item in row.values())
     width = len(strings) * (positions + ends) + 1
-    table = np.full((len(texts) + 1, width), -1, np.int32)
+    table = np.full((max(rows, max(ids) + 2), width), -1, np.int32)
     for order, (inside, ending) in enumerate(zip(valid, overlaps)):
         for index, items in inside.items():
             table[index, positions * order:positions * order + len(items)] = items
         for index, items in ending.items():
             start = positions * len(strings) + ends * order
             table[index, start:start + len(items)] = items
-    for index, token in enumerate(texts):
-        table[index, -1] = len(token)
+    for piece, index in zip(pieces, ids):
+        table[index, -1] = len(piece)
     return StopStrings(jnp.asarray(table), jnp.asarray([len(value) for value in strings], jnp.int32),
                        positions, ends, max(len(value) for value in strings))
 

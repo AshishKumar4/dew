@@ -344,15 +344,12 @@ def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path):
     spelled across several tokens and several stop strings at once all have to
     agree, and a string finished before the last token must not stop the row.
     """
-    from dew.interop.pretrained import Processor
     from transformers.generation.stopping_criteria import StopStringCriteria
 
     tokenizer = stop_string_tokenizer(tmp_path)
     size = len(tokenizer)
-    processor = Processor(tokenizer, {}, {}, size)
     strings = ["stop", "operation"]
-    native = decoding.stop_strings(processor, strings, size,
-                                   probe=tokenizer.encode("abcdef"))
+    native = decoding.stop_strings(tokenizer, strings, size)
     oracle = StopStringCriteria(tokenizer, strings)
     checked = jax.jit(decoding.criterion((native,)))
 
@@ -377,13 +374,9 @@ def test_stop_strings_match_the_reference_criterion_over_random_rows(tmp_path):
 
 
 def test_stop_strings_refuse_a_vocabulary_that_cannot_spell_them(tmp_path):
-    from dew.interop.pretrained import Processor
-
     tokenizer = stop_string_tokenizer(tmp_path)
-    processor = Processor(tokenizer, {}, {}, len(tokenizer))
     with pytest.raises(ValueError, match="no token in the vocabulary"):
-        decoding.stop_strings(processor, "zzzz", len(tokenizer),
-                              probe=tokenizer.encode("abcdef"))
+        decoding.stop_strings(tokenizer, "zzzz", len(tokenizer))
 
 
 def test_end_of_sequence_and_length_criteria_read_what_they_name():
@@ -397,3 +390,45 @@ def test_end_of_sequence_and_length_criteria_read_what_they_name():
         np.asarray(decoding.MaxNewTokens(3)(state, jnp.zeros(2, jnp.int32))), [True, False])
     np.testing.assert_array_equal(
         np.asarray(decoding.MaxLength(7)(state, jnp.zeros(2, jnp.int32))), [True, False])
+
+
+def byte_level_tokenizer(tmp_path):
+    """A byte-level BPE over all 256 bytes, so a code point splits in two."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    alphabet = {byte: char for char, byte in decoding.byte_alphabet().items()}
+    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [],
+                                   unk_token=None))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(tmp_path / "bytes")
+    return AutoTokenizer.from_pretrained(tmp_path / "bytes", local_files_only=True)
+
+
+def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
+    """A byte-level vocabulary spells 'é' as two tokens, neither of which is
+    valid text on its own. Reading the vocabulary as text loses them, so the
+    match runs over the bytes each piece contributes, as the reference does.
+    """
+    from transformers.generation.stopping_criteria import StopStringCriteria
+
+    tokenizer = byte_level_tokenizer(tmp_path)
+    assert decoding.matching_mode(tokenizer) == "byte_level"
+    pair = tokenizer.encode("é")
+    assert len(pair) == 2 and tokenizer.decode(pair) == "é"
+
+    native = decoding.stop_strings(tokenizer, ["é", "stop"], 256)
+    oracle = StopStringCriteria(tokenizer, ["é", "stop"])
+    checked = jax.jit(decoding.criterion((native,)))
+    rows = [pair, [ord("a")] + pair, [pair[0]], [pair[1]], tokenizer.encode("stop"),
+            tokenizer.encode("laststop"), tokenizer.encode("stopat"), tokenizer.encode("héllo")]
+    for row in rows:
+        width = len(row)
+        state = StepState(tokens=jnp.asarray([[0] * (12 - width) + list(row)], jnp.int32),
+                          valid=jnp.asarray([[False] * (12 - width) + [True] * width]),
+                          step=jnp.asarray([width], jnp.int32), active=jnp.ones(1, bool),
+                          keys=jax.random.split(jax.random.key(0), 1), prompt_width=0)
+        got = bool(checked(state, jnp.asarray([row[-1]], jnp.int32))[0])
+        want = bool(oracle(torch.tensor([row], dtype=torch.long), None)[0])
+        assert got == want, (row, got, want)

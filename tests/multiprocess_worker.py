@@ -1473,9 +1473,88 @@ def mode_mixed_validity(args) -> dict:
     }
 
 
+def mode_decoding_components(args) -> dict:
+    """Decoding components over a pool, and the disagreements it has to refuse.
+
+    Every process resolves its own chain and criteria. A pool that agreed only
+    on their shapes would run two different policies and never say so, so the
+    disagreements here keep the shapes identical and change the values: one
+    rank bans a different token, and one rank names a different function.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+    from dew.inference import TextGeneration
+    from dew.inference.pipeline import place
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Sampling, decoding
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
+    prompts, lengths = continuation_prompts()
+    rows = len(prompts) // processes
+    local = slice(rank * rows, (rank + 1) * rows)
+    mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
+    request = ModelInputs(jnp.asarray(prompts[local]), {"attention_mask": jnp.asarray(mask[local])})
+
+    def raise_last(state, scores):
+        return scores.at[:, -1].add(4.0)
+
+    chain = (decoding.RepetitionPenalty(1.3), jax.tree_util.Partial(raise_last),
+             decoding.Temperature(0.8), decoding.TopK(5))
+    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_id=12),
+                          logits=chain, stopping=(decoding.MaxNewTokens(3),))
+    result = task(request, 4, seed=7).host()
+
+    refused = []
+    if processes > 1:
+        divergences = {
+            "criterion payload": (chain, (decoding.EndOfSequence(
+                jnp.asarray([3 if rank == 1 else 5], jnp.int32)),)),
+            "transform identity": (
+                chain[:1] + (jax.tree_util.Partial(
+                    (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last),)
+                + chain[2:], ()),
+            "transform payload": (
+                (decoding.RepetitionPenalty(1.3),
+                 decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32))), ()),
+        }
+        for name, (logits, stopping) in divergences.items():
+            try:
+                task(request, 4, seed=7, logits=logits, stopping=stopping)
+            except (ValueError, RuntimeError, AssertionError) as failure:
+                refused.append(name)
+                del failure
+            else:
+                raise AssertionError(f"a peer's different {name} was accepted")
+            # A rank stranded in a collective never reaches this rendezvous.
+            arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+            if arrivals.tolist() != list(range(processes)):
+                raise AssertionError("a rank did not return from the rejected request")
+        agreed = task(request, 4, seed=7, logits=chain,
+                      stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
+        if int(agreed.lengths.sum()) < 1:
+            raise AssertionError("the agreed request emitted nothing")
+    return {
+        "process_index": rank,
+        "rows": int(result.rows),
+        "tokens": result.tokens.tolist(),
+        "lengths": result.lengths.tolist(),
+        "behavior": np.round(result.behavior_log_probs, 5).tolist(),
+        "refused": refused,
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
+         "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,

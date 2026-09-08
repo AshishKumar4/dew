@@ -129,10 +129,13 @@ class TextGeneration:
     rows, in prompt order. Weights keep their placement: on a mesh, rows
     split over its batch axes and results keep that sharding.
 
-    `logits` and `stopping` are the transforms and criteria the call runs
-    around `sampling`, and `strategy` the device loop it runs them in. A call
-    replaces each of them whole, so a caller that wants to add one writes
-    `logits=task.logits + (mine,)`.
+    `logits` is the whole transform chain, `stopping` the criteria that run
+    beside the policy's EOS one, and `strategy` the device loop. `logits=None`
+    means the chain `sampling` compiles to. A call replaces each of them
+    whole, so a caller that wants to add to a bound chain writes
+    `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
+    replaces a bound chain with its own, because the policy it overrides is
+    what that chain was built from.
     """
 
     model: nn.Module
@@ -142,7 +145,7 @@ class TextGeneration:
     max_new_tokens: int | None = None
     max_length: int | None = None
     n: int = 1
-    logits: tuple[LogitsTransform, ...] = ()
+    logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
 
@@ -176,10 +179,11 @@ class TextGeneration:
                                       collective=mesh_of(self.variables) is not None,
                                       max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                       max_length=self.max_length, key=key, seed=seed)
+        chain = self.logits if sampling is None else None
         result = generate(self.model, self.variables, inputs, budget, key=random_key,
                           sampling=self.sampling if sampling is None else sampling,
                           n=self.n if n is None else n,
-                          logits=self.logits if logits is None else logits,
+                          logits=chain if logits is None else logits,
                           stopping=self.stopping if stopping is None else stopping,
                           strategy=self.strategy if strategy is None else strategy)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)

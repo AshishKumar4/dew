@@ -34,16 +34,19 @@ def walk(module, params, prompt, steps, transform=None):
 
 
 def test_defaults_reproduce_the_plain_greedy_walk_when_no_component_is_given(model):
-    """Absent components change nothing: the default call, an explicit pair of
-    empty tuples and an explicit `Sample()` all draw the same tokens."""
+    """Absent components change nothing: the default call, explicit `None`
+    components and an explicit `Sample()` all draw the same tokens. An empty
+    chain is a different request, because it runs no transform at all."""
     module, params = model
     prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
     policy = Sampling(temperature=0)
     plain = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy)
     explicit = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy,
-                        logits=(), stopping=(), strategy=None)
+                        logits=None, stopping=None, strategy=None)
     chosen = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy,
                       strategy=Sample())
+    bare = generate(module, params, prompt, 4, key=jax.random.key(1), sampling=policy, logits=())
+    assert not np.array_equal(np.asarray(bare.tokens), np.asarray(plain.tokens))
     np.testing.assert_array_equal(np.asarray(plain.tokens), walk(module, params, prompt, 4))
     np.testing.assert_array_equal(np.asarray(explicit.tokens), np.asarray(plain.tokens))
     np.testing.assert_array_equal(np.asarray(chosen.tokens), np.asarray(plain.tokens))
@@ -62,7 +65,7 @@ def test_a_plain_callable_transform_runs_inside_the_compiled_loop(model):
         return logits + bias
 
     drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
-                     sampling=Sampling(temperature=0), logits=(lean,))
+                     sampling=Sampling(temperature=0), logits=(lean, decoding.Greedy()))
 
     expected = walk(module, params, prompt, 5,
                     transform=lambda ids, logits: logits + np.asarray(bias))
@@ -83,15 +86,16 @@ def test_a_partial_carries_its_array_configuration_without_recompiling(model):
     second = jnp.asarray(np.eye(VOCAB, dtype=np.float32)[7] * 20.0)
     draw = lambda bias: generate(  # noqa: E731
         module, params, prompt, 3, key=jax.random.key(0), sampling=Sampling(temperature=0),
-        logits=(jax.tree_util.Partial(shifted, bias),))
+        logits=(jax.tree_util.Partial(shifted, bias), decoding.Greedy()))
     np.testing.assert_array_equal(np.asarray(draw(first).tokens)[0, 3:], [2, 2, 2])
     np.testing.assert_array_equal(np.asarray(draw(second).tokens)[0, 3:], [7, 7, 7])
 
 
-def test_the_policy_tail_runs_after_a_callers_transform(model):
-    """Order is observable. The bias is sized so that adding it before the
-    temperature divides picks the runner-up, and adding it after picks the
-    leader, so the two orders name different tokens."""
+def test_an_explicit_chain_runs_in_the_order_it_is_written(model):
+    """A chain is complete and ordered. The bias is sized so that adding it
+    before the temperature divides picks the runner-up and adding it after
+    picks the leader, so the two orders name different tokens and each order
+    returns its own."""
     module, params = model
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     logits = np.asarray(module.apply(params, prompt)[:, -1])[0]
@@ -105,9 +109,13 @@ def test_the_policy_tail_runs_after_a_callers_transform(model):
     def add(state, values):
         return values + jnp.asarray(bias)
 
-    drawn = generate(module, params, prompt, 1, key=jax.random.key(0),
-                     sampling=Sampling(temperature=0.5, top_k=1), logits=(add,))
-    assert int(np.asarray(drawn.tokens)[0, -1]) == before
+    scaled = decoding.Temperature(0.5)
+    first = generate(module, params, prompt, 1, key=jax.random.key(0),
+                     logits=(add, scaled, decoding.TopK(1)))
+    second = generate(module, params, prompt, 1, key=jax.random.key(0),
+                      logits=(scaled, add, decoding.TopK(1)))
+    assert int(np.asarray(first.tokens)[0, -1]) == before
+    assert int(np.asarray(second.tokens)[0, -1]) == after
 
 
 def test_a_callers_criterion_ends_the_row_it_names(model):
@@ -192,19 +200,15 @@ def test_stop_strings_end_a_row_on_text_it_never_decodes_on_the_host(tmp_path, m
     token and its likelihood are still returned."""
     from tokenizers import Tokenizer, decoders, models
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    from dew.interop.pretrained import Processor
-
     module, params = model
-    pieces = ["st", "op", "sto", "pper", "las", "x", "yy", "zz", "a", "b", "c", "d"]
+    pieces = ["st", "op", "sto", "pper", "x", "yy", "a", "b", "c", "d", "e", "f"]
     vocabulary = {"<unk>": 0}
     vocabulary.update({piece: index for index, piece in enumerate(pieces, start=1)})
     backend = Tokenizer(models.BPE(vocabulary, [], unk_token="<unk>"))
     backend.decoder = decoders.Fuse()
     PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>").save_pretrained(tmp_path)
     tokenizer = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
-    processor = Processor(tokenizer, {}, {}, VOCAB)
-    criterion = decoding.stop_strings(processor, "stop", VOCAB,
-                                      probe=tokenizer.encode("abcd"))
+    criterion = decoding.stop_strings(tokenizer, "stop", VOCAB)
 
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     # A transform that forces "st" then "op" spells the stop string on the
@@ -216,7 +220,7 @@ def test_stop_strings_end_a_row_on_text_it_never_decodes_on_the_host(tmp_path, m
         return jnp.where(jnp.arange(VOCAB)[None, :] == pick[:, None], 0.0, -jnp.inf)
 
     drawn = generate(module, params, prompt, 4, key=jax.random.key(0),
-                     sampling=Sampling(temperature=1.0, pad_id=0), logits=(scripted,),
+                     sampling=Sampling(pad_id=0), logits=(scripted,),
                      stopping=(criterion,))
     assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:5], order[:2])
