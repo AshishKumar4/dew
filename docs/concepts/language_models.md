@@ -101,7 +101,7 @@ for text in task(inputs, 3, seed=1).text:
     print(text)
 ```
 
-The rows have different image counts, so the processor left-pads the shorter one; `inputs.token_fields["attention_mask"]` is the sole validity source and the padded slots consume no cache. Text-only prompts skip the `images` argument, and Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
+The rows have different image counts, so the processor left-pads the shorter one; `inputs.token_fields["attention_mask"]` is the sole validity source and the padded slots consume no cache. A batch with nothing to pad carries no `attention_mask` at all, which is how a host says every slot is real. The model then keeps causality as a kernel flag and attention runs fused, where an all-true mask would cost it that (`docs/performance.md`). Read the field with `token_fields.get("attention_mask")` if your code has to handle both. Text-only prompts skip the `images` argument, and Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
 
 To continue training, hand the loaded variables to the objective and feed `{"text": inputs}` batches to the trainer; `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names with the processor, so the directory loads again here and in Transformers.
 
