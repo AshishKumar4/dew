@@ -66,12 +66,13 @@ def build(root):
 
 
 def bundle(root, destination):
-    """Archive only the native checkpoint files and oracle arrays."""
+    """Archive source-compatible checkpoint files and numerical oracle arrays."""
     import tarfile
     with tarfile.open(destination, "w:xz") as archive:
         for case in ("sd1", "sd2", "sdxl-inpaint", "refiner"):
-            archive.add(Path(root) / case, arcname=case,
-                        filter=lambda info: None if info.name.endswith(".msgpack") else info)
+            directory = Path(root) / case
+            convert(directory)
+            archive.add(directory, arcname=case)
 
 
 if __name__ == "__main__":

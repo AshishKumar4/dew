@@ -768,11 +768,11 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     height, width = index.get("dew_height", sample_size), index.get("dew_width", sample_size)
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
-    pooled = unet_config.get("addition_embed_type") == "text_time"
+    pooled = model.additional_time_features > 0
     encoder = CLIPConditioner(tuple(towers), tuple(tokenizers), names, text_params, str(directory), height, width,
                               pooled=pooled, aesthetics=bool(index.get("requires_aesthetics_score", False)))
     unconditional = {"text": "", "negative": True, "zero": bool(pooled and index.get("force_zeros_for_empty_prompt", True))}
-    inpaint = int(unet_config["in_channels"]) == autoencoder.latent_channels * 2 + 1
+    inpaint = model.in_channels == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(Field("image", (height, width, 3)),
                        {"conditioning": Condition(encoder, unconditional=unconditional)},
                        mask=Field("mask", (height, width, 1)) if inpaint else None)
