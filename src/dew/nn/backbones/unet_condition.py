@@ -26,6 +26,27 @@ class DenoisingCondition:
     time_ids: jax.Array | None = None
     guidance: jax.Array | None = None
 
+    def aligned(self, given: "DenoisingCondition") -> "DenoisingCondition":
+        """This conditioning with `given`'s own model inputs.
+
+        A distilled guidance value belongs to the row rather than to its
+        caption: dropping the caption or guiding against an unconditional one
+        changes what the model reads about the text, not the scale the
+        checkpoint was distilled to walk at. The two seams that pair a
+        conditional record with an unconditional one align them here first,
+        so both keep each row's own scalar.
+        """
+        return self.replace(guidance=given.guidance)
+
+
+def aligned_conditions(conditions: dict, unconditional: dict) -> dict:
+    """`unconditional` with each row's own model inputs taken from
+    `conditions`, for the keywords that carry conditioning records."""
+    return {key: (value.aligned(conditions[key])
+                  if isinstance(value, DenoisingCondition)
+                  and isinstance(conditions.get(key), DenoisingCondition) else value)
+            for key, value in unconditional.items()}
+
 
 @dataclass(frozen=True)
 class UNetStage:

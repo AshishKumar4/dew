@@ -149,7 +149,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         the second one, and the T5 tower's own slot, which is `third` where a
         family has two CLIP towers beside it and `second` where it has one.
         """
-        rows, second, third, zero, negative = [], [], [], [], []
+        rows, second, third, zero, negative, guidance = [], [], [], [], [], []
         for item in data:
             record: Mapping[str, object] = {"text": item} if isinstance(item, str) else item
             text = _prompt(record, "text", "")
@@ -158,18 +158,34 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             third.append(_prompt(record, "third", text))
             zero.append(bool(record.get("zero", False)))
             negative.append(bool(record.get("negative", False)))
+            guidance.append(self._guidance(record))
         ids = [tokenizer(second if index == 1 else rows, padding="max_length",
                          max_length=tokenizer.model_max_length, truncation=True,
                          return_tensors="np").input_ids
                for index, tokenizer in enumerate(self.tokenizers)]
         tokens = {"input_ids": np.stack(ids, axis=1) if self.stacked else ids[0],
                   "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
+        if self.guidance is not None:
+            tokens["guidance"] = np.asarray(guidance, np.float32)
         if self.t5_tokenizer is not None:
             tokens["t5_input_ids"] = self.t5_tokenizer(
                 third if self.composition == "sd3" else second, padding="max_length",
                 max_length=self.t5_tokens, truncation=True, add_special_tokens=True,
                 return_tensors="np").input_ids
         return tokens
+
+    def _guidance(self, record: Mapping[str, object]) -> float:
+        """The guidance a row is walked at: its own where it names one, and
+        this checkpoint's pipeline default otherwise. A composition whose
+        model reads no guidance refuses a record that names one."""
+        value = record.get("guidance")
+        if value is None:
+            return 0.0 if self.guidance is None else self.guidance
+        if self.guidance is None:
+            raise ValueError("This checkpoint's model reads no guidance value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError("A record's guidance must be a finite number")
+        return float(value)
 
     def time_ids(self, count, dtype, *, original_size=None, crops_coords_top_left=(0, 0),
                  target_size=None, aesthetic_score=6.0):
@@ -228,7 +244,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             # Flux reads the CLIP pooled vector unprojected.
             pooled = outputs[0].pooled
             guidance = (None if self.guidance is None
-                        else jnp.full((rows,), self.guidance, hidden.dtype))
+                        else jnp.asarray(tokens["guidance"], hidden.dtype))
             return DenoisingCondition(self._zeroed(hidden, zero),
                                       self._zeroed(pooled, zero), guidance=guidance)
         else:

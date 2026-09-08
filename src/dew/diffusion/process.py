@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.diffusion.schedules import NoiseScheduler
+from dew.nn.backbones.unet_condition import aligned_conditions
 from dew.diffusion.transforms import (
     PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates,
 )
@@ -118,7 +119,7 @@ class Denoiser:
         doubled = jax.tree.map(
             lambda given, null: jnp.concatenate(
                 [given, jnp.broadcast_to(null, given.shape)], axis=0),
-            self.conditions, self.unconditional)
+            self.conditions, aligned_conditions(self.conditions, self.unconditional))
         output = self._raw(
             jnp.concatenate([x_t, x_t], axis=0), jnp.concatenate([t, t], axis=0), doubled)
         return output[:batch], output[batch:]

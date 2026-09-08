@@ -20,7 +20,9 @@ Run in the isolated reference environment on CPU:
 
 from __future__ import annotations
 
+import contextlib
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -52,6 +54,7 @@ class Case:
     config: dict = field(default_factory=dict)
     grid: tuple[int, int] = (4, 4)
     batch: int = 2
+    guidance: tuple[float, ...] = (3.5, 3.5)
 
 
 CASES: dict[str, Case] = {
@@ -59,7 +62,63 @@ CASES: dict[str, Case] = {
     "dev": Case(dict(guidance_embeds=True)),
     "rect": Case(dict(guidance_embeds=True), grid=(6, 2)),
     "deep": Case(dict(num_layers=1, num_single_layers=3), grid=(2, 6)),
+    # Each row walked at its own distilled guidance, which the source takes as
+    # a per-row tensor rather than one scalar.
+    "mixed": Case(dict(guidance_embeds=True), guidance=(3.5, 7.0)),
 }
+
+
+def native_frequencies(half: int) -> np.ndarray:
+    """The frequency table Dew's own `sinusoidal_time` builds, in float32.
+
+    Torch's CPU `exp` is not correctly rounded at six of these entries, so the
+    two libraries' tables differ by an ulp there. Handing this table to the
+    source as well is the controlled comparison: everything but that ulp is
+    then identical on both sides.
+    """
+    import jax.numpy as jnp
+
+    from dew.nn.backbones.unet_condition import sinusoidal_time
+
+    del sinusoidal_time  # the expression below is the one it evaluates
+    return np.asarray(jnp.exp(-math.log(10000.0)
+                              * jnp.arange(half, dtype=jnp.float32) / half))
+
+
+def source_frequencies(half: int) -> np.ndarray:
+    """The table the source's own `get_timestep_embedding` builds."""
+    exponent = -math.log(10000.0) * torch.arange(start=0, end=half, dtype=torch.float32)
+    return torch.exp(exponent / half).numpy()
+
+
+@contextlib.contextmanager
+def controlled_frequencies(frequencies: np.ndarray):
+    """The source's timestep embedding over a handed-in frequency table.
+
+    Its own arithmetic otherwise: the same float32 product, the same `sin` and
+    `cos`, the same flip. This is a control, not unmodified-source parity.
+    """
+    from diffusers.models import embeddings
+
+    original = embeddings.get_timestep_embedding
+
+    def patched(timesteps, embedding_dim, flip_sin_to_cos=False, downscale_freq_shift=1,
+                scale=1, max_period=10000):
+        half = embedding_dim // 2
+        if downscale_freq_shift != 0 or max_period != 10000 or scale != 1:
+            raise RuntimeError("the control covers the embedding these models call")
+        table = torch.from_numpy(np.ascontiguousarray(frequencies[:half]))
+        angle = scale * (timesteps[:, None].float() * table[None, :])
+        embedded = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
+        if flip_sin_to_cos:
+            embedded = torch.cat([embedded[:, half:], embedded[:, :half]], dim=-1)
+        return embedded
+
+    embeddings.get_timestep_embedding = patched
+    try:
+        yield
+    finally:
+        embeddings.get_timestep_embedding = original
 
 
 def image_ids(rows: int, columns: int) -> torch.Tensor:
@@ -89,16 +148,30 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     # The schedule's own model times, which the pipeline divides by the
     # training count before the call and the transformer multiplies back.
     times = torch.tensor([731.0, 42.0][: case.batch], dtype=torch.float32)
-    guidance = (torch.full((case.batch,), 3.5, dtype=torch.float32)
+    guidance = (torch.tensor(case.guidance[: case.batch], dtype=torch.float32)
                 if config["guidance_embeds"] else None)
-    output = model(hidden_states=packed, encoder_hidden_states=context, pooled_projections=pooled,
-                   timestep=times / 1000, guidance=guidance, txt_ids=torch.zeros(TOKENS, 3),
-                   img_ids=image_ids(rows, columns), return_dict=False)[0]
-    probe = torch.randn(output.shape, generator=generator, dtype=torch.float32)
+    def walk(probe=None):
+        output = model(hidden_states=packed, encoder_hidden_states=context,
+                       pooled_projections=pooled, timestep=times / 1000, guidance=guidance,
+                       txt_ids=torch.zeros(TOKENS, 3), img_ids=image_ids(rows, columns),
+                       return_dict=False)[0]
+        cotangent = torch.randn(output.shape, generator=generator,
+                                dtype=torch.float32) if probe is None else probe
+        gradients = torch.autograd.grad((output * cotangent).sum(), [packed, context, pooled]
+                                        + [value for _, value in named])
+        return output, cotangent, gradients
+
     named = [(key, value) for key, value in model.named_parameters()]
-    grads = torch.autograd.grad((output * probe).sum(), [packed, context, pooled]
-                                + [value for _, value in named])
+    output, probe, grads = walk()
+    with controlled_frequencies(native_frequencies(128)):
+        control_output, _, control_grads = walk(probe)
     arrays = {
+        "frequencies_source": source_frequencies(128),
+        "frequencies_native": native_frequencies(128),
+        "control_output": control_output.detach().numpy(),
+        "control_grad_packed": control_grads[0].numpy(),
+        "control_grad_context": control_grads[1].numpy(),
+        "control_grad_pooled": control_grads[2].numpy(),
         "config": np.asarray(json.dumps(json.loads((directory / "config.json").read_text()))),
         "packed": packed.detach().numpy(), "context": context.detach().numpy(),
         "pooled": pooled.detach().numpy(), "times": times.numpy(),
@@ -109,6 +182,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     }
     for (key, _), gradient in zip(named, grads[3:]):
         arrays[f"grad_param.{key}"] = gradient.numpy()
+    for (key, _), gradient in zip(named, control_grads[3:]):
+        arrays[f"control_grad_param.{key}"] = gradient.numpy()
     print(f"{name}: packed {tuple(packed.shape)} grid {case.grid} tokens {TOKENS} "
           f"|output| <= {float(output.detach().abs().max()):.4g} parameters {len(named)}")
     return arrays
@@ -174,7 +249,7 @@ def main(destination: str) -> None:
         for key, value in build(name, case, root).items():
             arrays[f"{name}.{key}"] = value
         cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
-                       "batch": case.batch}
+                       "batch": case.batch, "guidance": list(case.guidance[: case.batch])}
     import inspect
 
     from diffusers import FluxPipeline
