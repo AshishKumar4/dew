@@ -58,10 +58,11 @@ def _stream(monkeypatch, producer, queue_timeout=0.05, **settings):
 class _StubRows:
     """As much of an HF dataset as the stream and the fetcher pool read.
 
-    Column oriented like HF's, so a shard is a dict of lists. `passes` bounds
-    the pool's otherwise endless loop, so a test's worker pool shuts down with
-    it. The urls are files that do not exist, so a real fetch fails at once
-    and without a network.
+    Column oriented like HF's, so a shard is a dict of lists. After `passes`
+    passes the reshuffle hands back an empty table, so the pool's otherwise
+    endless loop emits nothing more and a test sees exactly the rows of those
+    passes, however the workers' queue feeders interleave. The urls are files
+    that do not exist, so a real fetch fails at once and without a network.
     """
 
     def __init__(self, size, passes=1, root="/nonexistent"):
@@ -73,9 +74,7 @@ class _StubRows:
         return self
 
     def shuffle(self, seed=0):
-        if seed > self.passes:
-            raise RuntimeError("stub rows ran out of passes")
-        return self
+        return self if seed < self.passes else _StubRows(0, 0, self.root)
 
     def __len__(self):
         return self.size
