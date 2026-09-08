@@ -13,7 +13,7 @@ import pytest
 from dew import models
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext
-from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.diffusion.process import DenoisingCondition
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
@@ -108,6 +108,15 @@ PER_ARCH = {
     "jepa_video_encoder": {"patch_size": 4, "num_layers": 1, "num_heads": 2},
     "jepa_predictor": {"num_layers": 1, "num_heads": 2, "grid": (4, 4), "predictor_features": 16},
     "causal_transformer": LM,
+    # The two published transformer families, at one block each.
+    "sd3_transformer": {"patch_size": 2, "in_channels": 4, "out_channels": 4, "num_layers": 1,
+                        "heads": 2, "head_dim": 8, "joint_attention_dim": 12,
+                        "caption_projection_dim": 16, "pooled_projection_dim": 10,
+                        "sample_size": 8, "pos_embed_max_size": 8},
+    "flux_transformer": {"patch_size": 1, "in_channels": 16, "out_channels": 16, "num_layers": 1,
+                         "num_single_layers": 1, "heads": 2, "head_dim": 12,
+                         "joint_attention_dim": 16, "pooled_projection_dim": 10,
+                         "guidance_embeds": True, "axes_dims_rope": (4, 4, 4)},
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
@@ -118,7 +127,8 @@ def build_model(architecture, dtype="bfloat16"):
     it enters: leaf models through `with_precision`; the composites wrap a
     language model built that way, so the compute dtype reaches their trunk."""
     if architecture not in COMPOSITES:
-        fields = PER_ARCH[architecture] if architecture == "unet_2d_condition" else {**TINY, **PER_ARCH[architecture]}
+        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer")
+        fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **with_precision(
             architecture, fields, dtype=dtype, attention_impl="auto"))
     text = models.build("causal_transformer", **with_precision(
@@ -143,6 +153,14 @@ def tiny_inputs(architecture, rng):
     if architecture == "unet_2d_condition":
         latents = jax.random.normal(rng, (1, RES, RES, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden)}
+    if architecture == "sd3_transformer":
+        latents = jax.random.normal(rng, (1, 8, 8, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :12], jnp.ones((1, 10)))}
+    if architecture == "flux_transformer":
+        latents = jax.random.normal(rng, (1, 8, 8, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :16], jnp.ones((1, 10)), guidance=jnp.full((1,), 3.5))}
     if architecture == "jepa_encoder":
         return (image,)
     if architecture == "causal_transformer":

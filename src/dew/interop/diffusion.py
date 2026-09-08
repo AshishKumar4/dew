@@ -28,7 +28,13 @@ def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
         if not isinstance(child, dict):
             raise ValueError(f"Tensor path crosses an existing leaf: {path}")
         node = child
-    if path[-1] in node:
+    held = node.get(path[-1])
+    # A tied tensor a checkpoint stores under two names is one parameter,
+    # and each name is still bound for export. Two different arrays under
+    # one path are two parameters and one of them would be lost.
+    if isinstance(held, np.ndarray) and np.array_equal(held, value):
+        return
+    if held is not None:
         raise ValueError(f"Two source tensors map to {path}")
     node[path[-1]] = value
 
@@ -241,10 +247,265 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     return parameters, tuple(layouts)
 
 
+
+class SD3Fields(TypedDict):
+    patch_size: int
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    caption_projection_dim: int
+    pooled_projection_dim: int
+    sample_size: int
+    pos_embed_max_size: int
+    dual_attention_layers: tuple[int, ...]
+    qk_norm: str | None
+    dtype: object
+    attention_impl: str | None
+
+
+def sd3_fields(config: Mapping[str, object], *, dtype="float32",
+               attention_impl="auto") -> SD3Fields:
+    """A published `SD3Transformer2DModel` config as native model fields.
+
+    Every geometry control the source declares is read; a control whose
+    active meaning this model does not carry is refused rather than dropped,
+    so a checkpoint that means something else cannot load as if it did not.
+    """
+    from dew.interop.pretrained import resolve_dtype
+
+    heads = _integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
+    channels = _integer(config["in_channels"], "in_channels")
+    out_channels = config.get("out_channels")
+    dual = config.get("dual_attention_layers") or ()
+    if not isinstance(dual, (list, tuple)) or any(type(index) is not int for index in dual):
+        raise ValueError("dual_attention_layers must be a sequence of block indices")
+    qk_norm = config.get("qk_norm")
+    if qk_norm not in (None, "rms_norm"):
+        raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {qk_norm!r}")
+    return SD3Fields(
+        patch_size=_integer(config["patch_size"], "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
+        num_layers=_integer(config["num_layers"], "num_layers"), heads=heads, head_dim=head_dim,
+        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
+        caption_projection_dim=_integer(config["caption_projection_dim"], "caption_projection_dim"),
+        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        sample_size=_integer(config["sample_size"], "sample_size"),
+        pos_embed_max_size=_integer(config["pos_embed_max_size"], "pos_embed_max_size"),
+        dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype),
+        attention_impl=None if attention_impl == "reference" else attention_impl)
+
+
+_SD3_EMBEDDERS = {
+    "pos_embed.proj": ("pos_embed_proj",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "time_text_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_text_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
+    "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
+}
+# The MM-DiT tensors SD3 and Flux share: the modulation linear of each
+# stream, the joint attention's projections, output projections and per-head
+# norms, and the two feed-forwards. The attention's own name is the caller's,
+# since SD3.5's dual-attention blocks carry a second one.
+_JOINT_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
+                    "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+_SINGLE_ATTENTION = ("to_q", "to_k", "to_v", "norm_q", "norm_k")
+
+
+def _dit_leaf(leaf: str) -> str:
+    if leaf == "weight":
+        return "kernel"
+    if leaf != "bias":
+        raise ValueError(f"unknown tensor leaf {leaf!r}")
+    return "bias"
+
+
+def _dit_attention(block: tuple[str, ...], attention: str, inner: list[str], leaf: str,
+                   name: str, *, joint: bool) -> tuple[str, ...]:
+    """One attention tensor: a projection, the output projection a joint
+    attention holds, or a per-head norm's scale."""
+    if joint and inner == ["to_out", "0"]:
+        return (*block, attention, "to_out_0", _dit_leaf(leaf))
+    if len(inner) == 1 and inner[0] in (_JOINT_ATTENTION if joint else _SINGLE_ATTENTION):
+        if inner[0].startswith("norm"):
+            if leaf != "weight":
+                raise ValueError(f"unknown tensor name {name!r}")
+            return (*block, attention, inner[0], "scale")
+        return (*block, attention, inner[0], _dit_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def _dit_block(block: tuple[str, ...], rest: list[str], leaf: str, name: str, *,
+               attentions: tuple[str, ...]) -> tuple[str, ...]:
+    """A joint block's tensor: either stream's modulation, one of its
+    attentions, or either stream's feed-forward."""
+    if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
+        return (*block, rest[0], "linear", _dit_leaf(leaf))
+    if len(rest) > 1 and rest[0] in attentions:
+        return _dit_attention(block, rest[0], rest[1:], leaf, name, joint=True)
+    if len(rest) > 1 and rest[0] in ("ff", "ff_context"):
+        if rest[1:] == ["net", "0", "proj"]:
+            return (*block, rest[0], "net_0_proj", _dit_leaf(leaf))
+        if rest[1:] == ["net", "2"]:
+            return (*block, rest[0], "net_2", _dit_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def _sd3_path(name: str) -> tuple[str, ...] | None:
+    """One published SD3 tensor name as its path in `SD3Transformer`.
+
+    The position buffer is not a parameter and comes back as None; every
+    other declared tensor maps, and an unknown name raises with that name so
+    a checkpoint carrying something else cannot load silently.
+    """
+    if name == "pos_embed.pos_embed":
+        return None
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _SD3_EMBEDDERS:
+        return (*_SD3_EMBEDDERS[stem], _dit_leaf(leaf))
+    if parts[0] == "transformer_blocks" and parts[1].isdigit():
+        return _dit_block((f"transformer_blocks_{parts[1]}",), parts[2:-1], leaf, name,
+                          attentions=("attn", "attn2"))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+class FluxFields(TypedDict):
+    patch_size: int
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    num_single_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    pooled_projection_dim: int
+    guidance_embeds: bool
+    axes_dims_rope: tuple[int, ...]
+    dtype: object
+    attention_impl: str | None
+
+
+def flux_fields(config: Mapping[str, object], *, dtype="float32",
+                attention_impl="auto") -> FluxFields:
+    """A published `FluxTransformer2DModel` config as native model fields.
+
+    Every geometry control the source declares is read, including whether it
+    embeds its distilled guidance, which changes what the model takes as an
+    input rather than only which tensors it holds.
+    """
+    from dew.interop.pretrained import resolve_dtype
+
+    channels = _integer(config["in_channels"], "in_channels")
+    out_channels = config.get("out_channels")
+    axes = config.get("axes_dims_rope", (16, 56, 56))
+    if not isinstance(axes, (list, tuple)) or any(type(size) is not int for size in axes):
+        raise ValueError("axes_dims_rope must be a sequence of channel counts")
+    heads = _integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
+    if sum(axes) != head_dim:
+        raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
+    if any(size % 2 for size in axes):
+        raise ValueError(f"axes_dims_rope {tuple(axes)} rotates channel pairs, so each is even")
+    return FluxFields(
+        patch_size=_integer(config.get("patch_size", 1), "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
+        num_layers=_integer(config["num_layers"], "num_layers"),
+        num_single_layers=_integer(config["num_single_layers"], "num_single_layers"),
+        heads=heads, head_dim=head_dim,
+        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
+        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        guidance_embeds=_boolean(config.get("guidance_embeds", False), "guidance_embeds"),
+        axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
+        attention_impl=None if attention_impl == "reference" else attention_impl)
+
+
+_FLUX_EMBEDDERS = {
+    "x_embedder": ("x_embedder",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "time_text_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_text_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_text_embed.guidance_embedder.linear_1": ("guidance_embedder_linear_1",),
+    "time_text_embed.guidance_embedder.linear_2": ("guidance_embedder_linear_2",),
+    "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
+    "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
+}
+
+
+def _flux_path(name: str) -> tuple[str, ...]:
+    """One published Flux tensor name as its path in `FluxTransformer`.
+
+    A single-stream block's fused output projection is `proj_out` in the
+    source, inside its own block; here it is `proj_fused`, since the model's
+    own `proj_out` runs the other way round and one name carries one pair of
+    axes. Its attention is `pre_only`: it holds neither the context
+    projections nor any output of its own.
+    """
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _FLUX_EMBEDDERS:
+        return (*_FLUX_EMBEDDERS[stem], _dit_leaf(leaf))
+    if parts[0] == "transformer_blocks" and parts[1].isdigit():
+        return _dit_block((f"transformer_blocks_{parts[1]}",), parts[2:-1], leaf, name,
+                          attentions=("attn",))
+    if parts[0] == "single_transformer_blocks" and parts[1].isdigit():
+        block = (f"single_transformer_blocks_{parts[1]}",)
+        rest = parts[2:-1]
+        if rest == ["norm", "linear"]:
+            return (*block, "norm", "linear", _dit_leaf(leaf))
+        if rest == ["proj_mlp"]:
+            return (*block, "proj_mlp", _dit_leaf(leaf))
+        if rest == ["proj_out"]:
+            return (*block, "proj_fused", _dit_leaf(leaf))
+        if len(rest) > 1 and rest[0] == "attn":
+            return _dit_attention(block, "attn", rest[1:], leaf, name, joint=False)
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_flux_weights(tensors: Mapping[str, np.ndarray]
+                           ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+    """Native parameters and reversible source layouts. Flux builds its
+    rotary table from the ids it is called with, so it stores no buffer."""
+    return record_layouts("transformer", tensors, _flux_path, ("params",))
+
+
+def translate_sd3_weights(tensors: Mapping[str, np.ndarray]
+                          ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
+    """Native parameters, frozen buffers and reversible source layouts.
+
+    The source's position embedding is a persistent sin/cos-initialized
+    buffer, so its stored values land in the `buffers` collection: an
+    optimizer and an EMA see only `params`, and export writes the stored
+    array back unchanged.
+    """
+    from dew.interop.pretrained import WeightLayout
+
+    parameters, layouts = record_layouts("transformer", tensors, _sd3_path, ("params",))
+    buffers: TensorTree = {}
+    position = tensors.get("pos_embed.pos_embed")
+    if position is None:
+        raise ValueError("An SD3 transformer stores its position embedding buffer")
+    array = np.asarray(position, np.float32)
+    if array.ndim != 3 or array.shape[0] != 1:
+        raise ValueError(f"The position buffer must be [1, tokens, width], got {array.shape}")
+    buffers["pos_embed"] = np.ascontiguousarray(array)
+    layouts += (WeightLayout("transformer/pos_embed.pos_embed", (("buffers", "pos_embed"),),
+                             tuple(position.shape), None),)
+    return parameters, buffers, layouts
+
+
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read published safetensors, including sharded component directories."""
     folder = directory / component
-    weights = "diffusion_pytorch_model" if component in ("unet", "vae") else "model"
+    weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
     index = folder / f"{weights}.safetensors.index.json"
     def arrays(path: Path) -> dict[str, np.ndarray]:
         values = load_params(path)
@@ -354,7 +615,7 @@ def save_source(source, values, destination: Path) -> None:
         component, _, name = layout.name.partition("/")
         grouped.setdefault(component, {})[name] = layout.export(values)
     for component, tensors in grouped.items():
-        weights = "diffusion_pytorch_model" if component in ("unet", "vae") else "model"
+        weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         _safetensors().save_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
         declared = index.get(component)
         if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
@@ -363,4 +624,10 @@ def save_source(source, values, destination: Path) -> None:
     for name, tokenizer in zip(encoder.names, encoder.tokenizers):
         folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
         tokenizer.save_pretrained(folder)
+        # A CLIP tokenizer's own vocabulary and merges beside its config.
         tokenizer.backend_tokenizer.model.save(str(folder))
+    if encoder.t5 is not None:
+        # The T5 tokenizer ships one file, which `save_pretrained` writes, in
+        # the slot its own family keeps it.
+        encoder.t5.tokenizer.save_pretrained(
+            destination / ("tokenizer" + encoder.t5.name.removeprefix("text_encoder")))

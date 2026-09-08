@@ -122,7 +122,7 @@ class InputSpec:
                    mask=Field(data["mask"]["key"], tuple(data["mask"]["shape"])) if "mask" in data else None)
 
 
-from .diffusion import CLIPConditioner
+from .diffusion import DiffusionConditioner
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "CharTable", "CLIPConditioner", "rebuild", "unit_range", "pixel_field"]
+           "CharTable", "DiffusionConditioner", "rebuild", "unit_range", "pixel_field"]

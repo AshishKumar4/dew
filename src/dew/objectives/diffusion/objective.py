@@ -25,6 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
+from dew.diffusion.process import aligned_conditions
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
@@ -175,7 +176,7 @@ class DiffusionObjective(Objective[Mean]):
             given = jax.tree.map(
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-                given, self.unconditional)
+                given, aligned_conditions(given, self.unconditional))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
             spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],

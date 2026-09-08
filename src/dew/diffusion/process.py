@@ -2,18 +2,64 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.diffusion.schedules import NoiseScheduler
 from dew.diffusion.transforms import (
     PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates,
 )
 from dew.objectives.base import Variables
+
+
+@struct.dataclass
+class DenoisingCondition:
+    """Text conditioning as the published families read it: the token states,
+    a pooled vector, the size and crop ids the XL towers add, and the
+    distilled guidance value a guidance-embedded transformer takes as a model
+    input rather than as two guided branches."""
+
+    context: jax.Array
+    pooled: jax.Array | None = None
+    time_ids: jax.Array | None = None
+    guidance: jax.Array | None = None
+
+    def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
+        """This conditioning with `given`'s own model inputs.
+
+        A distilled guidance value belongs to the row rather than to its
+        caption: dropping the caption or guiding against an unconditional one
+        changes what the model reads about the text, not the scale the
+        checkpoint was distilled to walk at. The two seams that pair a
+        conditional record with an unconditional one align them here first,
+        so both keep each row's own scalar.
+        """
+        return replace(self, guidance=given.guidance)
+
+
+def aligned_conditions(conditions: Mapping[str, Any],
+                       unconditional: Mapping[str, Any]) -> dict[str, Any]:
+    """`unconditional` with each row's own model inputs taken from `conditions`.
+
+    A keyword names a conditioning record on both sides or on neither: the
+    spatial keywords an inpainting source adds are arrays and pass through. A
+    keyword that is a record on one side only is a caller pairing two
+    different conditionings, and raises rather than aligning nothing.
+    """
+    aligned: dict[str, Any] = {}
+    for key, null in unconditional.items():
+        given = conditions.get(key)
+        if isinstance(null, DenoisingCondition) and isinstance(given, DenoisingCondition):
+            aligned[key] = null.aligned(given)
+        elif isinstance(null, DenoisingCondition) or isinstance(given, DenoisingCondition):
+            raise ValueError(f"conditioning {key!r} is a record on one side only")
+        else:
+            aligned[key] = null
+    return aligned
 
 
 @dataclass(frozen=True)
@@ -118,10 +164,10 @@ class Denoiser:
         doubled = jax.tree.map(
             lambda given, null: jnp.concatenate(
                 [given, jnp.broadcast_to(null, given.shape)], axis=0),
-            self.conditions, self.unconditional)
+            self.conditions, aligned_conditions(self.conditions, self.unconditional))
         output = self._raw(
             jnp.concatenate([x_t, x_t], axis=0), jnp.concatenate([t, t], axis=0), doubled)
         return output[:batch], output[batch:]
 
 
-__all__ = ["Process", "Denoiser"]
+__all__ = ["DenoisingCondition", "aligned_conditions", "Process", "Denoiser"]
