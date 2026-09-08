@@ -234,6 +234,10 @@ and exported through Dew's public APIs.
 | Gemma 3n text, Gemma 4 text | `gemma3n_text`, `gemma4_text` |
 | OLMo 3 | `olmo3` |
 | gpt-oss | `gpt_oss` |
+| Mixtral, Qwen3-MoE | `mixtral`, `qwen3_moe` |
+| GLM floating-point checkpoints | `glm4_moe` |
+| DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
+| Llama 4 text | `llama4_text` |
 
 ### Native multimodal models
 
@@ -286,10 +290,7 @@ claimed, and more than one prediction layer is refused.
 
 | Model or family | `model_type` | Missing piece |
 |---|---|---|
-| Mixtral, Qwen3-MoE | `mixtral`, `qwen3_moe` | No routed-expert export writer |
-| GLM 4.5/5 | `glm4_moe` | No partial-rotary export writer |
-| DeepSeek V2, V3, V3.2 | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` | No MLA export writer |
-| Llama 4 text | `llama4_text` | No export writer |
+| Quantized source-format export | FP8 / MXFP4 | Requantization of trained weights into the original blocks/scales is unsupported |
 | LLaDA | `llada` | No masked-objective pretrained seam |
 | Dream | `dream`, `Dream` | Export writer, training seam |
 | Kimi K2 | `kimi_k2` | Config translation only, no weights |

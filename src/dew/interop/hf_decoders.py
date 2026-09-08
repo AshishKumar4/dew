@@ -2532,15 +2532,26 @@ def _glm4_moe_path(name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, 
     eh_proj and shared_head.norm around a decoder block named like any
     layer, plus copies of the trunk's embedding and head, which the depth
     shares here as in the reference (translate_weights checks the copies).
+    Those two copies name the trunk's leaves, the values they hold: the
+    tree has one embedding and one head for the trunk and every depth, so
+    a trained export writes the copies from the weights the depth read.
     """
     parts = name.split('.')
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
             and int(parts[2]) >= int(config['num_layers'])):
         return _dew_path(name, config)
+    if int(parts[2]) >= int(config["num_layers"]) + int(config.get("num_nextn_predict_layers", 0)):
+        raise ValueError(f"{name} names an undeclared prediction depth")
     depth = f"mtp_{int(parts[2]) - int(config['num_layers'])}"
     tail = parts[3:]
-    if tail in (['embed_tokens', 'weight'], ['shared_head', 'head', 'weight']):
-        return None
+    if tail == ['embed_tokens', 'weight']:
+        return ('params', 'embed_tokens', 'embedding')
+    if tail == ['shared_head', 'head', 'weight']:
+        # A tied trunk keeps the head in the embedding, which stores the
+        # same [vocab, features] the copy does; an untied one has the
+        # head's own kernel, which stores its transpose.
+        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
+                else ('params', 'lm_head', 'kernel'))
     if tail == ['shared_head', 'norm', 'weight']:
         return ('params', depth, 'final_norm', 'scale')
     if len(tail) == 2 and tail[0] in ('enorm', 'hnorm') and tail[1] == 'weight':
