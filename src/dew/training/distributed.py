@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import json
 import math
 import queue
@@ -205,7 +206,27 @@ HOST_RESIDENT = ("opt_state", "ema")
 """The train-state fields a layout may keep in pinned host memory between
 steps. The parameters are not among them: a host copy of the weights saves
 device memory only if each layer fetches its own just in time inside the
-stack, which the decoder does not do."""
+stack, which a training step's backward pass would have to fetch a second
+time and does not."""
+
+
+def _variable_path(path) -> str:
+    """A leaf's logical path as `host_parameters` patterns are written:
+    `params/layers_3/self_attn/q_proj/kernel`, the collection first."""
+    return "/".join(
+        entry.key if isinstance(entry, jax.tree_util.DictKey) else str(entry.idx)
+        for entry in path)
+
+
+def host_selected(patterns: tuple[str, ...], path: str) -> bool:
+    """Whether `path` is one of the variables `patterns` names.
+
+    A pattern is an `fnmatch` glob over the path, and a pattern that names a
+    subtree covers it whole, so `params/layers_3` selects that layer's every
+    leaf and `params/layers_*` the stack's.
+    """
+    return any(fnmatch.fnmatchcase(path, pattern)
+               or fnmatch.fnmatchcase(path, f"{pattern}/*") for pattern in patterns)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,11 +246,21 @@ class Layout:
     the fields of `HOST_RESIDENT` kept in pinned host memory between steps;
     the step fetches them to the device, updates them as it would have, and
     writes them back, so what they hold is the same and only where changes.
+
+    `host_parameters` names the variables an inference placement keeps in
+    pinned host memory, as globs over their logical paths
+    (`params/layers_*`). Where a parameter sits is independent of how it
+    splits: a selected leaf keeps the spec the rules give it and changes
+    only its memory kind. Only `offloaded` reads the patterns, because only
+    the stack fetches a layer's parameters as it reaches it; `check` refuses
+    a layout that names them to any other placement rather than place the
+    weights somewhere nothing brings them back from.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
     tolerance: float = 0.02
     host: tuple[str, ...] = ()
+    host_parameters: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not 0.0 <= self.tolerance <= 1.0:
@@ -251,6 +282,7 @@ class Layout:
                 f"host names the train-state fields kept in pinned host memory, "
                 f"{list(HOST_RESIDENT)}, got {unknown}")
         object.__setattr__(self, "host", host)
+        object.__setattr__(self, "host_parameters", tuple(self.host_parameters))
 
     def shardings(self, mesh: Mesh, tree: Any) -> Placement:
         """A NamedSharding per leaf of `tree`, from the declared parameter axes.
@@ -277,8 +309,37 @@ class Layout:
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
 
+    def offloaded(self, mesh: Mesh, tree: Any) -> Placement:
+        """`shardings`, with the memory kind each leaf's path asks for.
+
+        The spec is the one the rules give a leaf either way, so a selected
+        parameter is the same shard in another memory space and the
+        collectives its layer issues are the ones a resident run issues.
+        Every pattern has to name something: one that matches nothing is a
+        typo or a stale path, and a placement that quietly kept those weights
+        on the device would run, with only the memory it did not save to say
+        so. So each pattern is checked on its own, not the table as a whole.
+        """
+        placed = self.shardings(mesh, tree)
+        if not self.host_parameters:
+            return placed
+        paths = [_variable_path(path)
+                 for path, _ in jax.tree_util.tree_flatten_with_path(placed)[0]]
+        unmatched = [pattern for pattern in self.host_parameters
+                     if not any(host_selected((pattern,), path) for path in paths)]
+        if unmatched:
+            raise ValueError(
+                f"host_parameters {unmatched} names none of this tree's "
+                f"{len(paths)} variables; the paths start {sorted(paths)[:3]}")
+        return jax.tree_util.tree_map_with_path(
+            lambda path, sharding: (
+                sharding.with_memory_kind("pinned_host")
+                if host_selected(self.host_parameters, _variable_path(path)) else sharding),
+            placed)
+
     def check(self, params: Variables, shardings: Placement, mesh: Mesh) -> None:
-        """Reject a layout that left too much of the model replicated.
+        """Reject a layout that left too much of the model replicated, or that
+        asked for host-resident parameters where nothing fetches them.
 
         MaxText's guardrail (base.yml sharding_tolerance) against a mesh whose
         parameter axes divide none of the model's dimensions, which the shape
@@ -290,6 +351,17 @@ class Layout:
         replicated on purpose, so counting it would fire on models that are
         merely small.
         """
+        if self.host_parameters and not any(
+                sharding.memory_kind == "pinned_host"
+                for sharding in jax.tree.leaves(shardings)):
+            raise ValueError(
+                f"host_parameters {list(self.host_parameters)} keeps those weights "
+                f"in pinned host memory, which only a stack that fetches a layer's "
+                f"parameters as it reaches it reads; this placement keeps every "
+                f"parameter on the device. Place the weights for generation with "
+                f"dew.inference.host_banked, or drop host_parameters: a training "
+                f"step reads every weight again in its backward pass, which no "
+                f"forward staging covers")
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
 
