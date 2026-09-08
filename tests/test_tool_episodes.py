@@ -256,6 +256,24 @@ def test_environment_failures_abort_collection_and_release_sessions(failure, sta
         assert records[0].transitions[0].action.raw_log_probs
 
 
+def test_a_policy_drawing_several_continuations_per_slot_is_refused():
+    """A collector slot is one episode's turn, so a policy bound to draw
+    several continuations of each prompt hands back rows the slots cannot
+    absorb. Collection has to fail and release its sessions rather than
+    relabel one prompt's extra continuations as other episodes' actions."""
+    harness = Harness()
+    trainer, rollout = build(harness)
+    several = replace(rollout, policy=replace(rollout.policy, n=2))
+
+    with pytest.raises(EpisodeFailure) as caught:
+        collect(several, trainer.initial_state())
+
+    assert caught.value.episode.status == EpisodeStatus.ERROR
+    assert "per slot" in caught.value.episode.detail
+    assert not caught.value.episode.transitions
+    assert Counter(harness.opened) == Counter(harness.closed) and harness.closed
+
+
 @pytest.mark.parametrize("mode", ["raise", "nan"])
 def test_verifier_failure_is_not_a_zero_reward(mode):
     harness = Harness()

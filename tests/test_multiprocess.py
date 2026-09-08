@@ -1046,6 +1046,39 @@ def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_path):
+    """Three continuations of each prompt over two processes against one
+    process drawing the same global batch. Each rank reads back its own
+    prompts' continuations in prompt order, the padded prompt row it placed
+    for the mesh contributes none of them, and a rank asking for a different
+    number of continuations is refused on both ranks rather than issuing a
+    decode collective the peer never enters.
+    """
+    reports = run_pool("continuations", tmp_path, 2, devices=2, fsdp_size=2, timeout=240)
+    single = run_worker("continuations", tmp_path / "single.json", fsdp_size=1, devices=1)
+
+    for report in reports:
+        assert report["process_count"] == 2
+        assert report["spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        # Four placed prompt rows per process, three of them real, times three
+        # continuations: the padded prompt's group stays out of the result.
+        assert report["global_rows"] == 24 and report["rows"] == 9
+        assert len(report["tokens"]) == 9
+        assert len(report["rejected"]) == 1 and "continuations" in report["rejected"][0]
+    assert single["rows"] == 18 and single["global_rows"] == 18
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
+    assert reports[0]["terminated"] + reports[1]["terminated"] == single["terminated"]
+    np.testing.assert_allclose(reports[0]["behavior"] + reports[1]["behavior"],
+                               single["behavior"], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(reports[0]["raw"] + reports[1]["raw"], single["raw"], rtol=1e-5, atol=1e-6)
+    for report in reports:
+        assert report["canvas_rejected"] and report["canvas_rows"] == 4
+    for name in ("canvas_tokens", "canvas_lengths", "canvas_steps"):
+        assert reports[0][name] + reports[1][name] == single[name]
+
+
+@pytest.mark.distributed
 def test_a_pool_draws_a_jepa_artifact(tmp_path):
     """A tracker attached to a real pool run gets a complete artifact.
 

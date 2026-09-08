@@ -93,6 +93,41 @@ def test_multi_canvas_generation_matches_full_reference_loop(system):
     assert not bool(result.terminated.any())
 
 
+def test_canvas_continuations_refine_the_shared_prefill_without_moving_the_first_one(system):
+    """Several continuations per prompt refine the encoded prompt again, each
+    over the original prompt rows: continuation zero is the reference loop's
+    canvas row for row, the others are different canvases, rows stay prompt
+    major and growing the count leaves the earlier continuations alone."""
+    model, variables, process, reference, _ = system
+    inputs = ModelInputs(jnp.asarray(reference["prompt"]))
+    eos = (int(reference["eos_id"]),)
+
+    def draw(count):
+        return process.generate(model, variables, inputs, 7, key=jax.random.key(11),
+                                n=count, eos_token_ids=eos, pad_token_id=0)
+
+    one, two, three = draw(1), draw(2), draw(3)
+
+    assert two.tokens.shape == (4, 12) and two.rows == 4 and two.prompt_width == 5
+    np.testing.assert_array_equal(np.asarray(two.tokens)[:, :5],
+                                  np.repeat(reference["prompt"], 2, axis=0))
+    for field in ("tokens", "lengths", "terminated", "decoder_steps"):
+        single = np.asarray(getattr(one, field))
+        np.testing.assert_array_equal(np.asarray(getattr(two, field))[::2], single)
+        np.testing.assert_array_equal(np.asarray(getattr(three, field))[::3], single)
+        np.testing.assert_array_equal(
+            np.asarray(getattr(three, field)).reshape((2, 3, *single.shape[1:]))[:, 1],
+            np.asarray(getattr(two, field)).reshape((2, 2, *single.shape[1:]))[:, 1])
+    assert not np.array_equal(np.asarray(two.tokens)[0, 5:], np.asarray(two.tokens)[1, 5:])
+    # An unrequested canvas is still no canvas: the prompts repeat and nothing
+    # is refined for any continuation.
+    empty = process.generate(model, variables, inputs, 0, key=jax.random.key(11), n=2)
+    np.testing.assert_array_equal(empty.tokens, np.repeat(reference["prompt"], 2, axis=0))
+    np.testing.assert_array_equal(empty.decoder_steps, [0, 0, 0, 0])
+    with pytest.raises(ValueError, match="positive integer"):
+        draw(0)
+
+
 @pytest.mark.parametrize("budget", [0, 3, 7])
 def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
     from dew.diffusion.block import CanvasPlan, _begin, _advance, _materialize
