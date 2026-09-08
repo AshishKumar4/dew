@@ -10,6 +10,7 @@ the composite loss.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from flax import struct
 import jax
@@ -21,6 +22,10 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives.base import (Aux, Batch, EMASpec, Mean, Objective, Step,
                                  Variables, mean_loss)
 from dew.registry import objectives
+
+if TYPE_CHECKING:
+    from dew.training.state import TrainState
+    from dew.inference.tasks import BlockGeneration, Processor
 
 
 @struct.dataclass
@@ -127,6 +132,17 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
+
+    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> BlockGeneration:
+        """The DiffusionGemma over the state's published weights as a
+        `BlockGeneration` task with the published sampler defaults; the
+        tokenizer's EOS ids are the caller's to set."""
+        from dew.diffusion.block import BlockProcess
+        from dew.inference.tasks import BlockGeneration
+
+        process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
+        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process, processor,
+                               pad_token_id=self.pad_token_id)
 
     def held_variables(self) -> Variables | None:
         """The SFT source this objective starts from."""

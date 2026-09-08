@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     )
     from dew.data import Dataset
     from dew.diffusion import Process
+    from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
@@ -57,6 +58,7 @@ _EXPORTS = {
     "Process": "dew.diffusion",
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
+    "pipeline": "dew.inference",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -86,5 +88,6 @@ __all__ = [
     "ImageGrid", "InputSpec", "Layout", "MLflowTracker", "MeshSpec", "Objective", "Process",
     "Representations", "Step", "TensorBoardTracker", "TextSamples", "TokenScores", "Tracker",
     "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
-    "datasets", "encoders", "evaluate", "metrics", "models", "presets", "sample", "samplers",
+    "datasets", "encoders", "evaluate", "metrics", "models", "pipeline", "presets", "sample",
+    "samplers",
 ]

@@ -14,13 +14,15 @@ from jax.experimental import multihost_utils
 
 from dew.data.prompts import LENGTH_KEY
 from dew.nn.inputs import ModelInputs
+from dew.inference.tasks import Processor, TextGeneration
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.surrogate import clipped_value_loss_terms
-from dew.sampling.text import Generation, Sampling, _mesh
-from dew.training.distributed import local_rows, shard_batch
+from dew.sampling.text import Generation, Sampling
+from dew.nn.inputs import local_rows, mesh_of
+from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
 from .episodes import EpisodeInference, EpisodeRollout, _phase
 from .grpo import GRPOObjective
@@ -79,6 +81,8 @@ class PPOObjective(Objective[Mean, Variables]):
     returns [B, T] values; ValueHead supplies that interface for a decoder.
     """
 
+    _ema_is_reference = True
+
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
                  value_coefficient: float = .5, value_clip: float = .2, **policy_options):
         for name, value in (("value_coefficient", value_coefficient), ("value_clip", value_clip)):
@@ -109,6 +113,11 @@ class PPOObjective(Objective[Mean, Variables]):
     def policy(self, variables: Variables) -> EpisodeInference:
         """Bind the policy subtree when an episode collector supplies the full tree."""
         return _Policy(self.actor.policy(_part(variables, "policy")))
+
+    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+        """Publish the trained actor without the critic or the frozen KL reference."""
+        actor_state = replace(state, params=_part(state.params, "policy"))
+        return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
         """Values of states before each response action, with left padding removed."""
@@ -189,7 +198,7 @@ class PPORollout:
             count = np.sum(multihost_utils.process_allgather(count))
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
-        mesh = _mesh(state.params)
+        mesh = mesh_of(state.params)
         device = _phase(lambda: projected if mesh is None else shard_batch(mesh, projected), "PPO critic inputs")
         targets = _phase(lambda: self._compiled_targets(state.params, device), "PPO critic targets")
         return {**projected, **{name: local_rows(value) for name, value in targets.items()}}

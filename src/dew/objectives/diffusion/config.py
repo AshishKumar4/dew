@@ -114,6 +114,7 @@ class StableDiffusionAutoencoder:
 class DiffusionRunConfig(RunConfig):
     """A run, plus the diffusion objective's own knobs."""
 
+    objective: str = "diffusion"
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=OxfordFlowers)

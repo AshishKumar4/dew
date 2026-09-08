@@ -8,35 +8,59 @@ loops keep fixed bounds and mask finished rows, including their step counts.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
+from typing import Generic, overload
 
 from flax import struct
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, generation_signature
+from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables
 
 
 @struct.dataclass
-class CanvasGeneration:
+class CanvasGeneration(Generic[ArrayT]):
     """Prompt plus padded response, with no autoregressive likelihood claim.
 
     ``lengths`` counts response tokens including the first EOS, not prompt
     tokens. ``decoder_steps`` counts useful refinements per row across canvases.
-    ``terminated`` distinguishes EOS from the requested token limit.
+    ``terminated`` distinguishes EOS from the requested token limit. Arrays
+    keep the placement the task ran with; ``host()`` reads this process's
+    ``rows`` real rows back, and ``text`` decodes them through the bound
+    processor.
     """
 
-    tokens: jax.Array
-    lengths: jax.Array
-    terminated: jax.Array
-    decoder_steps: jax.Array
+    tokens: ArrayT
+    lengths: ArrayT
+    terminated: ArrayT
+    decoder_steps: ArrayT
+    rows: int | None = struct.field(pytree_node=False, default=None)
+    prompt_width: int | None = struct.field(pytree_node=False, default=None)
+    decoder: Callable[[jax.typing.ArrayLike, jax.typing.ArrayLike, int], tuple[str, ...]] | None = struct.field(
+        pytree_node=False, default=None)
+
+    def host(self) -> CanvasGeneration[np.ndarray]:
+        """This process's real rows as host arrays."""
+        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+
+    @functools.cached_property
+    def text(self) -> tuple[str, ...]:
+        """Each real row's response, decoded on first access."""
+        if self.decoder is None:
+            raise ValueError("this generation carries no processor to decode with")
+        if self.prompt_width is None:
+            raise ValueError("this generation has no prompt width")
+        rows = self.host()
+        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
 
 @struct.dataclass
@@ -155,34 +179,54 @@ class BlockProcess:
 
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
+    @overload
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array, eos_token_ids: tuple[int, ...] = (),
-                 pad_token_id: int = 0) -> CanvasGeneration:
+                 max_new_tokens: int, *, key: jax.Array, seed: None = None,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
+
+    @overload
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+                 max_new_tokens: int, *, key: None = None, seed: int,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
+
+    def generate(self, model: DiffusionGemma, variables: Variables,
+                 inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
+                 max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
+                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Run prefill, refinement and clean-token commits as one device computation.
 
         The last canvas is fully refined even when only part is requested;
         output is cropped to the token limit. Finished rows are padded after
         their first EOS. No host-side decisions depend on generated tokens.
+        Weights keep their placement; on a mesh, rows split over its batch
+        axes and the result keeps that sharding. The canvas sampler draws
+        one batch-wide key per refinement, so a row's draw depends on the
+        rows placed with it.
         """
         prepared = None
         error = None
+        request = None
         try:
-            prepared = ModelInputs.from_value(inputs)
-            if jax.random.key_data(key).ndim != 1:
-                raise ValueError("key must be one PRNG key, not a batch of keys")
+            request = request_key(key, seed)
+            canonical = ModelInputs.from_value(inputs)
+            prepared = jax.tree.map(local_rows, canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="canvas generation setup")
-        assert prepared is not None
+        assert prepared is not None and request is not None
         if jax.process_count() > 1:
             controls = (max_new_tokens, self, eos_token_ids, pad_token_id, model)
             multihost_utils.assert_equal(
                 generation_signature(prepared, controls),
                 "canvas input schemas, model geometry and generation policy must agree")
-        return _generate(model, variables, prepared, key,
-                         CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens))
+        plan = RowPlan.over(mesh_of(variables), prepared.tokens.shape[0])
+        placed = plan.place(plan.pad(prepared))
+        result = _compiled(plan.sharding)(model, variables, placed, request,
+                                          CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens))
+        return replace(result, rows=plan.rows, prompt_width=prepared.tokens.shape[1])
 
 
 @dataclass(frozen=True)
@@ -288,7 +332,6 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
     return replace(state.result, tokens=state.result.tokens[:, :prompt_length + max_new_tokens])
 
 
-@jax.jit(static_argnames=("model", "plan"))
 def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan) -> CanvasGeneration:
     initial = _begin(model, variables, inputs, plan)
@@ -300,3 +343,9 @@ def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
 
     final = jax.lax.fori_loop(0, plan.blocks, step, initial)
     return _materialize(final, inputs.tokens.shape[1], plan.max_new_tokens)
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled(rows: jax.sharding.NamedSharding | None):
+    return jax.jit(_generate, static_argnames=("model", "plan"),
+                   in_shardings=(None, rows, None), out_shardings=rows)

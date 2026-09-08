@@ -36,6 +36,8 @@ class DPOObjective(LMObjective):
     chosen responses' perplexity under the policy.
     """
 
+    _ema_is_reference = True
+
     def __init__(self, model, seq_len: int, beta: float = 0.1, **kwargs):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")

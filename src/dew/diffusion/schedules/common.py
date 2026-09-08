@@ -40,6 +40,15 @@ class NoiseScheduler(ABC):
         schedule says otherwise."""
         return jnp.asarray(t, jnp.float32)
 
+    def prior_scale(self) -> jax.Array:
+        """Standard deviation of the initial Gaussian draw."""
+        alpha, sigma = self.rates(jnp.asarray(self.T))
+        return jnp.sqrt(alpha ** 2 + sigma ** 2)
+
+    def half_interval(self, t, t_next) -> jax.Array:
+        """Half a grid interval, as a Runge-Kutta stage places its intermediate points."""
+        return (jnp.asarray(t, jnp.float32) - jnp.asarray(t_next, jnp.float32)) / 2
+
     def snr(self, t) -> jax.Array:
         alpha, sigma = self.rates(t)
         return (alpha / sigma) ** 2

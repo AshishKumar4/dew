@@ -9,14 +9,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import optax
 import tyro
 
 from dew.data import ByteTokenizer, Loading, TokenWindows
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import models
-from dew.sampling import Sampling, generate
+from dew.inference import RunProcessor
+from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 
 
@@ -54,9 +54,10 @@ def main(config: Config):
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)
 
-    tokens = generate(model, state.averaged, jnp.asarray([prompt], jnp.int32),
-                      config.sample_tokens, key=jax.random.key(1), sampling=Sampling(temperature=0.8, top_k=40)).tokens
-    text = tokenizer.decode(tokens[0])
+    # No reload is needed; the averaged weights
+    # stay where the trainer placed them, and the tokenizer decodes the rows.
+    task = objective.pipeline(state, processor=RunProcessor(tokenizer))
+    text = config.prompt + task(config.prompt, seed=1).text[0]
     config.out.mkdir(parents=True, exist_ok=True)
     (config.out / "sample.txt").write_text(text)
     print(text)

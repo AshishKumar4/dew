@@ -15,7 +15,7 @@ takes the vocabulary from the data, not the command line.
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -57,6 +57,8 @@ class LmRunConfig(RunConfig):
     """Prompt the validation samples continue; empty continues a newline."""
     sample_tokens: int = 128
     """Tokens generated per validation sample; 0 logs no text."""
+    sampling: Sampling = field(default_factory=lambda: Sampling(temperature=0.8, top_k=40))
+    """The preview policy, recorded with the run for inference."""
     pretrained: Optional[str] = None
     """Hugging Face decoder to continue training: a hub repo id or a local
     directory in that layout. The checkpoint decides the architecture, so
@@ -197,7 +199,7 @@ def build_samples(config: LmRunConfig) -> Optional[Samples]:
     tokenizer = tokenizer_for(config.tokenizer)
     return Samples(
         prompt=tokenizer.encode(config.sample_prompt or "\n"),
-        max_new_tokens=config.sample_tokens, sampling=Sampling(temperature=0.8, top_k=40),
+        max_new_tokens=config.sample_tokens, sampling=config.sampling,
         decode=tokenizer.decode)
 
 
@@ -286,6 +288,12 @@ def main(config: LmRunConfig) -> TrainState:
             config.pretrained, config.model, vocab_size, context, meta)
     if config.quantization is not None:
         model = apply_quantization(model, config.quantization)
+    # run.json records the resolved model as
+    # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
+    resolved = {name: value for name, value in fields.items() if name not in ("dtype", "attention_impl")}
+    if config.objective == "block_diffusion":
+        resolved["max_seq_len"] = model.max_seq_len
+    config = replace(config, model=replace(config.model, config=resolved))
     name = config.trainer.name or (
         f"{config.objective}-{tokens.name}/seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"

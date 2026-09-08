@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeAlias
 from typing_extensions import TypeVar
 
 from flax import struct
@@ -28,6 +28,11 @@ from dew.artifacts import Artifacts
 
 if TYPE_CHECKING:
     from dew.inputs import InputSpec
+    from dew.training.state import TrainState
+    from dew.inference.tasks import BlockGeneration, TextGeneration
+    from dew.sampling.pipelines import TextToImage
+
+    Task: TypeAlias = TextGeneration | BlockGeneration | TextToImage
 
 Variables: TypeAlias = Mapping[str, Any]
 """A flax variables dict: the `params` collection plus any other collection
@@ -155,6 +160,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     inputs: InputSpec
     """Per-example shapes and dtypes the parameter tree is initialised from."""
     ema: EMASpec | None = None
+    _ema_is_reference: ClassVar[bool] = False
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
 
@@ -230,6 +236,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def _pipeline_weights(self, state: TrainState, ema: bool) -> Variables:
+        if self._ema_is_reference or not ema:
+            return state.params
+        return state.averaged
+
+    def pipeline(self, state: TrainState, *, ema: bool = True) -> Task:
+        """The trained model as its inference task over `state`'s weights.
+
+        Ordinary generative objectives require `state.averaged` when `ema`
+        is True; False selects live parameters. Reference-policy objectives
+        publish the trained policy, never their frozen loss reference. Arrays
+        retain their placement. Objectives without a generation task raise.
+        """
+        raise TypeError(f"{type(self).__name__} has no inference task")
+
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
         """One display per event, reusing first-batch scoring when available.
@@ -241,6 +262,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         hook's final outcome before any subsequent collective.
         """
         return scored if scored is not None else self.evaluate(params, batch, step)
+
+
 
 def scalar_loss(objective: Objective[Loss, Effects], variables: Variables,
                 batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:

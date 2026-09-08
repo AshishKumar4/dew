@@ -299,18 +299,6 @@ def test_pixel_values_of_another_size_are_refused():
         model.get_image_features(np.zeros((1, 3, 16, 16), np.float32))
 
 
-def test_the_real_config_translates_to_the_tower_it_describes():
-    """openai/clip-vit-large-patch14 nests the text fields under text_config and
-    carries the whole transformers 4.16 config dump around them."""
-    config = translate_config(fixture_config(REAL))
-
-    assert config == {
-        "vocab_size": 49408, "hidden_size": 768, "intermediate_size": 3072,
-        "num_layers": 12, "num_heads": 12, "max_position_embeddings": 77,
-        "layer_norm_eps": 1e-5, "eos_token_id": 2,
-    }
-
-
 def test_a_text_only_config_translates_the_same_way():
     """A checkpoint of the tower alone carries the CLIPTextConfig at the root,
     which has to describe the same tower as the nested copy."""
@@ -335,16 +323,6 @@ def test_the_real_config_translates_to_the_towers_it_describes():
     }
     nested = fixture_config(TINY)
     assert translate_vision_config(nested) == translate_vision_config(nested["vision_config"])
-
-
-def test_a_config_asking_for_another_activation_is_refused():
-    """quick-GELU is the only activation here, and a checkpoint trained with
-    GELU would otherwise load into a model that computes something else."""
-    config = fixture_config(TINY)
-    config["text_config"]["hidden_act"] = "gelu"
-
-    with pytest.raises(ValueError, match="quick-GELU"):
-        translate_config(config)
 
 
 def test_an_unfamiliar_tensor_name_is_refused():

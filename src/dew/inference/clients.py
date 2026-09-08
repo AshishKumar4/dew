@@ -12,7 +12,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal
+import inspect
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from dew.sampling.text import Sampling
 
@@ -22,7 +23,19 @@ if TYPE_CHECKING:
     from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
     from openai.types import Completion as OpenAIResponse
     from openai.types.chat import ChatCompletion, ChatCompletionChunk
-    from openai._legacy_response import LegacyAPIResponse
+
+
+class _HTTPResponse(Protocol):
+    def json(self) -> object: ...
+
+
+class _RawResponse(Protocol):
+    """What the SDK's public `with_raw_response` returns: the parsed model and its HTTP response."""
+
+    @property
+    def http_response(self) -> _HTTPResponse: ...
+
+    def parse(self) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -99,13 +112,19 @@ def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> dict[s
     return {**options, **fixed}
 
 
+@lru_cache(maxsize=2)
+def _ollama_request_names(kind: Literal["generate", "chat"]) -> frozenset[str]:
+    """The request fields the SDK's public method accepts, read from its signature."""
+    from ollama import Client
+    return frozenset(inspect.signature(getattr(Client, kind)).parameters) - {"self"}
+
+
 def _ollama_budget(options: object, budget: int, seed: int | None, sampling: object = None) -> dict[str, object]:
     from ollama import Options
-    from ollama._types import GenerateRequest, ChatRequest
 
     supplied = options.model_dump(exclude_none=True) if isinstance(options, Options) else options
     fields = {} if supplied is None else _object(supplied, "options")
-    request_only = (GenerateRequest.model_fields.keys() | ChatRequest.model_fields.keys()) - Options.model_fields.keys()
+    request_only = (_ollama_request_names("generate") | _ollama_request_names("chat")) - Options.model_fields.keys()
     misplaced = fields.keys() & request_only
     if misplaced:
         raise ValueError(f"{sorted(misplaced)} are request fields, not Ollama options")
@@ -129,55 +148,18 @@ def _ollama_budget(options: object, budget: int, seed: int | None, sampling: obj
     return _bound(fields, fixed)
 
 
-def _ollama_body(model: str, path: str, fields: dict[str, object]) -> dict[str, object]:
-    # SDK request models own image serialization, tool/schema fields and options.
-    from ollama._types import ChatRequest, GenerateRequest
-    from ollama._client import _copy_images, _copy_messages, _copy_tools
-
-    request_type = ChatRequest if path == "/api/chat" else GenerateRequest
+def _ollama_body(model: str, kind: Literal["generate", "chat"], fields: dict[str, object]) -> dict[str, object]:
+    """Keyword arguments for the SDK method; it owns image, message and tool serialization."""
     body = _bound(fields, {"model": model})
-    for name, convert in (("images", _copy_images), ("messages", _copy_messages), ("tools", _copy_tools)):
-        if name in body:
-            values = body[name]
-            if values is not None and not isinstance(values, Sequence):
-                raise TypeError(f"{name} must be a sequence")
-            body[name] = list(convert(values))
-    unknown = body.keys() - request_type.model_fields.keys()
+    unknown = body.keys() - _ollama_request_names(kind)
     if unknown:
-        raise ValueError(f"fields {sorted(unknown)} are not supported by this Ollama SDK")
-    return request_type.model_validate(body).model_dump(exclude_none=True)
-
-
-@lru_cache(maxsize=1)
-def _ollama_responses() -> tuple[type[OllamaResponse], type[OllamaChat]]:
-    from ollama import ChatResponse, GenerateResponse
-    from pydantic import model_validator
-
-    def checked(value: object) -> object:
-        fields = _object(value, "Ollama response")
-        for name in ("eval_count", "prompt_eval_count"):
-            _count(fields.get(name), name)
-        _reason(fields.get("done_reason"))
-        if "response" in fields and not isinstance(fields["response"], str):
-            raise ValueError("Ollama response text must be a string")
-        return value
-
-    class Generate(GenerateResponse):
-        @model_validator(mode="before")
-        @classmethod
-        def validate_wire(cls, value: object) -> object:
-            return checked(value)
-
-    class Chat(ChatResponse):
-        @model_validator(mode="before")
-        @classmethod
-        def validate_wire(cls, value: object) -> object:
-            return checked(value)
-
-    return Generate, Chat
+        raise ValueError(f"fields {sorted(unknown)} are not accepted by this Ollama SDK's {kind}")
+    return body
 
 
 def _ollama_result(responses: Sequence[OllamaResponse]) -> Completion:
+    # The SDK exposes no raw-response hook, so these are its parsed values: it
+    # rejects non-integral counts and non-text responses; negatives fail here.
     texts: list[str] = []
     counts: list[int | None] = []
     reasons: list[str | None] = []
@@ -216,68 +198,57 @@ class OllamaCompletion:
             raise TypeError("async methods require ollama.AsyncClient")
         return self.client
 
+    def _request(self, kind: Literal["generate", "chat"], fields: dict[str, object],
+                 fixed: dict[str, object], seed: int | None, max_new_tokens: int) -> dict[str, object]:
+        fields = dict(fields)
+        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
+        return _ollama_body(self.model, kind, _bound(fields, fixed))
+
     def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                  seed: int | None = None, **parameters: object) -> Completion:
         rows = _prompts(prompts, max_new_tokens, seed)
-        response_type, _ = _ollama_responses()
+        client = self._sync()
         responses = []
         for index, prompt in enumerate(rows):
-            fields = dict(parameters)
-            fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, None if seed is None else seed + index, fields.pop("sampling", None))
-            body = _ollama_body(self.model, "/api/generate", _bound(fields, {"prompt": prompt, "stream": False}))
-            # _request is the SDK's typed response hook. Using a checked SDK
-            # subclass rejects bool/float counts before Pydantic can coerce them;
-            # HTTP, errors and streaming framing remain the SDK's implementation.
-            responses.append(self._sync()._request(response_type, "POST", "/api/generate", json=body))
+            body = self._request("generate", parameters, {"prompt": prompt, "stream": False},
+                                 None if seed is None else seed + index, max_new_tokens)
+            responses.append(_invoke(client.generate, body))
         return _ollama_result(responses)
 
     def stream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
                **parameters: object) -> Iterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
-        fields = dict(parameters)
-        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
-        body = _ollama_body(self.model, "/api/generate", _bound(fields, {"prompt": prompt, "stream": True}))
-        response_type, _ = _ollama_responses()
-        return self._sync()._request(response_type, "POST", "/api/generate", json=body, stream=True)
+        body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        return _invoke(self._sync().generate, body)
 
     def chat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
              stream: bool = False, **parameters: object) -> OllamaChat | Iterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
-        fields = dict(parameters)
-        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
-        body = _ollama_body(self.model, "/api/chat", _bound(fields, {"messages": messages, "stream": stream}))
-        _, response_type = _ollama_responses()
-        return self._sync()._request(response_type, "POST", "/api/chat", json=body, stream=stream)
+        body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        return _invoke(self._sync().chat, body)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                     seed: int | None = None, **parameters: object) -> Completion:
         rows = _prompts(prompts, max_new_tokens, seed)
-        response_type, _ = _ollama_responses()
+        client = self._async()
         responses = []
         for index, prompt in enumerate(rows):
-            fields = dict(parameters)
-            fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, None if seed is None else seed + index, fields.pop("sampling", None))
-            body = _ollama_body(self.model, "/api/generate", _bound(fields, {"prompt": prompt, "stream": False}))
-            responses.append(await self._async()._request(response_type, "POST", "/api/generate", json=body))
+            body = self._request("generate", parameters, {"prompt": prompt, "stream": False},
+                                 None if seed is None else seed + index, max_new_tokens)
+            responses.append(await _ainvoke(client.generate, body))
         return _ollama_result(responses)
 
     async def astream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
                       **parameters: object) -> AsyncIterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
-        fields = dict(parameters)
-        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
-        body = _ollama_body(self.model, "/api/generate", _bound(fields, {"prompt": prompt, "stream": True}))
-        response_type, _ = _ollama_responses()
-        return await self._async()._request(response_type, "POST", "/api/generate", json=body, stream=True)
+        body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
+        return await _ainvoke(self._async().generate, body)
 
     async def achat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
                     stream: bool = False, **parameters: object) -> OllamaChat | AsyncIterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
-        fields = dict(parameters)
-        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
-        body = _ollama_body(self.model, "/api/chat", _bound(fields, {"messages": messages, "stream": stream}))
-        _, response_type = _ollama_responses()
-        return await self._async()._request(response_type, "POST", "/api/chat", json=body, stream=stream)
+        body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
+        return await _ainvoke(self._async().chat, body)
 
 
 def _openai_result(raw: object, response: object, expected: int) -> Completion:
@@ -386,7 +357,7 @@ class OpenAICompletion:
     def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
                  seed: int | None = None, **parameters: object) -> Completion:
         fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
-        create: Callable[..., LegacyAPIResponse[OpenAIResponse]] = self._sync().completions.with_raw_response.create
+        create: Callable[..., _RawResponse] = self._sync().completions.with_raw_response.create
         raw = _invoke(create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 

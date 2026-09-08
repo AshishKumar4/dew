@@ -1,10 +1,12 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import importlib.util
+import dataclasses
 import json
 import sys
 from pathlib import Path
 
+import dew
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,7 +14,9 @@ import pytest
 import tyro
 
 from dew.data import PackedTokens, TokenWindows
-from dew.objectives.lm import Samples
+from dew.inference import TextGeneration
+from dew.sampling import Sampling
+from dew.objectives.lm import LMObjective, Samples
 
 pytestmark = pytest.mark.mesh
 
@@ -103,8 +107,27 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
     data = config.data.load(batch=8)
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "run")) == config
-    assert (tmp_path / "runs" / "run" / str(int(state.step))).is_dir()
+    run = tmp_path / "runs" / "run"
+    assert (run / str(int(state.step))).is_dir()
+    # run.json is the resolved spec: the model as built, vocabulary and
+    # context included, so the front door rebuilds it without the recipe.
+    recorded = recipe.LmRunConfig.load(str(run))
+    assert recorded.model.config["vocab_size"] == 256 and recorded.model.config["max_seq_len"] == SEQ
+    assert dataclasses.replace(recorded, model=config.model) == config
+    task = dew.pipeline(str(run))
+    assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
+    drawn = task("the ", seed=1, sampling=Sampling(temperature=0))
+    assert drawn.host().tokens.shape == (1, len("the ") + 4) and len(drawn.text[0]) > 0
+    np.testing.assert_array_equal(
+        drawn.host().tokens,
+        TextGeneration(task.model, state.averaged)([list(b"the ")], 4, seed=1,
+                                                   sampling=Sampling(temperature=0)).host().tokens)
+    objective = LMObjective(task.model, SEQ, samples=recipe.build_samples(config))
+    trained = objective.pipeline(state, processor=task.processor)
+    actual = task("the ", seed=11).host()
+    expected = trained("the ", seed=11).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
@@ -147,7 +170,9 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
     assert int(state.step) > 0
     assert all(bool(jnp.all(jnp.isfinite(leaf)))
                for leaf in jax.tree.leaves(state.params["params"]))
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant")) == config
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant"))
+    assert recorded.model.config["vocab_size"] == 256
+    assert dataclasses.replace(recorded, model=config.model) == config
 
 
 def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
@@ -201,7 +226,9 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     state = recipe.main(config)
 
     assert int(state.step) == 1
-    assert recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued")) == config
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued"))
+    assert recorded.model.config["vocab_size"] == 256
+    assert dataclasses.replace(recorded, model=config.model) == config
     kernel = state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)
     assert np.all(np.isfinite(np.asarray(kernel)))
@@ -428,3 +455,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     restored = recipe.main(config)
     for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(restored.params)):
         np.testing.assert_array_equal(actual, wanted)
+    task = dew.pipeline(str(tmp_path / "runs" / "block"), ema=False)
+    trained = recipe.build_block_objective(config, original.model, original.variables).pipeline(state, ema=False)
+    prompt = [[4, 5, 6, 7]]
+    np.testing.assert_array_equal(task(prompt, 4, seed=9).host().tokens,
+                                  trained(prompt, 4, seed=9).host().tokens)
