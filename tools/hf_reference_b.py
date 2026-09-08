@@ -15,6 +15,14 @@ What lands in tests/fixtures/hf:
 - deepseek-v2-tiny/: DeepSeek V2 Lite at toy width, softmax routing under
   group_limited_greedy with no renormalisation, the shared expert and a
   dense first layer, MLA without the query LoRA.
+- kimi-k2-tiny/: Kimi K2 at toy width under its own model_type, released
+  rope spelling and provenance in source.json. Its config carries the
+  release's routing (twelve experts in one group, sigmoid scores under
+  noaux_tc with the balancing bias, one shared expert, routed_scaling_factor
+  2.827), its rope (theta 50000 with YaRN factor 32 at beta_fast and
+  beta_slow 1.0) and its MLA widths (qk_nope twice qk_rope, values as wide
+  as qk_nope), not DeepSeek V3's. Its weights are the released per-expert
+  tensor names transformers reads through V3's conversion.
 - glm4-moe-tiny/: GLM 4.5 at toy width, biased q/k/v over a bias-free
   o_proj, the q/k norms of GLM 4.6, a half rotary, a dense first layer over
   a routed one with the balancing bias and a shared expert, scaled by 1.5,
@@ -68,15 +76,18 @@ What lands in tests/fixtures/gemma4, for tests/test_gemma4_moe.py:
   post_feedforward_layernorm.
 """
 
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from safetensors.numpy import load_file, save_file
 from transformers import (
-    DeepseekV2Config, DeepseekV2ForCausalLM, Gemma3nTextConfig, Gemma4TextConfig,
-    Glm4MoeConfig, Glm4MoeForCausalLM, Llama4TextConfig,
+    DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
+    Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
+    Llama4TextConfig,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
 from transformers.models.gemma3n.modeling_gemma3n import (
@@ -92,7 +103,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
 from hf_reference import (  # noqa: E402
-    DEEPSEEK_YARN, FIXTURES, scatter_weights, write_released_config, write_tiny,
+    DEEPSEEK_YARN, FIXTURES, reference_logits, scatter_weights, write_released_config,
+    write_tiny,
 )
 from moe_reference import expert_tensors  # noqa: E402
 
@@ -115,6 +127,120 @@ def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
         attention_bias=False, aux_loss_alpha=0.001, seq_aux=True))
     torch.manual_seed(0)
     return DeepseekV2ForCausalLM(config)
+
+
+# moonshotai/Kimi-K2-Instruct at revision fd1984e2, scaled to a fixture.
+# The release's proportions this rounds to a hidden width of 32:
+# intermediate_size 2.571x that width (80 here), moe_intermediate_size
+# 0.286x (8), the query LoRA 0.214x (8), and qk_nope twice qk_rope with the
+# values as wide as qk_nope, which is the one proportion that survives
+# exactly. The 0.071x latent would round to 2, too narrow to carry the
+# compressed keys and values, so kv_lora_rank stays at the 8 the other MLA
+# fixtures use.
+# The release's own values, unscaled: routed_scaling_factor 2.827,
+# rope_theta 50000, YaRN factor 32 with beta_fast and beta_slow both 1.0
+# over original_max_position_embeddings 4096, one group holding every
+# expert, one dense layer, one shared expert, no prediction depth, and
+# bos/eos at the release's own offsets below the top of the vocabulary
+# (163584 and 163585 of 163840). Kimi's 384 experts and the 48:1 ratio they
+# keep against num_experts_per_tok do not survive a fixture; twelve experts
+# with two per token keep a routed layer whose choice the group limit
+# cannot decide, which is what n_group 1 means.
+KIMI_K2_YARN = {
+    "type": "yarn", "factor": 32.0, "beta_fast": 1.0, "beta_slow": 1.0,
+    "mscale": 1.0, "mscale_all_dim": 1.0,
+    "original_max_position_embeddings": 4096,
+}
+KIMI_K2_TINY = dict(
+    vocab_size=256, hidden_size=32, intermediate_size=80,
+    moe_intermediate_size=8, num_hidden_layers=2, num_attention_heads=4,
+    num_key_value_heads=4, n_shared_experts=1, n_routed_experts=12,
+    routed_scaling_factor=2.827, q_lora_rank=8, kv_lora_rank=8,
+    qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16, n_group=1,
+    topk_group=1, num_experts_per_tok=2, first_k_dense_replace=1,
+    moe_layer_freq=1, norm_topk_prob=True, scoring_func="sigmoid",
+    topk_method="noaux_tc", num_nextn_predict_layers=0, hidden_act="silu",
+    max_position_embeddings=64, rms_norm_eps=1e-6, tie_word_embeddings=False,
+    rope_theta=50000.0, rope_scaling=dict(KIMI_K2_YARN), attention_bias=False,
+    attention_dropout=0.0, aux_loss_alpha=0.001, seq_aux=True,
+    pretraining_tp=1, bos_token_id=0, eos_token_id=1,
+)
+
+
+def tiny_kimi_k2() -> DeepseekV3ForCausalLM:
+    """Kimi K2's shape at toy width, built by the class its release names.
+
+    The config keeps transformers' own model_type here so that
+    `save_pretrained` reverses its per-expert conversion and writes the
+    released tensor names; `write_kimi_k2_config` puts Kimi's model_type and
+    its released rope spelling back over the saved config.
+
+    beta_fast and beta_slow both 1.0 place the YaRN correction range on one
+    frequency of the eight-wide rope slice, so three of its four frequencies
+    extrapolate and the fourth interpolates by the factor. A fixture whose
+    ramp came out all one way would agree with an implementation that
+    dropped either branch.
+
+    The rope entry is copied per call because config standardization writes
+    `rope_type` and `rope_theta` into the entry it is handed, and the config
+    written beside the weights is the release's own seven fields.
+    """
+    config = DeepseekV3Config.from_dict(
+        dict(KIMI_K2_TINY, rope_scaling=dict(KIMI_K2_YARN), rope_interleave=True))
+    torch.manual_seed(0)
+    return DeepseekV3ForCausalLM(config)
+
+
+def write_kimi_k2_config(name: str, repo: str) -> None:
+    """The fixture's config as Kimi K2 releases one, and its provenance.
+
+    The release ships `model_type: kimi_k2` with `architectures:
+    [DeepseekV3ForCausalLM]`, `rope_theta` beside a `rope_scaling` of
+    `type: yarn`, and the training fields transformers ignores. It also
+    ships an `auto_map` onto its own `modeling_deepseek.py` and an fp8
+    `quantization_config`; neither is written here, since the fixture
+    carries no remote code and its weights are floating.
+
+    transformers 5.16.1 registers no `kimi_k2` config, so the reload below
+    names the class the release's auto_map does and registers V3's own
+    per-expert conversion under Kimi's model_type. It fails the fixture if
+    the released spelling reaches other logits than the saved config did.
+    """
+    from huggingface_hub import model_info
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
+    )
+
+    directory = FIXTURES / name
+    saved = json.loads((directory / "config.json").read_text())
+    for field in ("head_dim", "qk_head_dim", "rope_parameters", "rope_interleave"):
+        saved.pop(field, None)
+    config = {"architectures": ["DeepseekV3ForCausalLM"], **saved, **KIMI_K2_TINY,
+              "model_type": "kimi_k2", "transformers_version": transformers.__version__}
+    (directory / "config.json").write_text(
+        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({
+        "released": {"repo": repo, "revision": model_info(repo).sha},
+        "transformers": {"version": transformers.__version__,
+                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
+    }, indent=1) + "\n")
+
+    register_checkpoint_conversion_mapping(
+        "kimi_k2", get_checkpoint_conversion_mapping("deepseek_v3"), overwrite=True)
+    model, report = DeepseekV3ForCausalLM.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    unread = {key: sorted(report[key]) for key in
+              ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+              if report[key]}
+    if unread:
+        raise SystemExit(f"{directory}: the released config does not read its own weights: {unread}")
+    ids = np.load(directory / "input_ids.npy")
+    difference = float(np.max(np.abs(reference_logits(model, ids)
+                                     - np.load(directory / "logits.npy"))))
+    if difference != 0.0:
+        raise SystemExit(f"{directory}: the released rope spelling moved the logits by {difference:.3e}")
+    print(f"{directory}: model_type {config['model_type']}, {len(config)} fields, "
+          f"released spelling reloads bit for bit")
 
 
 def tiny_glm4_moe() -> Glm4MoeForCausalLM:
@@ -381,6 +507,8 @@ def write_mirrored_config(name: str, repo: str) -> None:
 def main() -> None:
     write_tiny("gpt-oss-tiny", tiny_gpt_oss())
     write_tiny("deepseek-v2-tiny", tiny_deepseek_v2())
+    write_tiny("kimi-k2-tiny", tiny_kimi_k2())
+    write_kimi_k2_config("kimi-k2-tiny", "moonshotai/Kimi-K2-Instruct")
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
     write_glm4_moe_mtp("glm4-moe-tiny", glm)

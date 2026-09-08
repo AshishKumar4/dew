@@ -1,0 +1,10 @@
+{
+ "released": {
+  "repo": "moonshotai/Kimi-K2-Instruct",
+  "revision": "fd1984e2b7a3350dbf7305fe73a4ede25c14de50"
+ },
+ "transformers": {
+  "version": "5.16.1",
+  "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+ }
+}
