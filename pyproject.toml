@@ -41,6 +41,9 @@ test = [
     "pytest-xdist",
     "safetensors",
     "torch",
+    # A published scheduler's beta sigma grid is an inverse incomplete beta,
+    # which the source scheduler also takes from scipy and refuses without.
+    "scipy",
     "wandb",
     # The committed VAE fixture was generated with this reference release.
     "diffusers==0.34.0",

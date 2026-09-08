@@ -689,7 +689,7 @@ class Pretrained:
             raise TypeError("text_to_image needs a latent diffusion source")
         return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
                            grid=self.schedule.sampling, final_denoise=False, sampler=self.schedule.solver(),
-                           steps=min(50, len(self.schedule.betas)), guidance=CFG(7.5), finish=self.finish)
+                           steps=min(50, self.schedule.train_steps), guidance=CFG(7.5), finish=self.finish)
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with its tokenizer assets."""
