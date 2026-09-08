@@ -16,7 +16,10 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import (
+    ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature, local_rows,
+    mesh_of, request_key,
+)
 from dew.objectives.base import Variables
 
 
@@ -158,8 +161,11 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs) -> Decode
     logits, updated = model.apply(
         {**params, "cache": cache}, inputs.tokens, decode=True, mutable=["cache"],
         rngs=None, method=None, capture_intermediates=False, **inputs.kwargs())
-    valid = inputs.token_fields["attention_mask"]
-    last = jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1)
+    # An unpadded prompt carries no validity field, and its last real token is
+    # the last slot.
+    valid = inputs.token_fields.get("attention_mask")
+    last = (jnp.full((batch,), width - 1, jnp.int32) if valid is None else
+            jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
     positions = inputs.token_fields.get("positions")
     if positions is not None:
         positions = positions[jnp.arange(batch), jnp.maximum(last, 0)] + 1
@@ -204,14 +210,17 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs,
 
     state, samples = lax.scan(step, initial, None, length=max_new_tokens)
     samples = jax.tree.map(lambda value: jnp.swapaxes(value, 0, 1), samples)
+    valid = inputs.token_fields.get("attention_mask")
+    started = jnp.ones(batch, bool) if valid is None else jnp.any(valid, axis=1)
     return Generation(jnp.concatenate([inputs.tokens, samples.tokens], axis=1),
-                      state.lengths, state.finished & jnp.any(inputs.token_fields["attention_mask"], axis=1),
+                      state.lengths, state.finished & started,
                       samples.behavior_log_probs, samples.raw_log_probs)
 
 
 def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling) -> ModelInputs:
-    """Host checks shared by every caller; returns device inputs with a binary mask."""
+    """Host checks shared by every caller; returns device inputs whose validity
+    field is present only where a prompt is actually padded."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -233,9 +242,11 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     if vocab is not None and (sampling.pad_id >= vocab or
                              (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
         raise ValueError("sampling token ids must be inside the vocabulary")
-    prepared = ModelInputs(jnp.asarray(ids, jnp.int32),
-                           {**{name: jnp.asarray(value) for name, value in fields.items()},
-                            "attention_mask": jnp.asarray(valid.astype(bool))},
+    token_fields = {name: jnp.asarray(value) for name, value in fields.items()
+                    if name != "attention_mask"}
+    if not valid.all():
+        token_fields["attention_mask"] = jnp.asarray(valid.astype(bool))
+    prepared = ModelInputs(jnp.asarray(ids, jnp.int32), token_fields,
                            {name: jnp.asarray(value) for name, value in conditioning.items()})
     prepared.validate()
     return prepared
@@ -300,6 +311,12 @@ def generate(model: nn.Module, params: Variables,
         raise error
     assert prepared is not None and random_key is not None
     if processes > 1:
+        # Whether this process's own prompts needed padding is rank-local, and
+        # the digest below would refuse a pool that disagrees only about that,
+        # so the pool agrees one validity schema first.
+        prepared = agreed_validity(prepared, processes,
+                                   controls=(max_new_tokens, sampling),
+                                   phase="generation input")
         # Compare fixed-size hashes before creating distributed input arrays.
         # The schema covers all conditioning and token fields, not token length
         # alone; different traced shapes would issue mismatched collectives.
@@ -308,9 +325,13 @@ def generate(model: nn.Module, params: Variables,
     plan = RowPlan.over(mesh, prepared.tokens.shape[0])
     padded = plan.pad(prepared)
     if plan.count != plan.rows:
-        # Repeated rows carry no real token, so they finish at once and emit nothing.
-        mask = np.asarray(padded.token_fields["attention_mask"]) & ~plan.padding[:, None]
-        padded = replace(padded, token_fields={**padded.token_fields, "attention_mask": mask})
+        # Repeated rows carry no real token, so they finish at once and emit
+        # nothing. Their validity is the field an unpadded request omitted.
+        existing = padded.token_fields.get("attention_mask")
+        valid = (np.ones(padded.tokens.shape, bool) if existing is None
+                 else np.asarray(existing))
+        padded = replace(padded, token_fields={**padded.token_fields,
+                                               "attention_mask": valid & ~plan.padding[:, None]})
     output = _compiled(plan.sharding)(model, params, plan.place(padded), plan.keys(random_key),
                                       max_new_tokens, sampling)
     return replace(output, rows=plan.rows)

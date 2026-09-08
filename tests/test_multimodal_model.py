@@ -134,6 +134,30 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
         loaded.processor.from_hf({**values, "pixel_values": values["pixel_values"][:1]})
 
 
+def test_the_processor_emits_validity_only_where_the_batch_is_padded(source):
+    """A whole batch states its validity by carrying none, and the positions
+    it does carry are the row indices. A mask that only says every slot is
+    real says nothing the model can read, so it goes the same way; a mask
+    with a padded slot in it stays."""
+    loaded, _ = source
+    assert loaded.processor is not None
+    ids = np.load(FIXTURE / "input_ids.npy")[:1]
+    left_padded = np.ones(ids.shape, np.int32)
+    left_padded[:, :2] = 0
+
+    whole = loaded.processor.from_hf({"input_ids": ids})
+    spelled = loaded.processor.from_hf({"input_ids": ids, "attention_mask": np.ones(ids.shape, np.int32)})
+    padded = loaded.processor.from_hf({"input_ids": ids, "attention_mask": left_padded})
+
+    assert "attention_mask" not in whole.token_fields
+    assert "attention_mask" not in spelled.token_fields
+    np.testing.assert_array_equal(whole.token_fields["positions"],
+                                  np.arange(ids.shape[1])[None, :])
+    np.testing.assert_array_equal(np.asarray(padded.token_fields["attention_mask"]),
+                                  left_padded.astype(bool))
+    np.testing.assert_array_equal(padded.token_fields["positions"][0, :4], [0, 0, 0, 1])
+
+
 def test_public_cached_generation_preserves_image_conditioning(source):
     """Greedy continuation matches HF; changing pixels changes raw likelihoods."""
     loaded, inputs = source

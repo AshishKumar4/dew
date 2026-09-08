@@ -193,6 +193,31 @@ class CausalSelfAttention(nn.Module):
             keep = keep & (query_slots[:, None, :, None] >= 0)
         return keep
 
+    def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
+        """Whether metadata narrows who sees whom, so the mask has to be built.
+
+        Key validity does, and image groups do on a layer that makes images
+        bidirectional. Rotary positions rotate q and k and leave visibility
+        alone, and an explicit pairwise mask builds its own below. Metadata
+        that restricts nothing keeps causality and the window as the flags
+        the fused kernels take, because a materialized [B, 1, S, S] mask
+        sends the call to the xla kernel and costs the fused one's time and
+        memory (the numbers are in docs/performance.md).
+
+        A validity array is opaque at trace time, so its contents decide
+        nothing here. An all-true one restricts as much as any other, and a
+        host that knows a row is unpadded says so by passing none.
+
+        Decoding always builds the mask, which carries the cache's own
+        validity, and a bidirectional-image layer writes its cached groups
+        while building it.
+        """
+        if decode:
+            return metadata is not None or self.bidirectional_images
+        return metadata is not None and (
+            metadata.valid is not None
+            or (self.bidirectional_images and metadata.image_groups is not None))
+
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -366,7 +391,7 @@ class CausalSelfAttention(nn.Module):
                 # 75.8 ms and 4.99 GiB, measured in
                 # docs/concepts/language_models.md.
                 implementation = 'xla'
-        if prefix is None and (attention_metadata is not None or self.bidirectional_images):
+        if prefix is None and self._restricts_visibility(attention_metadata, decode):
             mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
             if segment_ids is not None and not decode:
                 inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])

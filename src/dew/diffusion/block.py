@@ -23,7 +23,10 @@ from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import (
+    ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature, local_rows,
+    mesh_of, request_key,
+)
 from dew.objectives.base import Variables
 
 
@@ -219,6 +222,10 @@ class BlockProcess:
         assert prepared is not None and request is not None
         if jax.process_count() > 1:
             controls = (max_new_tokens, self, eos_token_ids, pad_token_id, model)
+            # A process whose own rows needed no padding carries no validity,
+            # so the pool agrees one validity schema before the digest reads it.
+            prepared = agreed_validity(prepared, jax.process_count(), controls=controls,
+                                       phase="canvas input")
             multihost_utils.assert_equal(
                 generation_signature(prepared, controls),
                 "canvas input schemas, model geometry and generation policy must agree")
