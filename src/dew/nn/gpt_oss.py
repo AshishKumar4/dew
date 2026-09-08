@@ -56,11 +56,9 @@ def quantize_mxfp4(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     whose largest code is not +-6 or +-4 is rewritten with the scale this
     rule picks, so encoding a group that came from a checkpoint can move its
     bytes while every value it decodes to stays where it was. And the
-    round-up stops at 2 ** -126, the reference's own fp32 floor: a group
+    round-up stops at 2 ** -126, the reference's own fp32 floor, so a group
     whose largest magnitude is under 2 ** -128 has no scale left to reach it
-    and rounds to zeros, and one with nothing above the fp32 subnormal floor
-    is written as the zero group -- which is what a backend that flushes
-    subnormals, XLA's CPU among them, already makes of those weights.
+    and rounds to zeros.
     """
     src = jnp.asarray(values)
     if not jnp.issubdtype(src.dtype, jnp.floating):
@@ -74,27 +72,44 @@ def quantize_mxfp4(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     # except the one E2M1 conversion that is meant to.
     rows = src.astype(jnp.bfloat16).astype(jnp.float32).swapaxes(1, 2)
     groups = rows.reshape(*rows.shape[:2], -1, 32)
-    largest = jnp.max(jnp.abs(groups), axis=-1, keepdims=True)
-    if not bool(jnp.all(jnp.isfinite(largest))):
+    # XLA reads a subnormal as zero and writes a subnormal result as zero,
+    # where the reference's fp32 keeps both, so the group's largest is taken
+    # from the bits: the pattern of |value| orders exactly as |value| does,
+    # and an infinity or a NaN is every pattern at or above the exponent
+    # field's last value.
+    bits = jax.lax.bitcast_convert_type(groups, jnp.uint32)
+    largest = jnp.max(bits & 0x7fffffff, axis=-1, keepdims=True)
+    if not bool(jnp.all(largest < 0x7f800000)):
         raise ValueError(
             "MXFP4 holds no infinite or NaN weight: E2M1 encodes neither, and this "
             "rule gives such a group the reserved E8M0 NaN scale 0xff, which reads "
             "back as 2 ** 128")
-    # A group below 2 ** -64 has a subnormal quotient, and XLA flushes a
-    # subnormal result to zero where the reference's fp32 keeps it and rounds
-    # it up to 2 ** -126. Dividing a copy boosted into the normals gives the
-    # reference's bits back; the boost comes off the exponent, which then
-    # floors where the reference's subnormals do.
-    tiny = largest < 2.0 ** -64
-    bits = jax.lax.bitcast_convert_type(
-        jnp.where(tiny, largest * 2.0 ** 96, largest) / 6, jnp.uint32)
-    exponent = (((bits + 0x007fffff) & 0x7f800000) >> 23).astype(jnp.int32)
+    # The quotient of a group under 2 ** -64 (0x1f800000) is subnormal, and a
+    # flushed one would say 2 ** 0 where the reference says 2 ** -126, so the
+    # divide runs on a copy boosted into the normals and the boost comes off
+    # the exponent, which then floors where the reference's subnormals do. A
+    # group whose own largest is subnormal is boosted to zero here and floors
+    # to the same 2 ** -126 the reference rounds it up to.
+    tiny = largest < 0x1f800000
+    largest_value = jax.lax.bitcast_convert_type(largest, jnp.float32)
+    quotient = jax.lax.bitcast_convert_type(
+        jnp.where(tiny, largest_value * 2.0 ** 96, largest_value) / 6, jnp.uint32)
+    exponent = (((quotient + 0x007fffff) & 0x7f800000) >> 23).astype(jnp.int32)
     scales = jnp.where(largest == 0, 0,
                        jnp.maximum(exponent - jnp.where(tiny, 96, 0), 1)).astype(jnp.uint8)
     scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
     # The reciprocal is exact for every power of two the round-up can leave,
     # and a zero group multiplies by zero, which keeps a -0.0 weight's sign.
-    scaled = groups * jnp.where(scale == 0, 0.0, 1 / scale)
+    # A subnormal weight is zero to that multiply and is not zero to the
+    # format at the two smallest scales, so it goes through its significand
+    # instead: read as an integer that is the weight times 2 ** 149, which at
+    # 2 ** -23 is the weight times 2 ** 126 and normal, against a reciprocal
+    # brought down by the same 2 ** 126.
+    reciprocal = jnp.where(scale == 0, 0.0, 1 / scale)
+    subnormal = (bits & 0x7f800000) == 0
+    lifted = (bits & 0x007fffff).astype(jnp.float32) * 2.0 ** -23
+    scaled = (jnp.where(subnormal, jnp.where(bits >> 31 == 1, -lifted, lifted), groups)
+              * jnp.where(subnormal, reciprocal * 2.0 ** -126, reciprocal))
     codes = jax.lax.bitcast_convert_type(
         scaled.astype(jnp.float4_e2m1fn), jnp.uint4).astype(jnp.uint8)
     return codes[..., 0::2] | (codes[..., 1::2] << 4), scales.squeeze(-1)

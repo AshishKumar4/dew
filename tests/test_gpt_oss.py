@@ -14,6 +14,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -47,17 +48,27 @@ def nearest_codes(values: np.ndarray) -> np.ndarray:
     return (index + 8 * np.signbit(values)).astype(np.uint8)
 
 
-def released_scale_byte(largest: np.ndarray) -> np.ndarray:
-    """The released encoder's own scale expression, in numpy.
+def released_encode(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The released encoder written out in numpy, blocks and scales.
 
-    triton_kernels' `downcast_to_mxfp_torch` under ROUND_UP: the group's
-    largest magnitude over 6, rounded up to a power of two in the fp32 bits,
-    read back as the E8M0 exponent byte. numpy keeps the subnormal quotient
-    that XLA flushes, so this is the rule dew has to reproduce and not the
-    arithmetic it uses to get there.
+    triton_kernels' `downcast_to_mxfp_torch` under ROUND_UP, which is what
+    transformers 5.16.1's `quantize_to_mxfp4` calls: bf16 in, the group's
+    largest magnitude over 6 rounded up to a power of two in the fp32 bits,
+    the reciprocal of that (zero for a zero group) across the group, and the
+    nearest E2M1 value. numpy keeps the subnormals XLA reads and writes as
+    zero, so this is the arithmetic dew has to agree with and not the
+    arithmetic dew can use to get there.
     """
-    bits = (np.asarray(largest, np.float32) / np.float32(6)).view(np.uint32)
-    return (((bits + 0x007fffff) & 0x7f800000) >> 23).astype(np.uint8)
+    rows = weight.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
+    groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, 32)
+    rounded = ((np.abs(groups).max(-1, keepdims=True) / np.float32(6)).view(np.uint32)
+               + 0x007fffff) & 0x7f800000
+    dequant = rounded.view(np.float32)
+    with np.errstate(divide='ignore'):
+        codes = nearest_codes(groups * np.where(dequant == 0, np.float32(0),
+                                                np.float32(1) / dequant))
+    return ((codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8),
+            (rounded >> 23).astype(np.uint8).squeeze(-1))
 
 
 def group_codes(blocks: np.ndarray) -> np.ndarray:
@@ -72,10 +83,9 @@ def encode(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def bf16_magnitudes() -> np.ndarray:
-    """Every non-negative bf16 value that is normal or zero, as fp32."""
-    import ml_dtypes
+    """Every finite non-negative bf16 value, as fp32: subnormals included."""
     patterns = np.arange(1 << 15, dtype=np.uint16).view(ml_dtypes.bfloat16).astype(np.float32)
-    return patterns[np.isfinite(patterns) & ((patterns == 0) | (patterns >= np.ldexp(1.0, -126)))]
+    return patterns[np.isfinite(patterns)]
 
 
 def test_biased_interleaved_experts_match_reference():
@@ -126,38 +136,72 @@ def test_mxfp4_encodes_every_codepoint_and_the_released_reader_agrees():
     np.testing.assert_array_equal(np.signbit(decoded), np.signbit(weight))
 
 
-def test_mxfp4_scale_and_codes_are_the_ones_the_format_names():
-    """Every group of a trained-shaped weight against the released scale
-    expression and the codes read off the grid's midpoints: atol 0 on both.
-    The scale rounds up, so no value reaches the saturating clamp, and no
-    group takes 0xff, the byte E8M0 reserves for NaN."""
-    weight = (np.random.default_rng(2).standard_normal((2, 64, 3)) * 0.7).astype(np.float32)
+def test_mxfp4_encodes_what_the_released_encoder_encodes():
+    """Both bytes of every group against the released encoder written out in
+    numpy, atol 0, over three domains: random bf16 bit patterns, so every
+    exponent, both signs, the subnormals and the zeros are in there; groups
+    where one large value sets the scale and the rest sit under the grid;
+    and trained-shaped weights. The scale rounds up, so no value reaches the
+    saturating clamp and no group takes 0xff, the byte E8M0 reserves for
+    NaN."""
+    rng = np.random.default_rng(4242)
+    patterns = rng.integers(0, 1 << 16, size=20_000 * 32, dtype=np.uint16)
+    random_bf16 = patterns.view(ml_dtypes.bfloat16).astype(np.float32)
+    random_bf16[~np.isfinite(random_bf16)] = 0
+    small = np.ldexp(rng.integers(1, 256, size=(5_000, 31)).astype(np.float32), -141)
+    large = np.ldexp(np.float32(1), rng.integers(-132, 8, size=(5_000, 1))).astype(np.float32)
+    mixed = np.concatenate([large, small * rng.choice([-1, 1], size=(5_000, 31))], axis=1)
+
+    for weight in (random_bf16.reshape(1, -1, 1), mixed.reshape(1, -1, 1).astype(np.float32),
+                   (rng.standard_normal((4, 128, 9)) * 0.08).astype(np.float32)):
+        blocks, scales = encode(weight)
+        want_blocks, want_scales = released_encode(weight)
+        np.testing.assert_array_equal(scales, want_scales)
+        np.testing.assert_array_equal(blocks, want_blocks)
+        assert scales.max() < 0xff
+        rows = weight.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
+        groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, 32)
+        largest = np.abs(groups).max(-1)
+        assert np.all(largest / np.ldexp(np.float32(1), scales.astype(np.int32) - 127) <= 6)
+
+
+def test_mxfp4_encodes_every_bf16_magnitude_as_the_released_encoder_does():
+    """One group per finite bf16 magnitude, subnormals included: both bytes,
+    atol 0. This is where dew's arithmetic has to differ from the
+    reference's -- XLA reads a subnormal as zero and flushes the subnormal
+    quotient of a group under 6 * 2 ** -126, where the reference keeps both
+    and rounds up to the 2 ** -126 scale -- so the domain is checked whole
+    rather than at a few points."""
+    weight = np.repeat(bf16_magnitudes(), 32).reshape(1, -1, 1)
     blocks, scales = encode(weight)
-    rows = np.asarray(jnp.asarray(weight).astype(jnp.bfloat16).astype(jnp.float32))
-    groups = rows.swapaxes(1, 2).reshape(2, 3, -1, 32)
-    codes = group_codes(blocks)
-
-    assert scales.shape == groups.shape[:-1] and scales.max() < 0xff
-    for index in np.ndindex(groups.shape[:-1]):
-        byte = int(released_scale_byte(np.max(np.abs(groups[index]))))
-        assert int(scales[index]) == byte
-        scale = np.float32(np.ldexp(1.0, byte - 127))
-        assert np.max(np.abs(groups[index])) / scale <= 6
-        np.testing.assert_array_equal(codes[index], nearest_codes(groups[index] / scale))
+    want_blocks, want_scales = released_encode(weight)
+    np.testing.assert_array_equal(scales, want_scales)
+    np.testing.assert_array_equal(blocks, want_blocks)
 
 
-def test_mxfp4_scale_matches_the_released_rule_on_every_bf16_magnitude():
-    """One group per bf16 magnitude that fp32 holds as a normal, every one of
-    them, against the released expression: atol 0. This is where dew's
-    arithmetic has to differ from the reference's -- XLA flushes the
-    subnormal quotient of a group below 6 * 2 ** -126, where the reference
-    rounds it up to the 2 ** -126 scale -- so the byte is checked over the
-    whole domain rather than at a few points."""
-    magnitudes = bf16_magnitudes()
-    weight = np.repeat(magnitudes, 32).reshape(1, -1, 1)
-    _, scales = encode(weight)
-    np.testing.assert_array_equal(scales.reshape(-1), released_scale_byte(magnitudes))
+def test_mxfp4_keeps_a_group_of_bf16_subnormals():
+    """2 ** -127 is a bf16 subnormal, and the released encoder writes it as
+    the 0.5 code at the 2 ** -126 scale, so the reader gives it back exactly.
+    XLA reads that weight as zero in every comparison and multiply it takes
+    part in, which would write the group away as zeros; the encoder reads the
+    significand instead. A subnormal beside a normal large enough to set the
+    scale is a code below the grid, and rounds to zero as the reference's own
+    product does."""
+    weight = np.full((1, 32, 1), np.ldexp(1.0, -127), np.float32)
+    weight[0, 5, 0] = -weight[0, 5, 0]
+    blocks, scales = encode(weight)
+    decoded = released_decode(blocks, scales)
 
+    assert int(scales[0, 0, 0]) == 1
+    assert set(group_codes(blocks).reshape(-1).tolist()) == {1, 9}
+    np.testing.assert_array_equal(decoded, weight)
+    np.testing.assert_array_equal(np.signbit(decoded), np.signbit(weight))
+
+    beside = np.full((1, 32, 1), np.ldexp(1.0, -130), np.float32)
+    beside[0, 0, 0] = 1.0
+    blocks, scales = encode(beside)
+    assert int(scales[0, 0, 0]) == 125
+    assert set(group_codes(blocks).reshape(-1).tolist()) == {0, 6}
 
 
 def test_mxfp4_rounds_an_fp32_weight_through_bf16_first():
