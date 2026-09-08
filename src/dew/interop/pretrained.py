@@ -903,24 +903,53 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         min_p=_probability_control(config, generation_config, "min_p", 0.0))
 
 
-# Each pinned pipeline's own `__call__` policy: the steps it takes and the
-# guidance scale it applies, read from Diffusers 0.34.0. The class a file
-# declares is the one whose defaults it gets, so no class is normalized into
-# another: the XL inpainting pipeline keeps 7.5 where the other two XL ones
-# lowered to 5.0, and every Flax pipeline kept its own 7.5.
-_PIPELINE_POLICY: Mapping[str, tuple[int, float]] = MappingProxyType({
-    "StableDiffusionPipeline": (50, 7.5),
-    "StableDiffusionImg2ImgPipeline": (50, 7.5),
-    "StableDiffusionInpaintPipeline": (50, 7.5),
-    "StableDiffusionXLPipeline": (50, 5.0),
-    "StableDiffusionXLImg2ImgPipeline": (50, 5.0),
-    "StableDiffusionXLInpaintPipeline": (50, 7.5),
-    "StableDiffusion3Pipeline": (28, 7.0),
-    "FlaxStableDiffusionPipeline": (50, 7.5),
-    "FlaxStableDiffusionImg2ImgPipeline": (50, 7.5),
-    "FlaxStableDiffusionInpaintPipeline": (50, 7.5),
-    "FlaxStableDiffusionXLPipeline": (50, 7.5),
+# Each pinned pipeline's own `__call__` policy: the denoiser it drives, the
+# steps it takes and the guidance scale it applies, read from Diffusers
+# 0.34.0. The class a file declares is the one whose defaults it gets, so no
+# class is normalized into another: the XL inpainting pipeline keeps 7.5 where
+# the other two XL ones lowered to 5.0, and every Flax pipeline kept its own.
+# `guided` says what that scale is: two guided branches, or the value the
+# model itself embeds, which is Flux's, whose own true classifier-free
+# guidance is off at its default.
+_PIPELINE_POLICY: Mapping[str, tuple[str, int, float, bool]] = MappingProxyType({
+    "StableDiffusionPipeline": ("unet", 50, 7.5, True),
+    "StableDiffusionImg2ImgPipeline": ("unet", 50, 7.5, True),
+    "StableDiffusionInpaintPipeline": ("unet", 50, 7.5, True),
+    "StableDiffusionXLPipeline": ("unet", 50, 5.0, True),
+    "StableDiffusionXLImg2ImgPipeline": ("unet", 50, 5.0, True),
+    "StableDiffusionXLInpaintPipeline": ("unet", 50, 7.5, True),
+    "StableDiffusion3Pipeline": ("transformer", 28, 7.0, True),
+    "FluxPipeline": ("transformer", 28, 3.5, False),
+    "FlaxStableDiffusionPipeline": ("unet", 50, 7.5, True),
+    "FlaxStableDiffusionImg2ImgPipeline": ("unet", 50, 7.5, True),
+    "FlaxStableDiffusionInpaintPipeline": ("unet", 50, 7.5, True),
+    "FlaxStableDiffusionXLPipeline": ("unet", 50, 7.5, True),
 })
+
+
+def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> tuple[int, float, bool]:
+    """The call policy this file's own pipeline carries.
+
+    A directory that declares no pipeline - a bare component tree - takes its
+    family's reference pipeline. A directory that declares one Dew does not
+    implement is refused rather than run under another pipeline's defaults,
+    and a declared pipeline that drives a different denoiser than the one the
+    directory holds is refused too: a component this loader reads does not
+    qualify a workflow it does not.
+    """
+    published = index.get("_class_name")
+    if published is None:
+        component, steps, scale, guided = _PIPELINE_POLICY[denoiser.pipeline]
+    else:
+        policy = _PIPELINE_POLICY.get(published) if isinstance(published, str) else None
+        if policy is None:
+            raise ValueError(f"Native diffusion does not implement the published pipeline "
+                             f"{published!r}")
+        component, steps, scale, guided = policy
+    if component != denoiser.component:
+        raise ValueError(f"The published pipeline {published!r} drives a {component}, and this "
+                         f"directory holds a {denoiser.component}")
+    return steps, scale, guided
 
 
 @dataclass(frozen=True)
@@ -963,6 +992,7 @@ class _Denoiser:
     sample_size: int
     pipeline: str
     origin: Origin = "scheduler"
+    embeds_guidance: bool = False
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
@@ -993,8 +1023,10 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     height, width = index.get("dew_height", size), index.get("dew_width", size)
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
+    steps, scale, guided = _call_policy(index, denoiser)
     encoder = _conditioner(denoiser, index, directory, towers, tokenizers, names, text_params,
-                           height, width, t5=t5, t5_tokenizer=t5_tokenizer)
+                           height, width, t5=t5, t5_tokenizer=t5_tokenizer,
+                           guidance=None if guided else scale)
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(Field("image", (height, width, 3)),
                        {"conditioning": Condition(encoder, unconditional=_unconditional(
@@ -1003,12 +1035,9 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     encoders: dict[str, object] = {"conditioning": text_params}
     finish, safety_layouts, safety_configs = _image_safety(directory, index, compute, encoders)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
-    # A directory that names no pipeline takes its family's reference one.
-    published = index.get("_class_name")
-    steps, scale = _PIPELINE_POLICY.get(published if isinstance(published, str) else "",
-                                        _PIPELINE_POLICY[denoiser.pipeline])
     patch = denoiser.patch * autoencoder.downscale_factor
-    task = SourceTask(min(steps, schedule.train_steps), CFG(scale) if scale > 1 else None,
+    task = SourceTask(min(steps, schedule.train_steps),
+                      CFG(scale) if guided and scale > 1 else None,
                       functools.partial(schedule.sampling, origin=denoiser.origin,
                                         tokens=(height // patch) * (width // patch)))
     variables = {**denoiser.variables, "encoders": encoders, "autoencoder": vae_params}
@@ -1145,8 +1174,12 @@ def _t5_tower(directory: Path, compute):
 
 def _conditioner(denoiser: _Denoiser, index: Mapping[str, object], directory: Path, towers,
                  tokenizers, names: tuple[str, ...], text_params, height: int, width: int, *,
-                 t5, t5_tokenizer):
-    """The text conditioning this family composes, at this source's geometry."""
+                 t5, t5_tokenizer, guidance: float | None):
+    """The text conditioning this family composes, at this source's geometry.
+
+    `guidance` is the value a guidance-embedded model takes as an input; a
+    model that reads none refuses to carry it.
+    """
     from dew.inputs.diffusion import DiffusionConditioner
     from dew.interop.diffusion import _integer
 
@@ -1155,6 +1188,7 @@ def _conditioner(denoiser: _Denoiser, index: Mapping[str, object], directory: Pa
         composition=denoiser.composition, t5=t5, t5_tokenizer=t5_tokenizer,
         t5_width=_integer(denoiser.config.get("joint_attention_dim", 4096),
                           "joint_attention_dim"),
+        guidance=guidance if denoiser.embeds_guidance else None,
         aesthetics=bool(index.get("requires_aesthetics_score", False)))
 
 

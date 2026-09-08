@@ -102,6 +102,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     t5: T5EncoderTransformer | None = None
     t5_tokenizer: PreTrainedTokenizerBase | None = None
     t5_name: str = "text_encoder_3"
+    guidance: float | None = None
     t5_tokens: int = 256
     t5_width: int = 4096
 
@@ -133,6 +134,8 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                              f"CLIP towers, not {towers}")
         if t5 and self.composition not in ("sd3", "flux"):
             raise ValueError(f"{self.composition} conditioning has no T5 segment")
+        if self.guidance is not None and self.composition != "flux":
+            raise ValueError(f"{self.composition} conditioning carries no guidance input")
         if not t5 and self.composition == "flux":
             # SD3's pipeline writes a zero segment for an absent third encoder;
             # Flux's `_get_t5_prompt_embeds` has no such path.
@@ -222,7 +225,12 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                                       self._zeroed(pooled, zero), time_ids)
         if self.composition == "flux":
             hidden = self._t5_states(params, tokens, rows, outputs[0].pooled.dtype)
+            # Flux reads the CLIP pooled vector unprojected.
             pooled = outputs[0].pooled
+            guidance = (None if self.guidance is None
+                        else jnp.full((rows,), self.guidance, hidden.dtype))
+            return DenoisingCondition(self._zeroed(hidden, zero),
+                                      self._zeroed(pooled, zero), guidance=guidance)
         else:
             clip = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
             padded = jnp.pad(clip, ((0, 0), (0, 0), (0, self.t5_width - clip.shape[-1])))

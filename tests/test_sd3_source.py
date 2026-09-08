@@ -431,6 +431,12 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
                            initial.params["params"]["proj_out"]["kernel"])
     np.testing.assert_array_equal(state.params["buffers"]["pos_embed"], buffer)
+    # The released towers and the autoencoder are state, not weights: the
+    # optimizer never sees them, so every leaf is the loaded one.
+    for held in ("encoders", "autoencoder"):
+        for got, want in zip(jax.tree.leaves(state.params[held]),
+                             jax.tree.leaves(initial.params[held]), strict=True):
+            np.testing.assert_array_equal(got, want)
 
     checkpoints.save(1, state, None, {})
     checkpoints.wait()

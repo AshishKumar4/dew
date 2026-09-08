@@ -16,9 +16,15 @@ from dew.registry import models
 
 @struct.dataclass
 class DenoisingCondition:
+    """Text conditioning as the published families read it: the token states,
+    a pooled vector, the size and crop ids the XL towers add, and the
+    distilled guidance value a guidance-embedded transformer takes as a model
+    input rather than as two guided branches."""
+
     context: jax.Array
     pooled: jax.Array | None = None
     time_ids: jax.Array | None = None
+    guidance: jax.Array | None = None
 
 
 @dataclass(frozen=True)
