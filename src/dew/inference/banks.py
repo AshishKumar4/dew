@@ -15,17 +15,16 @@ same mesh under the same rules.
 
 A source is a `LayerBanks`: the shapes it can produce, the variables outside
 the layer stack, and one bank of consecutive layers. A run directory
-(`CheckpointBanks`), a tree already in memory (`HeldBanks`) and generated
-weights (`SyntheticBanks`) are the three that ship, and `host_banked` loads
-all three the same way.
+(`CheckpointBanks`) and a tree already in memory (`HeldBanks`) are the two
+that ship, and `host_banked` loads either the same way. `CheckpointBanks`
+reads Dew's own run checkpoints; a source that streams a published
+checkpoint too large to hold is not implemented here.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-import math
-import zlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
@@ -114,9 +113,13 @@ class HeldBanks:
     """A store already in memory, banked as it is read.
 
     The tree is the one `model.init` or a loader produced, one subtree per
-    layer. Stacking a bank copies those layers, so this holds the whole model
-    and one bank of it: for weights that fit, which is what a test and a
-    fixture have.
+    layer. It is borrowed: every array stays live and unchanged, nothing is
+    donated or deleted, and the caller's tree is as usable afterwards as
+    before. So a load through this holds the whole source *and* the growing
+    banked destination, and by the last bank it holds two copies of the
+    model. It is for weights that fit twice, which is what a test and a
+    fixture have; it is not evidence that a store larger than memory can be
+    built, and `CheckpointBanks` is what reads one that does not fit.
     """
 
     variables: Variables
@@ -199,69 +202,6 @@ class CheckpointBanks:
         return merge(values["params"], values["ema"]) if self.ema else values["params"]
 
 
-@dataclasses.dataclass(frozen=True)
-class SyntheticBanks:
-    """Generated weights of a given shape, one bank at a time.
-
-    Every element of every leaf of every layer gets its own value: the index
-    of the element inside its leaf, and a key from the leaf's path and the
-    layer's depth, go through murmur3's finalizer, which is a bijection on
-    32-bit words, so no two elements of a leaf and no two layers of a bank
-    hold the same numbers, and nothing is broadcast or aliased. The scale is
-    a fan-in init's and a norm's scale sits around one, so a stack this deep
-    still returns finite logits. The key comes from a CRC of the path, not
-    from `hash`, so two processes generate the same weights.
-
-    A bank is filled row by row into the array that is then placed, so what a
-    load holds past the store is one bank and one leaf of one layer.
-    """
-
-    held: Variables
-    seed: int = 0
-
-    def shapes(self) -> Variables:
-        return self.held
-
-    def entry(self, placement: "Placement") -> Variables:
-        held = named(self.held, entry_names(self.held))
-        return jax.device_put(
-            jax.tree_util.tree_map_with_path(
-                lambda path, leaf: self._values(path, None, leaf.shape, leaf.dtype), held),
-            narrowed(placement, held))
-
-    def bank(self, layers: Sequence[int], placement: "Placement") -> Variables:
-        def rows(path, leaf):
-            if len(layers) == 1:
-                return self._values(path, layers[0], leaf.shape, leaf.dtype)
-            bank = np.empty((len(layers),) + leaf.shape, np.dtype(leaf.dtype))
-            for offset, index in enumerate(layers):
-                bank[offset] = self._values(path, index, leaf.shape, leaf.dtype)
-            return bank
-
-        return jax.device_put(
-            jax.tree_util.tree_map_with_path(rows, one_layer(self.held, layers[0])),
-            placement)
-
-
-    def _values(self, path, layer: int | None, shape: tuple[int, ...], dtype) -> np.ndarray:
-        name = jax.tree_util.keystr(path)
-        key = np.uint32(zlib.crc32(f"{name}/{layer}/{self.seed}".encode()) | 1)
-        count = math.prod(shape) if shape else 1
-        word = np.arange(count, dtype=np.uint32) + key
-        word ^= word >> np.uint32(16)
-        word *= np.uint32(0x85EBCA6B)
-        word ^= word >> np.uint32(13)
-        word *= np.uint32(0xC2B2AE35)
-        word ^= word >> np.uint32(16)
-        unit = (word >> np.uint32(8)).astype(np.float32) * np.float32(2.0 ** -23) - 1.0
-        if name.endswith("['scale']"):
-            values = 1.0 + 0.02 * unit
-        else:
-            fan_in = shape[-2] if len(shape) >= 2 else max(count, 1)
-            values = unit * np.float32(1.0 / math.sqrt(fan_in))
-        return values.reshape(shape).astype(np.dtype(dtype))
-
-
 @functools.lru_cache(maxsize=None)
 def _stored(directory: str, step: int) -> Variables:
     from dew.checkpoints import Checkpoints
@@ -302,18 +242,23 @@ def host_banked(model: CausalTransformer, source: LayerBanks, *,
                 mesh: "MeshSpec | None" = None, layout: "Layout | None" = None) -> Variables:
     """`source`'s weights as the banked store `model`'s runs read.
 
-    Each run's bank is read, stacked and placed on its own and the rows it
-    came from are released before the next run is read, so what a load holds
-    past the store is one bank's worth. `model.bank_layers` caps how long a
-    run is, which is what makes that bound a choice.
+    Each run's bank is read, stacked and placed on its own, and the copies of
+    one bank are waited for before the next bank is read, so the transfers a
+    load has in flight are one bank's and not the store's.
+    `model.bank_layers` caps how long a run is, which is what makes that
+    bound a choice. What the *source* holds while it answers is the source's
+    contract, not this one: `HeldBanks` holds the whole tree it borrowed,
+    `CheckpointBanks` stages one bank's rows, and a load of either costs the
+    store plus whatever its source holds. Nothing here donates or deletes a
+    source's arrays.
 
     `layout.host_parameters` names the parameters kept in pinned host memory.
     Only the layers of the stack can be: the stack is what fetches a layer's
     parameters as it reaches it, and an embedding table or a head brought
     over in one piece would cost the device memory it was meant to save, so
-    naming one is refused here, before anything is allocated. A run whose
-    layers the patterns disagree about is refused for the same reason: a bank
-    is one array and sits in one memory space.
+    naming one is refused here, before anything is read. A run whose layers
+    the patterns place differently, leaf for leaf, is refused for the same
+    reason: a bank is one array with one sharding.
     """
     from dew.training.distributed import (
         Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh)
@@ -336,21 +281,37 @@ def host_banked(model: CausalTransformer, source: LayerBanks, *,
     _check_consumers(placement, groups)
 
     store: dict[str, dict] = {collection: {} for collection in shapes}
-    for collection, tree in source.entry(placement).items():
+    entry = jax.block_until_ready(source.entry(placement))
+    for collection, tree in entry.items():
         store[collection].update(tree)
     for (first, count), name in zip(groups, StackView(groups).bank_names()):
-        bank = source.bank(
+        bank = jax.block_until_ready(source.bank(
             range(first, first + count),
-            _bank_placement(one_layer(placement, first), stacked=count > 1))
+            _bank_placement(one_layer(placement, first), stacked=count > 1)))
         for collection, tree in bank.items():
             store[collection][name] = tree
         del bank
     return {collection: tree for collection, tree in store.items() if tree}
 
 
+def _places(subtree) -> dict[str, tuple[str, str]]:
+    """Where each leaf of one layer goes, by its path inside the layer: the
+    memory kind and the spec, which is what a bank has to hold in common."""
+    leaves, _ = jax.tree_util.tree_flatten_with_path(subtree)
+    return {jax.tree_util.keystr(path): (str(sharding.memory_kind), str(sharding.spec))
+            for path, sharding in leaves}
+
+
 def _check_consumers(placement: "Placement", groups: Sequence[tuple[int, int]]) -> None:
     """Refuse host-resident variables nothing fetches, and a run whose layers
-    disagree about where they sit."""
+    do not agree leaf for leaf about where they go.
+
+    The comparison is per path inside a layer, not over the set of memory
+    kinds a layer uses: two layers can use the same two spaces for different
+    leaves, and a bank stacks corresponding leaves, so it is the
+    correspondence that has to hold. The spec is compared beside the memory
+    kind, because a bank is one array and one sharding for the run.
+    """
     for collection, tree in placement.items():
         outside = sorted(
             name for name, subtree in tree.items()
@@ -366,14 +327,23 @@ def _check_consumers(placement: "Placement", groups: Sequence[tuple[int, int]]) 
                 f"Select layers_* paths and keep a tied head resident")
     for collection, tree in placement.items():
         for first, count in groups:
-            kinds = {
-                f"{collection}/layers_{index}": tuple(sorted(
-                    {sharding.memory_kind
-                     for sharding in jax.tree.leaves(tree[f"layers_{index}"])}))
-                for index in range(first, first + count) if f"layers_{index}" in tree}
-            if len(set(kinds.values())) > 1:
-                raise ValueError(
-                    f"layers {first} to {first + count - 1} are one run, so one bank "
-                    f"in one memory space, and host_parameters puts them in {kinds}. "
-                    f"Select whole runs, or set bank_layers so the runs follow the "
-                    f"selection")
+            held = [index for index in range(first, first + count)
+                    if f"layers_{index}" in tree]
+            if len(held) < 2:
+                continue
+            reference = _places(tree[f"layers_{held[0]}"])
+            for index in held[1:]:
+                places = _places(tree[f"layers_{index}"])
+                differing = sorted(
+                    path for path in set(reference) | set(places)
+                    if reference.get(path) != places.get(path))
+                if differing:
+                    first_path = differing[0]
+                    raise ValueError(
+                        f"layers {first} to {first + count - 1} are one run, so one "
+                        f"bank per leaf and one memory space and spec per bank, and "
+                        f"{collection} layer {held[0]} and layer {index} disagree "
+                        f"about {len(differing)} of them. {first_path} is "
+                        f"{reference.get(first_path)} in layer {held[0]} and "
+                        f"{places.get(first_path)} in layer {index}. Select whole "
+                        f"runs, or set bank_layers so the runs follow the selection")

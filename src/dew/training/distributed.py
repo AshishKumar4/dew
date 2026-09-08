@@ -315,21 +315,23 @@ class Layout:
         The spec is the one the rules give a leaf either way, so a selected
         parameter is the same shard in another memory space and the
         collectives its layer issues are the ones a resident run issues.
-        `host_parameters` naming nothing in `tree` is refused: a placement
-        that silently kept every weight on the device would run, and only
-        the memory it did not save would say so.
+        Every pattern has to name something: one that matches nothing is a
+        typo or a stale path, and a placement that quietly kept those weights
+        on the device would run, with only the memory it did not save to say
+        so. So each pattern is checked on its own, not the table as a whole.
         """
         placed = self.shardings(mesh, tree)
         if not self.host_parameters:
             return placed
         paths = [_variable_path(path)
                  for path, _ in jax.tree_util.tree_flatten_with_path(nn.unbox(tree))[0]]
-        selected = [host_selected(self.host_parameters, path) for path in paths]
-        if not any(selected):
+        unmatched = [pattern for pattern in self.host_parameters
+                     if not any(host_selected((pattern,), path) for path in paths)]
+        if unmatched:
             raise ValueError(
-                f"host_parameters {list(self.host_parameters)} names none of this "
-                f"tree's {len(paths)} variables; the paths start "
-                f"{sorted(paths)[:3]}")
+                f"host_parameters {unmatched} names none of this tree's "
+                f"{len(paths)} variables; the paths start {sorted(paths)[:3]}")
+        selected = [host_selected(self.host_parameters, path) for path in paths]
         kinds = iter(selected)
         return jax.tree.map(
             lambda sharding: (sharding.with_memory_kind("pinned_host") if next(kinds)

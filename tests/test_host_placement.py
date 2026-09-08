@@ -238,6 +238,42 @@ def test_a_run_split_between_the_two_memories_is_refused():
         host_banked(scanned, HeldBanks(variables), layout=half)
 
 
+def test_a_run_whose_layers_offload_different_leaves_is_refused():
+    """Layers of one run that use the same two memory spaces for different
+    leaves still disagree, because a bank stacks corresponding leaves.
+
+    Comparing the set of memory kinds a layer uses would pass this: both
+    layers use device and pinned_host. The check has to compare the leaves
+    that end up in one array, and name the first path they differ at.
+    """
+    _, scanned, variables, _ = pair(num_layers=4)
+    crossed = Layout(min_shard=1, tolerance=1.0, host_parameters=(
+        "params/layers_0/self_attn/q_proj", "params/layers_1/mlp",
+        "params/layers_2/self_attn/q_proj", "params/layers_3/mlp"))
+    with pytest.raises(ValueError, match=r"disagree about .* of them"):
+        host_banked(scanned, HeldBanks(variables), layout=crossed)
+
+
+def test_a_selector_that_names_nothing_is_refused_beside_ones_that_do():
+    """A stale or misspelled pattern is not excused by the patterns next to
+    it: the weights it meant to move would stay on the device silently."""
+    _, scanned, variables, _ = pair(num_layers=4)
+    stale = Layout(min_shard=1, tolerance=1.0,
+                   host_parameters=("params/layers_*", "params/blocks_*"))
+    with pytest.raises(ValueError, match=r"\['params/blocks_\*'\] names none"):
+        host_banked(scanned, HeldBanks(variables), layout=stale)
+
+
+def test_a_load_leaves_the_source_it_borrowed_usable():
+    """`HeldBanks` borrows: nothing it read is donated or deleted, so the
+    caller's tree still scores what it scored before the load."""
+    plain, scanned, variables, tokens = pair(num_layers=4)
+    before = np.asarray(plain.apply(variables, tokens))
+    host_banked(scanned, HeldBanks(variables), layout=BANKS)
+    assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
+    assert np.array_equal(np.asarray(plain.apply(variables, tokens)), before)
+
+
 @pytest.mark.parametrize("pattern, held", [
     ("params/embed_tokens", "embed_tokens"), ("params/norm", "norm")])
 def test_an_offloaded_variable_no_layer_fetches_is_refused(pattern, held):
