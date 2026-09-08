@@ -230,7 +230,9 @@ def continuation_keys(key: jax.Array, n: int) -> jax.Array:
     batch of them; a batch folds row by row.
     """
     fold = jax.random.fold_in if key.shape == () else jax.vmap(jax.random.fold_in, in_axes=(0, None))
-    return jnp.stack([key, *(fold(key, index) for index in range(1, n))])
+    indices = jnp.arange(1, n, dtype=jnp.uint32)
+    folded = jax.vmap(lambda index: fold(key, index))(indices)
+    return jnp.concatenate((key[None], folded), axis=0)
 
 
 def prompt_major(tree):

@@ -209,11 +209,10 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
               max_new_tokens: int, sampling: Sampling, n: int) -> Generation:
     """One fixed compiled scan; finished rows do not mutate their cache state.
 
-    The ``n`` continuations of a prompt share its prefill and run as
-    independent scans over that state, mapped over the continuation axis, so
-    the parameters and the prompt's cache are read once and no continuation
-    prefills again. Their rows leave in prompt order, each prompt's
-    continuations together.
+    The continuations share one prefill and run independent scans from its
+    read-only initial state. Parameters remain unmapped. A sequential
+    continuation map supports the same routed-expert kernels as n=1.
+    Results leave in prompt order, each prompt's continuations together.
     """
     batch = inputs.tokens.shape[0]
     prompt = inputs.tokens if n == 1 else jnp.repeat(inputs.tokens, n, axis=0)
