@@ -468,3 +468,23 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
     with pytest.raises(TypeError, match="no saved generation task"):
         dew.pipeline(str(tmp_path))
+
+
+def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
+    import json
+    from dew.sampling import Sampling
+
+    objective, state = make_lm_run(tmp_path)
+    policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
+    path = tmp_path / "run.json"
+    record = json.loads(path.read_text())
+    record.update(sample_tokens=0, sampling=dataclasses.asdict(policy))
+    path.write_text(json.dumps(record))
+    task = dew.pipeline(str(tmp_path))
+    assert task.max_new_tokens is None
+    with pytest.raises(ValueError, match="max_new_tokens is required"):
+        task([[1, 2]], seed=4)
+    expected = objective.policy(state.averaged, policy)([[1, 2]], 3, seed=4).host()
+    actual = task([[1, 2]], 3, seed=4).host()
+    np.testing.assert_array_equal(actual.tokens, expected.tokens)
+    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
