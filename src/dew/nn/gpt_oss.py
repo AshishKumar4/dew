@@ -1,7 +1,7 @@
 """GPT OSS's biased router, interleaved experts and MXFP4 checkpoint math."""
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +33,93 @@ def dequantize_mxfp4(blocks: jax.Array, scales: jax.Array) -> jax.Array:
     return values.reshape(*blocks.shape[:2], -1).swapaxes(1, 2).astype(jnp.bfloat16)
 
 
+def quantize_mxfp4(values: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """[expert, input, output] weights to packed [expert, output, group, 16] and E8M0 scales.
+
+    The encoding `dequantize_mxfp4` reads back, lossy the way the format is:
+    every 32 values along the input axis share one power-of-two scale and
+    keep four bits each. The rule is the released encoder, transformers
+    5.16.1's `quantize_to_mxfp4` over triton_kernels'
+    `downcast_to_mxfp(..., ROUND_UP)`. It rounds the weight to bf16 first,
+    takes a group's scale as its largest magnitude over 6 rounded up to a
+    power of two -- `(bits + 0x007fffff) & 0x7f800000` on the fp32 quotient,
+    which leaves an exact power of two where it is and sends an all-zero
+    group to the 0x00 scale byte -- and writes each value over that scale as
+    the nearest E2M1 value, ties to even, saturating at +-6. That element
+    rounding is the float4_e2m1fn cast. The scale rule is spelled out
+    because no cast performs it: float8_e8m0fnu rounds to nearest and takes
+    0 to the reserved NaN byte 0xff, which a zero group is not.
+
+    Three consequences worth naming. Rounding to bf16 is a second rounding:
+    an fp32 weight just short of a tie in the E2M1 grid can be carried onto
+    the tie and then rounded away from the value it started at. A group
+    whose largest code is not +-6 or +-4 is rewritten with the scale this
+    rule picks, so encoding a group that came from a checkpoint can move its
+    bytes while every value it decodes to stays where it was. And the
+    round-up stops at 2 ** -126, the reference's own fp32 floor: a group
+    whose largest magnitude is under 2 ** -128 has no scale left to reach it
+    and rounds to zeros, and one with nothing above the fp32 subnormal floor
+    is written as the zero group -- which is what a backend that flushes
+    subnormals, XLA's CPU among them, already makes of those weights.
+    """
+    src = jnp.asarray(values)
+    if not jnp.issubdtype(src.dtype, jnp.floating):
+        raise ValueError(f"MXFP4 encodes float weights, got {src.dtype}")
+    if src.ndim != 3 or src.shape[1] % 32:
+        raise ValueError(
+            "MXFP4 takes an [expert, input, output] weight whose input axis is a "
+            f"multiple of the 32-value group, got {src.shape}")
+    # bf16 first, as the reference does, and fp32 from there: a bf16 value
+    # scaled by a power of two is exact in fp32, so nothing below rounds
+    # except the one E2M1 conversion that is meant to.
+    rows = src.astype(jnp.bfloat16).astype(jnp.float32).swapaxes(1, 2)
+    groups = rows.reshape(*rows.shape[:2], -1, 32)
+    largest = jnp.max(jnp.abs(groups), axis=-1, keepdims=True)
+    if not bool(jnp.all(jnp.isfinite(largest))):
+        raise ValueError(
+            "MXFP4 holds no infinite or NaN weight: E2M1 encodes neither, and this "
+            "rule gives such a group the reserved E8M0 NaN scale 0xff, which reads "
+            "back as 2 ** 128")
+    # A group below 2 ** -64 has a subnormal quotient, and XLA flushes a
+    # subnormal result to zero where the reference's fp32 keeps it and rounds
+    # it up to 2 ** -126. Dividing a copy boosted into the normals gives the
+    # reference's bits back; the boost comes off the exponent, which then
+    # floors where the reference's subnormals do.
+    tiny = largest < 2.0 ** -64
+    bits = jax.lax.bitcast_convert_type(
+        jnp.where(tiny, largest * 2.0 ** 96, largest) / 6, jnp.uint32)
+    exponent = (((bits + 0x007fffff) & 0x7f800000) >> 23).astype(jnp.int32)
+    scales = jnp.where(largest == 0, 0,
+                       jnp.maximum(exponent - jnp.where(tiny, 96, 0), 1)).astype(jnp.uint8)
+    scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
+    # The reciprocal is exact for every power of two the round-up can leave,
+    # and a zero group multiplies by zero, which keeps a -0.0 weight's sign.
+    scaled = groups * jnp.where(scale == 0, 0.0, 1 / scale)
+    codes = jax.lax.bitcast_convert_type(
+        scaled.astype(jnp.float4_e2m1fn), jnp.uint4).astype(jnp.uint8)
+    return codes[..., 0::2] | (codes[..., 1::2] << 4), scales.squeeze(-1)
+
+
+def mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The names a checkpoint ships as an MXFP4 `<stem>_blocks`/`<stem>_scales` pair.
+
+    `unpack_mxfp4` spends this: the tensor it leaves behind no longer says it
+    arrived quantized, so a loader that means to write the source's own
+    format back reads the stems off the raw tensors first and carries them.
+    Half a pair is refused either way round, since a checkpoint holding one
+    of the two has lost the weight and not merely its format. Sorted, so the
+    record does not depend on the order the shards were read in.
+    """
+    stems = sorted({name.removesuffix(suffix) for name in tensors
+                    for suffix in ('_blocks', '_scales') if name.endswith(suffix)})
+    for stem in stems:
+        for suffix in ('_blocks', '_scales'):
+            if stem + suffix not in tensors:
+                raise ValueError(
+                    f"{stem} arrives MXFP4 packed and the checkpoint holds no {stem}{suffix}")
+    return tuple(stems)
+
+
 def unpack_mxfp4(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Replace each `<name>_blocks` and `<name>_scales` pair with `<name>` in fp32.
 
@@ -40,12 +127,33 @@ def unpack_mxfp4(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     transformers materializes before its own forward pass.
     """
     unpacked = dict(tensors)
-    for name in [name for name in tensors if name.endswith('_blocks')]:
-        stem = name.removesuffix('_blocks')
-        blocks, scales = unpacked.pop(name), unpacked.pop(stem + '_scales')
+    for stem in mxfp4_stems(tensors):
+        blocks, scales = unpacked.pop(stem + '_blocks'), unpacked.pop(stem + '_scales')
         unpacked[stem] = np.asarray(
             dequantize_mxfp4(jnp.asarray(blocks), jnp.asarray(scales)).astype(jnp.float32))
     return unpacked
+
+
+def pack_mxfp4(tensors: Mapping[str, np.ndarray],
+               stems: Collection[str]) -> dict[str, np.ndarray]:
+    """Replace each named `<stem>` with the `<stem>_blocks` and `<stem>_scales` it encodes to.
+
+    What `unpack_mxfp4` undid, for the stems a source shipped packed
+    (`mxfp4_stems`) and for nothing else: a tensor trained as a float weight
+    -- the biases, the router, the attention sinks, the embeddings, a tied
+    head -- is written back as itself rather than quantized for looking like
+    a matrix. A named stem the tensors no longer hold is refused, since
+    writing that checkpoint would leave its config still promising blocks.
+    """
+    packed = dict(tensors)
+    for stem in stems:
+        if stem not in packed:
+            raise ValueError(
+                f"{stem} arrived MXFP4 packed and is not among the tensors to write back")
+        blocks, scales = quantize_mxfp4(jnp.asarray(packed.pop(stem)))
+        packed[f'{stem}_blocks'] = np.asarray(blocks)
+        packed[f'{stem}_scales'] = np.asarray(scales)
+    return packed
 
 
 class GptOssExperts(nn.Module):
