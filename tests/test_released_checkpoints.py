@@ -2,9 +2,44 @@
 
 SmolLM2-135M and Qwen3-0.6B are revision-pinned below. Dew and Transformers
 5.16.1 load the same snapshot in float32; the Torch reference stays on CPU.
-The GPU run uses the suite's highest matmul precision. Observed maximum
-logit differences on the RTX 4080 were 1.8e-4 and 3.6e-4 respectively.
-Lowering precision to TF32 made four Qwen cases fail at the unchanged bounds.
+The GPU run uses the suite's highest matmul precision. Lowering precision to
+TF32 made four Qwen cases fail at the unchanged bounds.
+
+`LOGITS` is per checkpoint because the fp32 forward residual is per
+checkpoint, and it is not 1e-4. What sets it, measured on these two
+revisions over the prompts below:
+
+                  CPU fp32   GPU fp32   fp64, both sides widened
+  SmolLM2-135M    1.469e-4   1.590e-4   2.149e-13
+  Qwen3-0.6B      7.820e-5   3.586e-4   2.487e-13
+
+The last column is the exactness proof, and it says the arithmetic is the
+same arithmetic. Both implementations deliberately pin several operations to
+fp32 whatever the model's compute dtype: the rotary tables
+(`dew.nn.attention.rotary_freqs`, `modeling_llama.py:108-125`), RMSNorm
+(`dew.nn.attention.RMSNorm`, `modeling_llama.py:62-67`) and the attention
+softmax (`flax/linen/attention.py:143-144`, `modeling_llama.py:208`). Widen
+exactly those on both sides, run the trunk in double, and the two agree to
+2e-13, five decimal orders inside 1e-4: rope, norm epsilon, attention
+scaling, grouped-query repetition and the gated MLP are not merely close,
+they are the same operators. The ids are identical too, which
+`test_the_load_hands_back_the_checkpoints_own_tokenizer` asserts.
+
+What remains in fp32 is therefore rounding, not a difference, and no change
+to dew drives it under 1e-4. The residual stream of these checkpoints
+carries massive activations, peaking near 19279 for SmolLM2 and 6560 for
+Qwen3, where one fp32 ulp is already 1.95e-3 and 4.88e-4; the measured
+per-layer residuals sit at one to four of those ulps, and the final norm and
+unembedding carry that into logits of magnitude 36.1 and 20.7 as a few tens
+of eps. TF32 is not the cause either: the CPU lane has no TF32 at all and
+lands within 1.1x (SmolLM2) and 4.6x (Qwen3) of the GPU lane, both lanes
+being accumulation order over the same operators.
+
+The bounds below are the tightest the numerics support, each about twice its
+checkpoint's worst measured lane. That leaves room for a backend
+reassociating a sum without leaving room for a wrong operator: an eps-scale
+bug in any operation above moves these residuals by orders of magnitude, not
+by a factor of two.
 
 Each prompt is tokenized individually, then the public numeric-input seam
 assembles padded rows. This does not exercise raw-text batch padding when
@@ -39,7 +74,7 @@ PROMPTS = ("The Cascade Range runs from northern California through Oregon and W
 SEQ = 32
 NEW_TOKENS = 12
 RATE = 1e-4
-LOGITS = 2e-3
+LOGITS = {"SmolLM2-135M": 3e-4, "Qwen3-0.6B": 7e-4}
 TOKEN_LOSS = 5e-3
 UPDATE = 1e-6
 
@@ -67,9 +102,16 @@ def stop_ids(generation_config) -> tuple[int, ...] | None:
 
 
 @pytest.fixture(scope="module", params=list(CHECKPOINTS), ids=list(CHECKPOINTS))
-def bundle(request):
+def checkpoint(request):
+    """Which pinned checkpoint the case runs on: the key into `CHECKPOINTS`
+    and `LOGITS`, since the forward residual is a property of the weights."""
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def bundle(checkpoint):
     """One released checkpoint as a native model, loaded once per checkpoint."""
-    repo, revision = CHECKPOINTS[request.param]
+    repo, revision = CHECKPOINTS[checkpoint]
     if not available(repo, revision):
         pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     return load_pretrained(repo, dtype="float32", attention_impl="reference",
@@ -181,7 +223,8 @@ def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
     assert lengths[1] < lengths[0], "both prompts tokenize to the same length; nothing is padded"
 
 
-def test_the_released_logits_match_transformers_on_the_same_ids(bundle, batch, reference):
+def test_the_released_logits_match_transformers_on_the_same_ids(
+        bundle, batch, reference, checkpoint):
     """The parity claim on real weights: dew's fp32 forward over the released
     checkpoint against transformers over the same directory, the same ids,
     the same mask and the same positions."""
@@ -194,7 +237,7 @@ def test_the_released_logits_match_transformers_on_the_same_ids(bundle, batch, r
 
     assert np.array_equal(np.argmax(ours[valid], -1), np.argmax(theirs[valid], -1))
     difference = float(np.max(np.abs(ours[valid] - theirs[valid])))
-    assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
+    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
 
 
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
@@ -264,11 +307,13 @@ def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, 
     assert difference < UPDATE, f"max |update difference| {difference:.3e}"
 
 
-def test_the_trained_export_reloads_and_transformers_reads_it(bundle, batch, trained, tmp_path):
+def test_the_trained_export_reloads_and_transformers_reads_it(
+        bundle, batch, trained, checkpoint, tmp_path):
     """`Pretrained.save` writes the trained weights back into the released
     layout: `load_pretrained` reads them back leaf for leaf, rebuilds the
     same model and still carries a tokenizer, and transformers loads the
-    same directory and computes the same logits."""
+    same directory, consuming every tensor and wanting none, and computes
+    the same logits."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -291,11 +336,19 @@ def test_the_trained_export_reloads_and_transformers_reads_it(bundle, batch, tra
                           np.float32)
     np.testing.assert_array_equal(reloaded[valid], ours[valid])
 
-    read_back = AutoModelForCausalLM.from_pretrained(str(export), dtype=torch.float32,
-                                                     local_files_only=True)
+    # The loading report, as `tools/decoder_export_reference.py` reads it:
+    # silent name drift leaves a tensor behind and a randomly initialized
+    # parameter in its place, which agreeing logits below would then have to
+    # catch by luck. These two families declare no module transformers lacks,
+    # so nothing may be missing, mismatched or left over.
+    read_back, report = AutoModelForCausalLM.from_pretrained(
+        str(export), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    for category in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
+        assert not report.get(category), f"{category}: {report[category]}"
+
     read_back.eval()
     read_back.set_attn_implementation("eager")
     theirs = reference_logits(read_back, inputs.tokens, valid, inputs.token_fields["positions"])
     assert np.array_equal(np.argmax(theirs[valid], -1), np.argmax(ours[valid], -1))
     difference = float(np.max(np.abs(theirs[valid] - ours[valid])))
-    assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
+    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
