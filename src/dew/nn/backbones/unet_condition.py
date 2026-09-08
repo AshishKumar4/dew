@@ -34,7 +34,11 @@ def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    frequencies = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-math.log(10000.0) / (half - shift)))
+    # The published models scale the whole exponent and then divide, and a
+    # float32 log times a timestep near a thousand keeps that ulp: dividing
+    # the constant first moves the sine by 1e-5 and the timestep embedder's
+    # own gradient with it.
+    frequencies = jnp.exp(-math.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / (half - shift))
     phase = jnp.asarray(time, jnp.float32).reshape(-1, 1) * frequencies[None]
     first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
     return jnp.concatenate([first, second], axis=-1)

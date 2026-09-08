@@ -43,26 +43,31 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler
+from dew.diffusion.schedules.common import NoiseScheduler
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
+from dew.diffusion.schedules.source_grids import (
+    FlowGrid, SigmaGrid, StageSigmaGrid, TabulatedVP, VPGrid,
+)
+from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.karras import EDMNoiseScheduler
 from dew.diffusion.transforms import (
     ConsistencyBoundary, DirectPredictionTransform, EpsilonPredictionTransform,
-    KarrasPredictionTransform, PredictionTransform, SourceLimitedPrediction,
-    VPredictionTransform,
+    FlowMatchPredictionTransform, KarrasPredictionTransform, PredictionTransform,
+    SourceLimitedPrediction, VPredictionTransform,
 )
 from dew.sampling.solvers import (
     Algorithm, Consistency, DDIM, DDPM, DEIS, DPMSolverMultistep, DPMSolverSDE,
-    DPMSolverSinglestep, Euler, EulerAncestral, Heun, KDPM2, LMS, PNDM, TCD, UniPC,
+    DPMSolverSinglestep, Euler, EulerAncestral, Heun, KDPM2, LMS, PNDM, Solver, TCD, UniPC,
 )
 
 Kind = Literal[
     "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
     "HeunDiscrete", "KDPM2Discrete", "KDPM2AncestralDiscrete", "DPMSolverMultistep",
     "DPMSolverSinglestep", "DPMSolverSDE", "DEISMultistep", "UniPCMultistep",
-    "EDMDPMSolverMultistep", "LCM", "TCD",
+    "EDMDPMSolverMultistep", "LCM", "TCD", "FlowMatchEulerDiscrete",
 ]
-Family = Literal["tabulated", "lambda", "sigma", "stage", "edm"]
+Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
+Origin = Literal["scheduler", "linspace"]
 Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
@@ -153,112 +158,6 @@ def published_betas(*, count: object, start: object, end: object, schedule: obje
         bars = signal ** 2
         betas = 1 - np.concatenate([bars[:1], bars[1:] / bars[:-1]])
     return np.asarray(betas, np.float32)
-
-
-class TabulatedVP(DiscreteNoiseScheduler):
-    """The training beta table as the sampling schedule, indexed by t.
-
-    `stride` is the fixed training transfer DDIM and PNDM step over whatever
-    their evaluation grid is; None leaves the grid's own interval, which is
-    what DDPM's previous-timestep policy and the distilled schedules take.
-    A t below zero is the source's "no previous alpha" end.
-    """
-
-    def __init__(self, betas: np.ndarray, *, final_alpha_cumprod: float, stride: int | None):
-        super().__init__(betas, p2_loss_weight_gamma=0)
-        self.final_alpha_cumprod = jnp.asarray(final_alpha_cumprod, jnp.float32)
-        self.stride = stride
-
-    def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
-        index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        alpha = jnp.where(t < 0, self.final_alpha_cumprod, self.alpha_cumprod[index])
-        return jnp.sqrt(alpha), jnp.sqrt(1 - alpha)
-
-    def model_time(self, t):
-        return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
-
-    def step_interval(self, t, t_next):
-        """Published DDIM/PNDM transfer stride, independent of evaluation spacing."""
-        if self.stride is None:
-            return super().step_interval(t, t_next)
-        return jnp.full_like(jnp.asarray(t, jnp.float32), self.stride)
-
-    def half_interval(self, t, t_next):
-        """Published PRK uses the integer transfer stride divided by two."""
-        return jnp.floor(self.step_interval(t, t_next) / 2)
-
-
-class _PairedGrid:
-    def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
-        self.table = jnp.asarray(sigmas, jnp.float32)
-        self.times = jnp.asarray(model_times, jnp.float32)
-        self.prior = jnp.asarray(prior, jnp.float32)
-        self.T = float(len(sigmas) - 1)
-
-    def sigmas(self, t):
-        return jnp.interp(self.T - jnp.asarray(t, jnp.float32), jnp.arange(len(self.table)), self.table)
-
-    def t_of_sigma(self, sigma):
-        return self.T - jnp.interp(jnp.asarray(sigma), self.table[::-1], jnp.arange(len(self.table))[::-1])
-
-    def model_time(self, t):
-        return jnp.interp(self.T - jnp.asarray(t, jnp.float32), jnp.arange(len(self.times)), self.times)
-
-    def prior_scale(self):
-        return self.prior
-
-
-class SigmaGrid(_PairedGrid, GeneralizedNoiseScheduler):
-    """A VE process with paired continuous sigma and model-time coordinates.
-
-    `sigma_min` and `sigma_max` are the prepared grid's own positive extremes,
-    which is the domain a source noise sampler is built over."""
-
-    def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
-        levels = np.asarray(sigmas, np.float64)
-        GeneralizedNoiseScheduler.__init__(self, sigma_min=float(np.min(levels[levels > 0])),
-                                           sigma_max=float(np.max(levels)))
-        _PairedGrid.__init__(self, sigmas, model_times, prior)
-
-
-class StageSigmaGrid(SigmaGrid):
-    """A source VE grid that carries the stage rows of a two-evaluation solver.
-
-    Even coordinates are the grid points the outer walk visits; the odd one
-    between each pair is the source's own interpolated evaluation, at the
-    sigma it places there and the model time it reads back for that sigma.
-    `t_of_sigma` resolves a sigma to a stage coordinate, which is the only
-    inversion these solvers ask of a schedule: KDPM2's midpoint and
-    DPMSolverSDE's proposal both land on a stage row.
-    """
-
-    def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
-        super().__init__(sigmas, model_times, prior)
-        stages = np.asarray(sigmas, np.float64)[1::2]
-        self.stages = jnp.asarray(stages[::-1].copy(), jnp.float32)
-        self.stage_positions = jnp.asarray(
-            np.arange(1, len(sigmas), 2, dtype=np.float32)[::-1].copy())
-
-    def t_of_sigma(self, sigma):
-        return self.T - jnp.interp(jnp.asarray(sigma), self.stages, self.stage_positions)
-
-
-class VPGrid(_PairedGrid, NoiseScheduler):
-    """The same paired coordinates in normalized VP latent space."""
-
-    def rates(self, t):
-        sigma = self.sigmas(t)
-        # The source rounds sqrt before its reciprocal. Fusing to rsqrt moves
-        # stiff cosine-grid VJPs beyond the float32 source-parity bound.
-        alpha = 1 / jax.lax.optimization_barrier(jnp.sqrt(1 + sigma ** 2))
-        return alpha, sigma * alpha
-
-    def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
-
-    def weight(self, t):
-        return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
 
 def _fields(*groups: Mapping[str, object], **extra: object) -> Mapping[str, object]:
@@ -354,6 +253,12 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
         sigma_max=80.0, sigma_data=0.5, sigma_schedule="karras", rho=7.0, solver_order=2,
         algorithm_type="dpmsolver++", solver_type="midpoint", lower_order_final=True,
         euler_at_final=False, final_sigmas_type="zero"), (), _NO_SAMPLE),
+    "FlowMatchEulerDiscrete": _Class("flow", _fields(
+        _TRANSFORMS, num_train_timesteps=1000, prediction_type="flow_prediction", shift=1.0,
+        use_dynamic_shifting=False,
+        base_shift=0.5, max_shift=1.15, base_image_seq_len=256, max_image_seq_len=4096,
+        invert_sigmas=False, shift_terminal=None, time_shift_type="exponential",
+        stochastic_sampling=False), (), ("flow_prediction",)),
     "LCM": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED)),
     "TCD": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED)),
 })
@@ -363,6 +268,7 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
 # behaviour unchanged, so an active one is refused instead of dropped.
 _UNIMPLEMENTED: Mapping[str, object] = MappingProxyType({
     "use_lu_lambdas": False, "use_flow_sigmas": False, "solver_p": None,
+    "invert_sigmas": False, "stochastic_sampling": False,
     "interpolation_type": "linear", "timestep_type": "discrete",
 })
 
@@ -371,6 +277,56 @@ _UNIMPLEMENTED: Mapping[str, object] = MappingProxyType({
 # class rounds an exponential or beta grid's.
 _KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
                   "KDPM2Discrete", "KDPM2AncestralDiscrete")
+
+
+@dataclass(frozen=True)
+class _Flow:
+    """A rectified-flow file's shift controls and the shift they name.
+
+    `shift` alone is the static form; with `dynamic` the shift follows the
+    latent's token count through the source pipeline's `calculate_shift`,
+    which returns mu itself, and `terminal` stretches the result to end where
+    the file says.
+    """
+
+    shift: float
+    dynamic: bool
+    base_shift: float
+    max_shift: float
+    base_tokens: int
+    max_tokens: int
+    terminal: float | None
+    kind: str
+
+    def mu(self, tokens: int) -> float:
+        """The source pipeline's `calculate_shift`: mu interpolated linearly
+        in the token count, not exponentiated."""
+        slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
+        return tokens * slope + self.base_shift - slope * self.base_tokens
+
+    def shifted(self, sigmas: np.ndarray, tokens: int | None) -> np.ndarray:
+        """The sigmas after this file's shift.
+
+        The static and the dynamic forms are the same map with a different
+        base: shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
+        base = shift, and the dynamic base is exp(mu) or mu itself.
+        """
+        if not self.dynamic:
+            return self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+        if tokens is None:
+            raise ValueError("Dynamic shifting needs the latent token count; bind the "
+                             "geometry through the task's grid")
+        mu = self.mu(tokens)
+        base = np.exp(mu) if self.kind == "exponential" else mu
+        return base * sigmas / (1 + (base - 1) * sigmas)
+
+    def stretched(self, sigmas: np.ndarray) -> np.ndarray:
+        """`stretch_shift_to_terminal`, which the source applies once in
+        `set_timesteps` and never to the constructor's own seed."""
+        if self.terminal is None:
+            return sigmas
+        remaining = 1 - sigmas
+        return 1 - remaining / (remaining[-1] / (1 - self.terminal))
 
 
 @dataclass(frozen=True)
@@ -395,22 +351,13 @@ class _Policy:
     rho: float
     stride: bool
     clean_terminal: bool
-    variance: Variance
     clip: float | None
     threshold: tuple[float, float] | None
     recompute_epsilon: bool
-    order: int
-    algorithm: Algorithm
-    solver_type: str
-    lower_order_final: bool
-    euler_at_final: bool
-    predict_x0: bool
-    disable_corrector: tuple[int, ...]
-    skip_prk: bool
     distilled: bool
     original_steps: int
     timestep_scaling: float
-    seed: int | None
+    flow: _Flow | None
 
 
 def _spaced_times(spacing: str, *, train_steps: int, steps: int, offset: int, last: int,
@@ -479,6 +426,7 @@ class SourceSchedule:
     betas: np.ndarray
     prediction: PredictionTransform
     policy: _Policy
+    sampler: Solver
 
     @classmethod
     def from_config(cls, config: Mapping[str, object]) -> SourceSchedule:
@@ -499,20 +447,25 @@ class SourceSchedule:
         for key, inactive in _UNIMPLEMENTED.items():
             if key in declared and value(key) != inactive:
                 raise ValueError(f"Native source scheduling does not implement active {key}")
-        prediction = _choice(value("prediction_type"), "prediction_type", source.predictions)
+        # A flow file declares no prediction type: its class fixes the
+        # convention, so the family names the transform.
+        prediction = ("flow_prediction" if source.family == "flow"
+                      else _choice(value("prediction_type"), "prediction_type",
+                                   source.predictions))
         if kind == "PNDM" and prediction == "v_prediction":
             raise ValueError("Published PNDM v-prediction requires velocity-domain history; "
                              "native PNDM uses epsilon history")
-        betas = (np.zeros((0,), np.float32) if source.family == "edm" else published_betas(
+        betas = (np.zeros((0,), np.float32) if source.family in ("edm", "flow")
+                 else published_betas(
             count=value("num_train_timesteps"), start=value("beta_start"),
             end=value("beta_end"), schedule=value("beta_schedule"),
             trained=value("trained_betas"),
             zero_snr=_boolean(value("rescale_betas_zero_snr", False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
-        policy = _resolve(kind, source, value, betas)
+        policy, sampler = _resolve(kind, source, value, betas)
         return cls(MappingProxyType(dict(config)), betas,
-                   _prediction_transform(policy, prediction), policy)
+                   _prediction_transform(policy, prediction), policy, sampler)
 
     @property
     def kind(self) -> str:
@@ -532,6 +485,8 @@ class SourceSchedule:
         process is EDM's own log-normal sigma draw over the same
         preconditioning the sampler reads.
         """
+        if self.policy.family == "flow":
+            return Process(FlowMatchingScheduler(), self.prediction)
         if self.policy.family == "edm":
             schedule = EDMNoiseScheduler(sigma_min=self.policy.sigma_min or 0.002,
                                          sigma_max=self.policy.sigma_max or 80.0,
@@ -539,45 +494,10 @@ class SourceSchedule:
             return Process(schedule, self.prediction)
         return Process(DiscreteNoiseScheduler(self.betas, p2_loss_weight_gamma=0), self.prediction)
 
-    def solver(self):
-        policy = self.policy
-        kind = policy.kind
-        if kind == "DDIM":
-            return DDIM()
-        if kind == "PNDM":
-            return PNDM(skip_prk_steps=policy.skip_prk)
-        if kind == "DDPM":
-            return DDPM(policy.variance)
-        if kind == "LMSDiscrete":
-            return LMS(order=4)
-        if kind == "EulerDiscrete":
-            return Euler()
-        if kind == "EulerAncestralDiscrete":
-            return EulerAncestral()
-        if kind == "HeunDiscrete":
-            return Heun()
-        if kind in ("KDPM2Discrete", "KDPM2AncestralDiscrete"):
-            return KDPM2(ancestral=kind == "KDPM2AncestralDiscrete")
-        if kind == "DPMSolverSDE":
-            return DPMSolverSDE(seed=policy.seed)
-        if kind == "DPMSolverSinglestep":
-            return DPMSolverSinglestep(
-                policy.order, _choice(policy.algorithm, "algorithm_type", _SINGLE_ALGORITHMS),
-                _choice(policy.solver_type, "solver_type", _DPM_TYPES), policy.lower_order_final)
-        if kind == "DEISMultistep":
-            return DEIS(policy.order, policy.lower_order_final)
-        if kind == "UniPCMultistep":
-            return UniPC(policy.order, _choice(policy.solver_type, "solver_type", _UNIPC_TYPES),
-                         policy.predict_x0, policy.lower_order_final, policy.disable_corrector)
-        if kind == "LCM":
-            return Consistency()
-        if kind == "TCD":
-            # The source takes eta as a step argument, not a checkpoint field,
-            # so this is the step signature's own default.
-            return TCD()
-        return DPMSolverMultistep(policy.order, policy.algorithm,
-                                  _choice(policy.solver_type, "solver_type", _DPM_TYPES),
-                                  policy.lower_order_final, policy.euler_at_final)
+    def solver(self) -> Solver:
+        """The native solver this file's class and controls name, resolved
+        once when the file was read."""
+        return self.sampler
 
     def _training_sigmas(self) -> tuple[np.ndarray, np.ndarray]:
         """The training sigma table sigma/alpha and its logarithm, with the
@@ -697,6 +617,37 @@ class SourceSchedule:
                 f"({times[0]}), which the source scheduler cannot walk: it "
                 "looks its starting step up by that value and finds the second")
 
+    def _flow_grid(self, steps: int, tokens: int | None,
+                   origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
+        """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
+
+        `origin` is where the sigmas start, which is a pipeline fact rather
+        than a config one: SD3 lets the scheduler lay them out between its own
+        sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes the
+        file's shift, then whichever sigma conversion it asks for, then the
+        appended zero.
+        """
+        policy = self.policy
+        flow, count = policy.flow, policy.train_steps
+        assert flow is not None
+        if origin == "linspace":
+            sigmas = np.linspace(1.0, 1.0 / steps, steps, dtype=np.float64)
+        else:
+            # The class's own sigma extremes, which its constructor already
+            # shifted statically when it is not shifting dynamically; the
+            # shift below then lands on this seed a second time, as the
+            # source's own two passes do.
+            trained = np.linspace(1, count, count, dtype=np.float32)[::-1].astype(np.float64) / count
+            if not flow.dynamic:
+                trained = flow.shifted(trained, tokens)
+            times = np.linspace(float(trained[0]) * count, float(trained[-1]) * count, steps)
+            sigmas = np.asarray(times, np.float64) / count
+        sigmas = flow.stretched(flow.shifted(sigmas, tokens))
+        if policy.transform != "none":
+            sigmas = _transformed_sigmas(policy.transform, float(sigmas[-1]), float(sigmas[0]),
+                                         steps, policy.rho)
+        return np.append(sigmas, 0.0), np.asarray(sigmas, np.float64) * count, 1.0
+
     def _edm_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
         """EDM's own grid: rho spacing or an exponential one between sigma_min
         and sigma_max, with c_noise = log(sigma) / 4 as the model time and the
@@ -711,11 +662,22 @@ class SourceSchedule:
                 float(np.sqrt(high ** 2 + 1)))
 
     @lru_cache(maxsize=32)
-    def sampling(self, steps: int) -> tuple[Process, jax.Array]:
-        """The process and the explicit descending grid a `steps` walk takes."""
+    def sampling(self, steps: int, *, tokens: int | None = None,
+                 origin: Origin = "scheduler") -> tuple[Process, jax.Array]:
+        """The process and the explicit descending grid a `steps` walk takes.
+
+        `tokens` is the latent token count a resolution-dependent flow shift
+        reads, and `origin` where a flow file's sigmas start; both are the
+        calling pipeline's, bound through the task's grid callable.
+        """
         policy = self.policy
         if type(steps) is not int or steps < 1:
             raise ValueError("The sampling count must be a positive integer")
+        if policy.family == "flow":
+            sigmas, times, prior = self._flow_grid(steps, tokens, origin)
+            schedule = FlowGrid(sigmas, np.append(times, 0.0), prior)
+            return (Process(schedule, self.prediction),
+                    jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
         if policy.family in ("tabulated", "lambda") and steps > policy.train_steps:
             raise ValueError("The sampling count must fit the training table")
         if policy.family == "tabulated":
@@ -828,7 +790,7 @@ def _x0_limit(kind: str, declared: Mapping[str, object], value: Callable[..., ob
 
 
 def _resolve(kind: str, source: _Class, value: Callable[..., object],
-             betas: np.ndarray) -> _Policy:
+             betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
     train_steps = _integer(value("num_train_timesteps"), "num_train_timesteps")
@@ -869,6 +831,7 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
         lambda_clipped = int(np.searchsorted(np.flip(lambdas),
                                              _number(limit, "lambda_min_clipped")))
+    terminal_shift = value("shift_terminal")
     original_steps = _integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
@@ -877,7 +840,21 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
     if not isinstance(corrector, (list, tuple)) or any(type(index) is not int for index in corrector):
         raise ValueError("disable_corrector must be a sequence of step indices")
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
-    return _Policy(
+    order = _integer(value("solver_order", 2), "solver_order")
+    flow = None
+    if family == "flow":
+        terminal_shift = value("shift_terminal")
+        flow = _Flow(
+            shift=_number(value("shift", 1.0), "shift"),
+            dynamic=_boolean(value("use_dynamic_shifting", False), "use_dynamic_shifting"),
+            base_shift=_number(value("base_shift", 0.5), "base_shift"),
+            max_shift=_number(value("max_shift", 1.15), "max_shift"),
+            base_tokens=_integer(value("base_image_seq_len", 256), "base_image_seq_len"),
+            max_tokens=_integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
+            terminal=None if terminal_shift is None else _number(terminal_shift, "shift_terminal"),
+            kind=_choice(value("time_shift_type", "exponential"), "time_shift_type",
+                         ("exponential", "linear")))
+    policy = _Policy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
         offset=_integer(value("steps_offset", 0), "steps_offset"),
@@ -895,30 +872,72 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         stride=kind in ("DDIM", "PNDM"),
         clean_terminal=(kind == "DDPM"
                         or _boolean(value("set_alpha_to_one", True), "set_alpha_to_one")),
-        variance=variance,
         clip=clip, threshold=threshold,
         recompute_epsilon=(kind in ("DDPM", "DEISMultistep")
                            or (family == "lambda" and algorithm in ("dpmsolver", "sde-dpmsolver"))),
-        order=_integer(value("solver_order", 2), "solver_order"),
-        algorithm=algorithm,
-        solver_type=solver_type,
-        lower_order_final=(_boolean(value("lower_order_final", True), "lower_order_final")
-                           or (kind == "DPMSolverSinglestep" and terminal == "zero")),
-        euler_at_final=_boolean(value("euler_at_final", False), "euler_at_final"),
-        predict_x0=_boolean(value("predict_x0", True), "predict_x0"),
-        disable_corrector=tuple(corrector),
-        skip_prk=_boolean(value("skip_prk_steps", False), "skip_prk_steps"),
         distilled=kind in ("LCM", "TCD"),
         original_steps=original_steps,
-        seed=None if value("noise_sampler_seed") is None
-        else _integer(value("noise_sampler_seed"), "noise_sampler_seed"),
         timestep_scaling=_number(value("timestep_scaling", 10.0), "timestep_scaling"),
-    )
+        flow=flow)
+    return policy, _build_solver(kind, family, value, order, algorithm, solver_type, terminal,
+                                 variance, tuple(corrector))
+
+
+def _build_solver(kind: str, family: str, value: Callable[..., object], order: int,
+                  algorithm: Algorithm, solver_type: str, terminal: Terminal, variance: Variance,
+                  corrector: tuple[int, ...]) -> Solver:
+    """The native solver this class and its controls name, built once.
+
+    A solver is a frozen value, so the file's class and controls resolve into
+    one here and `SourceSchedule.solver()` hands that same value out; nothing
+    downstream re-reads a control to rebuild it.
+    """
+    if kind == "DDIM":
+        return DDIM()
+    if kind == "PNDM":
+        return PNDM(skip_prk_steps=_boolean(value("skip_prk_steps"), "skip_prk_steps"))
+    if kind == "DDPM":
+        return DDPM(variance)
+    if kind == "LMSDiscrete":
+        return LMS(order=4)
+    if kind in ("EulerDiscrete", "FlowMatchEulerDiscrete"):
+        return Euler()
+    if kind == "EulerAncestralDiscrete":
+        return EulerAncestral()
+    if kind == "HeunDiscrete":
+        return Heun()
+    if kind in ("KDPM2Discrete", "KDPM2AncestralDiscrete"):
+        return KDPM2(ancestral=kind == "KDPM2AncestralDiscrete")
+    if kind == "DPMSolverSDE":
+        seed = value("noise_sampler_seed")
+        return DPMSolverSDE(seed=None if seed is None
+                            else _integer(seed, "noise_sampler_seed"))
+    if kind == "DEISMultistep":
+        return DEIS(order, _boolean(value("lower_order_final"), "lower_order_final"))
+    if kind == "LCM":
+        return Consistency()
+    if kind == "TCD":
+        # The source takes eta as a step argument, not a checkpoint field, so
+        # this is the step signature's own default.
+        return TCD()
+    lower_order_final = _boolean(value("lower_order_final"), "lower_order_final")
+    if kind == "UniPCMultistep":
+        return UniPC(order, solver_type, _boolean(value("predict_x0"), "predict_x0"),
+                     lower_order_final, corrector)
+    if kind == "DPMSolverSinglestep":
+        # `set_timesteps` rewrites this control for a zero terminal, so the
+        # reconstruction reads the value the source would walk with.
+        return DPMSolverSinglestep(order, algorithm, solver_type,
+                                   lower_order_final or terminal == "zero")
+    return DPMSolverMultistep(order, algorithm, solver_type, lower_order_final,
+                              _boolean(value("euler_at_final"), "euler_at_final"))
 
 
 def _prediction_transform(policy: _Policy, prediction: str) -> PredictionTransform:
     """What the model predicts on this class's grid, with the class's own input
     scaling and its own limit on x_0."""
+    if policy.family == "flow":
+        return FlowMatchPredictionTransform()
     if policy.family == "edm":
         inner: PredictionTransform = KarrasPredictionTransform(
             policy.sigma_data, velocity=prediction == "v_prediction")
@@ -936,5 +955,4 @@ def _prediction_transform(policy: _Policy, prediction: str) -> PredictionTransfo
     return inner
 
 
-__all__ = ["SourceSchedule", "TabulatedVP", "SigmaGrid", "StageSigmaGrid", "VPGrid",
-           "published_betas"]
+__all__ = ["SourceSchedule", "published_betas"]
