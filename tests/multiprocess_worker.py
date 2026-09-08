@@ -1307,6 +1307,26 @@ def mode_continuations(args) -> dict:
         arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
         if arrivals.tolist() != list(range(processes)):
             raise AssertionError("a rank did not return from the rejected request")
+    from dew.interop import load_pretrained
+    source = load_pretrained(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
+                             dtype="float32", attention_impl="xla", max_seq_len=32)
+    canvas = source.block_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
+                                                  Layout(min_shard=TINY)))
+    canvas_prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * 2
+    canvas_rows = len(canvas_prompts) // processes
+    canvas_prompts = canvas_prompts[rank * canvas_rows:(rank + 1) * canvas_rows]
+    canvases = canvas(canvas_prompts, 7, n=2, seed=11)
+    canvas_host = canvases.host()
+    canvas_rejected = False
+    if processes > 1:
+        try:
+            canvas(canvas_prompts, 7, n=3 if rank == 1 else 2, seed=11)
+        except (ValueError, RuntimeError, AssertionError):
+            canvas_rejected = True
+        else:
+            raise AssertionError("a peer's different canvas count was accepted")
+        arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+        assert arrivals.tolist() == list(range(processes))
     return {
         "process_count": processes,
         "spec": str(result.tokens.sharding.spec),
@@ -1317,6 +1337,12 @@ def mode_continuations(args) -> dict:
         "lengths": np.asarray(host.lengths).tolist(),
         "terminated": np.asarray(host.terminated).tolist(),
         "behavior": np.asarray(host.behavior_log_probs).tolist(),
+        "raw": np.asarray(host.raw_log_probs).tolist(),
+        "canvas_rejected": canvas_rejected,
+        "canvas_rows": canvases.rows,
+        "canvas_tokens": np.asarray(canvas_host.tokens).tolist(),
+        "canvas_lengths": np.asarray(canvas_host.lengths).tolist(),
+        "canvas_steps": np.asarray(canvas_host.decoder_steps).tolist(),
     }
 
 

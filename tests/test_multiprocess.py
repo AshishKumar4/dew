@@ -987,6 +987,11 @@ def test_a_pool_draws_every_prompts_continuations_on_the_process_that_asked(tmp_
     assert reports[0]["terminated"] + reports[1]["terminated"] == single["terminated"]
     np.testing.assert_allclose(reports[0]["behavior"] + reports[1]["behavior"],
                                single["behavior"], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(reports[0]["raw"] + reports[1]["raw"], single["raw"], rtol=1e-5, atol=1e-6)
+    for report in reports:
+        assert report["canvas_rejected"] and report["canvas_rows"] == 4
+    for name in ("canvas_tokens", "canvas_lengths", "canvas_steps"):
+        assert reports[0][name] + reports[1][name] == single[name]
 
 
 @pytest.mark.distributed
