@@ -286,17 +286,28 @@ claimed, and more than one prediction layer is refused.
 `layer_scalar` trainable, so the export goes through the objective's model:
 `replace(loaded, model=objective.model).save(directory, variables=state.params)`.
 
+### Masked-diffusion decoders
+
+| Model | `model_type` | Workflow |
+|---|---|---|
+| LLaDA | `llada` | MDLM training from the released weights |
+| Dream | `dream`, `Dream` | MDLM training from the released weights |
+
+`MaskedDiffusionObjective(model, MDLM(mask_id=...)(), seq_len,
+pretrained=loaded.variables)` trains the MDLM negative ELBO from a loaded
+checkpoint, and `loaded.save(directory, variables=state.params)` writes the
+trained weights back under the source's own tensor names beside the config
+they came with: LLaDA's OLMo-style spellings, Dream's Qwen 2 layout.
+Transformers ships no class for either release, so the export is qualified
+against the block each of them is, read with an all-visible attention mask:
+`LlamaForCausalLM` for LLaDA and `Qwen2ForCausalLM` for Dream.
+
 ### Unsupported configurations
 
 | Model or family | `model_type` | Missing piece |
 |---|---|---|
 | Quantized source-format export | FP8 / MXFP4 | Requantization of trained weights into the original blocks/scales is unsupported |
-| LLaDA | `llada` | No masked-objective pretrained seam |
-| Dream | `dream`, `Dream` | Export writer, training seam |
 | Kimi K2 | `kimi_k2` | Config translation only, no weights |
-
-`MaskedDiffusionObjective` takes no `pretrained` argument, so LLaDA and Dream
-train from a fresh init rather than from their released weights.
 
 Video inputs are qualified on Qwen 3.5 only; the other processors are
 exercised for text, images and waveforms. Native checkpoint loading covers

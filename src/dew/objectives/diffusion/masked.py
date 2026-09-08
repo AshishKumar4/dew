@@ -10,6 +10,11 @@ LM objective's chunked one, which holds one vocabulary slice of logits at a time
 
 Evaluation generates one token row per input row for custom text metrics.
 The separate preview hook generates and decodes the configured display count.
+
+`pretrained` continues from a released masked-diffusion checkpoint (LLaDA,
+Dream) instead of a fresh init. It reaches the trainer's state JIT as data
+through `held_variables`, so the loaded tree is an argument of that
+compilation rather than a constant embedded in the executable.
 """
 
 from __future__ import annotations
@@ -53,10 +58,15 @@ class MaskedDiffusionObjective(Objective[Mean]):
         steps: int = 64,
         samples: int = 4,
         decode: Optional[Callable[[Sequence[int]], str]] = None,
+        pretrained: Variables | None = None,
     ):
         """`seq_len` is the width of a batch row; `sampler`, `steps` and
         `samples` are how evaluation unmasks; `decode` turns a row of ids into
-        the text the artifact shows, and None shows the ids alone."""
+        the text the artifact shows, and None shows the ids alone.
+
+        `pretrained` is a released masked-diffusion checkpoint's variables as
+        `load_pretrained` returns them, so a run continues from LLaDA's or
+        Dream's weights instead of a fresh init; None draws the init."""
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -69,12 +79,24 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self.steps = steps
         self.samples = samples
         self.decode = decode
+        self.pretrained = pretrained
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
+    def held_variables(self) -> Variables | None:
+        """The checkpoint this run continues from, or None for a fresh init."""
+        return self.pretrained
+
     def init(self, key, variables: Variables | None = None):
-        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+        pretrained = self.pretrained if variables is None else variables
+        if pretrained is None:
+            return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+        if "params" not in pretrained:
+            raise ValueError(
+                "pretrained is the variables dict ({'params': ...}) that "
+                "load_pretrained and model.init return")
+        return pretrained
 
     def loss(self, params, batch, step: Step):
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
