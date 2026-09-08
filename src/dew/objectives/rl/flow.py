@@ -214,26 +214,26 @@ class FlowGRPOObjective(DiffusionObjective):
         prepared = None
         try:
             count = _source(self.inputs, batch).shape[0]
-            tokens = {keyword: batch[condition.field]
-                      for keyword, condition in self.inputs.conditions.items()}
+            sample_batch = self._sampling_batch(batch)
             if limit is not None:
                 count = min(limit, count)
-                tokens = jax.tree.map(lambda value: value[:count], tokens)
-            prepared = (count, tokens)
+                sample_batch = jax.tree.map(lambda value: value[:count], sample_batch)
+            prepared = (count, sample_batch)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="flow sample setup")
         assert prepared is not None
-        count, tokens = prepared
+        count, sample_batch = prepared
         error = None
         samples = None
         try:
-            samples = self._sample(params, tokens, key, count=count)
+            samples = self._sample(params, sample_batch, key, count=count)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="flow sample generation")
         assert samples is not None
-        return samples, tokens
+        return samples, {keyword: sample_batch[condition.field]
+                         for keyword, condition in self.inputs.conditions.items()}
 
     def evaluate(self, params: Variables, batch: Batch, step: Step):
         """Generate one live-policy sample per source row, including prompt-only batches."""

@@ -184,9 +184,9 @@ class DiffusionObjective(Objective[Mean]):
         return given, self.unconditional
 
     def _sampling_batch(self, batch):
-        fields = [self.inputs.sample.key, *(condition.field for condition in self.inputs.conditions.values())]
+        fields = [condition.field for condition in self.inputs.conditions.values()]
         if self.inputs.mask is not None:
-            fields.append(self.inputs.mask.key)
+            fields.extend((self.inputs.sample.key, self.inputs.mask.key))
         return {name: batch[name] for name in fields}
 
     def loss(self, params, batch, step: Step):
