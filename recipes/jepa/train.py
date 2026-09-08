@@ -34,6 +34,7 @@ SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ra
 class JepaRunConfig(RunConfig):
     """A run, plus the JEPA objective's own knobs."""
 
+    objective: str = "jepa"
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
     optim: OptimConfig = field(
