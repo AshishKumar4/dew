@@ -296,21 +296,27 @@ PIPELINE_GUIDANCE = 3.5
 PIPELINE_SIZE = 16
 
 
-def clip_tokenizers(root: Path):
+def clip_tokenizers(root: Path, count: int = 2):
     """The committed tiny CLIP tokenizer files, which are real published
-    byte-level BPE vocabularies rather than anything this tool invents."""
+    byte-level BPE vocabularies rather than anything this tool invents.
+
+    Only the tokenizers a family actually reads are written, so a directory
+    never carries a stale one for another family's slot.
+    """
     import tarfile
     from transformers import CLIPTokenizer
 
     fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "tiny_diffusers.tar.xz"
     with tarfile.open(fixture) as archive:
-        for name, source in (("tokenizer", "xl/tokenizer"), ("tokenizer_2", "xl/tokenizer_2")):
+        wanted = (("tokenizer", "xl/tokenizer"), ("tokenizer_2", "xl/tokenizer_2"))[:count]
+        for name, source in wanted:
             members = [member for member in archive.getmembers()
                        if member.name.startswith(source + "/")]
             for member in members:
                 member.name = name + "/" + member.name.split("/")[-1]
             archive.extractall(root, members=members, filter="data")
-    return [CLIPTokenizer.from_pretrained(root / name) for name in ("tokenizer", "tokenizer_2")]
+    return [CLIPTokenizer.from_pretrained(root / name)
+            for name, _ in (("tokenizer", None), ("tokenizer_2", None))[:count]]
 
 
 def t5_tokenizer():

@@ -641,5 +641,8 @@ def save_source(source, values, destination: Path) -> None:
         # A CLIP tokenizer's own vocabulary and merges beside its config.
         tokenizer.backend_tokenizer.model.save(str(folder))
     if encoder.t5_tokenizer is not None:
-        # The T5 tokenizer ships one file, which `save_pretrained` writes.
-        encoder.t5_tokenizer.save_pretrained(destination / "tokenizer_3")
+        # The T5 tokenizer ships one file, which `save_pretrained` writes, in
+        # the slot its own family keeps it: an SD3 directory's third, a Flux
+        # directory's second.
+        slot = "tokenizer" + encoder.t5_name.removeprefix("text_encoder")
+        encoder.t5_tokenizer.save_pretrained(destination / slot)

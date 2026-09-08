@@ -86,13 +86,13 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
                           generator=generator, dtype=torch.float32, requires_grad=True)
     pooled = torch.randn((case.batch, config["pooled_projection_dim"]), generator=generator,
                          dtype=torch.float32, requires_grad=True)
-    # The pipeline divides the scheduler's timestep by the training count
-    # before the call, and the model multiplies it back up.
-    times = torch.tensor([0.731, 0.042][: case.batch], dtype=torch.float32)
+    # The schedule's own model times, which the pipeline divides by the
+    # training count before the call and the transformer multiplies back.
+    times = torch.tensor([731.0, 42.0][: case.batch], dtype=torch.float32)
     guidance = (torch.full((case.batch,), 3.5, dtype=torch.float32)
                 if config["guidance_embeds"] else None)
     output = model(hidden_states=packed, encoder_hidden_states=context, pooled_projections=pooled,
-                   timestep=times, guidance=guidance, txt_ids=torch.zeros(TOKENS, 3),
+                   timestep=times / 1000, guidance=guidance, txt_ids=torch.zeros(TOKENS, 3),
                    img_ids=image_ids(rows, columns), return_dict=False)[0]
     probe = torch.randn(output.shape, generator=generator, dtype=torch.float32)
     named = [(key, value) for key, value in model.named_parameters()]
@@ -112,6 +112,38 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     print(f"{name}: packed {tuple(packed.shape)} grid {case.grid} tokens {TOKENS} "
           f"|output| <= {float(output.detach().abs().max()):.4g} parameters {len(named)}")
     return arrays
+
+
+def reload(directory: str, recorded: str) -> None:
+    """Read a native export with the actual source classes.
+
+    `directory` is a directory Dew wrote after a native training step and
+    `recorded` the arrays that step left behind. The published pipeline is
+    loaded from those files and the actual transformer recomputes the forward
+    the native model computed with the trained weights.
+    """
+    from diffusers import FluxPipeline
+
+    arrays = np.load(recorded)
+    pipe = FluxPipeline.from_pretrained(directory, torch_dtype=torch.float32,
+                                        local_files_only=True)
+    model = pipe.transformer.eval()
+    rows = int(arrays["rows"])
+    with torch.no_grad():
+        output = model(hidden_states=torch.from_numpy(arrays["packed"]),
+                       encoder_hidden_states=torch.from_numpy(arrays["context"]),
+                       pooled_projections=torch.from_numpy(arrays["pooled"]),
+                       timestep=torch.from_numpy(arrays["times"]) / 1000,
+                       guidance=torch.from_numpy(arrays["guidance"]),
+                       txt_ids=torch.zeros(arrays["context"].shape[1], 3),
+                       img_ids=image_ids(rows, rows), return_dict=False)[0]
+    native = arrays["native"]
+    gap = float(np.abs(output.numpy() - native).max() / max(1.0, float(np.abs(native).max())))
+    trained = float(np.abs(model.proj_out.weight.detach().numpy().T - arrays["proj_out"]).max())
+    print(f"reimported forward gap {gap:.3g}; trained kernel gap {trained:.3g}")
+    if not (gap < 1e-5 and trained == 0.0):
+        raise SystemExit("the source did not read the native update")
+    print("the source reads the native update")
 
 
 def bundle(directory: str, destination: str) -> None:
@@ -143,14 +175,110 @@ def main(destination: str) -> None:
             arrays[f"{name}.{key}"] = value
         cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
                        "batch": case.batch}
+    import inspect
+
+    from diffusers import FluxPipeline
+
+    defaults = inspect.signature(FluxPipeline.__call__).parameters
+    arrays.update(pipeline_record(root))
+    record["pipeline"] = {"config": PIPELINE, "prompts": PROMPTS, "size": PIPELINE_SIZE,
+                          "sequence": SEQUENCE,
+                          "default_steps": defaults["num_inference_steps"].default,
+                          "default_guidance": defaults["guidance_scale"].default,
+                          "true_cfg": defaults["true_cfg_scale"].default}
     np.savez_compressed(root / "flux_transformer.npz", allow_pickle=False, **arrays)
     (root / "flux_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
 
 
+
+
+# The pipeline half: one tiny Flux pipeline, saved the way a published
+# checkpoint is saved and walked through its own call.
+PIPELINE = dict(BASE, guidance_embeds=True, num_layers=1, num_single_layers=1)
+PROMPTS = [{"text": "a red cat", "second": "a green bird"},
+           {"text": "tiny photo", "second": "a blue dog"}]
+PIPELINE_SIZE = 16
+SEQUENCE = 512
+
+
+def build_pipeline(root: Path):
+    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxPipeline
+    from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+    from transformers import CLIPTextConfig, CLIPTextModel, T5Config, T5EncoderModel
+
+    from diffusers_sd3_reference import clip_tokenizers, t5_tokenizer
+
+    directory = root / "pipeline"
+    tokenizer = clip_tokenizers(directory, count=1)[0]
+    tokenizer_2 = t5_tokenizer()
+    torch.manual_seed(SEED + 5)
+    # Flux reads its CLIP tower's pooled row, so the special ids must be the
+    # tokenizer's own for that row to be the end-of-text one.
+    text_encoder = CLIPTextModel(CLIPTextConfig(
+        vocab_size=len(tokenizer.get_vocab()), hidden_size=PIPELINE["pooled_projection_dim"],
+        intermediate_size=2 * PIPELINE["pooled_projection_dim"], num_hidden_layers=2,
+        num_attention_heads=2, projection_dim=PIPELINE["pooled_projection_dim"],
+        max_position_embeddings=tokenizer.model_max_length, bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)).eval()
+    text_encoder_2 = T5EncoderModel(T5Config(
+        vocab_size=tokenizer_2.vocab_size, d_model=PIPELINE["joint_attention_dim"], d_ff=32,
+        num_layers=2, num_heads=2, d_kv=8, relative_attention_num_buckets=8,
+        feed_forward_proj="gated-gelu")).eval()
+    vae = AutoencoderKL(in_channels=3, out_channels=3, block_out_channels=(4, 8),
+                        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+                        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
+                        layers_per_block=1, latent_channels=PIPELINE["in_channels"] // 4,
+                        norm_num_groups=2, sample_size=PIPELINE_SIZE, shift_factor=0.1159,
+                        scaling_factor=0.3611, use_quant_conv=False,
+                        use_post_quant_conv=False).eval()
+    pipe = FluxPipeline(
+        scheduler=FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000, use_dynamic_shifting=True, base_shift=0.5, max_shift=1.15,
+            base_image_seq_len=256, max_image_seq_len=4096),
+        vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
+        text_encoder_2=text_encoder_2, tokenizer_2=tokenizer_2,
+        transformer=FluxTransformer2DModel(**PIPELINE).eval())
+    pipe.save_pretrained(directory, safe_serialization=True)
+    pipe.set_progress_bar_config(disable=True)
+    # The class declares no sample size, so the directory declares the
+    # geometry it is read at, which is what these keys are for.
+    index = json.loads((directory / "model_index.json").read_text())
+    index.update(dew_height=PIPELINE_SIZE, dew_width=PIPELINE_SIZE)
+    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
+    return pipe, directory
+
+
+def pipeline_record(root: Path) -> dict[str, np.ndarray]:
+    pipe, _ = build_pipeline(root)
+    prompts = [row["text"] for row in PROMPTS]
+    seconds = [row["second"] for row in PROMPTS]
+    with torch.no_grad():
+        embeds, pooled, ids = pipe.encode_prompt(prompt=prompts, prompt_2=seconds,
+                                                 device=torch.device("cpu"),
+                                                 num_images_per_prompt=1,
+                                                 max_sequence_length=SEQUENCE)
+    generator = torch.Generator().manual_seed(SEED + 7)
+    rows = PIPELINE_SIZE // 2 // 2
+    latents = torch.randn((len(PROMPTS), rows * rows, PIPELINE["in_channels"]),
+                          generator=generator, dtype=torch.float32)
+    with torch.no_grad():
+        walked = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE,
+                      width=PIPELINE_SIZE, latents=latents.clone(),
+                      output_type="latent").images
+        images = pipe(prompt=prompts, prompt_2=seconds, height=PIPELINE_SIZE,
+                      width=PIPELINE_SIZE, latents=latents.clone(), output_type="np").images
+    print(f"pipeline: context {tuple(embeds.shape)} pooled {tuple(pooled.shape)} "
+          f"latents {tuple(walked.shape)} |image| <= {float(np.abs(images).max()):.4g}")
+    return {"pipeline.context": embeds.numpy(), "pipeline.pooled": pooled.numpy(),
+            "pipeline.text_ids": ids.numpy(), "pipeline.x_T": latents.numpy(),
+            "pipeline.latents": walked.numpy(), "pipeline.images": images}
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 2 and sys.argv[1] == "reload":
+        reload(sys.argv[2], sys.argv[3])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-flux-reference")

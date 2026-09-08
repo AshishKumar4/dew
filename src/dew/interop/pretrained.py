@@ -31,7 +31,7 @@ from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import ModelTime, Origin, SourceSchedule
+from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
@@ -1002,7 +1002,6 @@ class _Denoiser:
     sample_size: int
     pipeline: str
     origin: Origin = "scheduler"
-    model_time: ModelTime = "timesteps"
     embeds_guidance: bool = False
     t5_tower: str | None = None
 
@@ -1053,7 +1052,6 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       functools.partial(schedule.sampling, origin=denoiser.origin,
-                                        model_time=denoiser.model_time,
                                         tokens=(height // patch) * (width // patch)))
     variables = {**denoiser.variables, "encoders": encoders, "autoencoder": vae_params}
     components = {denoiser.component: denoiser.config, "vae": vae_config,
@@ -1130,8 +1128,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl:
 
     The class declares no sample size; its pipeline's `default_sample_size`
     is 128 latent positions, which a directory overrides with its own
-    geometry. The transformer takes the sigma itself as its model time and
-    starts from the sigmas its pipeline hands the scheduler.
+    geometry. It starts from the sigmas its pipeline hands the scheduler.
     """
     from dew.interop import diffusion
     from dew.interop.diffusion import _integer
@@ -1147,8 +1144,8 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl:
     return _Denoiser("transformer", model, {"params": params}, layouts, built, config, "flux",
                      ("text_encoder",), 2, fields["in_channels"] // 4,
                      _integer(config.get("sample_size", 128), "sample_size"), "FluxPipeline",
-                     origin="linspace", model_time="sigma",
-                     embeds_guidance=fields["guidance_embeds"], t5_tower="text_encoder_2")
+                     origin="linspace", embeds_guidance=fields["guidance_embeds"],
+                     t5_tower="text_encoder_2")
 
 
 def _component_config(directory: Path, name: str) -> dict:
