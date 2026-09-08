@@ -14,7 +14,8 @@ from transformers.generation.logits_process import (
 from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling
-from dew.sampling.text import _sample_token
+from dew.sampling.decoding import StepState, chain
+from dew.sampling.strategies import draw
 from test_text_rollout_contract import decoder
 
 
@@ -147,7 +148,10 @@ def test_every_continuation_records_the_likelihoods_of_its_own_draw(task):
 @pytest.mark.parametrize("sampling", [Sampling(top_p=0), Sampling(min_p=1), Sampling(top_k=1, top_p=0.1)])
 def test_filters_keep_the_best_token_at_the_boundary(sampling):
     logits = jnp.array([[1.0, 3.0, -2.0]])
-    token, behavior, raw = _sample_token(logits, jax.random.split(jax.random.key(3), 1), sampling)
+    state = StepState(tokens=jnp.zeros((1, 1), jnp.int32), valid=jnp.ones((1, 1), bool),
+                      step=jnp.zeros(1, jnp.int32), active=jnp.ones(1, bool),
+                      keys=jax.random.split(jax.random.key(3), 1), prompt_width=1)
+    token, behavior, raw = draw(state, logits, chain(sampling.transforms()))
     np.testing.assert_array_equal(token, [1])
     np.testing.assert_allclose(behavior, [0.0], atol=1e-6)
     np.testing.assert_allclose(raw, jax.nn.log_softmax(logits)[0, 1:2], atol=1e-6)
@@ -161,35 +165,79 @@ def test_invalid_probability_controls_are_refused():
             Sampling(min_p=value)
 
 
-def test_source_policy_preserves_supported_filters_and_requires_an_override_for_others(task):
+def test_source_policy_preserves_supported_filters_and_binds_its_transforms(task):
+    """A source's basic policy stays a `Sampling` value an explicit one
+    replaces, and its distribution transforms bind as separate components
+    that keep working under that override."""
     from dew.interop.pretrained import Pretrained
     from pathlib import Path
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4, "min_p": 0.1})
     policy = source.text_generation()
-    assert policy.sampling.top_p == 0.4 and policy.sampling.min_p == 0.1
+    assert policy.sampling.top_p == 0.4 and policy.sampling.min_p == 0.1 and policy.logits == ()
     altered = replace(source, generation_config={**source.generation_config, "repetition_penalty": 2.0})
-    with pytest.raises(ValueError, match="repetition_penalty"):
-        altered.text_generation()
+    penalized = altered.text_generation()
+    assert [type(item).__name__ for item in penalized.logits] == ["RepetitionPenalty"]
     override = altered.text_generation(sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(override([[1, 2]], 2, key=jax.random.key(1)).behavior_log_probs, 0)
+    assert override.logits == penalized.logits
+    # A penalty that strong moves the greedy walk away from the plain one.
+    plain = replace(override, logits=())([[1, 2]], 6, key=jax.random.key(1))
+    biased = override([[1, 2]], 6, key=jax.random.key(1))
+    np.testing.assert_array_equal(biased.behavior_log_probs, 0)
+    assert not np.array_equal(np.asarray(plain.tokens), np.asarray(biased.tokens))
     inactive = replace(source, generation_config={"do_sample": False, "typical_p": 0.1})
     assert inactive.text_generation().sampling.temperature == 0
+    assert inactive.text_generation().logits == ()
 
 
-def test_neutral_source_controls_are_accepted_and_active_unsupported_controls_raise(task):
+def test_active_source_controls_map_to_components_or_raise_with_their_reason(task):
+    """Every active control is classified. One the native decoder implements
+    becomes a component; one it does not names itself and why."""
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
-               "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None}
+               "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None,
+               "use_cache": True, "cache_implementation": "static", "output_scores": False,
+               "assistant_ensemble_weight": 1.0, "return_dict_in_generate": True}
     assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
-    for active in ({"stop_strings": ["END"]}, {"num_beams": 2}, {"num_beams": 2, "length_penalty": 0.8},
-                   {"do_sample": True, "penalty_alpha": 0.6, "top_k": 4}, {"a_future_control": 3},
-                   {"remove_invalid_values": True}, {"max_time": 5.0}):
-        with pytest.raises(ValueError, match="cannot honor"):
+    mapped = {"remove_invalid_values": True, "no_repeat_ngram_size": 3, "min_new_tokens": 2,
+              "suppress_tokens": [4], "eos_token_id": 5}
+    names = [type(item).__name__ for item in
+             replace(source, generation_config=mapped).text_generation().logits]
+    assert names == ["NoRepeatNGram", "MinNewTokens", "RemoveInvalidValues", "SuppressTokens"]
+    refusals = {
+        "num_beams": ({"num_beams": 2}, "beam search is not implemented"),
+        "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
+        "num_beam_groups": ({"num_beams": 2, "num_beam_groups": 2}, "group beam search"),
+        "penalty_alpha": ({"do_sample": True, "penalty_alpha": 0.6}, "contrastive search"),
+        "unknown": ({"a_future_control": 3}, "does not know this control"),
+        "max_time": ({"max_time": 5.0}, "host clock"),
+        "token_healing": ({"token_healing": True}, "prompt construction"),
+        "guidance_scale": ({"guidance_scale": 2.0}, "second time per step"),
+        "dola_layers": ({"dola_layers": "high"}, "DoLa"),
+        "watermark": ({"watermarking_config": {"greenlist_ratio": 0.5}}, "watermarking"),
+        "constraints": ({"force_words_ids": [[3]]}, "constrained beam search"),
+        "ensemble": ({"assistant_ensemble_weight": 0.5}, "biased distribution"),
+        "lookup": ({"prompt_lookup_num_tokens": 3}, "prompt lookup"),
+        "early exit": ({"assistant_early_exit": 2}, "early-exit"),
+        "mtp flag": ({"use_mtp": True}, "caller's choice"),
+        "cache": ({"use_cache": False}, "its own cache"),
+        "quantized cache": ({"cache_config": {"backend": "quanto"}}, "quantized and offloaded"),
+        "chunked prefill": ({"prefill_chunk_size": 8}, "one call"),
+        "continuous batching": ({"continuous_batching_config": {"max_batch_tokens": 8}}, "continuous batching"),
+        "scores": ({"output_scores": True}, "per-step distributions"),
+        "hidden states": ({"output_hidden_states": True}, "hidden states"),
+        "no compile": ({"disable_compile": True}, "always runs compiled"),
+        "capacity": ({"max_cache_len": 4096}, "max_seq_len"),
+    }
+    for name, (active, reason) in refusals.items():
+        with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
+    with pytest.raises(ValueError, match="different order than the reference"):
+        replace(source, generation_config={"do_sample": True, "typical_p": 0.9,
+                                           "top_p": 0.8}).text_generation()
 
 
 def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(task):
