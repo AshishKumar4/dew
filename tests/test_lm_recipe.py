@@ -406,7 +406,7 @@ def test_masked_diffusion_without_a_mask_id_is_refused():
         recipe.build_masked_objective(
             recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
                                objective="masked_diffusion"),
-            model, {})
+            model, {}, None)
 
 
 def test_masked_diffusion_on_a_causal_model_is_refused():
@@ -421,7 +421,54 @@ def test_masked_diffusion_on_a_causal_model_is_refused():
         recipe.build_masked_objective(
             recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
                                objective="masked_diffusion"),
-            model, {"mask_token_id": 5})
+            model, {"mask_token_id": 5}, None)
+
+
+def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
+    """`--pretrained` over a masked-diffusion checkpoint continues from its
+    weights. One step at 1e-3 leaves the trained state within 1.1e-3 of the
+    LLaDA fixture, while the fresh init the same run would otherwise draw is
+    1.45 away, so a run that dropped the weights could not pass.
+
+    A window is `--data.seq-len + 1` ids wide and masked diffusion has no
+    shift, so the objective denoises all twelve; the trainer's step would
+    raise on an eleven-token objective."""
+    from dew.interop import load_pretrained
+
+    recipe = load_recipe()
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
+    directory = tmp_path / "tokens"
+    directory.mkdir()
+    for split, count in (("train", 400), ("val", 96)):
+        ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
+        (directory / f"{split}.bin").write_bytes(ids.tobytes())
+    (directory / "meta.json").write_text(json.dumps(
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+        "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
+        "--tokenizer", str(checkpoint), "--data.path", str(directory),
+        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+
+    state = recipe.main(config)
+
+    assert int(state.updates) == 1
+    original = load_pretrained(str(checkpoint), dtype="float32", attention_impl="xla")
+    objective = recipe.build_masked_objective(
+        config, original.model, original.model_config, original.variables)
+    assert objective.seq_len == 12, "the objective has to take the window's whole width"
+    held = jax.tree.leaves(original.variables)
+    distance = max(float(jnp.max(jnp.abs(a - b)))
+                   for a, b in zip(jax.tree.leaves(state.params), held))
+    drawn = max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
+        jax.tree.leaves(recipe.build_masked_objective(
+            config, original.model, original.model_config, None).init(jax.random.key(0))), held))
+    assert 1e-4 < distance < 1e-2, f"the step moved the checkpoint {distance:.3e}"
+    assert drawn > 1.0, f"a fresh init is only {drawn:.3e} from the checkpoint"
 
 
 def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):

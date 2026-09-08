@@ -216,13 +216,19 @@ def run_summary(config: LmRunConfig, fields: dict) -> dict:
     }
 
 
-def build_masked_objective(config: LmRunConfig, model, fields):
+def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
     """The MDLM objective over a bidirectional model, its mask id from the run.
 
     A --pretrained diffusion checkpoint carries mask_token_id in the fields it
-    was built from; a from-scratch run names it in --model.config beside
-    causal=False. The validation text is the unmasked rows decoded with the
-    run's tokenizer, or bare ids when --sample-tokens is 0."""
+    was built from and its weights in `pretrained`, so the run continues from
+    them; a from-scratch run names the mask id in --model.config beside
+    causal=False and draws its tree from the key. The validation text is the
+    unmasked rows decoded with the run's tokenizer, or bare ids when
+    --sample-tokens is 0.
+
+    A token window is `--data.seq-len + 1` ids wide: the LM objective spends
+    the extra id on the shift, and masked diffusion has no shift, so it
+    denoises the whole row rather than dropping a token off every window."""
     from dew.diffusion.discrete import MDLM
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 
@@ -234,8 +240,8 @@ def build_masked_objective(config: LmRunConfig, model, fields):
             "mask_token_id in --model.config beside causal=False")
     decode = None if config.sample_tokens <= 0 else tokenizer_for(config.tokenizer).decode
     return MaskedDiffusionObjective(
-        model, MDLM(mask_id=int(mask))(), config.data.seq_len,
-        ema_decay=config.ema_decay, decode=decode)
+        model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
+        ema_decay=config.ema_decay, decode=decode, pretrained=pretrained)
 
 
 def build_block_objective(config: LmRunConfig, model, pretrained):
@@ -302,7 +308,7 @@ def main(config: LmRunConfig) -> TrainState:
                "dataset": {"path": config.data.path, "records": data.records,
                            "tokens": meta.get("train_tokens")}}
     if config.objective == "masked_diffusion":
-        return config.train(build_masked_objective(config, model, fields), data,
+        return config.train(build_masked_objective(config, model, fields, pretrained), data,
                             name=name, summary=summary)
     if config.objective == "block_diffusion":
         return config.train(build_block_objective(config, model, pretrained), data,
