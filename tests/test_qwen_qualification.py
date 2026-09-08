@@ -145,7 +145,7 @@ def test_prediction_cache_matches_reference_candidate_steps(source):
             options["positions"] = jnp.asarray(positions[:, index:index + 1])
         else:
             options["rotary_positions"] = jnp.asarray(rotary[:, index:index + 1])
-        logits, state = loaded.model.apply(
+        (logits, _), state = loaded.model.apply(
             {**loaded.variables, **state}, jnp.asarray(reference["hidden"][:, index:index + 1]),
             inputs.tokens[:, index + 1:index + 2], decode=True,
             method=loaded.model.mtp_step, mutable=["cache"], **options)

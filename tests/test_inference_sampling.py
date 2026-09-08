@@ -165,51 +165,67 @@ def test_invalid_probability_controls_are_refused():
             Sampling(min_p=value)
 
 
-def test_source_policy_preserves_supported_filters_and_binds_its_transforms(task):
-    """A source's basic policy stays a `Sampling` value an explicit one
-    replaces, and its distribution transforms bind as separate components
-    that keep working under that override."""
+def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
+    """A source builds the complete chain in the reference's order, keeping
+    its basic policy visible as a `Sampling` value. An explicit policy
+    replaces that policy and clears the chain it was built around, while the
+    row count stays the source's."""
     from dew.interop.pretrained import Pretrained
     from pathlib import Path
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
-                        generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4, "min_p": 0.1})
+                        generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
+                                           "min_p": 0.1, "num_return_sequences": 2})
     policy = source.text_generation()
-    assert policy.sampling.top_p == 0.4 and policy.sampling.min_p == 0.1 and policy.logits == ()
-    altered = replace(source, generation_config={**source.generation_config, "repetition_penalty": 2.0})
-    penalized = altered.text_generation()
-    assert [type(item).__name__ for item in penalized.logits] == ["RepetitionPenalty"]
+    assert policy.sampling.top_p == 0.4 and policy.sampling.min_p == 0.1
+    assert [type(item).__name__ for item in policy.logits] == ["Temperature", "TopP", "MinP"]
+    altered = replace(source, generation_config={**source.generation_config,
+                                                 "repetition_penalty": 2.0, "typical_p": 0.9})
+    # The reference orders the warper group temperature, top-h, top-k, top-p,
+    # min-p, typical, epsilon, eta, after every processor.
+    assert [type(item).__name__ for item in altered.text_generation().logits] == [
+        "RepetitionPenalty", "Temperature", "TopP", "MinP", "Typical"]
     override = altered.text_generation(sampling=Sampling(temperature=0))
-    assert override.logits == penalized.logits
-    # A penalty that strong moves the greedy walk away from the plain one.
-    plain = replace(override, logits=())([[1, 2]], 6, key=jax.random.key(1))
-    biased = override([[1, 2]], 6, key=jax.random.key(1))
-    np.testing.assert_array_equal(biased.behavior_log_probs, 0)
-    assert not np.array_equal(np.asarray(plain.tokens), np.asarray(biased.tokens))
+    assert override.logits is None and override.n == 2
+    plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
+    np.testing.assert_array_equal(plain.behavior_log_probs, 0)
+    penalized = replace(override, logits=altered.text_generation().logits)
+    assert not np.array_equal(np.asarray(plain.tokens),
+                              np.asarray(penalized([[1, 2]], 6, key=jax.random.key(1), n=1).tokens))
     inactive = replace(source, generation_config={"do_sample": False, "typical_p": 0.1})
     assert inactive.text_generation().sampling.temperature == 0
-    assert inactive.text_generation().logits == ()
+    assert [type(item).__name__ for item in inactive.text_generation().logits] == ["Greedy"]
 
 
 def test_active_source_controls_map_to_components_or_raise_with_their_reason(task):
     """Every active control is classified. One the native decoder implements
-    becomes a component; one it does not names itself and why."""
+    becomes a component or a strategy; one it does not names itself and why."""
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
+    from dew.sampling import Beam
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
                "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None,
                "use_cache": True, "cache_implementation": "static", "output_scores": False,
                "assistant_ensemble_weight": 1.0, "return_dict_in_generate": True}
-    assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
+    bound = replace(source, generation_config=neutral).text_generation()
+    assert bound.sampling.temperature == 1.0 and bound.strategy is None
     mapped = {"remove_invalid_values": True, "no_repeat_ngram_size": 3, "min_new_tokens": 2,
               "suppress_tokens": [4], "eos_token_id": 5}
     names = [type(item).__name__ for item in
              replace(source, generation_config=mapped).text_generation().logits]
-    assert names == ["NoRepeatNGram", "MinNewTokens", "RemoveInvalidValues", "SuppressTokens"]
+    assert names == ["NoRepeatNGram", "MinNewTokens", "RemoveInvalidValues", "SuppressTokens",
+                     "Greedy"]
+    beams = replace(source, generation_config={"num_beams": 3, "length_penalty": 0.7,
+                                               "early_stopping": "never", "eos_token_id": [5, 6]})
+    search = beams.text_generation().strategy
+    assert isinstance(search, Beam) and search.width == 3 and search.length_penalty == 0.7
+    assert search.early_stopping == "never" and search.stop_ids == 2
+    # A search picks its own continuations, so the chain stops at the processors.
+    assert beams.text_generation().logits == ()
     refusals = {
-        "num_beams": ({"num_beams": 2}, "beam search is not implemented"),
         "stochastic beam": ({"num_beams": 2, "do_sample": True}, "marginal probability"),
+        "beams below rows": ({"num_beams": 2, "num_return_sequences": 3}, "exceeds num_beams"),
         "num_beam_groups": ({"num_beams": 2, "num_beam_groups": 2}, "group beam search"),
         "penalty_alpha": ({"do_sample": True, "penalty_alpha": 0.6}, "contrastive search"),
         "unknown": ({"a_future_control": 3}, "does not know this control"),
@@ -222,7 +238,9 @@ def test_active_source_controls_map_to_components_or_raise_with_their_reason(tas
         "ensemble": ({"assistant_ensemble_weight": 0.5}, "biased distribution"),
         "lookup": ({"prompt_lookup_num_tokens": 3}, "prompt lookup"),
         "early exit": ({"assistant_early_exit": 2}, "early-exit"),
-        "mtp flag": ({"use_mtp": True}, "caller's choice"),
+        "no depths": ({"use_mtp": True}, "no prediction-depth weights"),
+        "other proposer": ({"speculation_type": "ngram"}, "names no native proposer"),
+        "both searches": ({"num_beams": 2, "use_mtp": True}, "at once"),
         "cache": ({"use_cache": False}, "its own cache"),
         "quantized cache": ({"cache_config": {"backend": "quanto"}}, "quantized and offloaded"),
         "chunked prefill": ({"prefill_chunk_size": 8}, "one call"),
@@ -235,18 +253,16 @@ def test_active_source_controls_map_to_components_or_raise_with_their_reason(tas
     for name, (active, reason) in refusals.items():
         with pytest.raises(ValueError, match=reason):
             replace(source, generation_config=active).text_generation()
-    with pytest.raises(ValueError, match="different order than the reference"):
-        replace(source, generation_config={"do_sample": True, "typical_p": 0.9,
-                                           "top_p": 0.8}).text_generation()
 
 
 def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(task):
-    """num_return_sequences counts continuations rather than filtering the
-    distribution, so the loaded task draws that many rows per prompt. An
-    explicit call count overrides it in either direction, an explicit
-    sampling policy leaves it alone, and beam search stays refused."""
+    """num_return_sequences counts returned rows rather than filtering the
+    distribution, so the loaded task returns that many per prompt whichever
+    strategy runs. An explicit call count overrides it in either direction and
+    an explicit sampling policy leaves it alone."""
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
+    from dew.sampling import Beam
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.9,
@@ -258,6 +274,12 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
     np.testing.assert_array_equal(rows.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
     assert policy([[1, 2], [3, 4]], 4, n=1, seed=5).host().tokens.shape == (2, 6)
     assert source.text_generation(sampling=Sampling(temperature=0)).n == 3
+    searched = replace(source, generation_config={"num_return_sequences": 3, "num_beams": 4})
+    beamed = searched.text_generation()
+    assert isinstance(beamed.strategy, Beam) and beamed.strategy.width == 4 and beamed.n == 3
+    found = beamed([[1, 2], [3, 4]], 4, seed=5).host()
+    assert found.tokens.shape == (6, 6)
+    np.testing.assert_array_equal(found.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
     with pytest.raises(ValueError, match="cannot honor"):
         replace(source, generation_config={**source.generation_config, "num_beams": 4}).text_generation()
     with pytest.raises(ValueError, match="num_return_sequences"):

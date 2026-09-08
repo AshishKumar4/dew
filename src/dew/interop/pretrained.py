@@ -21,6 +21,7 @@ from dew.interop.quantized import dequantize_checkpoint, fp8_block
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.sampling import decoding
+from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
 from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -661,26 +662,27 @@ class Pretrained:
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
-        """Use the source's decoding components, or the caller's explicit policy.
+        """The source's decoding components, or the caller's explicit policy.
 
-        The source's basic policy is a `Sampling` value an explicit one
-        replaces. Its transforms and criteria bind to the task either way,
-        because they are separate components; pass `logits=()` and
-        `stopping=()` on the call to drop them. `num_return_sequences` counts
-        rows and is independent of both.
+        Without an override the task runs the source's whole chain, its
+        criteria and the strategy its config names. An explicit `sampling`
+        replaces the basic policy and clears that chain with it, because the
+        chain was built around the policy the caller just replaced; the
+        criteria and `num_return_sequences` still come from the source.
         """
         if self.process is not None:
             raise TypeError("a latent diffusion source generates through text_to_image")
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
-        policy, logits, stopping = _source_decoding(self.config, self.generation_config,
-                                                    self.model, self.processor)
+        rows = _return_sequences(self.config, self.generation_config)
+        policy, logits, stopping, strategy = _source_decoding(
+            self.config, self.generation_config, self.model, self.processor, rows)
         return TextGeneration(self.model, self.variables, self.processor,
                               policy if sampling is None else sampling,
                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
                               max_length=_generation_limit(self.config, self.generation_config, "max_length"),
-                              n=_return_sequences(self.config, self.generation_config),
-                              logits=logits, stopping=stopping)
+                              n=rows, logits=None if sampling is not None else logits,
+                              stopping=stopping, strategy=strategy)
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -846,6 +848,9 @@ _TRANSFORM_CONTROLS = frozenset({
     "top_h", "typical_p", "epsilon_cutoff", "eta_cutoff", "renormalize_logits",
 })
 _CRITERION_CONTROLS = frozenset({"stop_strings"})
+_STRATEGY_CONTROLS = frozenset({"num_beams", "early_stopping", "length_penalty", "use_mtp",
+                                "speculation_type", "num_assistant_tokens",
+                                "assistant_confidence_threshold"})
 _REFUSED_CONTROLS: dict[str, str] = {
     "max_time": "a host clock cannot stop a coordinated device loop",
     "token_healing": "retokenizing the prompt is prompt construction, not decoding",
@@ -853,25 +858,18 @@ _REFUSED_CONTROLS: dict[str, str] = {
     "penalty_alpha": "contrastive search is a decoding strategy that is not implemented",
     "dola_layers": "DoLa is a decoding strategy that is not implemented",
     "watermarking_config": "no watermarking transform is implemented",
-    "num_beams": "beam search is not implemented",
     "num_beam_groups": "diverse group beam search is not implemented",
     "diversity_penalty": "diverse group beam search is not implemented",
     "constraints": "constrained beam search is not implemented",
     "force_words_ids": "constrained beam search is not implemented",
-    "early_stopping": "beam search is not implemented",
-    "length_penalty": "beam search is not implemented",
     "prompt_lookup_num_tokens": "prompt lookup proposal is not implemented",
     "max_matching_ngram_size": "prompt lookup proposal is not implemented",
     "assistant_early_exit": "early-exit proposal is not implemented",
     "assistant_ensemble_weight": "ensemble verification below one accepts a biased distribution",
     "num_assistant_tokens_schedule": "an adaptive proposal length cannot fix the device block size",
-    "assistant_confidence_threshold": "a confidence-gated proposal cannot fix the device block size",
     "assistant_lookbehind": "translating between two tokenizers' token spaces is not implemented",
     "target_lookbehind": "translating between two tokenizers' token spaces is not implemented",
     "is_assistant": "a source loads as a target model, not as another model's assistant",
-    "use_mtp": "a decoding strategy is the caller's choice, not the checkpoint's",
-    "speculation_type": "a decoding strategy is the caller's choice, not the checkpoint's",
-    "num_assistant_tokens": "a decoding strategy is the caller's choice, not the checkpoint's",
     "use_cache": "native decoding always runs through its own cache",
     "cache_implementation": "the native cache is the fixed-capacity static one",
     "cache_config": "quantized and offloaded caches are not implemented",
@@ -913,7 +911,6 @@ _BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
 }
 _SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff",
                                     "eta_cutoff", "top_h"})
-_TAIL_CONTROLS = frozenset({"temperature", "top_k", "top_p", "min_p"})
 
 
 def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
@@ -940,8 +937,8 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
     them, and an unknown name is refused rather than ignored.
     """
     known = (_POLICY_CONTROLS | _TASK_CONTROLS | _METADATA_CONTROLS | _TRANSFORM_CONTROLS
-             | _CRITERION_CONTROLS | set(_REFUSED_CONTROLS) | set(_NEUTRAL_CONTROLS)
-             | set(_BEAM_ONLY_CONTROLS))
+             | _CRITERION_CONTROLS | _STRATEGY_CONTROLS | set(_REFUSED_CONTROLS)
+             | set(_NEUTRAL_CONTROLS) | set(_BEAM_ONLY_CONTROLS))
     refused: list[str] = []
     for name in sorted(known | set(generation_config)):
         if name in _POLICY_CONTROLS or name in _METADATA_CONTROLS:
@@ -958,7 +955,7 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
         active = _active(config, generation_config, name)
         if active is None:
             continue
-        if name in _TRANSFORM_CONTROLS or name in _CRITERION_CONTROLS:
+        if name in _TRANSFORM_CONTROLS or name in _CRITERION_CONTROLS or name in _STRATEGY_CONTROLS:
             continue
         reason = _REFUSED_CONTROLS.get(name, "the native decoder does not know this control")
         refused.append(f"{name} ({reason})")
@@ -1068,16 +1065,17 @@ def _as_strings(value: object) -> tuple[str, ...]:
 
 
 def _source_transforms(config: Mapping[str, object], generation_config: Mapping[str, object],
-                       sampling: Sampling, do_sample: bool) -> tuple[decoding.LogitsTransform, ...]:
-    """The source's active transforms, in `_get_logits_processor`'s order.
+                       sampling: Sampling, do_sample: bool,
+                       searching: bool) -> tuple[decoding.LogitsTransform, ...]:
+    """The source's whole transform chain, in `_get_logits_processor`'s order.
 
-    The policy tail runs after this tuple, which is where `generate()` puts
-    temperature, top-k, top-p and min-p. The remaining warpers sit inside that
-    same group upstream, so they are honored only when the tail is neutral;
-    otherwise the order would differ from the reference and the source is
-    refused. `renormalize_logits` shifts every score by one constant, which no
-    later filter and neither recorded likelihood can see, so its position
-    relative to the tail does not matter.
+    This is the complete chain the task runs, so the policy's own tail is
+    built here rather than appended afterwards and every warper lands where
+    the reference puts it: temperature, top-h, top-k, top-p, min-p, typical,
+    epsilon, eta, and `renormalize_logits` last of all. Without sampling the
+    reference adds no warper at all and picks the argmax, which is the
+    trailing `Greedy`. Beam search picks its own continuations, so it ends
+    the chain after the processors.
     """
     eos = jnp.asarray(_eos_ids(config, generation_config) or (), jnp.int32)
     read = functools.partial(_active, config, generation_config)
@@ -1118,21 +1116,27 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
         transforms.append(decoding.BeginSuppressTokens(
             jnp.asarray(_token_list(value, "begin_suppress_tokens"), jnp.int32),
             read("forced_bos_token_id") is not None))
-    warpers: list[decoding.LogitsTransform] = []
-    if do_sample:
+    if searching:
+        return tuple(transforms)
+    if not do_sample:
+        transforms.append(decoding.Greedy())
+    else:
+        if sampling.temperature != 1.0:
+            transforms.append(decoding.Temperature(sampling.temperature))
         if (value := read("top_h")) is not None:
-            warpers.append(decoding.TopH(_as_float("top_h", value)))
+            transforms.append(decoding.TopH(_as_float("top_h", value)))
+        if sampling.top_k is not None:
+            transforms.append(decoding.TopK(sampling.top_k))
+        if sampling.top_p < 1.0:
+            transforms.append(decoding.TopP(sampling.top_p))
+        if sampling.min_p > 0.0:
+            transforms.append(decoding.MinP(sampling.min_p))
         if (value := read("typical_p")) is not None:
-            warpers.append(decoding.Typical(_as_float("typical_p", value)))
+            transforms.append(decoding.Typical(_as_float("typical_p", value)))
         if (value := read("epsilon_cutoff")) is not None:
-            warpers.append(decoding.EpsilonCutoff(_as_float("epsilon_cutoff", value)))
+            transforms.append(decoding.EpsilonCutoff(_as_float("epsilon_cutoff", value)))
         if (value := read("eta_cutoff")) is not None:
-            warpers.append(decoding.EtaCutoff(_as_float("eta_cutoff", value)))
-    if warpers and any(read(name) is not None for name in _TAIL_CONTROLS):
-        raise ValueError("a source that declares top_h, typical_p, epsilon_cutoff or eta_cutoff "
-                         "together with temperature, top_k, top_p or min_p would filter in a "
-                         "different order than the reference; pass an explicit logits= chain")
-    transforms.extend(warpers)
+            transforms.append(decoding.EtaCutoff(_as_float("eta_cutoff", value)))
     if read("renormalize_logits") is not None:
         transforms.append(decoding.Renormalize())
     return tuple(transforms)
@@ -1152,19 +1156,74 @@ def _source_stopping(config: Mapping[str, object], generation_config: Mapping[st
     return (decoding.stop_strings(processor, _as_strings(value), vocab_size),)
 
 
+def _source_strategy(config: Mapping[str, object], generation_config: Mapping[str, object],
+                     model: nn.Module, do_sample: bool, rows: int) -> Strategy | None:
+    """The device loop a source's config names, or None for plain sampling."""
+    read = functools.partial(_active, config, generation_config)
+    beams = read("num_beams")
+    speculating = read("use_mtp") is not None or _mtp_mode(read("speculation_type"))
+    if beams is not None and speculating:
+        raise ValueError("a source cannot ask for beam search and speculative decoding at once")
+    if beams is not None:
+        if do_sample:
+            raise ValueError("stochastic beam search is refused: a selected beam's marginal "
+                             "probability is not the per-step candidate probability, so no honest "
+                             "behaviour likelihood exists")
+        width = _as_int("num_beams", beams)
+        if rows > width:
+            raise ValueError(f"num_return_sequences {rows} exceeds num_beams {width}")
+        early = _generation_value(config, generation_config, "early_stopping")
+        penalty = _generation_value(config, generation_config, "length_penalty")
+        if early is None:
+            early = False
+        if early not in (True, False, "never"):
+            raise ValueError("early_stopping is True, False or 'never'")
+        return Beam(width=width,
+                    length_penalty=1.0 if penalty is None else _as_float("length_penalty", penalty),
+                    early_stopping=early is True if isinstance(early, bool) else "never",
+                    stop_ids=len(_eos_ids(config, generation_config)))
+    if not speculating:
+        return None
+    if not int(getattr(model, "num_nextn_predict_layers", 0) or 0):
+        raise ValueError("the source asks for multi-token-prediction speculation, but this "
+                         "checkpoint carries no prediction-depth weights")
+    length = read("num_assistant_tokens")
+    threshold = read("assistant_confidence_threshold")
+    if length is not None and _as_int("num_assistant_tokens", length) < 1:
+        raise ValueError("num_assistant_tokens must draft at least one token")
+    # The source counts the tokens the proposer drafts; a block also holds the
+    # ordinary target draw the proposer chains from.
+    drafted = 3 if length is None else _as_int("num_assistant_tokens", length)
+    return Speculative(block=drafted + 1,
+                       confidence=0.0 if threshold is None else
+                       _as_float("assistant_confidence_threshold", threshold))
+
+
+def _mtp_mode(value: object) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, str) or value.lower() not in ("mtp", "multi_token_prediction"):
+        raise ValueError(f"speculation_type {value!r} names no native proposer; only the model's "
+                         "own prediction depths draft natively")
+    return True
+
+
 def _source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None
+                     model: nn.Module, processor: Processor | None, rows: int
                      ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...],
-                                tuple[decoding.Stopping, ...]]:
-    """The policy, transforms and criteria a loaded source decodes with."""
+                                tuple[decoding.Stopping, ...], Strategy | None]:
+    """The policy, chain, criteria and strategy a loaded source decodes with."""
     do_sample = _generation_value(config, generation_config, "do_sample", False) is True
     _audit(config, generation_config, model, do_sample,
            _generation_value(config, generation_config, "num_beams"))
     sampling = _source_sampling(config, generation_config)
+    strategy = _source_strategy(config, generation_config, model, do_sample, rows)
     return (sampling,
-            _source_transforms(config, generation_config, sampling, do_sample),
+            _source_transforms(config, generation_config, sampling, do_sample,
+                               isinstance(strategy, Beam)),
             _source_stopping(config, generation_config, processor,
-                             getattr(model, "vocab_size", None)))
+                             getattr(model, "vocab_size", None)),
+            strategy)
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,

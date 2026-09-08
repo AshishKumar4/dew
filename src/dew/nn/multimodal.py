@@ -276,7 +276,8 @@ class MultimodalTransformer(nn.Module):
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
-        """One candidate prediction step using the decoder's independent MTP cache."""
+        """One candidate prediction step using the decoder's independent MTP
+        cache, returning its logits and its hidden state."""
         if conditioning is not None:
             if input_embeddings is not None:
                 raise ValueError("MTP receives either prepared embeddings or media conditioning")
@@ -350,6 +351,11 @@ class MultimodalTransformer(nn.Module):
                                    conditioning=conditioning, attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self.language_model._logits(hidden)
+
+    def states_and_logits(self, tokens, **kwargs):
+        """The final hidden states and their logits from one media-aware forward."""
+        hidden = self.hidden_states(tokens, **kwargs)
+        return hidden, self.language_model._logits(hidden)
 
     def head_weight(self, params):
         """The decoder's shared fp32 head matrix for chunked objective scoring."""

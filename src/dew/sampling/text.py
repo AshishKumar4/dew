@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import hashlib
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -12,9 +14,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
 
+from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.inputs import (
     ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature,
     local_rows, mesh_of, request_key,
@@ -140,14 +144,27 @@ class Generation(Generic[ArrayT]):
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
 
-def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs
+def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps
              ) -> tuple[DecoderState, jax.Array]:
-    """The state after the prompt, and which rows hold a real token."""
+    """The state after the prompt, and which rows hold a real token.
+
+    A model with prediction depths also gets their independent cache, seeded
+    over the prompt: each depth reads the target's hidden state at one
+    position with the token at the next, at that token's own position, which
+    is the history a checkpoint's predictor was trained behind. A depth left
+    empty would draft the first block from nothing.
+    """
     batch, width = inputs.tokens.shape
     cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
-    logits, updated = model.apply(
-        {**params, "cache": cache}, inputs.tokens, decode=True, mutable=["cache"],
-        rngs=None, method=None, capture_intermediates=False, **inputs.kwargs())
+    if ops.depths:
+        drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
+        cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
+    exposed = _exposes_states(model)
+    answer, updated = model.apply(
+        {**params, "cache": cache}, inputs.tokens, decode=True, mutable=["cache"], rngs=None,
+        method="states_and_logits" if exposed else None, capture_intermediates=False,
+        **inputs.kwargs())
+    states, logits = answer if exposed else (None, answer)
     # An unpadded prompt carries no validity field, and its last real token is
     # the last slot.
     valid = inputs.token_fields.get("attention_mask")
@@ -156,30 +173,77 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs
     positions = inputs.token_fields.get("positions")
     if positions is not None:
         positions = positions[jnp.arange(batch), jnp.maximum(last, 0)] + 1
-    return DecoderState(updated["cache"], logits[jnp.arange(batch), jnp.maximum(last, 0)],
-                        positions), last >= 0
+    rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
+    state = DecoderState(updated["cache"], logits[rows, slot], positions,
+                         None if states is None else states[rows, slot])
+    if ops.depths and width > 1 and states is not None:
+        real = jnp.ones(inputs.tokens.shape, bool) if valid is None else valid.astype(bool)
+        order = jnp.argsort(~real, axis=1, stable=True)
+        lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
+        state = strategies.reseed(
+            ops, state, jnp.take_along_axis(states, order[..., None], axis=1)[:, :-1],
+            jnp.take_along_axis(inputs.tokens, order, axis=1)[:, 1:],
+            jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
+            jnp.broadcast_to(jnp.arange(1, width)[None, :], (batch, width - 1)))
+    return state, last >= 0
 
 
-def _operations(model: nn.Module, params: Variables, pad_id: int) -> DecodeOps:
+def _exposes_states(model: nn.Module) -> bool:
+    """Whether the model hands back its hidden states beside its logits.
+
+    A decoder that does seeds a speculative draft from them. One that does
+    not still decodes; it only cannot draft.
+    """
+    return hasattr(type(model), "states_and_logits")
+
+
+def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
 
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows.
     """
+    exposed = _exposes_states(model)
+
+    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
+            ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
+        width = tokens.shape[1]
+        positions = ({} if state.positions is None else
+                     {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
+        answer, updated = model.apply(
+            {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
+            decode=True, attention_mask=valid, mutable=["cache"], rngs=None,
+            method="states_and_logits" if exposed else None,
+            capture_intermediates=False, **positions)
+        states, logits = answer if exposed else (None, answer)
+        moved = (None if state.positions is None else
+                 state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
+        return (DecoderState(updated["cache"], logits[:, -1], moved,
+                             None if states is None else states[:, -1]), logits, states)
 
     def advance(state: DecoderState, token: jax.Array, active: jax.Array) -> DecoderState:
-        positions = {} if state.positions is None else {"positions": state.positions[:, None]}
-        logits, updated = model.apply(
-            {**params, "cache": state.cache}, jnp.where(active, token, pad_id)[:, None],
-            decode=True, attention_mask=active[:, None], mutable=["cache"], rngs=None,
-            method=None, capture_intermediates=False, **positions)
-        return DecoderState(updated["cache"], logits[:, -1],
-                            None if state.positions is None else state.positions + active)
+        return run(state, token[:, None], active[:, None])[0]
 
     def reindex(state: DecoderState, rows: jax.Array) -> DecoderState:
-        return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), state)
+        return dataclasses.replace(state, cache=gather_cache_rows(state.cache, rows),
+                                   logits=jnp.take(state.logits, rows, axis=0),
+                                   positions=None if state.positions is None
+                                   else jnp.take(state.positions, rows, axis=0),
+                                   hidden=None if state.hidden is None
+                                   else jnp.take(state.hidden, rows, axis=0))
 
-    return DecodeOps(advance, reindex)
+    if not depths or not exposed:
+        return DecodeOps(advance, reindex, run)
+
+    def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array, valid: jax.Array,
+                positions: jax.Array, depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
+        (logits, states), updated = model.apply(
+            {**params, "cache": state.cache}, hidden, jnp.where(valid, tokens, pad_id),
+            depth=depth, attention_mask=valid, positions=positions, decode=True,
+            mutable=["cache"], rngs=None, method="mtp_step", capture_intermediates=False)
+        return dataclasses.replace(state, cache=updated["cache"]), logits, states
+
+    return DecodeOps(advance, reindex, run, propose, depths)
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
@@ -199,15 +263,16 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    state, real = _prefill(model, params, inputs)
+    ops = _operations(model, params, sampling.pad_id,
+                      int(getattr(model, "num_nextn_predict_layers", 0) or 0))
+    state, real = _prefill(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, max_new_tokens), jnp.int32)], axis=1),
         valid=jnp.concatenate([jnp.ones((batch, width), bool) if valid is None else valid.astype(bool),
                                jnp.zeros((batch, max_new_tokens), bool)], axis=1),
         step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width)
-    drawn: Draws = strategy(state, start, _operations(model, params, sampling.pad_id),
-                            decoding.chain(transforms), decoding.criterion(stopping),
-                            max_new_tokens, n)
+    drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
+                            decoding.criterion(stopping), max_new_tokens, n)
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, sampling.pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
@@ -252,24 +317,67 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
     return prepared
 
 
-def resolve(sampling: Sampling, logits: Transforms, stopping: Criteria,
+def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | None,
             strategy: Strategy | None
             ) -> tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]:
     """The one chain, criterion and strategy a request runs.
 
-    A caller's transforms run first, in the order given, and the policy's
-    filtering tail runs last, which is the order `generate()` builds its
-    processor list in. Criteria combine with OR. No strategy means `Sample`.
+    `logits=None` runs the policy's own filtering tail. An explicit sequence
+    is the whole chain instead, in the order given, so a caller that needs a
+    different order than `Sampling` produces writes the order it wants, and
+    `()` runs no transform at all.
+
+    Criteria always compose: an explicit sequence runs alongside the policy's
+    EOS criterion rather than replacing it, so naming a criterion cannot drop
+    termination by accident. No strategy means `Sample`.
     """
-    return (decoding.components(logits, "logits") + sampling.transforms(),
-            decoding.components(stopping, "stopping") + sampling.criteria(),
+    return (sampling.transforms() if logits is None else decoding.components(logits, "logits"),
+            (() if stopping is None else decoding.components(stopping, "stopping"))
+            + sampling.criteria(),
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
 
+def _named(value: object) -> str:
+    """A component's identity, the same string in every process.
+
+    A repr would carry the object's address, and two processes that resolved
+    the same chain would then look like they disagreed.
+    """
+    if not isinstance(value, type) and hasattr(value, "__qualname__"):
+        return f"{getattr(value, '__module__', '?')}.{value.__qualname__}"
+    kind = value if isinstance(value, type) else type(value)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _shape(value: object) -> object:
+    """One component's configuration, without its array contents."""
+    if isinstance(value, (tuple, list)):
+        return tuple(_shape(item) for item in value)
+    if isinstance(value, jax.tree_util.Partial):
+        return ("partial", _named(value.func), _shape(value.args),
+                tuple((name, _shape(item)) for name, item in sorted(value.keywords.items())))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return (_named(value),) + tuple(
+            (field.name, repr(getattr(value, field.name)))
+            for field in dataclasses.fields(value)
+            if not field.metadata.get("pytree_node", True))
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return (tuple(shape), str(getattr(value, "dtype", "")))
+    return repr(value)
+
+
 def _digest(components: object) -> tuple[object, ...]:
-    """A stable description of resolved components, without their payloads."""
-    return (str(jax.tree.structure(components)),
-            tuple((jnp.shape(leaf), str(jnp.result_type(leaf))) for leaf in jax.tree.leaves(components)))
+    """Resolved components as a value every process can compare.
+
+    The configuration arrays are part of the identity: two processes holding
+    `EndOfSequence` over different ids build the same tree of the same shapes
+    and would agree on a schema alone, so their contents are hashed in.
+    """
+    payload = hashlib.sha256()
+    for leaf in jax.tree.leaves(components):
+        payload.update(np.ascontiguousarray(np.asarray(leaf)).tobytes())
+    return (_shape(components), payload.hexdigest())
 
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
@@ -303,7 +411,7 @@ def _compiled(rows: jax.sharding.NamedSharding | None):
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: jax.Array, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms = (), stopping: Criteria = (),
+             logits: Transforms | None = None, stopping: Criteria | None = None,
              strategy: Strategy | None = None) -> Generation: ...
 
 
@@ -311,15 +419,15 @@ def generate(model: nn.Module, params: Variables,
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, seed: int, sampling: Sampling = Sampling(), n: int = 1,
-             logits: Transforms = (), stopping: Criteria = (),
+             logits: Transforms | None = None, stopping: Criteria | None = None,
              strategy: Strategy | None = None) -> Generation: ...
 
 
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: jax.Array | None = None, seed: int | None = None,
-             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms = (),
-             stopping: Criteria = (), strategy: Strategy | None = None) -> Generation:
+             sampling: Sampling = Sampling(), n: int = 1, logits: Transforms | None = None,
+             stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 
     ModelInputs.token_fields["attention_mask"] identifies real tokens. Missing masks mean all
@@ -340,10 +448,11 @@ def generate(model: nn.Module, params: Variables,
     prompt draws with that prompt's own key, so ``n=1`` and continuation zero
     of any larger request are the same draw.
 
-    ``logits`` and ``stopping`` extend decoding with transforms from
-    ``dew.sampling.decoding`` or plain callables of the same shape; the
-    ``sampling`` tail and its EOS criterion follow them. ``strategy`` replaces
-    the per-row draw loop; ``None`` uses ``Sample``.
+    ``logits`` is the whole transform chain, in the order it runs. Left as
+    ``None`` it is what ``sampling`` compiles to, and ``()`` runs no
+    transform. ``stopping`` adds criteria beside the policy's EOS one rather
+    than replacing it. ``strategy`` replaces the per-row draw loop; ``None``
+    uses ``Sample``.
     """
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
@@ -369,8 +478,8 @@ def generate(model: nn.Module, params: Variables,
     elif error is not None:
         raise error
     assert prepared is not None and random_key is not None and components is not None
-    controls = (max_new_tokens, n, sampling, _digest(components))
     if processes > 1:
+        controls = (max_new_tokens, n, sampling, _digest(components))
         # Whether this process's own prompts needed padding is rank-local, and
         # the digest below would refuse a pool that disagrees only about that,
         # so the pool agrees one validity schema first.

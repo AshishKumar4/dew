@@ -1,0 +1,314 @@
+"""Speculative decoding: the emitted law, and the cache the block leaves behind.
+
+The law is checked against fixed distributions rather than a model, so nothing
+but the acceptance rule, the residual and the bonus decide the answer. The
+cache is checked against greedy sampling on real models: with a zero
+temperature the target's point mass wins every rejection, so a block has to
+emit exactly the greedy walk, which it can only do if the state it replays
+after a rejection is the state the accepted prefix would have left.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.experimental import checkify
+
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.sampling import Sampling, Speculative, generate
+from dew.sampling import decoding
+from dew.sampling.decoding import StepState, chain, criterion
+from dew.sampling.strategies import DecodeOps, DecoderState
+from test_text_rollout_contract import decoder
+
+VOCAB = 13
+HIDDEN = 2
+
+
+def predictor(kind="attention", **overrides):
+    """A tiny decoder that also carries one prediction depth."""
+    mixer = decoder(kind).mixer
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+                             head_dim=8, mlp_features=32, max_seq_len=16, dtype="float32",
+                             mixer=mixer, num_nextn_predict_layers=1, **overrides)
+
+
+def scripted(target, drafts, rows):
+    """Decode operations whose target and draft distributions are fixed.
+
+    `drafts` holds one distribution per chained draft step, so a block can be
+    made to agree on its first candidates and disagree later.
+    """
+    calls = {"index": 0}
+
+    def verify(state, tokens, valid):
+        width = tokens.shape[1]
+        return (state, jnp.broadcast_to(target, (rows, width, VOCAB)),
+                jnp.zeros((rows, width, HIDDEN), jnp.float32))
+
+    def propose(state, states, tokens, valid, positions, depth):
+        width = tokens.shape[1]
+        scores = drafts[calls["index"] % len(drafts)]
+        calls["index"] += width
+        return (state, jnp.broadcast_to(scores, (rows, width, VOCAB)),
+                jnp.zeros((rows, width, HIDDEN), jnp.float32))
+
+    return DecodeOps(advance=lambda state, token, active: state,
+                     reindex=lambda state, rows_: state, verify=verify, propose=propose, depths=1)
+
+
+def run(target, drafts, rows, budget, block, seed=0, stopping=()):
+    """One speculative run over fixed distributions."""
+    return run_with(Speculative(block=block), target, drafts, rows, budget, seed, stopping)
+
+
+def run_with(plan, target, drafts, rows, budget, seed=0, stopping=()):
+    """One run of a given speculative plan over fixed distributions."""
+    state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
+                         positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32))
+    start = StepState(tokens=jnp.zeros((rows, 1 + budget), jnp.int32),
+                      valid=jnp.concatenate([jnp.ones((rows, 1), bool),
+                                             jnp.zeros((rows, budget), bool)], axis=1),
+                      step=jnp.zeros(rows, jnp.int32), active=jnp.ones(rows, bool),
+                      keys=jax.random.split(jax.random.key(seed), rows), prompt_width=1)
+    ops = scripted(target, drafts, rows)
+
+    def body(carried, opening):
+        return plan(carried, opening, ops, chain(()), criterion(stopping), budget, 1)
+
+    failure, drawn = checkify.checkify(body, errors=checkify.user_checks)(state, start)
+    failure.throw()
+    return drawn
+
+
+def point(token):
+    return jnp.where(jnp.arange(VOCAB) == token, 0.0, -jnp.inf)
+
+
+def spread(weights):
+    full = np.full(VOCAB, -np.inf, np.float32)
+    for token, weight in weights.items():
+        full[token] = np.log(weight)
+    return jnp.asarray(full)
+
+
+def test_the_emitted_tokens_follow_the_target_distribution():
+    """The point of the law: whatever the draft proposes, the tokens that come
+    out are distributed as the target. Four thousand rows over four positions
+    give sixteen thousand samples, whose standard error at a probability of a
+    quarter is 0.0034, so 0.015 is a four-sigma band."""
+    target = spread({0: 0.4, 1: 0.3, 2: 0.2, 3: 0.1})
+    drafts = [spread({0: 0.1, 1: 0.2, 2: 0.3, 3: 0.4})]
+    drawn = run(target, drafts, 4096, 4, 2)
+    tokens = np.asarray(drawn.tokens)[np.asarray(drawn.valid)]
+    counts = np.bincount(tokens, minlength=VOCAB)[:4] / tokens.size
+    largest = float(np.max(np.abs(counts - np.array([0.4, 0.3, 0.2, 0.1]))))
+    assert largest < 0.015, f"largest deviation {largest:g}"
+    # The draft is the reverse distribution, so emitting it would be obvious.
+    assert counts[0] > counts[3]
+
+
+def test_a_rejected_first_candidate_emits_the_residual_of_the_target():
+    """The target is a point mass the draft never proposes, so the second
+    candidate is always rejected and the replacement is the normalized
+    positive part of `p - q`, which here is the target itself."""
+    drawn = run(point(5), [point(7)], 4, 6, 2)
+    tokens, valid = np.asarray(drawn.tokens), np.asarray(drawn.valid)
+    np.testing.assert_array_equal(valid.sum(axis=1), 6)
+    # Every emitted token is the target's, never the draft's.
+    np.testing.assert_array_equal(tokens[valid], 5)
+    np.testing.assert_allclose(np.asarray(drawn.behavior_log_probs)[valid], 0.0, atol=1e-6)
+
+
+def test_a_rejection_in_the_middle_keeps_the_accepted_prefix():
+    """The first chained draft agrees with the target and the second does not,
+    so the block emits the accepted candidate, then the replacement, and
+    nothing the rejected draft proposed."""
+    drawn = run(point(5), [point(5), point(7)], 4, 3, 3)
+    tokens, valid = np.asarray(drawn.tokens), np.asarray(drawn.valid)
+    np.testing.assert_array_equal(valid.sum(axis=1), 3)
+    np.testing.assert_array_equal(tokens[valid], 5)
+
+
+def test_a_matching_draft_is_accepted_and_the_block_draws_a_bonus():
+    """With `q` equal to `p` nothing is rejected, so a block of `g` candidates
+    emits `g + 1` tokens and the budget is reached in fewer blocks."""
+    for block in (2, 4):
+        drawn = run(point(5), [point(5)] * (block - 1), 2, block + 1, block)
+        np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), block + 1)
+        np.testing.assert_array_equal(np.asarray(drawn.tokens)[np.asarray(drawn.valid)], 5)
+
+
+def test_a_draft_outside_the_target_support_never_survives():
+    """A candidate the target cannot produce is rejected with probability one,
+    and the residual still covers the target's own support."""
+    target = spread({1: 0.5, 2: 0.5})
+    drawn = run(target, [point(9)], 2048, 2, 2)
+    tokens = np.asarray(drawn.tokens)[np.asarray(drawn.valid)]
+    assert set(np.unique(tokens).tolist()) == {1, 2}
+    share = float(np.mean(tokens == 1))
+    assert abs(share - 0.5) < 0.02, f"share {share:g}"
+
+
+def test_a_criterion_inside_a_block_truncates_it():
+    """A stopping criterion is applied after every committed token, so a block
+    that produces one stops there instead of emitting the rest."""
+    stop = jax.tree_util.Partial(lambda state, tokens: state.step >= 2)
+    drawn = run(point(5), [point(5)] * 3, 2, 8, 4)
+    assert int(np.asarray(drawn.valid).sum(axis=1)[0]) == 8
+    stopped = run(point(5), [point(5)] * 3, 2, 8, 4, stopping=(stop,))
+    np.testing.assert_array_equal(np.asarray(stopped.valid).sum(axis=1), 2)
+    np.testing.assert_array_equal(np.asarray(stopped.terminated), True)
+
+
+def test_the_budget_bounds_the_last_block():
+    """A block that would emit past the budget stops at it, and the emitted
+    count is exactly the budget even when it is not a multiple of the block."""
+    for budget in (3, 5, 7):
+        drawn = run(point(5), [point(5)] * 3, 2, budget, 4)
+        np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), budget)
+        np.testing.assert_array_equal(np.asarray(drawn.valid)[:, :budget], True)
+
+
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
+    """At zero temperature the target is a point mass, so every rejected draft
+    is replaced by the target's own token and the whole run has to equal the
+    greedy walk. It only can if the accepted prefix is replayed into the
+    cache: a recurrent mixer keeps a running summary that no cursor rewinds,
+    and reusing the draft's state would show up on the next token."""
+    model = predictor(kind)
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = model.init(jax.random.key(0), prompts)
+    drawn = generate(model, params, prompts, 6, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+
+    walked = np.asarray(prompts)
+    for _ in range(6):
+        scores = np.asarray(model.apply(params, jnp.asarray(walked))[:, -1])
+        walked = np.concatenate([walked, scores.argmax(-1)[:, None].astype(np.int32)], axis=1)
+    np.testing.assert_array_equal(np.asarray(drawn.tokens), walked)
+    np.testing.assert_array_equal(np.asarray(drawn.lengths), 6)
+    np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs), 0.0)
+    for step in range(6):
+        scores = jax.nn.log_softmax(model.apply(params, jnp.asarray(walked[:, :3 + step]))[:, -1])
+        chosen = walked[:, 3 + step]
+        np.testing.assert_allclose(drawn.raw_log_probs[:, step],
+                                   np.asarray(scores)[np.arange(2), chosen], atol=3e-6, rtol=0)
+
+
+def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
+    """A block commits its tokens in order, so an EOS drawn at the second of
+    three candidates is emitted with its likelihoods and every later slot of
+    that row stays padding."""
+    model = predictor()
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    eos = 4
+
+    def script(state, logits):
+        """Force the EOS at the second drawn token, leaving the first alone."""
+        forced = jnp.where(jnp.arange(VOCAB)[None, :] == eos, 0.0, -jnp.inf)
+        return jnp.where((state.step == 1)[:, None], forced, logits)
+
+    drawn = generate(model, params, prompt, 6, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0, eos_id=eos, pad_id=0),
+                     logits=(script, decoding.Greedy()), strategy=Speculative(block=3))
+    assert int(drawn.lengths[0]) == 2 and bool(drawn.terminated[0])
+    assert int(np.asarray(drawn.tokens)[0, 4]) == eos
+    np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 5:], 0)
+    np.testing.assert_array_equal(np.asarray(drawn.behavior_log_probs)[0, 2:], 0.0)
+    np.testing.assert_array_equal(np.asarray(drawn.raw_log_probs)[0, 2:], 0.0)
+    # The EOS is an emitted action, so it carries the model's own likelihood.
+    scores = jax.nn.log_softmax(model.apply(
+        params, jnp.asarray(np.asarray(drawn.tokens)[:, :4]))[:, -1])
+    np.testing.assert_allclose(drawn.raw_log_probs[0, 1], scores[0, eos], atol=3e-6, rtol=0)
+
+
+def test_the_prediction_cache_is_rebuilt_from_the_accepted_prefix():
+    """A block's draft writes prediction-layer state for candidates that may
+    be rejected. Running the same request twice has to give the same answer,
+    and it has to be the greedy walk, which a prediction cache that kept
+    rejected entries would drift away from over several blocks."""
+    model = predictor()
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    short = generate(model, params, prompt, 2, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0), strategy=Speculative(block=2))
+    long = generate(model, params, prompt, 8, key=jax.random.key(1),
+                    sampling=Sampling(temperature=0), strategy=Speculative(block=2))
+    plain = generate(model, params, prompt, 8, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(long.tokens), np.asarray(plain.tokens))
+    np.testing.assert_array_equal(np.asarray(long.tokens)[:, :5], np.asarray(short.tokens))
+
+
+def test_a_model_without_prediction_depths_is_refused():
+    model = decoder()
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    with pytest.raises(ValueError, match="no prediction depths|declares none"):
+        generate(model, params, prompt, 2, key=jax.random.key(0), strategy=Speculative(block=2))
+
+
+def test_a_draft_that_loses_confidence_ends_the_block_on_a_target_draw():
+    """Below the confidence threshold the proposer simply stops offering, so
+    the block ends on an ordinary target draw. Treating that as a rejection
+    would ask for the positive part of `p - q` where the two are equal, which
+    is nothing at all."""
+    target = spread({3: 0.5, 4: 0.5})
+    open_ = run(target, [target] * 3, 512, 5, 4, seed=2)
+    np.testing.assert_array_equal(np.asarray(open_.valid).sum(axis=1), 5)
+    assert set(np.unique(np.asarray(open_.tokens)[np.asarray(open_.valid)]).tolist()) == {3, 4}
+    # A threshold no draft of this distribution can meet truncates every block
+    # after its free target draw, and the emitted law is unchanged.
+    guarded = run_with(Speculative(block=4, confidence=0.9), target, [target] * 3, 512, 5, seed=2)
+    np.testing.assert_array_equal(np.asarray(guarded.valid).sum(axis=1), 5)
+    share = float(np.mean(np.asarray(guarded.tokens)[np.asarray(guarded.valid)] == 3))
+    assert abs(share - 0.5) < 0.03, f"share {share:g}"
+
+
+def test_the_prediction_cache_matches_a_teacher_forced_reference():
+    """The prompt seeds the prediction cache, and a cached draft step then has
+    to produce what an uncached pass over the same pairing produces. A cache
+    left empty, paired with the wrong hidden state, or written at the wrong
+    position all show up here and nowhere in the emitted tokens, because the
+    proposal does not change the law."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor()
+    prompt = jnp.asarray([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    width = prompt.shape[1]
+    states = model.apply(params, prompt, method=model.hidden_states)
+    reference = model.apply(params, states[:, :-1], prompt[:, 1:], depth=0,
+                            positions=jnp.broadcast_to(jnp.arange(1, width)[None, :],
+                                                       (2, width - 1)),
+                            method=model.mtp_step)[0]
+
+    ops = _operations(model, params, 0, 1)
+    seeded, _ = _prefill(model, params, ModelInputs(prompt[:, :-1]), ops)
+    _, cached, _ = ops.propose(seeded, states[:, width - 2:width - 1], prompt[:, width - 1:width],
+                               jnp.ones((2, 1), bool),
+                               jnp.full((2, 1), width - 1, jnp.int32), 0)
+    largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
+    assert largest < 2e-5, f"largest difference {largest:g}"
+
+    # Writing one more accepted token through the same seam keeps agreeing,
+    # which is what a block does after it decides its accepted prefix.
+    grown = jnp.concatenate([prompt, jnp.asarray([[2], [3]], jnp.int32)], axis=1)
+    ahead = model.apply(params, grown, method=model.hidden_states)
+    full, _ = _prefill(model, params, ModelInputs(prompt), ops)
+    full = reseed(ops, full, states[:, width - 1:width], grown[:, width:width + 1],
+                  jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32))
+    _, after, _ = ops.propose(full, ahead[:, width:width + 1], jnp.asarray([[5], [5]], jnp.int32),
+                              jnp.ones((2, 1), bool), jnp.full((2, 1), width + 1, jnp.int32), 0)
+    plain = model.apply(
+        params, jnp.concatenate([ahead, ahead[:, -1:]], axis=1)[:, :-1],
+        jnp.concatenate([grown[:, 1:], jnp.asarray([[5], [5]], jnp.int32)], axis=1), depth=0,
+        positions=jnp.broadcast_to(jnp.arange(1, width + 2)[None, :], (2, width + 1)),
+        method=model.mtp_step)[0]
+    largest = float(np.max(np.abs(np.asarray(after)[:, 0] - np.asarray(plain)[:, -1])))
+    assert largest < 2e-5, f"largest difference {largest:g}"

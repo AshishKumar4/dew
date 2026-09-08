@@ -1509,6 +1509,15 @@ class CausalTransformer(nn.Module):
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
+    def states_and_logits(self, tokens, **kwargs):
+        """The final hidden states and their logits from one forward.
+
+        A speculative decoder verifies with both: the logits give the target
+        distribution and the states seed the next block's prediction depths.
+        """
+        x = self.hidden_states(tokens, **kwargs)
+        return x, self._logits(x)
+
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
         # fp32 head, as in the DiT output projection: the loss is computed in fp32
@@ -1582,6 +1591,8 @@ class CausalTransformer(nn.Module):
         Call init_mtp_cache before cached steps. The hidden input is the
         target model's preceding state; tokens or input_embeddings supply
         the candidate next token, as in vLLM's Qwen3_5MultiTokenPredictor.
+        Returns the step's logits and its own hidden state, which the next
+        step of a chained draft consumes in place of the target's.
         """
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
@@ -1589,7 +1600,7 @@ class CausalTransformer(nn.Module):
         state = self.mtp[depth](hidden, embeds, positions=positions, decode=decode,
                                 attention_metadata=AttentionMetadata(valid=attention_mask,
                                                                     rotary_positions=rotary_positions))
-        return self._logits(state)
+        return self._logits(state), state
 
     def init_mtp_cache(self, batch_size: int):
         """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
@@ -1956,3 +1967,24 @@ class CausalTransformer(nn.Module):
         the ones after it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+
+
+def gather_cache_rows(cache, rows):
+    """A decode cache reindexed on its batch axis, one gather per leaf.
+
+    Outside the layer stack a cache holds one subtree per layer, and every
+    leaf a decode step writes carries its batch on axis zero: dense keys and
+    values with their cached validity and cursor, a gated delta net's
+    convolution and recurrent state, latent attention's compressed cache,
+    cached image groups, and a multimodal model's next position. The scanned
+    stack's layer axis exists only inside `run_stack`; `StackView` removes it
+    before the cache crosses `apply`, so axis zero is the row here whatever
+    the stack did.
+
+    `rows` is any index array: repeats duplicate a row's whole decode state,
+    a permutation reparents rows, and a shorter or longer array changes the
+    row count. Beam branching and speculative rollback are both this
+    operation. Nothing else in the tree depends on the row order, so the
+    gathered cache decodes exactly as the rows it came from.
+    """
+    return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

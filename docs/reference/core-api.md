@@ -167,7 +167,7 @@ Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
 generate(model, params, inputs, max_new_tokens, *, key=None, seed=None,
-         sampling=Sampling(), n=1, logits=(), stopping=(), strategy=None) -> Generation
+         sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
 ```
 
@@ -196,14 +196,13 @@ StepState(tokens, valid, step, active, keys, prompt_width)
 
 `StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` and `generated()` the two regions, and `total()` the real token count. A transform never sees model parameters or cache internals.
 
-`logits` and `stopping` take a callable or a sequence of them. A call's tuple replaces the bound one whole, so a caller adds to a task's components by concatenation: `logits=task.logits + (mine,)`. The chain runs in the order given and the `sampling` tail runs after it. Criteria combine with OR and run after every committed token. A criterion that fires marks the row terminated, the token that fired it is emitted with its likelihoods, and later slots hold `pad_id` with zero likelihood. `strategy=None` runs `Sample`, which draws every row independently.
+`logits` is the whole transform chain, in the order it runs. Left as `None` it is what `sampling` compiles to, an explicit sequence replaces that entirely, and `()` runs no transform, so a caller who needs an order `Sampling` does not produce writes the order they want. A call's value replaces a task's bound one, and an explicit `sampling=` on a call also clears a bound chain, because that chain was built around the policy the call just replaced. `stopping` composes instead: an explicit sequence runs beside the policy's EOS criterion rather than replacing it, so naming a criterion cannot drop termination. Criteria combine with OR and run after every committed token; the token that fired one is emitted with its likelihoods and later slots hold `pad_id` with zero likelihood.
 
-Built-in transforms are pytrees, so a configuration holding arrays travels as data rather than entering a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` carries array configuration for one. Everything runs inside the compiled loop; there is no host callback.
+Built-in transforms are pytrees, so a configuration holding arrays travels as data rather than entering a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` carries array configuration for one. Everything runs inside the compiled loop; there is no host callback. Across a pool the resolved components are compared by their structure and by the contents of their configuration arrays, so two ranks banning different tokens are refused rather than quietly running two policies.
 
 ```python
-import jax, jax.numpy as jnp
-from dew.sampling import Sampling, generate
-from dew.sampling import decoding
+import jax.numpy as jnp
+from dew.sampling import Beam, Sampling, Speculative, decoding, generate
 
 
 def favor_short(state, logits):
@@ -211,14 +210,29 @@ def favor_short(state, logits):
     return logits.at[:, 2].add(jnp.where(state.step >= 8, 3.0, 0.0))
 
 
-result = generate(
+# The chain is complete, so the policy's own filters are written into it.
+drawn = generate(
     model, variables, prompts, 32, seed=0,
-    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
+    sampling=Sampling(eos_id=2, pad_id=0),
     logits=(decoding.RepetitionPenalty(1.1),
             decoding.NoRepeatNGram(3),
             decoding.FrequencyPenalty(0.4),
-            favor_short),
+            favor_short,
+            decoding.Temperature(0.8),
+            decoding.TopP(0.9)),
     stopping=(decoding.MaxNewTokens(24),))
+
+# The same request as a deterministic search over four beams, returning two.
+searched = generate(model, variables, prompts, 32, seed=0,
+                    sampling=Sampling(eos_id=2, pad_id=0),
+                    logits=(decoding.NoRepeatNGram(3),),
+                    strategy=Beam(width=4, length_penalty=1.0), n=2)
+
+# Or drafted by the model's own prediction depths, with the same law as the
+# first call and fewer target forwards.
+drafted = generate(model, variables, prompts, 32, seed=0,
+                   sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
+                   strategy=Speculative(block=4))
 ```
 
 The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
@@ -257,15 +271,31 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `EndOfSequence(eos)` | `EosTokenCriteria` | what `Sampling.eos_id` compiles to |
 | `MaxNewTokens(count)` | | a budget below `max_new_tokens` |
 | `MaxLength(length)` | `MaxLengthCriteria` | prompt and generated tokens together |
-| `stop_strings(processor, strings, vocab_size)` | `StopStringCriteria` | |
+| `stop_strings(tokenizer, strings, vocab_size=None)` | `StopStringCriteria` | |
 
-`stop_strings` reads the tokenizer once, on the host, and compiles where every token can sit inside each stop string and how many of the string's trailing characters its start can cover. The criterion then runs entirely on device and never decodes. A string counts only when it touches the token just drawn, so a string produced earlier does not stop the row later, and a string spelled across several tokens or overhanging either end does stop it. `processor` is anything with the task `Processor`'s `decode(tokens) -> list[str]`. A token's text is read by decoding `probe` followed by that token and dropping what `probe` alone produces, because a tokenizer's decoder adds or removes a leading space depending on what came before.
+`stop_strings` reads the tokenizer once, on the host, and compiles where every token's piece can sit inside each stop string and how many of the string's trailing units its start can cover. The criterion then runs entirely on device and never decodes. A string counts only when it touches the token just drawn, so a string produced earlier does not stop the row later, and a string spelled across several tokens or overhanging either end does stop it. A byte-level or byte-fallback vocabulary is read through its byte spelling and matched over UTF-8 bytes, so a stop string whose code point two tokens split still ends the row; every other vocabulary is read through `convert_tokens_to_string` behind an ordinary prefix, because a decoder adds or removes a leading space depending on what came before. `tokenizer` is a Transformers tokenizer or a task `Processor` holding one, and `vocab_size` sizes the table for a model whose head is wider than the vocabulary.
 
-An active row whose chain leaves no finite score has no distribution to draw from, and `generate` raises rather than returning the first index. Add `RemoveInvalidValues()` to repair one deliberately.
+An active row is drawable only when every score is finite or `-inf` and at least one is finite. A NaN or a `+inf` beside a finite score makes the draw arbitrary, and a row with nothing finite has no distribution at all, so `generate` raises instead of returning an index; a zero-temperature policy passes such a row through rather than collapsing it onto an argmax. The same holds for the model's own distribution: an undefined one cannot be reported truthfully, so it raises rather than returning a NaN likelihood, whatever a later `RemoveInvalidValues()` does to the scores. Add that transform to repair scores a chain itself made invalid.
+
+#### Strategies
+
+```text
+Sample()
+Beam(width=1, length_penalty=1.0, early_stopping=False, stop_ids=1)
+Speculative(block=4, confidence=0.0)
+```
+
+`Sample` draws every row independently and is what a request without a strategy runs.
+
+`Beam` is deterministic beam search, with `_beam_search`'s bookkeeping from Transformers 5.16.1: a step keeps the best `(1 + stop_ids) * width` continuations so `width` live beams always remain, a criterion moves one into the completed set with its score divided by its generated length raised to `length_penalty`, and `early_stopping` takes the reference's `False`, `True` and `"never"`. The prompt is prefilled once and copied into `width` cache rows, which each step reparents, so a branched beam decodes exactly like a separately selected prefix. `n` is how many completed hypotheses to return and `n > width` is an error. A selected path is a search result rather than a draw, so its behaviour log probability is zero while the raw ones stay the model's own. Sampling with beams is refused: the marginal probability of a selected beam is not the per-step candidate probability, so there is no honest behaviour likelihood to record.
+
+`Speculative` drafts with the model's own prediction depths and verifies with the model, following algorithm 1 of [arXiv 2211.17192](https://arxiv.org/abs/2211.17192) as `_speculative_sampling` applies it. The first candidate of a block is an ordinary target draw, so it is always accepted, and each depth chains the next from the previous hidden state and the candidate's embedding. A proposal is accepted with probability `min(1, p(x) / q(x))` for the target's post-transform `p` and the draft's actual `q`; the first rejection draws from the normalized positive part of `p - q`, and a block with nothing rejected draws a bonus from `p`. The emitted tokens are therefore distributed exactly as `Sample` distributes them, though not draw for draw at one seed. Every emitted action records the target's post-transform log probability as its behaviour and the model's own as its raw value; the draft's `q`, the acceptance probability and the residual are never recorded. `confidence` stops the draft after the first candidate the draft is less sure of, as `ConfidenceCriteria` does; a candidate the draft never offered was not rejected, so the block then ends on an ordinary target draw. A model without prediction depths is refused rather than silently falling back.
+
+The target cache is saved before a block and the accepted prefix is replayed into it, because a recurrent mixer keeps a running summary no cursor can rewind. The prediction cache is rebuilt the same way, from the target's hidden state at the position before each accepted token paired with that token at its own position, which is the pairing `MTPCandidateGenerator` corrects with and `Qwen3_5MultiTokenPredictor.forward` takes; the prompt seeds it before the first block. A block emits at least two tokens, so `ceil(budget / 2)` iterations always reach the budget, and it costs two target forwards whatever the block size.
 
 #### Source generation controls
 
-A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform or criterion carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
+A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The transforms a source binds are the complete chain, built in `_get_logits_processor`'s order, so the policy tail lands where the reference puts it; a source running beam search ends its chain after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
 
 | Control | Native mapping | Refused because |
 | --- | --- | --- |
@@ -287,7 +317,7 @@ A loaded source's `generation_config.json` is data. Every control Transformers 5
 | `exponential_decay_length_penalty` | `ExponentialDecayLengthPenalty` | |
 | `remove_invalid_values` | `RemoveInvalidValues` | |
 | `renormalize_logits` | `Renormalize` | |
-| `typical_p`, `epsilon_cutoff`, `eta_cutoff`, `top_h` | `Typical`, `EpsilonCutoff`, `EtaCutoff`, `TopH` | together with an active `temperature`, `top_k`, `top_p` or `min_p` they would filter in a different order than the reference, because the policy tail runs after the source's transforms |
+| `typical_p`, `epsilon_cutoff`, `eta_cutoff`, `top_h` | `Typical`, `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
 | `stop_strings` | `stop_strings` | without the source's processor or the model's `vocab_size` there is no vocabulary to compile |
 | `use_cache` | native decoding always runs through its own cache | `use_cache=False` |
 | `cache_implementation` | the fixed-capacity static cache | any other implementation |
@@ -299,8 +329,10 @@ A loaded source's `generation_config.json` is data. Every control Transformers 5
 | `output_attentions`, `output_hidden_states`, `output_scores`, `output_logits` | | generation returns tokens, lengths, termination and both likelihood arrays, and none of these |
 | `return_dict_in_generate` | generation always returns a record | |
 | `transformers_version`, `_from_model_config`, `_commit_hash`, `tokenizer_name` | provenance | |
-| `num_beams`, `early_stopping`, `length_penalty` | | beam search is not implemented |
+| `num_beams`, `early_stopping`, `length_penalty` | `Beam(width, length_penalty, early_stopping)`, with `stop_ids` from the EOS ids | |
 | `do_sample` with `num_beams` | | a selected beam's marginal probability is not the per-step candidate probability, so no honest behaviour likelihood exists |
+| `num_beams` with `use_mtp` | | a request cannot run two strategies |
+| `num_return_sequences` above `num_beams` | | a search returns at most its width |
 | `num_beam_groups`, `diversity_penalty` | | diverse group beam search is not implemented |
 | `constraints`, `force_words_ids` | | constrained beam search is not implemented |
 | `max_time` | | a host clock cannot stop a coordinated device loop |
@@ -309,9 +341,10 @@ A loaded source's `generation_config.json` is data. Every control Transformers 5
 | `penalty_alpha` | | contrastive search is a decoding strategy that is not implemented |
 | `dola_layers` | | DoLa is a decoding strategy that is not implemented |
 | `watermarking_config` | | no watermarking transform is implemented |
-| `use_mtp`, `speculation_type`, `num_assistant_tokens` | | a decoding strategy is the caller's choice, not the checkpoint's |
+| `use_mtp`, `speculation_type`, `num_assistant_tokens` | `Speculative(block=num_assistant_tokens + 1)`, the drafted count plus the block's own target draw | a checkpoint without prediction-depth weights, or a proposer other than the model's own depths |
 | `assistant_ensemble_weight` below one | | ensemble verification below one accepts a biased distribution |
-| `num_assistant_tokens_schedule`, `assistant_confidence_threshold` | | an adaptive or confidence-gated proposal cannot fix the device block size |
+| `assistant_confidence_threshold` | `Speculative(confidence=...)`, which stops the draft without changing the block size | |
+| `num_assistant_tokens_schedule` | | an adaptive proposal length cannot fix the device block size |
 | `assistant_early_exit` | | early-exit proposal is not implemented |
 | `assistant_lookbehind`, `target_lookbehind` | | translating between two tokenizers' token spaces is not implemented |
 | `prompt_lookup_num_tokens`, `max_matching_ngram_size` | | prompt lookup proposal is not implemented |
@@ -328,7 +361,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, ema=True, step=None, rev
 Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
 LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
-               max_length=None, n=1, logits=(), stopping=(), strategy=None)
+               max_length=None, n=1, logits=None, stopping=(), strategy=None)
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
      images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
@@ -361,7 +394,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
 
-Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's transforms and criteria as `logits` and `stopping`, and take their continuation count from `num_return_sequences`. An explicit `sampling=` replaces the policy value alone, because the components are separate; pass `logits=()` and `stopping=()` on a call to drop them, and `n` stays what the source asked for either way. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
+Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and take their return count from `num_return_sequences`. An explicit `sampling=` replaces the policy and clears the chain with it, because the chain was built around that policy; the criteria, the strategy and the return count still come from the source. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
 
 `BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()`, `text` and continuation rows. Its continuations refine the shared encoded prompt independently, each over the original prompt rows, so the batch-wide canvas draw a row sees is the one a single continuation sees. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose sampler pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; exactly one of `steps` and `times` is passed, and an explicit grid decides the trajectory's length. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
 
