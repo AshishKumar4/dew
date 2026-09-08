@@ -33,7 +33,7 @@ ValueError naming it.
 import dataclasses
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Protocol,
@@ -2523,6 +2523,8 @@ class DecoderFamily:
     export_model_type: str
     architecture: str
     export_fields: Callable[[CausalTransformer], dict[str, object]]
+    preserve_source_layout: bool = field(kw_only=True)
+    """Bind source tensor names/config for export instead of deriving them from the model."""
     weight_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]] = _dew_path
     export_path: Callable[[str, Mapping[str, object]], Optional[str]] = _hf_name
     sandwich_norms: bool = False
@@ -2913,12 +2915,12 @@ _FAMILY_ENTRIES = (
                                            or fields.get('num_kv_shared_layers'))),
                   'diffusion_gemma_text', 'DiffusionGemmaForBlockDiffusion',
                   _diffusion_gemma_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare),
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare, preserve_source_layout=False),
     DecoderFamily(('dream', 'Dream'), _dream_config,
                   lambda fields: bool(fields.get('causal') is False
                                       and fields.get('attention_bias')
                                       and fields.get('o_proj_bias') is False),
-                  'dream', 'DreamModel', _dream_export),
+                  'dream', 'DreamModel', _dream_export, preserve_source_layout=True),
     DecoderFamily(('llada',), _llada_config,
                   lambda fields: bool(fields.get('causal') is False
                                       and not fields.get('attention_bias')
@@ -2929,89 +2931,82 @@ _FAMILY_ENTRIES = (
                                       and not fields.get('output_gate')
                                       and not fields.get('qk_norm')),
                   'llada', 'LLaDAModelLM', _llada_export,
-                  weight_path=_llada_path, export_path=_llada_export_path),
+                  weight_path=_llada_path, export_path=_llada_export_path, preserve_source_layout=True),
     DecoderFamily(('gpt_oss',), _gpt_oss_config,
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
                   weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path,
-                  prepare_weights=unpack_mxfp4),
+                  prepare_weights=unpack_mxfp4, preserve_source_layout=False),
     DecoderFamily(('llama4_text',), _llama4_config,
                   lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
                   'llama4_text', 'Llama4ForCausalLM', lambda model: {},
-                  weight_path=_llama4_path, prepare_weights=_llama4_prepare),
+                  weight_path=_llama4_path, prepare_weights=_llama4_prepare, preserve_source_layout=True),
     DecoderFamily(('glm4_moe',), _glm4_moe_config,
                   lambda fields: (fields['partial_rotary_type'] == 'default'
                                   and (mixture := _mixture_value(fields)) is not None
                                   and mixture.bias),
                   'glm4_moe', 'Glm4MoeForCausalLM', lambda model: {},
-                  weight_path=_glm4_moe_path),
+                  weight_path=_glm4_moe_path, preserve_source_layout=True),
     DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
                   lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
                                   and mixer.index_topk is not None),
-                  'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}),
+                  'deepseek_v32', 'DeepseekV32ForCausalLM', lambda model: {}, preserve_source_layout=True),
     DecoderFamily(('deepseek_v2',), partial(_deepseek_config, mixture=_deepseek_v2_mixture),
                   lambda fields: (isinstance(_mixer_value(fields), MLAMixer)
                                   and (mixture := _mixture_value(fields)) is not None
                                   and not mixture.bias),
-                  'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}),
-    # Kimi K2 computes what DeepSeek V3 does, under its own model_type,
-    # vocabulary, rope base and routing widths. A built model's fields
-    # therefore name no family of its own, and `matches` returning False
-    # keeps this entry off the model side of the registry so a V3 model is
-    # never written under Kimi's name. A loaded Kimi checkpoint keeps its
-    # provenance instead: its tensors and its own config go back out
-    # through pretrained._SOURCE_LAYOUT_FAMILIES. The export vocabulary
-    # here names the class the release's auto_map points at, which is what
-    # transformers implements for these weights.
+                  'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}, preserve_source_layout=True),
+    # Kimi and DeepSeek V3 share a computation; only source provenance names Kimi.
+    # Derived-model export therefore never selects Kimi via `matches`.
     DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
+                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
-                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
+                  'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
     DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
                   lambda fields: bool(fields['output_gate'] and _mixture_value(fields) is not None),
                   'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
-                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare),
+                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
     DecoderFamily((_QWEN35,), _qwen35_config,
                   lambda fields: bool(fields['output_gate']
                                       or 'linear_attention' in (fields['layer_types'] or ())),
-                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path),
+                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path, preserve_source_layout=True),
     DecoderFamily(('olmo3',), _olmo3_config,
                   lambda fields: not fields['pre_norms'],
-                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),
+                  'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True, preserve_source_layout=True),
     DecoderFamily(('gemma3n_text',), _gemma3n_config,
                   lambda fields: fields['altup'] is not None,
                   'gemma3n_text', 'Gemma3nForCausalLM', _gemma3_export, sandwich_norms=True,
-                  weight_path=_gemma3n_path),
+                  weight_path=_gemma3n_path, preserve_source_layout=True),
     DecoderFamily(('gemma4_text',), _gemma4_config,
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),
                   'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare),
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
     DecoderFamily((_GEMMA,), _gemma3_config,
                   lambda fields: bool(fields['sandwich_norms'] and fields['qk_norm']),
-                  _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True),
+                  _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True, preserve_source_layout=False),
     DecoderFamily(('gemma2',), _gemma2_config,
                   lambda fields: bool(fields['sandwich_norms']),
-                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True),
+                  'gemma2', 'Gemma2ForCausalLM', _gemma2_export, sandwich_norms=True, preserve_source_layout=False),
     DecoderFamily(('gemma',), _gemma_config,
                   lambda fields: bool(fields['embedding_scale']),
-                  'gemma', 'GemmaForCausalLM', lambda model: {}),
+                  'gemma', 'GemmaForCausalLM', lambda model: {}, preserve_source_layout=False),
     DecoderFamily(('qwen3_moe',), _qwen3_moe_config,
                   lambda fields: bool(fields['qk_norm'] and fields['mixture'] is not None),
-                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export),
+                  'qwen3_moe', 'Qwen3MoeForCausalLM', _qwen3_export, preserve_source_layout=True),
     DecoderFamily(('qwen3',), _qwen3_config, lambda fields: bool(fields['qk_norm']),
-                  'qwen3', 'Qwen3ForCausalLM', _qwen3_export),
+                  'qwen3', 'Qwen3ForCausalLM', _qwen3_export, preserve_source_layout=False),
     DecoderFamily(('qwen2',), _qwen2_config,
                   lambda fields: bool(fields['attention_bias'] and fields['o_proj_bias'] is False),
-                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export),
+                  'qwen2', 'Qwen2ForCausalLM', _qwen3_export, preserve_source_layout=False),
     DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields['mixture'] is not None,
                   'mixtral', 'MixtralForCausalLM', lambda model: {},
-                  weight_path=_mixtral_path),
+                  weight_path=_mixtral_path, preserve_source_layout=True),
     DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
-                  'mistral', 'MistralForCausalLM', lambda model: {}),
+                  'mistral', 'MistralForCausalLM', lambda model: {}, preserve_source_layout=False),
     DecoderFamily(('llama',), _base_config, lambda fields: True,
-                  'llama', 'LlamaForCausalLM', lambda model: {}),
+                  'llama', 'LlamaForCausalLM', lambda model: {}, preserve_source_layout=False),
 )
 _FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
 

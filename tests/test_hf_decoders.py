@@ -116,6 +116,28 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
+def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, monkeypatch):
+    from shutil import copytree
+    from dew.interop import hf_decoders
+
+    alias = "dream_registered_alias"
+    family = hf_decoders._FAMILIES["dream"]
+    monkeypatch.setitem(hf_decoders._FAMILIES, alias,
+                        dataclasses.replace(family, model_types=(*family.model_types, alias)))
+    source = copytree(FIXTURES / "dream-tiny", tmp_path / "source")
+    config = fixture_config("dream-tiny")
+    config["model_type"] = alias
+    (source / "config.json").write_text(json.dumps(config))
+    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    destination = tmp_path / "export"
+    loaded.save(destination)
+    assert json.loads((destination / "config.json").read_text()) == config
+    restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    ids = np.load(source / "input_ids.npy")
+    np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
+                                  restored.model.apply(restored.variables, ids))
+
+
 def fp32_decoder(directory, **kwargs):
     """The fixture as a model plus variables, in fp32 on the reference kernel."""
     pretrained = load_pretrained(str(directory), dtype='float32',

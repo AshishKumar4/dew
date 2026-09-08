@@ -501,28 +501,6 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
     return path, None
 
 
-# The decoder families whose checkpoint the leaf map runs backwards, so a
-# trained model writes back into the source's own tensor names beside the
-# config, generation config and tokenizer it came with. A family outside
-# this set saves through the decoder writer, which derives a config
-# instead. The routed-family update/export tests live in test_decoder_export.py
-# and the masked-diffusion ones in test_masked_diffusion_export.py.
-#
-# LLaDA and Dream are here for what their config carries rather than for a
-# routed layout: LLaDA names its tensors OLMo-style, which only its own
-# family map spells, and both reserve a mask_token_id and the bidirectional
-# reading their masked-diffusion reference needs. Writing either through the
-# derived-config writer would drop those and rename LLaDA's tensors, so the
-# source layout is what puts a trained checkpoint back where it came from.
-# Kimi K2 is here because a derived config cannot know it: it computes what
-# DeepSeek V3 does, so only the source's own config carries its model_type,
-# vocabulary and rope base back out.
-_SOURCE_LAYOUT_FAMILIES = frozenset({
-    "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
-    "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-    "deepseek_v32", "kimi_k2", "llama4_text", "llada", "dream", "Dream", "olmo3"})
-
-
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, component: str | None = None) -> WeightLayout | None:
     """The text family's existing leaf map plus its inverse storage operations."""
@@ -1086,7 +1064,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if family in _SOURCE_LAYOUT_FAMILIES:
+        if decoders._FAMILIES[family].preserve_source_layout:
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
