@@ -598,7 +598,8 @@ class Pretrained:
         return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
                               else _source_sampling(self.config, self.generation_config),
                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                              max_length=_generation_limit(self.config, self.generation_config, "max_length"))
+                              max_length=_generation_limit(self.config, self.generation_config, "max_length"),
+                              n=_return_sequences(self.config, self.generation_config))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -610,7 +611,8 @@ class Pretrained:
                                self.processor, _eos_ids(self.config, self.generation_config),
                                _pad_id(self.config, self.generation_config),
                                max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
-                               max_length=_generation_limit(self.config, self.generation_config, "max_length"))
+                               max_length=_generation_limit(self.config, self.generation_config, "max_length"),
+                               n=_return_sequences(self.config, self.generation_config))
 
     def text_to_image(self) -> TextToImage:
         """The latent diffusion source as an image task with its published policy."""
@@ -700,6 +702,17 @@ def _generation_limit(config: Mapping[str, object], generation_config: Mapping[s
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
+
+
+def _return_sequences(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
+    """The source's continuations per prompt; one when it declares none."""
+    value = _generation_value(config, generation_config, "num_return_sequences")
+    if value is None:
+        return 1
+    if type(value) is not int or value < 1:
+        raise ValueError("num_return_sequences must be a positive integer")
+    return value
+
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
@@ -724,6 +737,7 @@ _SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "
                                  "eos_token_id", "pad_token_id"})
 _TASK_OWNED_CONTROLS = frozenset({
     "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens",
+    "num_return_sequences",
     "use_cache", "cache_implementation", "cache_config",
     "max_cache_len", "prefill_chunk_size", "continuous_batching_config", "compile_config",
     "disable_compile", "low_memory", "use_mtp", "speculation_type", "is_assistant",
@@ -735,7 +749,7 @@ _TASK_OWNED_CONTROLS = frozenset({
     "tokenizer_name",
 })
 _NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
-    "num_return_sequences": (1,), "max_time": (),
+    "max_time": (),
     "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
     "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
     "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),

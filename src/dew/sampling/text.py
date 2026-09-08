@@ -16,7 +16,8 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import (ArrayT, ModelInputs, RowPlan, continuation_keys, generation_signature,
+                           local_rows, mesh_of, prompt_major, request_key)
 from dew.objectives.base import Variables
 
 
@@ -61,6 +62,10 @@ class Generation(Generic[ArrayT]):
     have shape [B, max_new_tokens]. Only positions below ``lengths`` are valid.
     ``behavior_log_probs`` describes the temperature/top-k/top-p/min-p distribution that
     drew each action. ``raw_log_probs`` describes the unmodified model policy.
+
+    A request for ``n`` continuations per prompt gives every array
+    ``[B * n, ...]`` rows: prompt zero's ``n`` continuations, then prompt
+    one's. Each row carries its own length, termination and likelihoods.
 
     Arrays keep the placement the task ran with: on a mesh they are global
     arrays whose rows split over the batch axes, padded to the device count.
@@ -189,33 +194,58 @@ def _decode(model: nn.Module, params: Variables, state: DecoderState,
                                    jnp.where(active, raw, 0.0))
 
 
-def _generate(model: nn.Module, params: Variables, inputs: ModelInputs,
-              keys: jax.Array, max_new_tokens: int, sampling: Sampling) -> Generation:
-    """One fixed compiled scan; finished rows do not mutate their cache state."""
-    batch = inputs.tokens.shape[0]
-    if max_new_tokens == 0:
-        empty = jnp.zeros((batch, 0), jnp.float32)
-        return Generation(inputs.tokens, jnp.zeros(batch, jnp.int32),
-                          jnp.zeros(batch, bool), empty, empty)
-    initial = _prefill(model, params, inputs)
+def _scan_from(model: nn.Module, params: Variables, initial: DecoderState, keys: jax.Array,
+               max_new_tokens: int, sampling: Sampling) -> tuple[DecoderState, TokenSample]:
+    """The decode scan from one prefilled state; samples come back [B, T]."""
 
     def step(state, _):
         return _decode(model, params, state, keys, sampling)
 
     state, samples = lax.scan(step, initial, None, length=max_new_tokens)
-    samples = jax.tree.map(lambda value: jnp.swapaxes(value, 0, 1), samples)
-    return Generation(jnp.concatenate([inputs.tokens, samples.tokens], axis=1),
-                      state.lengths, state.finished & jnp.any(inputs.token_fields["attention_mask"], axis=1),
+    return state, jax.tree.map(lambda value: jnp.swapaxes(value, 0, 1), samples)
+
+
+def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
+              max_new_tokens: int, sampling: Sampling, n: int) -> Generation:
+    """One fixed compiled scan; finished rows do not mutate their cache state.
+
+    The ``n`` continuations of a prompt share its prefill and run as
+    independent scans over that state, mapped over the continuation axis, so
+    the parameters and the prompt's cache are read once and no continuation
+    prefills again. Their rows leave in prompt order, each prompt's
+    continuations together.
+    """
+    batch = inputs.tokens.shape[0]
+    prompt = inputs.tokens if n == 1 else jnp.repeat(inputs.tokens, n, axis=0)
+    real = jnp.any(inputs.token_fields["attention_mask"], axis=1)
+    if max_new_tokens == 0:
+        empty = jnp.zeros((batch * n, 0), jnp.float32)
+        return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
+                          jnp.zeros(batch * n, bool), empty, empty)
+    initial = _prefill(model, params, inputs)
+    if n == 1:
+        state, samples = _scan_from(model, params, initial, keys, max_new_tokens, sampling)
+        lengths, finished = state.lengths, state.finished
+    else:
+        state, samples = lax.map(
+            lambda row: _scan_from(model, params, initial, row, max_new_tokens, sampling),
+            continuation_keys(keys, n))
+        (lengths, finished), samples = prompt_major(((state.lengths, state.finished), samples))
+        real = jnp.repeat(real, n, axis=0)
+    return Generation(jnp.concatenate([prompt, samples.tokens], axis=1), lengths, finished & real,
                       samples.behavior_log_probs, samples.raw_log_probs)
 
 
 def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling) -> ModelInputs:
+               conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling,
+               n: int) -> ModelInputs:
     """Host checks shared by every caller; returns device inputs with a binary mask."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a non-negative integer")
+    if type(n) is not int or n < 1:
+        raise ValueError("n must be a positive integer number of continuations")
     valid = np.asarray(fields.get("attention_mask", np.ones(ids.shape, bool)))
     if valid.shape != ids.shape or not np.all((valid == 0) | (valid == 1)):
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
@@ -243,26 +273,26 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
 
 @functools.lru_cache(maxsize=None)
 def _compiled(rows: jax.sharding.NamedSharding | None):
-    return jax.jit(_generate, static_argnames=("model", "max_new_tokens", "sampling"),
+    return jax.jit(_generate, static_argnames=("model", "max_new_tokens", "sampling", "n"),
                    in_shardings=(None, rows, rows), out_shardings=rows)
 
 
 @overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array, sampling: Sampling = Sampling()) -> Generation: ...
+             *, key: jax.Array, sampling: Sampling = Sampling(), n: int = 1) -> Generation: ...
 
 
 @overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, seed: int, sampling: Sampling = Sampling()) -> Generation: ...
+             *, seed: int, sampling: Sampling = Sampling(), n: int = 1) -> Generation: ...
 
 
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: jax.Array | None = None, seed: int | None = None,
-             sampling: Sampling = Sampling()) -> Generation:
+             sampling: Sampling = Sampling(), n: int = 1) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 
     ModelInputs.token_fields["attention_mask"] identifies real tokens. Missing masks mean all
@@ -273,9 +303,14 @@ def generate(model: nn.Module, params: Variables,
     Parameters keep their placement. On a mesh, rows split over its batch
     axes and the result keeps that sharding; ``Generation.host()`` reads a
     process's own rows back. All cooperating processes use the same input
-    shapes and sampling value and execute a fixed decode trip count. Keys
-    fold in the global row index and the response position, so a pool draws
-    what one process draws for the same rows.
+    shapes, sampling value and continuation count, and execute a fixed decode
+    trip count. Keys fold in the global row index and the response position,
+    so a pool draws what one process draws for the same rows.
+
+    ``n`` continuations of each prompt share its prefill and leave as ``n``
+    consecutive rows of every array, in prompt order. Continuation zero of a
+    prompt draws with that prompt's own key, so ``n=1`` and continuation zero
+    of any larger request are the same draw.
     """
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
@@ -290,7 +325,7 @@ def generate(model: nn.Module, params: Variables,
         conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
         if "params" not in params:
             raise ValueError("generate takes the full variables dict ({'params': ...})")
-        prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling)
+        prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
     except BaseException as failure:
         error = failure
     if processes > 1:
@@ -303,8 +338,9 @@ def generate(model: nn.Module, params: Variables,
         # Compare fixed-size hashes before creating distributed input arrays.
         # The schema covers all conditioning and token fields, not token length
         # alone; different traced shapes would issue mismatched collectives.
-        digest = generation_signature(prepared, (max_new_tokens, sampling))
-        multihost_utils.assert_equal(digest, "generation input shapes and sampling must agree across processes")
+        digest = generation_signature(prepared, (max_new_tokens, n, sampling))
+        multihost_utils.assert_equal(
+            digest, "generation input shapes, continuations and sampling must agree across processes")
     plan = RowPlan.over(mesh, prepared.tokens.shape[0])
     padded = plan.pad(prepared)
     if plan.count != plan.rows:
@@ -312,5 +348,5 @@ def generate(model: nn.Module, params: Variables,
         mask = np.asarray(padded.token_fields["attention_mask"]) & ~plan.padding[:, None]
         padded = replace(padded, token_fields={**padded.token_fields, "attention_mask": mask})
     output = _compiled(plan.sharding)(model, params, plan.place(padded), plan.keys(random_key),
-                                      max_new_tokens, sampling)
-    return replace(output, rows=plan.rows)
+                                      max_new_tokens, sampling, n)
+    return replace(output, rows=plan.rows * n)

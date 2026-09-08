@@ -30,9 +30,9 @@ For ordinary LM, image-diffusion and block-diffusion objectives, `ema=True` requ
 
 Without `mesh`, the default `MeshSpec()` uses the current process pool's devices in data parallelism. `mesh=MeshSpec(...)` selects another layout. Weight placement uses `Layout.shardings` and its replication check, as the trainer does. Checkpoint restore gets explicit shardings for the current devices; it does not reuse the topology recorded by the writer.
 
-Every process supplies its own rows. The cooperating processes must supply equal row counts and tokenized shapes and use matching execution controls. Invalid inputs, conflicting controls and prepared-input errors are agreed before device collectives.
+Every process supplies its own rows. The cooperating processes must supply equal row counts and tokenized shapes and use matching execution controls, including the same number of continuations. Invalid inputs, conflicting controls and prepared-input errors are agreed before device collectives.
 
-Results contain global row-sharded arrays, including any filler rows needed for device divisibility. `result.host()` returns the same record with NumPy arrays for this process's real rows. It does not gather the other processes' rows. Token generation and image prior noise use global row keys. Canvas refinement and an explicitly sampled VAE posterior use batch-wide keys, so changing their placed batch shape can change the draws.
+Results contain global row-sharded arrays, including any filler rows needed for device divisibility. `result.host()` returns the same record with NumPy arrays for this process's real rows. It does not gather the other processes' rows. Filler rows are added to the prompts, before the continuations exist, so a prompt's continuations stay together on the process that asked for them and the rows `host()` drops belong only to filler prompts. Token generation and image prior noise use global row keys. Canvas refinement and an explicitly sampled VAE posterior use batch-wide keys, so changing their placed batch shape can change the draws.
 
 ```python
 from dew.training import Layout, MeshSpec
@@ -46,7 +46,20 @@ local_pixels = result.host().images
 
 A call takes exactly one of `seed` and `key`. `seed=n` means `jax.random.key(n)`.
 
-`max_new_tokens` is the continuation budget. A checkpoint may supply a default in `generation_config.json`. If only `max_length` is declared, the continuation budget is that total length minus the padded prompt width. An explicit call budget takes precedence. Without either source limit, the caller must provide a budget. Active unsupported controls, including multiple returned sequences or wall-clock stopping, raise when constructing a source-default task.
+`max_new_tokens` is the continuation budget. A checkpoint may supply a default in `generation_config.json`. If only `max_length` is declared, the continuation budget is that total length minus the padded prompt width. An explicit call budget takes precedence. Without either source limit, the caller must provide a budget. Active unsupported controls, such as repetition penalties or wall-clock stopping, raise when constructing a source-default task.
+
+`n` is how many continuations a prompt gets, a positive integer. A checkpoint's `num_return_sequences` becomes the task's default, whatever sampling policy the caller passes; otherwise it is 1. An explicit call `n` takes precedence in both directions, so `n=1` overrides a source asking for more. Every result array then has `n` rows per prompt: prompt zero's continuations first, then prompt one's, in the order the prompts arrived, and `result.rows` counts this process's real prompts times `n`. `Generation.text` returns one string per row in the same order, and every row carries its own length, termination flag and likelihoods.
+
+A prompt is prepared, tokenized and prefilled once for all its continuations, and its media reaches the processor once per call. The continuations then run one after another on the device, with each continuation's prompts batched as they are for a single continuation, so decode time grows with `n` while one continuation's cache working memory is reused by the next; the output arrays are what grows with `n`. Randomness follows the prompt's own key: continuation zero draws with it, so `n=1` and continuation zero of a larger request are the same draw, and continuation `j` folds `j` into that key, so asking for more continuations leaves the ones already drawn unchanged.
+
+```python
+import dew
+
+task = dew.pipeline("runs/shakespeare")
+result = task("ROMEO:", 32, n=4, seed=0)
+for continuation in result.text:
+    print(continuation)
+```
 
 An LM run records its `sampling` value and `sample_tokens` budget. Reloading the run preserves the preview policy. `Sampling` carries temperature, top-k, top-p, min-p, EOS ids and the output padding id. `TextToImage` carries solver, guidance and step defaults. Calls can override these values; `guidance=None` disables classifier-free guidance.
 
