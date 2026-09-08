@@ -44,7 +44,7 @@ def check_solver(process, sampler, steps: int) -> None:
     x = jnp.zeros((1, 1), jnp.float32)
     with jax.ensure_compile_time_eval():
         times = process.times(steps)
-    state = sampler.init(x, times, process)
+    state = sampler.init(x, times, process, key=jax.random.PRNGKey(0))
     if times.shape[0] < 2:
         return
     t, t_next = times[:1], times[1:2]

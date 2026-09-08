@@ -32,12 +32,40 @@ def test_native_source_control_and_gradient_parity(edges, case):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("control", ["thresholding", "use_beta_sigmas", "use_lu_lambdas"])
-def test_unimplemented_active_scheduler_controls_do_not_change_meaning(edges, control):
+@pytest.mark.parametrize("case,control,value", [
+    ("dpm-karras", "use_lu_lambdas", True),
+    ("dpm-karras", "use_flow_sigmas", True),
+    ("dpm-karras", "variance_type", "learned_range"),
+    ("dpm-karras", "prediction_type", "flow_prediction"),
+    ("euler-zero-snr", "interpolation_type", "log_linear"),
+    ("euler-zero-snr", "timestep_type", "continuous"),
+])
+def test_unimplemented_active_scheduler_controls_do_not_change_meaning(edges, case, control, value):
+    """A control the pinned class declares and this reconstruction does not
+    read is refused at load, so a checkpoint whose meaning it changes cannot
+    be sampled as if it were absent."""
     with np.load(edges / "schedulers.npz") as reference:
-        config = json.loads(str(reference["dpm-karras.config"]))
+        config = json.loads(str(reference[case + ".config"]))
     with pytest.raises(ValueError):
-        SourceSchedule.from_config({**config, control: True})
+        SourceSchedule.from_config({**config, control: value})
+
+
+@pytest.mark.parametrize("scheduler,controls", [
+    # The published TCD step reads none of the three limits its config carries.
+    ("TCDScheduler", {"thresholding": True}),
+    ("TCDScheduler", {"clip_sample": True}),
+    # Its epsilon branch ignores thresholding, and DDPM's log-space wide
+    # variance returns a logarithm the step then takes the square root of.
+    ("UniPCMultistepScheduler", {"predict_x0": False, "thresholding": True}),
+    ("DDPMScheduler", {"variance_type": "fixed_large_log"}),
+    ("DDPMScheduler", {"variance_type": "learned"}),
+    ("DPMSolverSDEScheduler", {"use_karras_sigmas": True, "use_beta_sigmas": True}),
+])
+def test_controls_the_published_step_does_not_read_are_refused(scheduler, controls):
+    config = {"_class_name": scheduler, "num_train_timesteps": 20, "beta_start": 0.00085,
+              "beta_end": 0.012, "beta_schedule": "scaled_linear", **controls}
+    with pytest.raises(ValueError):
+        SourceSchedule.from_config(config)
 
 
 def test_source_pndm_does_not_substitute_epsilon_history_for_velocity(edges):

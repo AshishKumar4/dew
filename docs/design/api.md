@@ -201,7 +201,7 @@ process = presets.EDM(sigma_data=0.5)()
 ```python
 class Solver(Protocol):
     State: type                                              # () for one-step solvers; history for multistep
-    def init(self, x, times, process) -> State: ...                   # times: the grid the walk takes
+    def init(self, x, times, process, *, key) -> State: ...          # times: the grid the walk takes; key: the walk root
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise) -> tuple[Array, State]: ...
 
 samples = sample(denoise, x_T, steps, solver=samplers.Heun(), guidance=CFG(4.0, interval=(0.4, 0.6)), key=key)

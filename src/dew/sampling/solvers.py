@@ -1,7 +1,8 @@
 """One reverse step each, from t to t_next, given the model's denoising at t.
 
 A solver is a value. What it needs between steps travels in its state;
-`init` builds it from x_T, a concrete time grid and the process; `step` threads it through
+`init` builds it from x_T, a concrete time grid, the process and the walk's
+root key; `step` threads it through
 `sample`'s scan. The rates of the sampling schedule come from `process`; a
 solver that needs another evaluation of the model (Heun's corrector, RK4's
 stages, KDPM2's midpoint) calls `denoise`. A solver that integrates
@@ -15,6 +16,11 @@ checks each algorithm's endpoint domain before the compiled scan. Finite
 endpoint limits are verified separately in tools/diffusers_limits_reference.py;
 DEIS history, UniPC epsilon correction, and non-++ SDE noise can survive a
 zero-sigma target. Undefined limits raise rather than substitute an update.
+
+`init`'s `key` is the walk's own key, the one `sample` folds per step. Every
+solver draws its per-step noise from the folded key it is handed, so the root
+key is unused except by `DPMSolverSDE`, whose source noise sampler is one
+Brownian tree over the whole trajectory and needs a state its steps share.
 """
 
 from __future__ import annotations
@@ -43,11 +49,14 @@ class Solver(Protocol[StateT]):
     solver's own state type is checked at its call sites.
     """
 
-    def init(self, x, times, process) -> StateT:
+    def init(self, x, times, process, *, key) -> StateT:
         """Prepare state and check endpoint domains on the concrete time grid.
 
         sample() materializes this grid at compile time, so validation adds
-        no host callbacks to the compiled step.
+        no host callbacks to the compiled step. `key` is the walk's root key;
+        a solver whose source draws one correlated path over the whole
+        trajectory keeps that path's state, and every other solver ignores it
+        and draws from the per-step key `step` is handed.
         """
         ...
 
@@ -109,17 +118,30 @@ class DDPM:
     holds for any schedule and any step stride. The
     posterior mean is alpha_s x_0 + alpha_t sigma_s^2 / (alpha_s sigma_t) eps
     and its variance is sigma_s^2 (1 - alpha_t^2 sigma_s^2 / (alpha_s^2 sigma_t^2)).
+
+    `variance` is which of Diffusers 0.34.0's fixed `DDPMScheduler` posterior
+    variances the draw takes: `"small"` is that posterior's own, and `"large"`
+    is the forward step's beta, 1 - alpha_t^2 / alpha_s^2, the wider `Glide`
+    choice. Both are written in rates, so neither assumes alpha^2 + sigma^2 = 1.
     """
 
-    def init(self, x, times, process):
+    variance: Literal["small", "large"] = "small"
+
+    def __post_init__(self) -> None:
+        if self.variance not in ("small", "large"):
+            raise ValueError(f"DDPM's fixed variances are 'small' and 'large', not {self.variance}")
+
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
         noise = jax.random.normal(key, x.shape, dtype=jnp.float32)
         eps_coeff = (sigma_s ** 2 * alpha_t) / (sigma_t * alpha_s)
-        gamma = sigma_s * jnp.sqrt(
-            1 - (alpha_t ** 2 / alpha_s ** 2) * (sigma_s ** 2 / sigma_t ** 2))
+        if self.variance == "large":
+            gamma = jnp.sqrt(1 - alpha_t ** 2 / alpha_s ** 2)
+        else:
+            gamma = sigma_s * jnp.sqrt(1 - (alpha_t ** 2 / alpha_s ** 2) * (sigma_s ** 2 / sigma_t ** 2))
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
 
 
@@ -127,20 +149,23 @@ class DDPM:
 @dataclass(frozen=True)
 class DDIM:
     """DDIM (Song et al. 2021); `eta` is the stochasticity, 0 deterministic and
-    1 DDPM-like."""
+    1 DDPM-like.
+
+    Diffusers 0.34.0's `DDIMScheduler` limits the clean prediction under
+    `clip_sample` or `thresholding` and keeps the model's own output as its
+    epsilon, so the direction term is the unlimited one. That pairing is
+    `SourceLimitedPrediction`'s, in the process's conversion.
+    """
 
     eta: float = 0.0
-    clip: float | None = None
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
         target = t - schedule.step_interval(t, t_next)
         (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, target, x)
-        if self.clip is not None:
-            denoised = jnp.clip(denoised, -self.clip, self.clip)
         if self.eta > 0:
             # DDIM paper eq. 16: eta=0 is deterministic DDIM, eta=1.0 approaches DDPM.
             # The direction term must shrink to keep the marginal variance right.
@@ -158,7 +183,7 @@ class Euler:
     """The DDIM update written as an Euler step of the probability flow ODE.
     On a variance exploding schedule it is dx/dsigma = eps."""
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -177,7 +202,7 @@ class EulerAncestral:
     sigma_up of fresh noise brings the marginal back to sigma_s. Integrates a
     `GeneralizedNoiseScheduler`."""
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -193,9 +218,15 @@ class EulerAncestral:
 @dataclass(frozen=True)
 class Heun:
     """Heun's second order method (Karras et al. 2022, Algorithm 2): an Euler
-    step, the derivative re-evaluated at its end, and the average of the two."""
+    step, the derivative re-evaluated at its end, and the average of the two.
 
-    def init(self, x, times, process):
+    Diffusers 0.34.0's `HeunDiscreteScheduler` limits the clean prediction of
+    both stages under `clip_sample`; that limit belongs to the process's
+    conversion, `SourceLimitedPrediction`, so both evaluations here read the
+    limited prediction without the solver knowing about it.
+    """
+
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -220,7 +251,7 @@ class RK4:
     schedule; the stages at half steps read the model at the time the schedule
     maps that sigma back to."""
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -255,7 +286,7 @@ class KDPM2:
 
     ancestral: bool = False
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -284,13 +315,178 @@ class KDPM2:
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state
 
 
+class _Brownian(NamedTuple):
+    """The root interval of a keyed dyadic Brownian bridge, shared by a walk.
+
+    `low` and `high` are the interval the source noise sampler is built over,
+    and `key` seeds every node of the bridge. Nothing else is carried: a value
+    of the path is a pure function of these three and the point asked for, so
+    the state is three scalars whatever the sample's shape.
+    """
+
+    key: jax.Array
+    low: jax.Array
+    high: jax.Array
+
+
+# A float32 position in [0, 1] carries 24 mantissa bits, so a descent deeper
+# than this cannot tell two positions apart and only pretends to refine.
+MAX_BROWNIAN_DEPTH = 24
+
+
+def _brownian_walk(state: _Brownian, point, shape, depth: int) -> jax.Array:
+    """W(point) - W(low) of the bridge, by Levy's construction to `depth`.
+
+    W(low) is zero and W(high) is sqrt(high - low) times the root draw; each
+    level conditions the midpoint of the half the point falls in, which is the
+    Brownian bridge's own N((W(a) + W(b)) / 2, (b - a) / 4). A node's draw comes
+    from its level and its dyadic index alone, so deepening the construction
+    leaves every coarser node where it was, and the path inside the finest
+    cell, of width (high - low) / 2**depth, is read off that cell's two ends.
+
+    The descent reads the binary expansion of the normalized position by
+    doubling and subtracting, which is exact in binary floating point, and
+    names each node by its integer dyadic index, so no level's bounds are
+    accumulated and none collapses however deep the construction runs.
+
+    `point` is a scalar: a source noise sampler is one tree over the whole
+    batch tensor, so the interval is the grid's, not a row's.
+    """
+    span = state.high - state.low
+    # A grid whose only interval lands on sigma zero prepares a zero-width
+    # interval and never queries it; the walk stays at the path's origin.
+    scale = jnp.where(span > 0, span, 1.0)
+    position = jnp.clip((point - state.low) / scale, 0.0, 1.0)
+    value_low = jnp.zeros(shape, jnp.float32)
+    value_high = jnp.sqrt(span) * jax.random.normal(jax.random.fold_in(state.key, 0), shape,
+                                                    dtype=jnp.float32)
+    index = jnp.zeros((), jnp.int32)
+    for level in range(1, depth + 1):
+        node = jax.random.fold_in(jax.random.fold_in(state.key, level), 2 * index + 1)
+        deviation = 0.5 * jnp.sqrt(span * 2.0 ** (1 - level))
+        value_middle = 0.5 * (value_low + value_high) + deviation * jax.random.normal(
+            node, shape, dtype=jnp.float32)
+        position = position * 2.0
+        right = position >= 1.0
+        position = position - right.astype(jnp.float32)
+        value_low = jnp.where(right, value_middle, value_low)
+        value_high = jnp.where(right, value_high, value_middle)
+        index = 2 * index + right.astype(jnp.int32)
+    return value_low + position * (value_high - value_low)
+
+
+def _brownian_noise(state: _Brownian, first, second, shape, depth: int) -> jax.Array:
+    """The bridge's increment over `[first, second]`, normalized the way
+    k-diffusion's `BrownianTreeNoiseSampler` normalizes it: signed with the
+    interval's direction and divided by the square root of its width, so the
+    result is a standard normal draw carrying the path's correlations."""
+    increment = (_brownian_walk(state, second, shape, depth)
+                 - _brownian_walk(state, first, shape, depth))
+    return increment / jnp.sqrt(jnp.abs(second - first))
+
+
+def _sde_step(x, denoised, sigma, target):
+    """The deterministic part of one `DPMSolverSDEScheduler` step, in the
+    exponential form it evaluates: (target / sigma) x - expm1(log target -
+    log sigma) x_0, which is the Euler step to `target` regrouped so the
+    coefficient stays accurate when the levels are close."""
+    return (target / sigma) * x - jnp.expm1(jnp.log(target) - jnp.log(sigma)) * denoised
+
+
+@samplers("dpmsolver_sde")
+@dataclass(frozen=True)
+class DPMSolverSDE:
+    """Diffusers 0.34.0's `DPMSolverSDEScheduler`, k-diffusion's
+    `sample_dpmpp_sde` midpoint solver over a Brownian tree.
+
+    Each interval takes two ancestral first-order steps from its own start:
+    one to the geometric midpoint of sigma_t and sigma_s, which the model is
+    read at, and one to sigma_s with that midpoint's clean prediction. Both
+    steps go down to k-diffusion's sigma_down and add sigma_up of noise, and
+    both draw that noise from one Brownian path over the trajectory's sigma
+    interval: the first over `[sigma_t, sigma_mid]` and the second over
+    `[sigma_t, sigma_s]`, so the two are correlated exactly as nested
+    increments of one path. The source's sampler transforms sigma with the
+    identity even though its own steps integrate -log(sigma), so the interval
+    widths are sigma differences.
+
+    `depth` resolves the root interval to `(sigma_max - sigma_min) / 2**depth`:
+    on a published VP table's span of about 14.6 the default reaches 8.7e-7,
+    at or inside the reference tree's own 1e-6 tolerance, and it is also where
+    a float32 position runs out of mantissa, so no deeper descent tells two
+    sigmas apart. A zero-sigma target has no ancestral step and lands on the
+    clean prediction.
+
+    The root interval is the schedule's own positive sigma domain, not the
+    extremes of the grid handed to `init`: the source builds its tree from all
+    the positive sigmas it prepared, so a continuation that walks a suffix of
+    that grid keeps the path the same key gives the whole one. A grid whose
+    only interval lands on sigma zero leaves that domain a single point, which
+    the source also prepares and never queries.
+
+    `seed` is the source's `noise_sampler_seed`: with it the tree's entropy is
+    the checkpoint's rather than the caller's, so every walk over the same
+    grid integrates one fixed path however the sampling key changes. It seeds
+    this bridge, not the reference tree, because a Torch seed does not name a
+    JAX stream; what carries over is the contract, a path independent of the
+    walk's key.
+    """
+
+    depth: int = MAX_BROWNIAN_DEPTH
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.depth) is not int or not 1 <= self.depth <= MAX_BROWNIAN_DEPTH:
+            raise ValueError(f"the Brownian bridge takes 1 to {MAX_BROWNIAN_DEPTH} levels, "
+                             f"the mantissa of a float32 position, not {self.depth}")
+        if self.seed is not None and (type(self.seed) is not int or self.seed < 0):
+            raise ValueError(f"the noise sampler's seed is a nonnegative integer, not {self.seed}")
+
+    def init(self, x, times, process, *, key):
+        schedule = _sigma_integrator("DPMSolverSDE", process)
+        with jax.ensure_compile_time_eval():
+            sigmas = schedule.sigmas(jnp.asarray(times, jnp.float32))
+            if times.shape[0] > 1 and bool(jnp.any(sigmas[:-1] <= 0)):
+                raise ValueError("sigma=0 source has no finite update: DPMSolverSDE "
+                                 "steps down from the interval's own sigma")
+        low, high = float(schedule.sigma_min), float(schedule.sigma_max)
+        if not 0 < low <= high:
+            raise ValueError("the Brownian tree needs a positive sigma domain, and this "
+                             f"schedule reports [{low}, {high}]")
+        root = key if self.seed is None else jax.random.PRNGKey(self.seed)
+        return _Brownian(root, jnp.asarray(low, jnp.float32), jnp.asarray(high, jnp.float32))
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        schedule = _sigma_integrator("DPMSolverSDE", process)
+        (_, sigma_t), (_, sigma_s) = _rates(process, t, t_next, x)
+
+        def ancestral(target):
+            """The source's `sigma_up`, capped at the target level, and the
+            `sigma_down` a step actually reaches."""
+            up = jnp.minimum(target, (target ** 2 * (sigma_t ** 2 - target ** 2) / sigma_t ** 2) ** 0.5)
+            return (target ** 2 - up ** 2) ** 0.5, up
+
+        def midpoint(_):
+            sigma_mid = jnp.exp(0.5 * (jnp.log(sigma_t) + jnp.log(sigma_s)))
+            first_down, first_up = ancestral(sigma_mid)
+            noise = _brownian_noise(state, jnp.min(sigma_t), jnp.min(sigma_mid), x.shape, self.depth)
+            x_mid = _sde_step(x, denoised, sigma_t, first_down) + noise * first_up
+            denoised_mid, _ = denoise(x_mid, schedule.t_of_sigma(sigma_mid.reshape(-1)))
+            down, up = ancestral(sigma_s)
+            noise = _brownian_noise(state, jnp.min(sigma_t), jnp.min(sigma_s), x.shape, self.depth)
+            return _sde_step(x, denoised_mid, sigma_t, down) + noise * up
+
+        stepped = lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None)
+        return jnp.where(sigma_s > 0, stepped, denoised), state
+
+
 @samplers("multistep_dpm")
 @dataclass(frozen=True)
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
     exploding schedule, from finite differences of the last three eps."""
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         coefficient = jnp.zeros((x.shape[0],) + (1,) * (x.ndim - 1), jnp.float32)
         return (jnp.zeros_like(x), coefficient, jnp.zeros_like(x), coefficient,
                 jnp.zeros((), jnp.int32))
@@ -461,7 +657,7 @@ class DPMSolverMultistep:
         if self.algorithm == "sde-dpmsolver" and self.order == 3:
             raise ValueError("sde-dpmsolver has no third-order update; use order 2 or sde-dpmsolver++")
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         if self.algorithm == "sde-dpmsolver":
             first_at_end = (self.order == 1 or self.euler_at_final
                             or (self.lower_order_final and times.shape[0] - 1 < 15))
@@ -565,7 +761,7 @@ class DPMSolverSinglestep:
             return [1] * steps
         return list(range(1, order + 1)) * (steps // order)
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         steps = times.shape[0] - 1
         orders = self.order_list(steps)
         if orders:
@@ -703,7 +899,7 @@ class DEIS:
         if self.order not in (1, 2, 3):
             raise ValueError(f"DEIS has orders 1, 2 and 3, not {self.order}")
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return _multistep(x, times, self.order)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -814,7 +1010,7 @@ class UniPC:
         if self.order < 1:
             raise ValueError(f"UniPC's order is at least 1, not {self.order}")
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         corrects_source = times.shape[0] > 2 and 0 not in self.disable_corrector
         _check_endpoint_domain(
             process, times,
@@ -919,7 +1115,7 @@ class PNDM:
 
     skip_prk_steps: bool = False
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         _check_endpoint_domain(process, times, source=True,
                                reason="PNDM stage differences are divided by the source alpha")
         return jnp.zeros((4,) + x.shape, x.dtype), jnp.zeros((), jnp.int32)
@@ -1003,7 +1199,7 @@ class LMS:
         if self.order < 1:
             raise ValueError(f"LMS's order is at least 1, not {self.order}")
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
         return jnp.zeros((self.order,) + x.shape, x.dtype), sigmas, jnp.zeros((), jnp.int32)
 
@@ -1035,7 +1231,7 @@ class Consistency:
     `ConsistencyBoundary` reads out of the model's prediction.
     """
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -1065,7 +1261,7 @@ class TCD:
         if not 0 <= self.eta <= 1:
             raise ValueError(f"TCD's eta is in [0, 1], not {self.eta}")
 
-    def init(self, x, times, process):
+    def init(self, x, times, process, *, key):
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -1080,5 +1276,5 @@ class TCD:
 
 
 __all__ = ["Solver", "DDPM", "DDIM", "Euler", "EulerAncestral", "Heun", "RK4", "KDPM2",
-           "MultiStepDPM", "DPMSolverMultistep", "DPMSolverSinglestep", "DEIS", "UniPC",
-           "PNDM", "LMS", "Consistency", "TCD"]
+           "MultiStepDPM", "DPMSolverMultistep", "DPMSolverSinglestep", "DPMSolverSDE",
+           "DEIS", "UniPC", "PNDM", "LMS", "Consistency", "TCD"]
