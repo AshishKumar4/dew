@@ -318,9 +318,8 @@ the xla kernel, at the cost it always had, because nothing in the shape of
 a validity array says its contents are all true. The GDN rows time the whole
 mixer, projections, gates, rule, norm and all, and the masked conv is the
 only part of it that changed: the mixer with a mask is 3.3 times faster
-forward and 3.0 times faster with the gradient, which is what the conv was
-costing it, and it now runs within 11 percent of the same mixer with no mask
-at all. Its launches drop 22.8 times forward (10707 to 470 a call) and 19.5
+forward and 3.0 times faster with the gradient. Its launches drop 22.8 times
+forward (10707 to 470 a call) and 19.5
 times with the gradient (36700 to 1884): the scan's `while` loop is gone
 from the HLO and the `__cudnn$convForward` of the unmasked path is there
 instead. Against the reference it is exact where it has to be: on
