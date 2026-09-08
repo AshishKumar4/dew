@@ -6,7 +6,8 @@ import dataclasses
 import functools
 import hashlib
 import math
-from collections.abc import Callable, Sequence
+import types
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Generic, overload
 
@@ -161,7 +162,8 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
     exposed = _exposes_states(model)
     answer, updated = model.apply(
-        {**params, "cache": cache}, inputs.tokens, decode=True, mutable=["cache"], rngs=None,
+        {**params, "cache": cache}, inputs.tokens, decode=True,
+        mutable=["cache", "embeddings"], rngs=None,
         method="states_and_logits" if exposed else None, capture_intermediates=False,
         **inputs.kwargs())
     states, logits = answer if exposed else (None, answer)
@@ -170,21 +172,31 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     valid = inputs.token_fields.get("attention_mask")
     last = (jnp.full((batch,), width - 1, jnp.int32) if valid is None else
             jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
-    positions = inputs.token_fields.get("positions")
-    if positions is not None:
-        positions = positions[jnp.arange(batch), jnp.maximum(last, 0)] + 1
+    supplied = inputs.token_fields.get("positions")
+    positions = None if supplied is None else supplied[jnp.arange(batch),
+                                                       jnp.maximum(last, 0)] + 1
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     state = DecoderState(updated["cache"], logits[rows, slot], positions,
                          None if states is None else states[rows, slot])
-    if ops.depths and width > 1 and states is not None:
+    prepared = jax.tree.leaves(updated.get("embeddings", {}))
+    if ops.depths and states is not None:
+        # Every depth needs a predecessor slot in the carry from the start,
+        # so a block's loop keeps one structure whatever the prompt held.
+        state = dataclasses.replace(state, drafts=(states[rows, slot],) * ops.depths)
+    if ops.depths and width > 1 and states is not None and prepared:
         real = jnp.ones(inputs.tokens.shape, bool) if valid is None else valid.astype(bool)
-        order = jnp.argsort(~real, axis=1, stable=True)
+        order = jnp.argsort(~real, axis=1, stable=True)[..., None]
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        state = strategies.reseed(
-            ops, state, jnp.take_along_axis(states, order[..., None], axis=1)[:, :-1],
-            jnp.take_along_axis(inputs.tokens, order, axis=1)[:, 1:],
+        coordinates = (jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
+                       if supplied is None else supplied.astype(jnp.int32))
+        compact = jnp.take_along_axis(states, order, axis=1)
+        state, _, carried = strategies.reseed(
+            ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
+            jnp.take_along_axis(prepared[0], order, axis=1)[:, 1:],
             jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
-            jnp.broadcast_to(jnp.arange(1, width)[None, :], (batch, width - 1)))
+            jnp.take_along_axis(coordinates[..., None], order, axis=1)[:, 1:, 0],
+            jnp.maximum(lengths - 2, 0))
+        state = dataclasses.replace(state, drafts=carried)
     return state, last >= 0
 
 
@@ -218,8 +230,10 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
         states, logits = answer if exposed else (None, answer)
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
-        return (DecoderState(updated["cache"], logits[:, -1], moved,
-                             None if states is None else states[:, -1]), logits, states)
+        return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
+                                    positions=moved,
+                                    hidden=None if states is None else states[:, -1]),
+                logits, states)
 
     def advance(state: DecoderState, token: jax.Array, active: jax.Array) -> DecoderState:
         return run(state, token[:, None], active[:, None])[0]
@@ -235,15 +249,22 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
     if not depths or not exposed:
         return DecodeOps(advance, reindex, run)
 
-    def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array, valid: jax.Array,
-                positions: jax.Array, depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
+    def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array | None,
+                embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
+                depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
+        ids = jnp.zeros(valid.shape, jnp.int32) if tokens is None else jnp.where(valid, tokens, pad_id)
         (logits, states), updated = model.apply(
-            {**params, "cache": state.cache}, hidden, jnp.where(valid, tokens, pad_id),
-            depth=depth, attention_mask=valid, positions=positions, decode=True,
-            mutable=["cache"], rngs=None, method="mtp_step", capture_intermediates=False)
+            {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
+            positions=positions, input_embeddings=embeds, decode=True, mutable=["cache"],
+            rngs=None, method="mtp_step", capture_intermediates=False)
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
-    return DecodeOps(advance, reindex, run, propose, depths)
+    def embed(tokens: jax.Array) -> jax.Array:
+        prepared = model.apply(params, tokens, method="token_embeddings")
+        assert isinstance(prepared, jax.Array)
+        return prepared
+
+    return DecodeOps(advance, reindex, run, propose, embed, depths)
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
@@ -349,22 +370,63 @@ def _named(value: object) -> str:
     return f"{kind.__module__}.{kind.__qualname__}"
 
 
-def _shape(value: object) -> object:
-    """One component's configuration, without its array contents."""
+def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
+    """A component's configuration as something every process can compare.
+
+    The description reaches every part a rank could differ in: a dataclass's
+    fields including its array shapes, a partial's function and bound
+    arguments, and a function's captured cells and defaults. A name alone is
+    not enough, because two ranks can hold the same nested function closed
+    over different values. Module-level helpers and library references keep
+    working, since globals are not captured cells.
+
+    Anything whose text carries an address cannot be compared across
+    processes, so it is refused here rather than after the ranks have entered
+    different device loops.
+    """
+    if isinstance(value, (bool, int, float, complex, str, bytes)) or value is None:
+        return repr(value)
+    if id(value) in seen:
+        return "cycle"
+    seen = seen | {id(value)}
     if isinstance(value, (tuple, list)):
-        return tuple(_shape(item) for item in value)
-    if isinstance(value, jax.tree_util.Partial):
-        return ("partial", _named(value.func), _shape(value.args),
-                tuple((name, _shape(item)) for name, item in sorted(value.keywords.items())))
+        return ("sequence", tuple(_stable(item, seen) for item in value))
+    if isinstance(value, Mapping):
+        return ("mapping", tuple(sorted((repr(name), _stable(item, seen))
+                                        for name, item in value.items())))
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return ("array",) + _hashed(value)
+    if isinstance(value, functools.partial):
+        return ("partial", _stable(value.func, seen), _stable(value.args, seen),
+                _stable(dict(value.keywords), seen))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return (_named(value),) + tuple(
-            (field.name, repr(getattr(value, field.name)))
-            for field in dataclasses.fields(value)
-            if not field.metadata.get("pytree_node", True))
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        return (tuple(shape), str(getattr(value, "dtype", "")))
-    return repr(value)
+            (field.name, _stable(getattr(value, field.name), seen))
+            for field in dataclasses.fields(value))
+    if isinstance(value, types.FunctionType):
+        cells = []
+        for cell in value.__closure__ or ():
+            try:
+                captured = cell.cell_contents
+            except ValueError:
+                cells.append("empty")
+                continue
+            cells.append(_stable(captured, seen))
+        return ("function", _named(value), tuple(cells), _stable(value.__defaults__ or (), seen),
+                _stable(value.__kwdefaults__ or {}, seen))
+    text = repr(value)
+    if "0x" in text:
+        raise ValueError(
+            f"a decoding component holds {_named(value)}, whose identity is this process's "
+            "memory address; give the configuration as arrays or plain values so a pool can "
+            "agree on it")
+    return (_named(value), text)
+
+
+def _hashed(value: object) -> tuple[object, ...]:
+    """An array's shape, dtype and contents, as a comparable triple."""
+    array = np.ascontiguousarray(np.asarray(value))
+    return (array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest())
 
 
 def _digest(components: object) -> tuple[object, ...]:
@@ -372,12 +434,15 @@ def _digest(components: object) -> tuple[object, ...]:
 
     The configuration arrays are part of the identity: two processes holding
     `EndOfSequence` over different ids build the same tree of the same shapes
-    and would agree on a schema alone, so their contents are hashed in.
+    and would agree on a schema alone. Each leaf contributes its shape, dtype
+    and contents separately, so moving a value from one leaf to the next
+    changes the digest too, and an array a plain function captured is covered
+    by the description even though no pytree leaf holds it.
     """
     payload = hashlib.sha256()
     for leaf in jax.tree.leaves(components):
-        payload.update(np.ascontiguousarray(np.asarray(leaf)).tobytes())
-    return (_shape(components), payload.hexdigest())
+        payload.update(repr(_hashed(leaf)).encode())
+    return (_stable(components), payload.hexdigest())
 
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,

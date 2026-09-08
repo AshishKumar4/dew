@@ -287,6 +287,10 @@ class MultimodalTransformer(nn.Module):
             raise ValueError("image_indices require conditioning payloads")
         return self.language_model.mtp_step(hidden, tokens, input_embeddings=input_embeddings, **kwargs)
 
+    def token_embeddings(self, tokens):
+        """The decoder's own table; a drawn token is text, never media."""
+        return self.language_model.token_embeddings(tokens)
+
     def init_mtp_cache(self, batch_size: int):
         self.language_model.init_mtp_cache(batch_size)
 

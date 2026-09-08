@@ -261,7 +261,7 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `SuppressTokens(tokens)` | `SuppressTokensLogitsProcessor` | |
 | `BeginSuppressTokens(tokens, after_forced_bos=False)` | `SuppressTokensAtBeginLogitsProcessor` | |
 | `ForcedBOS(token)` | `ForcedBOSTokenLogitsProcessor` | |
-| `ForcedEOS(token, max_length)` | `ForcedEOSTokenLogitsProcessor` | `max_length` counts prompt and generated tokens |
+| `ForcedEOS(eos, max_length=None)` | `ForcedEOSTokenLogitsProcessor` | `max_length` counts prompt and generated tokens; `None` is the request's own end, so a per-call budget moves it |
 | `MinLength(length, eos)` | `MinLengthLogitsProcessor` | suppresses EOS below a total length |
 | `MinNewTokens(count, eos)` | `MinNewTokensLengthLogitsProcessor` | suppresses EOS below a generated count |
 | `ExponentialDecayLengthPenalty(start, factor, eos)` | `ExponentialDecayLengthPenalty` | `start` counts generated tokens |
@@ -291,7 +291,9 @@ Speculative(block=4, confidence=0.0)
 
 `Speculative` drafts with the model's own prediction depths and verifies with the model, following algorithm 1 of [arXiv 2211.17192](https://arxiv.org/abs/2211.17192) as `_speculative_sampling` applies it. The first candidate of a block is an ordinary target draw, so it is always accepted, and each depth chains the next from the previous hidden state and the candidate's embedding. A proposal is accepted with probability `min(1, p(x) / q(x))` for the target's post-transform `p` and the draft's actual `q`; the first rejection draws from the normalized positive part of `p - q`, and a block with nothing rejected draws a bonus from `p`. The emitted tokens are therefore distributed exactly as `Sample` distributes them, though not draw for draw at one seed. Every emitted action records the target's post-transform log probability as its behaviour and the model's own as its raw value; the draft's `q`, the acceptance probability and the residual are never recorded. `confidence` stops the draft after the first candidate the draft is less sure of, as `ConfidenceCriteria` does; a candidate the draft never offered was not rejected, so the block then ends on an ordinary target draw. A model without prediction depths is refused rather than silently falling back.
 
-The target cache is saved before a block and the accepted prefix is replayed into it, because a recurrent mixer keeps a running summary no cursor can rewind. The prediction cache is rebuilt the same way, from the target's hidden state at the position before each accepted token paired with that token at its own position, which is the pairing `MTPCandidateGenerator` corrects with and `Qwen3_5MultiTokenPredictor.forward` takes; the prompt seeds it before the first block. A block emits at least two tokens, so `ceil(budget / 2)` iterations always reach the budget, and it costs two target forwards whatever the block size.
+The target cache is saved before a block and the accepted prefix is replayed into it, because a recurrent mixer keeps a running summary no cursor can rewind. The prediction cache is rebuilt on the same invariant: depth `d`'s entry for token `t` reads depth `d - 1`'s hidden state at `t - 1` and `t`'s own prepared embedding, at `t`'s own coordinate, with the target as depth zero's predecessor. That is what `mtp_hidden_states` trains the depths on, what `MTPCandidateGenerator` corrects with and what `Qwen3_5MultiTokenPredictor.forward` takes. Each depth carries its last state across blocks, so a boundary loses no entry, and the prompt seeds every depth from the embeddings the prefill already prepared, media replacements included, without running an encoder again.
+
+A block emits at least two tokens, so `ceil(budget / 2)` iterations always reach the budget, and a block costs two target forwards whatever its size. Once every row has finished or spent its budget the remaining iterations run no model call at all; the predicate is a reduction over the whole batch, so a pool skips the same blocks.
 
 #### Source generation controls
 
@@ -312,7 +314,7 @@ A loaded source's `generation_config.json` is data. Every control Transformers 5
 | `bad_words_ids` | `bad_words` | |
 | `min_length`, `min_new_tokens` | `MinLength`, `MinNewTokens` | |
 | `forced_bos_token_id` | `ForcedBOS` | |
-| `forced_eos_token_id` | `ForcedEOS` | without the source's `max_length`, the position to force at is a per-call value |
+| `forced_eos_token_id` | `ForcedEOS` at the request's own end, so a per-call budget moves it | |
 | `suppress_tokens`, `begin_suppress_tokens` | `SuppressTokens`, `BeginSuppressTokens` | |
 | `exponential_decay_length_penalty` | `ExponentialDecayLengthPenalty` | |
 | `remove_invalid_values` | `RemoveInvalidValues` | |

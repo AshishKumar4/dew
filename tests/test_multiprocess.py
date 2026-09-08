@@ -1210,3 +1210,10 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
     assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
     np.testing.assert_allclose(reports[0]["behavior"] + reports[1]["behavior"],
                                single["behavior"], rtol=1e-5, atol=1e-6)
+    # A search and a speculative block both run ragged rows over the pool: a
+    # criterion ends some rows early while their peers keep going, and each
+    # rank still answers exactly what one process answers for its own rows.
+    for name in ("beam_tokens", "beam_lengths", "draft_tokens", "draft_lengths"):
+        assert reports[0][name] + reports[1][name] == single[name], name
+    assert len(set(single["draft_lengths"])) > 1, "the rows did not end raggedly"
+    assert len(single["beam_tokens"]) == 2 * len(single["draft_tokens"])

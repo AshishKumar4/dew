@@ -299,3 +299,31 @@ def test_source_total_length_and_explicit_continuation_budget_have_defined_prece
     np.testing.assert_array_equal(overridden.tokens, full.tokens[:, :3])
     with pytest.raises(ValueError, match="prompt width"):
         policy([[1, 2, 3, 4, 5, 6]], seed=1)
+
+
+def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
+    """`forced_eos_token_id` accepts several ids and fires one step before the
+    end of the request, so a call that changes the budget moves it. Pinning
+    the position to the source's own length would force at the wrong step."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config={"forced_eos_token_id": [2, 5],
+                                           "max_new_tokens": 3, "max_length": 18,
+                                           "pad_token_id": 0})
+    policy = source.text_generation()
+    assert [type(item).__name__ for item in policy.logits] == ["ForcedEOS", "Greedy"]
+    from dew.sampling import decoding
+    plain = replace(policy, logits=(decoding.Greedy(),))
+    moved = False
+    for budget in (3, 5):
+        drawn = policy([[1, 2]], budget, seed=0).host()
+        assert drawn.tokens.shape == (1, 2 + budget)
+        # The last step allows either id and nothing else.
+        assert int(drawn.tokens[0, 2 + budget - 1]) in (2, 5)
+        free = plain([[1, 2]], budget, seed=0).host()
+        moved = moved or int(free.tokens[0, -1]) != int(drawn.tokens[0, -1])
+    assert moved, "the control changed nothing, so the position it fires at is untested"
+    # Without an explicit budget the source's own max_new_tokens decides.
+    assert policy([[1, 2]], seed=0).host().tokens.shape == (1, 5)

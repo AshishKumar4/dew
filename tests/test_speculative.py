@@ -26,11 +26,11 @@ HIDDEN = 2
 
 
 def predictor(kind="attention", **overrides):
-    """A tiny decoder that also carries one prediction depth."""
-    mixer = decoder(kind).mixer
+    """A tiny decoder that also carries prediction depths."""
+    fields = {"num_nextn_predict_layers": 1, **overrides}
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=16, dtype="float32",
-                             mixer=mixer, num_nextn_predict_layers=1, **overrides)
+                             mixer=decoder(kind).mixer, **fields)
 
 
 def scripted(target, drafts, rows):
@@ -46,15 +46,17 @@ def scripted(target, drafts, rows):
         return (state, jnp.broadcast_to(target, (rows, width, VOCAB)),
                 jnp.zeros((rows, width, HIDDEN), jnp.float32))
 
-    def propose(state, states, tokens, valid, positions, depth):
-        width = tokens.shape[1]
+    def propose(state, states, tokens, embeds, valid, positions, depth):
+        width = valid.shape[1]
         scores = drafts[calls["index"] % len(drafts)]
         calls["index"] += width
         return (state, jnp.broadcast_to(scores, (rows, width, VOCAB)),
                 jnp.zeros((rows, width, HIDDEN), jnp.float32))
 
     return DecodeOps(advance=lambda state, token, active: state,
-                     reindex=lambda state, rows_: state, verify=verify, propose=propose, depths=1)
+                     reindex=lambda state, rows_: state, verify=verify, propose=propose,
+                     embed=lambda tokens: jnp.zeros((rows, tokens.shape[1], HIDDEN), jnp.float32),
+                     depths=1)
 
 
 def run(target, drafts, rows, budget, block, seed=0, stopping=()):
@@ -65,7 +67,8 @@ def run(target, drafts, rows, budget, block, seed=0, stopping=()):
 def run_with(plan, target, drafts, rows, budget, seed=0, stopping=()):
     """One run of a given speculative plan over fixed distributions."""
     state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
-                         positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32))
+                         positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32),
+                         drafts=(jnp.zeros((rows, HIDDEN), jnp.float32),))
     start = StepState(tokens=jnp.zeros((rows, 1 + budget), jnp.int32),
                       valid=jnp.concatenate([jnp.ones((rows, 1), bool),
                                              jnp.zeros((rows, budget), bool)], axis=1),
@@ -225,22 +228,52 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     np.testing.assert_allclose(drawn.raw_log_probs[0, 1], scores[0, eos], atol=3e-6, rtol=0)
 
 
-def test_the_prediction_cache_is_rebuilt_from_the_accepted_prefix():
-    """A block's draft writes prediction-layer state for candidates that may
-    be rejected. Running the same request twice has to give the same answer,
-    and it has to be the greedy walk, which a prediction cache that kept
-    rejected entries would drift away from over several blocks."""
+def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
+    """The cache a block leaves has to describe the tokens that were emitted,
+    not the ones the draft proposed. Writing an emitted history the draft
+    never suggested and then drafting from it has to match a teacher-forced
+    pass over that realized sequence, which comparing greedy target tokens
+    cannot show, because the target picks the same token whatever the
+    proposer did."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
     model = predictor()
-    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
-    params = model.init(jax.random.key(0), prompt)
-    short = generate(model, params, prompt, 2, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0), strategy=Speculative(block=2))
-    long = generate(model, params, prompt, 8, key=jax.random.key(1),
-                    sampling=Sampling(temperature=0), strategy=Speculative(block=2))
-    plain = generate(model, params, prompt, 8, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(long.tokens), np.asarray(plain.tokens))
-    np.testing.assert_array_equal(np.asarray(long.tokens)[:, :5], np.asarray(short.tokens))
+    prompt = jnp.asarray([[1, 2, 3, 4], [5, 6, 7, 8]], jnp.int32)
+    emitted = jnp.asarray([[11, 3], [2, 9]], jnp.int32)
+    realized = jnp.concatenate([prompt, emitted], axis=1)
+    width = realized.shape[1]
+    ops = _operations(model, params_of(model, prompt), 0, 1)
+    params = params_of(model, prompt)
+
+    ahead = model.apply(params, realized, method=model.hidden_states)
+    reference = model.apply(params, ahead[:, :-1], realized[:, 1:], depth=0,
+                            positions=jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
+                            method=model.mtp_step)[0]
+
+    state, _ = _prefill(model, params, ModelInputs(prompt), ops)
+    state, _, _ = reseed(
+        ops, state, (state.hidden,), ahead[:, prompt.shape[1]:width],
+        model.apply(params, emitted, method=model.token_embeddings),
+        jnp.ones((2, 2), bool),
+        jnp.broadcast_to(jnp.arange(prompt.shape[1], width)[None, :], (2, 2)),
+        jnp.ones(2, jnp.int32))
+    _, cached, _ = ops.propose(state, ahead[:, -1:], jnp.asarray([[7], [7]], jnp.int32), None,
+                               jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32), 0)
+
+    grown = jnp.concatenate([realized, jnp.asarray([[7], [7]], jnp.int32)], axis=1)
+    after = model.apply(params, grown, method=model.hidden_states)
+    plain = model.apply(params, after[:, :-1], grown[:, 1:], depth=0,
+                        positions=jnp.broadcast_to(jnp.arange(1, width + 1)[None, :], (2, width)),
+                        method=model.mtp_step)[0]
+    largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(plain)[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"
+    assert reference.shape[1] == width - 1
+
+
+def params_of(model, prompt):
+    return model.init(jax.random.key(0), prompt)
 
 
 def test_a_model_without_prediction_depths_is_refused():
@@ -291,7 +324,7 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
     ops = _operations(model, params, 0, 1)
     seeded, _ = _prefill(model, params, ModelInputs(prompt[:, :-1]), ops)
     _, cached, _ = ops.propose(seeded, states[:, width - 2:width - 1], prompt[:, width - 1:width],
-                               jnp.ones((2, 1), bool),
+                               None, jnp.ones((2, 1), bool),
                                jnp.full((2, 1), width - 1, jnp.int32), 0)
     largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 2e-5, f"largest difference {largest:g}"
@@ -301,10 +334,13 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
     grown = jnp.concatenate([prompt, jnp.asarray([[2], [3]], jnp.int32)], axis=1)
     ahead = model.apply(params, grown, method=model.hidden_states)
     full, _ = _prefill(model, params, ModelInputs(prompt), ops)
-    full = reseed(ops, full, states[:, width - 1:width], grown[:, width:width + 1],
-                  jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32))
+    full = reseed(ops, full, (states[:, width - 1],), states[:, width - 1:width],
+                  model.apply(params, grown[:, width:width + 1], method=model.token_embeddings),
+                  jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32),
+                  jnp.zeros(2, jnp.int32))[0]
     _, after, _ = ops.propose(full, ahead[:, width:width + 1], jnp.asarray([[5], [5]], jnp.int32),
-                              jnp.ones((2, 1), bool), jnp.full((2, 1), width + 1, jnp.int32), 0)
+                              None, jnp.ones((2, 1), bool),
+                              jnp.full((2, 1), width + 1, jnp.int32), 0)
     plain = model.apply(
         params, jnp.concatenate([ahead, ahead[:, -1:]], axis=1)[:, :-1],
         jnp.concatenate([grown[:, 1:], jnp.asarray([[5], [5]], jnp.int32)], axis=1), depth=0,
@@ -312,3 +348,119 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
         method=model.mtp_step)[0]
     largest = float(np.max(np.abs(np.asarray(after)[:, 0] - np.asarray(plain)[:, -1])))
     assert largest < 2e-5, f"largest difference {largest:g}"
+
+
+def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
+    """`mtp_hidden_states` chains a depth onto the one before it, shifted one
+    token further on, and that is the history a checkpoint's second depth was
+    trained behind. Seeding every depth from the target's own states instead
+    would leave the second one drafting from a pairing it never saw."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor(num_nextn_predict_layers=2)
+    prompt = jnp.asarray([[1, 2, 3, 4, 5, 6], [6, 7, 8, 9, 10, 11]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    width = prompt.shape[1]
+    states = model.apply(params, prompt, method=model.hidden_states)
+    trained = model.apply(params, states, prompt, method=model.mtp_hidden_states)
+
+    ops = _operations(model, params, 0, 2)
+    empty, _ = _prefill(model, params, ModelInputs(prompt[:, :1]), ops)
+    _, produced, _ = reseed(
+        ops, empty, (states[:, 0], None), states[:, 1:],
+        model.apply(params, prompt[:, 1:], method=model.token_embeddings),
+        jnp.ones((2, width - 1), bool),
+        jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
+        jnp.full(2, width - 2, jnp.int32))
+
+    assert len(produced) == 2 == len(trained)
+    for depth, (cached, reference) in enumerate(zip(produced, trained)):
+        # Depth d starts d positions in, as the training pass shifts it.
+        kept = np.asarray(cached)[:, depth:]
+        assert kept.shape == np.asarray(reference).shape
+        largest = float(np.max(np.abs(kept - np.asarray(reference))))
+        assert largest < 3e-5, f"depth {depth} differs by {largest:g}"
+
+
+def test_explicit_prompt_coordinates_reach_the_prediction_cache():
+    """A caller that supplies its own rotary coordinates gets a prediction
+    cache written at those coordinates, not at a count of tokens."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor()
+    prompt = jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32)
+    coordinates = jnp.asarray([[2, 4, 7, 11, 13]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    ops = _operations(model, params, 0, 1)
+    states = model.apply(params, prompt, positions=coordinates, method=model.hidden_states)
+    reference = model.apply(params, states[:, :-1], prompt[:, 1:], depth=0,
+                            positions=coordinates[:, 1:], method=model.mtp_step)[0]
+
+    seeded, _ = _prefill(model, params,
+                         ModelInputs(prompt[:, :-1], {"positions": coordinates[:, :-1]}), ops)
+    _, cached, _ = ops.propose(seeded, states[:, -2:-1], prompt[:, -1:], None,
+                               jnp.ones((1, 1), bool), coordinates[:, -1:], 0)
+    largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"
+
+
+def test_beam_search_refuses_a_chain_that_leaves_a_live_beam_undefined():
+    """A search reads the same distributions a draw does, so a chain that
+    removes every token has to raise there too rather than ranking `-inf`."""
+    from dew.sampling import Beam
+
+    model = decoder()
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = model.init(jax.random.key(0), prompt)
+    banned = decoding.SuppressTokens(jnp.arange(VOCAB, dtype=jnp.int32))
+    with pytest.raises(Exception, match="without a distribution"):
+        generate(model, params, prompt, 4, key=jax.random.key(0), logits=(banned,),
+                 strategy=Beam(width=2))
+    kept = decoding.SuppressTokens(jnp.asarray([token for token in range(VOCAB) if token != 5],
+                                               jnp.int32))
+    found = generate(model, params, prompt, 4, key=jax.random.key(0), logits=(kept,),
+                     sampling=Sampling(pad_id=0), strategy=Beam(width=2))
+    np.testing.assert_array_equal(np.asarray(found.tokens)[0, 3:], 5)
+
+
+def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
+    """An image slot's embedding comes from the vision tower, not from the
+    token id sitting in that slot. A depth seeded from ids would read a
+    placeholder where the picture is, and the prefill already prepared the
+    real embeddings, so they reach the depths without running the tower
+    again."""
+    from dew.nn.inputs import ModelInputs
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+    from dew.sampling.text import _operations, _prefill
+
+    language = predictor()
+    model = MultimodalTransformer(
+        language, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                               image_size=8, patch_size=4),
+        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+    prompt = jnp.asarray([[2, 1, 3, 4]], jnp.int32)
+    indices = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
+    pixels = jax.random.normal(jax.random.key(1), (1, 1, 3, 8, 8))
+    params = model.init(jax.random.key(0), prompt, image_indices=indices,
+                        conditioning={"pixel_values": pixels})
+    width = prompt.shape[1]
+
+    states = model.apply(params, prompt, image_indices=indices,
+                         conditioning={"pixel_values": pixels}, method=model.hidden_states)
+    reference = model.apply(params, states, prompt, image_indices=indices,
+                            conditioning={"pixel_values": pixels},
+                            method=model.mtp_hidden_states)[0]
+
+    ops = _operations(model, params, 0, 1)
+    seeded, _ = _prefill(model, params,
+                         ModelInputs(prompt[:, :-1], {"image_indices": indices[:, :-1]},
+                                     {"pixel_values": pixels}), ops)
+    _, _, produced = ops.propose(seeded, states[:, -2:-1], prompt[:, -1:], None,
+                                 jnp.ones((1, 1), bool), jnp.full((1, 1), width - 1, jnp.int32), 0)
+    largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"
