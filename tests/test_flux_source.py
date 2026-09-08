@@ -27,7 +27,7 @@ from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.unet_condition import DenoisingCondition
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("schnell", "dev", "rect", "deep")
+CASES = ("schnell", "dev", "rect", "deep", "mixed")
 
 
 @pytest.fixture(scope="module")
@@ -84,21 +84,19 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
 
     The variants are the ones whose wiring differs: the schnell-style model
     with no guidance embedder, the distilled one with it, a rectangular packed
-    grid whose row and column rotations differ, and a stack with a different
-    split between double and single blocks.
+    grid whose row and column rotations differ, a stack with a different split
+    between double and single blocks, and one walked at a different distilled
+    guidance per row.
 
-    The forward and the latent, token and pooled gradients land within 1e-5 of
-    the source's scale, and every parameter gradient within 1e-4 - except the
-    two embedders' first weights, which are the sinusoidal features
-    themselves. Those features are the source's own `sin` and `cos` of an
-    argument the model scales by a thousand, and float32 already disagrees
-    there by 6.1e-5 at this case's timestep and 1.8e-4 at its guidance,
-    measured against `get_timestep_embedding` directly; the gradients of
-    those two weights are those features transposed, so they inherit it.
+    Two records are compared. The unmodified source gives the forward and the
+    latent, token and pooled gradients within 1e-5. The controlled record is
+    the same source walk with Dew's own frequency table handed to its timestep
+    embedding - a control, not unmodified-source parity - and every parameter
+    gradient is held to 1e-4 there, because torch's CPU `exp` is not correctly
+    rounded at six of those 128 frequencies and an ulp of a frequency is 1e-4
+    of a 3500-radian angle. `test_the_frequency_table_is_the_only_component_
+    that_differs` measures that difference and what it costs unmodified.
     """
-    # The measured feature difference at an argument of 3.5 * 1000.
-    features = ("time_text_embed.guidance_embedder.linear_1.weight",
-                "time_text_embed.timestep_embedder.linear_1.weight")
     record = json.loads((source / "flux_transformer.json").read_text())
     grid = tuple(record["cases"][name]["grid"])
     with np.load(source / "flux_transformer.npz") as arrays:
@@ -113,8 +111,11 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         assert relative_gap(packed(np.asarray(gradients[1])), arrays[f"{name}.grad_packed"]) < 1e-5
         assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
         assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
+        # The controlled record, where both sides read the same frequencies.
+        assert relative_gap(packed(np.asarray(output)),
+                            arrays[f"{name}.control_output"]) < 1e-5
         layout = {entry.name: entry for entry in layouts}
-        prefix = f"{name}.grad_param."
+        prefix = f"{name}.control_grad_param."
         names = [key for key in arrays.files if key.startswith(prefix)]
         assert names, name
         for key in names:
@@ -126,8 +127,44 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
             if entry.transpose is not None:
                 value = value.transpose(entry.transpose)
             assert value.shape == tuple(entry.shape), key
-            bound = 2e-4 if key[len(prefix):] in features else 1e-4
-            assert relative_gap(value, arrays[key]) < bound, key
+            assert relative_gap(value, arrays[key]) < 1e-4, key
+
+
+def test_the_frequency_table_is_the_only_component_that_differs(source):
+    """What the unmodified source's own `exp` costs, measured.
+
+    Dew's frequency table is the correctly rounded float32 exponential of the
+    same bit-identical exponent; torch's CPU `exp` differs from it at a few
+    entries by one unit in the last place. Nothing else in the embedding
+    differs, so with the source's own table handed back to it the whole model
+    agrees, and the two weights whose gradients ARE those features are the
+    only place the unmodified comparison exceeds 1e-4. That excess is reported
+    here rather than accommodated: the bound above stays 1e-4 over every
+    tensor of the controlled record.
+    """
+    features = ("time_text_embed.timestep_embedder.linear_1.weight",
+                "time_text_embed.guidance_embedder.linear_1.weight")
+    with np.load(source / "flux_transformer.npz") as arrays:
+        native = arrays["dev.frequencies_native"]
+        theirs = arrays["dev.frequencies_source"]
+        differing = np.nonzero(native != theirs)[0]
+        # The tables agree to one unit in the last place everywhere, and they
+        # do differ, so the control is not comparing a table with itself.
+        assert differing.size
+        ulps = np.abs(native[differing] - theirs[differing]) / np.spacing(theirs[differing])
+        np.testing.assert_array_equal(ulps, np.ones_like(ulps))
+        # An ulp of a frequency times a guidance of 3500 is an ulp of the
+        # angle, and that is what the two feature gradients carry.
+        worst = {}
+        for name in ("dev", "rect"):
+            for key in features:
+                unmodified = arrays[f"{name}.grad_param.{key}"]
+                controlled = arrays[f"{name}.control_grad_param.{key}"]
+                worst[f"{name}.{key}"] = float(
+                    np.abs(unmodified - controlled).max()
+                    / max(1.0, float(np.abs(unmodified).max())))
+        assert max(worst.values()) < 3e-4, worst
+        assert min(worst.values()) > 1e-5, worst
 
 
 def test_every_declared_flux_tensor_is_mapped(source):
@@ -318,3 +355,84 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
     reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
+
+
+def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
+        source, pipeline_record):
+    """A row's own distilled guidance, through the ordinary seams.
+
+    The value belongs to the row rather than to its caption: it reaches the
+    model per row, a row's output does not depend on another row's value, and
+    both caption dropout and the unconditional branch keep it, since dropping
+    a caption changes what the model reads about the text and not the scale
+    the checkpoint was distilled to walk at.
+    """
+    import optax
+    from dew.interop.pretrained import load_pretrained
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective
+
+    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    encoder = loaded.inputs.conditions["conditioning"].encoder
+    params = loaded.variables["encoders"]["conditioning"]
+    rows = [dict(pipeline_record["prompts"][0], guidance=2.0),
+            dict(pipeline_record["prompts"][1], guidance=6.0)]
+    same = [dict(rows[0]), dict(rows[1], guidance=2.0)]
+    tokens = encoder.tokenize(rows)
+    np.testing.assert_allclose(tokens["guidance"], [2.0, 6.0], atol=0)
+    given = encoder.encode(params, tokens)
+    np.testing.assert_allclose(np.asarray(given.guidance), [2.0, 6.0], atol=0)
+    # A value that is not a finite number is refused rather than embedded.
+    with pytest.raises(ValueError, match="finite number"):
+        encoder.tokenize([{"text": "a red cat", "guidance": float("inf")}])
+
+    grid = pipeline_record["size"] // 4
+    with np.load(source / "flux_transformer.npz") as arrays:
+        latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
+    times = jnp.asarray([500.0, 500.0])
+    variables = {"params": loaded.variables["params"]}
+    mixed = loaded.model.apply(variables, latent, times, given)
+    lowered = loaded.model.apply(variables, latent, times,
+                                 encoder.encode(params, encoder.tokenize(same)))
+    # The first row shares its value with the second run and matches exactly;
+    # the second row's own value moves only its own output.
+    np.testing.assert_array_equal(mixed[0], lowered[0])
+    assert not np.allclose(mixed[1], lowered[1], atol=1e-6)
+
+    # The unconditional branch of a guided call carries each row's scalar, so
+    # it is the plain call with the empty caption at that row's own guidance.
+    process, _ = loaded.task.grid(4)
+    empty = {"text": "", "negative": True}
+    denoise = process.denoiser(loaded.model, variables, {"conditioning": given},
+                              {"conditioning": encoder.encode(
+                                  params, encoder.tokenize([empty]))})
+    _, raw = denoise.raw_both(latent, times)
+    branch, _ = denoise.convert(latent, times, raw)
+    per_row = encoder.encode(params, encoder.tokenize(
+        [dict(empty, guidance=2.0), dict(empty, guidance=6.0)]))
+    direct, _ = process.denoiser(loaded.model, variables, {"conditioning": per_row})(latent, times)
+    # The guided call runs one model call over the doubled batch, so its
+    # reductions are not the two-row call's bit for bit; the value that
+    # matters is which guidance each row was walked at, and reading the
+    # default instead of the row's own moves the output by far more.
+    np.testing.assert_allclose(branch, direct, rtol=2e-5, atol=2e-5)
+    default = encoder.encode(params, encoder.tokenize([dict(empty), dict(empty)]))
+    other, _ = process.denoiser(loaded.model, variables, {"conditioning": default})(latent, times)
+    assert not np.allclose(branch, other, rtol=2e-5, atol=2e-5)
+
+    # Dropping every caption leaves the guidance in place, so the loss still
+    # depends on it.
+    objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
+                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   unconditional_prob=1.0, ema_decay=None, steps=2)
+    height, width = loaded.inputs.sample.shape[:2]
+    pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
+                     (2, 1, 1, 1))
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(11), None)
+
+    def loss(records) -> float:
+        batch = {"image": pixels, **loaded.inputs.tokenize(records)}
+        value, _ = objective.loss(loaded.variables, batch, step)
+        return float(value.total / value.mass)
+
+    assert not np.isclose(loss(rows), loss(same), atol=1e-6)
