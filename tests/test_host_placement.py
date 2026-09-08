@@ -353,8 +353,10 @@ def staged_plan(depth: int) -> tuple[int, int, int]:
     compiled = compiled_forward(scanned, on_host, cache, tokens)
     assert host_parameters_in_plan(compiled_forward(scanned, resident, cache, tokens)) == 0
     cache_bytes = sum(leaf.nbytes for leaf in jax.tree.leaves(cache))
+    analysis = compiled.memory_analysis()
+    assert analysis is not None
     return (host_parameters_in_plan(compiled), bank_leaves(on_host),
-            compiled.memory_analysis().temp_size_in_bytes - cache_bytes)
+            analysis.temp_size_in_bytes - cache_bytes)
 
 
 def test_the_compiled_plan_puts_every_bank_in_host_memory_and_stages_one_layer():

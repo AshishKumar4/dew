@@ -324,18 +324,18 @@ class Layout:
         if not self.host_parameters:
             return placed
         paths = [_variable_path(path)
-                 for path, _ in jax.tree_util.tree_flatten_with_path(nn.unbox(tree))[0]]
+                 for path, _ in jax.tree_util.tree_flatten_with_path(placed)[0]]
         unmatched = [pattern for pattern in self.host_parameters
                      if not any(host_selected((pattern,), path) for path in paths)]
         if unmatched:
             raise ValueError(
                 f"host_parameters {unmatched} names none of this tree's "
                 f"{len(paths)} variables; the paths start {sorted(paths)[:3]}")
-        selected = [host_selected(self.host_parameters, path) for path in paths]
-        kinds = iter(selected)
-        return jax.tree.map(
-            lambda sharding: (sharding.with_memory_kind("pinned_host") if next(kinds)
-                              else sharding), placed)
+        return jax.tree_util.tree_map_with_path(
+            lambda path, sharding: (
+                sharding.with_memory_kind("pinned_host")
+                if host_selected(self.host_parameters, _variable_path(path)) else sharding),
+            placed)
 
     def check(self, params: Variables, shardings: Placement, mesh: Mesh) -> None:
         """Reject a layout that left too much of the model replicated, or that
