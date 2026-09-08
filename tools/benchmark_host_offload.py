@@ -121,9 +121,20 @@ def build(config: OffloadConfig, depth: int) -> CausalTransformer:
         attention_impl=config.attention_impl))
 
 
-def shapes_of(model: CausalTransformer, tokens) -> dict:
-    """The store a plain init would produce, as shapes: what a source fills."""
-    return jax.eval_shape(lambda key: model.init(key, tokens), jax.random.key(0))
+def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:
+    """The store a source fills, as shapes.
+
+    `init` writes fp32 masters, which a training run keeps and a published
+    checkpoint does not: `dew.sampling.pipelines.cast_floating` casts every
+    floating leaf on the way out of a run, so a bf16 case holds bf16 weights
+    and no fp32 copy of them exists anywhere here.
+    """
+    shapes = jax.eval_shape(lambda key: model.init(key, tokens), jax.random.key(0))
+    target = jnp.dtype(dtype)
+    return jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(
+            leaf.shape, target if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype),
+        shapes)
 
 
 def decode_step(model: CausalTransformer):
@@ -156,7 +167,7 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     record: dict = {"depth": depth, "offload": offload, "rss_before": status()}
 
     started = time.perf_counter()
-    shapes = shapes_of(model, tokens)
+    shapes = shapes_of(model, tokens, config.dtype)
     record["shapes_seconds"] = time.perf_counter() - started
     record["parameters"] = sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(shapes))
     record["parameter_bytes"] = sum(
