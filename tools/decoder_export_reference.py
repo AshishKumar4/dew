@@ -18,6 +18,7 @@ numbers below and the assertions come from one pipeline.
 
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 from dataclasses import dataclass, field
@@ -40,17 +41,29 @@ SEED = 3
 
 @dataclass(frozen=True)
 class Case:
-    """A family's fixture and the loss terms its checkpoint supports.
+    """A family's fixture, the loss terms its checkpoint supports and the
+    class the reference reads it with.
 
     `balance_rate` needs a mixture that keeps a routing bias, so only the
     sigmoid-scored families carry one; `mtp_weight` needs a configured
     prediction depth, which GLM's checkpoint is the one to ship.
+
+    `reference_class` names the transformers class for a released
+    model_type transformers registers no config for. Kimi K2 is the family
+    that ships that way. Its `auto_map` points at its own copy of DeepSeek
+    V3's modeling code, and transformers says the same thing where it does
+    read the name: `Kimi_K25Config.__post_init__` turns a text config of
+    model_type `kimi_k2` into a `deepseek_v3` one
+    (models/kimi_k25/configuration_kimi_k25.py:80-91), so
+    `DeepseekV3ForCausalLM` is upstream's implementation of these weights.
+    `AutoModelForCausalLM` reads every other family here off its model_type.
     """
 
     name: str
     fixture: str
     balance_rate: float | None = None
     mtp_weight: float | None = None
+    reference_class: str | None = None
 
 
 CASES = (
@@ -60,6 +73,8 @@ CASES = (
     Case("deepseek_v2", "deepseek-v2-tiny"),
     Case("deepseek_v3", "deepseek-v3-tiny", balance_rate=1e-2),
     Case("deepseek_v32", "deepseek-v32-tiny", balance_rate=1e-2),
+    Case("kimi_k2", "kimi-k2-tiny", balance_rate=1e-2,
+         reference_class="DeepseekV3ForCausalLM"),
     Case("llama4_text", "llama4-tiny"),
 )
 
@@ -116,16 +131,45 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     return state
 
 
-def reference_logits(directory: Path, ids: np.ndarray) -> np.ndarray:
-    """transformers 5.16.1 over the exported directory, fp32 on the eager path."""
-    import torch
-    from transformers import AutoModelForCausalLM
+def reference_model(case: Case, directory: Path):
+    """The reference implementation over the exported directory, with its
+    loading report.
 
-    loaded = AutoModelForCausalLM.from_pretrained(
+    A family whose released model_type transformers registers a config for
+    loads through `AutoModelForCausalLM`. Kimi K2's does not exist upstream,
+    so the case names the class its release's `auto_map` points at and this
+    registers that class's own tensor conversion under the checkpoint's
+    model_type. transformers keys the per-expert conversion by model_type,
+    so without it a Kimi checkpoint's one tensor per expert would reach no
+    converter and arrive unread while the fused parameters stayed random.
+    The arithmetic is transformers' own either way.
+    """
+    import torch
+    import transformers
+
+    factory = transformers.AutoModelForCausalLM
+    if case.reference_class is not None:
+        from transformers.conversion_mapping import (
+            get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
+        )
+
+        factory = getattr(transformers, case.reference_class)
+        model_type = json.loads((directory / "config.json").read_text())["model_type"]
+        register_checkpoint_conversion_mapping(
+            model_type, get_checkpoint_conversion_mapping(factory.config_class.model_type),
+            overwrite=True)
+    loaded = factory.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise TypeError("output_loading_info must return a model and its loading report")
-    model, report = loaded
+    return loaded
+
+
+def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
+    """transformers 5.16.1 over the exported directory, fp32 on the eager path."""
+    import torch
+
+    model, report = reference_model(case, directory)
     for category in ("missing_keys", "mismatched_keys", "error_msgs"):
         if report.get(category):
             raise ValueError(f"reference load {category}: {report[category]}")
@@ -156,7 +200,7 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     reloaded = load_pretrained(str(export), dtype="float32", attention_impl="reference")
     return RoundTrip(case, source, state.params, export, ids,
                      logits(source, state.params, ids), reloaded,
-                     reference_logits(export, ids),
+                     reference_logits(case, export, ids),
                      source_tensors(directory), source_tensors(export))
 
 

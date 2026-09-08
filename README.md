@@ -237,7 +237,15 @@ and exported through Dew's public APIs.
 | Mixtral, Qwen3-MoE | `mixtral`, `qwen3_moe` |
 | GLM floating-point checkpoints | `glm4_moe` |
 | DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
+| Kimi K2 | `kimi_k2` |
 | Llama 4 text | `llama4_text` |
+
+Kimi K2 loads and exports under its own `model_type` rather than DeepSeek
+V3's, so a trained checkpoint keeps the vocabulary, rope base and routing
+widths it came with. `tests/fixtures/hf/kimi-k2-tiny/source.json` pins the
+released revision those were scaled from. The 1T released weights were not
+downloaded, so the load, `Trainer` update, export and reference reload run
+on that tiny fixture on CPU in float32.
 
 ### Native multimodal models
 
@@ -293,10 +301,10 @@ claimed, and more than one prediction layer is refused.
 | Quantized source-format export | FP8 / MXFP4 | Requantization of trained weights into the original blocks/scales is unsupported |
 | LLaDA | `llada` | No masked-objective pretrained seam |
 | Dream | `dream`, `Dream` | Export writer, training seam |
-| Kimi K2 | `kimi_k2` | Config translation only, no weights |
 
-DeepSeek's MLA layers need `attention_impl="reference"`; `auto` rejects their
-query and value head widths. `MaskedDiffusionObjective` takes no `pretrained`
+The MLA layers of DeepSeek and Kimi K2 need `attention_impl="reference"`;
+`auto` rejects their query and value head widths.
+`MaskedDiffusionObjective` takes no `pretrained`
 argument, so LLaDA and Dream train from a fresh init rather than from their
 released weights.
 

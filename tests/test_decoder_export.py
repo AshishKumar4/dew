@@ -23,6 +23,7 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 | deepseek_v2  |             48 |         24 |                  3.2e-06 |
 | deepseek_v3  |             53 |         24 |                  5.1e-06 |
 | deepseek_v32 |             63 |         24 |                  3.4e-06 |
+| kimi_k2      |             65 |         36 |                  2.6e-06 |
 | llama4_text  |             45 |          0 |                  4.2e-06 |
 
 Llama 4 ships one fused `experts.gate_up_proj` per routed layer instead of
@@ -30,6 +31,15 @@ one tensor per expert, so its export runs the fused path and holds no
 indexed binding. transformers' Glm4Moe has no MTP depth and ignores those
 tensors of the GLM checkpoint, so the reference agrees on the trunk and the
 depth's own weights are held to account through the dew reload.
+
+transformers 5.16.1 registers no `kimi_k2` config, so the tool names the
+class Kimi's release points its `auto_map` at, `DeepseekV3ForCausalLM`,
+which is also the class transformers itself substitutes where it reads the
+name (`Kimi_K25Config.__post_init__`). It registers that class's own
+per-expert tensor conversion under the checkpoint's model_type, since
+transformers keys the conversion by model_type; without it the release's
+one tensor per expert reaches no converter and the loading report names 2
+missing and 36 unexpected keys.
 
 The tiny checkpoints carry no tokenizer, so the tokenizer half of an export
 is exercised on a copy of one with the committed byte-level BPE beside it.
@@ -55,7 +65,8 @@ MOVEMENT = 1e-4
 # The families whose checkpoint names one tensor per expert, which the load
 # stacks and the export slices back apart. Llama 4 fuses its experts
 # instead and is covered by every other case here.
-INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3", "deepseek_v32")
+INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
+           "deepseek_v32", "kimi_k2")
 
 
 CASES = {case.name: case for case in tool.CASES}
