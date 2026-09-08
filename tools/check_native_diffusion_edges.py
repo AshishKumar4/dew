@@ -10,7 +10,8 @@ from flax import linen as nn
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
-from dew.nn.backbones.unet_condition import DenoisingCondition, UNet2DCondition
+from dew.diffusion.process import DenoisingCondition
+from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.sampling.sample import sample
 
 

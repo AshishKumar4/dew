@@ -226,7 +226,8 @@ def regress(directory, case):
 
 def check_model(directory):
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
-    from dew.nn.backbones.unet_condition import DenoisingCondition, UNet2DCondition
+    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.backbones.unet_condition import UNet2DCondition
     directory = Path(directory)
     reference = np.load(directory / "reference.npz")
     model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()), attention_impl="xla"))

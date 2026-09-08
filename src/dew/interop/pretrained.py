@@ -8,7 +8,8 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Literal, Protocol
+from types import MappingProxyType
+from typing import Literal, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -33,9 +34,10 @@ from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import SourceSchedule
-from dew.inputs import InputSpec
-from dew.nn.autoencoders import AutoEncoder
+from dew.diffusion.schedules.source import Origin, SourceSchedule
+from dew.inputs import Condition, Field, InputSpec
+from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
+from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
@@ -638,6 +640,7 @@ class Pretrained:
     inputs: InputSpec | None = None
     autoencoder: AutoEncoder | None = None
     schedule: SourceSchedule | None = None
+    task: SourceTask | None = None
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = field(default=(), kw_only=True)
 
@@ -680,9 +683,11 @@ class Pretrained:
         """The latent diffusion source as an image task with its published policy."""
         if self.process is None or self.inputs is None or self.schedule is None:
             raise TypeError("text_to_image needs a latent diffusion source")
+        if self.task is None:
+            raise TypeError("text_to_image needs the source's own call policy")
         return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
-                           grid=self.schedule.sampling, final_denoise=False, sampler=self.schedule.solver(),
-                           steps=min(50, self.schedule.train_steps), guidance=CFG(7.5), finish=self.finish)
+                           grid=self.task.grid, final_denoise=False, sampler=self.schedule.solver(),
+                           steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with its tokenizer assets."""
@@ -1259,95 +1264,369 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
     return policy, transforms, criteria, strategy
 
 
+class _Call(NamedTuple):
+    """One pinned pipeline's own `__call__` policy, read from Diffusers
+    0.34.0: the denoiser it drives, the steps and guidance scale it defaults
+    to, whether that scale guides two branches or is the value the model
+    embeds, and the text sequence budget it pads its T5 tower to."""
+
+    component: str
+    steps: int
+    guidance: float
+    guided: bool
+    sequence: int = 0
+
+
+# The class a file declares is the one whose defaults it gets, so no class is
+# normalized into another: the XL inpainting pipeline keeps 7.5 where the
+# other two XL ones lowered to 5.0, every Flax pipeline kept its own 7.5, and
+# Flux's 3.5 is the guidance its transformer embeds while its own true
+# classifier-free guidance is off at the pinned default.
+_PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
+    "StableDiffusionPipeline": _Call("unet", 50, 7.5, True),
+    "StableDiffusionImg2ImgPipeline": _Call("unet", 50, 7.5, True),
+    "StableDiffusionInpaintPipeline": _Call("unet", 50, 7.5, True),
+    "StableDiffusionXLPipeline": _Call("unet", 50, 5.0, True),
+    "StableDiffusionXLImg2ImgPipeline": _Call("unet", 50, 5.0, True),
+    "StableDiffusionXLInpaintPipeline": _Call("unet", 50, 7.5, True),
+    "StableDiffusion3Pipeline": _Call("transformer", 28, 7.0, True, 256),
+    "FluxPipeline": _Call("transformer", 28, 3.5, False, 512),
+    "FlaxStableDiffusionPipeline": _Call("unet", 50, 7.5, True),
+    "FlaxStableDiffusionImg2ImgPipeline": _Call("unet", 50, 7.5, True),
+    "FlaxStableDiffusionInpaintPipeline": _Call("unet", 50, 7.5, True),
+    "FlaxStableDiffusionXLPipeline": _Call("unet", 50, 7.5, True),
+})
+
+
+def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
+    """The call policy this file's own pipeline carries.
+
+    A directory that declares no pipeline - a bare component tree - takes its
+    family's reference pipeline. A directory that declares one Dew does not
+    implement is refused rather than run under another pipeline's defaults,
+    and a declared pipeline that drives a different denoiser than the one the
+    directory holds is refused too: a component this loader reads does not
+    qualify a workflow it does not.
+    """
+    published = index.get("_class_name")
+    if published is None:
+        policy = _PIPELINE_POLICY[denoiser.pipeline]
+    else:
+        found = _PIPELINE_POLICY.get(published) if isinstance(published, str) else None
+        if found is None:
+            raise ValueError(f"Native diffusion does not implement the published pipeline "
+                             f"{published!r}")
+        policy = found
+    if policy.component != denoiser.component:
+        raise ValueError(f"The published pipeline {published!r} drives a {policy.component}, and "
+                         f"this directory holds a {denoiser.component}")
+    return policy
+
+
+@dataclass(frozen=True)
+class SourceTask:
+    """A published pipeline's own call policy.
+
+    `steps` and `guidance` are the defaults its `__call__` signature carries,
+    and `grid` prepares the sampling grid the way that pipeline prepares it,
+    with the sigma origin it uses and the latent geometry it lays out already
+    bound. A pipeline whose guidance is a model input rather than two branches
+    carries `guidance=None`.
+    """
+
+    steps: int
+    guidance: CFG | None
+    grid: Callable[[int], tuple[Process, jax.Array]]
+
+
+@dataclass(frozen=True)
+class _Denoiser:
+    """What one architecture contributes to a diffusion source.
+
+    The native model and the variables its component's tensors translate to,
+    and the reading conventions the rest of the source follows from it: which
+    text towers it takes and how they compose, the width it reads their
+    sequence at, how many latent pixels one of its positions covers, its own
+    input channel count, the pipeline class its family's call policy comes
+    from and where that pipeline's sigmas start.
+    """
+
+    component: str
+    model: nn.Module
+    variables: Variables
+    layouts: tuple[WeightLayout, ...]
+    built: Mapping[str, object]
+    config: Mapping[str, object]
+    composition: Composition
+    towers: tuple[str, ...]
+    patch: int
+    latent_input: int
+    sample_size: int
+    context_width: int
+    pipeline: str
+    origin: Origin = "scheduler"
+    embeds_guidance: bool = False
+    t5_tower: str | None = None
+
+
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
-                          attention_impl: str) -> Pretrained:
-    """A published latent diffusion directory as native modules and variables."""
-    from transformers import CLIPTokenizer
-    from dew.diffusion.schedules.source import SourceSchedule
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.inputs.diffusion import CLIPConditioner, CLIPImageTransform, CLIPSafetyHead, ImageSafety
+                           attention_impl: str) -> Pretrained:
+    """A published latent diffusion directory as native modules and variables.
+
+    Two denoiser families ship this layout: a UNet reading one or two CLIP
+    towers through cross attention, and an MM-DiT transformer reading them
+    jointly beside a T5 tower. The directory's own denoiser component selects
+    the family, and everything the families share - the autoencoder, the text
+    towers, the geometry, the conditioning, the safety head a file declares,
+    the schedule and the call policy - is read once here.
+    """
+    compute = resolve_dtype(dtype)
+    denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
+                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    policy = _call_policy(index, denoiser)
+    autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute)
+    names = tuple(name for name in denoiser.towers if _present(index, name))
+    if not names:
+        raise ValueError("A latent diffusion source needs at least one text encoder")
+    towers, tokenizers, text_params, text_layouts = _clip_towers(directory, names, compute)
+    components = {denoiser.component: denoiser.config, "vae": vae_config,
+                  **{name: _component_config(directory, name) for name in names}}
+    t5 = None
+    if denoiser.t5_tower is not None and _present(index, denoiser.t5_tower):
+        t5, t5_params, t5_layouts, components[denoiser.t5_tower] = _t5_tower(
+            directory, compute, denoiser.t5_tower, policy.sequence)
+        text_params[denoiser.t5_tower] = t5_params
+        text_layouts += t5_layouts
+    size = denoiser.sample_size * autoencoder.downscale_factor
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    # A guidance-embedded model takes the pipeline's scale as an input; a
+    # model that reads none carries nothing.
+    encoder = DiffusionConditioner(
+        towers, tokenizers, names, text_params, str(directory), height, width,
+        denoiser.context_width, composition=denoiser.composition, t5=t5,
+        guidance=policy.guidance if denoiser.embeds_guidance and not policy.guided else None,
+        aesthetics=bool(index.get("requires_aesthetics_score", False)))
+    inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
+    inputs = InputSpec(Field("image", (height, width, 3)),
+                       {"conditioning": Condition(encoder, unconditional=_unconditional(
+                           denoiser.composition, index))},
+                       mask=Field("mask", (height, width, 1)) if inpaint else None)
+    encoders: dict[str, object] = {"conditioning": text_params}
+    finish, safety_layouts = None, ()
+    if _present(index, "safety_checker"):
+        finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
+            directory, compute)
+        components.update(safety_configs)
+    schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
+    components["scheduler"] = dict(schedule.config)
+    patch = denoiser.patch * autoencoder.downscale_factor
+    task = SourceTask(min(policy.steps, schedule.train_steps),
+                      CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
+                      functools.partial(schedule.sampling, origin=denoiser.origin,
+                                        tokens=(height // patch) * (width // patch)))
+    variables = {**denoiser.variables, "encoders": encoders, "autoencoder": vae_params}
+    config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
+    return Pretrained(denoiser.model, variables, None, config, directory, denoiser.built,
+                      weight_layouts=denoiser.layouts + vae_layouts + text_layouts + safety_layouts,
+                      process=schedule.training_process(), inputs=inputs, autoencoder=autoencoder,
+                      schedule=schedule, finish=finish, task=task)
+
+
+def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+    """The published UNet: cross attention over one or two CLIP towers, whose
+    pooled text conditioning is the one its added time features ask for."""
+    from dew.interop import diffusion
+    from dew.interop.diffusion import _integer
+    from dew.nn.backbones.unet_condition import UNet2DCondition
+
+    config = _component_config(directory, "unet")
+    fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = UNet2DCondition(**fields)
+    params, layouts = diffusion.translate_unet_weights(
+        diffusion.component_tensors(directory, "unet"), model)
+    pooled = model.additional_time_features > 0
+    built = {"name": "unet_2d_condition",
+             "fields": {**fields, "dtype": dtype,
+                        "stages": [asdict(stage) for stage in model.stages]}}
+    return _Denoiser(
+        component="unet", model=model, variables={"params": params}, layouts=layouts,
+        built=built, config=config, composition="clip_pooled" if pooled else "clip",
+        towers=("text_encoder", "text_encoder_2"), patch=1, latent_input=model.in_channels,
+        sample_size=_integer(config["sample_size"], "sample_size"),
+        context_width=_integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
+        pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
+
+
+def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+    """The published transformer this directory holds, by the class it names."""
+    config = _component_config(directory, "transformer")
+    published = config.get("_class_name")
+    if published == "SD3Transformer2DModel":
+        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "FluxTransformer2DModel":
+        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    raise ValueError(f"Native diffusion does not implement the published transformer "
+                     f"{published!r}")
+
+
+def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+    """SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
+    stored position buffer in its own frozen collection."""
+    from dew.interop import diffusion
+    from dew.interop.diffusion import _integer
+    from dew.nn.backbones.sd3 import SD3Transformer
+
+    fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = SD3Transformer(**fields)
+    params, buffers, layouts = diffusion.translate_sd3_weights(
+        diffusion.component_tensors(directory, "transformer"))
+    built = {"name": "sd3_transformer",
+             "fields": {**fields, "dtype": dtype,
+                        "dual_attention_layers": list(fields["dual_attention_layers"])}}
+    return _Denoiser(
+        component="transformer", model=model, variables={"params": params, "buffers": buffers},
+        layouts=layouts, built=built, config=config, composition="sd3",
+        towers=("text_encoder", "text_encoder_2"), patch=fields["patch_size"],
+        latent_input=fields["in_channels"], sample_size=_integer(config["sample_size"], "sample_size"),
+        context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline",
+        t5_tower="text_encoder_3")
+
+
+def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+    """Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
+    for the sequence, and a latent its pipeline packs in 2x2 patches.
+
+    The class declares no sample size; its pipeline's `default_sample_size`
+    is 128 latent positions, which a directory overrides with its own
+    geometry. It starts from the sigmas its pipeline hands the scheduler.
+    """
+    from dew.interop import diffusion
+    from dew.interop.diffusion import _integer
+    from dew.nn.backbones.flux import FluxTransformer
+
+    fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = FluxTransformer(**fields)
+    params, layouts = diffusion.translate_flux_weights(
+        diffusion.component_tensors(directory, "transformer"))
+    built = {"name": "flux_transformer",
+             "fields": {**fields, "dtype": dtype,
+                        "axes_dims_rope": list(fields["axes_dims_rope"])}}
+    return _Denoiser(
+        component="transformer", model=model, variables={"params": params}, layouts=layouts,
+        built=built, config=config, composition="flux", towers=("text_encoder",), patch=2,
+        latent_input=fields["in_channels"] // 4,
+        sample_size=_integer(config.get("sample_size", 128), "sample_size"),
+        context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
+        origin="linspace", embeds_guidance=fields["guidance_embeds"], t5_tower="text_encoder_2")
+
+
+def _component_config(directory: Path, name: str) -> dict:
+    """One published component's own config file."""
+    file = "scheduler_config.json" if name == "scheduler" else "config.json"
+    with open(directory / name / file) as handle:
+        return json.load(handle)
+
+
+def _present(index: Mapping[str, object], name: str) -> bool:
+    """Whether the index declares a component rather than declaring it absent."""
+    entry = index.get(name)
+    return isinstance(entry, list) and entry[0] is not None
+
+
+def _diffusion_vae(directory: Path, compute) -> tuple[StableDiffusionVAE, Variables,
+                                                      tuple[WeightLayout, ...], dict]:
+    """The published autoencoder, its parameters and their source layouts."""
     from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
     from dew.nn.autoencoders.vae import _vae_path
-    from dew.nn.backbones.unet_condition import UNet2DCondition
-    from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, translate_config, translate_vision_config
 
-    def component_config(name: str) -> dict:
-        file = "scheduler_config.json" if name == "scheduler" else "config.json"
-        with open(directory / name / file) as handle:
-            return json.load(handle)
+    config = _component_config(directory, "vae")
+    model = AutoencoderKL(
+        channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
+        image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
+        norm_groups=config["norm_num_groups"], quantize=config.get("use_quant_conv", True),
+        post_quantize=config.get("use_post_quant_conv", True), dtype=compute)
+    tensors = diffusion.component_tensors(directory, "vae")
+    params, layouts = diffusion.record_layouts(
+        "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",))
+    autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=params, model=model,
+                                     latent_shift=config.get("shift_factor") or 0.0,
+                                     latent_scale=config.get("scaling_factor", 0.18215))
+    return autoencoder, params, layouts, config
 
-    def present(name: str) -> bool:
-        entry = index.get(name)
-        return isinstance(entry, list) and entry[0] is not None
 
-    compute = resolve_dtype(dtype)
-    unet_config = component_config("unet")
-    native_fields = diffusion.unet_fields(unet_config, dtype=dtype, attention_impl=attention_impl)
-    model = UNet2DCondition(**native_fields)
-    unet_params, layouts = diffusion.translate_unet_weights(diffusion.component_tensors(directory, "unet"), model)
-    vae_config = component_config("vae")
-    vae_model = AutoencoderKL(
-        channels=tuple(vae_config["block_out_channels"]), latent_channels=vae_config["latent_channels"],
-        image_channels=vae_config["in_channels"], blocks_per_level=vae_config["layers_per_block"],
-        norm_groups=vae_config["norm_num_groups"], quantize=vae_config.get("use_quant_conv", True),
-        post_quantize=vae_config.get("use_post_quant_conv", True), dtype=compute)
-    vae_tensors = diffusion.component_tensors(directory, "vae")
-    vae_params, vae_layouts = diffusion.record_layouts(
-        "vae", vae_tensors, lambda name: _vae_path(name, np.ndim(vae_tensors[name])), ("autoencoder",))
-    autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=vae_params, model=vae_model,
-                                     latent_shift=vae_config.get("shift_factor") or 0.0,
-                                     latent_scale=vae_config.get("scaling_factor", 0.18215))
-    names = tuple(name for name in ("text_encoder", "text_encoder_2") if present(name))
-    if not names:
-        raise ValueError("A latent diffusion source needs at least one text encoder")
-    towers, tokenizers, text_params, text_layouts = [], [], {}, ()
+def _clip_towers(directory: Path, names: tuple[str, ...], compute):
+    """The published CLIP text towers, their tokenizers, their parameters and
+    the layouts those parameters came from."""
+    from transformers import CLIPTokenizer
+    from dew.interop import diffusion
+    from dew.nn.text_encoders import CLIPTextTransformer, translate_config
+
+    towers, tokenizers, params, layouts = [], [], {}, ()
     for name in names:
-        text_config = component_config(name)
-        towers.append(CLIPTextTransformer(**translate_config(text_config), dtype=compute))
-        params, recorded = diffusion.record_layouts(
-            name, diffusion.component_tensors(directory, name), _text_head_path, ("encoders", "conditioning", name))
-        text_params[name] = params
-        text_layouts += recorded
-        tokenizers.append(CLIPTokenizer.from_pretrained(directory / ("tokenizer" + name.removeprefix("text_encoder"))))
-    sample_size = int(unet_config["sample_size"]) * autoencoder.downscale_factor
-    height, width = index.get("dew_height", sample_size), index.get("dew_width", sample_size)
-    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-        raise ValueError("Image geometry must contain positive integer dimensions")
-    pooled = model.additional_time_features > 0
-    encoder = CLIPConditioner(tuple(towers), tuple(tokenizers), names, text_params, str(directory), height, width,
-                              pooled=pooled, aesthetics=bool(index.get("requires_aesthetics_score", False)))
-    unconditional = {"text": "", "negative": True, "zero": bool(pooled and index.get("force_zeros_for_empty_prompt", True))}
-    inpaint = model.in_channels == autoencoder.latent_channels * 2 + 1
-    inputs = InputSpec(Field("image", (height, width, 3)),
-                       {"conditioning": Condition(encoder, unconditional=unconditional)},
-                       mask=Field("mask", (height, width, 1)) if inpaint else None)
-    encoders = {"conditioning": text_params}
-    finish = None
-    safety_layouts = ()
-    extra_configs = {}
-    if present("safety_checker"):
-        checker_config = component_config("safety_checker")
-        with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
-            transform_config = json.load(handle)
-        encoders["safety"], safety_layouts = diffusion.record_layouts(
-            "safety_checker", diffusion.component_tensors(directory, "safety_checker"), _safety_path, ("encoders", "safety"))
-        head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(checker_config), dtype=compute),
-                              int(checker_config["projection_dim"]), dtype=compute)
-        finish = ImageSafety(head, CLIPImageTransform.from_config(transform_config))
-        extra_configs.update(safety_checker=checker_config, feature_extractor=transform_config)
-    schedule = SourceSchedule.from_config(component_config("scheduler"))
-    variables = {"params": unet_params, "encoders": encoders, "autoencoder": vae_params}
-    components = {"unet": unet_config, "vae": vae_config, "scheduler": dict(schedule.config),
-                  **{name: component_config(name) for name in names}}
-    components.update(extra_configs)
-    config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
-    built = {"name": "unet_2d_condition", "fields": {**native_fields, "dtype": dtype,
-             "stages": [asdict(stage) for stage in model.stages]}}
-    return Pretrained(model, variables, None, config, directory, built,
-                      weight_layouts=layouts + vae_layouts + text_layouts + safety_layouts,
-                      process=schedule.training_process(), inputs=inputs, autoencoder=autoencoder,
-                      schedule=schedule, finish=finish)
+        config = _component_config(directory, name)
+        towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
+        tower, recorded = diffusion.record_layouts(
+            name, diffusion.component_tensors(directory, name), _text_head_path,
+            ("encoders", "conditioning", name))
+        params[name] = tower
+        layouts += recorded
+        tokenizers.append(CLIPTokenizer.from_pretrained(
+            directory / ("tokenizer" + name.removeprefix("text_encoder"))))
+    return tuple(towers), tuple(tokenizers), params, layouts
+
+
+def _t5_tower(directory: Path, compute, component: str, tokens: int):
+    """The published T5 encoder as the conditioner's segment, with its
+    parameters, their layouts and its config.
+
+    `component` is where the family keeps it: an SD3 directory's third text
+    encoder, a Flux directory's second one; `tokens` is the sequence budget
+    the pipeline pads to.
+    """
+    from transformers import AutoTokenizer
+    from dew.interop import diffusion
+    from dew.nn.text_encoders import (
+        T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config)
+
+    config = _component_config(directory, component)
+    tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tensors = diffusion.component_tensors(directory, component)
+    t5_embedding(tensors)
+    params, layouts = diffusion.record_layouts(
+        component, tensors, _t5_path, ("encoders", "conditioning", component))
+    tokenizer = AutoTokenizer.from_pretrained(
+        directory / ("tokenizer" + component.removeprefix("text_encoder")))
+    return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
+
+
+def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
+    """The empty-prompt row a file's own pipeline guides against: the XL
+    pipelines zero it where their index says so, and the SD3 pipeline encodes
+    it with its towers, having no such control."""
+    zero = composition == "clip_pooled" and bool(index.get("force_zeros_for_empty_prompt", True))
+    return {"text": "", "negative": True, "zero": zero}
+
+
+def _image_safety(directory: Path, compute):
+    """The safety head a file declares: the finish, its parameters, their
+    layouts and the two configs it ships."""
+    from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
+    from dew.interop import diffusion
+    from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
+
+    config = _component_config(directory, "safety_checker")
+    with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
+        transform = json.load(handle)
+    params, layouts = diffusion.record_layouts(
+        "safety_checker", diffusion.component_tensors(directory, "safety_checker"), _safety_path,
+        ("encoders", "safety"))
+    head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
+                          int(config["projection_dim"]), dtype=compute)
+    return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
+            {"safety_checker": config, "feature_extractor": transform})
 
 
 def _text_head_path(name: str):
