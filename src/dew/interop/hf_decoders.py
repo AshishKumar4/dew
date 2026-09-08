@@ -879,6 +879,23 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, Any], used: set[str]) -
     return config
 
 
+# LLaDA's own block tensor names beside the llama-layout spellings the
+# shared map reads. The load renames one way and the export the other from
+# this one table, so the two directions cannot drift apart.
+_LLADA_BLOCK_NAMES = {
+    'attn_norm': 'input_layernorm', 'attn_out': 'self_attn.o_proj',
+    'ff_norm': 'post_attention_layernorm', 'ff_proj': 'mlp.gate_proj',
+    'up_proj': 'mlp.up_proj', 'ff_out': 'mlp.down_proj',
+    'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
+    'v_proj': 'self_attn.v_proj',
+}
+_LLADA_TRUNK_NAMES = {
+    'model.transformer.wte.weight': 'model.embed_tokens.weight',
+    'model.transformer.ln_f.weight': 'model.norm.weight',
+    'model.transformer.ff_out.weight': 'lm_head.weight',
+}
+
+
 def _llada_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
     """LLaDA's OLMo-style names onto the shared llama-layout map.
 
@@ -886,28 +903,40 @@ def _llada_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, 
     head), only the names differ, so each name is respelled and _dew_path does
     the rest. No second table.
     """
-    renamed = name
-    if renamed == 'model.transformer.wte.weight':
-        renamed = 'model.embed_tokens.weight'
-    elif renamed == 'model.transformer.ln_f.weight':
-        renamed = 'model.norm.weight'
-    elif renamed == 'model.transformer.ff_out.weight':
-        renamed = 'lm_head.weight'
-    else:
-        parts = renamed.split('.')
-        if (len(parts) == 6 and parts[:3] == ['model', 'transformer', 'blocks']
-                and parts[3].isdigit()):
-            tail = {'attn_norm': 'input_layernorm', 'attn_out': 'self_attn.o_proj',
-                    'ff_norm': 'post_attention_layernorm', 'ff_proj': 'mlp.gate_proj',
-                    'up_proj': 'mlp.up_proj', 'ff_out': 'mlp.down_proj',
-                    'q_proj': 'self_attn.q_proj', 'k_proj': 'self_attn.k_proj',
-                    'v_proj': 'self_attn.v_proj'}.get(parts[4])
-            if tail is None or parts[5] != 'weight':
-                raise ValueError(f'unknown tensor name {name!r}')
-            renamed = f'model.layers.{parts[3]}.{tail}.weight'
-        else:
+    renamed = _LLADA_TRUNK_NAMES.get(name)
+    if renamed is None:
+        parts = name.split('.')
+        tail = (_LLADA_BLOCK_NAMES.get(parts[4])
+                if len(parts) == 6 and parts[:3] == ['model', 'transformer', 'blocks']
+                and parts[3].isdigit() and parts[5] == 'weight' else None)
+        if tail is None:
             raise ValueError(f'unknown tensor name {name!r}')
+        renamed = f'model.layers.{parts[3]}.{tail}.weight'
     return _dew_path(renamed, config)
+
+
+def _llada_export_path(name: str, config: Mapping[str, object]) -> Optional[str]:
+    """One dew leaf back into LLaDA's own tensor name, `_llada_path` inverted.
+
+    The llama spelling is what the shared map produced, not what the release
+    stores, so writing it under a config that declares model_type llada
+    would leave a checkpoint neither `modeling_llada.py` nor `_llada_path`
+    reads back. None stays None: the tied head's copy is the embedding.
+    """
+    llama = _hf_name(name, config)
+    if llama is None:
+        return None
+    for theirs, ours in _LLADA_TRUNK_NAMES.items():
+        if llama == ours:
+            return theirs
+    parts = llama.split('.')
+    if (len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and parts[-1] == 'weight'):
+        module = '.'.join(parts[3:-1])
+        for theirs, ours in _LLADA_BLOCK_NAMES.items():
+            if module == ours:
+                return f'model.transformer.blocks.{parts[2]}.{theirs}.weight'
+    raise ValueError(f"unknown parameter path {name!r}")
 
 
 def _llada_export(model: CausalTransformer) -> dict[str, object]:
@@ -2286,16 +2315,18 @@ def _export_config(model) -> Dict[str, Any]:
         'hidden_act': _HF_ACTIVATIONS[model.mlp],
         'use_cache': True,
     }
-    # A dial only one family's reference reads cannot ride in another
-    # family's config. Qwen2 alone splits the o_proj bias from the others,
-    # and Gemma 2 alone applies the attention softcap (Gemma 3 reads the
-    # field without passing it on). A checkpoint written under a family
-    # that would drop the dial is refused naming it.
+    # A dial only some families' references read cannot ride in another
+    # family's config. Qwen2 splits the o_proj bias from the others, and
+    # Dream's reference is that block with the causal mask dropped
+    # (modeling_dream.py, DreamAttention builds o_proj bias-free over
+    # biased q/k/v); Gemma 2 alone applies the attention softcap (Gemma 3
+    # reads the field without passing it on). A checkpoint written under a
+    # family that would drop the dial is refused naming it.
     if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
-        if family.export_model_type != 'qwen2':
+        if family.export_model_type not in ('qwen2', 'dream'):
             raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
-                "family's reference builds, so the model cannot be written as "
+                "and dream references build, so the model cannot be written as "
                 f"{family.export_model_type}")
     if model.attn_logit_softcap is not None and family.export_model_type != 'gemma2':
         raise ValueError(
@@ -2824,7 +2855,7 @@ _FAMILY_ENTRIES = (
                                       and not fields.get('output_gate')
                                       and not fields.get('qk_norm')),
                   'llada', 'LLaDAModelLM', _llada_export,
-                  weight_path=_llada_path),
+                  weight_path=_llada_path, export_path=_llada_export_path),
     DecoderFamily(('gpt_oss',), _gpt_oss_config,
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
