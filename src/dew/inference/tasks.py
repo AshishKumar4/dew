@@ -28,7 +28,9 @@ from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
-from dew.sampling.text import Generation, Sampling, generate
+from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.strategies import Strategy
+from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -126,6 +128,14 @@ class TextGeneration:
     generation config. `n` continuations of a prompt leave as `n` consecutive
     rows, in prompt order. Weights keep their placement: on a mesh, rows
     split over its batch axes and results keep that sharding.
+
+    `logits` is the whole transform chain, `stopping` the criteria that run
+    beside the policy's EOS one, and `strategy` the device loop. `logits=None`
+    means the chain `sampling` compiles to. A call replaces each of them
+    whole, so a caller that wants to add to a bound chain writes
+    `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
+    replaces a bound chain with its own, because the policy it overrides is
+    what that chain was built from.
     """
 
     model: nn.Module
@@ -135,6 +145,9 @@ class TextGeneration:
     max_new_tokens: int | None = None
     max_length: int | None = None
     n: int = 1
+    logits: tuple[LogitsTransform, ...] | None = None
+    stopping: tuple[Stopping, ...] = ()
+    strategy: Strategy | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -146,23 +159,33 @@ class TextGeneration:
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
                  n: int | None = None, sampling: Sampling | None = None,
-                 images: object | None = None) -> Generation: ...
+                 images: object | None = None, logits: Transforms | None = None,
+                 stopping: Criteria | None = None,
+                 strategy: Strategy | None = None) -> Generation: ...
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
                  n: int | None = None, sampling: Sampling | None = None,
-                 images: object | None = None) -> Generation: ...
+                 images: object | None = None, logits: Transforms | None = None,
+                 stopping: Criteria | None = None,
+                 strategy: Strategy | None = None) -> Generation: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
-                 sampling: Sampling | None = None, images: object | None = None) -> Generation:
+                 sampling: Sampling | None = None, images: object | None = None,
+                 logits: Transforms | None = None, stopping: Criteria | None = None,
+                 strategy: Strategy | None = None) -> Generation:
         inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                       collective=mesh_of(self.variables) is not None,
                                       max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                       max_length=self.max_length, key=key, seed=seed)
+        chain = self.logits if sampling is None else None
         result = generate(self.model, self.variables, inputs, budget, key=random_key,
                           sampling=self.sampling if sampling is None else sampling,
-                          n=self.n if n is None else n)
+                          n=self.n if n is None else n,
+                          logits=chain if logits is None else logits,
+                          stopping=self.stopping if stopping is None else stopping,
+                          strategy=self.strategy if strategy is None else strategy)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
         return replace(result, decoder=decoder)
 
