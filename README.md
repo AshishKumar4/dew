@@ -244,6 +244,7 @@ carries the processor and tokenizer files beside the weights.
 | Model or family | `model_type` | Media |
 |---|---|---|
 | Gemma 3 | `gemma3` | Images |
+| Gemma 3n | `gemma3n` | Images through MobileNet-v5; waveforms |
 | Gemma 4 | `gemma4` | Images; waveforms |
 | Qwen 3.5 | `qwen3_5` | Images, with M-RoPE positions |
 | Llama 4 | `llama4` | Tiled images |
@@ -272,14 +273,11 @@ Available image and audio inputs follow the checkpoint's modality configuration.
 | LLaDA | `llada` | No masked-objective pretrained seam |
 | Dream | `dream`, `Dream` | Export writer, training seam |
 | Kimi K2 | `kimi_k2` | Config translation only, no weights |
-| Gemma 3n multimodal | `gemma3n` | Vision tower sharding axes undeclared |
 
 DeepSeek's MLA layers need `attention_impl="reference"`; `auto` rejects their
-query and value head widths. Gemma 3n's MobileNet-v5 tower leaves 132 of its
-707 parameter leaves without declared sharding axes, so `Trainer` refuses the
-model even though its gradients are finite. `MaskedDiffusionObjective` takes no
-`pretrained` argument, so LLaDA and Dream train from a fresh init rather than
-from their released weights.
+query and value head widths. `MaskedDiffusionObjective` takes no `pretrained`
+argument, so LLaDA and Dream train from a fresh init rather than from their
+released weights.
 
 No processor takes video: `Processor.__call__` accepts `text`, `images` and
 `audio`. Diffusers pipelines such as SDXL, SD3 and Flux have no loader.
