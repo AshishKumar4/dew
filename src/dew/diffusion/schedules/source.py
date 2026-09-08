@@ -674,12 +674,14 @@ class SourceSchedule:
         """Refuse a grid whose first model time appears again in it.
 
         The source finds the step it starts at by matching that time against
-        its own list and takes the second match when the time repeats, which
-        shifts its whole walk by one and runs off the end of its sigma table.
-        A grid that repeats its first model time therefore has no source
-        trajectory to reproduce; the Karras grid of a cosine table at a small
-        step count is the case that reaches it, because the largest sigmas of
-        that table all recover the same index.
+        the whole list of times it will evaluate and takes the second match
+        when the time repeats, which shifts its walk by one and runs off the
+        end of its sigma table. A list that repeats its first time therefore
+        has no source trajectory to reproduce; the Karras grid of a cosine
+        table at a small step count is the case that reaches it, because the
+        largest sigmas of that table all recover the same index. Repeats after
+        the first entry are left alone: the two-evaluation classes and PNDM's
+        warmup place them on purpose and count from where they started.
         """
         if len(times) > 1 and float(np.sum(times == times[0])) > 1:
             raise ValueError(
@@ -719,7 +721,11 @@ class SourceSchedule:
             schedule = SigmaGrid(sigmas, np.append(times, times[-1]), prior)
         elif policy.family == "stage":
             sigmas, times, prior = self._stage_grid(steps)
-            self._check_unique_start(times[0::2][:-1])
+            # The source matches its starting time against the whole
+            # interleaved evaluation list, stage rows included; only the
+            # padding row this table carries past the last stage is never
+            # evaluated. Repeats after the first entry are the deliberate ones.
+            self._check_unique_start(times[:2 * steps - 1])
             schedule = StageSigmaGrid(sigmas, times, prior)
             return (Process(schedule, self.prediction),
                     jnp.arange(len(sigmas) - 1, -1, -2, dtype=jnp.float32))
