@@ -106,7 +106,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     for (key, _), gradient in zip(named, grads[3:]):
         arrays[f"grad_param.{key}"] = gradient.numpy()
     print(f"{name}: latent {tuple(latent.shape)} tokens {TOKENS} "
-          f"|output| <= {float(output.abs().max()):.4g} parameters {len(named)}")
+          f"|output| <= {float(output.detach().abs().max()):.4g} parameters {len(named)}")
     return arrays
 
 
@@ -338,10 +338,15 @@ def build_pipeline(root: Path, *, t5: bool):
     tokenizers = clip_tokenizers(directory)
     torch.manual_seed(SEED + 5)
     widths = (8, 12)
+    # The special ids come from the tokenizer that feeds each tower, so the
+    # pooled row is the one at its real end-of-text token rather than a
+    # degenerate first row under an id outside a tiny vocabulary.
     towers = [CLIPTextModelWithProjection(CLIPTextConfig(
         vocab_size=len(tokenizer.get_vocab()), hidden_size=width, intermediate_size=2 * width,
         num_hidden_layers=2, num_attention_heads=2, projection_dim=5,
-        max_position_embeddings=tokenizer.model_max_length)).eval()
+        max_position_embeddings=tokenizer.model_max_length,
+        bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id)).eval()
         for tokenizer, width in zip(tokenizers, widths)]
     encoder_3 = tokenizer_3 = None
     if t5:

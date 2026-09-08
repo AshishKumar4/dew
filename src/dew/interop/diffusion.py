@@ -352,6 +352,141 @@ def _sd3_path(name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
+class FluxFields(TypedDict):
+    patch_size: int
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    num_single_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    pooled_projection_dim: int
+    guidance_embeds: bool
+    axes_dims_rope: tuple[int, ...]
+    dtype: object
+    attention_impl: str | None
+
+
+def flux_fields(config: Mapping[str, object], *, dtype="float32",
+                attention_impl="auto") -> FluxFields:
+    """A published `FluxTransformer2DModel` config as native model fields.
+
+    Every geometry control the source declares is read, including whether it
+    embeds its distilled guidance, which changes what the model takes as an
+    input rather than only which tensors it holds.
+    """
+    from dew.interop.pretrained import resolve_dtype
+
+    channels = _integer(config["in_channels"], "in_channels")
+    out_channels = config.get("out_channels")
+    axes = config.get("axes_dims_rope", (16, 56, 56))
+    if not isinstance(axes, (list, tuple)) or any(type(size) is not int for size in axes):
+        raise ValueError("axes_dims_rope must be a sequence of channel counts")
+    heads = _integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
+    if sum(axes) != head_dim:
+        raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
+    if any(size % 2 for size in axes):
+        raise ValueError(f"axes_dims_rope {tuple(axes)} rotates channel pairs, so each is even")
+    return FluxFields(
+        patch_size=_integer(config.get("patch_size", 1), "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
+        num_layers=_integer(config["num_layers"], "num_layers"),
+        num_single_layers=_integer(config["num_single_layers"], "num_single_layers"),
+        heads=heads, head_dim=head_dim,
+        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
+        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        guidance_embeds=_boolean(config.get("guidance_embeds", False), "guidance_embeds"),
+        axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
+        attention_impl=None if attention_impl == "reference" else attention_impl)
+
+
+_FLUX_EMBEDDERS = {
+    "x_embedder": ("x_embedder",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "time_text_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_text_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_text_embed.guidance_embedder.linear_1": ("guidance_embedder_linear_1",),
+    "time_text_embed.guidance_embedder.linear_2": ("guidance_embedder_linear_2",),
+    "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
+    "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
+}
+_FLUX_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
+                   "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+
+
+def _flux_leaf(leaf: str) -> str:
+    if leaf == "weight":
+        return "kernel"
+    if leaf != "bias":
+        raise ValueError(f"unknown tensor leaf {leaf!r}")
+    return "bias"
+
+
+def _flux_attention(block: tuple[str, ...], inner: list[str], leaf: str, name: str
+                    ) -> tuple[str, ...]:
+    """One attention tensor of either block, whose projections a single-stream
+    block leaves unprojected and so does not carry."""
+    if inner == ["to_out", "0"]:
+        return (*block, "attn", "to_out_0", _flux_leaf(leaf))
+    if len(inner) == 1 and inner[0] in _FLUX_ATTENTION:
+        if inner[0].startswith("norm"):
+            if leaf != "weight":
+                raise ValueError(f"unknown tensor name {name!r}")
+            return (*block, "attn", inner[0], "scale")
+        return (*block, "attn", inner[0], _flux_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def _flux_path(name: str) -> tuple[str, ...]:
+    """One published Flux tensor name as its path in `FluxTransformer`.
+
+    A single-stream block's fused output projection is `proj_out` in the
+    source, inside its own block; here it is `proj_fused`, since the model's
+    own `proj_out` runs the other way round and one name carries one pair of
+    axes.
+    """
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _FLUX_EMBEDDERS:
+        return (*_FLUX_EMBEDDERS[stem], _flux_leaf(leaf))
+    if parts[0] == "transformer_blocks" and parts[1].isdigit():
+        block = (f"transformer_blocks_{parts[1]}",)
+        rest = parts[2:-1]
+        if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
+            return (*block, rest[0], "linear", _flux_leaf(leaf))
+        if rest[0] == "attn":
+            return _flux_attention(block, rest[1:], leaf, name)
+        if rest[0] in ("ff", "ff_context"):
+            inner = rest[1:]
+            if inner == ["net", "0", "proj"]:
+                return (*block, rest[0], "net_0_proj", _flux_leaf(leaf))
+            if inner == ["net", "2"]:
+                return (*block, rest[0], "net_2", _flux_leaf(leaf))
+    if parts[0] == "single_transformer_blocks" and parts[1].isdigit():
+        block = (f"single_transformer_blocks_{parts[1]}",)
+        rest = parts[2:-1]
+        if rest == ["norm", "linear"]:
+            return (*block, "norm", "linear", _flux_leaf(leaf))
+        if rest == ["proj_mlp"]:
+            return (*block, "proj_mlp", _flux_leaf(leaf))
+        if rest == ["proj_out"]:
+            return (*block, "proj_fused", _flux_leaf(leaf))
+        if rest[0] == "attn":
+            return _flux_attention(block, rest[1:], leaf, name)
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_flux_weights(tensors: Mapping[str, np.ndarray]
+                           ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+    """Native parameters and reversible source layouts. Flux builds its
+    rotary table from the ids it is called with, so it stores no buffer."""
+    return record_layouts("transformer", tensors, _flux_path, ("params",))
+
+
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray]
                           ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
     """Native parameters, frozen buffers and reversible source layouts.
