@@ -522,19 +522,25 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
     assert largest < 3e-5, f"largest difference {largest:g}"
 
 
+def mrope_predictor():
+    """A tiny decoder rotating three axes per token, with one prediction depth."""
+    from dew.nn.mixers.attention import AttentionMixer
+
+    return CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=16, dtype="float32", num_nextn_predict_layers=1,
+        partial_rotary_type="default", mixer=AttentionMixer(mrope_section=(1, 1, 1)))
+
+
 def test_multi_axis_rotary_coordinates_reach_the_depths():
     """A processor that emits three rotary axes per token gives the depths
     coordinates, not a count of tokens: the prompt seed carries the axes it
     was given and a drawn token continues from the coordinate the model's
     cache reached, which is where the reference puts it."""
     from dew.nn.inputs import ModelInputs
-    from dew.nn.mixers.attention import AttentionMixer
     from dew.sampling.text import _operations, _prefill
 
-    model = CausalTransformer(
-        vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-        mlp_features=32, max_seq_len=16, dtype="float32", num_nextn_predict_layers=1,
-        partial_rotary_type="default", mixer=AttentionMixer(mrope_section=(1, 1, 1)))
+    model = mrope_predictor()
     tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     rotary = jnp.asarray([[[0, 0, 0], [1, 4, 1], [1, 4, 2], [5, 5, 5]]], jnp.int32)
     params = model.init(jax.random.key(0), tokens, rotary_positions=rotary)
@@ -552,6 +558,30 @@ def test_multi_axis_rotary_coordinates_reach_the_depths():
     assert largest < 3e-5, f"largest difference {largest:g}"
     # The continuation coordinate is the model's own, not the token count.
     assert int(np.asarray(seeded.positions)[0]) == 5
+
+
+def test_the_target_advances_a_drawn_token_at_the_multi_axis_coordinate():
+    """The target decodes a drawn token where the reference's rope deltas put
+    it: one past the largest coordinate a real token reached on any axis,
+    the same on every axis, not at the count of tokens. Two drawn tokens
+    through the cache have to score what an uncached forward scores at
+    those coordinates."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import _operations, _prefill
+
+    model = mrope_predictor()
+    tokens = jnp.asarray([[1, 2, 3, 4, 6]], jnp.int32)
+    rotary = jnp.asarray([[[0, 0, 0], [1, 4, 1], [1, 4, 2], [5, 5, 5], [6, 6, 6]]], jnp.int32)
+    params = model.init(jax.random.key(0), tokens, rotary_positions=rotary)
+    reference = model.apply(params, tokens, rotary_positions=rotary)
+
+    ops = _operations(model, params, 0, 1)
+    state, _ = _prefill(model, params,
+                        ModelInputs(tokens[:, :3], {"rotary_positions": rotary[:, :3]}), ops)
+    for at in (3, 4):
+        state = ops.advance(state, tokens[:, at], jnp.ones(1, bool))
+        largest = float(np.max(np.abs(np.asarray(state.logits) - np.asarray(reference)[:, at])))
+        assert largest < 3e-5, f"token {at} differs by {largest:g}"
 
 
 def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():
