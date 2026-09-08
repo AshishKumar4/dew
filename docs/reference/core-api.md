@@ -281,7 +281,13 @@ The same `dew.interop.load_pretrained` entry reads a diffusion checkpoint direct
 
 Source UNet configuration selects normalization groups and epsilon, and the declared implementation selects GEGLU semantics: exact GELU for PyTorch sources, approximate GELU for Flax sources. Spatial upsampling targets the actual next skip shape, including odd intermediate dimensions.
 
-The source scheduler policy retains rounded DDIM/PNDM model times and fixed transfer strides, DDIM clipping, zero-terminal-SNR beta rescaling, and DPM Karras grids. Unsupported active controls fail at load rather than being ignored, including dynamic thresholding and published PNDM velocity-domain history. Native PNDM itself integrates epsilon history.
+`SourceSchedule.from_config` reconstructs seventeen published scheduler classes: DDIM, PNDM, DDPM, LMS, Euler, Euler ancestral, Heun, KDPM2, KDPM2 ancestral, DPM-Solver multistep, singlestep and SDE, DEIS, UniPC, EDM DPM-Solver, LCM and TCD. The returned process, solver and grid use the controls and defaults of the declared class.
+
+Supported policies include source timestep spacing and offsets; Karras, exponential and beta sigma grids; finite lambda clipping; zero-terminal-SNR rescaling; terminal sigma selection; solver orders and correctors; DDPM fixed posterior variances; and clipping or dynamic thresholding in the source conversion order. DDIM and PNDM retain fixed training strides. LCM and TCD select their grids from `original_inference_steps`. Two-evaluation solvers retain the source stage sigma and model time. EDM uses its own sigma range, data scale, rho, log-sigma model time and signed output preconditioning; its training process uses EDM sigma draws rather than a VP beta table.
+
+Unimplemented active controls fail explicitly: Lu-lambda and flow-sigma grids, UniPC external predictors, nonlinear sigma interpolation, continuous model times, learned variances, DDPM log-space wide variance, and PNDM velocity-domain history. TCD clipping/thresholding and epsilon-prediction UniPC thresholding are also refused because the published update does not apply them. Sigma-indexed source schedulers whose initial model time repeats are refused when preparing their grid: the source starts at the second match and cannot complete its published evaluation list. Repeated noninitial stage and corrector times remain supported.
+
+The tiny oracles in `tools/diffusers_source_reference.py` run actual Diffusers scheduler objects. Ordinary stochastic walks share explicit Gaussian draws. DPM-Solver SDE runs the actual `torchsde` tree, and native solver parity uses its recorded increments; separate tests exercise the native Brownian bridge law. All native source-trajectory and VJP checks run in float32 at a fixed `1e-4` scaled-error bound, with VJPs compared directly to the actual float32 source. Saved float64 VJPs are diagnostic data, not a tolerance adjustment.
 
 ```python
 from dew.interop import load_pretrained

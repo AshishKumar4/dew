@@ -102,7 +102,8 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     assert np.max(np.abs(np.asarray(output)[valid] - before[valid])) > 1e-3
     loaded.save(tmp_path, variables=state.params)
     reloaded = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
-    for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.params)):
+    for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.params),
+                              strict=True):
         np.testing.assert_array_equal(actual, wanted)
     restored = reloaded.model.apply(reloaded.variables, inputs.tokens, **inputs.kwargs())
     np.testing.assert_allclose(np.asarray(restored)[valid], expected[valid], atol=1e-4, rtol=0)
@@ -386,5 +387,6 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
     np.testing.assert_allclose(np.asarray(output)[valid], np.load(directory / "updated_logits.npy")[valid], atol=1e-4, rtol=0)
     for collection, tree in restored.variables.items():
         if collection != "params":
-            for actual, original in zip(jax.tree.leaves(tree), jax.tree.leaves(loaded.variables[collection])):
+            for actual, original in zip(jax.tree.leaves(tree),
+                                        jax.tree.leaves(loaded.variables[collection]), strict=True):
                 np.testing.assert_array_equal(actual, original)

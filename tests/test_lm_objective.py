@@ -301,7 +301,7 @@ def test_pretrained_weights_are_what_init_returns():
 
     resumed = make_objective(pretrained=loaded).init(jax.random.key(1))
 
-    for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded)):
+    for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded), strict=True):
         assert jnp.array_equal(restored, expected)
 
 

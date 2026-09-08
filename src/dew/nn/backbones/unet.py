@@ -29,6 +29,14 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
 
     feature_depths = model.feature_depths
     attention_configs = model.attention_configs
+    if len(attention_configs) != len(feature_depths):
+        # The decoder walks the two reversed, so a disagreement does not drop
+        # the odd stage: it offsets the levels the decoder attends in from the
+        # ones the encoder does, and the halves stop mirroring silently.
+        raise ValueError(
+            "attention_configs names one stage per feature depth; got "
+            f"{len(attention_configs)} stages for {len(feature_depths)} depths")
+
     conv = partial(nn.Conv, kernel_size=(3, 3), strides=(1, 1),
                    dtype=model.dtype, precision=model.precision)
     residual = partial(ResidualBlock, kernel_size=(3, 3), activation=model.activation,
@@ -40,7 +48,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     x = conv(features=feature_depths[0])(x)
     downs = [x]
 
-    for i, (dim_out, stage) in enumerate(zip(feature_depths, attention_configs)):
+    for i, (dim_out, stage) in enumerate(zip(feature_depths, attention_configs, strict=True)):
         dim_in = x.shape[-1]
         for j in range(model.num_res_blocks):
             x = residual(features=dim_in, name=f"down_{i}_residual_{j}")(x, temb)
@@ -65,7 +73,8 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
             x = temporal(x, f"middle_temporal_{j}")
         x = residual(features=middle_dim_out, name=f"middle_res2_{j}")(x, temb)
 
-    for i, (dim_out, stage) in enumerate(zip(reversed(feature_depths), reversed(attention_configs))):
+    for i, (dim_out, stage) in enumerate(
+            zip(reversed(feature_depths), reversed(attention_configs), strict=True)):
         for j in range(model.num_res_blocks):
             x = jnp.concatenate([x, downs.pop()], axis=-1)
             x = residual(features=dim_out, name=f"up_{i}_residual_{j}")(x, temb)
@@ -74,7 +83,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
         if temporal is not None:
             x = temporal(x, f"up_{i}_temporal")
         if i != len(feature_depths) - 1:
-            x = Upsample(features=feature_depths[-i], scale=2, name=f"up_{i}_upsample",
+            x = Upsample(features=feature_depths[-i - 2], scale=2, name=f"up_{i}_upsample",
                          dtype=model.dtype, precision=model.precision)(x)
 
     x = conv(features=feature_depths[0])(x)

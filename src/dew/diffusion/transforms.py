@@ -124,10 +124,16 @@ class FlowMatchPredictionTransform(PredictionTransform):
 class KarrasPredictionTransform(PredictionTransform):
     """The EDM preconditioning (Karras et al. 2022, Table 1): the model sees
     c_in x_t and its raw output F is read as x_0 = c_skip x_t + c_out F. Every
-    denominator is at least sigma_data, so none needs a guard."""
+    denominator is at least sigma_data, so none needs a guard.
 
-    def __init__(self, sigma_data: float = 0.5) -> None:
+    `velocity` is Diffusers 0.34.0's EDM `prediction_type="v_prediction"`,
+    whose `precondition_outputs` negates c_out: the model's output is the
+    velocity of the preconditioned path rather than its endpoint offset.
+    """
+
+    def __init__(self, sigma_data: float = 0.5, *, velocity: bool = False) -> None:
         self.sigma_data = sigma_data
+        self.velocity = velocity
 
     def backward_diffusion(self, x_t, preds, rates):
         signal_rate, noise_rate = rates
@@ -137,7 +143,7 @@ class KarrasPredictionTransform(PredictionTransform):
         _, sigma = rates
         c_out = sigma * self.sigma_data / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
         c_skip = self.sigma_data ** 2 / (self.sigma_data ** 2 + sigma ** 2)
-        return c_out * preds + c_skip * x_t
+        return (-c_out if self.velocity else c_out) * preds + c_skip * x_t
 
     def get_input_scale(self, rates):
         _, sigma = rates
@@ -178,6 +184,68 @@ class ConsistencyBoundary(PredictionTransform):
 
     def get_input_scale(self, rates):
         return self.inner.get_input_scale(rates)
+
+
+class SourceLimitedPrediction(PredictionTransform):
+    """A published scheduler's limit on x_0, in the conversion order its
+    `step` applies it.
+
+    `inner` reads x_0 out of the model's output; then dynamic thresholding
+    (Saharia et al. 2022: clamp each sample to its own `ratio` quantile of
+    |x_0|, never below 1 and never above `maximum`, and divide by it) or a
+    plain clamp to `clip` limits it. Thresholding wins where a source
+    declares both, the way its `step` tests them.
+
+    `recompute_epsilon` is whether the source re-derives epsilon from the
+    limited x_0. DDPM's posterior, DEIS and the noise-prediction DPM-Solver
+    algorithms do, so their update carries the limit; DDIM keeps the model's
+    own output as its epsilon and only its x_0 term is limited.
+
+    The limit is not linear in the model's output, so it belongs to the
+    conversion a guided walk runs once on the combined output rather than to
+    each guidance branch.
+    """
+
+    def __init__(self, inner: PredictionTransform, *, clip: float | None = None,
+                 threshold: tuple[float, float] | None = None,
+                 recompute_epsilon: bool = True) -> None:
+        if clip is None and threshold is None:
+            raise ValueError("a limited prediction needs a clip range or a thresholding ratio")
+        self.inner = inner
+        self.clip = clip
+        self.threshold = threshold
+        self.recompute_epsilon = recompute_epsilon
+
+    def _limit(self, x_0) -> jax.Array:
+        if self.threshold is not None:
+            ratio, maximum = self.threshold
+            flat = jnp.reshape(x_0, (x_0.shape[0], -1))
+            level = jnp.quantile(jnp.abs(flat), ratio, axis=1)
+            level = expand(jnp.clip(level, 1.0, maximum), x_0)
+            return jnp.clip(x_0, -level, level) / level
+        if self.clip is None:
+            raise ValueError("a limited prediction needs a clip range or a thresholding ratio")
+        return jnp.clip(x_0, -self.clip, self.clip)
+
+    def pred_transform(self, x_t, preds, rates, t):
+        return self.inner.pred_transform(x_t, preds, rates, t)
+
+    def backward_diffusion(self, x_t, preds, rates):
+        x_0, epsilon = self.inner.backward_diffusion(x_t, preds, rates)
+        limited = self._limit(x_0)
+        if not self.recompute_epsilon:
+            return limited, epsilon
+        signal_rate, noise_rate = rates
+        return limited, (x_t - signal_rate * limited) / noise_rate
+
+    def get_target(self, x_0, epsilon, rates):
+        return self.inner.get_target(x_0, epsilon, rates)
+
+    def get_input_scale(self, rates):
+        return self.inner.get_input_scale(rates)
+
+    def target_error_scale(self, snr):
+        return self.inner.target_error_scale(snr)
 
 
 class Weighting(Protocol):
