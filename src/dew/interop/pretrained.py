@@ -500,7 +500,7 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 # trained model writes back into the source's own tensor names beside the
 # config, generation config and tokenizer it came with. A family outside
 # this set saves through the decoder writer, which derives a config
-# instead. tests/test_decoder_export.py trains and exports each one.
+# instead. The routed-family update/export tests live in test_decoder_export.py.
 _SOURCE_LAYOUT_FAMILIES = frozenset({
     "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
     "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
