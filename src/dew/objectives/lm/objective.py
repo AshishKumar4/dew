@@ -14,13 +14,14 @@ and the reason. Padding is excluded only when the run names the pad id.
 Packed token files have no padding, and masking out a real id would drop
 those tokens from the average.
 
-The auxiliary terms ride on the same batch: DeepSeek's router balancing and
-balance loss, the multi-token prediction depths, and V3.2's lightning
-indexer, which the attention layers score and sow the KL of when the
-objective opens their `indexer` collection (`IndexerTraining` names the
-phase). Evaluation returns teacher-forced per-token scores for streaming
-perplexity. The separate preview hook writes text from a fixed prompt once
-per event.
+The auxiliary terms ride on the same batch: PaLM's z-loss on the log
+partition, DeepSeek's router balancing and balance loss, the multi-token
+prediction depths, and V3.2's lightning indexer, which the attention layers
+score and sow the KL of when the objective opens their `indexer` collection
+(`IndexerTraining` names the phase). `predict` hands the scores, the logits
+and named layers' states to a distillation. Evaluation returns
+teacher-forced per-token scores for streaming perplexity. The separate
+preview hook writes text from a fixed prompt once per event.
 """
 
 from __future__ import annotations
@@ -40,12 +41,13 @@ from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collect
 from dew.data.chat import ROLES_KEY, Role
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
+from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
+from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Prediction, Step, Variables,
                                  mean_loss, merge, select)
-from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import metrics, objectives
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor
@@ -262,17 +264,23 @@ def _global_qk_max(qk) -> jax.Array | None:
 class Scores(NamedTuple):
     """What `LMObjective.token_scores` computes over a `[B, seq_len + 1]` batch.
 
-    `losses` and `weights` are `[B, seq_len]`: the next-token cross entropy
-    and 1 where the target counts. `correct` is 1 where the argmax was the
-    target. `routing` is what the routers sowed, `depths` the prediction
-    depths' (losses, weights) pairs, `qk` the attention layers' per-head
-    logit maxima, `indexer` their per-query indexer KL; each is None or
-    empty unless its flag asked for it.
+    `losses`, `weights` and `log_z` are `[B, seq_len]`: the next-token cross
+    entropy, 1 where the target counts, and the log partition of each
+    prediction's distribution (what PaLM's z-loss squares). `correct` is 1
+    where the argmax was the target. `hidden` is the `[B, seq_len, D]` final
+    states the head scored, `layers` the states of the layers `token_scores`
+    was asked for, in that order. `routing` is what the routers sowed,
+    `depths` the prediction depths' (losses, weights) pairs, `qk` the
+    attention layers' per-head logit maxima, `indexer` their per-query
+    indexer KL; each is None or empty unless its flag asked for it.
     """
 
     losses: jax.Array
     weights: jax.Array
+    log_z: jax.Array
     correct: jax.Array
+    hidden: jax.Array
+    layers: tuple[jax.Array, ...]
     routing: Optional[dict]
     depths: list
     qk: Optional[dict]
@@ -308,6 +316,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         seq_aux: bool = True,
         loss_role: Role | None = None,
         mtp_weight: Optional[float] = None,
+        z_loss: float = 0.0,
         qk_stats: bool = False,
         indexer: Optional[IndexerTraining] = None,
     ):
@@ -358,7 +367,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         a dense checkpoint does, and the fresh init fills them. The sparse
         phase reads a whole tree, either layout. The warm-up trains nothing
         but the indexer, so the terms of the main loss (`balance_rate`,
-        `aux_loss_alpha`, `mtp_weight`, `loss_role`) are refused there."""
+        `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
+
+        `z_loss` adds PaLM's auxiliary, this coefficient times the squared
+        log partition of every counted prediction, to the cross entropy
+        (MaxText's `z_loss_multiplier`; PaLM used 1e-4). It keeps the
+        logits from drifting away from normalised log probabilities. Zero
+        adds nothing."""
         if getattr(model, "causal", True) is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
         self.model = model
@@ -386,6 +401,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     f"mtp_weight is a positive weight on the term, got {mtp_weight}; "
                     "None leaves the term out")
         self.mtp_weight = mtp_weight
+        if not (0 <= z_loss < float("inf")):
+            raise ValueError(
+                f"z_loss weights the squared log partition, so it is finite and "
+                f"nonnegative, got {z_loss}; 0 adds nothing")
+        self.z_loss = z_loss
         self.qk_stats = qk_stats
         self.indexer = indexer
         if indexer is not None:
@@ -405,7 +425,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     "its mixers name an index_topk")
             if indexer.phase == "warmup":
                 lm_terms = {"balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
-                            "mtp_weight": mtp_weight, "loss_role": loss_role}
+                            "mtp_weight": mtp_weight, "loss_role": loss_role,
+                            "z_loss": z_loss or None}
                 asked = sorted(name for name, value in lm_terms.items() if value is not None)
                 if asked:
                     raise ValueError(
@@ -489,12 +510,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
-                     indexer: bool = False):
+                     indexer: bool = False, layers: Sequence[int] = ()):
         """Per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
-        prediction was right, and what `routing`, `depths`, `qk_stats` and
-        `indexer` asked for.
+        prediction was right, the states behind them, and what `routing`,
+        `depths`, `qk_stats`, `indexer` and `layers` asked for. `layers`
+        names the model's layers whose output states to keep, `layers_N` in
+        its tree, as a feature distillation reads them.
 
         A packed batch carries `segment_ids` for the same rows. The last token
         of a document does not predict the first of the next one, so that
@@ -520,13 +543,15 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         params = model_variables(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
-        hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections, packing)
+        hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections,
+                                               packing, layers)
         sown = gathered.get("router", {}) if routing else None
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
+        kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
-        losses, predicted = chunked_cross_entropy(
+        losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
@@ -563,7 +588,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 if indexer:
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
-                depth_losses, _ = chunked_cross_entropy(
+                depth_losses, _, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision)
@@ -578,16 +603,21 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 if roles is not None and self.loss_role is not None:
                     depth_weights = depth_weights * (roles[:, depth + 1:] == int(self.loss_role))
                 depth_scores.append((depth_losses, depth_weights))
-        return Scores(losses, weights, correct, sown, depth_scores, qk, kls)
+        return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
-                       packing: dict[str, object]):
+                       packing: dict[str, object], layers: Sequence[int] = ()):
         """The model's final states over `inputs`, with what the open
-        `collections` gathered (empty when none was opened)."""
+        `collections` gathered (empty when none was opened) and, under
+        `intermediates`, the outputs of every layer when `layers` asks for
+        any."""
+        opened = [*collections, INTERMEDIATES] if layers else collections
         hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
                                   method=type(self.model).hidden_states,
-                                  mutable=collections or False, **packing)
-        if not collections:
+                                  mutable=opened or False,
+                                  capture_intermediates=layer_outputs if layers else False,
+                                  **packing)
+        if not opened:
             return hidden, {}
         return hidden
 
@@ -698,23 +728,62 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def loss(self, params, batch, step: Step) -> tuple[Mean | LMStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(params, batch, step)
+        statistics, aux, _ = self._scored_loss(params, batch, step, train=True)
+        return statistics, aux
+
+    def predict(self, params, batch, step: Step, *, train: bool,
+                layers: Sequence[int] = ()) -> tuple[Mean, Aux[Variables], Prediction]:
+        """The loss with the logits, the target weights and the outputs of
+        `layers` behind it, for a teacher to compare (`Objective.predict`).
+
+        The logits are the whole `[B, seq_len, vocab]` fp32 tensor the
+        chunked loss never holds; a distillation's KL reads every column.
+        `aux_loss_alpha`'s router terms carry their own normalisation, so
+        they cannot ride a distillation's token mass and are refused;
+        `balance_rate` balances without a loss term. The indexer warm-up
+        scores no token, so it has nothing to distil.
+        """
+        if self._warmup:
+            raise ValueError("the indexer warm-up scores no token, so it has no prediction")
+        if self.aux_loss_alpha is not None:
+            raise ValueError(
+                "aux_loss_alpha's router terms normalise per router, and a "
+                "distillation mixes terms over the counted tokens; balance the "
+                "student's routers with balance_rate instead")
+        statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
+        assert isinstance(statistics, Mean)
+        variables = model_variables(params)
+        head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
+        logits = head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
+                             precision=self.model.precision)
+        return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
+
+    def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
+                     ) -> tuple[Mean | LMStatistics, Aux[Variables], Scores]:
+        """The loss's statistics and reports, with the scores they came from."""
         tokens = batch[TEXT_KEY]
         prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         segment_ids, positions = _packing(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
-            params, prepared, train=True, rngs={"dropout": step.key},
+            params, prepared, train=train, rngs={"dropout": step.key},
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
-            qk_stats=self.qk_stats, indexer=self.indexer is not None)
-        losses, weights, correct, routing, depths, qk, kls = scores
+            qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         prediction = Mean(jnp.sum(losses * weights), mass)
         ce, _ = mean_loss(prediction)
         reported = {"ce": ce, "perplexity": jnp.exp(ce),
                     "token_accuracy": jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)}
+        if self.z_loss:
+            # PaLM's auxiliary over the same counted targets as the cross
+            # entropy, so one Mean carries both.
+            z_total = self.z_loss * jnp.sum(jnp.square(log_z) * weights)
+            reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
+            prediction = Mean(prediction.total + z_total, mass)
         if self.mtp_weight is not None:
             # Depths retain the main target denominator and configured depth average.
             mtp_total = jnp.mean(jnp.stack([
@@ -758,7 +827,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk, effects=effects)
+        return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
     def reduce_loss(self, stats: Mean | LMStatistics) -> tuple[jax.Array, jax.Array]:
         if isinstance(stats, Mean):

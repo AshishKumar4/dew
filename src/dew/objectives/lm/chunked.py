@@ -61,14 +61,23 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> Tuple[Tuple[int, int], ..
     return bounds
 
 
-def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
-                 softcap: Optional[float], precision: PrecisionLike):
-    """One tile's logsumexp, target logit, best logit and its column."""
-    logits = jnp.einsum('td,dv->tv', hidden, head_chunk,
+def head_logits(hidden, head_weight, *, softcap: Optional[float],
+                precision: PrecisionLike) -> jax.Array:
+    """`hidden @ head_weight` as the model's forward scores it: fp32 states
+    against the `[features, vocab]` head, accumulated in fp32, softcapped
+    when the backbone caps; `[..., vocab]`."""
+    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head_weight,
                         precision=precision, preferred_element_type=jnp.float32)
     if softcap is not None:
         cap = jnp.asarray(softcap, jnp.float32)
         logits = cap * jnp.tanh(logits / cap)
+    return logits
+
+
+def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
+                 softcap: Optional[float], precision: PrecisionLike):
+    """One tile's logsumexp, target logit, best logit and its column."""
+    logits = head_logits(hidden, head_chunk, softcap=softcap, precision=precision)
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
@@ -82,11 +91,13 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
 def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           softcap: Optional[float] = None,
                           precision: PrecisionLike = None):
-    """Per-token cross entropy of `hidden @ head_weight` and its top-1 column.
+    """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
+    and its log partition.
 
     `hidden` is `[..., features]` states in any compute dtype, `head_weight`
     the `[features, vocab]` float32 head, `targets` the `[...]` int32 ids.
-    Returns the per-token losses and the argmax prediction, both shaped like
+    Returns the per-token losses, the argmax prediction and the row's
+    logsumexp (log Z, which PaLM's z-loss squares), all shaped like
     `targets`. The caller owns the weighting and the mean, and with them the
     padding id.
 
@@ -125,4 +136,5 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         predicted = jnp.where(better, chunk_column, predicted)
 
     return ((total - target_logit).reshape(targets.shape),
-            predicted.reshape(targets.shape))
+            predicted.reshape(targets.shape),
+            total.reshape(targets.shape))
