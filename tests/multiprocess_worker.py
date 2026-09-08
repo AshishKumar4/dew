@@ -1130,7 +1130,14 @@ def mode_rollout(args) -> dict:
     direct = generate(model, state.params, local["prompt"], 4, key=jax.random.key(27), sampling=controls).host()
     invalid_errors = {}
     if processes > 1:
-        for fault in ("token", "length", "key"):
+        # A component only one rank can describe: its closure holds an object
+        # whose identity is this process's address.
+        captured = None if rank == 0 else object()
+
+        def rewrite(state, logits):
+            return logits if captured is None else logits
+
+        for fault in ("token", "length", "key", "component"):
             broken = {name: np.array(value, copy=True) for name, value in local.items()}
             if rank == 1:
                 if fault == "token":
@@ -1139,7 +1146,11 @@ def mode_rollout(args) -> dict:
                     broken["prompt_length"][0] = 0
             key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
             try:
-                rollout(state, broken, key)
+                if fault == "component":
+                    generate(model, state.params, inputs_for(local), 4, key=key, sampling=sampling,
+                             logits=(jax.tree_util.Partial(rewrite),))
+                else:
+                    rollout(state, broken, key)
             except (ValueError, RuntimeError) as error:
                 invalid_errors[fault] = str(error)
             else:

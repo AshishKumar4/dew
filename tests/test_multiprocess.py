@@ -898,7 +898,8 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
     A shared padded shape and fixed decode trip count keep collectives in
     the same order despite different validity masks. Both ranks reach the
-    rendezvous after sampling and after a peer rejects invalid input.
+    rendezvous after sampling and after a peer rejects invalid input or a
+    decoding component only it can describe.
     The sampled rows, lengths and likelihoods match a single process over
     the same prompts, and the update that follows moves the same parameters.
     """
@@ -910,6 +911,7 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         assert "vocabulary" in report["invalid_errors"]["token"]
         assert "prompt_length" in report["invalid_errors"]["length"]
         assert "single JAX PRNG key" in report["invalid_errors"]["key"]
+        assert "memory address" in report["invalid_errors"]["component"]
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2
