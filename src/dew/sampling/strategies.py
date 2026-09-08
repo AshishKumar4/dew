@@ -42,6 +42,7 @@ class DecoderState:
     positions: jax.Array | None = None
     hidden: jax.Array | None = None
     drafts: tuple[jax.Array, ...] = ()
+    coordinate: jax.Array | None = None
 
 
 @struct.dataclass
@@ -114,30 +115,30 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
 
     `carry` holds each depth's predecessor state at the position before this
     stretch, so a block continues where the last one stopped instead of losing
-    the entry on the boundary; `None` means a depth has no predecessor yet,
-    which shifts its first entry one further on, as the training pass does
-    over a prompt. `embeds` are the prepared embeddings, so a media
-    replacement reaches the depths without running its encoder again. `last`
-    is each row's final written slot, and a row that wrote nothing keeps its
-    carry.
+    the entry on the boundary. Depth `d` first has an entry at position
+    `d + 1`, because that is the first token with `d + 1` tokens behind it, so
+    the coordinates decide which slots a depth writes rather than any count of
+    calls: a row with a one-token prompt starts its second depth two tokens
+    later than a row with a long one. `embeds` are the prepared embeddings, so
+    a media replacement reaches the depths without running its encoder again.
+    `last` is each row's final written slot, and a row that wrote nothing
+    keeps its carry.
     """
     propose = ops.propose
     produced: list[jax.Array] = []
     if propose is None:
         return state, produced, tuple(item for item in carry if item is not None)
-    width = embeds.shape[1]
-    upstream, offset, tails = states, 0, []
+    upstream, tails = states, []
     for depth in range(ops.depths):
         head = carry[depth] if depth < len(carry) else None
-        offset = offset + 1 if head is None else 0
         before = jnp.concatenate(
             [(jnp.zeros_like(upstream[:, 0]) if head is None else head)[:, None],
              upstream[:, :-1]], axis=1)
-        ready = valid & (jnp.arange(width)[None, :] >= offset)
+        reached = positions if positions.ndim == 2 else jnp.max(positions, axis=-1)
+        ready = valid & (reached >= depth + 1)
         state, _, out = propose(state, before, None, embeds, ready, positions, depth)
         produced.append(out)
-        previous = carry[depth] if depth < len(carry) else None
-        held = out[:, 0] if previous is None else previous
+        held = out[:, 0] if head is None else head
         tails.append(jnp.where(jnp.any(ready, axis=1)[:, None],
                                jnp.take_along_axis(upstream, last[:, None, None], axis=1)[:, 0],
                                held))
@@ -470,6 +471,18 @@ class Speculative:
             continuation_keys(start.keys, n)))
 
 
+def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.Array:
+    """The logical coordinate of each slot a block may emit.
+
+    A prompt that supplied its own coordinates continues from the model's next
+    one, which is the largest a real token reached on any axis; a drawn token
+    sits at that coordinate on every axis. Without supplied coordinates the
+    count of real tokens is what the cache assigns.
+    """
+    base = step.total() if state.coordinate is None else state.coordinate
+    return base[:, None] + slots
+
+
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
                stopping: Callable[[StepState, jax.Array], jax.Array],
@@ -484,7 +497,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         state, step, terminated, out = carry
         active = step.active
         saved = state.cache
-        base = step.total() if state.positions is None else state.positions
+        base = _coordinates(state, step, slots)
         keys = jax.vmap(lambda key, count: jax.random.split(
             jax.random.fold_in(key, count), 2 * gamma + 1))(step.keys, step.step)
 
@@ -505,7 +518,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
             states[depth] = dataclasses.replace(states[depth], active=live)
             drafting, logits, produced = propose(
                 drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
-                (base + depth - 1)[:, None], (depth - 1) % ops.depths)
+                base[:, depth - 1][:, None], (depth - 1) % ops.depths)
             hidden = produced[:, 0]
             scores = transform(states[depth], logits[:, 0].astype(jnp.float32))
             token = select(keys[:, depth], scores, live)
@@ -599,7 +612,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         assert ops.embed is not None
         following, _, carried = reseed(
             ops, following, (state.hidden,) + tuple(state.drafts[1:]), seen, ops.embed(emitted),
-            keep, base[:, None] + slots, jnp.maximum(count - 1, 0))
+            keep, base, jnp.maximum(count - 1, 0))
         following = dataclasses.replace(following, drafts=carried)
         return (following, committed, terminated, out), None
 
