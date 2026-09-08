@@ -40,6 +40,62 @@ SENTINEL_MIB = 256
 TOLERANCE = 0.1
 
 
+CAP_BYTES = 4 * 1024 ** 3
+HEADROOM_BYTES = 12 * 1024 ** 3
+
+
+def preflight(store_mib: int | None = None, bank_counts=None) -> dict:
+    """Refuse to start unless a live budget already bounds this process tree.
+
+    Read before the backend is opened, because a check that runs after the
+    first allocation is not a check. Reported limits are not taken as a
+    guard: the group has to be an active cgroup v2 memory controller with a
+    finite `memory.max` no larger than the agreed cap and swap turned off, and
+    the machine has to have the agreed headroom left. Anything missing,
+    unlimited or unreadable exits nonzero with the reason, since running
+    without enforcement is what the cap exists to prevent.
+    """
+    line = Path("/proc/self/cgroup").read_text().strip().splitlines()[-1]
+    where = Path("/sys/fs/cgroup") / line.split(":")[-1].lstrip("/")
+    if not (where / "memory.current").is_file():
+        raise SystemExit(
+            f"refusing to run: {where} is not an active cgroup v2 memory controller, "
+            f"so nothing bounds this process tree")
+    for name in ("memory.max", "memory.swap.max"):
+        if not (where / name).is_file():
+            raise SystemExit(f"refusing to run: {where}/{name} is not readable")
+    limit = (where / "memory.max").read_text().strip()
+    if limit == "max":
+        raise SystemExit(
+            f"refusing to run: {where}/memory.max is unlimited; start inside a scope "
+            f"with MemoryMax set, at most {CAP_BYTES} bytes")
+    if int(limit) > CAP_BYTES:
+        raise SystemExit(
+            f"refusing to run: {where}/memory.max is {limit}, over the agreed "
+            f"{CAP_BYTES} byte cap")
+    swap = (where / "memory.swap.max").read_text().strip()
+    if swap != "0":
+        raise SystemExit(
+            f"refusing to run: {where}/memory.swap.max is {swap}, not 0, so the cap "
+            f"can be paid for in swap")
+    available = 0
+    for entry in Path("/proc/meminfo").read_text().splitlines():
+        if entry.startswith("MemAvailable:"):
+            available = int(entry.split()[1]) * 1024
+    if available < HEADROOM_BYTES:
+        raise SystemExit(
+            f"refusing to run: MemAvailable is {available} bytes, under the "
+            f"{HEADROOM_BYTES} byte headroom this is allowed to leave")
+    if store_mib is not None and not 0 < store_mib <= 512:
+        raise SystemExit(
+            f"refusing to run: store_mib is {store_mib}, outside the permitted "
+            f"1 to 512 MiB")
+    if bank_counts is not None and any(count < 1 for count in bank_counts):
+        raise SystemExit(f"refusing to run: bank_counts {list(bank_counts)} is not positive")
+    return {"cgroup": str(where), "memory.max": limit, "memory.swap.max": swap,
+            "MemAvailable": available}
+
+
 @dataclass(frozen=True)
 class ProbeConfig:
     """How large a store to build, and in how many banks."""
@@ -155,9 +211,11 @@ def load(where: Path | None, mesh, store_mib: int, banks: int, serialized: bool)
 
 
 def main(config: ProbeConfig) -> None:
+    enforced = preflight(config.store_mib, config.bank_counts)
     where = cgroup()
     mesh = jax.make_mesh((1,), ("x",), devices=jax.devices()[:1])
-    report = {"devices": [str(device) for device in jax.devices()],
+    report = {"enforced": enforced,
+              "devices": [str(device) for device in jax.devices()],
               "sentinel": sentinel(where, mesh)}
     if not report["sentinel"]["charged"]:
         report["matrix"] = None
