@@ -8,6 +8,7 @@ sequence back out of generate().
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -164,30 +165,29 @@ def test_copy_task_trains_and_generate_reads_the_sequence_back():
 
 
 @pytest.mark.mesh
-def test_the_sampled_tokens_land_replicated_on_the_mesh(rng):
-    """Where a decode lands is part of the contract: the tokens are read on
-    the host, decoded to text and logged, so every device that reads a row
-    holds the whole row. Without the pinned out sharding the layout is the
-    compiler's choice and can shard the batch, which a decode must not
-    depend on."""
+def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
+    """Where a decode lands is part of the contract: rows split over the
+    mesh's batch axes the way the prompt does, so no device holds a batch it
+    did not compute, and `host()` hands back the rows a process owns in
+    order. Without the pinned output layout the placement would be the
+    compiler's choice."""
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import batch_shardings, build_mesh
+    from dew.nn.inputs import BATCH_AXES
 
     model = tiny(max_seq_len=8)
     mesh = build_mesh(MeshSpec(fsdp=2))
     params = model.init(rng, jnp.ones((2, 4), jnp.int32))
     placed = jax.device_put(params, Layout(min_shard=2 ** 8).shardings(mesh, params))
-    # The prompt arrives the way a validation batch does, split over the
-    # mesh; without the explicit output layout the result would follow it.
     prompt = jax.random.randint(rng, (8, 3), 0, VOCAB)
-    prompt = jax.device_put(prompt, batch_shardings(mesh, prompt))
+    sharded = jax.device_put(prompt, batch_shardings(mesh, prompt))
 
-    generated = generate(model, placed, prompt, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0)).tokens
+    generated = generate(model, placed, sharded, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
+    plain = generate(model, params, prompt, 3, key=jax.random.PRNGKey(0), sampling=Sampling(temperature=0))
 
-    assert generated.sharding.mesh == mesh
-    assert generated.sharding.spec == jax.sharding.PartitionSpec()
-    assert len(generated.addressable_shards) == len(mesh.devices.flatten())
-    whole = jax.device_get(generated)
-    for shard in generated.addressable_shards:
-        assert shard.data.shape == generated.shape
-        assert jnp.array_equal(jax.device_get(shard.data), whole)
+    assert generated.tokens.sharding.mesh == mesh
+    assert generated.tokens.sharding.spec == jax.sharding.PartitionSpec(BATCH_AXES)
+    assert generated.rows == 8
+    rows = generated.host()
+    assert isinstance(rows.tokens, np.ndarray) and rows.tokens.shape == (8, 6)
+    np.testing.assert_array_equal(rows.tokens, plain.host().tokens)

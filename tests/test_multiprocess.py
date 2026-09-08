@@ -935,6 +935,33 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
 
 @pytest.mark.distributed
+def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
+    """Identical user code on one device and on a two-process pool: the run's
+    weights land on the mesh under the trainer's layout, each rank hands in
+    its own prompts, results stay row-sharded, and `host()` gives every rank
+    the rows a single process draws for the same prompts."""
+    from test_inference import make_lm_run, make_run
+
+    make_run(tmp_path / "diffusion", encoder="char_table", checkpoint="char_table")
+    make_lm_run(tmp_path / "lm")
+    runs = dict(run_dir=str(tmp_path / "diffusion"), lm_dir=str(tmp_path / "lm"))
+    reports = run_pool("inference_pipeline", tmp_path, 2, devices=2, fsdp_size=2, timeout=240, **runs)
+    single = run_worker("inference_pipeline", tmp_path / "single.json", fsdp_size=1, devices=1, **runs)
+
+    for report in reports:
+        assert report["process_count"] == 2
+        assert report["image_spec"] == report["token_spec"] == "P(('data', 'expert', 'fsdp', 'tensor'),)"
+        assert report["image_rows"] == report["rows"] == 3
+        assert set(report["rejected"]) == {"prompts", "guidance", "steps", "row_count",
+                                           "prepared", "prepared_rows", "request_kind", "budget"}
+        assert any("fsdp" in spec for spec in report["parameter_specs"])
+    assert single["image_rows"] == single["rows"] == 6
+    np.testing.assert_allclose(reports[0]["images"] + reports[1]["images"], single["images"], atol=2e-5, rtol=2e-5)
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["text"] + reports[1]["text"] == single["text"]
+
+
+@pytest.mark.distributed
 def test_a_pool_draws_a_jepa_artifact(tmp_path):
     """A tracker attached to a real pool run gets a complete artifact.
 

@@ -69,29 +69,18 @@ Accumulation weights CE and MTP by the main supported-target mass, including tar
 
 ## Generate from a checkpoint
 
-`load_pretrained` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its explicit variables tree, the checkpoint's own processor or tokenizer, the source config and the generation defaults. Text decoders and the multimodal wrappers share this one entry point. `bundle.processor` turns prompts, images and waveforms into `ModelInputs` (tokens, row-aligned token fields and media conditioning), which `model.apply`, `LMObjective` batches and `bundle.generate` all accept; `bundle.generate` reads EOS and padding ids from the checkpoint's generation config. `Generation.tokens` has shape `(B, P + max_new_tokens)` and preserves the input token slots; `lengths` counts the valid continuation per row.
+`load_pretrained` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its explicit variables tree, the checkpoint's own processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` is the front door over the same loader: it answers with a `TextGeneration` (or a `BlockGeneration` for DiffusionGemma) whose weights are placed once, on the current device mesh, and whose sampling policy and budget come from the checkpoint. [Inference](inference.md) describes placement, `seed`, `host()` and `text`, and the workflows from a trained objective, a run directory and a published checkpoint.
 
-The real prompt plus continuation must fit `model.max_seq_len`; input padding consumes no capacity. `Sampling` carries temperature, top-k, top-p, min-p, EOS and the output padding id. `eos_id` accepts one id or a tuple of stop ids. EOS counts as a valid generated action. `Generation.lengths` counts response actions; `terminated` distinguishes EOS from the token budget. Likelihood arrays cover only the response: `behavior_log_probs` includes temperature/top-k/top-p/min-p, while `raw_log_probs` records the original policy. Ignore slots beyond each response length.
-
-Generation prepares inputs on the host and runs prefill and decode in one compiled call. Each row has its own cache cursor. Invalid tokens consume no cache slots; paused recurrent rows retain their convolution history and recurrent memory. Different valid lengths at the same padded shape reuse the executable. Changing batch size, padded width, model or sampling settings can still compile a new executable. Media conditioning runs at prefill; subsequent steps use the native model's cache and logical positions.
-
-On a mesh, rows split over the batch axes and parameters retain their placement. The decode executes a fixed number of steps. EOS disables cache writes and output recording for the finished row without skipping collectives. In a multi-process run, each process passes and receives its own rows. Processes validate inputs together and require matching input shapes and sampling settings. Invalid input on one rank raises on all ranks before device execution; this does not recover a failed device collective.
-
-### Generate through a task
-
-`TextGeneration` from `dew.inference` binds a decoder, one variables tree and the source's processor, so a call takes text or prepared inputs and returns the same `Generation` as `generate`. `bind` returns the task over other weights; a rollout binds a policy snapshot once and draws from it for the whole collection, with the actual and raw-policy likelihood of every action in the result.
+The real prompt plus continuation must fit `model.max_seq_len`; input padding consumes no capacity. `Sampling` carries temperature, top-k, top-p, min-p, EOS and the output padding id; the source's `generation_config.json` fills it for a loaded checkpoint, and `text_generation(sampling=...)` overrides it. Generation prepares inputs on the host and runs prefill and decode in one compiled call with one padded input shape and per-row cache cursors; different valid lengths at the same padded shape reuse the executable.
 
 ```python
-from dew.inference import TextGeneration
-from dew.sampling import Sampling
+import dew
 
-policy = TextGeneration(model, variables, sampling=Sampling(temperature=0.8, top_k=40))
-drawn = policy([[1, 2, 3], [4, 5, 6]], 32, key=jax.random.key(0))
-later = policy.bind(state.params)
+task = dew.pipeline("tests/fixtures/hf/gemma3-native-tiny", dtype="float32")
+print(task("token7 token9", 3, seed=1).text[0])
 ```
 
 `LMObjective.policy(params)` returns the same task already bound to a training tree, which is what `SampledRollout` draws with. To hand the weights to another runtime, export them and point Ollama or vLLM at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) walks that through to the client call.
-
 This example runs offline on the tiny Gemma 3 fixture that the wrapper tests use. A Hub name such as `"Qwen/Qwen3-0.6B"` works the same way with the `interop` extra and a download; a real checkpoint needs enough host and device memory for its weights and cache.
 
 ```python
@@ -107,11 +96,9 @@ inputs = bundle.processor(["token7 <start_of_image> token9",
                            "token5 <start_of_image> token8 <start_of_image> token6"],
                           images=[[images[0]], [images[1], images[2]]])
 logits = bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs())
-generated = bundle.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
-width = inputs.tokens.shape[1]
-for row, length in enumerate(generated.lengths):
-    continuation = generated.tokens[row, width:width + int(length)]
-    print(bundle.processor.decode(continuation[None])[0])
+task = bundle.text_generation(sampling=Sampling(temperature=0))
+for text in task(inputs, 3, seed=1).text:
+    print(text)
 ```
 
 The rows have different image counts, so the processor left-pads the shorter one; `inputs.token_fields["attention_mask"]` is the sole validity source and the padded slots consume no cache. Text-only prompts skip the `images` argument, and Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.

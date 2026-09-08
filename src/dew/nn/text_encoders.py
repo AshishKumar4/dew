@@ -141,6 +141,7 @@ class CLIPEncoderLayer(nn.Module):
     layer_norm_eps: float = 1e-5
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    activation: str = "quick_gelu"
 
     def setup(self):
         norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
@@ -150,7 +151,7 @@ class CLIPEncoderLayer(nn.Module):
             self.hidden_size, self.num_heads, self.causal, dtype=self.dtype,
             precision=self.precision, name="self_attn")
         self.layer_norm2 = norm(name="layer_norm2")
-        self.mlp = MLP(self.hidden_size, self.intermediate_size,
+        self.mlp = MLP(self.hidden_size, self.intermediate_size, activation=self.activation,
                        dtype=self.dtype, precision=self.precision, name="mlp")
 
     def __call__(self, hidden_states, mask=None):
@@ -178,6 +179,7 @@ class CLIPTextTransformer(nn.Module):
     eos_token_id: int = 49407
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
+    activation: str = "quick_gelu"
 
     def setup(self):
         embed = functools.partial(nn.Embed, features=self.hidden_size, dtype=self.dtype)
@@ -187,7 +189,7 @@ class CLIPTextTransformer(nn.Module):
         self.layers = [
             CLIPEncoderLayer(
                 self.hidden_size, self.num_heads, self.intermediate_size, causal=True,
-                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype,
+                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype, activation=self.activation,
                 precision=self.precision, name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_layer_norm = nn.LayerNorm(
@@ -341,7 +343,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     """
     text = dict(hf_config.get("text_config", hf_config))
 
-    _quick_gelu_only(text)
+    activation = text.get("hidden_act", "quick_gelu")
+    if activation not in ("quick_gelu", "gelu", "gelu_pytorch_tanh"):
+        raise ValueError(f"Unsupported CLIP text activation: {activation}")
     eos_token_id = text.get("eos_token_id", 49407)
     if not isinstance(eos_token_id, int):
         raise ValueError(
@@ -357,6 +361,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
         "max_position_embeddings": int(text["max_position_embeddings"]),
         "layer_norm_eps": float(text.get("layer_norm_eps", 1e-5)),
         "eos_token_id": eos_token_id,
+        "activation": activation,
     }
 
 

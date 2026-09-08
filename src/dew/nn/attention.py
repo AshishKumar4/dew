@@ -789,13 +789,17 @@ class FlaxFeedForward(nn.Module):
     dim: int
     dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
+    dropout: float = 0.0
 
     def setup(self):
         self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision)
         self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
+        self.dropout_layer = nn.Dropout(self.dropout)
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, *, train: bool = False):
         hidden_states = self.net_0(hidden_states)
+        if self.dropout:
+            hidden_states = self.dropout_layer(hidden_states, deterministic=not train)
         hidden_states = self.net_2(hidden_states)
         return hidden_states
 

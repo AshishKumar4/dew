@@ -29,7 +29,7 @@ from dew.data.prompts import LENGTH_KEY
 from dew.rl import group_advantage
 from dew.objectives.base import Variables
 from dew.sampling.text import Generation, Sampling
-from dew.training.distributed import local_rows
+from dew.nn.inputs import local_rows
 from dew.training.state import TrainState
 
 from .rollout import (
@@ -348,7 +348,10 @@ class EpisodeRollout:
 
     def _advance(self, slots: list[_Session], result: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
-        if not isinstance(result, Generation) or result.tokens.shape[0] != len(slots):
+        if not isinstance(result, Generation):
+            raise TypeError("tool episodes require an autoregressive Generation")
+        rows = result.host()
+        if rows.tokens.shape[0] != len(slots):
             raise TypeError("tool episodes require one autoregressive Generation row per slot")
         # Record every actual draw before invoking any tool. A tool failure
         # must not erase the other requests already sampled in this cohort.
@@ -356,7 +359,7 @@ class EpisodeRollout:
             if slot.status == EpisodeStatus.RUNNING and len(slot.transitions) == turn and slot.pending is None:
                 observation = slot.observation
                 assert observation is not None
-                slot.pending = slot.invoke(self._action, result, row, observation.context, policy_step, binding_id)
+                slot.pending = slot.invoke(self._action, rows, row, observation.context, policy_step, binding_id)
                 self._persist(slot, run, policy_step, binding_id)
         for slot in slots:
             action = slot.pending
@@ -418,7 +421,7 @@ class EpisodeRollout:
             raise failure from None
         raise failure from error
 
-    def _action(self, result: Generation, row: int, context: tuple[int, ...], policy_step: int,
+    def _action(self, result: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
         """Validate a cohort row's provenance before an environment acts."""
         tokens = np.asarray(result.tokens)[row]

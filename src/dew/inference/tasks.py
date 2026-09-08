@@ -12,9 +12,10 @@ not mutate, donate or delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Protocol, overload
 
 import jax
 import numpy as np
@@ -25,9 +26,9 @@ from jax.typing import ArrayLike
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
-from dew.sampling.text import Generation, Sampling, _mesh, generate
+from dew.sampling.text import Generation, Sampling, generate
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -73,19 +74,24 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
 
 
 def _task_inputs(processor: Processor | None, request: Request, *, images: object | None,
-                 collective: bool) -> ModelInputs:
+                 collective: bool, max_new_tokens: int | None, default_tokens: int | None,
+                 max_length: int | None, key: jax.Array | None, seed: int | None) -> tuple[ModelInputs, int, jax.Array]:
     inputs = None
+    budget = None
+    random_key = None
     error = None
     try:
+        random_key = request_key(key, seed)
         inputs = _prepared(processor, request, images=images)
+        budget = _budget(max_new_tokens, default_tokens, max_length, inputs.tokens.shape[1])
     except Exception as failure:
         error = failure
     if collective:
         agree_process_phase(error, phase="inference task input preparation")
     elif error is not None:
         raise error
-    assert inputs is not None
-    return inputs
+    assert inputs is not None and budget is not None and random_key is not None
+    return inputs, budget, random_key
 
 
 def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
@@ -96,6 +102,18 @@ def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike,
                  for row in range(rows.shape[0]))
 
 
+def _budget(requested: int | None, default: int | None, max_length: int | None, prompt_width: int) -> int:
+    if requested is not None:
+        return requested
+    if default is not None:
+        return default
+    if max_length is not None:
+        if type(max_length) is not int or max_length < prompt_width:
+            raise ValueError("source max_length must be an integer at least as large as the prompt width")
+        return max_length - prompt_width
+    raise ValueError("max_new_tokens is required; the source declares no default budget")
+
+
 @dataclass(frozen=True)
 class TextGeneration:
     """Next-token generation bound to a decoder, its weights and its processor.
@@ -103,13 +121,17 @@ class TextGeneration:
     A call runs the shared cached prefill and decode; the result is the
     `Generation` a training rollout consumes, with the actual and raw-policy
     likelihood of every drawn action. `sampling` is the policy a call uses
-    when it passes none; a loaded source fills it from its generation config.
+    when it passes none, and `max_new_tokens` the budget; a loaded source
+    fills both from its generation config. Weights keep their placement: on
+    a mesh, rows split over its batch axes and results keep that sharding.
     """
 
     model: nn.Module
     variables: Variables
     processor: Processor | None = None
     sampling: Sampling = Sampling()
+    max_new_tokens: int | None = None
+    max_length: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -118,17 +140,30 @@ class TextGeneration:
         """The same task over other weights, such as a training policy snapshot."""
         return replace(self, variables=variables)
 
-    def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array, sampling: Sampling | None = None, images: object | None = None) -> Generation: ...
+
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 seed: int, sampling: Sampling | None = None, images: object | None = None) -> Generation: ...
+
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array | None = None, seed: int | None = None,
                  sampling: Sampling | None = None, images: object | None = None) -> Generation:
-        inputs = _task_inputs(self.processor, request, images=images,
-                              collective=_mesh(self.variables) is not None)
-        return generate(self.model, self.variables, inputs, max_new_tokens, key=key,
-                        sampling=self.sampling if sampling is None else sampling)
+        inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
+                                      collective=mesh_of(self.variables) is not None,
+                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+                                      max_length=self.max_length, key=key, seed=seed)
+        result = generate(self.model, self.variables, inputs, budget,
+                          key=random_key, sampling=self.sampling if sampling is None else sampling)
+        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        return replace(result, decoder=decoder)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        width = generation.tokens.shape[1] - generation.behavior_log_probs.shape[1]
-        return _decoded(self.processor, generation.tokens, generation.lengths, width)
+        rows = generation.host()
+        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -138,7 +173,7 @@ class BlockGeneration:
     A call runs prefill, refinement and clean-token commits as one device
     computation; the `CanvasGeneration` result carries no autoregressive
     likelihoods. `process` is the published sampler configuration used when
-    a call passes none.
+    a call passes none, and `max_new_tokens` the budget a call omits.
     """
 
     model: DiffusionGemma
@@ -147,6 +182,8 @@ class BlockGeneration:
     processor: Processor | None = None
     eos_token_ids: tuple[int, ...] = ()
     pad_token_id: int = 0
+    max_new_tokens: int | None = None
+    max_length: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -155,13 +192,29 @@ class BlockGeneration:
         """The same task over other weights."""
         return replace(self, variables=variables)
 
-    def __call__(self, request: Request, max_new_tokens: int, *, key: jax.Array,
-                 process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
-        inputs = _task_inputs(self.processor, request, images=images, collective=True)
-        return (self.process if process is None else process).generate(
-            self.model, self.variables, inputs, max_new_tokens, key=key,
-            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array, process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration: ...
 
-    def decode(self, generation: CanvasGeneration, prompt_width: int) -> tuple[str, ...]:
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 seed: int, process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration: ...
+
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array | None = None, seed: int | None = None,
+                 process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
+        inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
+                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+                                      max_length=self.max_length, key=key, seed=seed)
+        result = (self.process if process is None else process).generate(
+            self.model, self.variables, inputs, budget,
+            key=random_key, eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        return replace(result, decoder=decoder)
+
+    def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        return _decoded(self.processor, generation.tokens, generation.lengths, prompt_width)
+        if generation.prompt_width is None:
+            raise ValueError("this generation has no prompt width")
+        rows = generation.host()
+        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)

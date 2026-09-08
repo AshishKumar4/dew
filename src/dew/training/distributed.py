@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.linen import spmd
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 from dew.data.dataset import Checkpointable
+from dew.nn.inputs import BATCH_AXES
 from dew.nn.sharding import (
     DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LogicalAxes,
     declared_axes,
@@ -33,7 +34,7 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 # they sit on; the sequence dimension splits over the sequence axis. Every
 # stage sees the whole batch, since the pipeline hands its microbatches from
 # stage to stage itself. Only parameters distinguish the axes further.
-BATCH_SPEC = P((DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS), SEQUENCE_AXIS)
+BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
 
 MeshAxes: TypeAlias = str | tuple[str, ...] | None
 Placement: TypeAlias = Any
@@ -354,28 +355,6 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
         lambda leaf, sharding: jax.make_array_from_process_local_data(
             sharding, np.asarray(leaf)),
         batch, batch_shardings(mesh, batch))
-
-
-def local_rows(leaf) -> np.ndarray:
-    """This process's rows of a batch leaf, in global order.
-
-    The inverse of `shard_batch` for one leaf: a global array hands back the
-    rows this process's devices hold, with a sequence-split second dimension
-    reassembled. Anything a process can read whole is read whole.
-    """
-    if not isinstance(leaf, jax.Array) or leaf.is_fully_addressable:
-        return np.asarray(leaf)
-    if leaf.ndim == 0:
-        return np.asarray(leaf.addressable_shards[0].data)
-    pieces: dict[tuple[int, ...], np.ndarray] = {}
-    for shard in leaf.addressable_shards:
-        pieces.setdefault(tuple(part.start or 0 for part in shard.index), np.asarray(shard.data))
-    blocks = []
-    for start in sorted({key[0] for key in pieces}):
-        columns = sorted(key for key in pieces if key[0] == start)
-        blocks.append(np.concatenate([pieces[key] for key in columns], axis=1)
-                      if len(columns) > 1 else pieces[columns[0]])
-    return np.concatenate(blocks, axis=0)
 
 
 class DevicePrefetchIterator:

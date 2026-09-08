@@ -12,7 +12,7 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +30,10 @@ from dew.registry import objectives
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
+
+if TYPE_CHECKING:
+    from dew.training.state import TrainState
+    from dew.sampling.pipelines import TextToImage
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -67,6 +71,7 @@ class DiffusionObjective(Objective[Mean]):
         sampler: Solver[Any] = DDIM(),
         guidance: Optional[CFG] = CFG(3.0),
         steps: int = 200,
+        pretrained: Variables | None = None,
     ):
         """`sampler`, `guidance` and `steps` are how evaluation samples;
         `guidance` None is the plain conditional prediction."""
@@ -74,6 +79,9 @@ class DiffusionObjective(Objective[Mean]):
         self.process = process
         self.inputs = inputs
         self.autoencoder = autoencoder
+        self.pretrained = pretrained
+        if inputs.mask is not None and autoencoder is None:
+            raise ValueError("Masked-image conditioning requires an autoencoder")
         self.unconditional_prob = unconditional_prob
         self.sampler = sampler
         self.guidance = guidance
@@ -89,6 +97,13 @@ class DiffusionObjective(Objective[Mean]):
             for keyword, condition in inputs.conditions.items()})
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
+    def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:
+        """The model over the state's published weights as a `TextToImage`
+        task, sampling the way this objective's evaluation does."""
+        from dew.sampling.pipelines import TextToImage
+
+        return TextToImage.from_objective(self, self._pipeline_weights(state, ema))
+
     @property
     def latent_shape(self) -> tuple[int, ...]:
         """The per-example shape the model denoises: the sample field's, or
@@ -101,6 +116,8 @@ class DiffusionObjective(Objective[Mean]):
         return (*lead, height // factor, width // factor, self.autoencoder.latent_channels)
 
     def encoder_params(self) -> dict:
+        if self.pretrained is not None:
+            return dict(self.pretrained["encoders"])
         return {keyword: condition.encoder.params
                 for keyword, condition in self.inputs.conditions.items()}
 
@@ -111,13 +128,16 @@ class DiffusionObjective(Objective[Mean]):
                 for keyword, condition in self.inputs.conditions.items()}
 
     def held_variables(self) -> Variables:
-        """Every array `init` starts from rather than draws: the frozen towers.
+        """Every array `init` starts from rather than draws: a whole pretrained
+        tree, or the frozen towers.
 
         A text tower and a VAE are released weights: hundreds of megabytes
         that a nullary trace would compile into the state executable as
         constants. One mapping, so an objective that starts from more than
         the towers extends this and `init` together.
         """
+        if self.pretrained is not None:
+            return self.pretrained
         held: dict[str, Any] = {"encoders": self.encoder_params()}
         if self.autoencoder is not None:
             held["autoencoder"] = self.autoencoder.params
@@ -125,8 +145,13 @@ class DiffusionObjective(Objective[Mean]):
 
     def init(self, key, variables: Variables | None = None) -> Variables:
         held = self.held_variables() if variables is None else variables
-        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
-                                **self.unconditional)
+        if "params" in held:
+            return held
+        conditions = self.unconditional
+        if self.inputs.mask is not None:
+            conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
+                          "masked_image": jnp.zeros((1, *self.latent_shape))}
+        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
         state: dict[str, Any] = {**drawn, "encoders": held["encoders"]}
         if "autoencoder" in held:
             # The frozen weights are state, like the encoders'. They ride in
@@ -140,6 +165,30 @@ class DiffusionObjective(Objective[Mean]):
         return {name: value for name, value in params.items()
                 if name not in ("encoders", "autoencoder")}
 
+    def _conditions(self, params, batch, key, *, dropout):
+        tokens = {keyword: batch[condition.field]
+                  for keyword, condition in self.inputs.conditions.items()}
+        given = self.encode(params["encoders"], tokens)
+        if dropout:
+            count = batch[self.inputs.sample.key].shape[0]
+            dropped = jax.random.bernoulli(key, self.unconditional_prob, (count,))
+            given = jax.tree.map(
+                lambda value, blank: jnp.where(
+                    expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
+                given, self.unconditional)
+        if self.inputs.mask is not None:
+            from dew.inputs.diffusion import latent_image_conditions
+            spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],
+                unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key], jax.random.fold_in(key, 1))
+            return {**given, **spatial}, {**self.unconditional, **spatial}
+        return given, self.unconditional
+
+    def _sampling_batch(self, batch):
+        fields = [self.inputs.sample.key, *(condition.field for condition in self.inputs.conditions.values())]
+        if self.inputs.mask is not None:
+            fields.append(self.inputs.mask.key)
+        return {name: batch[name] for name in fields}
+
     def loss(self, params, batch, step: Step):
         data = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
@@ -147,16 +196,7 @@ class DiffusionObjective(Objective[Mean]):
             data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
         count = data.shape[0]
 
-        # Conditioning dropout. A row drawn for the unconditional branch reads
-        # the unconditional value in every one of its conditions.
-        dropped = jax.random.bernoulli(drop_key, self.unconditional_prob, (count,))
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in self.inputs.conditions.items()}
-        given = self.encode(params["encoders"], tokens)
-        conditions = jax.tree.map(
-            lambda value, blank: jnp.where(
-                expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-            given, self.unconditional)
+        conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
 
         schedule = self.process.schedule
         t = schedule.sample_t(time_key, count)
@@ -174,11 +214,11 @@ class DiffusionObjective(Objective[Mean]):
         return Mean(jnp.sum(losses * weights),
                     jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
-    def _sample_impl(self, params, tokens, key, *, count: int):
-        given = self.encode(params["encoders"], tokens)
+    def _sample_impl(self, params, batch, key, *, count: int):
+        given, unconditional = self._conditions(params, batch, key, dropout=False)
         variables = self.trainable(params)
         denoise = self.process.denoiser(
-            self.model, variables, given, None if self.guidance is None else self.unconditional)
+            self.model, variables, given, None if self.guidance is None else unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
@@ -191,9 +231,7 @@ class DiffusionObjective(Objective[Mean]):
         """One generated sample for every real row, without display decoding."""
         params = params if step.ema is None else step.ema
         count = batch[self.inputs.sample.key].shape[0]
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in self.inputs.conditions.items()}
-        samples = self._sample(params, tokens, step.key, count=count)
+        samples = self._sample(params, self._sampling_batch(batch), step.key, count=count)
         assert self.artifact is not None
         return self.artifact(samples)
 
@@ -204,9 +242,7 @@ class DiffusionObjective(Objective[Mean]):
         try:
             params = params if step.ema is None else step.ema
             count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-            raw_tokens = {keyword: batch[condition.field]
-                          for keyword, condition in self.inputs.conditions.items()}
-            prepared = (self._sample, count, raw_tokens)
+            prepared = (self._sample, count, self._sampling_batch(batch))
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="diffusion preview setup")
@@ -214,9 +250,11 @@ class DiffusionObjective(Objective[Mean]):
         samples = tokens = None
         try:
             assert prepared is not None
-            sample, count, raw_tokens = prepared
-            tokens = jax.tree.map(lambda value: value[:count], raw_tokens)
-            samples = sample(params, tokens, step.key, count=count)
+            sample, count, raw_batch = prepared
+            selected = jax.tree.map(lambda value: value[:count], raw_batch)
+            samples = sample(params, selected, step.key, count=count)
+            tokens = {keyword: selected[condition.field]
+                      for keyword, condition in self.inputs.conditions.items()}
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="diffusion preview generation")

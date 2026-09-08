@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +16,7 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ModelInputs, generation_signature
+from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables
 
 
@@ -52,7 +53,7 @@ class Sampling:
 
 
 @struct.dataclass
-class Generation:
+class Generation(Generic[ArrayT]):
     """Prompt plus padded continuation, and response-aligned likelihoods.
 
     ``lengths`` counts response actions, including EOS. ``terminated`` marks
@@ -60,13 +61,37 @@ class Generation:
     have shape [B, max_new_tokens]. Only positions below ``lengths`` are valid.
     ``behavior_log_probs`` describes the temperature/top-k/top-p/min-p distribution that
     drew each action. ``raw_log_probs`` describes the unmodified model policy.
+
+    Arrays keep the placement the task ran with: on a mesh they are global
+    arrays whose rows split over the batch axes, padded to the device count.
+    ``host()`` reads this process's ``rows`` real rows back as host arrays.
+    ``text`` decodes them through the processor the task was bound to.
     """
 
-    tokens: jax.Array
-    lengths: jax.Array
-    terminated: jax.Array
-    behavior_log_probs: jax.Array
-    raw_log_probs: jax.Array
+    tokens: ArrayT
+    lengths: ArrayT
+    terminated: ArrayT
+    behavior_log_probs: ArrayT
+    raw_log_probs: ArrayT
+    rows: int | None = struct.field(pytree_node=False, default=None)
+    decoder: Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None = struct.field(
+        pytree_node=False, default=None)
+
+    @property
+    def prompt_width(self) -> int:
+        return self.tokens.shape[1] - self.behavior_log_probs.shape[1]
+
+    def host(self) -> Generation[np.ndarray]:
+        """This process's real rows as host arrays."""
+        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+
+    @functools.cached_property
+    def text(self) -> tuple[str, ...]:
+        """Each real row's valid continuation, decoded on first access."""
+        if self.decoder is None:
+            raise ValueError("this generation carries no processor to decode with")
+        rows = self.host()
+        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
 
 def _sample_token(logits: jax.Array, keys: jax.Array, sampling: Sampling
@@ -184,17 +209,9 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs,
                       samples.behavior_log_probs, samples.raw_log_probs)
 
 
-def _mesh(params: Variables) -> jax.sharding.Mesh | None:
-    for leaf in jax.tree.leaves(params):
-        mesh = getattr(getattr(leaf, "sharding", None), "mesh", None)
-        if mesh is not None and not mesh.empty:
-            return mesh
-    return None
-
-
 def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling) -> ModelInputs:
-    """Host checks shared by batch generation and the engine; returns device inputs."""
+    """Host checks shared by every caller; returns device inputs with a binary mask."""
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -230,9 +247,22 @@ def _compiled(rows: jax.sharding.NamedSharding | None):
                    in_shardings=(None, rows, rows), out_shardings=rows)
 
 
+@overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
-             *, key: jax.Array, sampling: Sampling = Sampling()) -> Generation:
+             *, key: jax.Array, sampling: Sampling = Sampling()) -> Generation: ...
+
+
+@overload
+def generate(model: nn.Module, params: Variables,
+             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+             *, seed: int, sampling: Sampling = Sampling()) -> Generation: ...
+
+
+def generate(model: nn.Module, params: Variables,
+             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+             *, key: jax.Array | None = None, seed: int | None = None,
+             sampling: Sampling = Sampling()) -> Generation:
     """Generate from numeric model inputs, with an array shorthand for text.
 
     ModelInputs.token_fields["attention_mask"] identifies real tokens. Missing masks mean all
@@ -241,22 +271,19 @@ def generate(model: nn.Module, params: Variables,
     state. Each cache compacts real input tokens and leaves paused rows intact.
 
     Parameters keep their placement. On a mesh, rows split over its batch
-    axes. All cooperating processes use the same input shapes and sampling
-    value, and execute a fixed decode trip count. Each process receives only
-    its own rows, with keys folded by global row index and response position.
+    axes and the result keeps that sharding; ``Generation.host()`` reads a
+    process's own rows back. All cooperating processes use the same input
+    shapes and sampling value and execute a fixed decode trip count. Keys
+    fold in the global row index and the response position, so a pool draws
+    what one process draws for the same rows.
     """
-    from dew.training.distributed import BATCH_SPEC, local_rows
-
-    mesh = _mesh(params)
+    mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
-    process = jax.process_index() if mesh is not None else 0
     error = None
     prepared = None
     random_key = None
     try:
-        random_key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
-        if random_key.shape != ():
-            raise ValueError("key must be a single JAX PRNG key")
+        random_key = request_key(key, seed)
         canonical = ModelInputs.from_value(inputs)
         ids = local_rows(canonical.tokens)
         fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
@@ -272,39 +299,18 @@ def generate(model: nn.Module, params: Variables,
     elif error is not None:
         raise error
     assert prepared is not None and random_key is not None
-    batch = prepared.tokens.shape[0]
     if processes > 1:
         # Compare fixed-size hashes before creating distributed input arrays.
         # The schema covers all conditioning and token fields, not token length
         # alone; different traced shapes would issue mismatched collectives.
         digest = generation_signature(prepared, (max_new_tokens, sampling))
         multihost_utils.assert_equal(digest, "generation input shapes and sampling must agree across processes")
-    rows_sharding = None
-    if mesh is not None:
-        rows_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(BATCH_SPEC[0]))
-        batch_devices = math.prod(mesh.shape[axis] for axis in BATCH_SPEC[0])
-        if batch_devices % processes:
-            raise ValueError("the batch axes of the mesh do not split evenly over the processes")
-        local_devices = batch_devices // processes
-        count = -(-batch // local_devices) * local_devices
-        if count != batch:
-            indices = jnp.arange(count) % batch
-            prepared = prepared.take_rows(indices)
-            valid = prepared.token_fields["attention_mask"] & (jnp.arange(count)[:, None] < batch)
-            prepared = replace(prepared, token_fields={**prepared.token_fields, "attention_mask": valid})
-        prepared = jax.tree.map(
-            lambda leaf: jax.make_array_from_process_local_data(rows_sharding, np.asarray(leaf)), prepared)
-    else:
-        count = batch
-    row_keys = jax.vmap(lambda row: jax.random.fold_in(random_key, row))(
-        jnp.arange(count) + process * batch)
-    if rows_sharding is not None:
-        key_data = jax.make_array_from_process_local_data(rows_sharding, np.asarray(jax.random.key_data(row_keys)))
-        row_keys = jax.random.wrap_key_data(key_data, impl=jax.random.key_impl(random_key))
-    output = _compiled(rows_sharding)(model, params, prepared, row_keys, max_new_tokens, sampling)
-    if mesh is None:
-        return output
-    if processes == 1:
-        output = jax.tree.map(lambda leaf: leaf[:batch], output)
-        return jax.device_put(output, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))
-    return jax.tree.map(lambda leaf: jnp.asarray(local_rows(leaf)[:batch]), output)
+    plan = RowPlan.over(mesh, prepared.tokens.shape[0])
+    padded = plan.pad(prepared)
+    if plan.count != plan.rows:
+        # Repeated rows carry no real token, so they finish at once and emit nothing.
+        mask = np.asarray(padded.token_fields["attention_mask"]) & ~plan.padding[:, None]
+        padded = replace(padded, token_fields={**padded.token_fields, "attention_mask": mask})
+    output = _compiled(plan.sharding)(model, params, plan.place(padded), plan.keys(random_key),
+                                      max_new_tokens, sampling)
+    return replace(output, rows=plan.rows)

@@ -56,7 +56,7 @@ class Condition:
 
     encoder: ConditionEncoder
     field: str = "text"
-    unconditional: str | float = ""
+    unconditional: str | float | Mapping[str, object] = ""
 
     def to_json(self) -> dict:
         return {"encoder": {"name": registry.encoders.name_of(type(self.encoder)),
@@ -84,6 +84,8 @@ class InputSpec:
 
     sample: Field
     conditions: Mapping[str, Condition] = field(default_factory=dict)
+    mask: Field | None = None
+    """A binary image mask for explicit masked-image latent conditioning."""
 
     def __post_init__(self):
         fields = [condition.field for condition in self.conditions.values()]
@@ -106,7 +108,8 @@ class InputSpec:
     def to_json(self) -> dict:
         return {"sample": {"key": self.sample.key, "shape": list(self.sample.shape)},
                 "conditions": {keyword: condition.to_json()
-                               for keyword, condition in self.conditions.items()}}
+                               for keyword, condition in self.conditions.items()},
+                **({"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}} if self.mask is not None else {})}
 
     @classmethod
     def from_json(cls, data: Mapping) -> "InputSpec":
@@ -115,8 +118,11 @@ class InputSpec:
         sample = data["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
                    conditions={keyword: Condition.from_json(condition)
-                               for keyword, condition in data["conditions"].items()})
+                               for keyword, condition in data["conditions"].items()},
+                   mask=Field(data["mask"]["key"], tuple(data["mask"]["shape"])) if "mask" in data else None)
 
+
+from .diffusion import CLIPConditioner
 
 __all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "CharTable", "rebuild", "unit_range", "pixel_field"]
+           "CharTable", "CLIPConditioner", "rebuild", "unit_range", "pixel_field"]

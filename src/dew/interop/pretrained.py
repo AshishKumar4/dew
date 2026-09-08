@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
@@ -21,12 +21,19 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.sampling.text import Sampling
 from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
+from dew.diffusion.process import Process
+from dew.diffusion.schedules.source import SourceSchedule
+from dew.inputs import InputSpec
+from dew.nn.autoencoders import AutoEncoder
+from dew.objectives.diffusion import DiffusionObjective
+from dew.sampling.guidance import CFG
+from dew.sampling.pipelines import TextToImage
 
 
 class HostProcessor(Protocol):
@@ -53,6 +60,21 @@ class Processor:
 
     def __call__(self, text: str | Sequence[str], *, images: object | None = None,
                  audio: object | None = None) -> ModelInputs:
+        if images is None and audio is None:
+            rows = [text] if isinstance(text, str) else list(text)
+            values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
+            tokenizer = getattr(self.reference, "tokenizer", self.reference)
+            pad_id = getattr(tokenizer, "pad_token_id", None)
+            side = getattr(tokenizer, "padding_side", "right")
+            if side not in ("left", "right"):
+                raise ValueError("the tokenizer padding_side must be left or right")
+            ids = values["input_ids"]
+            ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
+            fields = {name: value if isinstance(value, Sequence) else np.asarray(value)
+                      for name, value in values.items() if name != "input_ids"}
+            tokens, fields = pad_token_rows(ids, pad_id=0 if pad_id is None else pad_id,
+                                           padding_side=side, fields=fields)
+            return self.from_hf({"input_ids": tokens, **fields})
         import torch
 
         # truncation is off for text anyway; reloaded Gemma processors forward
@@ -478,13 +500,22 @@ class Pretrained:
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
     export_adapter: Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
+    process: Process | None = None
+    inputs: InputSpec | None = None
+    autoencoder: AutoEncoder | None = None
+    schedule: SourceSchedule | None = None
+    finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Use the source policy, or an explicit supported policy supplied by the caller."""
+        if self.process is not None:
+            raise TypeError("a latent diffusion source generates through text_to_image")
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
         return TextGeneration(self.model, self.variables, self.processor, sampling if sampling is not None
-                              else _source_sampling(self.config, self.generation_config))
+                              else _source_sampling(self.config, self.generation_config),
+                              max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                              max_length=_generation_limit(self.config, self.generation_config, "max_length"))
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -494,7 +525,17 @@ class Pretrained:
         return BlockGeneration(self.model, self.variables,
                                diffusion_gemma.generation_process(self.config, self.generation_config),
                                self.processor, _eos_ids(self.config, self.generation_config),
-                               _pad_id(self.config, self.generation_config))
+                               _pad_id(self.config, self.generation_config),
+                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                               max_length=_generation_limit(self.config, self.generation_config, "max_length"))
+
+    def text_to_image(self) -> TextToImage:
+        """The latent diffusion source as an image task with its published policy."""
+        if self.process is None or self.inputs is None or self.schedule is None:
+            raise TypeError("text_to_image needs a latent diffusion source")
+        return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
+                           grid=self.schedule.sampling, final_denoise=False, sampler=self.schedule.solver(),
+                           steps=min(50, len(self.schedule.betas)), guidance=CFG(7.5), finish=self.finish)
 
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
         """Write trained variables back to the source layout with its tokenizer assets."""
@@ -502,6 +543,10 @@ class Pretrained:
         values = self.variables if variables is None else variables
         destination = Path(directory)
         generation_config = dict(self.generation_config)
+        if self.schedule is not None:
+            from dew.interop import diffusion
+            diffusion.save_source(self, values, destination)
+            return
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
@@ -564,6 +609,15 @@ def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object
     return value
 
 
+def _generation_limit(config: Mapping[str, object], generation_config: Mapping[str, object], name: str) -> int | None:
+    """Read a nonnegative source generation limit."""
+    value = _generation_value(config, generation_config, name)
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
@@ -574,40 +628,81 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
+# Checkpoint generation_config.json is data; interpreting it must not run
+# Transformers generation code. Neutral values follow Transformers 5.16.1
+# generation/utils.py::_get_logits_processor and get_generation_mode in
+# generation/configuration_utils.py. Other active controls are refused.
+_SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
+                                 "eos_token_id", "pad_token_id"})
+_TASK_OWNED_CONTROLS = frozenset({
+    "bos_token_id", "decoder_start_token_id", "max_length", "max_new_tokens",
+    "use_cache", "cache_implementation", "cache_config",
+    "max_cache_len", "prefill_chunk_size", "continuous_batching_config", "compile_config",
+    "disable_compile", "low_memory", "use_mtp", "speculation_type", "is_assistant",
+    "num_assistant_tokens", "num_assistant_tokens_schedule", "assistant_confidence_threshold",
+    "assistant_early_exit", "assistant_lookbehind", "assistant_ensemble_weight",
+    "target_lookbehind", "prompt_lookup_num_tokens", "max_matching_ngram_size",
+    "output_attentions", "output_hidden_states", "output_scores", "output_logits",
+    "return_dict_in_generate", "transformers_version", "_from_model_config", "_commit_hash",
+    "tokenizer_name",
+})
+_NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
+    "num_return_sequences": (1,), "max_time": (),
+    "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
+    "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
+    "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),
+    "typical_p": (1.0,), "epsilon_cutoff": (0.0,), "eta_cutoff": (0.0,), "top_h": (),
+    "guidance_scale": (1.0,), "remove_invalid_values": (False,), "renormalize_logits": (False,),
+    "token_healing": (False,), "sequence_bias": (), "bad_words_ids": (), "force_words_ids": (),
+    "constraints": (), "forced_bos_token_id": (), "forced_eos_token_id": (),
+    "exponential_decay_length_penalty": (), "suppress_tokens": (), "begin_suppress_tokens": (),
+    "watermarking_config": (), "dola_layers": (), "stop_strings": (),
+}
+_BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
+    "early_stopping": (False,), "length_penalty": (1.0,), "num_beam_groups": (1,),
+    "diversity_penalty": (0.0,),
+}
+_SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"})
+
+
+def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
+    if value is None:
+        return True
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return any(value == item and (numeric and not isinstance(item, bool) or type(value) is type(item))
+               for item in neutral)
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
     """Construct only policies whose active controls the native sampler implements."""
-    from transformers import GenerationConfig
-
-    defaults = GenerationConfig().to_dict()
     do_sample = _generation_value(config, generation_config, "do_sample", False)
+    if do_sample is None:
+        do_sample = False
     if type(do_sample) is not bool:
         raise ValueError("do_sample must be a boolean")
-    supported = {"do_sample", "temperature", "top_k", "top_p", "min_p", "eos_token_id", "pad_token_id"}
-    # Prompt creation, requested output size and output representation belong
-    # to the task. These source fields do not transform its token distribution.
-    task_owned = {"bos_token_id", "max_length", "max_new_tokens", "use_cache",
-                  "cache_implementation", "cache_config", "return_legacy_cache", "compile_config",
-                  "disable_compile", "output_attentions", "output_hidden_states", "output_scores",
-                  "output_logits", "return_dict_in_generate", "transformers_version",
-                  "_from_model_config", "_commit_hash", "tokenizer_name"}
-    sampled_only = {"top_p", "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff", "top_h"}
+    beams = _generation_value(config, generation_config, "num_beams")
+    judged = dict(_NEUTRAL_CONTROLS)
+    if not _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
+        judged.update(_BEAM_ONLY_CONTROLS)
     unsupported = []
-    for name in set(defaults) | set(generation_config):
-        if name in supported or name in task_owned:
+    for name in sorted(set(judged) | set(generation_config)):
+        if name in _SUPPORTED_CONTROLS or name in _TASK_OWNED_CONTROLS or (
+                name in _BEAM_ONLY_CONTROLS and name not in judged):
             continue
-        if not do_sample and name in sampled_only:
+        if not do_sample and name in _SAMPLED_ONLY_CONTROLS:
             continue
-        default = defaults.get(name)
-        value = _generation_value(config, generation_config, name, default)
-        if value != default:
+        value = _generation_value(config, generation_config, name)
+        if not _neutral(value, judged.get(name, ())):
             unsupported.append(name)
     if unsupported:
-        raise ValueError(f"native sampling cannot honor active source controls {sorted(unsupported)}; "
+        raise ValueError(f"native sampling cannot honor active source controls {unsupported}; "
                          "pass an explicit sampling=Sampling(...) policy to text_generation")
     temperature = _generation_value(config, generation_config, "temperature", 1.0)
+    if temperature is None:
+        temperature = 1.0
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
-    top_k = _generation_value(config, generation_config, "top_k", defaults["top_k"])
+    top_k = _generation_value(config, generation_config, "top_k")
     if top_k is not None and type(top_k) is not int:
         raise ValueError("top_k must be an integer")
     return Sampling(
@@ -616,6 +711,112 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         pad_id=_pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", 1.0),
         min_p=_probability_control(config, generation_config, "min_p", 0.0))
+
+
+def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
+                          attention_impl: str) -> Pretrained:
+    """A published latent diffusion directory as native modules and variables."""
+    from transformers import CLIPTokenizer
+    from dew.diffusion.schedules.source import SourceSchedule
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.diffusion import CLIPConditioner, CLIPImageTransform, CLIPSafetyHead, ImageSafety
+    from dew.interop import diffusion
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+    from dew.nn.autoencoders.vae import _vae_path
+    from dew.nn.backbones.unet_condition import UNet2DCondition
+    from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, translate_config, translate_vision_config
+
+    def component_config(name: str) -> dict:
+        file = "scheduler_config.json" if name == "scheduler" else "config.json"
+        with open(directory / name / file) as handle:
+            return json.load(handle)
+
+    def present(name: str) -> bool:
+        entry = index.get(name)
+        return isinstance(entry, list) and entry[0] is not None
+
+    compute = resolve_dtype(dtype)
+    unet_config = component_config("unet")
+    native_fields = diffusion.unet_fields(unet_config, dtype=dtype, attention_impl=attention_impl)
+    model = UNet2DCondition(**native_fields)
+    unet_params, layouts = diffusion.translate_unet_weights(diffusion.component_tensors(directory, "unet"), model)
+    vae_config = component_config("vae")
+    vae_model = AutoencoderKL(
+        channels=tuple(vae_config["block_out_channels"]), latent_channels=vae_config["latent_channels"],
+        image_channels=vae_config["in_channels"], blocks_per_level=vae_config["layers_per_block"],
+        norm_groups=vae_config["norm_num_groups"], quantize=vae_config.get("use_quant_conv", True),
+        post_quantize=vae_config.get("use_post_quant_conv", True), dtype=compute)
+    vae_tensors = diffusion.component_tensors(directory, "vae")
+    vae_params, vae_layouts = diffusion.record_layouts(
+        "vae", vae_tensors, lambda name: _vae_path(name, np.ndim(vae_tensors[name])), ("autoencoder",))
+    autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=vae_params, model=vae_model,
+                                     latent_shift=vae_config.get("shift_factor") or 0.0,
+                                     latent_scale=vae_config.get("scaling_factor", 0.18215))
+    names = tuple(name for name in ("text_encoder", "text_encoder_2") if present(name))
+    if not names:
+        raise ValueError("A latent diffusion source needs at least one text encoder")
+    towers, tokenizers, text_params, text_layouts = [], [], {}, ()
+    for name in names:
+        text_config = component_config(name)
+        towers.append(CLIPTextTransformer(**translate_config(text_config), dtype=compute))
+        params, recorded = diffusion.record_layouts(
+            name, diffusion.component_tensors(directory, name), _text_head_path, ("encoders", "conditioning", name))
+        text_params[name] = params
+        text_layouts += recorded
+        tokenizers.append(CLIPTokenizer.from_pretrained(directory / ("tokenizer" + name.removeprefix("text_encoder"))))
+    sample_size = int(unet_config["sample_size"]) * autoencoder.downscale_factor
+    height, width = index.get("dew_height", sample_size), index.get("dew_width", sample_size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    pooled = unet_config.get("addition_embed_type") == "text_time"
+    encoder = CLIPConditioner(tuple(towers), tuple(tokenizers), names, text_params, str(directory), height, width,
+                              pooled=pooled, aesthetics=bool(index.get("requires_aesthetics_score", False)))
+    unconditional = {"text": "", "negative": True, "zero": bool(pooled and index.get("force_zeros_for_empty_prompt", True))}
+    inpaint = int(unet_config["in_channels"]) == autoencoder.latent_channels * 2 + 1
+    inputs = InputSpec(Field("image", (height, width, 3)),
+                       {"conditioning": Condition(encoder, unconditional=unconditional)},
+                       mask=Field("mask", (height, width, 1)) if inpaint else None)
+    encoders = {"conditioning": text_params}
+    finish = None
+    safety_layouts = ()
+    extra_configs = {}
+    if present("safety_checker"):
+        checker_config = component_config("safety_checker")
+        with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
+            transform_config = json.load(handle)
+        encoders["safety"], safety_layouts = diffusion.record_layouts(
+            "safety_checker", diffusion.component_tensors(directory, "safety_checker"), _safety_path, ("encoders", "safety"))
+        head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(checker_config), dtype=compute),
+                              int(checker_config["projection_dim"]), dtype=compute)
+        finish = ImageSafety(head, CLIPImageTransform.from_config(transform_config))
+        extra_configs.update(safety_checker=checker_config, feature_extractor=transform_config)
+    schedule = SourceSchedule.from_config(component_config("scheduler"))
+    variables = {"params": unet_params, "encoders": encoders, "autoencoder": vae_params}
+    components = {"unet": unet_config, "vae": vae_config, "scheduler": dict(schedule.config),
+                  **{name: component_config(name) for name in names}}
+    components.update(extra_configs)
+    config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
+    built = {"name": "unet_2d_condition", "fields": {**native_fields, "dtype": dtype,
+             "stages": [asdict(stage) for stage in model.stages]}}
+    return Pretrained(model, variables, None, config, directory, built,
+                      weight_layouts=layouts + vae_layouts + text_layouts + safety_layouts,
+                      process=schedule.training_process(), inputs=inputs, autoencoder=autoencoder,
+                      schedule=schedule, finish=finish)
+
+
+def _text_head_path(name: str):
+    from dew.nn.text_encoders import _text_path
+    if name == "text_projection.weight":
+        return ("text_projection", "kernel")
+    path = _text_path(name)
+    return None if path is None else ("text_model", *path)
+
+
+def _safety_path(name: str):
+    from dew.nn.text_encoders import _clip_path
+    if name.startswith(("concept_embeds", "special_care_embeds")):
+        return (name,)
+    return _clip_path(name.removeprefix("vision_model."))
 
 
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
@@ -629,6 +830,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
     artifacts are loaded only when the source contains them.
     """
     directory = decoders._snapshot(str(name_or_dir), revision)
+    if (directory / "model_index.json").is_file():
+        with open(directory / "model_index.json") as handle:
+            return _load_diffusion_source(directory, json.load(handle), dtype=dtype, attention_impl=attention_impl)
     with open(directory / "config.json") as handle:
         config = json.load(handle)
     tensors = dequantize_checkpoint(decoders._load_shards(directory), fp8_block(config))

@@ -298,6 +298,19 @@ class Checkpoints:
         if saved is not None:
             item['position'] = gather_positions(saved)
         return item
+    def stored(self, step: int | None = None) -> dict[str, Any]:
+        """What the checkpoint at `step` (the latest by default) holds, as
+        shape/dtype trees per state field; an unset field is None."""
+        if step is None:
+            step = self.latest
+            if step is None:
+                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        manager = self._open_local() if step == self._local_latest() else self._open()
+        metadata = manager.item_metadata(step)
+        return {name: None if value is None else
+                jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
+                for name, value in dict(metadata).items()}
+
     def accumulation_template(self, step: int):
         """The persisted pending-array shapes, without reading their values."""
         from dew.training.state import Accumulation
@@ -373,7 +386,9 @@ class Checkpoints:
                 lambda leaf: ocp.ArrayRestoreArgs(
                     sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
                 item)
-            if 'position' in stored:
+            if 'position' in stored and not isinstance(template, Mapping):
+                # A mapping names the leaves it wants and nothing else; a
+                # resume takes the whole state, the data position included.
                 # The table's shape depends on the process count and the
                 # iterator's position, so it comes from the checkpoint's own
                 # metadata, not from the template. A local checkpoint

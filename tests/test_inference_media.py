@@ -22,22 +22,22 @@ def test_trained_image_task_accepts_raw_and_prepared_inputs_and_immutable_rebind
     objective, state = make_run(tmp_path)
     task = TextToImage.from_objective(objective, state.params)
     key = jax.random.key(23)
-    raw = task(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
+    raw = task(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
     prepared = task.prepare(["flower", "tree"], key=key)
-    assert isinstance(prepared, DenoisingInputs)
-    again = task(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
+    assert isinstance(prepared, DenoisingInputs) and prepared.rows == 2
+    again = task(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
     np.testing.assert_array_equal(again, raw)
     loaded = TextToImage.from_run(str(tmp_path), ema=False)
-    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key), raw,
-                               atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(loaded(["flower", "tree"], steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images,
+                               raw, atol=2e-6, rtol=2e-6)
     mutable = jax.tree.map(lambda leaf: leaf, task.params.unfreeze())
     bound = task.bind(mutable)
     mutable["params"] = jax.tree.map(lambda leaf: leaf + 0.05, mutable["params"])
-    np.testing.assert_array_equal(bound(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key), raw)
-    changed = task.bind(mutable)(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key)
-    assert np.max(np.abs(np.asarray(changed) - np.asarray(raw))) > 1e-4
-    np.testing.assert_allclose(task("flower", steps=3, sampler=Heun(), key=key),
-                               task(["flower"], steps=3, sampler=Heun(), key=key), atol=0, rtol=0)
+    np.testing.assert_array_equal(bound(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images, raw)
+    changed = task.bind(mutable)(prepared, steps=3, sampler=Heun(), guidance=CFG(2.0), key=key).host().images
+    assert np.max(np.abs(changed - raw)) > 1e-4
+    np.testing.assert_allclose(task("flower", steps=3, sampler=Heun(), key=key).host().images,
+                               task(["flower"], steps=3, sampler=Heun(), key=key).host().images, atol=0, rtol=0)
     with pytest.raises(ValueError, match="initial noise"):
         task(replace(prepared, noise=prepared.noise[:, :-1]), steps=3, key=key)
 
@@ -72,3 +72,29 @@ def test_canvas_raw_media_processing_reaches_the_real_conditioner():
     for invalid in ([[1.9, 2.8]], [[1, 2], "drop this"], [[True, 1]]):
         with pytest.raises(ValueError):
             task(invalid, 2, key=jax.random.key(1))
+
+
+def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path):
+    from dew.sampling import Euler
+
+    objective, state = make_run(tmp_path)
+    task = replace(objective.pipeline(state), final_denoise=False, sampler=Euler())
+    shape = (1, *task.latent_shape)
+    pixels = np.zeros(shape, np.float32)
+    noise = np.full(shape, 0.25, np.float32)
+    times = np.asarray(task.process.times(5))
+    prepared = task.prepare(["flower"], image=pixels, noise=noise, times=times, steps=5, seed=3)
+    _, sigma = task.process.sampler_schedule.rates(times[0])
+    np.testing.assert_allclose(np.asarray(prepared.noise)[:1], float(sigma) * noise, atol=1e-6, rtol=1e-6)
+    full = task(prepared, seed=3, decode=False).host()
+    assert full.images is None
+    # The handoff carries the state at this grid point, not pixels or a newly noised image.
+    prefix = task(replace(prepared, times=tuple(times[:3])), seed=3, decode=False).host()
+    resumed = task.prepare(["flower"], initial=prefix.latents, times=times[2:], steps=5, seed=3)
+    np.testing.assert_array_equal(np.asarray(resumed.noise)[:1], prefix.latents)
+    tail = task(resumed, seed=3, decode=False).host()
+    np.testing.assert_allclose(tail.latents, full.latents, atol=1e-6, rtol=1e-6)
+    decoded = task(resumed, seed=3).host()
+    np.testing.assert_array_equal(decoded.images, np.clip(tail.latents, -1, 1))
+    with pytest.raises(ValueError, match="already noisy"):
+        task.prepare(["flower"], initial=prefix.latents, noise=noise, seed=3)

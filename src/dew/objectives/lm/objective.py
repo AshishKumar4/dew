@@ -28,7 +28,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, NamedTuple, Optional
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -48,7 +48,11 @@ from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
 from dew.inference import TextGeneration
+from dew.inference.tasks import Processor
 from dew.sampling.text import Sampling
+
+if TYPE_CHECKING:
+    from dew.training.state import TrainState
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -58,6 +62,14 @@ FROZEN = "frozen"
 The optimizer moves the `params` collection and nothing else, so what the
 warm-up leaves there is the indexer alone; the rest of the tree rides
 beside it as state, and the model sees them merged."""
+
+
+def model_variables(params: Variables) -> Variables:
+    """Merge a pretrained run's frozen split into the model variables."""
+    if FROZEN not in params:
+        return params
+    variables = {name: value for name, value in params.items() if name != FROZEN}
+    return {**variables, "params": merge(params[FROZEN], params["params"])}
 
 
 @dataclass(frozen=True)
@@ -456,12 +468,6 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 f"pretrained tree lacks {outside[:3]}{'...' if len(outside) > 3 else ''}")
         return merge(variables, pretrained)
 
-    def _model_variables(self, params: Variables) -> Variables:
-        """The tree the model applies: the frozen split merged back."""
-        if FROZEN not in params:
-            return params
-        variables = {name: value for name, value in params.items() if name != FROZEN}
-        return {**variables, "params": merge(params[FROZEN], params["params"])}
 
     def policy(self, params: Variables, sampling: Sampling = Sampling()) -> TextGeneration:
         """The model over this training tree as a generation task.
@@ -470,7 +476,15 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         from it; the result records the actual and raw-policy likelihoods
         the objective's ratio needs.
         """
-        return TextGeneration(self.model, self._model_variables(params), sampling=sampling)
+        return TextGeneration(self.model, model_variables(params), sampling=sampling)
+
+    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
+        """The decoder over the state's published weights, sampling and
+        budgeted the way this objective's previews are; `processor` decodes."""
+        samples = self.samples
+        return TextGeneration(self.model, model_variables(self._pipeline_weights(state, ema)), processor,
+                              sampling=Sampling() if samples is None else samples.sampling,
+                              max_new_tokens=None if samples is None else samples.max_new_tokens)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -503,7 +517,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             packing["positions"] = positions[:, :-1]
         if segment_ids is not None:
             packing["segment_ids"] = segment_ids[:, :-1]
-        params = self._model_variables(params)
+        params = model_variables(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections, packing)
@@ -656,7 +670,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         segment_ids, positions = _packing(batch)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
-            self._model_variables(params), inputs, True, {"dropout": step.key},
+            model_variables(params), inputs, True, {"dropout": step.key},
             collections, _packing_of(segment_ids, positions))
         total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], inputs, segment_ids)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
@@ -790,7 +804,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         try:
             if prepared is not None:
                 policy, prompt, max_new_tokens = prepared
-                generated = policy(prompt, max_new_tokens, key=step.key).tokens
+                generated = policy(prompt, max_new_tokens, key=step.key).host().tokens
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="LM preview generation")

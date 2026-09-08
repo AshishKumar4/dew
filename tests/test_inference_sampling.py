@@ -51,19 +51,37 @@ def test_bind_freezes_mapping_structure_but_preserves_array_leaves(task):
 
 
 
-def test_single_prompt_processor_does_not_require_an_unneeded_pad_token(task):
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(task, tmp_path, padding_side):
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
     from dew.interop.pretrained import Processor
 
-    backend = Tokenizer(models.WordLevel({"<unk>": 0, "one": 1, "two": 2}, unk_token="<unk>"))
+    vocabulary = {"<unk>": 0, "one": 1, "two": 2, "three": 3, "<eos>": 4}
+    vocabulary.update({f"t{index}": index for index in range(5, task.model.vocab_size)})
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
-    assert tokenizer.pad_token_id is None
-    policy = replace(task, processor=Processor(tokenizer, {}, {}, task.model.vocab_size))
-    generated = policy("one two", 2, key=jax.random.key(0))
-    np.testing.assert_array_equal(generated.tokens[:, :2], [[1, 2]])
-    assert generated.lengths[0] == 2
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", eos_token="<eos>",
+                                        padding_side=padding_side)
+    processor = Processor(tokenizer, {}, {}, task.model.vocab_size)
+    processor.save_pretrained(tmp_path / "before")
+    policy = replace(task, processor=processor, sampling=Sampling(temperature=0))
+    prompts = ["one", "one two three"]
+    inputs = processor(prompts)
+    generated = policy(inputs, 2, seed=0).host()
+    for row, prompt in enumerate(prompts):
+        valid = np.asarray(inputs.token_fields["attention_mask"])[row]
+        ids = np.asarray(inputs.tokens)[row, valid]
+        np.testing.assert_array_equal(ids, tokenizer.encode(prompt))
+        alone = policy(prompt, 2, seed=0).host()
+        np.testing.assert_array_equal(generated.tokens[row, -2:], alone.tokens[0, -2:])
+        np.testing.assert_allclose(generated.raw_log_probs[row], alone.raw_log_probs[0], atol=2e-6, rtol=2e-6)
+    assert tokenizer.pad_token_id is None and tokenizer.padding_side == padding_side
+    assert len(tokenizer) == len(vocabulary)
+    processor.save_pretrained(tmp_path / "after")
+    before = {path.name: path.read_bytes() for path in (tmp_path / "before").iterdir()}
+    after = {path.name: path.read_bytes() for path in (tmp_path / "after").iterdir()}
+    assert after == before
 
 
 def warped(logits, sampling):
@@ -134,3 +152,33 @@ def test_source_policy_preserves_supported_filters_and_requires_an_override_for_
     np.testing.assert_array_equal(override([[1, 2]], 2, key=jax.random.key(1)).behavior_log_probs, 0)
     inactive = replace(source, generation_config={"do_sample": False, "typical_p": 0.1})
     assert inactive.text_generation().sampling.temperature == 0
+
+
+def test_neutral_source_controls_are_accepted_and_active_unsupported_controls_raise(task):
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
+    neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
+               "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None}
+    assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
+    for active in ({"stop_strings": ["END"]}, {"num_beams": 2}, {"num_beams": 2, "length_penalty": 0.8},
+                   {"do_sample": True, "penalty_alpha": 0.6, "top_k": 4}, {"a_future_control": 3},
+                   {"remove_invalid_values": True}, {"num_return_sequences": 4}, {"max_time": 5.0}):
+        with pytest.raises(ValueError, match="cannot honor"):
+            replace(source, generation_config=active).text_generation()
+
+
+def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config={"do_sample": False, "max_length": 5})
+    policy = source.text_generation()
+    full = policy([[1, 2]], seed=1).host()
+    assert full.tokens.shape == (1, 5) and full.lengths.tolist() == [3]
+    overridden = policy([[1, 2]], 1, seed=1).host()
+    np.testing.assert_array_equal(overridden.tokens, full.tokens[:, :3])
+    with pytest.raises(ValueError, match="prompt width"):
+        policy([[1, 2, 3, 4, 5, 6]], seed=1)
