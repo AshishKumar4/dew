@@ -505,11 +505,19 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 # trained model writes back into the source's own tensor names beside the
 # config, generation config and tokenizer it came with. A family outside
 # this set saves through the decoder writer, which derives a config
-# instead. The routed-family update/export tests live in test_decoder_export.py.
+# instead. The routed-family update/export tests live in test_decoder_export.py
+# and the masked-diffusion ones in test_masked_diffusion_export.py.
+#
+# LLaDA and Dream are here for what their config carries rather than for a
+# routed layout: LLaDA names its tensors OLMo-style, which only its own
+# family map spells, and both reserve a mask_token_id and the bidirectional
+# reading their masked-diffusion reference needs. Writing either through the
+# derived-config writer would drop those and rename LLaDA's tensors, so the
+# source layout is what puts a trained checkpoint back where it came from.
 _SOURCE_LAYOUT_FAMILIES = frozenset({
     "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
     "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-    "deepseek_v32", "llama4_text"})
+    "deepseek_v32", "llama4_text", "llada", "dream", "Dream"})
 
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
