@@ -167,7 +167,7 @@ Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 ```text
 generate(model, params, inputs, max_new_tokens, *, key=None, seed=None,
-         sampling=Sampling(), n=1) -> Generation
+         sampling=Sampling(), n=1, logits=(), stopping=(), strategy=None) -> Generation
 Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0)
 ```
 
@@ -177,11 +177,146 @@ The compiled decoder uses one padded input shape with per-row cache cursors and 
 
 `n` is the number of continuations drawn per prompt and must be a positive integer. The continuations of a prompt share its prefill and then run one after another on the device, with the prompts of each continuation batched as before: decode time grows with `n`, one continuation's cache working memory is reused by the next, and only the output storage grows with `n`. A prompt's key is its global row key: continuation zero draws with that key, so `n=1` and continuation zero of a larger request are the same draw, and continuation `j` folds `j` into it, so raising `n` leaves the continuations already drawn unchanged. Row padding on a mesh pads prompts before the continuations exist, so a prompt's `n` rows stay together on the process that asked for them and `host()` drops only padded prompts' rows.
 
-`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering.
+`Sampling.eos_id` accepts an integer or a tuple of ids; any of them terminates a row. The value normalizes the ids into an immutable tuple. Stochastic selection applies temperature, top-k, nucleus top-p, then relative min-p filtering. At least one token survives. `top_p=1` and `min_p=0` disable their filters. Zero temperature selects argmax without filtering. A `Sampling` value is a convenience over the components below: it compiles to those four transforms, in that order, plus an EOS criterion, and `generate` appends them after whatever `logits` and `stopping` hold.
 
 `Generation.tokens` includes the original prompt and has shape `(B * n, P + max_new_tokens)` with `B` the placed prompt rows, prompt zero's `n` continuations first and the prompts in request order. `lengths` counts response tokens including EOS. `terminated` marks EOS termination; false means the token budget. Slots after termination hold `Sampling.pad_id`. `behavior_log_probs` and `raw_log_probs` have shape `(B * n, max_new_tokens)`; the first describes the filtered distribution that drew each action and the second the unmodified policy. Each row carries its own length, termination and likelihoods. `rows` counts this process's real prompts times `n`; `host()` returns the record over host arrays of those rows; `text` decodes them through the processor a task bound, one string per row.
 
 `LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records these raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`. Reward text excludes EOS and padding. GRPO does not silently replace raw-policy ratios with behavior probabilities. The next-token objective refuses models declaring `causal=False`.
+
+### Decoding components
+
+Three things extend decoding, and nothing else does. Import them from `dew.sampling`, and the built-ins from `dew.sampling.decoding`.
+
+```text
+LogitsTransform: (StepState, logits[rows, vocab]) -> logits[rows, vocab]
+Stopping:        (StepState, drawn_tokens[rows]) -> finished[rows]
+Strategy:        (DecoderState, StepState, DecodeOps, transform, stopping, budget, n) -> Draws
+StepState(tokens, valid, step, active, keys, prompt_width)
+```
+
+`StepState` is the whole input of a transform or a criterion. `tokens` is the fixed-capacity buffer of the prompt followed by the draw slots, `[rows, prompt_width + max_new_tokens]`, and `valid` marks the slots holding a real token, so a row reads its own history whatever padding its prompt batch needed. `step` counts the tokens a row has committed, `active` marks the rows still generating, and `keys` holds one PRNG key per row. `state.history()` returns each row's real tokens left aligned with their count, `prompt_history()` and `generated()` the two regions, and `total()` the real token count. A transform never sees model parameters or cache internals.
+
+`logits` and `stopping` take a callable or a sequence of them. A call's tuple replaces the bound one whole, so a caller adds to a task's components by concatenation: `logits=task.logits + (mine,)`. The chain runs in the order given and the `sampling` tail runs after it. Criteria combine with OR and run after every committed token. A criterion that fires marks the row terminated, the token that fired it is emitted with its likelihoods, and later slots hold `pad_id` with zero likelihood. `strategy=None` runs `Sample`, which draws every row independently.
+
+Built-in transforms are pytrees, so a configuration holding arrays travels as data rather than entering a compilation cache key. A plain function works too, and `jax.tree_util.Partial(fn, array)` carries array configuration for one. Everything runs inside the compiled loop; there is no host callback.
+
+```python
+import jax, jax.numpy as jnp
+from dew.sampling import Sampling, generate
+from dew.sampling import decoding
+
+
+def favor_short(state, logits):
+    """Raise the end token's score once a row has drawn eight tokens."""
+    return logits.at[:, 2].add(jnp.where(state.step >= 8, 3.0, 0.0))
+
+
+result = generate(
+    model, variables, prompts, 32, seed=0,
+    sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
+    logits=(decoding.RepetitionPenalty(1.1),
+            decoding.NoRepeatNGram(3),
+            decoding.FrequencyPenalty(0.4),
+            favor_short),
+    stopping=(decoding.MaxNewTokens(24),))
+```
+
+The transforms port `transformers/generation/logits_process.py` from Transformers 5.16.1, with each row reading its own unpadded history instead of the batch's padded width.
+
+| Transform | Reference | Notes |
+| --- | --- | --- |
+| `Temperature(value)` | `TemperatureLogitsWarper` | |
+| `TopK(k)` | `TopKLogitsWarper` | |
+| `TopP(p)` | `TopPLogitsWarper` | keeps the best token |
+| `MinP(p)` | `MinPLogitsWarper` | |
+| `Typical(mass)` | `TypicalLogitsWarper` | |
+| `EpsilonCutoff(epsilon)` | `EpsilonLogitsWarper` | |
+| `EtaCutoff(epsilon)` | `EtaLogitsWarper` | |
+| `TopH(h, n=100)` | `TopHLogitsWarper` | `n` is the reference's fixed head |
+| `Greedy()` | greedy search | zero on the argmax, `-inf` elsewhere; what `temperature=0` compiles to |
+| `Renormalize()` | `LogitNormalization` | shifts every score by one constant, so no later filter and neither likelihood can see it |
+| `RemoveInvalidValues()` | `InfNanRemoveLogitsProcessor` | the only transform that repairs a broken distribution |
+| `RepetitionPenalty(penalty)` | `RepetitionPenaltyLogitsProcessor` | over the row's valid prompt and drawn tokens |
+| `PromptRepetitionPenalty(penalty)` | `EncoderRepetitionPenaltyLogitsProcessor` | the prompt is the encoder input; the reference inverts the argument |
+| `FrequencyPenalty(penalty)` | vLLM `model_executor/layers/utils.py` | subtracts the penalty times each generated token's count |
+| `PresencePenalty(penalty)` | vLLM `model_executor/layers/utils.py` | subtracts the penalty from every generated token |
+| `NoRepeatNGram(size)` | `NoRepeatNGramLogitsProcessor` | |
+| `PromptNoRepeatNGram(size)` | `EncoderNoRepeatNGramLogitsProcessor` | n-grams of the prompt |
+| `sequence_bias(entries)` | `SequenceBiasLogitsProcessor` | `(token ids, bias)` pairs compiled into one table |
+| `bad_words(ids, eos_id=None)` | `NoBadWordsLogitsProcessor` | a `-inf` table; single-token EOS sequences are dropped |
+| `SuppressTokens(tokens)` | `SuppressTokensLogitsProcessor` | |
+| `BeginSuppressTokens(tokens, after_forced_bos=False)` | `SuppressTokensAtBeginLogitsProcessor` | |
+| `ForcedBOS(token)` | `ForcedBOSTokenLogitsProcessor` | |
+| `ForcedEOS(token, max_length)` | `ForcedEOSTokenLogitsProcessor` | `max_length` counts prompt and generated tokens |
+| `MinLength(length, eos)` | `MinLengthLogitsProcessor` | suppresses EOS below a total length |
+| `MinNewTokens(count, eos)` | `MinNewTokensLengthLogitsProcessor` | suppresses EOS below a generated count |
+| `ExponentialDecayLengthPenalty(start, factor, eos)` | `ExponentialDecayLengthPenalty` | `start` counts generated tokens |
+
+| Criterion | Reference | Notes |
+| --- | --- | --- |
+| `EndOfSequence(eos)` | `EosTokenCriteria` | what `Sampling.eos_id` compiles to |
+| `MaxNewTokens(count)` | | a budget below `max_new_tokens` |
+| `MaxLength(length)` | `MaxLengthCriteria` | prompt and generated tokens together |
+| `stop_strings(processor, strings, vocab_size)` | `StopStringCriteria` | |
+
+`stop_strings` reads the tokenizer once, on the host, and compiles where every token can sit inside each stop string and how many of the string's trailing characters its start can cover. The criterion then runs entirely on device and never decodes. A string counts only when it touches the token just drawn, so a string produced earlier does not stop the row later, and a string spelled across several tokens or overhanging either end does stop it. `processor` is anything with the task `Processor`'s `decode(tokens) -> list[str]`. A token's text is read by decoding `probe` followed by that token and dropping what `probe` alone produces, because a tokenizer's decoder adds or removes a leading space depending on what came before.
+
+An active row whose chain leaves no finite score has no distribution to draw from, and `generate` raises rather than returning the first index. Add `RemoveInvalidValues()` to repair one deliberately.
+
+#### Source generation controls
+
+A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform or criterion carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
+
+| Control | Native mapping | Refused because |
+| --- | --- | --- |
+| `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `eos_token_id`, `pad_token_id` | `Sampling` | |
+| `max_length`, `max_new_tokens` | the task's token budget | |
+| `num_return_sequences` | the task's `n`, independent of any `sampling=` override | |
+| `bos_token_id`, `decoder_start_token_id` | prompt construction, outside decoding | |
+| `max_cache_len` | checked against the model's `max_seq_len` | a length above that capacity |
+| `repetition_penalty` | `RepetitionPenalty` | |
+| `encoder_repetition_penalty` | `PromptRepetitionPenalty` | |
+| `no_repeat_ngram_size` | `NoRepeatNGram` | |
+| `encoder_no_repeat_ngram_size` | `PromptNoRepeatNGram` | |
+| `sequence_bias` | `sequence_bias` | |
+| `bad_words_ids` | `bad_words` | |
+| `min_length`, `min_new_tokens` | `MinLength`, `MinNewTokens` | |
+| `forced_bos_token_id` | `ForcedBOS` | |
+| `forced_eos_token_id` | `ForcedEOS` | without the source's `max_length`, the position to force at is a per-call value |
+| `suppress_tokens`, `begin_suppress_tokens` | `SuppressTokens`, `BeginSuppressTokens` | |
+| `exponential_decay_length_penalty` | `ExponentialDecayLengthPenalty` | |
+| `remove_invalid_values` | `RemoveInvalidValues` | |
+| `renormalize_logits` | `Renormalize` | |
+| `typical_p`, `epsilon_cutoff`, `eta_cutoff`, `top_h` | `Typical`, `EpsilonCutoff`, `EtaCutoff`, `TopH` | together with an active `temperature`, `top_k`, `top_p` or `min_p` they would filter in a different order than the reference, because the policy tail runs after the source's transforms |
+| `stop_strings` | `stop_strings` | without the source's processor or the model's `vocab_size` there is no vocabulary to compile |
+| `use_cache` | native decoding always runs through its own cache | `use_cache=False` |
+| `cache_implementation` | the fixed-capacity static cache | any other implementation |
+| `cache_config` | | quantized and offloaded caches are not implemented |
+| `prefill_chunk_size` | | the native prefill evaluates a prompt in one call |
+| `continuous_batching_config` | | continuous batching is not implemented |
+| `compile_config`, `disable_compile` | | the native decoder owns its compilation and always runs compiled |
+| `low_memory` | | sequential beam evaluation is not implemented |
+| `output_attentions`, `output_hidden_states`, `output_scores`, `output_logits` | | generation returns tokens, lengths, termination and both likelihood arrays, and none of these |
+| `return_dict_in_generate` | generation always returns a record | |
+| `transformers_version`, `_from_model_config`, `_commit_hash`, `tokenizer_name` | provenance | |
+| `num_beams`, `early_stopping`, `length_penalty` | | beam search is not implemented |
+| `do_sample` with `num_beams` | | a selected beam's marginal probability is not the per-step candidate probability, so no honest behaviour likelihood exists |
+| `num_beam_groups`, `diversity_penalty` | | diverse group beam search is not implemented |
+| `constraints`, `force_words_ids` | | constrained beam search is not implemented |
+| `max_time` | | a host clock cannot stop a coordinated device loop |
+| `token_healing` | | retokenizing the prompt is prompt construction, not decoding |
+| `guidance_scale` | | classifier-free guidance evaluates the model a second time per step |
+| `penalty_alpha` | | contrastive search is a decoding strategy that is not implemented |
+| `dola_layers` | | DoLa is a decoding strategy that is not implemented |
+| `watermarking_config` | | no watermarking transform is implemented |
+| `use_mtp`, `speculation_type`, `num_assistant_tokens` | | a decoding strategy is the caller's choice, not the checkpoint's |
+| `assistant_ensemble_weight` below one | | ensemble verification below one accepts a biased distribution |
+| `num_assistant_tokens_schedule`, `assistant_confidence_threshold` | | an adaptive or confidence-gated proposal cannot fix the device block size |
+| `assistant_early_exit` | | early-exit proposal is not implemented |
+| `assistant_lookbehind`, `target_lookbehind` | | translating between two tokenizers' token spaces is not implemented |
+| `prompt_lookup_num_tokens`, `max_matching_ngram_size` | | prompt lookup proposal is not implemented |
+| `is_assistant` | | a source loads as a target model, not as another model's assistant |
+| any other name | | the native decoder does not know the control, so it refuses instead of ignoring it |
 
 ### Inference tasks
 
@@ -193,9 +328,9 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, ema=True, step=None, rev
 Objective.pipeline(state, *, ema=True) -> the objective's task over state.averaged or state.params
 LMObjective.pipeline(state, *, ema=True, processor=None) -> TextGeneration
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
-               max_length=None, n=1)
+               max_length=None, n=1, logits=(), stopping=(), strategy=None)
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
-     images=None) -> Generation
+     images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
 BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
                 max_new_tokens=None, max_length=None, n=1)
@@ -226,7 +361,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
 
-Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings, and take their continuation count from `num_return_sequences`, whatever `sampling=` the caller passes. Active unsupported controls such as repetition penalties or beam search raise when creating the default task. Loading weights for training or export does not select a sampling policy. Pass `source.text_generation(sampling=Sampling(...))` for an explicit policy.
+Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's transforms and criteria as `logits` and `stopping`, and take their continuation count from `num_return_sequences`. An explicit `sampling=` replaces the policy value alone, because the components are separate; pass `logits=()` and `stopping=()` on a call to drop them, and `n` stays what the source asked for either way. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
 
 `BlockGeneration` uses `BlockProcess.generate`; its `CanvasGeneration` carries lengths, termination and decoder-step counts, without autoregressive likelihoods, plus the same `rows`, `host()`, `text` and continuation rows. Its continuations refine the shared encoded prompt independently, each over the original prompt rows, so the batch-wide canvas draw a row sees is the one a single continuation sees. `TextToImage` carries the objective's or source's `steps`, `guidance` and `sampler` defaults; `prepare` encodes prompts and draws their noise once, placed for the task's mesh, and `Images.images` is `[rows, H, W, C]` in [-1, 1] with `host()` reading a process's rows back. `grid(steps)` answers the process and the explicit time grid a trajectory of that length walks, for a source whose sampler pairs its own sigma and model-time tables; the noise prior follows that process, so `prepare` takes the same `steps`. `final_denoise=False` ends a trajectory at the last grid point without the closing clean prediction. `sample(denoise, x_T, steps=None, *, solver, guidance=None, key, times=None, final_denoise=True)` in `dew.sampling` takes the same two controls; exactly one of `steps` and `times` is passed, and an explicit grid decides the trajectory's length. `finish(params, images)` runs on the decoded images under the same placement, for a source that ships a checker or an output transform. Rebinding preserves the compilation identity of every task.
 
