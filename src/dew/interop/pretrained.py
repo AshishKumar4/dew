@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -434,13 +435,20 @@ class Processor:
 
 @dataclass(frozen=True)
 class WeightLayout:
-    """An existing source tensor's location and reversible storage layout."""
+    """An existing source tensor's location and reversible storage layout.
+
+    `expert_index` is the expert a per-expert source tensor holds. The
+    loader stacks those tensors onto an expert dimension
+    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
+    expert of a layer and the index says which slice this tensor is.
+    """
 
     name: str
     paths: tuple[tuple[str, ...], ...]
     shape: tuple[int, ...]
     transpose: tuple[int, ...] | None = None
     concatenate: int | None = None
+    expert_index: int | None = None
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
@@ -454,11 +462,54 @@ class WeightLayout:
                 if not isinstance(node, Mapping):
                     raise ValueError(f"parameter path {path} does not traverse a mapping")
                 node = node[part]
+            if self.expert_index is not None:
+                # Slice the expert where the leaf lives. One stacked leaf
+                # answers for E source tensors, so copying it to the host
+                # per tensor would move the whole stack E times.
+                if not isinstance(node, (np.ndarray, jax.Array)):
+                    raise ValueError(
+                        f"{self.name} takes an expert of {path}, which holds "
+                        f"{type(node).__name__} rather than an array")
+                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
+                    raise ValueError(
+                        f"{self.name} is expert {self.expert_index} of {path}, which "
+                        f"holds {node.shape}")
+                node = node[self.expert_index]
             leaves.append(np.asarray(node))
         value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
         if self.transpose is not None:
             value = value.transpose(self.transpose)
+        if value.size != math.prod(self.shape):
+            raise ValueError(
+                f"{self.name} assembles {value.shape} from {self.paths}, which does not "
+                f"fill the source's {self.shape}")
         return np.ascontiguousarray(value).reshape(self.shape)
+
+
+def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
+    """A per-expert leaf path as the stacked leaf the loaded tree holds.
+
+    A checkpoint that names one tensor per expert maps through the family
+    to `experts/K/projection/kernel`, a path `hf_decoders._stack_experts`
+    consumed on the way in: the tree keeps one `experts/projection/kernel`
+    stacked in expert order, so that leaf and K are where the tensor's
+    values live.
+    """
+    if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
+            and path[-1] == "kernel"):
+        return (*path[:-3], path[-2], path[-1]), int(path[-3])
+    return path, None
+
+
+# The decoder families whose checkpoint the leaf map runs backwards, so a
+# trained model writes back into the source's own tensor names beside the
+# config, generation config and tokenizer it came with. A family outside
+# this set saves through the decoder writer, which derives a config
+# instead. The routed-family update/export tests live in test_decoder_export.py.
+_SOURCE_LAYOUT_FAMILIES = frozenset({
+    "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
+    "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
+    "deepseek_v32", "llama4_text"})
 
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
@@ -471,6 +522,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
 
     transpose = None
     concatenate = None
+    expert_index = None
     if text_name == "lm_head.weight" and config["tie_embeddings"]:
         paths = (nested(("params", "embed_tokens", "embedding")),)
     elif text_name.endswith(".experts.gate_up_proj"):
@@ -489,12 +541,13 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         path = family.weight_path(text_name, config)
         if path is None:
             return None
+        path, expert_index = _stacked_expert(path)
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
             transpose = (1, 0)
         elif text_name.endswith(".experts.down_proj") and model_type in ("gemma4_text", "qwen3_5_moe_text"):
             transpose = (0, 2, 1)
-    return WeightLayout(name, paths, tensor.shape, transpose, concatenate)
+    return WeightLayout(name, paths, tensor.shape, transpose, concatenate, expert_index)
 
 
 
@@ -640,6 +693,19 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
+            # The layouts write the source's own tensors back beside the
+            # config it came with. A quantized source arrives dequantized
+            # (dew.interop.quantized), so its weights no longer hold the
+            # format that config declares and no writer here produces the
+            # blocks and scales again; the export is refused rather than
+            # written as a checkpoint whose config lies about its bytes.
+            quantization = self.config.get("quantization_config")
+            if quantization is not None:
+                method = quantization.get("quant_method") if isinstance(quantization, Mapping) else quantization
+                raise ValueError(
+                    f"this source's config declares quantization_config {method!r} and the "
+                    "loader dequantized its weights, so the trained weights cannot be written "
+                    "back under that config")
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             tensors = {**self.retained_tensors,
@@ -1009,7 +1075,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text"):
+        if family in _SOURCE_LAYOUT_FAMILIES:
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
