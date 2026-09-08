@@ -1,0 +1,66 @@
+{
+  "maxtext": "0.2.4",
+  "commit": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
+  "source": {
+    "compute_loss": "src/maxtext/trainers/post_train/distillation/distillation_utils.py:462-566",
+    "mask_from_labels": "distillation_utils.py:492-494 with create_labels :635-642",
+    "student_log_softmax_at_T": "distillation_utils.py:499",
+    "teacher_softmax_at_T": "distillation_utils.py:526",
+    "kl_teacher_to_student": "distillation_utils.py:529 (optax.kl_divergence(log_s_T, t_p_T))",
+    "temperature_squared": "distillation_utils.py:537-538",
+    "hard_loss": "distillation_utils.py:541-543",
+    "mix": "distillation_utils.py:547",
+    "feature_cast_fp32": "distillation_utils.py:559-560",
+    "feature_cosine": "distillation_utils.py:418-427",
+    "feature_l2": "distillation_utils.py:430-436",
+    "feature_layers": "distillation_utils.py:552-557",
+    "total": "distillation_utils.py:562-566",
+    "teacher_loss": "distillation_utils.py:532, :545, :582",
+    "compute_schedule": "distillation_utils.py:165-194",
+    "knobs": "src/maxtext/configs/base.yml:1386-1401, configs/types.py:1626-1654",
+    "teacher_frozen": "train_distill.py:705 (eval), :309 (stop_gradient)",
+    "vocab_check": "train_distill.py:678-682",
+    "z_loss": "src/maxtext/utils/max_utils.py:649-656",
+    "z_loss_mask_and_mean": "src/maxtext/trainers/pre_train/train.py:227-234, :337-340",
+    "z_loss_knob": "src/maxtext/configs/base.yml:404, configs/types.py:585"
+  },
+  "student": {
+    "vocab_size": 37,
+    "emb_features": 16,
+    "num_layers": 2,
+    "num_heads": 2,
+    "mlp_features": 32,
+    "max_seq_len": 16
+  },
+  "teacher": {
+    "vocab_size": 37,
+    "emb_features": 24,
+    "num_layers": 3,
+    "num_heads": 2,
+    "mlp_features": 48,
+    "max_seq_len": 16
+  },
+  "pairs": [
+    [
+      0,
+      0
+    ],
+    [
+      2,
+      1
+    ]
+  ],
+  "alpha": 0.6,
+  "temperature": 2.0,
+  "beta": 0.7,
+  "schedule": {
+    "start": 0.6,
+    "end": 0.1,
+    "max_steps": 100
+  },
+  "batch": 2,
+  "seq_len": 8,
+  "vocab": 37,
+  "pad_id": 0,
+  "seed": 11
+}
