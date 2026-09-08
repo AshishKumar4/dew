@@ -356,3 +356,25 @@ def test_published_pipeline_walk_matches_the_source(source, pipeline_record, cas
     assert relative_gap(walked.latents, arrays[f"{case}.latents"]) < 2e-5
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     assert relative_gap(images, arrays[f"{case}.images"]) < 2e-5
+
+
+@pytest.mark.parametrize("case", PIPELINE_CASES)
+def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_record, case):
+    """A call that names no policy walks what the source's own call walks.
+
+    The published pipeline class carries the step count and the guidance scale
+    its `__call__` applies, so a native task built from a checkpoint that
+    declares that class takes them: not the fifty steps and 7.5 of the older
+    UNet pipelines, and not anything a test passes in.
+    """
+    from dew.interop.pretrained import load_pretrained
+
+    arrays = np.load(source / "sd3_pipeline.npz")
+    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    task = loaded.text_to_image()
+    assert task.steps == pipeline_record["default_steps"]
+    assert task.guidance.scale == pipeline_record["default_guidance"]
+    prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
+                            initial=arrays[f"{case}.x_T"], seed=0)
+    walked = task(prepared, key=jax.random.PRNGKey(0)).host()
+    assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
