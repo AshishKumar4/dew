@@ -676,13 +676,14 @@ class Pretrained:
             raise TypeError("a DiffusionGemma source generates through block_generation")
         rows = _return_sequences(self.config, self.generation_config)
         policy, logits, stopping, strategy = _source_decoding(
-            self.config, self.generation_config, self.model, self.processor, rows)
-        return TextGeneration(self.model, self.variables, self.processor,
-                              policy if sampling is None else sampling,
+            self.config, self.generation_config, self.model, self.processor, rows,
+            sampling is not None)
+        chosen = sampling if sampling is not None else policy
+        assert chosen is not None
+        return TextGeneration(self.model, self.variables, self.processor, chosen,
                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
                               max_length=_generation_limit(self.config, self.generation_config, "max_length"),
-                              n=rows, logits=None if sampling is not None else logits,
-                              stopping=stopping, strategy=strategy)
+                              n=rows, logits=logits, stopping=stopping, strategy=strategy)
 
     def block_generation(self) -> BlockGeneration:
         """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
@@ -866,7 +867,7 @@ _REFUSED_CONTROLS: dict[str, str] = {
     "max_matching_ngram_size": "prompt lookup proposal is not implemented",
     "assistant_early_exit": "early-exit proposal is not implemented",
     "assistant_ensemble_weight": "ensemble verification below one accepts a biased distribution",
-    "num_assistant_tokens_schedule": "an adaptive proposal length cannot fix the device block size",
+    "num_assistant_tokens_schedule": "only a constant proposal length fits a fixed device block",
     "assistant_lookbehind": "translating between two tokenizers' token spaces is not implemented",
     "target_lookbehind": "translating between two tokenizers' token spaces is not implemented",
     "is_assistant": "a source loads as a target model, not as another model's assistant",
@@ -900,7 +901,7 @@ _NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
     "output_attentions": (False,), "output_hidden_states": (False,),
     "output_scores": (False,), "output_logits": (False,),
     "use_mtp": (False,), "speculation_type": (), "is_assistant": (False,),
-    "num_assistant_tokens": (), "num_assistant_tokens_schedule": (),
+    "num_assistant_tokens": (), "num_assistant_tokens_schedule": ("constant",),
     "assistant_confidence_threshold": (), "assistant_early_exit": (),
     "assistant_lookbehind": (), "assistant_ensemble_weight": (1.0,), "target_lookbehind": (),
     "prompt_lookup_num_tokens": (), "max_matching_ngram_size": (),
@@ -911,6 +912,9 @@ _BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
 }
 _SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff",
                                     "eta_cutoff", "top_h"})
+_SHAPING_REFUSALS = frozenset({"watermarking_config", "guidance_scale"})
+"""Refusals that only concern the token distribution, which an explicit policy
+replaces along with the chain."""
 
 
 def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
@@ -929,19 +933,28 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
 
 
 def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],
-           model: nn.Module, do_sample: bool, beams: object) -> None:
+           model: nn.Module, do_sample: bool, beams: object, overridden: bool) -> None:
     """Refuse every active control the native decoder does not implement.
 
     A control is judged individually. Sampling-only and beam-only controls are
     judged only when sampling or beam search is active, as `generate()` judges
-    them, and an unknown name is refused rather than ignored.
+    them, and an unknown name is refused rather than ignored, because nothing
+    says who would own it.
+
+    `overridden` means the caller replaced the basic policy and the chain, so
+    the controls that would have built them are neither judged nor built. The
+    task still owns the criteria, the strategy and the row count, so those are
+    judged as always.
     """
     known = (_POLICY_CONTROLS | _TASK_CONTROLS | _METADATA_CONTROLS | _TRANSFORM_CONTROLS
              | _CRITERION_CONTROLS | _STRATEGY_CONTROLS | set(_REFUSED_CONTROLS)
              | set(_NEUTRAL_CONTROLS) | set(_BEAM_ONLY_CONTROLS))
+    replaced = _POLICY_CONTROLS | _TRANSFORM_CONTROLS | _SHAPING_REFUSALS
     refused: list[str] = []
     for name in sorted(known | set(generation_config)):
         if name in _POLICY_CONTROLS or name in _METADATA_CONTROLS:
+            continue
+        if overridden and name in replaced:
             continue
         if name in _BEAM_ONLY_CONTROLS and _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
             continue
@@ -963,9 +976,11 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
         refused.append("do_sample with num_beams (a selected beam's marginal probability is not "
                        "the per-step candidate probability, so no honest behaviour likelihood exists)")
     if refused:
-        raise ValueError("native decoding cannot honor active source controls "
-                         f"{refused}; pass explicit sampling=, logits= and stopping= components "
-                         "to text_generation")
+        raise ValueError(
+            f"native decoding cannot honor active source controls {refused}; "
+            "text_generation(sampling=Sampling(...)) replaces the basic policy and the "
+            "transform chain, and TextGeneration(model, variables, processor, logits=..., "
+            "stopping=..., strategy=...) builds the task from components outright")
 
 
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -1210,21 +1225,28 @@ def _mtp_mode(value: object) -> bool:
 
 
 def _source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None, rows: int
-                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...],
+                     model: nn.Module, processor: Processor | None, rows: int, overridden: bool
+                     ) -> tuple[Sampling | None, tuple[decoding.LogitsTransform, ...] | None,
                                 tuple[decoding.Stopping, ...], Strategy | None]:
-    """The policy, chain, criteria and strategy a loaded source decodes with."""
+    """The policy, chain, criteria and strategy a loaded source decodes with.
+
+    An explicit policy replaces the first two, so they are not built and the
+    controls behind them are not judged: a watermark the caller just replaced
+    cannot block the call.
+    """
     do_sample = _generation_value(config, generation_config, "do_sample", False) is True
     _audit(config, generation_config, model, do_sample,
-           _generation_value(config, generation_config, "num_beams"))
-    sampling = _source_sampling(config, generation_config)
+           _generation_value(config, generation_config, "num_beams"), overridden)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)
+    criteria = _source_stopping(config, generation_config, processor,
+                                getattr(model, "vocab_size", None))
+    if overridden:
+        return None, None, criteria, strategy
+    sampling = _source_sampling(config, generation_config)
     return (sampling,
             _source_transforms(config, generation_config, sampling, do_sample,
                                isinstance(strategy, Beam)),
-            _source_stopping(config, generation_config, processor,
-                             getattr(model, "vocab_size", None)),
-            strategy)
+            criteria, strategy)
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,

@@ -464,3 +464,90 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
                                  jnp.ones((1, 1), bool), jnp.full((1, 1), width - 1, jnp.int32), 0)
     largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
+
+
+def test_multi_axis_rotary_coordinates_reach_the_depths():
+    """A processor that emits three rotary axes per token gives the depths
+    coordinates, not a count of tokens: the prompt seed carries the axes it
+    was given and a drawn token continues from the coordinate the model's
+    cache reached, which is where the reference puts it."""
+    from dew.nn.inputs import ModelInputs
+    from dew.nn.mixers.attention import AttentionMixer
+    from dew.sampling.text import _operations, _prefill
+
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=16, dtype="float32", num_nextn_predict_layers=1,
+        partial_rotary_type="default", mixer=AttentionMixer(mrope_section=(1, 1, 1)))
+    tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    rotary = jnp.asarray([[[0, 0, 0], [1, 4, 1], [1, 4, 2], [5, 5, 5]]], jnp.int32)
+    params = model.init(jax.random.key(0), tokens, rotary_positions=rotary)
+
+    states = model.apply(params, tokens, rotary_positions=rotary, method=model.hidden_states)
+    reference = model.apply(params, states, tokens, rotary_positions=rotary,
+                            method=model.mtp_hidden_states)[0]
+
+    ops = _operations(model, params, 0, 1)
+    seeded, _ = _prefill(model, params,
+                         ModelInputs(tokens[:, :-1], {"rotary_positions": rotary[:, :-1]}), ops)
+    _, _, produced = ops.propose(seeded, states[:, -2:-1], tokens[:, -1:], None,
+                                 jnp.ones((1, 1), bool), jnp.full((1, 1), 5, jnp.int32), 0)
+    largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"
+    # The continuation coordinate is the model's own, not the token count.
+    assert int(np.asarray(seeded.coordinate)[0]) == 5
+
+
+def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():
+    """A left-padded prompt's third real token sits at coordinate two, not at
+    the physical slot the padding pushed it to. Seeding from slots would put
+    the whole prediction history one place along."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor()
+    padded = jnp.asarray([[0, 1, 2, 3]], jnp.int32)
+    mask = jnp.asarray([[False, True, True, True]])
+    plain = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = model.init(jax.random.key(0), plain)
+
+    grown = jnp.concatenate([plain, jnp.asarray([[4]], jnp.int32)], axis=1)
+    states = model.apply(params, grown, method=model.hidden_states)
+    reference = model.apply(params, states[:, :-1], grown[:, 1:], depth=0,
+                            positions=jnp.asarray([[1, 2, 3]], jnp.int32),
+                            method=model.mtp_step)[0]
+
+    ops = _operations(model, params, 0, 1)
+    seeded, _ = _prefill(model, params, ModelInputs(padded, {"attention_mask": mask}), ops)
+    _, cached, _ = ops.propose(seeded, states[:, 2:3], grown[:, 3:4], None,
+                               jnp.ones((1, 1), bool), jnp.asarray([[3]], jnp.int32), 0)
+    largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"
+
+
+def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
+    """A depth's first entry needs that many tokens behind it. A one-token
+    prompt gives the second depth no predecessor at all, so inventing one from
+    the target's state writes an entry the training pass never has."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor(num_nextn_predict_layers=2)
+    cold = jnp.asarray([[1]], jnp.int32)
+    emitted = jnp.asarray([[2, 3]], jnp.int32)
+    whole = jnp.concatenate([cold, emitted], axis=1)
+    params = model.init(jax.random.key(0), whole)
+    states = model.apply(params, whole, method=model.hidden_states)
+    trained = model.apply(params, states, whole, method=model.mtp_hidden_states)
+
+    ops = _operations(model, params, 0, 2)
+    state, _ = _prefill(model, params, ModelInputs(cold), ops)
+    _, produced, _ = reseed(ops, state, (state.hidden,) + tuple(state.drafts[1:]),
+                            states[:, 1:], model.apply(params, emitted,
+                                                       method=model.token_embeddings),
+                            jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
+                            jnp.ones(1, jnp.int32))
+    # Depth two's only entry is at coordinate two, and it is the trained one.
+    largest = float(np.max(np.abs(np.asarray(produced[1])[:, 1] - np.asarray(trained[1])[:, -1])))
+    assert largest < 3e-5, f"largest difference {largest:g}"

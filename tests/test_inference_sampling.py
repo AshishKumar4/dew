@@ -327,3 +327,37 @@ def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
     assert moved, "the control changed nothing, so the position it fires at is untested"
     # Without an explicit budget the source's own max_new_tokens decides.
     assert policy([[1, 2]], seed=0).host().tokens.shape == (1, 5)
+
+
+def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
+    """The override replaces the basic policy and the chain, so a control that
+    only shapes the distribution is neither built nor judged: a watermark the
+    caller just replaced cannot block the call. Everything the task keeps is
+    still judged, and an unknown name still refuses because nothing says who
+    would own it."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    blocked = {"watermarking_config": {"greenlist_ratio": 0.5}, "guidance_scale": 2.0,
+               "temperature": "warm", "num_return_sequences": 2}
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config=blocked)
+    with pytest.raises(ValueError):
+        source.text_generation()
+    overridden = source.text_generation(sampling=Sampling(temperature=0))
+    assert overridden.logits is None and overridden.sampling.temperature == 0 and overridden.n == 2
+    np.testing.assert_array_equal(overridden([[1, 2]], 2, key=jax.random.key(0), n=1
+                                             ).behavior_log_probs, 0)
+    # A control the task still owns keeps refusing under the same override.
+    for active, reason in (({"max_time": 5.0}, "host clock"),
+                           ({"output_scores": True}, "per-step distributions"),
+                           ({"a_future_control": 3}, "does not know this control")):
+        with pytest.raises(ValueError, match=reason):
+            replace(source, generation_config={**blocked, **active}).text_generation(
+                sampling=Sampling(temperature=0))
+    # A constant proposal length is the fixed block size, so it is not adaptive.
+    steady = replace(source, generation_config={"num_assistant_tokens_schedule": "constant"})
+    assert steady.text_generation().strategy is None
+    with pytest.raises(ValueError, match="constant proposal length"):
+        replace(source, generation_config={"num_assistant_tokens_schedule": "heuristic"}
+                ).text_generation()

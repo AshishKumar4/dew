@@ -30,7 +30,7 @@ from dew.sampling.decoding import (
     EndOfSequence, Greedy, LogitsTransform, MinP, StepState, Stopping, Temperature, TopK, TopP,
 )
 from dew.sampling import strategies
-from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+from dew.sampling.strategies import Beam, DecodeOps, DecoderState, Draws, Sample, Strategy
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -173,11 +173,20 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     last = (jnp.full((batch,), width - 1, jnp.int32) if valid is None else
             jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
     supplied = inputs.token_fields.get("positions")
+    rotary = inputs.token_fields.get("rotary_positions")
     positions = None if supplied is None else supplied[jnp.arange(batch),
                                                        jnp.maximum(last, 0)] + 1
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
+    logical = rotary if rotary is not None else supplied
+    # The model's own next coordinate, as its cache records it: the largest
+    # coordinate a real token holds on any axis, one on. A drawn token
+    # continues from there on every axis.
+    real = jnp.ones((batch, width), bool) if valid is None else valid.astype(bool)
+    coordinate = None if logical is None else jnp.max(
+        jnp.where(jnp.reshape(real, real.shape + (1,) * (logical.ndim - 2)), logical, -1),
+        axis=tuple(range(1, logical.ndim))) + 1
     state = DecoderState(updated["cache"], logits[rows, slot], positions,
-                         None if states is None else states[rows, slot])
+                         None if states is None else states[rows, slot], coordinate=coordinate)
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths and states is not None:
         # Every depth needs a predecessor slot in the carry from the start,
@@ -187,15 +196,20 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         real = jnp.ones(inputs.tokens.shape, bool) if valid is None else valid.astype(bool)
         order = jnp.argsort(~real, axis=1, stable=True)[..., None]
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        coordinates = (jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
-                       if supplied is None else supplied.astype(jnp.int32))
+        # Without supplied coordinates a token's position is its rank among
+        # the row's real tokens, which is what the cache assigns; the physical
+        # slot a padded prompt put it in is not a coordinate.
+        coordinates = (jnp.take_along_axis(logical.astype(jnp.int32), order, axis=1)
+                       if logical is not None and logical.ndim == 3 else
+                       jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
+                       if logical is None
+                       else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
         compact = jnp.take_along_axis(states, order, axis=1)
         state, _, carried = strategies.reseed(
             ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
             jnp.take_along_axis(prepared[0], order, axis=1)[:, 1:],
             jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
-            jnp.take_along_axis(coordinates[..., None], order, axis=1)[:, 1:, 0],
-            jnp.maximum(lengths - 2, 0))
+            coordinates[:, 1:], jnp.maximum(lengths - 2, 0))
         state = dataclasses.replace(state, drafts=carried)
     return state, last >= 0
 
@@ -239,12 +253,12 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
         return run(state, token[:, None], active[:, None])[0]
 
     def reindex(state: DecoderState, rows: jax.Array) -> DecoderState:
-        return dataclasses.replace(state, cache=gather_cache_rows(state.cache, rows),
-                                   logits=jnp.take(state.logits, rows, axis=0),
-                                   positions=None if state.positions is None
-                                   else jnp.take(state.positions, rows, axis=0),
-                                   hidden=None if state.hidden is None
-                                   else jnp.take(state.hidden, rows, axis=0))
+        # The whole carry moves, the prediction states with it; a leaf left
+        # behind would hand a reparented row another row's history.
+        return dataclasses.replace(
+            jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0),
+                         dataclasses.replace(state, cache={})),
+            cache=gather_cache_rows(state.cache, rows))
 
     if not depths or not exposed:
         return DecodeOps(advance, reindex, run)
@@ -253,10 +267,14 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
         ids = jnp.zeros(valid.shape, jnp.int32) if tokens is None else jnp.where(valid, tokens, pad_id)
+        # Multi-axis rotary metadata is not a scalar position, and a depth
+        # takes it under its own name.
+        placed = ({"rotary_positions": positions} if positions.ndim == 3
+                  else {"positions": positions})
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
-            positions=positions, input_embeddings=embeds, decode=True, mutable=["cache"],
-            rngs=None, method="mtp_step", capture_intermediates=False)
+            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
+            method="mtp_step", capture_intermediates=False, **placed)
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:
@@ -352,6 +370,11 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     EOS criterion rather than replacing it, so naming a criterion cannot drop
     termination by accident. No strategy means `Sample`.
     """
+    if isinstance(strategy, Beam) and logits is None and sampling.temperature == 0:
+        raise ValueError(
+            "a zero-temperature policy compiles to a point mass on the argmax, which would "
+            "give a search nothing to rank; pass the chain the search should score with, as "
+            "logits=(...), or a policy that keeps the distribution")
     return (sampling.transforms() if logits is None else decoding.components(logits, "logits"),
             (() if stopping is None else decoding.components(stopping, "stopping"))
             + sampling.criteria(),
