@@ -758,8 +758,10 @@ def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
 
 def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     """The rotary positions of an unpacked row are its row indices, so a batch
-    that spells them out has to score exactly as a batch that omits them,
-    gradients included. Both sides run the same kernel with the same flags."""
+    that spells them out has to score exactly as a batch that omits them. Both
+    sides run the same kernel with the same flags; the gradient graphs differ
+    by one gather, so XLA may fuse their reductions differently and the
+    gradients are compared at the file's fp32 bound rather than bitwise."""
     model = tiny(attention_impl='xla')
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -772,7 +774,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
                            model.apply(params, ids, rotary_positions=rotary))
     plain, spelled = scored(), scored(rotary_positions=rotary)
     for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled)):
-        assert jnp.array_equal(left, right)
+        assert jnp.max(jnp.abs(left - right)) < 1e-4 * max(1.0, float(jnp.max(jnp.abs(left))))
 
 
 def test_a_padded_slot_reaches_no_query(rng):
