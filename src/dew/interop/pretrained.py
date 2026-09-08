@@ -16,9 +16,10 @@ from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
-from dew.interop.quantized import dequantize_checkpoint, fp8_block
+from dew.interop.quantized import dequantize_checkpoint, fp8_block, pack_fp8, scaled_names
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.gpt_oss import mxfp4_stems, pack_mxfp4, unpack_mxfp4
 from dew.sampling.text import Sampling
 from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -514,7 +515,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     expert_index = None
     if text_name == "lm_head.weight" and config["tie_embeddings"]:
         paths = (nested(("params", "embed_tokens", "embedding")),)
-    elif text_name.endswith(".experts.gate_up_proj"):
+    elif text_name.endswith(".experts.gate_up_proj") and model_type != "gpt_oss":
         names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
         paths_list = []
         for key in names:
@@ -635,6 +636,7 @@ class Pretrained:
     autoencoder: AutoEncoder | None = None
     schedule: SourceSchedule | None = None
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
+    quantized_tensors: tuple[str, ...] = field(default=(), kw_only=True)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Use the source policy, or an explicit supported policy supplied by the caller."""
@@ -673,6 +675,9 @@ class Pretrained:
         """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
+        quantization = self.config.get("quantization_config")
+        if quantization is not None and (not isinstance(quantization, Mapping) or not self.quantized_tensors):
+            raise ValueError("quantization_config export requires recorded source tensor pairs")
         destination = Path(directory)
         generation_config = dict(self.generation_config)
         if self.schedule is not None:
@@ -682,19 +687,7 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
-            # The layouts write the source's own tensors back beside the
-            # config it came with. A quantized source arrives dequantized
-            # (dew.interop.quantized), so its weights no longer hold the
-            # format that config declares and no writer here produces the
-            # blocks and scales again; the export is refused rather than
-            # written as a checkpoint whose config lies about its bytes.
-            quantization = self.config.get("quantization_config")
-            if quantization is not None:
-                method = quantization.get("quant_method") if isinstance(quantization, Mapping) else quantization
-                raise ValueError(
-                    f"this source's config declares quantization_config {method!r} and the "
-                    "loader dequantized its weights, so the trained weights cannot be written "
-                    "back under that config")
+            # Preserve source names and geometry before restoring any packed format.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             tensors = {**self.retained_tensors,
@@ -711,6 +704,14 @@ class Pretrained:
             return
         else:
             raise ValueError("this source has no reversible weight layout")
+        if quantization is not None:
+            method = quantization.get("quant_method")
+            if method == "fp8":
+                tensors = pack_fp8(tensors, self.quantized_tensors, self.config)
+            elif method == "mxfp4":
+                tensors = pack_mxfp4(tensors, self.quantized_tensors)
+            else:
+                raise ValueError(f"unsupported source quantization method {method!r}")
         save_hf_layout(tensors, dict(self.config), destination)
         decoders.save_export_assets(destination, tokenizer=self.processor,
                                     generation_config=generation_config)
@@ -997,8 +998,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             return _load_diffusion_source(directory, json.load(handle), dtype=dtype, attention_impl=attention_impl)
     with open(directory / "config.json") as handle:
         config = json.load(handle)
-    tensors = dequantize_checkpoint(decoders._load_shards(directory), fp8_block(config))
+    tensors = decoders._load_shards(directory)
     family = config.get("model_type")
+    quantization = config.get("quantization_config")
+    method = quantization.get("quant_method") if isinstance(quantization, Mapping) else None
+    quantized_tensors = scaled_names(tensors) if method == "fp8" else (
+        mxfp4_stems(tensors) if method == "mxfp4" else ())
+    tensors = dequantize_checkpoint(tensors, fp8_block(config))
+    if method == "mxfp4":
+        tensors = unpack_mxfp4(tensors)
     layouts: tuple[WeightLayout, ...] = ()
     retained: dict[str, np.ndarray] = {}
     export_adapter = None
@@ -1064,7 +1072,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if decoders._FAMILIES[family].preserve_source_layout:
+        if decoders._FAMILIES[family].preserve_source_layout or quantized_tensors:
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
@@ -1095,4 +1103,4 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         error = failure
     agree_process_phase(error, phase="pretrained generation policy")
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
-                      layouts, retained, export_adapter)
+                      layouts, retained, export_adapter, quantized_tensors=quantized_tensors)

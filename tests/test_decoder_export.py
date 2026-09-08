@@ -280,8 +280,8 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     assert again.processor.decode(rows) == source.processor.decode(rows)
 
 
-def test_a_quantized_source_loads_and_refuses_to_write_its_own_config(tmp_path):
-    """Real FP8 bytes dequantize and train, but cannot be mislabeled on export."""
+def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
+    """The source config describes real FP8 bytes after a training update."""
     import torch
     from safetensors.torch import save_file
 
@@ -307,9 +307,76 @@ def test_a_quantized_source_loads_and_refuses_to_write_its_own_config(tmp_path):
     np.testing.assert_array_equal(tool.logits(quantized, quantized.variables, ids),
                                   tool.logits(expected, expected.variables, ids))
     state = tool.train(CASES["deepseek_v3"], quantized, ids)
-    assert all(bool(np.isfinite(np.asarray(leaf)).all()) for leaf in jax.tree.leaves(state.params))
-    with pytest.raises(ValueError, match="quantization_config"):
-        quantized.save(tmp_path / "refused", variables=state.params)
+    destination = tmp_path / "exported"
+    quantized.save(destination, variables=state.params)
+    from safetensors.torch import load_file
+    packed_export = load_file(str(destination / "model.safetensors"))
+    assert packed_export[scaled].dtype == torch.float8_e4m3fn
+    assert json.loads((destination / "config.json").read_text()) == config
+    float_export = {name: value.float().numpy() for name, value in packed_export.items()
+                    if name != scaled + "_scale_inv"}
+    float_export[scaled] = (packed_export[scaled].float() *
+                            packed_export[scaled + "_scale_inv"][0, 0]).numpy()
+    original_quantized = dense_tensors[scaled]
+    assert not np.array_equal(float_export[scaled], original_quantized)
+    plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
+    plain_directory = tmp_path / "decoded-export"
+    save_hf_layout(float_export, plain_config, plain_directory)
+    decoded = load_pretrained(plain_directory, dtype="float32", attention_impl="reference")
+    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(tool.logits(reloaded, reloaded.variables, ids),
+                                  tool.logits(decoded, decoded.variables, ids))
+    for layout in quantized.weight_layouts:
+        if layout.name != scaled:
+            np.testing.assert_array_equal(float_export[layout.name], layout.export(state.params))
+    without_provenance = dataclasses.replace(quantized, quantized_tensors=())
+    with pytest.raises(ValueError):
+        without_provenance.save(tmp_path / "refused", variables=state.params)
+
+
+def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
+    import torch
+    from safetensors.numpy import load_file
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+    from dew.nn.gpt_oss import pack_mxfp4
+
+    source = FIXTURES / "gpt-oss-tiny"
+    tensors = load_file(str(source / "model.safetensors"))
+    stems = tuple(name for name in tensors if name.endswith((".experts.gate_up_proj", ".experts.down_proj")))
+    packed = pack_mxfp4(tensors, stems)
+    config = json.loads((source / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "mxfp4"}
+    directory = tmp_path / "source"
+    save_hf_layout(packed, config, directory)
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    ids = np.load(source / "input_ids.npy")
+    state = tool.train(tool.Case("gpt_oss", "gpt-oss-tiny"), loaded, ids)
+    destination = tmp_path / "export"
+    loaded.save(destination, variables=state.params)
+    emitted = load_file(str(destination / "model.safetensors"))
+    assert set(emitted) == set(packed)
+    assert json.loads((destination / "config.json").read_text()) == config
+    decoded = {name: value for name, value in emitted.items()
+               if not name.endswith(("_blocks", "_scales"))}
+    for stem in stems:
+        decoded[stem] = convert_moe_packed_tensors(
+            torch.from_numpy(emitted[stem + "_blocks"]),
+            torch.from_numpy(emitted[stem + "_scales"])).float().numpy()
+    assert any(not np.array_equal(decoded[layout.name], layout.export(loaded.variables))
+               for layout in loaded.weight_layouts if layout.name in stems)
+    for layout in loaded.weight_layouts:
+        if layout.name not in stems:
+            np.testing.assert_array_equal(decoded[layout.name], layout.export(state.params))
+    plain_directory = tmp_path / "decoded"
+    plain_config = {name: value for name, value in config.items() if name != "quantization_config"}
+    save_hf_layout(decoded, plain_config, plain_directory)
+    plain = load_pretrained(plain_directory, dtype="float32", attention_impl="reference")
+    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(tool.logits(plain, plain.variables, ids),
+                                  tool.logits(reloaded, reloaded.variables, ids))
+    missing = dataclasses.replace(loaded, quantized_tensors=())
+    with pytest.raises(ValueError):
+        missing.save(tmp_path / "missing-provenance", variables=state.params)
 
 
 
