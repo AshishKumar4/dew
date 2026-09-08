@@ -107,7 +107,7 @@ TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
         "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
-ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
+ROUTED = DEEPSEEK + ("kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -1804,7 +1804,7 @@ def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
 
 
 # --------------------------------------------------------------------------
-# DeepSeek V2 and Kimi K2: the V2 router under MLA, and V3 under Kimi's name
+# DeepSeek V2 and Kimi K2: the V2 router under MLA, and Kimi's own release
 # --------------------------------------------------------------------------
 
 DEEPSEEK_V2 = FIXTURES / "deepseek-v2-tiny"
@@ -1882,26 +1882,58 @@ def test_the_real_kimi_k2_config_translates():
     assert config["mixer"]["yarn"]["factor"] == 32.0 and config["rope_theta"] == 50000.0
 
 
-def test_a_kimi_k2_checkpoint_loads_as_the_deepseek_v3_it_is(tmp_path):
-    """The V3 tiny fixture under Kimi's model_type and Kimi's extra fields
-    reaches the same logits, and exports back under deepseek_v3."""
-    directory = tmp_path / "kimi"
-    directory.mkdir()
-    for path in (FIXTURES / "deepseek-v3-tiny").iterdir():
-        if path.name != "config.json":
-            (directory / path.name).write_bytes(path.read_bytes())
-    (directory / "config.json").write_text(json.dumps({
-        **fixture_config("deepseek-v3-tiny"), "model_type": "kimi_k2",
-        "aux_loss_alpha": 0.001, "seq_aux": True, "num_nextn_predict_layers": 0}))
+def test_the_kimi_k2_fixture_translates_the_releases_own_choices():
+    """kimi-k2-tiny scales the release's widths and keeps its choices, so
+    both configs translate to the same routing, rope and MLA record, and
+    neither of them is DeepSeek V3's.
 
-    model, variables = fp32_decoder(directory)
-    reference = np.load(FIXTURES / "deepseek-v3-tiny" / "logits.npy")
-    ids = np.load(FIXTURES / "deepseek-v3-tiny" / "input_ids.npy")
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-    assert float(np.max(np.abs(logits - reference))) < 1e-4
-    from dew.interop.hf_decoders import _export_config
-    assert _export_config(model)["model_type"] == "deepseek_v3"
+    The release's own values the fixture holds unscaled are the sigmoid
+    scores under the balancing bias, one group holding every expert, the
+    2.827 scaling, rope theta 50000 and YaRN factor 32 at beta_fast and
+    beta_slow 1.0 over an original context of 4096.
+    """
+    tiny = translate_config(fixture_config("kimi-k2-tiny"))
+    released = translate_config(fixture_config("kimi-k2"))
+    v3 = translate_config(fixture_config("deepseek-v3-tiny"))
 
+    shared = ("score_function", "bias", "groups", "groups_per_token", "scaling")
+    assert ({name: tiny["mixture"][name] for name in shared}
+            == {name: released["mixture"][name] for name in shared}
+            == {"score_function": "sigmoid", "bias": True, "groups": 1,
+                "groups_per_token": 1, "scaling": 2.827})
+    assert tiny["mixer"]["yarn"] == released["mixer"]["yarn"]
+    assert tiny["mixer"]["yarn"]["factor"] == 32.0
+    assert (tiny["mixer"]["yarn"]["beta_fast"],
+            tiny["mixer"]["yarn"]["beta_slow"]) == (1.0, 1.0)
+    assert tiny["mixer"]["yarn"]["original_max_position_embeddings"] == 4096
+    assert tiny["rope_theta"] == released["rope_theta"] == 50000.0
+    assert tiny["mixture"]["layers"] == (1,) and tiny["num_layers"] == 2
+
+    # A copy of the V3 fixture under Kimi's model_type is what the audit
+    # found here. V3 groups its experts four ways, scales by 2.5 and runs a
+    # factor-40 ramp over theta 10000, so none of these agree.
+    differ = ("groups", "groups_per_token", "scaling")
+    for name in differ:
+        assert tiny["mixture"][name] != v3["mixture"][name], name
+    assert tiny["rope_theta"] != v3["rope_theta"]
+    assert tiny["mixer"]["yarn"]["factor"] != v3["mixer"]["yarn"]["factor"]
+
+
+def test_the_kimi_k2_fixture_keeps_the_releases_mla_proportions():
+    """The release makes qk_nope twice qk_rope and the values as wide as
+    qk_nope. The V3 fixture's three equal widths hide that split, so a
+    query head that halved its nope and rope slices evenly would load
+    there and fail here."""
+    tiny = translate_config(fixture_config("kimi-k2-tiny"))
+    released = translate_config(fixture_config("kimi-k2"))
+
+    for config in (tiny, released):
+        mixer = config["mixer"]
+        assert mixer["kind"] == "mla"
+        assert mixer["qk_nope_head_dim"] == 2 * mixer["qk_rope_head_dim"]
+        assert mixer["v_head_dim"] == mixer["qk_nope_head_dim"]
+        assert config["head_dim"] == mixer["qk_nope_head_dim"] + mixer["qk_rope_head_dim"]
+    assert tiny["mixer"]["q_lora_rank"] == 8 and released["mixer"]["q_lora_rank"] == 1536
 
 
 # --------------------------------------------------------------------------

@@ -514,10 +514,13 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 # reading their masked-diffusion reference needs. Writing either through the
 # derived-config writer would drop those and rename LLaDA's tensors, so the
 # source layout is what puts a trained checkpoint back where it came from.
+# Kimi K2 is here because a derived config cannot know it: it computes what
+# DeepSeek V3 does, so only the source's own config carries its model_type,
+# vocabulary and rope base back out.
 _SOURCE_LAYOUT_FAMILIES = frozenset({
     "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
     "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-    "deepseek_v32", "llama4_text", "llada", "dream", "Dream", "olmo3"})
+    "deepseek_v32", "kimi_k2", "llama4_text", "llada", "dream", "Dream", "olmo3"})
 
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
