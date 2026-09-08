@@ -37,6 +37,10 @@ Parameter names are the checkpoint's: in_proj_qkv, in_proj_z, in_proj_b,
 in_proj_a, conv1d, A_log, dt_bias, norm, out_proj. A_log and dt_bias are
 separate leaves because the reference materialises them as parameters, and
 `g = -exp(A_log) * softplus(a + dt_bias)` reads them per value head.
+Qwen3-Next fuses the four input projections into two, `in_proj_qkvz` and
+`in_proj_ba`, whose rows are grouped by key head
+(`modeling_qwen3_next.py:540-586`); `fused_in_proj` keeps those two leaves
+and splits them the way the reference does.
 """
 
 import functools
@@ -305,7 +309,12 @@ class GatedDeltaNet(nn.Module):
     Parameter names are the checkpoint's, so a translation only moves
     weights: `conv1d/weight` is the depthwise taps `[D, 1, K]`, and
     `A_log`/`dt_bias` are the `[Hv]` leaves the reference materialises as
-    parameters.
+    parameters. With `fused_in_proj` the input projections are the two
+    leaves Qwen3-Next stores, `in_proj_qkvz` and `in_proj_ba`
+    (`Qwen3NextGatedDeltaNet.__init__`, modeling_qwen3_next.py:540-543);
+    `fix_query_key_value_ordering` (modeling_qwen3_next.py:558-586) splits
+    each row group of one key head into its q, k and the value heads' v and
+    z (b and a), which `_project` mirrors.
     """
 
     emb_features: int
@@ -318,6 +327,7 @@ class GatedDeltaNet(nn.Module):
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
     gate_activation: str = 'silu'  # the norm's gate: 'silu' | 'sigmoid', qwen4_exp's output_gate_type
+    fused_in_proj: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -352,11 +362,16 @@ class GatedDeltaNet(nn.Module):
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-        self.in_proj_qkv = dense(self.key_features * 2 + self.value_features,
-                                 name='in_proj_qkv')
-        self.in_proj_z = dense(self.value_features, name='in_proj_z')
-        self.in_proj_b = dense(self.num_v_heads, name='in_proj_b')
-        self.in_proj_a = dense(self.num_v_heads, name='in_proj_a')
+        if self.fused_in_proj:
+            self.in_proj_qkvz = dense(2 * self.key_features + 2 * self.value_features,
+                                      name='in_proj_qkvz')
+            self.in_proj_ba = dense(2 * self.num_v_heads, name='in_proj_ba')
+        else:
+            self.in_proj_qkv = dense(self.key_features * 2 + self.value_features,
+                                     name='in_proj_qkv')
+            self.in_proj_z = dense(self.value_features, name='in_proj_z')
+            self.in_proj_b = dense(self.num_v_heads, name='in_proj_b')
+            self.in_proj_a = dense(self.num_v_heads, name='in_proj_a')
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
                                        kernel=self.conv_kernel, name='conv1d')
         self.A_log = self.param('A_log', nn.initializers.constant(0.0),
@@ -383,6 +398,25 @@ class GatedDeltaNet(nn.Module):
         """The depthwise taps [D, K]; calling the conv initialises its param."""
         return jnp.asarray(self.conv1d()[:, 0, :], jnp.float32)
 
+    def _project(self, x):
+        """(query, key, value, z, b, a) of `x`, flat over heads: `[B, S, H*D]`
+        for the four wide ones and `[B, S, Hv]` for b and a."""
+        B, S, _ = x.shape
+        if not self.fused_in_proj:
+            key_dim = self.key_features
+            query, key, value = jnp.split(self.in_proj_qkv(x), [key_dim, 2 * key_dim], axis=-1)
+            return query, key, value, self.in_proj_z(x), self.in_proj_b(x), self.in_proj_a(x)
+        # One row group per key head: its q, its k, then the v and z of the
+        # value heads it serves (modeling_qwen3_next.py:558-586).
+        per_key = self.per_v * self.head_v_dim
+        qkvz = self.in_proj_qkvz(x).reshape(B, S, self.num_k_heads, 2 * self.head_k_dim + 2 * per_key)
+        query, key, value, z = jnp.split(
+            qkvz, [self.head_k_dim, 2 * self.head_k_dim, 2 * self.head_k_dim + per_key], axis=-1)
+        ba = self.in_proj_ba(x).reshape(B, S, self.num_k_heads, 2 * self.per_v)
+        b, a = jnp.split(ba, 2, axis=-1)
+        return (query.reshape(B, S, -1), key.reshape(B, S, -1), value.reshape(B, S, -1),
+                z.reshape(B, S, -1), b.reshape(B, S, -1), a.reshape(B, S, -1))
+
     @nn.compact
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
@@ -392,12 +426,8 @@ class GatedDeltaNet(nn.Module):
         valid = None if attention_metadata is None else attention_metadata.valid
         if valid is not None and valid.shape != (B, S):
             raise ValueError(f"row validity must be {(B, S)}, got {valid.shape}")
-        projected = self.in_proj_qkv(x)
-        key_dim, value_dim = self.key_features, self.value_features
-        query, key, value = jnp.split(projected, [key_dim, 2 * key_dim], axis=-1)
-        z = self.in_proj_z(x)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        query, key, value, z, b, a = self._project(x)
+        key_dim = self.key_features
 
         # fp32 on purpose, as the reference notes: an fp16 A can make exp
         # underflow to -inf (modeling_qwen3_next.py:652-653).

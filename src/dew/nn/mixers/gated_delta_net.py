@@ -20,9 +20,11 @@ class GatedDeltaNetMixer(MixerBase):
     conv's window. `output_gate_type` is the activation the gated norm
     applies to its gate, silu in qwen3_5 (`Qwen3_5RMSNormGated.activation`,
     modeling_qwen3_5.py:173) and `output_gate_type or hidden_act` in
-    qwen4_exp (modeling_qwen4_exp.py:438). The chunk size (64, the
-    reference's default) belongs to the implementation, so it is not a field
-    here.
+    qwen4_exp (modeling_qwen4_exp.py:438). `fused_in_proj` is Qwen3-Next's
+    parameterisation of the same layer: the four input projections stored as
+    the two leaves `in_proj_qkvz` and `in_proj_ba`, grouped by key head
+    (modeling_qwen3_next.py:540-586). The chunk size (64, the reference's
+    default) belongs to the implementation, so it is not a field here.
 
     This kind ignores the context's attention geometry (num_kv_heads,
     head_dim, the window, partial rotary, KV sharing, the output gate): a
@@ -35,6 +37,7 @@ class GatedDeltaNetMixer(MixerBase):
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
     output_gate_type: str = 'silu'
+    fused_in_proj: bool = False
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
@@ -53,5 +56,6 @@ class GatedDeltaNetMixer(MixerBase):
             chunk_size=CHUNK_SIZE,
             norm_eps=ctx.norm_eps,
             gate_activation=self.output_gate_type,
+            fused_in_proj=self.fused_in_proj,
             dtype=ctx.dtype,
             precision=ctx.precision)

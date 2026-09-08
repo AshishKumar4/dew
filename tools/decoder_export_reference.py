@@ -78,6 +78,7 @@ CASES = (
          reference_class="DeepseekV3ForCausalLM"),
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
+    Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3),
 )
 
 
@@ -176,12 +177,16 @@ def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray
         if report.get(category):
             raise ValueError(f"reference load {category}: {report[category]}")
     unexpected = report.get("unexpected_keys", [])
-    # Transformers has no GLM prediction module. Only its declared MTP
-    # depths may remain unconsumed; an unrelated tensor is an export bug.
+    # Transformers has no GLM or Qwen prediction module: Glm4MoePreTrainedModel
+    # reads the depths past num_hidden_layers as unexpected and
+    # Qwen3NextPreTrainedModel ignores `^mtp.*` on load
+    # (modeling_qwen3_next.py:877). Only those may remain unconsumed; an
+    # unrelated tensor is an export bug.
     config = model.config
-    prefixes = (tuple(f"model.layers.{config.num_hidden_layers + depth}."
-                      for depth in range(config.num_nextn_predict_layers))
-                if config.model_type in ("glm4_moe", "glm_moe_dsa") else ())
+    depths = tuple(f"model.layers.{config.num_hidden_layers + depth}."
+                   for depth in range(config.num_nextn_predict_layers))
+    prefixes = {"glm4_moe": depths, "glm_moe_dsa": depths,
+                "qwen3_next": ("mtp.",)}.get(config.model_type, ())
     if any(not name.startswith(prefixes) for name in unexpected):
         raise ValueError(f"reference load unexpected tensors: {unexpected}")
     model.eval()

@@ -595,14 +595,15 @@ _SPLIT_GATE_UP = ("llama4_text", "gemma4_text", "qwen3_5_moe_text")
 """Families whose fused `experts.gate_up_proj` loads as two stacked kernels;
 GPT OSS keeps the reference's fused leaf and maps the name itself."""
 
-_TRANSPOSED_EXPERTS = ("gemma4_text", "qwen3_5_moe_text")
-"""Families whose expert matrices are stored [E, out, in]."""
-
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, component: str | None = None) -> WeightLayout | None:
     """The text family's existing leaf map plus its inverse storage operations."""
     family = decoders._FAMILIES[model_type]
+    # A family whose checkpoint packs its experts as `[E, out, in]`
+    # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
+    # back swapped.
+    packed = family.prepare_weights is decoders._gemma4_prepare
 
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
@@ -622,7 +623,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
             paths_list.append(nested(path))
         paths = tuple(paths_list)
         concatenate = -1
-        if model_type in _TRANSPOSED_EXPERTS:
+        if packed:
             transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
@@ -632,7 +633,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
             transpose = (1, 0)
-        elif text_name.endswith(".experts.down_proj") and model_type in _TRANSPOSED_EXPERTS:
+        elif text_name.endswith(".experts.down_proj") and packed:
             transpose = (0, 2, 1)
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate, expert_index)
 

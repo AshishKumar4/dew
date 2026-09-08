@@ -49,6 +49,7 @@ from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mla import MLAMixer
 from dew.registry import from_record
 from dew.nn import audio as audio_nn
@@ -1406,15 +1407,60 @@ def _deepseek_config(hf_config: Mapping[str, Any], used: set[str], *,
     return config
 
 
-def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
-    if hf_config.get('layer_types') is None:
-        used.add('full_attention_interval')
+def _qwen_hybrid_config(hf_config: Mapping[str, Any], used: set[str], *,
+                        mixer: Mapping[str, Any]) -> Dict[str, Any]:
+    """The hybrid Qwen decoder qwen3_5_text and qwen3_next share: gated
+    delta net layers on the kind's record, gated full attention with a
+    'default'-convention partial rope, and (1 + w) norms. `mixer` is the
+    family's own fields of the delta net record beside the config's geometry.
+    """
     interval = int(hf_config.get('full_attention_interval', 4))
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
         for index in range(int(hf_config['num_hidden_layers']))))
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           layer_types=layer_types, rope=_Ropes(10000.0))
+    used.add('full_attention_interval')
+    rope_theta, partial = _qwen35_rope(hf_config)
+    used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
+    kinds = dict(config['kinds'])
+    if 'linear_attention' in layer_types:
+        kinds['linear_attention'] = {'mixer': {
+            'kind': 'gated_delta_net',
+            **{field: int(hf_config[field]) for field in _LINEAR_FIELDS},
+            **mixer}}
+    unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
+    if unknown_kinds:
+        _refuse(f"layer_types {unknown_kinds}",
+                "a hybrid Qwen layer is linear_attention or full_attention")
+    used.update(_LINEAR_FIELDS)
+    config.update(
+        # Qwen3_5RMSNorm scales by (1 + w) from a zero init
+        # (modeling_qwen3_5.py:727, 736; modeling_qwen3_next.py:137, 146),
+        # the q/k norms included.
+        scale_offset=True,
+        output_gate=True,
+        rope_theta=rope_theta,
+        partial_rotary_factor=partial,
+        partial_rotary_type='default',
+        kinds=kinds,
+    )
+    return config
+
+
+def _qwen_prediction_depth(hf_config: Mapping[str, Any], used: set[str], field: str) -> int:
+    """The single shared-embedding prediction layer vLLM's Qwen MTP modules
+    build (qwen3_5_mtp.py, qwen3_next_mtp.py:59), by the config field that
+    declares it; 0 or absent is a model without one."""
+    depth = hf_config.get(field, 0)
+    if type(depth) is not int or depth not in (0, 1):
+        _refuse(field, 'Qwen supports the released single shared prediction layer')
+    used.add(field)
+    return depth
+
+
+def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    config = _qwen_hybrid_config(hf_config, used, mixer={})
     # The reference's attention always chunks a doubled q_proj into the
     # query and a sigmoid gate on the branch (modeling_qwen3_5.py:644-646,
     # 670-673, 701), whatever the config's attn_output_gate says. The
@@ -1423,43 +1469,53 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
     if not hf_config.get('attn_output_gate', True):
         _refuse("attn_output_gate=False",
                 "Qwen3_5Attention always gates its output")
-    used.update(('attn_output_gate', 'full_attention_interval'))
+    used.add('attn_output_gate')
     # Published checkpoints call the DeltaNet SiLU gate "swish". Full
     # attention always uses sigmoid; this field never changes that branch.
     if hf_config.get('output_gate_type', 'swish') != 'swish':
         _refuse('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate')
     used.add('output_gate_type')
-    rope_theta, partial = _qwen35_rope(hf_config)
-    used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
-    kinds = dict(config['kinds'])
-    if 'linear_attention' in layer_types:
-        kinds['linear_attention'] = {'mixer': {
-            'kind': 'gated_delta_net',
-            **{field: int(hf_config[field]) for field in _LINEAR_FIELDS}}}
-    unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
-    if unknown_kinds:
-        _refuse(f"layer_types {unknown_kinds}",
-                "a qwen3_5_text layer is linear_attention or full_attention")
-    used.update(_LINEAR_FIELDS)
-    config.update(
-        # Qwen3_5RMSNorm scales by (1 + w) from a zero init
-        # (modeling_qwen3_5.py:727, 736), the q/k norms included.
-        scale_offset=True,
-        output_gate=True,
-        rope_theta=rope_theta,
-        partial_rotary_factor=partial,
-        partial_rotary_type='default',
-        kinds=kinds,
-    )
-    depth = hf_config.get('mtp_num_hidden_layers', 0)
-    if type(depth) is not int or depth not in (0, 1):
-        _refuse('mtp_num_hidden_layers', 'Qwen supports the released single shared prediction layer')
+    config['num_nextn_predict_layers'] = _qwen_prediction_depth(hf_config, used, 'mtp_num_hidden_layers')
     if hf_config.get('mtp_use_dedicated_embeddings', False):
         _refuse('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head')
-    config['num_nextn_predict_layers'] = depth
-    used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_num_hidden_layers',
-                 'mtp_use_dedicated_embeddings'))
+    used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_use_dedicated_embeddings'))
+    return config
 
+
+def _qwen3_next_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """Qwen3-Next: the Qwen3.5 hybrid block with its delta net's input
+    projections fused (modeling_qwen3_next.py:540-586) and a routed
+    feed-forward, softmax top-k over the experts beside a sigmoid-gated
+    shared expert (Qwen3NextTopKRouter and Qwen3NextSparseMoeBlock,
+    modeling_qwen3_next.py:758-798), on the layers decoder_sparse_step
+    selects minus mlp_only_layers (modeling_qwen3_next.py:813-818); the
+    others stay dense at intermediate_size.
+    """
+    config = _qwen_hybrid_config(hf_config, used, mixer={'fused_in_proj': True})
+    # The release spells its rope flat: rope_theta beside a null rope_scaling.
+    # A ramp there is the YaRN its model card suggests past 256K, which the
+    # plain rotary of this block does not apply.
+    used.add('rope_scaling')
+    if hf_config.get('rope_scaling') is not None:
+        _refuse('rope_scaling', 'the Qwen3-Next rotary is plain at rope_theta')
+    layers = int(hf_config['num_hidden_layers'])
+    used.update(('num_experts', 'decoder_sparse_step', 'mlp_only_layers', 'norm_topk_prob',
+                 'moe_intermediate_size', 'shared_expert_intermediate_size'))
+    experts = _record_int(hf_config, 'num_experts')
+    step = _record_int(hf_config, 'decoder_sparse_step')
+    if step < 1:
+        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
+    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
+    sparse = tuple(index for index in range(layers)
+                   if experts > 0 and (index + 1) % step == 0 and index not in dense)
+    if sparse:
+        config['mixture'] = _softmax_mixture(
+            hf_config, used, experts, layers=sparse,
+            norm_topk_prob=bool(hf_config.get('norm_topk_prob', True)),
+            expert_features=_record_int(hf_config, 'moe_intermediate_size'),
+            shared_features=_record_int(hf_config, 'shared_expert_intermediate_size'),
+            shared_gate=True)
+    config['num_nextn_predict_layers'] = _qwen_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
     return config
 
 
@@ -2024,8 +2080,10 @@ _MLA_NORMS = ('q_a_layernorm', 'kv_a_layernorm')
 _MOE_SHARED = ('gate_proj', 'up_proj', 'down_proj')
 # Qwen3.5's linear_attn is the block's mixer, so it lands where self_attn
 # does; its Linear leaves transpose like any other, and the rest keep the
-# checkpoint's names and shapes (GatedDeltaNet in dew.nn.linear).
-_LINEAR_PROJECTIONS = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj')
+# checkpoint's names and shapes (GatedDeltaNet in dew.nn.linear). Qwen3-Next
+# stores the same projections fused as in_proj_qkvz and in_proj_ba.
+_LINEAR_PROJECTIONS = ('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a',
+                       'in_proj_qkvz', 'in_proj_ba', 'out_proj')
 _LINEAR_LEAVES: frozenset[Tuple[str, ...]] = frozenset(
     (('conv1d', 'weight'), ('norm', 'weight'), ('A_log',), ('dt_bias',)))
 
@@ -3291,6 +3349,11 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
+    DecoderFamily(('qwen3_next',), _qwen3_next_config,
+                  lambda fields: any(isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj
+                                     for mixer in _kind_mixers(fields)),
+                  'qwen3_next', 'Qwen3NextForCausalLM', lambda model: {},
+                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
     DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
                   lambda fields: bool(fields['output_gate'] and _mixture_value(fields) is not None),
                   'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
