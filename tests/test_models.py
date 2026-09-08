@@ -317,6 +317,82 @@ def test_non_symmetric_attention_configs_place_attention_on_that_stage_alone(rng
         rng, video, temb, textcontext)) == expected
 
 
+def test_stages_that_do_not_match_the_feature_depths_are_refused(rng):
+    """attention_configs names one stage per feature depth. The decoder walks
+    the two reversed, so a list of the wrong length does not lose its odd end:
+    it offsets the levels the decoder attends in from the ones the encoder
+    does, and the halves stop mirroring with nothing raised. Narrowing
+    feature_depths and leaving the stages alone is how a run reaches it, so
+    both UNets refuse the disagreement instead of building either half.
+    """
+    from dew.nn.backbones.unet3d import UNet3D
+
+    config = dict(emb_features=64, feature_depths=[16, 32], num_res_blocks=1,
+                  num_middle_res_blocks=1,
+                  attention_configs=[None, Stage(heads=2), Stage(heads=2)])
+    temb, textcontext = jnp.ones((2,)), text()
+    with pytest.raises(ValueError, match="3 stages for 2 depths"):
+        Unet(**config).init(rng, jax.random.normal(rng, (2, 16, 16, 3)), temb, textcontext)
+    with pytest.raises(ValueError, match="3 stages for 2 depths"):
+        UNet3D(**config, temporal_heads=2).init(
+            rng, jax.random.normal(rng, (2, 3, 16, 16, 3)), temb, textcontext)
+
+
+@pytest.mark.parametrize("video", [False, True])
+def test_upsampling_reaches_the_next_decoder_stage_width(rng, video):
+    from dew.nn.backbones.unet3d import UNet3D
+    from dew.nn.blocks import Upsample
+
+    depths = (8, 16, 32)
+    model_type = UNet3D if video else Unet
+    model = model_type(emb_features=16, feature_depths=depths,
+                       attention_configs=(None,) * len(depths),
+                       num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
+    shape = (1, 2, 16, 16, 3) if video else (1, 16, 16, 3)
+    _, variables = model.init_with_output(
+        rng, jax.random.normal(rng, shape), jnp.ones((1,)),
+        capture_intermediates=lambda module, method: isinstance(module, Upsample))
+    transitions = [values["__call__"][0].shape[-3:]
+                   for _, values in sorted(variables["intermediates"].items())]
+    assert transitions == [(8, 8, 16), (16, 16, 8)]
+
+
+def test_benchmark_unet_resampling_matches_the_native_model(rng, tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dew.nn.blocks import Upsample
+
+    for name in ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    from tools.benchmark_torch import Unet as TorchUnet
+
+    depths = (8, 16, 32)
+    native = Unet(emb_features=16, feature_depths=depths,
+                  attention_configs=(None,) * len(depths),
+                  num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
+    image = jnp.ones((1, 16, 16, 3))
+    _, variables = native.init_with_output(
+        rng, image, jnp.ones((1,)),
+        capture_intermediates=lambda module, method: isinstance(module, Upsample))
+    expected = [values["__call__"][0].shape[-3:]
+                for _, values in sorted(variables["intermediates"].items())]
+    twin = TorchUnet({"feature_depths": depths, "attention_heads": (None,) * len(depths),
+                      "emb_features": 16, "num_res_blocks": 1, "num_middle_res_blocks": 1},
+                     "reference")
+    observed = []
+
+    def record_shape(module, arguments, output):
+        observed.append((output.shape[2], output.shape[3], output.shape[1]))
+
+    handles = [layer.register_forward_hook(record_shape) for layer in twin.upsamples]
+    try:
+        with torch.no_grad():
+            twin(torch.ones(1, 16, 16, 3), torch.ones(1), None)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert observed == expected
+
+
 def test_a_stage_with_an_unknown_field_is_refused():
     """Design rule 6: an unknown field raises ValueError naming it, so a
     misspelled dial fails at build and the dial it meant is never left at
@@ -396,3 +472,22 @@ def test_a_block_pattern_and_a_ratio_together_are_refused():
         HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=2, num_heads=2,
                               **alone).init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)),
                                             jnp.ones((1,)))
+
+
+def test_a_block_pattern_that_misses_a_layer_is_refused():
+    """`block_pattern` names every layer's mixer, so one shorter than
+    `num_layers` is refused rather than deciding the depth. The hybrid DiT
+    built one block per named layer and the factorized stack paired its two
+    halves, so a short pattern silently returned a shallower model than the
+    config asked for, with the temporal blocks past the pattern built and
+    never run."""
+    from dew.nn.backbones.jepa import FactorizedTokenStack
+
+    hybrid = HybridSSMAttentionDiT(patch_size=4, emb_features=32, num_layers=4,
+                                   num_heads=2, block_pattern=("ssm", "attn"))
+    with pytest.raises(ValueError, match="2 entries for 4 layers"):
+        hybrid.init(jax.random.PRNGKey(0), jnp.zeros((1, 8, 8, 3)), jnp.ones((1,)))
+    factorized = FactorizedTokenStack(features=16, num_layers=4, num_heads=2,
+                                      block_pattern=("attn", "attn"))
+    with pytest.raises(ValueError, match="2 entries for 4 layers"):
+        factorized.init(jax.random.PRNGKey(0), jnp.zeros((1, 2, 4, 16)))

@@ -77,7 +77,7 @@ def test_native_shared_model_forward_matches_reference(system):
     np.testing.assert_allclose(bare, reference["bare"], atol=1e-4, rtol=0)
     np.testing.assert_allclose(conditioned, reference["conditioned"], atol=1e-4, rtol=0)
     np.testing.assert_array_equal(jnp.argmax(conditioned, -1), reference["conditioned"].argmax(-1))
-    for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache)):
+    for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
 
@@ -188,7 +188,7 @@ def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
     restored = adapter.translate_weights(adapter.export_weights(model, changed, config), config)
-    for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored)):
+    for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored), strict=True):
         np.testing.assert_array_equal(actual, wanted)
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
     wanted = process.generate(model, changed, inputs, 7, key=jax.random.key(11))
